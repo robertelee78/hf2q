@@ -8,6 +8,7 @@ pub mod attention;
 pub mod cache;
 pub mod compressor;
 pub mod config;
+pub mod forward;
 pub mod hyper_connection;
 pub mod model;
 pub mod residency;
@@ -21,6 +22,8 @@ pub use residency::Deepseek4Weights;
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod forward_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]

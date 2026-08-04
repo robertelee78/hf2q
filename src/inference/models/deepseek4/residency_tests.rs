@@ -14,8 +14,8 @@ use super::Deepseek4Config;
 pub(super) fn tiny_config() -> Deepseek4Config {
     Deepseek4Config {
         num_hidden_layers: 2,
-        hidden_size: 32,
-        hidden_size_out: 128,
+        hidden_size: 256,
+        hidden_size_out: 1024,
         max_position_embeddings: 128,
         vocab_size: 32,
         num_attention_heads: 2,
@@ -216,6 +216,7 @@ fn metadata(cfg: &Deepseek4Config) -> Vec<(String, MetaValue)> {
 
 fn tensor_type(role: TensorRole, name: &str, bad_lookup: bool) -> GgmlType {
     match role {
+        TensorRole::RawMatrix if name == "token_embd.weight" => GgmlType::Q2_K,
         TensorRole::RawMatrix => GgmlType::Q4_0,
         TensorRole::ElementwiseF32 if name.contains("_ape.weight") => GgmlType::Q4_0,
         TensorRole::ElementwiseF32 => GgmlType::F32,
@@ -233,6 +234,23 @@ fn payload(spec_shape: &[usize], ggml_type: GgmlType) -> Vec<u8> {
     let columns = *spec_shape.last().unwrap();
     let bytes = rows * ggml_type.row_size(columns);
     match ggml_type {
+        GgmlType::Q2_K => {
+            let blocks = rows * columns / 256;
+            let mut data = Vec::with_capacity(blocks * 84);
+            for block in 0..blocks {
+                for group in 0..16u8 {
+                    let scale = (group.wrapping_add(block as u8) % 15) + 1;
+                    let min = 15 - (group.wrapping_mul(3).wrapping_add(block as u8) % 16);
+                    data.push((min << 4) | scale);
+                }
+                for byte in 0..64u8 {
+                    data.push(byte.wrapping_mul(73).wrapping_add(block as u8));
+                }
+                data.extend_from_slice(&0x3000u16.to_le_bytes());
+                data.extend_from_slice(&0x2c00u16.to_le_bytes());
+            }
+            data
+        }
         GgmlType::F32 => (0..spec_shape.iter().product::<usize>())
             .flat_map(|_| 1.0_f32.to_le_bytes())
             .collect(),
@@ -302,14 +320,14 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
 
     let embedding = weights.raw_matrix("token_embd.weight").unwrap();
     assert_eq!(embedding.dtype(), DType::U8);
-    assert_eq!(embedding.byte_len(), 32 * 18);
+    assert_eq!(embedding.byte_len(), 32 * 84);
     let embedding_ref = weights.raw_matrix_ref("token_embd.weight").unwrap();
-    assert_eq!(embedding_ref.ggml_type, mlx_native::GgmlType::Q4_0);
-    assert_eq!(embedding_ref.shape, &[32, 32]);
+    assert_eq!(embedding_ref.ggml_type, mlx_native::GgmlType::Q2_K);
+    assert_eq!(embedding_ref.shape, &[32, 256]);
 
     let norm = weights.f32_state("output_norm.weight").unwrap();
     assert_eq!(norm.dtype(), DType::F32);
-    assert_eq!(norm.byte_len(), 32 * 4);
+    assert_eq!(norm.byte_len(), 256 * 4);
     let ape = weights
         .f32_state("blk.0.attn_compressor_ape.weight")
         .unwrap();
