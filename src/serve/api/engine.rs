@@ -11280,13 +11280,35 @@ fn generate_once_with_soft_tokens(
     // iter-420 pp3.4K byte-identical, iter-421 long-decode/sampling/
     // streaming all robust.  Opt out via `HF2Q_SERVE_BATCHED_PREFILL=0`
     // / `=false` / `=off` (matches iter-326 q6_K_NR2 default-on pattern).
-    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL")
-        .ok()
-        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-        .unwrap_or(true);
+    // Tri-state (2026-08-03 auto-fallback): explicit =1 FORCES the
+    // batched route (operator override); explicit =0/=false/=off forces
+    // the linear route; UNSET = auto — engage batched only when this
+    // request's O(n²) mask overhead fits the available-memory budget.
+    // A 92K-token opencode first turn allocated ~120 GB transient on
+    // 2026-08-03 and died in Metal with a command-buffer error — no
+    // user should need to know BATCHED=0 exists.
+    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
+    let batched_allowed = match serve_batched_env.as_deref() {
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => {
+            let viable =
+                crate::serve::forward_prefill_batched::serve_batched_route_viable(
+                    prompt_tokens.len(),
+                );
+            if !viable {
+                eprintln!(
+                    "[hf2q batched prefill] auto-fallback to linear route: \
+                     seq_len={} O(n²) mask overhead exceeds the available- \
+                     memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+                    prompt_tokens.len()
+                );
+            }
+            viable
+        }
+    };
     let use_batched_serve = soft_tokens.is_empty()
         && resume_lcp.is_none()
-        && serve_batched_env;
+        && batched_allowed;
     let prefill_argmax = if use_batched_serve {
         loaded
             .weights
@@ -16251,13 +16273,35 @@ fn generate_stream_once(
     // iter-420 pp3.4K byte-identical, iter-421 long-decode/sampling/
     // streaming all robust.  Opt out via `HF2Q_SERVE_BATCHED_PREFILL=0`
     // / `=false` / `=off` (matches iter-326 q6_K_NR2 default-on pattern).
-    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL")
-        .ok()
-        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-        .unwrap_or(true);
+    // Tri-state (2026-08-03 auto-fallback): explicit =1 FORCES the
+    // batched route (operator override); explicit =0/=false/=off forces
+    // the linear route; UNSET = auto — engage batched only when this
+    // request's O(n²) mask overhead fits the available-memory budget.
+    // A 92K-token opencode first turn allocated ~120 GB transient on
+    // 2026-08-03 and died in Metal with a command-buffer error — no
+    // user should need to know BATCHED=0 exists.
+    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
+    let batched_allowed = match serve_batched_env.as_deref() {
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => {
+            let viable =
+                crate::serve::forward_prefill_batched::serve_batched_route_viable(
+                    prompt_tokens.len(),
+                );
+            if !viable {
+                eprintln!(
+                    "[hf2q batched prefill] auto-fallback to linear route: \
+                     seq_len={} O(n²) mask overhead exceeds the available- \
+                     memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+                    prompt_tokens.len()
+                );
+            }
+            viable
+        }
+    };
     let use_batched_serve = soft_tokens.is_empty()
         && resume_lcp.is_none()
-        && serve_batched_env;
+        && batched_allowed;
     let next_token_result = if use_batched_serve {
         loaded
             .weights

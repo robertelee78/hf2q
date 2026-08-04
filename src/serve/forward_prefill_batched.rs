@@ -41,6 +41,42 @@ use crate::serve::forward_mlx_shared::{
 };
 use super::gpu::GpuContext;
 
+// ---------------------------------------------------------------------------
+// Auto route viability (2026-08-03)
+// ---------------------------------------------------------------------------
+
+/// Conservative O(n²) memory overhead of the batched route: two
+/// [seq_len × seq_len] bf16 mask planes (sliding + global, reused across
+/// layers) plus their F16 casts (`HF2Q_FA_F16` default-on) ≈ 8 bytes per
+/// seq² token-pair.  These are the terms that make the batched route
+/// diverge from the linear-memory non-batched route — KV/model/scratch
+/// are O(n) and common to both.  (The tensor-mm `pf_kq` scratch,
+/// `nh × seq² × 4`, exists only on the NO_FA global route; long prompts
+/// route globals through FA, so it is not part of the universal term.)
+pub fn batched_route_overhead_bytes(seq_len: usize) -> u64 {
+    8u64.saturating_mul((seq_len as u64).saturating_mul(seq_len as u64))
+}
+
+/// Per-request auto-route predicate: engage the batched route only when
+/// its O(n²) mask overhead fits a conservative share (÷6) of CURRENTLY
+/// available unified memory.  Read fresh each call so the decision
+/// adapts to model residency + KV growth over the process lifetime.
+///
+/// Motivation: on 2026-08-03 a 92K-token opencode first turn took the
+/// batched route by default, allocated ~120 GB transient (masks ~68 GB
+/// + dense KV ~49 GB + model), and died inside Metal with
+/// `batched head finish: Command buffer error`.  The operator fix was
+/// `BATCHED=0` — but no user should have to know that flag exists.
+/// With this predicate the engine falls back to the linear-memory route
+/// on oversized prompts automatically; `HF2Q_SERVE_BATCHED_PREFILL=1`
+/// remains as an explicit force-on override.
+pub fn serve_batched_route_viable(seq_len: usize) -> bool {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let avail = sys.available_memory();
+    batched_route_overhead_bytes(seq_len) <= avail / 6
+}
+
 // Wave P4.0 — env-gated per-kernel GPU-time profiling.  Enabled via
 // HF2Q_PROFILE_FA / HF2Q_PROFILE_MOE / HF2Q_PROFILE_MM to break out the
 // contribution of each kernel category.  Each adds 2 commit_and_wait per
@@ -4760,5 +4796,25 @@ mod block_diagonal_mask_tests {
                 assert_eq!(bits(m[q * t + k]), neg, "cross-seq mask[{q},{k}] must be -inf");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod route_viability_tests {
+    #[test]
+    fn batched_route_overhead_scales_quadratically() {
+        assert_eq!(super::batched_route_overhead_bytes(0), 0);
+        assert_eq!(
+            super::batched_route_overhead_bytes(1024),
+            8 * 1024 * 1024
+        );
+        let envelope_ok = super::batched_route_overhead_bytes(32 * 1024);
+        let failure_scale = super::batched_route_overhead_bytes(92066);
+        // 32K prompt ⇒ ~8.6 GB — inside the measured "batched fine"
+        // envelope (scripts/serve_gemma4_opencode.sh header).
+        assert!(envelope_ok < 10_000_000_000);
+        // 92066-token prompt ⇒ ~68 GB — the 2026-08-03 command-buffer
+        // failure scale; must far exceed any sane availability budget.
+        assert!(failure_scale > 60_000_000_000);
     }
 }
