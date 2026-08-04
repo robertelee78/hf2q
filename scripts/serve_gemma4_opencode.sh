@@ -42,17 +42,20 @@
 #                           prompt), never to the T=0 GPU argmax path.
 #
 # BATCHED PREFILL vs CONTEXT SIZE (auto-routed since 2026-08-03):
-#   The engine now picks per request: batched route (~20-47× faster
-#   prefill) engages only when its O(n²) mask overhead fits 1/6 of
-#   CURRENTLY available RAM — measured envelope ≈ ≤35-40K tokens on a
-#   128 GB box. Larger prompts auto-fall-back to the linear-memory route
-#   (~1,700 tok/s; a 97K first turn ≈ 60 s once, then LCP resumes carry
-#   later turns) with a stderr notice. No operator action needed.
+#   The engine picks per request: batched route (~20-47× faster
+#   prefill) engages only when its O(n²) overhead fits 1/6 of
+#   CURRENTLY available RAM. Overhead is config-dependent:
+#     default (tensor-mm globals): ~72 B/seq² — masks + pf_kq scratch
+#       ⇒ batched envelope ≈ ≤12K tokens on a 128 GB box
+#     HF2Q_GLOBAL_FA=1 (FA globals): ~8 B/seq² — masks only
+#       ⇒ batched envelope ≈ ≤35-40K tokens
+#   Larger prompts auto-fall-back to the linear-memory route
+#   (~1,700 tok/s; a 97K first turn ≈ 60 s once, then LCP resumes
+#   carry later turns) with a stderr notice. No operator action needed.
 #   Env escapes (neither should be necessary):
 #     HF2Q_SERVE_BATCHED_PREFILL=0  force linear route always
 #     HF2Q_SERVE_BATCHED_PREFILL=1  force batched route always (can
-#         reproduce the 2026-08-03 92K command-buffer OOM — diagnostic
-#         use only)
+#         reproduce the 2026-08-03 command-buffer OOM — diagnostic only)
 #     BATCHED=0 (this script)        same as the =0 env, kept for compat
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):

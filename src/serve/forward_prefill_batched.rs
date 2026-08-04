@@ -45,36 +45,85 @@ use super::gpu::GpuContext;
 // Auto route viability (2026-08-03)
 // ---------------------------------------------------------------------------
 
-/// Conservative O(n²) memory overhead of the batched route: two
-/// [seq_len × seq_len] bf16 mask planes (sliding + global, reused across
-/// layers) plus their F16 casts (`HF2Q_FA_F16` default-on) ≈ 8 bytes per
-/// seq² token-pair.  These are the terms that make the batched route
-/// diverge from the linear-memory non-batched route — KV/model/scratch
-/// are O(n) and common to both.  (The tensor-mm `pf_kq` scratch,
-/// `nh × seq² × 4`, exists only on the NO_FA global route; long prompts
-/// route globals through FA, so it is not part of the universal term.)
-pub fn batched_route_overhead_bytes(seq_len: usize) -> u64 {
-    8u64.saturating_mul((seq_len as u64).saturating_mul(seq_len as u64))
+/// Whether the batched route will allocate the tensor-mm global-layer
+/// scratch (`pf_kq` = `n_heads × seq² × 4 B` — the DOMINANT O(n²) term
+/// on gemma4: 64 B/seq² at 16 heads, 8× the mask planes).  Mirrors the
+/// dispatch chain below: `need_nofa_bufs = use_no_fa || force_global_nofa`
+/// where `use_no_fa` = HF2Q_NO_FA tri-state (default false) and
+/// `force_global_nofa` = `HF2Q_GLOBAL_FA != "1"` (**default TRUE**).
+/// Setting `HF2Q_GLOBAL_FA=1` eliminates this term entirely (FA globals)
+/// and extends the batched envelope from ~12K to ~35-40K tokens.
+fn nofa_scratch_engaged(seq_len: usize) -> bool {
+    let env_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
+        Ok("0") | Ok("false") | Ok("off") => Some(false),
+        Ok("1") | Ok("true") | Ok("on") => Some(true),
+        _ => None,
+    };
+    let use_no_fa = match env_no_fa {
+        Some(b) => b && seq_len >= 32, // force-FA at seq<32 (kernel guard)
+        None => false,
+    };
+    let force_global_nofa = std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1");
+    use_no_fa || force_global_nofa
+}
+
+/// Whether the F16 mask casts are built (`HF2Q_FA_F16` default-on;
+/// opt-out via =0/=false/=off).
+fn f16_masks_engaged() -> bool {
+    !matches!(
+        std::env::var("HF2Q_FA_F16").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+/// Conservative O(n²) memory overhead of the batched route:
+///   masks      4 B/seq²  — sliding + global [seq×seq] bf16 planes
+///   F16 casts  4 B/seq²  — when `f16_masks` (default)
+///   pf_kq      n_heads×4 B/seq² — tensor-mm global scratch, when
+///              `nofa_scratch` (DEFAULT — see nofa_scratch_engaged)
+/// These are the terms that make the batched route diverge from the
+/// linear-memory non-batched route — KV/model/scratch are O(n) and
+/// common to both.
+pub fn batched_route_overhead_bytes(
+    seq_len: usize,
+    n_attn_heads: usize,
+    nofa_scratch: bool,
+    f16_masks: bool,
+) -> u64 {
+    let sq = (seq_len as u64).saturating_mul(seq_len as u64);
+    let masks = 4u64.saturating_mul(sq);
+    let f16 = if f16_masks { 4u64.saturating_mul(sq) } else { 0 };
+    let kq = if nofa_scratch {
+        4u64.saturating_mul(n_attn_heads as u64).saturating_mul(sq)
+    } else {
+        0
+    };
+    masks + f16 + kq
 }
 
 /// Per-request auto-route predicate: engage the batched route only when
-/// its O(n²) mask overhead fits a conservative share (÷6) of CURRENTLY
+/// its O(n²) overhead fits a conservative share (÷6) of CURRENTLY
 /// available unified memory.  Read fresh each call so the decision
 /// adapts to model residency + KV growth over the process lifetime.
 ///
 /// Motivation: on 2026-08-03 a 92K-token opencode first turn took the
-/// batched route by default, allocated ~120 GB transient (masks ~68 GB
-/// + dense KV ~49 GB + model), and died inside Metal with
-/// `batched head finish: Command buffer error`.  The operator fix was
-/// `BATCHED=0` — but no user should have to know that flag exists.
-/// With this predicate the engine falls back to the linear-memory route
-/// on oversized prompts automatically; `HF2Q_SERVE_BATCHED_PREFILL=1`
-/// remains as an explicit force-on override.
-pub fn serve_batched_route_viable(seq_len: usize) -> bool {
+/// batched route by default, allocated ~120 GB transient, and died
+/// inside Metal with `batched head finish: Command buffer error` — and
+/// the FIRST cut of this predicate under-counted the default
+/// tensor-mm `pf_kq` scratch (64 B/seq²), still admitting mid-length
+/// prompts that died the same way.  With this predicate the engine
+/// falls back to the linear-memory route automatically;
+/// `HF2Q_SERVE_BATCHED_PREFILL=1` remains as an explicit force-on.
+pub fn serve_batched_route_viable(seq_len: usize, n_attn_heads: usize) -> bool {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let avail = sys.available_memory();
-    batched_route_overhead_bytes(seq_len) <= avail / 6
+    batched_route_overhead_bytes(
+        seq_len,
+        n_attn_heads,
+        nofa_scratch_engaged(seq_len),
+        f16_masks_engaged(),
+    ) <= avail / 6
 }
 
 
@@ -4887,20 +4936,31 @@ mod block_diagonal_mask_tests {
 
 #[cfg(test)]
 mod route_viability_tests {
+    use super::batched_route_overhead_bytes as overhead;
+
     #[test]
-    fn batched_route_overhead_scales_quadratically() {
-        assert_eq!(super::batched_route_overhead_bytes(0), 0);
-        assert_eq!(
-            super::batched_route_overhead_bytes(1024),
-            8 * 1024 * 1024
-        );
-        let envelope_ok = super::batched_route_overhead_bytes(32 * 1024);
-        let failure_scale = super::batched_route_overhead_bytes(92066);
-        // 32K prompt ⇒ ~8.6 GB — inside the measured "batched fine"
-        // envelope (scripts/serve_gemma4_opencode.sh header).
-        assert!(envelope_ok < 10_000_000_000);
-        // 92066-token prompt ⇒ ~68 GB — the 2026-08-03 command-buffer
-        // failure scale; must far exceed any sane availability budget.
-        assert!(failure_scale > 60_000_000_000);
+    fn batched_route_overhead_default_config_includes_nofa_scratch() {
+        // Default gemma4 config: nofa_scratch=TRUE (HF2Q_GLOBAL_FA
+        // unset ⇒ tensor-mm globals), f16 masks on, 16 attn heads.
+        assert_eq!(overhead(0, 16, true, true), 0);
+        assert_eq!(overhead(1024, 16, true, true), 72 * 1024 * 1024);
+        // 8K default ⇒ ~4.6 GB — comfortably inside a ~10 GB budget.
+        assert!(overhead(8 * 1024, 16, true, true) < 5_000_000_000);
+        // 32K DEFAULT ⇒ ~77 GB — the first-cut masks-only estimate
+        // (8.6 GB) wrongly admitted this; the 2026-08-03 mid-length
+        // command-buffer failures lived here.
+        assert!(overhead(32 * 1024, 16, true, true) > 70_000_000_000);
+        // 92066 with FA globals (the observed failing run) ⇒ ~68 GB.
+        assert!(overhead(92066, 16, false, true) > 60_000_000_000);
+    }
+
+    #[test]
+    fn batched_route_overhead_fa_globals_extends_envelope() {
+        // HF2Q_GLOBAL_FA=1 (nofa_scratch=false) drops the dominant term:
+        // 32K ⇒ ~8.6 GB (viable), 40K ⇒ ~13.4 GB (borderline).
+        assert!(overhead(32 * 1024, 16, false, true) < 10_000_000_000);
+        assert!(overhead(40 * 1024, 16, false, true) > 10_000_000_000);
+        // F16 casts off shaves another 4 B/seq².
+        assert_eq!(overhead(1024, 16, false, false), 4 * 1024 * 1024);
     }
 }

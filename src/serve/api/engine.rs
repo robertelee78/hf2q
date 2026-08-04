@@ -11298,6 +11298,7 @@ fn generate_once_with_soft_tokens(
             let viable =
                 crate::serve::forward_prefill_batched::serve_batched_route_viable(
                     prompt_tokens.len(),
+                    loaded.weights.num_attention_heads,
                 );
             if !viable {
                 eprintln!(
@@ -16298,6 +16299,7 @@ fn generate_stream_once(
             let viable =
                 crate::serve::forward_prefill_batched::serve_batched_route_viable(
                     prompt_tokens.len(),
+                    loaded.weights.num_attention_heads,
                 );
             if !viable {
                 eprintln!(
