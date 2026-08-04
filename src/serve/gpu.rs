@@ -80,6 +80,8 @@ impl GpuContext {
         mlx_native::ops::flash_attn_prefill_d512::register(&mut registry);
         mlx_native::ops::flash_attn_prefill_mask::register(&mut registry);
         mlx_native::ops::flash_attn_prefill_blk::register(&mut registry);
+        mlx_native::ops::embedding_q2_k::register(&mut registry);
+        mlx_native::ops::deepseek_hyper_connection::register(&mut registry);
 
         // ADR-031 Phase B (Option A): allocate a second identical registry for
         // the parallel-encode worker thread, but ONLY when opt-in is set.
@@ -101,6 +103,8 @@ impl GpuContext {
             mlx_native::ops::flash_attn_prefill_d512::register(&mut wreg);
             mlx_native::ops::flash_attn_prefill_mask::register(&mut wreg);
             mlx_native::ops::flash_attn_prefill_blk::register(&mut wreg);
+            mlx_native::ops::embedding_q2_k::register(&mut wreg);
+            mlx_native::ops::deepseek_hyper_connection::register(&mut wreg);
             tracing::info!("mlx-native GpuContext: worker KernelRegistry pre-warmed (HF2Q_PARALLEL_ENCODE=1)");
             Some(wreg)
         } else {
