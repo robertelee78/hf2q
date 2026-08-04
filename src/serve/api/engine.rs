@@ -10951,9 +10951,13 @@ fn generate_once_with_soft_tokens(
                                 // `prefix.linear_capacity >= new_linear`
                                 // saves us, but a future refactor could
                                 // admit an undersized sliding snapshot.
+                                // "gemma-hybrid-lcp": long-resume admits
+                                // dense OR production hybrid (kernel
+                                // mask_type=2 verified for both legs).
                                 let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
                                     && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                                    && crate::debug::INVESTIGATION_ENV.use_dense;
+                                    && (crate::debug::INVESTIGATION_ENV.use_dense
+                                        || crate::debug::INVESTIGATION_ENV.hybrid_kv);
                                 prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                     let layer = &loaded.weights.layers[li];
                                     let layer_is_ring = matches!(
@@ -11723,9 +11727,12 @@ fn generate_once_with_soft_tokens(
             // positions [0..N) faithfully even when N > sw. The guard
             // skip is no longer needed; lift it for the long-resume
             // path. (Default OFF: behavior is byte-identical to iter-7.)
+            // "gemma-hybrid-lcp": long-resume admits dense OR production
+            // hybrid (mirrors the probe-side gate).
             let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
                 && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                && crate::debug::INVESTIGATION_ENV.use_dense;
+                && (crate::debug::INVESTIGATION_ENV.use_dense
+                    || crate::debug::INVESTIGATION_ENV.hybrid_kv);
             let prefill_safe =
                 !has_sliding_layer || prompt_len <= sliding_window || kv_lcp_long_resume;
             // The `physical_decode_writes` counter is no longer
@@ -15810,9 +15817,13 @@ fn generate_stream_once(
                                 // `prefix.linear_capacity >= new_linear`
                                 // saves us, but a future refactor could
                                 // admit an undersized sliding snapshot.
+                                // "gemma-hybrid-lcp": long-resume admits
+                                // dense OR production hybrid (kernel
+                                // mask_type=2 verified for both legs).
                                 let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
                                     && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                                    && crate::debug::INVESTIGATION_ENV.use_dense;
+                                    && (crate::debug::INVESTIGATION_ENV.use_dense
+                                        || crate::debug::INVESTIGATION_ENV.hybrid_kv);
                                 prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                     let layer = &loaded.weights.layers[li];
                                     let layer_is_ring = matches!(
@@ -16759,9 +16770,12 @@ fn generate_stream_once(
             // iter-3.5c prefill-wrap guard (mirrors non-streaming).
             // ADR-017 Phase E.a iter-3.6: lift when LONG_RESUME=1 (mirrors
             // engine.rs:4516 non-streaming site).
+            // "gemma-hybrid-lcp": long-resume admits dense OR production
+            // hybrid (mirrors the probe-side gate).
             let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
                 && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                && crate::debug::INVESTIGATION_ENV.use_dense;
+                && (crate::debug::INVESTIGATION_ENV.use_dense
+                    || crate::debug::INVESTIGATION_ENV.hybrid_kv);
             let prefill_safe = !has_sliding_layer
                 || prompt_tokens.len() <= sliding_window
                 || kv_lcp_long_resume;
