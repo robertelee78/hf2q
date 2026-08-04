@@ -1148,6 +1148,82 @@ fn is_greedy_eligible(params: &SamplingParams) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// LCP store observability (2026-08-03 store-gate fix)
+// ---------------------------------------------------------------------------
+//
+// The prefix-cache store path used to fail silently: snapshot/store errors
+// were `tracing::warn!`-only (invisible without RUST_LOG) and the store
+// gates gave no signal when env config disabled them — an empty registry
+// (probe prints `registry_len=0`) had zero diagnostics.  These helpers emit
+// one-shot-per-process stderr lines for each distinct skip/failure reason:
+// enough to diagnose an empty registry at a glance, without spamming once
+// per chunk boundary (20-40 boundaries per long-context request).
+
+static LCP_STORE_NOTIFY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn lcp_notify_once(bit: u64, msg: std::string::String) {
+    let prev = LCP_STORE_NOTIFY.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    if prev & bit == 0 {
+        eprintln!("{msg}");
+    }
+}
+
+/// One-shot notice when a stride-aligned boundary skips its checkpoint
+/// store for env-config reasons.  Non-aligned partial tails are normal
+/// (unaddressable by the descending probe) and never logged.
+fn lcp_store_skip_notify(
+    stride_aligned: bool,
+    lcp_resume_enabled: bool,
+    mid_store_disabled: bool,
+) {
+    if !stride_aligned {
+        return;
+    }
+    if !lcp_resume_enabled {
+        lcp_notify_once(
+            1,
+            "[hf2q qwen35 lcp store] SKIPPED: HF2Q_KV_LCP_RESUME is off — \
+             no prefix checkpoints will be written (once-per-process notice)"
+                .to_string(),
+        );
+    } else if mid_store_disabled {
+        lcp_notify_once(
+            2,
+            "[hf2q qwen35 lcp store] SKIPPED: HF2Q_KV_LCP_DISABLE_MID_STORE=1 \
+             — mid-prefill checkpoints disabled (once-per-process notice)"
+                .to_string(),
+        );
+    }
+}
+
+/// One-shot notice for checkpoint snapshot failures (was silent on the
+/// stream path: `if let Ok(snap)` swallowed the Err arm).
+fn lcp_snapshot_error_notify<E: std::fmt::Debug>(phase: &str, chunk_pos: usize, err: &E) {
+    lcp_notify_once(
+        4,
+        format!(
+            "[hf2q qwen35 lcp store] snapshot FAILED ({phase}, chunk_pos={chunk_pos}): \
+             {err:?} — checkpoints are NOT being written; further occurrences \
+             suppressed (once-per-process notice)"
+        ),
+    );
+}
+
+/// One-shot notice for registry store rejections (e.g. EntryExceedsBudget —
+/// was `tracing::warn!`-only, invisible under default logging).
+fn lcp_store_error_notify<E: std::fmt::Debug>(phase: &str, chunk_pos: usize, err: &E) {
+    lcp_notify_once(
+        8,
+        format!(
+            "[hf2q qwen35 lcp store] store FAILED ({phase}, chunk_pos={chunk_pos}): \
+             {err:?} — check the registry byte budget; further occurrences \
+             suppressed (once-per-process notice)"
+        ),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Wedge-3 / iter-216 Phase D — worker-thread inference paths
 // ---------------------------------------------------------------------------
 //
@@ -1836,7 +1912,20 @@ pub fn generate_qwen35_once(
                 let stride_aligned = k_end % stride == 0;
                 let mid_store_disabled =
                     std::env::var("HF2Q_KV_LCP_DISABLE_MID_STORE").as_deref() == Ok("1");
-                if lcp_resume_enabled && is_greedy && stride_aligned && !mid_store_disabled {
+                // 2026-08-03 store-gate fix: prefix KV state is a pure
+                // function of the prompt tokens + weights — sampling
+                // params (temperature/top_p/top_k/seed) never touch it.
+                // The `is_greedy` conjunct here was copy-pasted from
+                // HybridPromptCache (whose replayed first DECODED token
+                // IS sampling-dependent) and silently disabled every
+                // mid-prefill store for any client sending sampling
+                // params — probes printed registry_len=0 forever and
+                // every turn re-prefilled the whole conversation.
+                // Greedy gating stays ONLY on the decoded-token replay
+                // cache (HybridPromptCache); prefix checkpoints store
+                // unconditionally.
+                lcp_store_skip_notify(stride_aligned, lcp_resume_enabled, mid_store_disabled);
+                if lcp_resume_enabled && stride_aligned && !mid_store_disabled {
                     match kv_cache.snapshot(&device) {
                         Ok(snap) => {
                             let chunk_key = build_lcp_key_for_qwen35_chunk(
@@ -1860,11 +1949,7 @@ pub fn generate_qwen35_once(
                                 0,
                                 linear_capacity,
                             ) {
-                                tracing::warn!(
-                                    "qwen35 lcp_registry mid-prefill store failed at \
-                                     chunk_pos={k_end}: {:?}",
-                                    e
-                                );
+                                lcp_store_error_notify("mid-prefill", k_end, &e);
                             } else {
                                 eprintln!(
                                     "[hf2q qwen35 lcp store] mid-prefill snapshot \
@@ -1874,10 +1959,7 @@ pub fn generate_qwen35_once(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "qwen35 lcp_registry mid-prefill snapshot skipped at chunk_pos={k_end}"
-                            );
+                            lcp_snapshot_error_notify("mid-prefill", k_end, &e);
                         }
                     }
                 }
@@ -1946,10 +2028,23 @@ pub fn generate_qwen35_once(
             next_token = sample_logits_qwen35(&mut logits, params, &[]);
         }
 
-        // Snapshot + cache update for greedy-eligible requests.  The
-        // snapshot captures KV state AFTER the prefill (current_len[0]
-        // == prompt_len for full-attn slots; DeltaNet conv/recurrent
-        // populated by the linear-attn layer's prefill emit).
+        // Snapshot + cache update.  The snapshot captures KV state AFTER
+        // the prefill (current_len[0] == prompt_len for full-attn slots;
+        // DeltaNet conv/recurrent populated by the linear-attn layer's
+        // prefill emit).  Split by sampling-dependence (2026-08-03
+        // store-gate fix):
+        //
+        // * prompt_cache (Phase E.b full-equality replay) STAYS
+        //   greedy-gated: it replays the first DECODED token, which is a
+        //   function of the sampling params — a sampled token must never
+        //   be replayed as a future greedy request's first token.
+        //
+        // * lcp_registry (Phase E.a partial-prefill resume) is NOT
+        //   greedy-gated: prefix KV state is a pure function of the
+        //   prompt tokens + weights, so checkpoints are valid regardless
+        //   of how the decoded tokens were sampled.  Gating stores on
+        //   `is_greedy` silently disabled them for any client sending
+        //   temperature/top_p/top_k/seed (registry_len=0 forever).
         //
         // ADR-017 Phase E.a B.2b: snapshot BOTH the existing prompt_cache
         // (Phase E.b full-equality replay, capacity 1) AND the lcp_registry
@@ -1970,11 +2065,16 @@ pub fn generate_qwen35_once(
                     params,
                 ),
                 Err(e) => {
-                    tracing::warn!(error = %e, "qwen35 prompt_cache snapshot skipped");
+                    eprintln!(
+                        "[hf2q qwen35 lcp store] prompt_cache snapshot failed: {e}"
+                    );
                 }
             }
+        }
 
-            // Snapshot 2: lcp_registry (partial-prefill resume, Phase E.a).
+        // Snapshot 2: lcp_registry (partial-prefill resume, Phase E.a).
+        // NOT greedy-gated — see the split rationale above.
+        {
             // ADR-017 Phase E.a B.3: when chunked prefill ran (lcp_resume_enabled
             // AND prompt_len > stride), the in-loop mid-prefill checkpointing
             // already stored every stride-aligned boundary INCLUDING the last
@@ -1990,17 +2090,13 @@ pub fn generate_qwen35_once(
             //
             // Skip when chunked already ran: mid-prefill loop already stored
             // the last chunk boundary, no need to double-store.
-            let stride =
-                crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
             let chunked_already_stored = stride > 0
                 && prompt_len > stride
                 && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
             let prompt_stride_aligned =
                 stride > 0 && prompt_len > 0 && prompt_len % stride == 0;
             let should_store_eof =
-                crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                    && !chunked_already_stored
-                    && prompt_stride_aligned;
+                lcp_resume_enabled && !chunked_already_stored && prompt_stride_aligned;
             if should_store_eof {
                 eprintln!(
                     "[hf2q qwen35 lcp store] end-of-prefill snapshot for prompt_len={} \
@@ -2026,17 +2122,11 @@ pub fn generate_qwen35_once(
                             0,
                             linear_capacity,
                         ) {
-                            tracing::warn!(
-                                "qwen35 lcp_registry store skipped: {:?}",
-                                e
-                            );
+                            lcp_store_error_notify("end-of-prefill", prompt_len, &e);
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "qwen35 lcp_registry snapshot skipped"
-                        );
+                        lcp_snapshot_error_notify("end-of-prefill", prompt_len, &e);
                     }
                 }
             }
@@ -4638,10 +4728,19 @@ pub fn generate_stream_qwen35_once_extended(
                 if chunk_idx == n_chunks - 1 {
                     last_logits_res = Ok(logits.clone());
                 }
-                // B.3 mid-prefill snapshot store (greedy + LCP_RESUME).
+                // B.3 mid-prefill snapshot store (LCP_RESUME; NOT
+                // greedy-gated — prefix KV state is sampling-independent,
+                // see the non-streaming sibling's 2026-08-03 store-gate
+                // fix).  `HF2Q_KV_LCP_DISABLE_MID_STORE` now applies to
+                // the stream path too (was non-stream-only — asymmetric
+                // kill-switch).
                 let stride_aligned = k_end % stride == 0;
-                if lcp_resume_enabled && is_greedy && stride_aligned {
-                    if let Ok(snap) = kv_cache.snapshot(&device) {
+                let mid_store_disabled =
+                    std::env::var("HF2Q_KV_LCP_DISABLE_MID_STORE").as_deref() == Ok("1");
+                lcp_store_skip_notify(stride_aligned, lcp_resume_enabled, mid_store_disabled);
+                if lcp_resume_enabled && stride_aligned && !mid_store_disabled {
+                    match kv_cache.snapshot(&device) {
+                        Ok(snap) => {
                         let chunk_key = build_lcp_key_for_qwen35_chunk(
                             qwen, params, k_end,
                         );
@@ -4659,11 +4758,7 @@ pub fn generate_stream_qwen35_once_extended(
                             0,
                             linear_capacity,
                         ) {
-                            tracing::warn!(
-                                "qwen35 stream lcp_registry mid-prefill store \
-                                 failed at chunk_pos={k_end}: {:?}",
-                                e
-                            );
+                            lcp_store_error_notify("stream mid-prefill", k_end, &e);
                         } else {
                             eprintln!(
                                 "[hf2q qwen35 stream lcp store] mid-prefill \
@@ -4671,6 +4766,13 @@ pub fn generate_stream_qwen35_once_extended(
                                  (registry_len_after={})",
                                 qwen.lcp_registry.len()
                             );
+                        }
+                        }
+                        Err(e) => {
+                            // Was `if let Ok` — snapshot failures used to
+                            // be 100% silent on this path, producing the
+                            // empty-registry symptom with zero diagnostics.
+                            lcp_snapshot_error_notify("stream mid-prefill", k_end, &e);
                         }
                     }
                 }
@@ -4735,22 +4837,30 @@ pub fn generate_stream_qwen35_once_extended(
                     next_token,
                     params,
                 ),
-                Err(e) => tracing::warn!(error = %e, "qwen35 stream prompt_cache snapshot skipped"),
+                Err(e) => eprintln!(
+                    "[hf2q qwen35 stream lcp store] prompt_cache snapshot failed: {e}"
+                ),
             }
+        }
 
-            // ADR-017 Phase E.a B.3: end-of-prefill snapshot store
-            // under chunk-position key (when not already stored by
-            // mid-prefill loop).  See non-streaming sibling for the
-            // gating logic explanation.
-            if lcp_resume_enabled {
-                let chunked_already_stored = stride > 0
-                    && prompt_len > stride
-                    && (crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill
-                        || lcp_resume_start > 0);
-                let prompt_stride_aligned =
-                    stride > 0 && prompt_len > 0 && prompt_len % stride == 0;
-                if !chunked_already_stored && prompt_stride_aligned {
-                    if let Ok(snap) = kv_cache.snapshot(&device) {
+        // ADR-017 Phase E.a B.3: end-of-prefill snapshot store
+        // under chunk-position key (when not already stored by
+        // mid-prefill loop).  See non-streaming sibling for the
+        // gating logic explanation.  NOT greedy-gated (2026-08-03
+        // store-gate fix): prefix KV state is sampling-independent.
+        // Still skipped on extension paths — a soft-token-tainted KV
+        // snapshot must never be restored by a subsequent text-only
+        // request.
+        if !has_extension && lcp_resume_enabled {
+            let chunked_already_stored = stride > 0
+                && prompt_len > stride
+                && (crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill
+                    || lcp_resume_start > 0);
+            let prompt_stride_aligned =
+                stride > 0 && prompt_len > 0 && prompt_len % stride == 0;
+            if !chunked_already_stored && prompt_stride_aligned {
+                match kv_cache.snapshot(&device) {
+                    Ok(snap) => {
                         let chunk_key = build_lcp_key_for_qwen35_chunk(
                             qwen, params, prompt_len,
                         );
@@ -4770,11 +4880,12 @@ pub fn generate_stream_qwen35_once_extended(
                             0,
                             linear_capacity,
                         ) {
-                            tracing::warn!(
-                                error = ?e,
-                                "qwen35 streaming lcp_registry EOF store failed"
-                            );
+                            lcp_store_error_notify("stream end-of-prefill", prompt_len, &e);
                         }
+                    }
+                    Err(e) => {
+                        // Was `if let Ok` — silent snapshot failure.
+                        lcp_snapshot_error_notify("stream end-of-prefill", prompt_len, &e);
                     }
                 }
             }
@@ -6687,6 +6798,50 @@ mod tests {
             "Wedge-4e: streaming prompt-cache write MUST be skipped on \
              extension paths to avoid poisoning subsequent text-only \
              requests with a soft-token-tainted KV snapshot"
+        );
+    }
+
+    /// 2026-08-03 store-gate fix: prefix-KV checkpoint stores must NOT be
+    /// gated on `is_greedy`.  KV state is a pure function of the prompt
+    /// tokens + weights — sampling params (temperature/top_p/top_k/seed)
+    /// never touch it.  The greedy conjunct was copy-pasted from
+    /// HybridPromptCache (whose replayed first DECODED token IS
+    /// sampling-dependent) and silently disabled every store for clients
+    /// sending sampling params: probes printed `registry_len=0` forever
+    /// and every agentic turn re-prefilled the whole conversation.  Pin
+    /// the new gate shape so a future refactor can't reintroduce it.
+    #[test]
+    fn lcp_prefix_stores_are_not_greedy_gated() {
+        let src = include_str!("engine_qwen35.rs");
+        // NOTE: patterns are split via concat! so this test's own source
+        // doesn't self-match the pins (include_str! reads the whole file,
+        // test code included).
+        let forbidden = concat!("lcp_resume_enabled", " && ", "is_greedy");
+        // Negative pin: no LCP store gate may combine resume with greedy.
+        assert!(
+            !src.contains(forbidden),
+            "LCP prefix-KV stores must NOT be greedy-gated — KV state is \
+             sampling-independent; greedy gating belongs only on \
+             HybridPromptCache's decoded-token replay"
+        );
+        // Positive pin: non-stream AND stream mid-prefill gates share the
+        // new shape, including the symmetric mid-store kill-switch.
+        let gate = concat!(
+            "if lcp_resume_enabled && stride_aligned",
+            " && !mid_store_disabled {"
+        );
+        assert_eq!(
+            src.matches(gate).count(),
+            2,
+            "non-stream + stream mid-prefill store gates must both be \
+             `lcp_resume_enabled && stride_aligned && !mid_store_disabled`"
+        );
+        // Greedy gate SURVIVES where it belongs: HybridPromptCache write —
+        // the replayed first decoded token IS sampling-dependent.
+        assert!(
+            src.contains("if is_greedy && !has_extension {"),
+            "HybridPromptCache write must REMAIN greedy-gated (first \
+             decoded token replay is sampling-dependent)"
         );
     }
 
