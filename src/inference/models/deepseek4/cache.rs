@@ -31,6 +31,25 @@ pub struct Deepseek4CachePlan {
     pub resident_bytes: u64,
 }
 
+/// Exact cache slots and visibility bounds for one autoregressive position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LayerCacheStep {
+    pub layer_index: usize,
+    pub window_write_slot: usize,
+    pub window_start_position: usize,
+    pub window_valid_after: usize,
+    pub compressed_write_slot: Option<usize>,
+    pub compressed_valid_after: usize,
+    pub indexer_write_slot: Option<usize>,
+    pub indexer_valid_after: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheStep {
+    pub position: usize,
+    pub layers: Vec<LayerCacheStep>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKind {
     WindowKv,
@@ -67,6 +86,10 @@ pub enum CacheError {
     },
     #[error("allocated cache byte accounting mismatch: planned {planned}, actual {actual}")]
     Accounting { planned: u64, actual: u64 },
+    #[error("DeepSeek-V4 cache is full at context bound {maximum}")]
+    ContextExhausted { maximum: usize },
+    #[error("cache step committed out of order: expected position {expected}, got {actual}")]
+    StepOutOfOrder { expected: usize, actual: usize },
 }
 
 pub struct LayerCache {
@@ -77,6 +100,8 @@ pub struct LayerCache {
 
 pub struct Deepseek4Cache {
     layers: Vec<LayerCache>,
+    plan: Deepseek4CachePlan,
+    next_position: usize,
     resident_bytes: u64,
     _device: MlxDevice,
 }
@@ -208,6 +233,8 @@ impl Deepseek4Cache {
         }
         Ok(Self {
             layers,
+            plan: plan.clone(),
+            next_position: 0,
             resident_bytes: actual,
             _device: device,
         })
@@ -220,6 +247,86 @@ impl Deepseek4Cache {
     pub fn resident_bytes(&self) -> u64 {
         self.resident_bytes
     }
+
+    pub fn position(&self) -> usize {
+        self.next_position
+    }
+
+    /// Return the write slots and post-write visibility bounds for the next
+    /// token without changing logical cache state. The caller commits only
+    /// after its Metal command buffer completes successfully.
+    pub fn plan_next_step(&self) -> Result<CacheStep, CacheError> {
+        if self.next_position >= self.plan.context_length {
+            return Err(CacheError::ContextExhausted {
+                maximum: self.plan.context_length,
+            });
+        }
+        let position = self.next_position;
+        let tokens_after = position + 1;
+        let layers = self
+            .plan
+            .layers
+            .iter()
+            .map(|layer| {
+                let window_capacity = layer.window_kv.shape[0];
+                let window_valid_after = tokens_after.min(window_capacity);
+                let (compressed_write_slot, compressed_valid_after) =
+                    completed_group_step(tokens_after, layer.compress_ratio);
+                let indexer_write_slot = (layer.compress_ratio == 4)
+                    .then_some(compressed_write_slot)
+                    .flatten();
+                let indexer_valid_after = if layer.compress_ratio == 4 {
+                    compressed_valid_after
+                } else {
+                    0
+                };
+                LayerCacheStep {
+                    layer_index: layer.layer_index,
+                    window_write_slot: position % window_capacity,
+                    window_start_position: tokens_after - window_valid_after,
+                    window_valid_after,
+                    compressed_write_slot,
+                    compressed_valid_after,
+                    indexer_write_slot,
+                    indexer_valid_after,
+                }
+            })
+            .collect();
+        Ok(CacheStep { position, layers })
+    }
+
+    /// Advance logical visibility after the planned GPU writes complete.
+    pub fn commit_step(&mut self, position: usize) -> Result<(), CacheError> {
+        if position != self.next_position {
+            return Err(CacheError::StepOutOfOrder {
+                expected: self.next_position,
+                actual: position,
+            });
+        }
+        if self.next_position >= self.plan.context_length {
+            return Err(CacheError::ContextExhausted {
+                maximum: self.plan.context_length,
+            });
+        }
+        self.next_position += 1;
+        Ok(())
+    }
+
+    /// Reset logical visibility. Buffers need not be cleared because every
+    /// read is bounded by the validity counts returned in `CacheStep`.
+    pub fn reset(&mut self) {
+        self.next_position = 0;
+    }
+}
+
+fn completed_group_step(tokens_after: usize, ratio: u32) -> (Option<usize>, usize) {
+    if ratio == 0 {
+        return (None, 0);
+    }
+    let ratio = ratio as usize;
+    let completed = tokens_after / ratio;
+    let write = (tokens_after % ratio == 0).then(|| completed - 1);
+    (write, completed)
 }
 
 fn validate_request(cfg: &Deepseek4Config, context_length: usize) -> Result<(), CacheError> {

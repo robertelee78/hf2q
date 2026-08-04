@@ -173,3 +173,55 @@ fn allocator_materializes_the_plan_as_zeroed_f32_buffers() {
         .iter()
         .all(|value| *value == 0.0));
 }
+
+#[test]
+fn cache_steps_publish_only_complete_groups_and_commit_transactionally() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+
+    let first = cache.plan_next_step().unwrap();
+    assert_eq!(first.position, 0);
+    assert_eq!(first.layers[0].window_write_slot, 0);
+    assert_eq!(first.layers[0].compressed_write_slot, None);
+    assert_eq!(first.layers[0].compressed_valid_after, 0);
+    assert!(matches!(
+        cache.commit_step(1),
+        Err(CacheError::StepOutOfOrder {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    cache.commit_step(first.position).unwrap();
+
+    for expected in 1..4 {
+        let step = cache.plan_next_step().unwrap();
+        assert_eq!(step.position, expected);
+        cache.commit_step(step.position).unwrap();
+    }
+    let after_boundary = cache.plan_next_step().unwrap();
+    assert_eq!(after_boundary.position, 4);
+    assert_eq!(after_boundary.layers[0].compressed_write_slot, None);
+    assert_eq!(after_boundary.layers[0].compressed_valid_after, 1);
+
+    cache.reset();
+    for expected in 0..128 {
+        let step = cache.plan_next_step().unwrap();
+        assert_eq!(step.position, expected);
+        if expected == 3 {
+            assert_eq!(step.layers[0].compressed_write_slot, Some(0));
+            assert_eq!(step.layers[0].indexer_write_slot, Some(0));
+        }
+        if expected == 127 {
+            assert_eq!(step.layers[0].compressed_write_slot, Some(31));
+            assert_eq!(step.layers[1].compressed_write_slot, Some(0));
+            assert_eq!(step.layers[1].indexer_write_slot, None);
+        }
+        cache.commit_step(step.position).unwrap();
+    }
+    assert!(matches!(
+        cache.plan_next_step(),
+        Err(CacheError::ContextExhausted { maximum: 128 })
+    ));
+}
