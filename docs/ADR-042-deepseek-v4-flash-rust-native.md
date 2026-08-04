@@ -216,6 +216,7 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Existing mlx-native Q2_K loader/kernel | Absent |
 | Existing DeepSeek-V4 converter/runtime | Absent |
 | Pinned llama.cpp conversion and graph | Present at reference commit |
+| Pinned llama.cpp oracle binaries | Rebuilt locally as version 10276 (`6ea215d17`) |
 | Synthetic converter proof | Pending implementation |
 | Official full conversion | Pending converter gate |
 | Coherent real-model inference | Pending full conversion/runtime |
