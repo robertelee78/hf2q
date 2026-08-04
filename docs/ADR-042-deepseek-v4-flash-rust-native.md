@@ -41,7 +41,8 @@ The checkpoint is not an ordinary BF16 model:
 - 43 layers combine 256 routed experts (top 6) and one shared expert;
 - the graph uses compressed sparse attention, a learned indexer, attention
   sinks, four-stream hyperconnections, clamped SwiGLU, and YaRN;
-- the repository includes one attached DSpark next-token prediction layer.
+- the repository includes one attached DSpark next-token prediction stage made
+  of three `mtp.{0,1,2}` blocks (4,705 checkpoint tensors).
 
 The existing converter rejects the source dtypes and architecture. Its current
 expert fusion creates a multi-gigabyte F32 aggregate, and the runtime has no
