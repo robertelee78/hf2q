@@ -4,6 +4,7 @@
 //! sqrt-softplus router and Hyper-Connection residual mixer are not
 //! interchangeable with the Qwen or Gemma graphs.
 
+pub mod attention;
 pub mod hyper_connection;
 pub mod routing;
 
