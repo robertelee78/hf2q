@@ -110,6 +110,19 @@ impl Deepseek4Config {
             bail!("general.architecture={arch:?} is not DeepSeek-V4 (expected {ARCH_DEEPSEEK4:?})");
         }
         let p = ARCH_DEEPSEEK4;
+        let rope_scaling_type = gguf
+            .metadata_string(&format!("{p}.rope.scaling.type"))
+            .ok_or_else(|| anyhow!("DeepSeek-V4 config: required YaRN scaling type missing"))?;
+        if rope_scaling_type != "yarn" {
+            bail!("DeepSeek-V4 config: rope scaling must be yarn, got {rope_scaling_type:?}");
+        }
+        let yarn_ext_factor = required_f32(gguf, &format!("{p}.rope.scaling.yarn_ext_factor"))?;
+        let yarn_attn_factor = required_f32(gguf, &format!("{p}.rope.scaling.yarn_attn_factor"))?;
+        if yarn_ext_factor != -1.0 || yarn_attn_factor != 1.0 {
+            bail!(
+                "DeepSeek-V4 config: unsupported YaRN ext/attention factors ({yarn_ext_factor}, {yarn_attn_factor})"
+            );
+        }
         let config = Self {
             hidden_size: required_u32(gguf, &format!("{p}.embedding_length"))?,
             hidden_size_out: required_u32(gguf, &format!("{p}.embedding_length_out"))?,
@@ -274,6 +287,18 @@ mod tests {
             ("deepseek4.rope.dimension_count", MetaValue::U32(64)),
             ("deepseek4.rope.freq_base", MetaValue::F32(10000.0)),
             ("deepseek4.rope.scaling.factor", MetaValue::F32(16.0)),
+            (
+                "deepseek4.rope.scaling.type",
+                MetaValue::String("yarn".into()),
+            ),
+            (
+                "deepseek4.rope.scaling.yarn_ext_factor",
+                MetaValue::F32(-1.0),
+            ),
+            (
+                "deepseek4.rope.scaling.yarn_attn_factor",
+                MetaValue::F32(1.0),
+            ),
             (
                 "deepseek4.rope.scaling.original_context_length",
                 MetaValue::U32(65536),
