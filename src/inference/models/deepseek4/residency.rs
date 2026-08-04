@@ -61,7 +61,15 @@ pub enum WeightLookupError {
 
 struct ResidentTensor {
     role: TensorRole,
+    ggml_type: GgmlType,
+    shape: Vec<usize>,
     buffer: MlxBuffer,
+}
+
+pub struct RawMatrixRef<'a> {
+    pub buffer: &'a MlxBuffer,
+    pub ggml_type: GgmlType,
+    pub shape: &'a [usize],
 }
 
 pub struct Deepseek4Weights {
@@ -127,6 +135,8 @@ impl Deepseek4Weights {
                 spec.name,
                 ResidentTensor {
                     role: spec.role,
+                    ggml_type: info.ggml_type,
+                    shape: info.shape.clone(),
                     buffer,
                 },
             );
@@ -175,6 +185,27 @@ impl Deepseek4Weights {
 
     pub fn raw_matrix(&self, name: &str) -> Result<&MlxBuffer, WeightLookupError> {
         self.tensor(name, TensorRole::RawMatrix)
+    }
+
+    pub fn raw_matrix_ref(&self, name: &str) -> Result<RawMatrixRef<'_>, WeightLookupError> {
+        let entry = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| WeightLookupError::Missing {
+                name: name.to_string(),
+            })?;
+        if entry.role != TensorRole::RawMatrix {
+            return Err(WeightLookupError::RoleMismatch {
+                name: name.to_string(),
+                expected: TensorRole::RawMatrix,
+                actual: entry.role,
+            });
+        }
+        Ok(RawMatrixRef {
+            buffer: &entry.buffer,
+            ggml_type: entry.ggml_type,
+            shape: &entry.shape,
+        })
     }
 
     pub fn f32_state(&self, name: &str) -> Result<&MlxBuffer, WeightLookupError> {

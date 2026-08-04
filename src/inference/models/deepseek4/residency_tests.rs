@@ -303,6 +303,9 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
     let embedding = weights.raw_matrix("token_embd.weight").unwrap();
     assert_eq!(embedding.dtype(), DType::U8);
     assert_eq!(embedding.byte_len(), 32 * 18);
+    let embedding_ref = weights.raw_matrix_ref("token_embd.weight").unwrap();
+    assert_eq!(embedding_ref.ggml_type, mlx_native::GgmlType::Q4_0);
+    assert_eq!(embedding_ref.shape, &[32, 32]);
 
     let norm = weights.f32_state("output_norm.weight").unwrap();
     assert_eq!(norm.dtype(), DType::F32);
