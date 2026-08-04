@@ -22,6 +22,10 @@ pub enum HyperConnectionError {
     BaseCount { expected: usize, actual: usize },
     #[error("Hyper-Connection input contains a non-finite value")]
     NonFinite,
+    #[error("expected {expected} state values, got {actual}")]
+    StateCount { expected: usize, actual: usize },
+    #[error("expected {expected} coefficient values, got {actual}")]
+    CoefficientCount { expected: usize, actual: usize },
 }
 
 fn sigmoid(value: f32) -> f32 {
@@ -134,6 +138,111 @@ pub fn split_sinkhorn(
     })
 }
 
+/// Reduce `tokens × hc_mult × dim` residual streams using per-token `pre`
+/// coefficients. This is the exact `hc_pre` reduction after mix projection.
+pub fn pre_reduce(
+    state: &[f32],
+    pre: &[f32],
+    tokens: usize,
+    hc_mult: usize,
+    dim: usize,
+) -> Result<Vec<f32>, HyperConnectionError> {
+    let expected_state = tokens.saturating_mul(hc_mult).saturating_mul(dim);
+    if state.len() != expected_state {
+        return Err(HyperConnectionError::StateCount {
+            expected: expected_state,
+            actual: state.len(),
+        });
+    }
+    let expected_pre = tokens.saturating_mul(hc_mult);
+    if pre.len() != expected_pre {
+        return Err(HyperConnectionError::CoefficientCount {
+            expected: expected_pre,
+            actual: pre.len(),
+        });
+    }
+    if state.iter().chain(pre).any(|value| !value.is_finite()) {
+        return Err(HyperConnectionError::NonFinite);
+    }
+    let mut output = vec![0.0; tokens * dim];
+    for token in 0..tokens {
+        for stream in 0..hc_mult {
+            let coefficient = pre[token * hc_mult + stream];
+            let source = (token * hc_mult + stream) * dim;
+            let target = token * dim;
+            for column in 0..dim {
+                output[target + column] += coefficient * state[source + column];
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Expand one sublayer result back to Hyper-Connection streams:
+/// `post * x + sum_source(combination * residual)`.
+pub fn post_expand(
+    x: &[f32],
+    residual: &[f32],
+    post: &[f32],
+    combination: &[f32],
+    tokens: usize,
+    hc_mult: usize,
+    dim: usize,
+) -> Result<Vec<f32>, HyperConnectionError> {
+    let expected_x = tokens.saturating_mul(dim);
+    if x.len() != expected_x {
+        return Err(HyperConnectionError::StateCount {
+            expected: expected_x,
+            actual: x.len(),
+        });
+    }
+    let expected_residual = tokens.saturating_mul(hc_mult).saturating_mul(dim);
+    if residual.len() != expected_residual {
+        return Err(HyperConnectionError::StateCount {
+            expected: expected_residual,
+            actual: residual.len(),
+        });
+    }
+    let expected_post = tokens.saturating_mul(hc_mult);
+    if post.len() != expected_post {
+        return Err(HyperConnectionError::CoefficientCount {
+            expected: expected_post,
+            actual: post.len(),
+        });
+    }
+    let expected_combination = tokens.saturating_mul(hc_mult).saturating_mul(hc_mult);
+    if combination.len() != expected_combination {
+        return Err(HyperConnectionError::CoefficientCount {
+            expected: expected_combination,
+            actual: combination.len(),
+        });
+    }
+    if x.iter()
+        .chain(residual)
+        .chain(post)
+        .chain(combination)
+        .any(|value| !value.is_finite())
+    {
+        return Err(HyperConnectionError::NonFinite);
+    }
+
+    let mut output = vec![0.0; expected_residual];
+    for token in 0..tokens {
+        for destination in 0..hc_mult {
+            let target = (token * hc_mult + destination) * dim;
+            for column in 0..dim {
+                let mut value = post[token * hc_mult + destination] * x[token * dim + column];
+                for source in 0..hc_mult {
+                    value += combination[(token * hc_mult + source) * hc_mult + destination]
+                        * residual[(token * hc_mult + source) * dim + column];
+                }
+                output[target + column] = value;
+            }
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +300,27 @@ mod tests {
                 expected: 24,
                 actual: 23
             }
+        );
+    }
+
+    #[test]
+    fn pre_and_post_preserve_official_source_destination_orientation() {
+        let state = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0];
+        let pre = [0.1, 0.2, 0.3, 0.4];
+        assert_eq!(pre_reduce(&state, &pre, 1, 4, 2).unwrap(), vec![3.0, 30.0]);
+
+        let x = [10.0, 100.0];
+        let post = [1.0, 2.0, 3.0, 4.0];
+        // Rows are sources, columns are destinations.
+        let combination = [
+            1.0, 0.0, 0.0, 0.0, // source 0
+            0.0, 1.0, 0.0, 0.0, // source 1
+            0.0, 0.0, 1.0, 0.0, // source 2
+            0.0, 0.0, 0.0, 1.0, // source 3
+        ];
+        assert_eq!(
+            post_expand(&x, &state, &post, &combination, 1, 4, 2).unwrap(),
+            vec![11.0, 110.0, 22.0, 220.0, 33.0, 330.0, 44.0, 440.0]
         );
     }
 }
