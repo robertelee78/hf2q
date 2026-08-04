@@ -9,16 +9,20 @@ pub mod cache;
 pub mod compressor;
 pub mod config;
 pub mod hyper_connection;
-pub mod rope;
+pub mod model;
 pub mod residency;
+pub mod rope;
 pub mod routing;
 pub mod weights;
 
 pub use config::Deepseek4Config;
+pub use model::Deepseek4Model;
 pub use residency::Deepseek4Weights;
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod model_tests;
 #[cfg(test)]
 mod residency_tests;
 

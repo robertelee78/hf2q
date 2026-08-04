@@ -3,6 +3,7 @@ use std::fs;
 use mlx_native::gguf::GgufFile;
 use mlx_native::{DType, MlxDevice};
 
+use crate::backends::gguf::types::MetaValue;
 use crate::backends::gguf::writer::GgufWriter;
 use crate::quantize::ggml_quants::GgmlType;
 
@@ -10,7 +11,7 @@ use super::residency::{Deepseek4Weights, WeightLookupError, WeightResidencyError
 use super::weights::{required_tensor_specs, TensorRole, WeightCatalogError};
 use super::Deepseek4Config;
 
-fn tiny_config() -> Deepseek4Config {
+pub(super) fn tiny_config() -> Deepseek4Config {
     Deepseek4Config {
         num_hidden_layers: 2,
         hidden_size: 32,
@@ -51,6 +52,168 @@ fn tiny_config() -> Deepseek4Config {
     }
 }
 
+fn metadata(cfg: &Deepseek4Config) -> Vec<(String, MetaValue)> {
+    let p = "deepseek4";
+    vec![
+        ("general.architecture".into(), MetaValue::String(p.into())),
+        (
+            format!("{p}.block_count"),
+            MetaValue::U32(cfg.num_hidden_layers),
+        ),
+        (
+            format!("{p}.context_length"),
+            MetaValue::U32(cfg.max_position_embeddings),
+        ),
+        (
+            format!("{p}.embedding_length"),
+            MetaValue::U32(cfg.hidden_size),
+        ),
+        (
+            format!("{p}.embedding_length_out"),
+            MetaValue::U32(cfg.hidden_size_out),
+        ),
+        (format!("{p}.vocab_size"), MetaValue::U32(cfg.vocab_size)),
+        (
+            format!("{p}.attention.head_count"),
+            MetaValue::U32(cfg.num_attention_heads),
+        ),
+        (
+            format!("{p}.attention.head_count_kv"),
+            MetaValue::U32(cfg.num_key_value_heads),
+        ),
+        (
+            format!("{p}.attention.key_length"),
+            MetaValue::U32(cfg.head_dim),
+        ),
+        (
+            format!("{p}.attention.value_length"),
+            MetaValue::U32(cfg.head_dim),
+        ),
+        (
+            format!("{p}.rope.dimension_count"),
+            MetaValue::U32(cfg.rope_head_dim),
+        ),
+        (
+            format!("{p}.rope.freq_base"),
+            MetaValue::F32(cfg.rope_theta),
+        ),
+        (
+            format!("{p}.rope.scaling.factor"),
+            MetaValue::F32(cfg.rope_factor),
+        ),
+        (
+            format!("{p}.rope.scaling.type"),
+            MetaValue::String("yarn".into()),
+        ),
+        (
+            format!("{p}.rope.scaling.yarn_ext_factor"),
+            MetaValue::F32(-1.0),
+        ),
+        (
+            format!("{p}.rope.scaling.yarn_attn_factor"),
+            MetaValue::F32(1.0),
+        ),
+        (
+            format!("{p}.rope.scaling.original_context_length"),
+            MetaValue::U32(cfg.original_context_length),
+        ),
+        (
+            format!("{p}.rope.scaling.yarn_beta_fast"),
+            MetaValue::F32(cfg.yarn_beta_fast),
+        ),
+        (
+            format!("{p}.rope.scaling.yarn_beta_slow"),
+            MetaValue::F32(cfg.yarn_beta_slow),
+        ),
+        (
+            format!("{p}.attention.q_lora_rank"),
+            MetaValue::U32(cfg.q_lora_rank),
+        ),
+        (
+            format!("{p}.attention.output_lora_rank"),
+            MetaValue::U32(cfg.o_lora_rank),
+        ),
+        (
+            format!("{p}.attention.output_group_count"),
+            MetaValue::U32(cfg.output_groups),
+        ),
+        (
+            format!("{p}.attention.sliding_window"),
+            MetaValue::U32(cfg.sliding_window),
+        ),
+        (
+            format!("{p}.attention.compress_rope_freq_base"),
+            MetaValue::F32(cfg.compress_rope_theta),
+        ),
+        (
+            format!("{p}.attention.indexer.head_count"),
+            MetaValue::U32(cfg.index_num_heads),
+        ),
+        (
+            format!("{p}.attention.indexer.key_length"),
+            MetaValue::U32(cfg.index_head_dim),
+        ),
+        (
+            format!("{p}.attention.indexer.top_k"),
+            MetaValue::U32(cfg.index_top_k),
+        ),
+        (
+            format!("{p}.attention.layer_norm_rms_epsilon"),
+            MetaValue::F32(cfg.rms_norm_eps),
+        ),
+        (format!("{p}.expert_count"), MetaValue::U32(cfg.num_experts)),
+        (
+            format!("{p}.expert_used_count"),
+            MetaValue::U32(cfg.num_experts_per_tok),
+        ),
+        (
+            format!("{p}.expert_shared_count"),
+            MetaValue::U32(cfg.num_shared_experts),
+        ),
+        (
+            format!("{p}.expert_feed_forward_length"),
+            MetaValue::U32(cfg.expert_intermediate_size),
+        ),
+        (
+            format!("{p}.expert_weights_scale"),
+            MetaValue::F32(cfg.route_scale),
+        ),
+        (
+            format!("{p}.expert_weights_norm"),
+            MetaValue::Bool(cfg.normalize_topk),
+        ),
+        (format!("{p}.expert_gating_func"), MetaValue::U32(4)),
+        (
+            format!("{p}.hyper_connection.count"),
+            MetaValue::U32(cfg.hyper_connection_count),
+        ),
+        (
+            format!("{p}.hyper_connection.sinkhorn_iterations"),
+            MetaValue::U32(cfg.hyper_connection_sinkhorn_iterations),
+        ),
+        (
+            format!("{p}.hyper_connection.epsilon"),
+            MetaValue::F32(cfg.hyper_connection_epsilon),
+        ),
+        (
+            format!("{p}.hash_layer_count"),
+            MetaValue::U32(cfg.hash_layer_count),
+        ),
+        (
+            format!("{p}.attention.compress_ratios"),
+            MetaValue::ArrayU32(cfg.compress_ratios.clone()),
+        ),
+        (
+            format!("{p}.swiglu_clamp_exp"),
+            MetaValue::ArrayF32(cfg.swiglu_clamp_experts.clone()),
+        ),
+        (
+            format!("{p}.swiglu_clamp_shexp"),
+            MetaValue::ArrayF32(cfg.swiglu_clamp_shared.clone()),
+        ),
+    ]
+}
+
 fn tensor_type(role: TensorRole, name: &str, bad_lookup: bool) -> GgmlType {
     match role {
         TensorRole::RawMatrix => GgmlType::Q4_0,
@@ -80,7 +243,7 @@ fn payload(spec_shape: &[usize], ggml_type: GgmlType) -> Vec<u8> {
     }
 }
 
-fn open_fixture(
+pub(super) fn open_fixture(
     cfg: &Deepseek4Config,
     omit_last: bool,
     bad_lookup: bool,
@@ -91,8 +254,14 @@ fn open_fixture(
     if omit_last {
         specs.pop();
     }
+    let metadata = metadata(cfg);
     let mut writer = GgufWriter::new(fs::File::create(&path).unwrap());
-    writer.write_header(specs.len() as u64, 0).unwrap();
+    writer
+        .write_header(specs.len() as u64, metadata.len() as u64)
+        .unwrap();
+    for (key, value) in &metadata {
+        writer.write_metadata_kv(key, value).unwrap();
+    }
     let mut types = Vec::with_capacity(specs.len());
     for spec in &specs {
         let ggml_type = tensor_type(spec.role, &spec.name, bad_lookup);
