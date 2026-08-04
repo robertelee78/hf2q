@@ -872,6 +872,27 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 tracing::info!("Detected architecture '{}' → routing to Qwen3.5 path", arch);
                 return cmd_generate_qwen35(args, gguf_peek);
             }
+            if arch == "deepseek4" {
+                anyhow::bail!(
+                    "DeepSeek-V4 GGUF is recognized, but the dedicated Rust/Metal generate \
+                     path is not available in this build; refusing to route it through Gemma. \
+                     Model: {}",
+                    model_path.display(),
+                );
+            }
+            if arch != "gemma4" {
+                anyhow::bail!(
+                    "unsupported GGUF general.architecture={arch:?}; `hf2q generate` supports \
+                     gemma4 and the explicitly dispatched Qwen families in this build. Model: {}",
+                    model_path.display(),
+                );
+            }
+        } else {
+            anyhow::bail!(
+                "GGUF is missing required `general.architecture`; refusing to guess Gemma. \
+                 Model: {}",
+                model_path.display(),
+            );
         }
     }
 
@@ -6345,14 +6366,11 @@ mod tests {
         );
     }
 
-    /// Negative-path / regression guard: unknown architectures still
-    /// route through the Gemma default arm of `LoadedModel::load`.
-    /// The Gemma loader fails for missing config/tensors but the
-    /// failure is the Gemma path's failure, NOT a wedge bail or a
-    /// qwen35 dispatch.  Iter-215 dispatch must not over-route on the
-    /// match arm.
+    /// Unknown architectures must fail closed at dispatch rather than
+    /// being guessed to be Gemma.  A wrong architectural fallback can
+    /// otherwise turn a metadata error into a misleading tensor error.
     #[test]
-    fn load_engine_routes_unknown_arch_to_gemma_default_unchanged() {
+    fn load_engine_rejects_unknown_arch_without_gemma_fallback() {
         let tmp = write_minimal_gguf_with_arch("totally-fake-arch-name");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -6366,25 +6384,43 @@ mod tests {
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err(), "minimal GGUF must fail downstream load");
+        assert!(result.is_err(), "unknown architecture must fail dispatch");
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            !msg.contains("Phase 4 follow-up: SERVE-side load for general.architecture"),
-            "wedge-1 bail must not fire on unknown arch; got: {msg}"
+            msg.contains("unsupported GGUF general.architecture")
+                && msg.contains("totally-fake-arch-name"),
+            "unknown architecture error must identify the rejected value; got: {msg}"
         );
-        // Iter-215 sentinel must NOT fire for unknown arch — that
-        // would mean the dispatcher's match arm widened beyond the
-        // intended set.
         assert!(
-            !msg.contains("qwen35_not_implemented"),
-            "qwen35 sentinel must not fire on unknown arch; got: {msg}"
+            !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
+            "unknown architecture must not reach the Gemma loader; got: {msg}"
         );
-        // Iter-227 sentinel must NOT fire for unknown arch — that
-        // would mean the Qwen3-VL match arm widened beyond the
-        // intended `qwen3_vl` / `qwen3vl` / `qwen3vlmoe` set.
+    }
+
+    /// DeepSeek-V4 is a known architecture, but until its dedicated runtime
+    /// lands it must be rejected explicitly rather than routed through Gemma.
+    #[test]
+    fn load_engine_rejects_deepseek4_without_gemma_fallback() {
+        let tmp = write_minimal_gguf_with_arch("deepseek4");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+            kv_metrics_sink: None,
+            dwq_overlay_path: None,
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err(), "DeepSeek-V4 must fail until its runtime exists");
+        let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            !msg.contains("Qwen3-VL"),
-            "iter-227 Qwen3-VL dispatch must not fire on unknown arch; got: {msg}"
+            msg.contains("DeepSeek-V4") && msg.contains("refusing to route it through Gemma"),
+            "DeepSeek-V4 error must explain the fail-closed dispatch; got: {msg}"
+        );
+        assert!(
+            !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
+            "DeepSeek-V4 must not reach the Gemma loader; got: {msg}"
         );
     }
 

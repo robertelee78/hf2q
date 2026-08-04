@@ -171,6 +171,7 @@ pub enum ToolCallPolicy {
     Constrained,
 }
 
+
 impl ToolCallPolicy {
     /// `true` when the policy carries an active grammar that physically
     /// constrains the tool-call body (Constrained from byte 0, or
@@ -2838,10 +2839,25 @@ impl LoadedModel {
                 let q = super::engine_qwen35::Qwen35LoadedModel::load(opts)?;
                 Ok(LoadedModel::Qwen35(q))
             }
-            _ => {
+            "gemma4" => {
                 let g = GemmaLoadedModel::load(opts)?;
                 Ok(LoadedModel::Gemma(g))
             }
+            "deepseek4" => anyhow::bail!(
+                "DeepSeek-V4 GGUF is recognized, but the dedicated Rust/Metal runtime is not \
+                 available in this build; refusing to route it through Gemma. Model: {}",
+                model_path.display()
+            ),
+            "" => anyhow::bail!(
+                "GGUF is missing required `general.architecture`; refusing to guess Gemma. \
+                 Model: {}",
+                model_path.display()
+            ),
+            other => anyhow::bail!(
+                "unsupported GGUF general.architecture={other:?}; supported runtimes in this \
+                 build are gemma4, qwen35, qwen35moe, and dense qwen3_vl. Model: {}",
+                model_path.display()
+            ),
         }
     }
 }
@@ -39452,5 +39468,3 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         );
     }
 }
-
-
