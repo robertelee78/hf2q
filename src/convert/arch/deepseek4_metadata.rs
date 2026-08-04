@@ -14,9 +14,41 @@ fn f32_req(config: &serde_json::Value, key: &'static str) -> f32 {
         .unwrap_or_else(|| panic!("config.json missing required f32 key `{key}`")) as f32
 }
 
-/// Build the architecture block emitted by llama.cpp's
+fn base_compress_ratios(config: &serde_json::Value, layers: u32) -> Vec<u32> {
+    let ratios = config["compress_ratios"]
+        .as_array()
+        .expect("config.json missing array `compress_ratios`")
+        .iter()
+        .map(|v| v.as_u64().expect("compress ratio must be u32") as u32)
+        .collect::<Vec<_>>();
+    let layer_count = layers as usize;
+    assert!(
+        ratios.len() >= layer_count,
+        "DeepSeek-V4 compress ratios must cover every base layer"
+    );
+    assert!(
+        ratios[..layer_count]
+            .iter()
+            .all(|v| matches!(v, 0 | 4 | 128)),
+        "DeepSeek-V4 base compress ratios must be 0, 4, or 128"
+    );
+
+    // The official 0731 config appends three zero entries for checkpoint
+    // MTP/DSpark stages. Base conversion excludes every `mtp.*` tensor, so
+    // those entries must not leak into the 43-element base-model metadata.
+    let excluded_tail = &ratios[layer_count..];
+    assert!(
+        excluded_tail.is_empty()
+            || (excluded_tail.len() == 3 && excluded_tail.iter().all(|&ratio| ratio == 0)),
+        "DeepSeek-V4 excluded MTP/DSpark compress-ratio tail must be exactly three zeros"
+    );
+
+    ratios[..layer_count].to_vec()
+}
+
+/// Build the base-artifact architecture block emitted by llama.cpp's
 /// `DeepseekV4Model.set_gguf_parameters`, plus the common text-model
-/// keys it inherits.
+/// keys it inherits. Checkpoint-only MTP/DSpark array entries are excluded.
 pub fn build_metadata(
     config: &serde_json::Value,
     file_type: u32,
@@ -71,12 +103,16 @@ pub fn build_metadata(
             MetaValue::U32(kv_heads),
         ),
         (
-            "deepseek4.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(rms_eps),
+            "deepseek4.attention.key_length".into(),
+            MetaValue::U32(u32_req(config, "head_dim")),
         ),
         (
-            "deepseek4.vocab_size".into(),
-            MetaValue::U32(u32_req(config, "vocab_size")),
+            "deepseek4.attention.value_length".into(),
+            MetaValue::U32(u32_req(config, "head_dim")),
+        ),
+        (
+            "deepseek4.attention.layer_norm_rms_epsilon".into(),
+            MetaValue::F32(rms_eps),
         ),
         ("deepseek4.expert_count".into(), MetaValue::U32(experts)),
         ("deepseek4.expert_used_count".into(), MetaValue::U32(used)),
@@ -164,17 +200,7 @@ pub fn build_metadata(
         ),
     ]);
 
-    let ratios = config["compress_ratios"]
-        .as_array()
-        .expect("config.json missing array `compress_ratios`")
-        .iter()
-        .map(|v| v.as_u64().expect("compress ratio must be u32") as u32)
-        .collect::<Vec<_>>();
-    assert_eq!(ratios.len(), layers as usize, "one compress ratio per layer");
-    assert!(
-        ratios.iter().all(|v| matches!(v, 0 | 4 | 128)),
-        "DeepSeek-V4 compress ratios must be 0, 4, or 128"
-    );
+    let ratios = base_compress_ratios(config, layers);
     kv.push((
         "deepseek4.attention.compress_ratios".into(),
         MetaValue::ArrayU32(ratios),
@@ -205,6 +231,34 @@ pub fn build_metadata(
                     MetaValue::U32(v as u32),
                 ));
             }
+            if let Some(v) = rope.get("extrapolation_factor").and_then(|v| v.as_f64()) {
+                kv.push((
+                    "deepseek4.rope.scaling.yarn_ext_factor".into(),
+                    MetaValue::F32(v as f32),
+                ));
+            }
+            if let Some(v) = rope
+                .get("attention_factor")
+                .or_else(|| rope.get("attn_factor"))
+                .and_then(|v| v.as_f64())
+            {
+                kv.push((
+                    "deepseek4.rope.scaling.yarn_attn_factor".into(),
+                    MetaValue::F32(v as f32),
+                ));
+            }
+            if let Some(v) = rope.get("beta_fast").and_then(|v| v.as_f64()) {
+                kv.push((
+                    "deepseek4.rope.scaling.yarn_beta_fast".into(),
+                    MetaValue::F32(v as f32),
+                ));
+            }
+            if let Some(v) = rope.get("beta_slow").and_then(|v| v.as_f64()) {
+                kv.push((
+                    "deepseek4.rope.scaling.yarn_beta_slow".into(),
+                    MetaValue::F32(v as f32),
+                ));
+            }
         }
     }
     if let Some(v) = config.get("rope_theta").and_then(|v| v.as_f64()) {
@@ -220,11 +274,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn emits_deepseek4_specific_contract() {
-        let cfg = json!({
+    fn fixture() -> serde_json::Value {
+        json!({
             "hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 4,
-            "num_key_value_heads": 1, "max_position_embeddings": 1024,
+            "num_key_value_heads": 1, "head_dim": 512, "max_position_embeddings": 1024,
             "rms_norm_eps": 1e-6, "vocab_size": 32, "n_routed_experts": 4,
             "num_experts_per_tok": 2, "n_shared_experts": 1,
             "moe_intermediate_size": 32, "routed_scaling_factor": 1.5,
@@ -234,9 +287,16 @@ mod tests {
             "index_head_dim": 8, "index_topk": 16, "o_groups": 2,
             "o_lora_rank": 8, "compress_ratios": [0, 4], "compress_rope_theta": 160000.0,
             "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6,
-            "num_hash_layers": 1, "rope_scaling": {"type":"yarn", "factor":16.0,
-              "original_max_position_embeddings":65536}
-        });
+            "num_hash_layers": 1, "rope_theta":10000.0,
+            "rope_scaling": {"type":"yarn", "factor":16.0,
+              "original_max_position_embeddings":65536, "extrapolation_factor":1.25,
+              "attention_factor":1.125, "beta_fast":32.0, "beta_slow":1.0}
+        })
+    }
+
+    #[test]
+    fn emits_deepseek4_specific_contract() {
+        let cfg = fixture();
         let by_key: std::collections::HashMap<_, _> =
             build_metadata(&cfg, 21, None, None, Some("DeepSeek-V4-Flash-0731"))
                 .into_iter()
@@ -247,9 +307,121 @@ mod tests {
         );
         assert_eq!(by_key["deepseek4.embedding_length_out"], MetaValue::U32(64));
         assert_eq!(by_key["deepseek4.expert_gating_func"], MetaValue::U32(4));
+        assert!(!by_key.contains_key("deepseek4.vocab_size"));
+        assert_eq!(
+            by_key["deepseek4.attention.key_length"],
+            MetaValue::U32(512)
+        );
+        assert_eq!(
+            by_key["deepseek4.attention.value_length"],
+            MetaValue::U32(512)
+        );
         assert_eq!(
             by_key["deepseek4.attention.compress_ratios"],
             MetaValue::ArrayU32(vec![0, 4])
         );
+        assert_eq!(
+            by_key["deepseek4.rope.scaling.yarn_ext_factor"],
+            MetaValue::F32(1.25)
+        );
+        assert_eq!(
+            by_key["deepseek4.rope.scaling.yarn_attn_factor"],
+            MetaValue::F32(1.125)
+        );
+        assert_eq!(
+            by_key["deepseek4.rope.scaling.yarn_beta_fast"],
+            MetaValue::F32(32.0)
+        );
+        assert_eq!(
+            by_key["deepseek4.rope.scaling.yarn_beta_slow"],
+            MetaValue::F32(1.0)
+        );
+
+        let actual_keys = by_key
+            .keys()
+            .filter(|key| key.starts_with("deepseek4."))
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_keys = [
+            "deepseek4.block_count",
+            "deepseek4.context_length",
+            "deepseek4.embedding_length",
+            "deepseek4.embedding_length_out",
+            "deepseek4.attention.head_count",
+            "deepseek4.attention.head_count_kv",
+            "deepseek4.attention.key_length",
+            "deepseek4.attention.value_length",
+            "deepseek4.attention.layer_norm_rms_epsilon",
+            "deepseek4.expert_count",
+            "deepseek4.expert_used_count",
+            "deepseek4.expert_shared_count",
+            "deepseek4.expert_feed_forward_length",
+            "deepseek4.expert_weights_scale",
+            "deepseek4.expert_weights_norm",
+            "deepseek4.expert_gating_func",
+            "deepseek4.swiglu_clamp_exp",
+            "deepseek4.swiglu_clamp_shexp",
+            "deepseek4.rope.dimension_count",
+            "deepseek4.attention.q_lora_rank",
+            "deepseek4.attention.sliding_window",
+            "deepseek4.attention.indexer.head_count",
+            "deepseek4.attention.indexer.key_length",
+            "deepseek4.attention.indexer.top_k",
+            "deepseek4.attention.output_group_count",
+            "deepseek4.attention.output_lora_rank",
+            "deepseek4.attention.compress_rope_freq_base",
+            "deepseek4.hyper_connection.count",
+            "deepseek4.hyper_connection.sinkhorn_iterations",
+            "deepseek4.hyper_connection.epsilon",
+            "deepseek4.hash_layer_count",
+            "deepseek4.attention.compress_ratios",
+            "deepseek4.rope.scaling.type",
+            "deepseek4.rope.scaling.factor",
+            "deepseek4.rope.scaling.original_context_length",
+            "deepseek4.rope.scaling.yarn_ext_factor",
+            "deepseek4.rope.scaling.yarn_attn_factor",
+            "deepseek4.rope.scaling.yarn_beta_fast",
+            "deepseek4.rope.scaling.yarn_beta_slow",
+            "deepseek4.rope.freq_base",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_keys, expected_keys);
+    }
+
+    #[test]
+    #[should_panic(expected = "head_dim")]
+    fn head_dim_is_required_like_current_llama_converter() {
+        let mut cfg = fixture();
+        cfg.as_object_mut().unwrap().remove("head_dim");
+        let _ = build_metadata(&cfg, 21, None, None, Some("DeepSeek-V4-Flash-0731"));
+    }
+
+    #[test]
+    fn official_43_layer_config_excludes_three_zero_mtp_dspark_ratios() {
+        let mut cfg = fixture();
+        cfg["num_hidden_layers"] = json!(43);
+        let mut ratios = vec![0, 0];
+        ratios.extend((2..43).map(|layer| if layer % 2 == 0 { 4 } else { 128 }));
+        ratios.extend([0, 0, 0]);
+        cfg["compress_ratios"] = json!(ratios);
+
+        let by_key: std::collections::HashMap<_, _> =
+            build_metadata(&cfg, 21, None, None, Some("DeepSeek-V4-Flash-0731"))
+                .into_iter()
+                .collect();
+        let MetaValue::ArrayU32(emitted) = &by_key["deepseek4.attention.compress_ratios"] else {
+            panic!("compress ratios must be a u32 array");
+        };
+        assert_eq!(emitted.len(), 43);
+        assert_eq!(emitted, &ratios[..43]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly three zeros")]
+    fn malformed_excluded_compress_ratio_tail_fails_closed() {
+        let mut cfg = fixture();
+        cfg["compress_ratios"] = json!([0, 4, 0, 4, 0]);
+        let _ = build_metadata(&cfg, 21, None, None, Some("DeepSeek-V4-Flash-0731"));
     }
 }

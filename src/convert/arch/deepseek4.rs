@@ -122,4 +122,61 @@ mod tests {
         assert_eq!(map_tensor_name("layers.0.ffn.experts.-1.w1.weight"), None);
         assert_eq!(map_tensor_name("layers.0.made_up.weight"), None);
     }
+
+    #[test]
+    fn covers_every_emitted_official_base_index_name_family() {
+        // Normalized from the 72,317-name official 0731 index. `.scale`
+        // sidecars are deliberately absent: HfModelSource consumes them
+        // inline, and `mtp.*` belongs to the separate draft artifact.
+        let names = [
+            "embed.weight",
+            "hc_head_base",
+            "hc_head_fn",
+            "hc_head_scale",
+            "head.weight",
+            "norm.weight",
+            "layers.0.attn.attn_sink",
+            "layers.0.attn.compressor.ape",
+            "layers.0.attn.compressor.norm.weight",
+            "layers.0.attn.compressor.wgate.weight",
+            "layers.0.attn.compressor.wkv.weight",
+            "layers.0.attn.indexer.compressor.ape",
+            "layers.0.attn.indexer.compressor.norm.weight",
+            "layers.0.attn.indexer.compressor.wgate.weight",
+            "layers.0.attn.indexer.compressor.wkv.weight",
+            "layers.0.attn.indexer.weights_proj.weight",
+            "layers.0.attn.indexer.wq_b.weight",
+            "layers.0.attn.kv_norm.weight",
+            "layers.0.attn.q_norm.weight",
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wo_a.weight",
+            "layers.0.attn.wo_b.weight",
+            "layers.0.attn.wq_a.weight",
+            "layers.0.attn.wq_b.weight",
+            "layers.0.attn_norm.weight",
+            "layers.0.ffn.experts.255.w1.weight",
+            "layers.0.ffn.experts.255.w2.weight",
+            "layers.0.ffn.experts.255.w3.weight",
+            "layers.0.ffn.gate.bias",
+            "layers.0.ffn.gate.tid2eid",
+            "layers.0.ffn.gate.weight",
+            "layers.0.ffn.shared_experts.w1.weight",
+            "layers.0.ffn.shared_experts.w2.weight",
+            "layers.0.ffn.shared_experts.w3.weight",
+            "layers.0.ffn_norm.weight",
+            "layers.0.hc_attn_base",
+            "layers.0.hc_attn_fn",
+            "layers.0.hc_attn_scale",
+            "layers.0.hc_ffn_base",
+            "layers.0.hc_ffn_fn",
+            "layers.0.hc_ffn_scale",
+        ];
+
+        for name in names {
+            assert!(
+                map_tensor_name(name).is_some(),
+                "unmapped official family: {name}"
+            );
+        }
+    }
 }

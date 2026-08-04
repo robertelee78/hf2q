@@ -369,8 +369,8 @@ impl From<TokenizerError> for ConvertError {
 ///    - `Drop` → discard (the arch mapper signed off explicitly).
 ///    - `None` → typed [`ConvertError::UnmappedTensor`].
 /// 5. Drain the expert accumulator: assert every group has exactly
-///    `n_experts` slices, sort by `expert_index`, flatten into the
-///    fused 3-D shape `[in, out, n_experts]`, push to the orchestrator.
+///    `n_experts` slices, sort by `expert_index`, then decode and
+///    quantize one expert at a time into the fused 3-D GGUF payload.
 /// 6. Emit metadata via the arch's `build_metadata`.
 /// 7. [`ConvertOrchestrator::write`] → BufWriter over the output file.
 pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
@@ -710,16 +710,57 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     let bw = BufWriter::new(f);
     let mut sw = orch.begin_write(bw)?;
 
-    // 5c. Stream every tensor's data in plan order. MoE fusion happens
-    // inline: each Fused step loads N expert slices in expert_index
-    // order, concatenates their F32 buffers, and pushes the fused
-    // payload to the writer. Per-call peak memory is bounded by the
-    // single largest tensor (Direct) or the largest fused group (Fused).
+    // 5c. Stream every tensor's data in plan order. A fused MoE tensor
+    // is emitted one expert at a time: decode → F16 roundtrip → quantize
+    // → exact payload chunk. The expert Vec drops before the next source
+    // tensor is opened, so 256-expert models never allocate the 3-D F32
+    // stack.
     for (idx, step) in plan.steps.iter().enumerate() {
-        let data: Vec<f32> = step.materialize(&src, &synthesized)?;
-        sw.stream_tensor(idx, &data)?;
-        // `data` drops here — the next iteration's allocation reuses
-        // the freed pages.
+        match step {
+            PlanStep::Fused {
+                gguf_name,
+                member_hf_names,
+                per_expert_py_shape,
+                ..
+            } => {
+                let per_expert_elems = per_expert_py_shape.iter().try_fold(
+                    1usize,
+                    |n, &d| n.checked_mul(d),
+                ).ok_or_else(|| {
+                    ConvertError::Source(SourceError::Safetensors(format!(
+                        "fused expert tensor `{gguf_name}` shape product overflow: {per_expert_py_shape:?}"
+                    )))
+                })?;
+                sw.begin_tensor_chunks(idx)?;
+                for name in member_hf_names {
+                    let ht = src.materialize_tensor(name)?;
+                    if ht.shape != *per_expert_py_shape || ht.data.len() != per_expert_elems {
+                        return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                            "fused expert slice `{name}`: shape {:?} / data len {} != expected {:?} / {}",
+                            ht.shape,
+                            ht.data.len(),
+                            per_expert_py_shape,
+                            per_expert_elems
+                        ))));
+                    }
+                    sw.stream_tensor_chunk(idx, &ht.data)?;
+                }
+                let stats = sw.finish_tensor_chunks(idx)?;
+                debug_assert_eq!(stats.chunk_count, member_hf_names.len());
+                debug_assert_eq!(stats.max_chunk_elements, per_expert_elems);
+                tracing::debug!(
+                    target: "convert",
+                    tensor = gguf_name,
+                    experts = stats.chunk_count,
+                    max_live_f32_elements = stats.max_chunk_elements,
+                    "streamed fused expert tensor with bounded input chunks"
+                );
+            }
+            _ => {
+                let data: Vec<f32> = step.materialize(&src, &synthesized)?;
+                sw.stream_tensor(idx, &data)?;
+            }
+        }
     }
 
     // 5d. Finalize — seek-back to fill tensor offsets, flush.
@@ -1792,10 +1833,9 @@ fn expert_role_to_kind(r: ExpertRole) -> ExpertKind {
 // metadata-only passes (plan + streaming-iteration index) and a single
 // data pass (one tensor's F32 buffer alive at a time).
 //
-// The MoE expert-fusion case is the only one where multiple HF tensors
-// fuse into one GGUF tensor, so the streaming data pass holds at most
-// one fused group's experts in memory simultaneously (e.g. Gemma 4 26B
-// with 128 experts at ~10 MB each = ~1.3 GB per group — fits easily).
+// The MoE expert-fusion case consumes multiple HF tensors into one GGUF
+// tensor. It streams complete expert slices in expert-index order, so
+// its input bound is ONE expert rather than the full fused group.
 
 /// One step of the convert plan: either a direct 1:1 HF→GGUF mapping,
 /// an MoE expert fusion that consumes N HF tensors, or a synthesized
@@ -1895,10 +1935,8 @@ impl PlanStep {
         }
     }
 
-    /// Pull the F32 data for this step from the source / synthesized
-    /// list. For `Direct` and `Synthesized` this is one allocation; for
-    /// `Fused` this is a single concatenated allocation containing
-    /// every expert slice's F32 data in expert_index order.
+    /// Pull the F32 data for a non-fused step. Fused tensors use the
+    /// begin/chunk/finish writer path and must never materialize here.
     fn materialize(
         &self,
         src: &HfModelSource,
@@ -1916,29 +1954,11 @@ impl PlanStep {
                     }),
                 }
             }
-            PlanStep::Fused {
-                member_hf_names,
-                per_expert_py_shape,
-                ..
-            } => {
-                let per_expert_elems: usize = per_expert_py_shape.iter().product();
-                let mut fused: Vec<f32> =
-                    Vec::with_capacity(per_expert_elems * member_hf_names.len());
-                for name in member_hf_names {
-                    let ht = src.materialize_tensor(name)?;
-                    if ht.data.len() != per_expert_elems {
-                        return Err(ConvertError::Source(SourceError::Safetensors(format!(
-                            "fused expert slice `{name}`: data len {} != expected per-expert {}",
-                            ht.data.len(),
-                            per_expert_elems
-                        ))));
-                    }
-                    fused.extend_from_slice(&ht.data);
-                    // `ht` drops here — only `fused` (which already
-                    // copied the bytes) stays live.
-                }
-                Ok(fused)
-            }
+            PlanStep::Fused { gguf_name, .. } => Err(ConvertError::Source(
+                SourceError::Safetensors(format!(
+                    "fused tensor `{gguf_name}` must use bounded chunk streaming"
+                )),
+            )),
             PlanStep::Synthesized { synth_idx, .. } => {
                 let t = synthesized.get(*synth_idx).ok_or_else(|| {
                     ConvertError::Source(SourceError::Safetensors(format!(
@@ -1954,9 +1974,9 @@ impl PlanStep {
 /// A complete convert plan: every step in deterministic emission order.
 /// Built once from the source's tensor metadata + the synthesized
 /// tensor list; consumed twice — once by the orchestrator's plan-phase
-/// (metadata only) and once by the streaming-write phase (one
-/// `materialize` call per step, F32 bytes allocated and dropped within
-/// one iteration).
+/// (metadata only) and once by the streaming-write phase. Direct steps
+/// materialize once; fused steps materialize and drop one expert slice
+/// per chunk.
 struct ConvertPlan {
     steps: Vec<PlanStep>,
 }
@@ -3187,7 +3207,7 @@ mod tests {
         let cfg = json!({
             "_name_or_path":"deepseek-ai/DeepSeek-V4-Flash-0731", "model_type":"deepseek_v4",
             "architectures":["DeepseekV4ForCausalLM"], "hidden_size":256,
-            "num_hidden_layers":1, "num_attention_heads":4, "num_key_value_heads":1,
+            "num_hidden_layers":1, "num_attention_heads":4, "num_key_value_heads":1, "head_dim":64,
             "max_position_embeddings":1024, "rms_norm_eps":1e-6, "vocab_size":32,
             "n_routed_experts":2, "num_experts_per_tok":1, "n_shared_experts":1,
             "moe_intermediate_size":256, "routed_scaling_factor":1.5,
