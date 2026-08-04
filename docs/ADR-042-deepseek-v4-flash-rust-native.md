@@ -212,8 +212,10 @@ until its exact-source receipt and all applicable acceptance gates are green.
 |---|---|
 | Hardware/storage audit | 128 GiB M5 Max; about 1.8 TiB free |
 | Official repository metadata | 48 shards; about 166.9 GB; 304.18B params |
+| Pinned `hf download --dry-run` | 74 official files; 166.9 GB; no payload fetched |
 | Existing hf2q Q2_K_S encoder | Present; source-format ingest absent |
-| Existing mlx-native Q2_K loader/kernel | Absent |
+| mlx-native Q2_K loader/matvec | Commit `3a0e8ab`; 6/6 exact tests, dense + expert-ID Metal |
+| Q2_K decode microbench | 55.81 us / 98.63 GB/s at M=1, N=K=4096 (integration rerun) |
 | Existing DeepSeek-V4 converter/runtime | Absent |
 | Pinned llama.cpp conversion and graph | Present at reference commit |
 | Pinned llama.cpp oracle binaries | Rebuilt locally as version 10276 (`6ea215d17`) |
