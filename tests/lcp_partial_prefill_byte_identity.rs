@@ -60,8 +60,25 @@ use std::time::{Duration, Instant};
 
 const ENV_PHASE_D_GATE: &str = "HF2Q_KV_PERSIST_PHASE_D";
 const ENV_MODEL_PATH: &str = "HF2Q_KV_PERSIST_E2E_MODEL_PATH";
-const PORT_A: u16 = 52391;
-const PORT_B: u16 = 52392;
+// Per-test port pairs (parallel-thread isolation): every test fn owns
+// a distinct (A, B) pair so concurrent cargo test threads can never
+// connect to / read metrics from another test's server. The shared
+// PORT_A/PORT_B constants were the iter7 false-failure root cause
+// (2026-08-03: detected_delta=3 read from a concurrent test's server).
+const PORT_52391: u16 = 52391;
+const PORT_52392: u16 = 52392;
+const PORT_52393: u16 = 52393;
+const PORT_52394: u16 = 52394;
+const PORT_52395: u16 = 52395;
+const PORT_52396: u16 = 52396;
+const PORT_52397: u16 = 52397;
+const PORT_52398: u16 = 52398;
+const PORT_52399: u16 = 52399;
+const PORT_52400: u16 = 52400;
+const PORT_52401: u16 = 52401;
+const PORT_52402: u16 = 52402;
+const PORT_52403: u16 = 52403;
+const PORT_52404: u16 = 52404;
 const HOST: &str = "127.0.0.1";
 const READYZ_BUDGET: Duration = Duration::from_secs(180);
 
@@ -433,14 +450,14 @@ fn iter3_partial_prefix_byte_identity() {
     let server_a = spawn_server(
         &bin,
         &model_path,
-        PORT_A,
+        PORT_52391,
         &[("HF2Q_KV_LCP_RESUME", "1")],
     );
     wait_for_readyz(&server_a);
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
         "[iter-3 falsifier] server A (LCP_RESUME=1) ready on {}:{} model={}",
-        HOST, PORT_A, canonical_a
+        HOST, PORT_52391, canonical_a
     );
 
     // Prime the LCP registry with Q on server A.
@@ -502,12 +519,12 @@ fn iter3_partial_prefix_byte_identity() {
     drop(server_a);
 
     // ── Server B: control (no resume) ──
-    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    let server_b = spawn_server(&bin, &model_path, PORT_52392, &[]);
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     eprintln!(
         "[iter-3 falsifier] server B (control, no resume) ready on {}:{} model={}",
-        HOST, PORT_B, canonical_b
+        HOST, PORT_52392, canonical_b
     );
 
     // Send P directly to server B — no priming, no LCP entry, fresh
@@ -664,14 +681,14 @@ fn iter5_r_c4_lcp_5_fraction_sweep() {
     let server_a = spawn_server(
         &bin,
         &model_path,
-        PORT_A,
+        PORT_52393,
         &[("HF2Q_KV_LCP_RESUME", "1")],
     );
     wait_for_readyz(&server_a);
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
         "[iter-5 sweep] server A (LCP_RESUME=1) ready on {}:{} model={}",
-        HOST, PORT_A, canonical_a
+        HOST, PORT_52393, canonical_a
     );
 
     // Run all 5 fractions on server A (registry capacity=1 means each
@@ -714,12 +731,12 @@ fn iter5_r_c4_lcp_5_fraction_sweep() {
     drop(server_a);
 
     // ── Server B: control (no resume; single instance for all fractions) ──
-    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    let server_b = spawn_server(&bin, &model_path, PORT_52394, &[]);
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     eprintln!(
         "[iter-5 sweep] server B (control, no resume) ready on {}:{} model={}",
-        HOST, PORT_B, canonical_b
+        HOST, PORT_52394, canonical_b
     );
 
     // Send each P_k to server B and capture decoded bytes for
@@ -910,14 +927,14 @@ fn iter7_prefill_wrap_guard_long_prompt_byte_identity() {
     let server_a = spawn_server(
         &bin,
         &model_path,
-        PORT_A,
+        PORT_52395,
         &[("HF2Q_KV_LCP_RESUME", "1")],
     );
     wait_for_readyz(&server_a);
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
         "[iter-7 wrap-guard] server A (LCP_RESUME=1) ready on {}:{} model={}",
-        HOST, PORT_A, canonical_a
+        HOST, PORT_52395, canonical_a
     );
 
     // Baseline counters — server may pre-emit zero entries; capture so
@@ -1030,12 +1047,12 @@ fn iter7_prefill_wrap_guard_long_prompt_byte_identity() {
     drop(server_a);
 
     // ── Server B: control (no resume) ──
-    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    let server_b = spawn_server(&bin, &model_path, PORT_52396, &[]);
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     eprintln!(
         "[iter-7 wrap-guard] server B (control, no resume) ready on {}:{} model={}",
-        HOST, PORT_B, canonical_b
+        HOST, PORT_52396, canonical_b
     );
 
     // Send P_long directly to server B; fresh prefill, no LCP path.
@@ -1312,14 +1329,14 @@ fn iter8_streaming_path_byte_identity() {
     let server_a = spawn_server(
         &bin,
         &model_path,
-        PORT_A,
+        PORT_52397,
         &[("HF2Q_KV_LCP_RESUME", "1")],
     );
     wait_for_readyz(&server_a);
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
         "[iter-8 streaming] server A (LCP_RESUME=1, stream=true) ready on {}:{} model={}",
-        HOST, PORT_A, canonical_a
+        HOST, PORT_52397, canonical_a
     );
 
     // Prime the LCP registry with Q via streaming.
@@ -1373,12 +1390,12 @@ fn iter8_streaming_path_byte_identity() {
     drop(server_a);
 
     // ── Server B: streaming control (no resume) ──
-    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    let server_b = spawn_server(&bin, &model_path, PORT_52398, &[]);
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     eprintln!(
         "[iter-8 streaming] server B (control, no resume, stream=true) ready on {}:{} model={}",
-        HOST, PORT_B, canonical_b
+        HOST, PORT_52398, canonical_b
     );
 
     let p_streamed_b = chat_decode_stream(&server_b, &canonical_b, PROMPT_P, MAX_TOKENS);
@@ -1595,7 +1612,7 @@ fn iter3_6_long_prompt_resume_byte_identity() {
     let server_a = spawn_server(
         &bin,
         &model_path,
-        PORT_A,
+        PORT_52399,
         &[
             ("HF2Q_KV_LCP_RESUME", "1"),
             ("HF2Q_KV_LCP_LONG_RESUME", "1"),
@@ -1605,7 +1622,7 @@ fn iter3_6_long_prompt_resume_byte_identity() {
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
         "[iter-3.6 long-resume] server A (LCP_RESUME=1, LONG_RESUME=1) ready on {}:{} model={}",
-        HOST, PORT_A, canonical_a
+        HOST, PORT_52399, canonical_a
     );
 
     // Prime the LCP registry with Q (long, > sw). After iter-3.6
@@ -1664,12 +1681,12 @@ fn iter3_6_long_prompt_resume_byte_identity() {
     drop(server_a);
 
     // ── Server B: control (no LONG_RESUME, default ring path) ──
-    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    let server_b = spawn_server(&bin, &model_path, PORT_52400, &[]);
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     eprintln!(
         "[iter-3.6 long-resume] server B (control, ring path) ready on {}:{} model={}",
-        HOST, PORT_B, canonical_b
+        HOST, PORT_52400, canonical_b
     );
 
     let p_decoded_b = chat_decode(&server_b, &canonical_b, &prompt_p, ITER36_MAX_TOKENS);
@@ -1772,7 +1789,7 @@ fn gemma_hybrid_lcp_partial_prefix_byte_identity() {
     let server_a = spawn_server_with_base(
         &bin,
         &model_path,
-        PORT_A,
+        PORT_52401,
         &[],
         &[("HF2Q_KV_LCP_RESUME", "1")],
     );
@@ -1780,7 +1797,7 @@ fn gemma_hybrid_lcp_partial_prefix_byte_identity() {
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
         "[gemma-hybrid-lcp falsifier] server A (hybrid + LCP_RESUME=1) ready on {}:{} model={}",
-        HOST, PORT_A, canonical_a
+        HOST, PORT_52401, canonical_a
     );
 
     // Prime the registry with Q.
@@ -1810,7 +1827,7 @@ fn gemma_hybrid_lcp_partial_prefix_byte_identity() {
     );
 
     // ── Server B: cold control (hybrid regime, no priming → fresh prefill) ──
-    let server_b = spawn_server_with_base(&bin, &model_path, PORT_B, &[], &[]);
+    let server_b = spawn_server_with_base(&bin, &model_path, PORT_52402, &[], &[]);
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     let p_decoded_b = chat_decode(&server_b, &canonical_b, PROMPT_P, MAX_TOKENS);
@@ -1829,6 +1846,119 @@ fn gemma_hybrid_lcp_partial_prefix_byte_identity() {
     );
     eprintln!(
         "[gemma-hybrid-lcp falsifier] PASS — hybrid resume byte-identical ({} bytes, K<N resume engaged)",
+        p_decoded_a.len()
+    );
+}
+
+/// ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — long-prompt LCP
+/// partial-prefill resume byte-identity falsifier under the PRODUCTION
+/// HYBRID regime (F16-K + TQ-HB V). Companion to
+/// [`iter3_6_long_prompt_resume_byte_identity`] (dense) and
+/// [`gemma_hybrid_lcp_partial_prefix_byte_identity`] (≤ sw hybrid).
+///
+/// What this pins beyond the ≤sw hybrid test:
+///   * sliding layers allocate LINEAR buffers under LONG_RESUME on the
+///     batched store route AND the resume-execution route (ring would
+///     corrupt [0..K) for prompts > sw = 1024);
+///   * the hybrid leg's encode writes slot=logical-position at prefill
+///     (both routes) AND at decode (capacity-derived predicate in
+///     `gpu_full_attn.rs`);
+///   * the hybrid SDPA kernel's `mask_type=2 + sliding_window` windowing
+///     over linear buffers (verified at
+///     `/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal:490-491,914-915`)
+///     composes byte-identically with a cold fresh prefill of the same
+///     long prompt.
+///
+/// Servers: A = `HF2Q_KV_LCP_RESUME=1 + HF2Q_KV_LCP_LONG_RESUME=1`
+/// (hybrid default, primed with Q_long then probed with P_long);
+/// B = control (no env, cold P_long).
+/// Falsifiers: `lcp_detected_total < 1` on A (engagement), or
+/// `decoded_A(P) != decoded_B(P)` (coherence).
+#[test]
+fn gemma_hybrid_long_resume_byte_identity() {
+    let model_path = match resolve_model_path_or_skip() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[gemma-hybrid-long-resume] {ENV_PHASE_D_GATE}=1 not set — short-circuit."
+            );
+            return;
+        }
+    };
+    let bin = hf2q_binary_path();
+    assert!(bin.exists(), "hf2q binary not found at {}", bin.display());
+
+    let prompt_q = iter36_build_prompt("Question Q ending here distinctively.");
+    let prompt_p =
+        iter36_build_prompt("Question P with different ending text continuing onward.");
+
+    let server_a = spawn_server_with_base(
+        &bin,
+        &model_path,
+        PORT_52403,
+        &[],
+        &[
+            ("HF2Q_KV_LCP_RESUME", "1"),
+            ("HF2Q_KV_LCP_LONG_RESUME", "1"),
+            // Long-resume snapshots over-allocate 4096 tokens of
+            // multi-turn headroom per layer; the resulting ~4.5 GB entry
+            // exceeds the default ~5%-of-avail byte budget and is
+            // rejected (EntryExceedsBudget → registry stays empty).
+            // 8g is the documented gemma LCP envelope at ~8-12K prompts.
+            ("HF2Q_KV_LCP_RESUME_CAPACITY", "8g"),
+        ],
+    );
+    wait_for_readyz(&server_a);
+    let canonical_a = fetch_canonical_model_id(&server_a);
+
+    let q_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_q, ITER36_MAX_TOKENS);
+    assert!(!q_decoded_a.is_empty(), "Q decoded empty on server A");
+
+    let p_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_p, ITER36_MAX_TOKENS);
+    assert!(!p_decoded_a.is_empty(), "P decoded empty on server A");
+
+    let metrics_body_a = fetch_metrics(&server_a);
+    let lcp_detected_a = metric_lcp_detected_total(&metrics_body_a);
+    assert!(
+        lcp_detected_a >= 1,
+        "[gemma-hybrid-long-resume] FALSIFIED #1 — detected_total={} (expected ≥1): \
+         hybrid long-resume did NOT engage (store-side linear alloc / snapshot \
+         guard / engine guard / capacity formula).",
+        lcp_detected_a
+    );
+
+    // Control = the NON-BATCHED route (parity reference). The batched
+    // ring path itself DIVERGES from the non-batched reference at
+    // seq>sw on this exact prompt shape — pre-existing batched-prefill
+    // sliding-layer divergence, confirmed at clean main 2026-08-03
+    // (A==C==D="while maintaining", B(batched ring)="effectively,").
+    // Comparing against the reference path is what makes this gate a
+    // resume-coherence falsifier rather than a batched-route-vs-
+    // reference comparator. Server B gets the SAME lr_long+hybrid env
+    // but no priming (cold P, empty registry).
+    let server_b = spawn_server_with_base(
+        &bin,
+        &model_path,
+        PORT_52404,
+        &[("HF2Q_SERVE_BATCHED_PREFILL", "0")],
+        &[
+            ("HF2Q_KV_LCP_RESUME", "1"),
+            ("HF2Q_KV_LCP_LONG_RESUME", "1"),
+        ],
+    );
+    wait_for_readyz(&server_b);
+    let canonical_b = fetch_canonical_model_id(&server_b);
+    let p_decoded_b = chat_decode(&server_b, &canonical_b, &prompt_p, ITER36_MAX_TOKENS);
+    assert!(!p_decoded_b.is_empty(), "P decoded empty on server B (control)");
+
+    assert_eq!(
+        p_decoded_a, p_decoded_b,
+        "[gemma-hybrid-long-resume] FALSIFIED #2 — hybrid long-resume output \
+         diverged from non-batched cold control: A (resumed): {:?} | B (cold): {:?}",
+        p_decoded_a, p_decoded_b
+    );
+    eprintln!(
+        "[gemma-hybrid-long-resume] PASS — byte-identical ({} bytes) with engagement",
         p_decoded_a.len()
     );
 }

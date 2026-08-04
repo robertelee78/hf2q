@@ -114,6 +114,19 @@ pub trait ByteSized {
 ///
 /// Always emits one info-level `eprintln!` naming the chosen budget and
 /// source on the first call (guards the invariant: no silent feature flip).
+/// Pre-copy LCP snapshot budget gate (2026-08-03, "gemma-hybrid-lcp"
+/// long-resume follow-up): TRUE when an entry of `est_bytes` would be
+/// admitted by the registry's byte budget (mirrors the single-entry
+/// rule behind `LcpStoreError::EntryExceedsBudget`). The gemma prefill
+/// routes use this to SKIP the expensive snapshot alloc+memcpy when
+/// the entry cannot possibly fit — at a ~97K-token opencode prompt
+/// the dual-leg (dense F32 + hybrid) snapshot is ~64 GB, and copying
+/// it only to be rejected at store time swap-storms a 128 GB box
+/// (measured live: 900s+ stall, OOM-adjacent).
+pub fn gemma_lcp_snapshot_fits_budget(est_bytes: u64) -> bool {
+    est_bytes <= default_lcp_byte_budget()
+}
+
 pub fn default_lcp_byte_budget() -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const FLOOR: u64 = GIB;          // 1 GiB minimum

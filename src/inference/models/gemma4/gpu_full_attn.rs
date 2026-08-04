@@ -415,7 +415,22 @@ impl MlxModelWeights {
                     // `kv_copy_f16_quantize_v_dual` kernel.
                     if INVESTIGATION_ENV.hybrid_kv {
                         if let Some(ref hybrid_kv) = self.hybrid_kv {
-                            let cache_pos_val = if kv_is_sliding {
+                            // ADR-017 Phase E.a "gemma-hybrid-lcp" long-resume:
+                            // capacity-derived write-slot predicate. When the
+                            // hybrid sliding buffer was allocated LINEAR
+                            // (LONG_RESUME on: cap = max(sw, seq+max)), decode
+                            // positions up to the buffer capacity write
+                            // slot=kv_write_pos directly (slot == logical
+                            // position for the mask_type=2 hybrid SDPA
+                            // kernel). With a ring-era buffer (cap = sw) the
+                            // position wraps — byte-identical to the legacy
+                            // behavior. Deriving the predicate from the
+                            // buffer's own capacity (not the env chain) keeps
+                            // a stale ring alloc from faulting on a linear
+                            // write past its end.
+                            let cache_pos_val = if kv_is_sliding
+                                && kv_write_pos >= hybrid_kv[layer_idx].capacity
+                            {
                                 (kv_write_pos % kv_capacity) as u32
                             } else {
                                 kv_write_pos as u32

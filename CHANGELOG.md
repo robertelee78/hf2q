@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Gemma 4 LCP long-resume past sliding_window + production hardening ("gemma-hybrid-lcp" follow-up)
+
+- **LCP now works past `sliding_window` (1024) under the hybrid regime.**
+  Sliding layers allocate linear buffers on both prefill routes;
+  hybrid encode writes slot=logical at prefill and decode (capacity-
+  derived predicate); the hybrid SDPA kernel's `mask_type=2` windowing
+  composes byte-identically with the non-batched reference
+  (`gemma_hybrid_long_resume_byte_identity`, engagement-asserted).
+  `HF2Q_KV_LCP_RESUME_CAPACITY=8g` is the documented envelope knob
+  (snapshots carry +4096/turn multi-turn headroom).
+- **Fixed: SerialFifo consume-gate 500 on growing conversations** — a
+  stale `dense_kvs` mount from turn N hard-errored turn N+1 on the
+  non-batched route when N+1's prompt was longer (`capacity < required`).
+  Leftover mounts now drop + fresh-alloc; slot-aware scaffold bails
+  preserved.
+- **Fixed: pre-copy snapshot budget gate** — dual-leg snapshot bytes are
+  estimated from shapes BEFORE the alloc+memcpy and skipped when over
+  the registry budget; a ~97K-token dual-leg snapshot (~64 GB)
+  previously swap-stormed the box before rejection could fire.
+- **Launcher + envelope:** `scripts/serve_gemma4_opencode.sh` (one-model
+  OOM guard, mmproj, `BATCHED=0` forces the linear-memory non-batched
+  route for >32K contexts — the batched route's O(n²) bf16 masks OOM
+  past ~32K at ~100K-token prompts). opencode-scale ~100K sessions are
+  documented as qwen-arch territory (fixed-size DeltaNet + TQ full-attn).
+- **Documented pre-existing divergences (reproduced at clean main, NOT
+  introduced by the gemma-hybrid-lcp arc):** batched-prefill sliding-
+  layer output diverges from the non-batched parity reference at seq>sw;
+  `iter5_r_c4_lcp_5_fraction_sweep` fraction 0 (tiny K) diverges —
+  dense-side, follow-up work.
+
 ### Added — Gemma 4 LCP partial-prefill resume under the production hybrid regime ("gemma-hybrid-lcp")
 
 - **Gemma 4 has prefix caching in production for the first time.** The

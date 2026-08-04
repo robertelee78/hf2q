@@ -669,9 +669,18 @@ impl MlxModelWeights {
         //
         // When the env-flag is OFF (default), behavior is byte-identical
         // to pre-iter-3.6 (sliding = ring, mask_type=1).
+        //
+        // "gemma-hybrid-lcp" (2026-08-03): the gate now admits the
+        // production HYBRID regime as well as dense — the hybrid
+        // `flash_attn_vec_hybrid` kernel implements the same
+        // `mask_type=2 + sliding_window` semantics (verified at
+        // `/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal:490-491,914-915`),
+        // so linear sliding buffers + logical-position masking compose
+        // identically for both legs.
         let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
             && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-            && crate::debug::INVESTIGATION_ENV.use_dense;
+            && (crate::debug::INVESTIGATION_ENV.use_dense
+                || crate::debug::INVESTIGATION_ENV.hybrid_kv);
         let sliding_layer_capacity = if kv_lcp_long_resume {
             sw.max(seq_len + max_decode_tokens)
         } else {
@@ -722,6 +731,65 @@ impl MlxModelWeights {
                     let cached_arcs = self.dense_kvs.take().expect(
                         "iter-2D consume-gate: self.dense_kvs.is_some() validated above",
                     );
+                    // "gemma-hybrid-lcp" SerialFifo leftover discipline
+                    // (2026-08-03): when `slot_aware == false`, a stale
+                    // mount from a PREVIOUS request is opportunistic
+                    // state, not a contract. Turn N's write-back leaves
+                    // `dense_kvs = Some(cap_N)`; turn N+1 with a longer
+                    // prompt hits `capacity N < required` and previously
+                    // hard-500'd EVERY growing SerialFifo conversation on
+                    // the non-batched route (measured live: title-gen
+                    // cap 8763 vs main-turn requirement 99942). On ANY
+                    // mismatch (len / capacity / is_sliding / shared
+                    // Arc) the correct behavior is drop + fresh-alloc —
+                    // the mount carries nothing the fresh alloc can't
+                    // recompute. The hard bails remain for
+                    // `slot_aware == true`, where the mount IS the
+                    // multi-seq scaffold contract (iter-2D invariant).
+                    let leftover_usable = !slot_aware
+                        && cached_arcs.len() == num_layers
+                        && cached_arcs.iter().zip(self.layers.iter()).all(
+                            |(arc, layer)| {
+                                let layer_is_ring =
+                                    layer.layer_type == LayerType::Sliding;
+                                let required_cap = if layer_is_ring {
+                                    sliding_layer_capacity
+                                } else {
+                                    linear_capacity
+                                };
+                                arc.capacity >= required_cap
+                                    && arc.is_sliding == layer_is_ring
+                            },
+                        );
+                    if !leftover_usable && !slot_aware {
+                        // Drop the stale mount, then run the SAME
+                        // fresh-alloc body the None-mount branch uses.
+                        drop(cached_arcs);
+                        let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                        for (layer_idx, layer) in self.layers.iter().enumerate() {
+                            let nkv = layer.num_kv_heads;
+                            let hd = layer.head_dim;
+                            let layer_is_sliding_model = layer.layer_type == LayerType::Sliding;
+                            let capacity = if layer_is_sliding_model {
+                                sliding_layer_capacity
+                            } else {
+                                linear_capacity
+                            };
+                            let n = nkv * capacity * hd;
+                            let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                                .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
+                            let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                                .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
+                            v.push(DenseKvBuffers {
+                                k: kbuf,
+                                v: vbuf,
+                                capacity,
+                                is_sliding: layer_is_sliding_model,
+                                dtype: kv_dtype,
+                            });
+                        }
+                        v
+                    } else {
                     if cached_arcs.len() != num_layers {
                         anyhow::bail!(
                             "forward_prefill iter-2D consume-gate: cached dense_kvs len {} \
@@ -783,6 +851,7 @@ impl MlxModelWeights {
                         v.push(owned);
                     }
                     v
+                    }
                 } else {
                     // Pre-iter-3 fresh-alloc path (byte-identical to the
                     // pre-iter-3 `forward_prefill_with_soft_tokens` body).
@@ -975,7 +1044,18 @@ impl MlxModelWeights {
                         let nkv = layer.num_kv_heads;
                         let hd = layer.head_dim;
                         let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                        let capacity = if layer_is_ring { sw } else { linear_capacity };
+                        // "gemma-hybrid-lcp" long-resume: LINEAR sliding
+                        // capacity (max(sw, seq+max)) when LONG_RESUME is
+                        // on — mirrors the dense leg's
+                        // `sliding_layer_capacity` (line ~675) so the
+                        // hybrid encode can write slot=tok_i without
+                        // ring wrap; the hybrid SDPA kernel applies
+                        // mask_type=2 sliding-window semantics.
+                        let capacity = if layer_is_ring {
+                            sliding_layer_capacity
+                        } else {
+                            linear_capacity
+                        };
                         hybrid_vec.push(crate::inference::models::gemma4::kv_cache::alloc_hybrid_kv_for_layer(
                             dev, layer_idx, nkv, hd, capacity, layer_is_ring)?);
                     }
@@ -1457,7 +1537,13 @@ impl MlxModelWeights {
                         if let Some(ref hybrid_kv) = self.hybrid_kv {
                             let hb_cap = hybrid_kv[layer_idx].capacity;
                             let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
-                            let hb_write_slot = if hb_is_ring {
+                            // "gemma-hybrid-lcp" long-resume: LINEAR
+                            // sliding writes (slot=tok_i) when LONG_RESUME
+                            // is on — mirrors the dense leg's write_slot
+                            // branch at line ~1364. With the ring off,
+                            // slot == logical position for the
+                            // mask_type=2 hybrid SDPA kernel.
+                            let hb_write_slot = if hb_is_ring && !kv_lcp_long_resume {
                                 (tok_i % hb_cap) as u32
                             } else {
                                 tok_i as u32
@@ -2208,10 +2294,54 @@ impl MlxModelWeights {
         // no restore path this sub-iter).
         let lcp_resumable_regime = crate::debug::INVESTIGATION_ENV.use_dense
             || self.hybrid_kv.is_some();
+        // Pre-copy budget gate (2026-08-03): estimate the dual-leg entry
+        // bytes from shapes BEFORE allocating ~2×live-KV of snapshot
+        // copies; skip when the entry cannot fit the registry budget
+        // (97K-token dual-leg ≈ 64 GB → swap-storm, measured live).
+        let lcp_snap_cap_est = sw.max(seq_len + max_decode_tokens
+            + if kv_lcp_long_resume { 4096 } else { 0 });
+        let lcp_est_bytes: u64 = {
+            let dense: u64 = self
+                .layers
+                .iter()
+                .map(|l| {
+                    (2 * l.num_kv_heads * lcp_snap_cap_est * l.head_dim
+                        * kv_elem_bytes) as u64
+                })
+                .sum();
+            let hybrid: u64 = if self.hybrid_kv.is_some() {
+                self.layers
+                    .iter()
+                    .map(|l| {
+                        (l.num_kv_heads
+                            * lcp_snap_cap_est
+                            * (l.head_dim * 2 + l.head_dim + 4)) as u64
+                    })
+                    .sum()
+            } else {
+                0
+            };
+            dense + hybrid
+        };
+        let lcp_fits_budget =
+            crate::serve::kv_persist::lcp_registry::gemma_lcp_snapshot_fits_budget(
+                lcp_est_bytes,
+            );
+        if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+            && lcp_resumable_regime
+            && !lcp_fits_budget
+        {
+            tracing::debug!(
+                "lcp_snapshot skipped (budget): est entry {} bytes > registry budget                  ({} bytes) — snapshots skipped, registry stays without this prompt",
+                lcp_est_bytes,
+                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget(),
+            );
+        }
         let snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
                 && lcp_resumable_regime
                 && snapshot_safe
+                && lcp_fits_budget
             {
                 // Allocate fresh per-layer buffers + memcpy bytes from
                 // each live `dense_kvs_vec[i]` into the new snapshot.
@@ -2238,7 +2368,16 @@ impl MlxModelWeights {
                 // sliding+short (seq_len ≤ sw) → snap_cap = sw →
                 // ~200 MB per cached entry. Capacity=1 registry ⇒
                 // ≤ 200 MB extra resident.
-                let snap_cap = sw.max(seq_len + max_decode_tokens);
+                // "gemma-hybrid-lcp" long-resume multi-turn headroom:
+                // turn N+1's prompt is strictly longer than turn N's
+                // (history grows), so a snap_cap sized exactly to this
+                // request fails the probe-side capacity check next turn
+                // (measured live: cached linear_cap 2029 < required
+                // 2031). +4096 under long-resume keeps typical turn
+                // growth admissible; only the snapshot over-allocates,
+                // the per-request live buffers stay exact.
+                let snap_cap = sw.max(seq_len + max_decode_tokens
+                    + if kv_lcp_long_resume { 4096 } else { 0 });
                 for live_layer in dense_kvs_vec.iter() {
                     let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
                     let live_cap_dim = live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
@@ -2387,7 +2526,8 @@ impl MlxModelWeights {
                     // Same capacity policy as the dense snapshot
                     // (mirrors line ~2229): sw headroom for short
                     // prompts, seq_len + decode for long ones.
-                    let snap_cap = sw.max(seq_len + max_decode_tokens);
+                    let snap_cap = sw.max(seq_len + max_decode_tokens
+                    + if kv_lcp_long_resume { 4096 } else { 0 });
                     let mut hsnap: Vec<
                         std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
                     > = Vec::with_capacity(live_hybrid.len());
