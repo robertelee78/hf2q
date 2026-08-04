@@ -5,7 +5,10 @@
 //! interchangeable with the Qwen or Gemma graphs.
 
 pub mod attention;
+pub mod config;
 pub mod hyper_connection;
 pub mod routing;
+
+pub use config::Deepseek4Config;
 
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";
