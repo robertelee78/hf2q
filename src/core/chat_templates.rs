@@ -41,10 +41,22 @@
 /// chat_template (e.g. all Qwen3.6 abliterated variants).
 pub const QWEN3_CHATML: &str = include_str!("chat_templates/qwen3-chatml.jinja");
 
+/// DeepSeek-V4-Flash-0731 GGUF interoperability template.
+///
+/// The hf2q runtime uses [`crate::core::deepseek_v4_encoding`] for its
+/// stateful, pure-Rust encoding path. This Jinja fixture is emitted into GGUF
+/// metadata so external readers such as the pinned llama.cpp reference can
+/// apply the same public chat contract. Provenance: llama.cpp template
+/// `models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja`, commit
+/// `6ea215d17`, which ports DeepSeek's published `encoding_dsv4.py`.
+pub const DEEPSEEK_V4_FLASH_0731: &str =
+    include_str!("chat_templates/deepseek-v4-flash-0731.jinja");
+
 /// Compile-time-known length of [`QWEN3_CHATML`]. The fixture's length
 /// must match the vendor's exactly — drift means someone trimmed or
 /// re-encoded the template, and the byte-identical guarantee fails.
 pub const QWEN3_CHATML_LEN: usize = 7764;
+pub const DEEPSEEK_V4_FLASH_0731_LEN: usize = 7646;
 
 /// Look up the vendor-shipped chat template for `arch`.
 ///
@@ -73,6 +85,7 @@ pub const QWEN3_CHATML_LEN: usize = 7764;
 pub fn arch_default_chat_template(arch: &str) -> Option<&'static str> {
     match arch {
         "qwen35" | "qwen35moe" => Some(QWEN3_CHATML),
+        "deepseek4" => Some(DEEPSEEK_V4_FLASH_0731),
         // Other arches: research pending — see arch-coverage table above.
         // Until we capture a vendor reference, we return None and let
         // the caller WARN. No synthesized templates per
@@ -99,12 +112,25 @@ mod tests {
             QWEN3_CHATML_LEN,
             QWEN3_CHATML.len()
         );
+        assert_eq!(
+            DEEPSEEK_V4_FLASH_0731.len(),
+            DEEPSEEK_V4_FLASH_0731_LEN,
+            "DeepSeek-V4 template drifted from pinned llama.cpp reference"
+        );
     }
 
     #[test]
     fn arch_default_qwen35_resolves_to_qwen3_chatml() {
         assert_eq!(arch_default_chat_template("qwen35"), Some(QWEN3_CHATML));
         assert_eq!(arch_default_chat_template("qwen35moe"), Some(QWEN3_CHATML));
+    }
+
+    #[test]
+    fn arch_default_deepseek4_resolves_to_flash_0731() {
+        assert_eq!(
+            arch_default_chat_template("deepseek4"),
+            Some(DEEPSEEK_V4_FLASH_0731)
+        );
     }
 
     #[test]

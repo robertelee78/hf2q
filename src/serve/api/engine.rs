@@ -16942,6 +16942,20 @@ pub fn render_chat_prompt_with_tools(
         }
     }
 
+    // DeepSeek-V4's published encoder is stateful: it merges consecutive
+    // tool results into a user turn, sorts results by call order, and drops
+    // old reasoning unless tools are active. Run the Rust behavioral port
+    // instead of attempting to approximate those transitions through
+    // minijinja. The GGUF still carries the Jinja form for external readers.
+    if template_str == crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731 {
+        return render_deepseek_v4_prompt(
+            messages,
+            tools,
+            enable_thinking,
+            chat_template_kwargs,
+        );
+    }
+
     let remap_assistant_to_model = template_str.contains("<|turn>model");
 
     // Lookup table tool_call_id → function-name for synthesizing
@@ -17105,6 +17119,82 @@ pub fn render_chat_prompt_with_tools(
         .render(minijinja::Value::from_serialize(&ctx))
         .context("Failed to render chat template")?;
     Ok(rendered)
+}
+
+fn render_deepseek_v4_prompt(
+    messages: &[super::schema::ChatMessage],
+    tools: Option<&[super::schema::Tool]>,
+    enable_thinking: bool,
+    kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<String> {
+    use crate::core::deepseek_v4_encoding::{
+        encode_json, EncodeOptions, ReasoningEffort, ThinkingMode,
+    };
+
+    let thinking = kwargs
+        .and_then(|v| v.get("thinking"))
+        .or_else(|| kwargs.and_then(|v| v.get("enable_thinking")))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(enable_thinking);
+    let drop_thinking = kwargs
+        .and_then(|v| v.get("drop_thinking"))
+        .map(|v| {
+            v.as_bool()
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek-V4 drop_thinking must be boolean"))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    let reasoning_effort = match kwargs
+        .and_then(|v| v.get("reasoning_effort"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("low")
+    {
+        "low" => ReasoningEffort::Low,
+        "high" => ReasoningEffort::High,
+        "max" => ReasoningEffort::Max,
+        other => anyhow::bail!("DeepSeek-V4 reasoning_effort must be low, high, or max; got {other:?}"),
+    };
+
+    let mut values = serde_json::to_value(messages)
+        .context("serialize DeepSeek-V4 messages")?
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek-V4 messages did not serialize as an array"))?;
+    if let Some(tools) = tools.filter(|v| !v.is_empty()) {
+        let tools = serde_json::to_value(tools).context("serialize DeepSeek-V4 tools")?;
+        if let Some(target) = values.iter_mut().find(|v| {
+            matches!(
+                v.get("role").and_then(|r| r.as_str()),
+                Some("system" | "developer")
+            )
+        }) {
+            target
+                .as_object_mut()
+                .expect("serialized ChatMessage is an object")
+                .insert("tools".into(), tools);
+        } else {
+            values.insert(
+                0,
+                serde_json::json!({"role": "system", "content": "", "tools": tools}),
+            );
+        }
+    }
+
+    let json = serde_json::to_string(&values).context("serialize DeepSeek-V4 transcript")?;
+    encode_json(
+        &json,
+        EncodeOptions {
+            thinking_mode: if thinking {
+                ThinkingMode::Thinking
+            } else {
+                ThinkingMode::Chat
+            },
+            drop_thinking,
+            add_bos: true,
+            reasoning_effort,
+        },
+    )
+    .map_err(anyhow::Error::from)
 }
 
 /// Resolve tokenizer path the same way `cmd_generate` does.
@@ -17585,6 +17675,51 @@ assistant:
         // byte-identical to the empty/None path.
         let out_legacy = render_chat_prompt(tmpl, &msgs).unwrap();
         assert_eq!(out_legacy, out_none);
+    }
+
+    #[test]
+    fn deepseek_v4_template_dispatches_to_rust_encoder() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some(MessageContent::Text("Be exact.".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("Weather?".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ];
+        let tools = vec![super::super::schema::Tool {
+            tool_type: "function".into(),
+            function: super::super::schema::ToolFunction {
+                name: "weather".into(),
+                description: Some("Get weather".into()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}}
+                })),
+            },
+        }];
+
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731,
+            &msgs,
+            Some(&tools),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(out.starts_with("<｜begin▁of▁sentence｜>Be exact.\n\n## Tools"));
+        assert!(out.contains("\"name\": \"weather\""));
+        assert!(out.ends_with("<｜User｜>Weather?<｜Assistant｜></think>"));
     }
 
     #[test]

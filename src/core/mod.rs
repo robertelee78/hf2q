@@ -48,6 +48,7 @@
 // B1.3 (alongside `integrity` migration — SourceShard's `from_integrity`
 // adapter depends on ShardIntegrity from `src/input/integrity`).
 pub mod chat_templates;
+pub mod deepseek_v4_encoding;
 pub mod hardware;
 pub mod integrity;
 pub mod kernel_parity;
