@@ -577,6 +577,26 @@ pub struct InvestigationEnv {
     /// ~768 MB per cached entry. Capacity=1 registry ⇒ bounded.
     pub kv_lcp_deltanet_checkpoint_stride: usize,
 
+    /// `HF2Q_DEFAULT_REPETITION_PENALTY` — default `1.0` (off) — the
+    /// server-wide repetition penalty applied when the client omits
+    /// `repetition_penalty` (handler default `1.0`).  Explicit
+    /// client-supplied values (≠ 1.0) always win.
+    ///
+    /// Motivation (2026-08-03 loop mitigation): opencode's
+    /// openai-compatible provider cannot send `repetition_penalty`, so
+    /// every agentic request sampled with penalty 1.0 — at 90-150K
+    /// context the model degenerated into repetition loops, and the
+    /// loop garbage then got baked into compacted history, re-priming
+    /// the loop on every later turn.
+    ///
+    /// Applied ONLY at the qwen35 sampler boundary
+    /// (`effective_repetition_penalty`, engine_qwen35.rs) — penalty
+    /// scope is the response's own generated tokens, never the prompt
+    /// (code-safe).  `SamplingParams` is never mutated, so
+    /// `is_greedy_eligible` / HybridPromptCache gating, the T=0 greedy
+    /// argmax path, and LCP byte-identity tests are all unaffected.
+    pub default_repetition_penalty: f32,
+
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
     ///   - "dense_all": all layers dense.
     ///   - "tq_all" / unset: all layers TQ (default).
@@ -934,6 +954,15 @@ impl InvestigationEnv {
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(1024),
+
+            // Server-wide repetition-penalty default for clients that
+            // can't send one (see field doc). Default 1.0 = off,
+            // preserving exact pre-knob behavior when unset.
+            default_repetition_penalty: env::var("HF2Q_DEFAULT_REPETITION_PENALTY")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(1.0),
 
             // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
             emit_nll: env_eq_one("HF2Q_EMIT_NLL"),

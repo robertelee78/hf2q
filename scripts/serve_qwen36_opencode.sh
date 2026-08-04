@@ -33,6 +33,20 @@
 #                           granularity loss is ≤4095 tokens (~2 s at
 #                           ~2K tok/s) on a boundary miss — the right
 #                           trade for long agentic sessions.
+#   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
+#                           Loop mitigation (2026-08-03). opencode's
+#                           openai-compatible provider cannot send
+#                           repetition_penalty, so without this every
+#                           request sampled with penalty 1.0 and long
+#                           sessions degenerated into repetition loops
+#                           (loop garbage then baked into compacted
+#                           history, re-priming the loop each turn).
+#                           Applied only when the client omits the param
+#                           (explicit values win), only to generated
+#                           tokens (never the prompt — code-safe), and
+#                           never to the T=0 greedy argmax path. 1.05 is
+#                           the gentle coding-safe setting; raise toward
+#                           1.1 if loops persist on creative workloads.
 #   --kv-persist <dir>      Wires the hot-swap spiller substrate. Set to
 #                           the SAME dir as HF2Q_KV_PERSIST (they are two
 #                           separate mechanisms; see operating-kv-cache.md).
@@ -91,6 +105,7 @@ exec env \
     HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE="${STRIDE:-4096}" \
     HF2Q_KV_PERSIST="$KV_DIR" \
     HF2Q_KV_PERSIST_BUDGET_BYTES="$KV_BUDGET_BYTES" \
+    HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
     "$HF2Q_BIN" serve \
         --model "$MODEL" \
         --host "$HOST" \

@@ -1302,6 +1302,27 @@ fn alloc_kv_cache_for_request(
 /// `logit_bias`, grammar enforcement, and seed-driven RNG are deferred
 /// to Wedge-4 (the Qwen35 MVP doesn't currently surface those — the
 /// chat handler short-circuits grammar use to Gemma-only).
+/// Effective repetition penalty for sampling (2026-08-03 loop mitigation).
+///
+/// Client-supplied values (≠ 1.0) always win.  When the client omits
+/// `repetition_penalty` (handler default `1.0`), fall back to the
+/// server-wide `HF2Q_DEFAULT_REPETITION_PENALTY` (default `1.0` = off).
+///
+/// Applied ONLY at this sampler boundary: `SamplingParams` is never
+/// mutated, so `is_greedy_eligible` / HybridPromptCache gating and the
+/// T=0 greedy argmax path (which bypasses the sampler entirely) are
+/// unaffected, and LCP byte-identity tests keep their exact semantics.
+/// Penalty scope downstream is the response's generated tokens only
+/// (decode call sites pass `&generated_tokens`), never the prompt —
+/// safe for code, where legit repetition lives in the prompt.
+fn effective_repetition_penalty(params: &SamplingParams) -> f64 {
+    if params.repetition_penalty != 1.0 {
+        params.repetition_penalty as f64
+    } else {
+        crate::debug::INVESTIGATION_ENV.default_repetition_penalty as f64
+    }
+}
+
 fn sample_logits_qwen35(
     logits: &mut [f32],
     params: &SamplingParams,
@@ -1312,7 +1333,7 @@ fn sample_logits_qwen35(
         top_p: params.top_p as f64,
         top_k: params.top_k,
         min_p: 0.0,
-        repetition_penalty: params.repetition_penalty as f64,
+        repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
     };
     sampler_pure::sample_token(logits, &sp, generated)
@@ -1332,7 +1353,7 @@ fn sample_logits_qwen35_with_logprob(
         top_p: params.top_p as f64,
         top_k: params.top_k,
         min_p: 0.0,
-        repetition_penalty: params.repetition_penalty as f64,
+        repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
     };
     sampler_pure::sample_token_with_logprob(logits, &sp, generated)
