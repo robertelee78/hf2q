@@ -5,6 +5,7 @@
 //! interchangeable with the Qwen or Gemma graphs.
 
 pub mod attention;
+pub mod compressor;
 pub mod config;
 pub mod hyper_connection;
 pub mod routing;
