@@ -11,11 +11,14 @@ use thiserror::Error;
 
 use super::Deepseek4Config;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TensorRole {
-    Matrix,
-    FloatState,
-    IntegerLookup,
+    /// Matmul operand kept in its on-disk GGML representation.
+    RawMatrix,
+    /// Elementwise state expanded to F32 when it becomes resident.
+    ElementwiseF32,
+    /// Hash-routing table kept as canonical signed I32 values.
+    IntegerLookupI32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,11 +52,11 @@ fn spec(name: impl Into<String>, shape: impl Into<Vec<usize>>, role: TensorRole)
 }
 
 fn matrix(name: impl Into<String>, rows: usize, columns: usize) -> TensorSpec {
-    spec(name, vec![rows, columns], TensorRole::Matrix)
+    spec(name, vec![rows, columns], TensorRole::RawMatrix)
 }
 
 fn state(name: impl Into<String>, shape: impl Into<Vec<usize>>) -> TensorSpec {
-    spec(name, shape, TensorRole::FloatState)
+    spec(name, shape, TensorRole::ElementwiseF32)
 }
 
 /// Generate the complete tensor contract for the verifier artifact described
@@ -138,17 +141,17 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
             spec(
                 format!("{prefix}.ffn_gate_exps.weight"),
                 vec![experts, expert_dim, hidden],
-                TensorRole::Matrix,
+                TensorRole::RawMatrix,
             ),
             spec(
                 format!("{prefix}.ffn_up_exps.weight"),
                 vec![experts, expert_dim, hidden],
-                TensorRole::Matrix,
+                TensorRole::RawMatrix,
             ),
             spec(
                 format!("{prefix}.ffn_down_exps.weight"),
                 vec![experts, hidden, expert_dim],
-                TensorRole::Matrix,
+                TensorRole::RawMatrix,
             ),
         ]);
 
@@ -156,7 +159,7 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
             specs.push(spec(
                 format!("{prefix}.ffn_gate_tid2eid.weight"),
                 vec![vocab, top_k],
-                TensorRole::IntegerLookup,
+                TensorRole::IntegerLookupI32,
             ));
         } else {
             specs.push(state(format!("{prefix}.exp_probs_b.bias"), vec![experts]));
@@ -166,10 +169,9 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
         if ratio > 0 {
             let overlap_factor = if ratio == 4 { 2 } else { 1 };
             specs.extend([
-                matrix(
+                state(
                     format!("{prefix}.attn_compressor_ape.weight"),
-                    ratio,
-                    overlap_factor * head_dim,
+                    vec![ratio, overlap_factor * head_dim],
                 ),
                 matrix(
                     format!("{prefix}.attn_compressor_kv.weight"),
@@ -197,10 +199,9 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
                     q_rank,
                 ),
                 matrix(format!("{prefix}.indexer.proj.weight"), index_heads, hidden),
-                matrix(
+                state(
                     format!("{prefix}.indexer_compressor_ape.weight"),
-                    ratio,
-                    2 * index_dim,
+                    vec![ratio, 2 * index_dim],
                 ),
                 matrix(
                     format!("{prefix}.indexer_compressor_kv.weight"),
@@ -326,10 +327,22 @@ mod tests {
         );
         assert!(!by_name.contains_key("blk.0.exp_probs_b.bias"));
         assert!(by_name.contains_key("blk.3.attn_compressor_ape.weight"));
+        assert_eq!(
+            by_name["blk.3.attn_compressor_ape.weight"].role,
+            TensorRole::ElementwiseF32
+        );
         assert!(!by_name.contains_key("blk.3.indexer.attn_q_b.weight"));
         assert_eq!(
             by_name["blk.4.indexer.attn_q_b.weight"].shape,
             vec![8192, 1024]
+        );
+        assert_eq!(
+            by_name["blk.4.indexer_compressor_ape.weight"].role,
+            TensorRole::ElementwiseF32
+        );
+        assert_eq!(
+            by_name["blk.0.ffn_gate_tid2eid.weight"].role,
+            TensorRole::IntegerLookupI32
         );
         assert_eq!(
             by_name["blk.42.ffn_down_exps.weight"].shape,
