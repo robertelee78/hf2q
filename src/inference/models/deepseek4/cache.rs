@@ -9,6 +9,9 @@ use super::cache_buffers::{
 };
 use super::Deepseek4Config;
 
+mod prefill;
+pub use prefill::{CacheSpan, LayerCacheSpan};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheBufferPlan {
     pub shape: Vec<usize>,
@@ -118,6 +121,12 @@ pub enum CacheError {
     ContextExhausted { maximum: usize },
     #[error("cache step committed out of order: expected position {expected}, got {actual}")]
     StepOutOfOrder { expected: usize, actual: usize },
+    #[error("DeepSeek-V4 prefill requires at least one token")]
+    EmptyPrefill,
+    #[error("DeepSeek-V4 start-zero prefill requires an empty cache, currently at {position}")]
+    PrefillNotEmpty { position: usize },
+    #[error("DeepSeek-V4 prefill length {requested} exceeds the {maximum}-token native window")]
+    PrefillWindow { requested: usize, maximum: usize },
     #[error("DeepSeek-V4 cache is poisoned by a partial token; reset and replay the request")]
     Poisoned,
 }
@@ -136,8 +145,8 @@ pub struct LayerCache {
 
 pub struct Deepseek4Cache {
     layers: Vec<LayerCache>,
-    plan: Deepseek4CachePlan,
-    next_position: usize,
+    pub(super) plan: Deepseek4CachePlan,
+    pub(super) next_position: usize,
     poisoned: bool,
     resident_bytes: u64,
     _device: MlxDevice,

@@ -11,7 +11,7 @@ use crate::cli;
 use crate::core::deepseek_v4_encoding::{
     encode_json, EncodeOptions, ReasoningEffort, ThinkingMode,
 };
-use crate::inference::models::deepseek4::{tokenizer, Deepseek4Model};
+use crate::inference::models::deepseek4::{cache::Deepseek4Cache, tokenizer, Deepseek4Model};
 
 use super::resolve_prompt;
 
@@ -23,10 +23,6 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
     anyhow::ensure!(
         args.repetition_penalty == 1.0,
         "DeepSeek-V4 native generation does not yet apply repetition penalties"
-    );
-    anyhow::ensure!(
-        !args.benchmark,
-        "DeepSeek-V4 benchmark mode requires the pending optimized prefill path"
     );
     anyhow::ensure!(
         args.mmproj.is_none() && args.image.is_none(),
@@ -119,17 +115,35 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
         model.weights.resident_bytes()
     );
 
-    let prefill_started = Instant::now();
-    let mut final_state = None;
-    for &token in prompt_tokens {
-        final_state = Some(
-            model
-                .forward_verifier_one(token, &mut cache)
-                .with_context(|| {
-                    format!("DeepSeek-V4 prompt token at position {}", cache.position())
-                })?,
-        );
+    if args.benchmark {
+        return run_benchmark(&args, &gguf, prompt_tokens, &mut model, &mut cache);
     }
+
+    let prefill_started = Instant::now();
+    if stage_profile_enabled() {
+        mlx_native::kernel_profile::reset();
+    }
+    if pipeline_bucket_enabled() {
+        mlx_native::reset_pipeline_dispatch_buckets();
+    }
+    let prefill_gpu_started = mlx_native::gpu_busy_ns();
+    let prefill_dispatch_started = mlx_native::dispatch_count();
+    let prefill_cb_started = mlx_native::cmd_buf_count();
+    let final_state = if std::env::var("HF2Q_DEEPSEEK_SEQUENTIAL_PREFILL").as_deref() == Ok("1") {
+        let mut state = None;
+        for &token in prompt_tokens {
+            state = Some(
+                model
+                    .forward_verifier_one(token, &mut cache)
+                    .context("execute DeepSeek-V4 sequential prompt token")?,
+            );
+        }
+        state.context("DeepSeek-V4 sequential prompt produced no state")?
+    } else {
+        model
+            .forward_verifier_prefill(prompt_tokens, &mut cache)
+            .context("execute DeepSeek-V4 batched prompt prefill")?
+    };
     let prefill_elapsed = prefill_started.elapsed();
     eprintln!(
         "DeepSeek-V4 prefill: {} tokens in {:.2}s ({:.3} tok/s)",
@@ -137,17 +151,33 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
         prefill_elapsed.as_secs_f64(),
         prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64()
     );
+    print_gpu_profile(
+        "prefill",
+        prefill_gpu_started,
+        prefill_dispatch_started,
+        prefill_cb_started,
+    );
+    print_stage_profile("prefill", prefill_gpu_started);
+    print_pipeline_profile("prefill");
     if args.max_tokens == 0 {
         return Ok(());
     }
 
     let decode_started = Instant::now();
+    if stage_profile_enabled() {
+        mlx_native::kernel_profile::reset();
+    }
+    if pipeline_bucket_enabled() {
+        mlx_native::reset_pipeline_dispatch_buckets();
+    }
+    let decode_gpu_started = mlx_native::gpu_busy_ns();
+    let decode_dispatch_started = mlx_native::dispatch_count();
+    let decode_cb_started = mlx_native::cmd_buf_count();
+    let prompt_last_state = model
+        .last_token_state(&final_state)
+        .context("view DeepSeek-V4 final prompt state")?;
     let mut logits = model
-        .forward_logits(
-            final_state
-                .as_ref()
-                .expect("nonempty prompt has final state"),
-        )
+        .forward_logits(&prompt_last_state)
         .context("execute DeepSeek-V4 prompt output head")?;
     let eos = gguf
         .metadata_u32("tokenizer.ggml.eos_token_id")
@@ -188,5 +218,206 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
         decode_elapsed.as_secs_f64(),
         generated as f64 / decode_elapsed.as_secs_f64()
     );
+    print_gpu_profile(
+        "decode",
+        decode_gpu_started,
+        decode_dispatch_started,
+        decode_cb_started,
+    );
+    print_stage_profile("decode", decode_gpu_started);
+    print_pipeline_profile("decode");
     Ok(())
+}
+
+fn run_benchmark(
+    args: &cli::GenerateArgs,
+    gguf: &GgufFile,
+    prompt_tokens: &[u32],
+    model: &mut Deepseek4Model,
+    cache: &mut Deepseek4Cache,
+) -> Result<()> {
+    const RUNS: usize = 5;
+
+    let eos = gguf
+        .metadata_u32("tokenizer.ggml.eos_token_id")
+        .unwrap_or(1);
+    let mut prefill_tps = Vec::with_capacity(RUNS);
+    let mut decode_tps = Vec::with_capacity(RUNS);
+    let mut generated_per_run = Vec::with_capacity(RUNS);
+    let mut decode_steps_per_run = Vec::with_capacity(RUNS);
+
+    for run in 0..RUNS {
+        cache.reset().context("reset DeepSeek-V4 benchmark cache")?;
+
+        // Match llama.cpp's timing boundary: prompt evaluation includes the
+        // output head that produces the first generated token. Decode timing
+        // then contains one verifier + output-head evaluation per subsequent
+        // token (llama.cpp reports these as its eval runs).
+        let prefill_started = Instant::now();
+        let final_state = model
+            .forward_verifier_prefill(prompt_tokens, cache)
+            .context("execute DeepSeek-V4 benchmark prefill")?;
+        let prompt_last_state = model
+            .last_token_state(&final_state)
+            .context("view DeepSeek-V4 benchmark final prompt state")?;
+        let mut logits = model
+            .forward_logits(&prompt_last_state)
+            .context("execute DeepSeek-V4 benchmark prompt output head")?;
+        let prefill_elapsed = prefill_started.elapsed();
+
+        let mut generated = 0usize;
+        let mut decode_steps = 0usize;
+        let mut token = None;
+        let mut stopped = false;
+        if args.max_tokens > 0 {
+            let first = model
+                .greedy_token(&logits)
+                .context("select DeepSeek-V4 benchmark first token")?;
+            if args.ignore_eos || first != eos {
+                generated = 1;
+                token = Some(first);
+            } else {
+                stopped = true;
+            }
+        }
+
+        let decode_started = Instant::now();
+        while !stopped && generated < args.max_tokens {
+            let previous = token.context("DeepSeek-V4 benchmark decode token is missing")?;
+            let state = model
+                .forward_verifier_one(previous, cache)
+                .with_context(|| {
+                    format!(
+                        "execute DeepSeek-V4 benchmark token at position {}",
+                        cache.position()
+                    )
+                })?;
+            logits = model
+                .forward_logits(&state)
+                .context("execute DeepSeek-V4 benchmark decode output head")?;
+            decode_steps += 1;
+            let next = model
+                .greedy_token(&logits)
+                .context("select DeepSeek-V4 benchmark decode token")?;
+            if !args.ignore_eos && next == eos {
+                break;
+            }
+            generated += 1;
+            token = Some(next);
+        }
+        let decode_elapsed = decode_started.elapsed();
+        let prefill_rate = prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64();
+        let decode_rate = if decode_steps == 0 {
+            0.0
+        } else {
+            decode_steps as f64 / decode_elapsed.as_secs_f64()
+        };
+        eprintln!(
+            "  Run {}/{}: prefill {} tok in {:.3}s ({:.1} tok/s); decode {} evals / {} generated tok in {:.3}s ({:.1} tok/s)",
+            run + 1,
+            RUNS,
+            prompt_tokens.len(),
+            prefill_elapsed.as_secs_f64(),
+            prefill_rate,
+            decode_steps,
+            generated,
+            decode_elapsed.as_secs_f64(),
+            decode_rate,
+        );
+        prefill_tps.push(prefill_rate);
+        decode_tps.push(decode_rate);
+        generated_per_run.push(generated);
+        decode_steps_per_run.push(decode_steps);
+    }
+
+    let decode_steps = decode_steps_per_run
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    super::print_benchmark_summary(
+        &args.model,
+        prompt_tokens.len(),
+        &generated_per_run,
+        Some(&prefill_tps),
+        &decode_tps,
+        &[("Decode evals".to_string(), decode_steps)],
+    );
+    Ok(())
+}
+
+fn print_gpu_profile(label: &str, gpu_started: u64, dispatch_started: u64, cb_started: u64) {
+    if std::env::var("HF2Q_GPU_BUSY").as_deref() != Ok("1") {
+        return;
+    }
+    eprintln!(
+        "DeepSeek-V4 {label} GPU profile: {:.3}s busy; {} dispatches; {} command buffers",
+        mlx_native::gpu_busy_ns().saturating_sub(gpu_started) as f64 / 1e9,
+        mlx_native::dispatch_count().saturating_sub(dispatch_started),
+        mlx_native::cmd_buf_count().saturating_sub(cb_started),
+    );
+}
+
+fn stage_profile_enabled() -> bool {
+    std::env::var("HF2Q_DEEPSEEK_STAGE_PROFILE").as_deref() == Ok("1")
+}
+
+fn pipeline_bucket_enabled() -> bool {
+    std::env::var("MLX_DISP_BUCKET").as_deref() == Ok("1")
+}
+
+fn print_pipeline_profile(phase: &str) {
+    if !pipeline_bucket_enabled() {
+        return;
+    }
+    let entries = mlx_native::pipeline_dispatch_buckets();
+    let total: u64 = entries.iter().map(|(_, count)| count).sum();
+    eprintln!(
+        "DeepSeek-V4 {phase} dispatch profile: {total} dispatches across {} pipelines",
+        entries.len(),
+    );
+    for (label, count) in entries.into_iter().take(20) {
+        eprintln!("DeepSeek-V4 {phase} dispatch: {label}: {count}");
+    }
+}
+
+fn print_stage_profile(phase: &str, gpu_started: u64) {
+    if !stage_profile_enabled() {
+        return;
+    }
+    let entries = mlx_native::kernel_profile::dump();
+    let mut categories = [
+        ("FFN", 0_u64, 0_u64),
+        ("uncompressed attention", 0, 0),
+        ("compressed attention", 0, 0),
+    ];
+    let mut staged_ns = 0_u64;
+    for (label, entry) in &entries {
+        staged_ns = staged_ns.saturating_add(entry.total_ns);
+        if let Some(category) = categories
+            .iter_mut()
+            .find(|(name, _, _)| label.contains(name))
+        {
+            category.1 = category.1.saturating_add(entry.total_ns);
+            category.2 = category.2.saturating_add(entry.count);
+        }
+    }
+    for (category, total_ns, count) in categories {
+        eprintln!(
+            "DeepSeek-V4 {phase} category: {category}: {:.3}ms / {count} calls",
+            total_ns as f64 / 1e6,
+        );
+    }
+    let gpu_ns = mlx_native::gpu_busy_ns().saturating_sub(gpu_started);
+    eprintln!(
+        "DeepSeek-V4 {phase} category: outside verifier stages: {:.3}ms",
+        gpu_ns.saturating_sub(staged_ns) as f64 / 1e6,
+    );
+    for (label, entry) in entries.into_iter().take(12) {
+        eprintln!(
+            "DeepSeek-V4 {phase} stage: {label}: {:.3}ms / {} calls",
+            entry.total_ns as f64 / 1e6,
+            entry.count,
+        );
+    }
 }

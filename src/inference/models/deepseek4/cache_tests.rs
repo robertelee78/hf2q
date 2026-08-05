@@ -302,3 +302,55 @@ fn partial_token_poison_requires_reset_before_replay() {
     assert!(!cache.is_poisoned());
     assert_eq!(cache.plan_next_step().unwrap().position, 0);
 }
+
+#[test]
+fn start_zero_prefill_span_counts_complete_groups_and_publishes_once() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+
+    for (tokens, ratio4, ratio128) in [(1, 0, 0), (3, 0, 0), (4, 1, 0), (127, 31, 0), (128, 32, 1)]
+    {
+        let span = cache.plan_prefill_start0(tokens).unwrap();
+        assert_eq!(span.start_position, 0);
+        assert_eq!(span.token_count, tokens);
+        assert_eq!(span.layers[0].window_valid_after, tokens);
+        assert_eq!(span.layers[0].compressed_count, ratio4);
+        assert_eq!(span.layers[0].indexer_count, ratio4);
+        assert_eq!(span.layers[1].compressed_count, ratio128);
+        assert_eq!(span.layers[1].indexer_count, 0);
+    }
+
+    assert!(matches!(
+        cache.plan_prefill_start0(0),
+        Err(CacheError::EmptyPrefill)
+    ));
+    assert!(matches!(
+        cache.plan_prefill_start0(129),
+        Err(CacheError::ContextBound {
+            requested: 129,
+            maximum: 128
+        })
+    ));
+    assert!(matches!(
+        cache.commit_prefill(1, 4),
+        Err(CacheError::StepOutOfOrder {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    cache.commit_prefill(0, 4).unwrap();
+    assert_eq!(cache.position(), 4);
+    assert!(matches!(
+        cache.plan_prefill_start0(4),
+        Err(CacheError::PrefillNotEmpty { position: 4 })
+    ));
+    cache.poison();
+    assert!(matches!(
+        cache.commit_prefill(4, 1),
+        Err(CacheError::Poisoned)
+    ));
+    cache.reset().unwrap();
+    assert_eq!(cache.position(), 0);
+}

@@ -7,7 +7,7 @@ use mlx_native::ops::deepseek_compressor::{
     dispatch_deepseek_compressor, DeepSeekCompressorParams,
 };
 use mlx_native::ops::deepseek_indexer::{
-    dispatch_deepseek_indexer, DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
+    dispatch_deepseek_indexer_into, DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
 };
 use mlx_native::ops::deepseek_tail_rope::{
     dispatch_deepseek_tail_rope_bf16, dispatch_deepseek_tail_rope_f32_to_bf16,
@@ -17,7 +17,7 @@ use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::cache::{LayerCache, LayerCacheStep};
+use super::cache::LayerCache;
 use super::compressed_attention_weights::IndexerWeightsRef;
 use super::forward_support::{alloc, raw_matmul};
 use super::Deepseek4Config;
@@ -38,6 +38,8 @@ impl RatioFourIndexerArena {
     pub(super) fn new(
         device: &MlxDevice,
         cfg: &Deepseek4Config,
+        rows: usize,
+        compressed_output_count: usize,
         valid_compressed: usize,
     ) -> Result<Self> {
         let heads = cfg.index_num_heads as usize;
@@ -47,50 +49,50 @@ impl RatioFourIndexerArena {
             query_f32: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, heads, dim],
+                vec![1, rows, heads, dim],
                 "index query f32",
             )?,
             query_bf16: alloc(
                 device,
                 DType::BF16,
-                vec![1, 1, heads, dim],
+                vec![1, rows, heads, dim],
                 "index query bf16",
             )?,
-            weights: alloc(device, DType::F32, vec![1, 1, heads], "index weights")?,
+            weights: alloc(device, DType::F32, vec![1, rows, heads], "index weights")?,
             scaled_weights: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, heads],
+                vec![1, rows, heads],
                 "scaled index weights",
             )?,
             compressor_kv: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, projected],
+                vec![1, rows, projected],
                 "index compressor KV",
             )?,
             compressor_score: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, projected],
+                vec![1, rows, projected],
                 "index compressor score",
             )?,
             compressor_output: alloc(
                 device,
                 DType::BF16,
-                vec![1, 1, dim],
+                vec![1, compressed_output_count.max(1), dim],
                 "index compressor output",
             )?,
             compressor_rope: alloc(
                 device,
                 DType::BF16,
-                vec![1, 1, 1, dim],
+                vec![1, compressed_output_count.max(1), 1, dim],
                 "index compressor rotated output",
             )?,
             score_scratch: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, valid_compressed.max(1)],
+                vec![1, rows, valid_compressed.max(1)],
                 "index score scratch",
             )?,
         })
@@ -103,8 +105,12 @@ pub(super) fn encode_ratio_four_indexer(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     cfg: &Deepseek4Config,
+    rows: usize,
     position: usize,
-    layer_step: &LayerCacheStep,
+    compressed_write_start: usize,
+    compressed_output_count: usize,
+    valid_compressed: usize,
+    attention_kv_offset: usize,
     layer_cache: &LayerCache,
     attn_norm: &MlxBuffer,
     query_rank: &MlxBuffer,
@@ -114,6 +120,8 @@ pub(super) fn encode_ratio_four_indexer(
     weights: &IndexerWeightsRef<'_>,
     arena: &RatioFourIndexerArena,
     output_indices: &MlxBuffer,
+    output_row_stride: usize,
+    output_column_offset: usize,
 ) -> Result<()> {
     let hidden = cfg.hidden_size as usize;
     let q_rank = cfg.q_lora_rank as usize;
@@ -141,7 +149,7 @@ pub(super) fn encode_ratio_four_indexer(
         query_rank,
         &weights.q_b,
         &arena.query_f32,
-        1,
+        rows,
         heads * dim,
         q_rank,
         "index query",
@@ -153,7 +161,7 @@ pub(super) fn encode_ratio_four_indexer(
         attn_norm,
         &weights.projection,
         &arena.weights,
-        1,
+        rows,
         heads,
         hidden,
         "index head weights",
@@ -165,7 +173,7 @@ pub(super) fn encode_ratio_four_indexer(
         attn_norm,
         &weights.compressor.kv,
         &arena.compressor_kv,
-        1,
+        rows,
         projected,
         hidden,
         "index compressor KV",
@@ -177,7 +185,7 @@ pub(super) fn encode_ratio_four_indexer(
         attn_norm,
         &weights.compressor.gate,
         &arena.compressor_score,
-        1,
+        rows,
         projected,
         hidden,
         "index compressor gate",
@@ -193,7 +201,7 @@ pub(super) fn encode_ratio_four_indexer(
         &arena.query_bf16,
         &DeepSeekTailRopeParams {
             batch: 1,
-            seq_len: 1,
+            seq_len: rows as u32,
             heads: heads as u32,
             head_dim: dim as u32,
             rope_dim: cfg.rope_head_dim,
@@ -206,7 +214,7 @@ pub(super) fn encode_ratio_four_indexer(
         registry,
         device,
         &arena.query_bf16,
-        heads as u32,
+        (rows * heads) as u32,
     )?;
     session.barrier_between(&[&arena.weights], &[&arena.scaled_weights]);
     scalar_mul_f32(
@@ -215,7 +223,7 @@ pub(super) fn encode_ratio_four_indexer(
         device.metal_device(),
         &arena.weights,
         &arena.scaled_weights,
-        heads,
+        rows * heads,
         1.0 / ((dim * heads) as f32).sqrt(),
     )?;
     session.barrier_between(
@@ -243,7 +251,7 @@ pub(super) fn encode_ratio_four_indexer(
         &arena.compressor_output,
         &DeepSeekCompressorParams {
             batch: 1,
-            seq_len: 1,
+            seq_len: rows as u32,
             start_pos: position as u32,
             ratio: 4,
             head_dim: dim as u32,
@@ -252,8 +260,11 @@ pub(super) fn encode_ratio_four_indexer(
             write_cache: 0,
         },
     )?;
-    if let Some(slot) = layer_step.indexer_write_slot {
-        let rope_input = arena.compressor_output.with_shape(vec![1, 1, 1, dim])?;
+    if compressed_output_count > 0 {
+        let rope_input =
+            arena
+                .compressor_output
+                .with_shape(vec![1, compressed_output_count, 1, dim])?;
         session.barrier_between(
             &[&rope_input, compressed_positions, frequencies],
             &[&arena.compressor_rope],
@@ -268,7 +279,7 @@ pub(super) fn encode_ratio_four_indexer(
             &arena.compressor_rope,
             &DeepSeekTailRopeParams {
                 batch: 1,
-                seq_len: 1,
+                seq_len: compressed_output_count as u32,
                 heads: 1,
                 head_dim: dim as u32,
                 rope_dim: cfg.rope_head_dim,
@@ -281,7 +292,7 @@ pub(super) fn encode_ratio_four_indexer(
             registry,
             device,
             &arena.compressor_rope,
-            1,
+            compressed_output_count as u32,
         )?;
         session.barrier_between(&[&arena.compressor_rope], &[cache]);
         dispatch_kv_cache_copy(
@@ -290,28 +301,28 @@ pub(super) fn encode_ratio_four_indexer(
             device.metal_device(),
             &arena.compressor_rope,
             cache,
-            slot as u32,
+            compressed_write_start as u32,
             dim as u32,
-            1,
+            compressed_output_count as u32,
             cache_capacity as u32,
             false,
         )?;
     }
 
-    let valid = layer_step.indexer_valid_after;
+    let valid = valid_compressed;
     if valid > 0 {
         let cache_view = cache
             .slice_view(0, valid * dim)
             .with_shape(vec![1, valid, dim])?;
         let scratch = arena
             .score_scratch
-            .slice_view(0, valid)
-            .with_shape(vec![1, 1, valid])?;
+            .slice_view(0, rows * valid)
+            .with_shape(vec![1, rows, valid])?;
         session.barrier_between(
             &[&arena.query_bf16, &cache_view, &arena.scaled_weights],
             &[&scratch, output_indices],
         );
-        dispatch_deepseek_indexer(
+        dispatch_deepseek_indexer_into(
             session.encoder_mut(),
             registry,
             device,
@@ -320,16 +331,19 @@ pub(super) fn encode_ratio_four_indexer(
             &arena.scaled_weights,
             &scratch,
             output_indices,
+            output_row_stride,
+            output_column_offset,
             &DeepSeekIndexerParams {
                 batch: 1,
-                query_len: 1,
+                query_len: rows as u32,
                 kv_len: valid as u32,
                 start_pos: position as u32,
                 ratio: 4,
                 heads: heads as u32,
                 head_dim: dim as u32,
                 top_k: DEEPSEEK_INDEXER_TOP_K as u32,
-                offset: cfg.sliding_window as i32,
+                offset: i32::try_from(attention_kv_offset)
+                    .context("DeepSeek-V4 indexer attention offset exceeds i32")?,
             },
         )?;
     }

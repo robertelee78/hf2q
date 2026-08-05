@@ -9,6 +9,40 @@ use super::forward_support::{alloc, raw_matmul, rms_params};
 use super::Deepseek4Model;
 
 impl Deepseek4Model {
+    /// Return a zero-copy one-row view for prompt-to-decode handoff.
+    pub fn last_token_state(&self, state: &MlxBuffer) -> Result<MlxBuffer> {
+        let hidden = self.cfg.hidden_size as usize;
+        let hc = self.cfg.hyper_connection_count as usize;
+        if state.dtype() != DType::F32
+            || state.shape().len() != 3
+            || state.shape()[0] == 0
+            || state.shape()[1..] != [hc, hidden]
+        {
+            bail!(
+                "DeepSeek-V4 output state must be F32 [tokens, {hc}, {hidden}], got {} {:?}",
+                state.dtype(),
+                state.shape()
+            );
+        }
+        let row_elements = hc
+            .checked_mul(hidden)
+            .context("DeepSeek-V4 output row size overflow")?;
+        let row_offset = (state.shape()[0] - 1)
+            .checked_mul(row_elements)
+            .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+            .context("DeepSeek-V4 output row offset overflow")?;
+        let absolute_offset = state
+            .byte_offset()
+            .checked_add(
+                u64::try_from(row_offset).context("DeepSeek-V4 output row offset exceeds u64")?,
+            )
+            .context("DeepSeek-V4 output row absolute offset overflow")?;
+        state
+            .slice_view(absolute_offset, row_elements)
+            .with_shape(vec![1, hc, hidden])
+            .context("view DeepSeek-V4 last prompt state")
+    }
+
     /// Collapse completed verifier states and compute vocabulary logits.
     ///
     /// The input is the exact `[tokens, 4, hidden]` F32 state emitted by the
@@ -195,6 +229,7 @@ impl Deepseek4Model {
         session
             .finish()
             .context("execute DeepSeek-V4 greedy argmax")?;
-        Ok(out_index.as_slice::<u32>()?[0])
+        let token = out_index.as_slice::<u32>()?[0];
+        Ok(token)
     }
 }

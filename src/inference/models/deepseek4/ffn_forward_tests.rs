@@ -22,7 +22,7 @@ fn ffn_rejects_layer_outside_verifier() {
     let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
     let state = model.embed_hyper_state(&[2]).unwrap();
     let error = model
-        .forward_ffn_one(&state, 2, cfg.num_hidden_layers as usize)
+        .forward_ffn_one(&state, 2, cfg.num_hidden_layers as usize, None, None)
         .expect_err("out-of-range layer must fail closed");
     assert!(error.to_string().contains("outside"));
 }

@@ -13,6 +13,6 @@ impl Deepseek4Model {
         token_id: u32,
         cache: &mut Deepseek4Cache,
     ) -> Result<MlxBuffer> {
-        self.forward_uncompressed_attention_one(None, token_id, 0, cache, true)
+        self.forward_uncompressed_attention_one(None, token_id, 0, cache, true, None, None)
     }
 }

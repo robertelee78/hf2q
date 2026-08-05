@@ -2200,6 +2200,7 @@ dependencies = [
 [[package]]
 name = "mlx-native"
 version = "0.9.5"
+source = "git+https://github.com/robertelee78/mlx-native.git?rev=7cc3d308c37161e6602c9218ad3a14b5f86d7d4a#7cc3d308c37161e6602c9218ad3a14b5f86d7d4a"
 dependencies = [
  "bytemuck",
  "half",
@@ -4987,3 +4988,7 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "mlx-native"
+version = "0.9.5"

@@ -1,6 +1,6 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
-- **Status:** Accepted; official conversion gate passed (2026-08-04), inference gates in progress
+- **Status:** Accepted; official base conversion, native inference, coherence, and performance gates passed (2026-08-04)
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -22,6 +22,14 @@ invoke the pinned llama.cpp build as an oracle.
 Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
 evidence.
+
+The accepted base-model runtime supports native prefill through 128 tokens and
+fails closed before cache publication above that boundary. The metadata/cache
+planner validates the official one-million-token schedule, but that is not a
+claim that the current execution path admits a million-token request. Extending
+the execution window and integrating the separate DSpark draft artifact are
+follow-up work; neither is silently represented as part of the accepted base
+GGUF.
 
 ## Context and spike result
 
@@ -46,8 +54,10 @@ The checkpoint is not an ordinary BF16 model:
 
 At spike time, the converter rejected the source dtypes and architecture, expert
 fusion created a multi-gigabyte F32 aggregate, and the runtime had no
-DeepSeek-V4 graph or cache. The converter and Q2_K residency boundary now pass
-their official-artifact gates; full graph integration remains in progress.
+DeepSeek-V4 graph or cache. The accepted implementation now converts the pinned
+source, executes every verifier layer and the vocabulary head, performs batched
+prefill, maintains the compressed cache transactionally, and generates coherent
+greedy text entirely through the owned Rust/Metal path.
 
 ## Hypotheses and falsifiers
 
@@ -228,7 +238,9 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Bounded working vectors | Receipt maximum 4,670,627,840 bytes; 529,530,880 F32 elements in the largest row-aligned chunk |
 | DSpark boundary | 4,705 source tensors explicitly excluded from the base GGUF and receipt-marked for a separate draft artifact |
 | Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
-| Native primitive regression | 44 DeepSeek-focused tests passed; three real-artifact hardware tests ignored by default |
+| Native primitive regression | 46 DeepSeek-focused tests passed; 0 failed; three real-artifact hardware tests ignored by default |
+| Pinned compute dependency | `mlx-native` commit `7cc3d308c37161e6602c9218ad3a14b5f86d7d4a`; pushed, clean-checkout build verified, and pinned exactly in `Cargo.lock` |
+| Clean dependency regression | 27 mlx-native tests passed across indexer, MoE routing, Q2_K, sparse-prefill-mask, and dense-GEMM suites |
 | Official activation simulation | Owned Metal E4M3/E8M0 main-KV and Hadamard+E2M1/E8M0 indexer paths match exact BF16 CPU references; 3/3 focused tests passed |
 | Compressed cache ownership | Fixed-offset contiguous raw/compressed KV views plus exact main/indexer F32 recurrent states; 1M-token resident plan 7,232,045,056 bytes |
 | Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
@@ -242,4 +254,10 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | One-token reference parity | Pinned llama.cpp `llama-simple` on the exact same GGUF and rendered six-token prompt also greedily decoded `Hello`; no product path invoked the oracle |
 | Native inference telemetry | 20.80 s load; 8.15 s incremental six-token prefill (0.736 tok/s); 30.38 s total; 67,364,585,472-byte max RSS; zero swaps |
 | Reference inference telemetry | Pinned llama.cpp raw-completion oracle processed the same six tokens in 73.89 ms (81.20 tok/s) after load; not yet an H4 comparison because hf2q currently submits one-token graphs while the reference batches all six |
-| Performance parity | Open: implement and measure owned batched prefill, then run source-bound three-run medians under matched settings |
+| Official arithmetic coherence | Prompt `What is 2+2? Answer with only the number.` rendered to 17 source-parity token IDs; greedy output reasoned to `2+2 = 4` and terminated with final answer `4` |
+| Batched prefill boundary | 125 prompt tokens executed in 6.85 s (18.257 tok/s) through native compressed prefill; a 510-token request was rejected before cache publication because the accepted execution window is 128 tokens |
+| Artifact-backed tests | Exact 1,328-tensor catalog, all 43 verifier layers plus finite vocabulary logits, greedy token selection, and embedded tokenizer parity passed against the 96.3 GB artifact |
+| Final native decode sample | 56 generated tokens in 1.24 s (45.308 tok/s) on the official arithmetic prompt after the clean pinned-dependency release build |
+| Matched five-run native benchmark | 45.1, 45.1, 37.7, 45.2, and 45.1 tok/s; median 45.1 tok/s, p95 45.2 tok/s; 63 verifier evaluations for 64 generated tokens; warm-prefill median 74.6 tok/s |
+| Matched llama.cpp reference | 41.58 tok/s on the same artifact and benchmark contract; hf2q median is 1.085x (+8.5%) |
+| Performance parity | Passed: native median exceeds the H4 0.90x decode floor and the pinned llama.cpp reference while retaining coherent greedy output |

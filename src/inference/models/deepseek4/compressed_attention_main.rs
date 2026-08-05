@@ -14,7 +14,7 @@ use mlx_native::ops::deepseek_tail_rope::{
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::cache::{LayerCache, LayerCacheStep};
+use super::cache::LayerCache;
 use super::compressed_attention_weights::CompressorWeightsRef;
 use super::forward_support::{alloc, raw_matmul};
 use super::Deepseek4Config;
@@ -27,7 +27,12 @@ pub(super) struct MainCompressorArena {
 }
 
 impl MainCompressorArena {
-    pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, ratio: u32) -> Result<Self> {
+    pub(super) fn new(
+        device: &MlxDevice,
+        cfg: &Deepseek4Config,
+        ratio: u32,
+        rows: usize,
+    ) -> Result<Self> {
         let dim = cfg.head_dim as usize;
         let coefficient = usize::from(ratio == 4) + 1;
         let projected = coefficient * dim;
@@ -35,25 +40,25 @@ impl MainCompressorArena {
             kv: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, projected],
+                vec![1, rows, projected],
                 "main compressor KV",
             )?,
             score: alloc(
                 device,
                 DType::F32,
-                vec![1, 1, projected],
+                vec![1, rows, projected],
                 "main compressor score",
             )?,
             output: alloc(
                 device,
                 DType::BF16,
-                vec![1, 1, dim],
+                vec![1, (rows / ratio as usize).max(1), dim],
                 "main compressor output",
             )?,
             rope: alloc(
                 device,
                 DType::BF16,
-                vec![1, 1, 1, dim],
+                vec![1, (rows / ratio as usize).max(1), 1, dim],
                 "main compressor rotated output",
             )?,
         })
@@ -67,8 +72,10 @@ pub(super) fn encode_main_compressor(
     device: &MlxDevice,
     cfg: &Deepseek4Config,
     ratio: u32,
+    rows: usize,
     position: usize,
-    layer_step: &LayerCacheStep,
+    compressed_write_start: usize,
+    compressed_count: usize,
     layer_cache: &LayerCache,
     attn_norm: &MlxBuffer,
     compressed_positions: &MlxBuffer,
@@ -100,7 +107,7 @@ pub(super) fn encode_main_compressor(
         attn_norm,
         &weights.kv,
         &arena.kv,
-        1,
+        rows,
         projected,
         hidden,
         "main compressor KV",
@@ -112,7 +119,7 @@ pub(super) fn encode_main_compressor(
         attn_norm,
         &weights.gate,
         &arena.score,
-        1,
+        rows,
         projected,
         hidden,
         "main compressor gate",
@@ -142,7 +149,7 @@ pub(super) fn encode_main_compressor(
         &arena.output,
         &DeepSeekCompressorParams {
             batch: 1,
-            seq_len: 1,
+            seq_len: rows as u32,
             start_pos: position as u32,
             ratio,
             head_dim: dim as u32,
@@ -151,10 +158,10 @@ pub(super) fn encode_main_compressor(
             write_cache: 0,
         },
     )?;
-    let Some(slot) = layer_step.compressed_write_slot else {
+    if compressed_count == 0 {
         return Ok(());
-    };
-    let rope_input = arena.output.with_shape(vec![1, 1, 1, dim])?;
+    }
+    let rope_input = arena.output.with_shape(vec![1, compressed_count, 1, dim])?;
     session.barrier_between(
         &[&rope_input, compressed_positions, frequencies],
         &[&arena.rope],
@@ -169,7 +176,7 @@ pub(super) fn encode_main_compressor(
         &arena.rope,
         &DeepSeekTailRopeParams {
             batch: 1,
-            seq_len: 1,
+            seq_len: compressed_count as u32,
             heads: 1,
             head_dim: dim as u32,
             rope_dim: cfg.rope_head_dim,
@@ -183,7 +190,7 @@ pub(super) fn encode_main_compressor(
         device,
         &arena.rope,
         &DeepSeekMxfp8Params {
-            rows: 1,
+            rows: compressed_count as u32,
             row_width: dim as u32,
             quantized_width: (dim - cfg.rope_head_dim as usize) as u32,
             block_size: 64,
@@ -196,9 +203,9 @@ pub(super) fn encode_main_compressor(
         device.metal_device(),
         &arena.rope,
         cache,
-        slot as u32,
+        compressed_write_start as u32,
         dim as u32,
-        1,
+        compressed_count as u32,
         cache_capacity as u32,
         false,
     )?;

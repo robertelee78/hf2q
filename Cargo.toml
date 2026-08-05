@@ -98,11 +98,10 @@ anyhow = "1"
 thiserror = "2"
 
 # ADR-008: mlx-native is the sole inference/compute backend.
-# Published at https://crates.io/crates/mlx-native. For local mlx-native
-# development, override via a (gitignored) .cargo/config.toml:
-#   [patch.crates-io]
-#   mlx-native = { path = "/opt/mlx-native" }
-mlx-native = "0.9.4"
+# DeepSeek-V4 requires the native batched verifier kernels introduced after
+# the latest crates.io release. Pin the exact reviewed source revision so a
+# clean build cannot drift with the dependency's main branch.
+mlx-native = { git = "https://github.com/robertelee78/mlx-native.git", rev = "7cc3d308c37161e6602c9218ad3a14b5f86d7d4a" }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
@@ -220,4 +219,3 @@ futures-util = "0.3"
 #
 #   [patch.crates-io]
 #   mlx-native = { path = "/opt/mlx-native" }
-

@@ -24,6 +24,53 @@ pub enum AttentionError {
     NonFinite,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct CompressedAttentionIndexPlan {
+    pub(super) storage: Vec<i32>,
+    pub(super) attention_width: usize,
+    pub(super) indexer_output_offset: Option<usize>,
+}
+
+/// Build a compact sparse-attention prefix while retaining fixed top-k
+/// storage for the ratio-four indexer output.
+///
+/// Masked `-1` slots do not participate in the official softmax, so dropping
+/// only the trailing padding preserves the valid index order and arithmetic.
+pub(super) fn compressed_attention_index_plan(
+    ratio: usize,
+    window_size: usize,
+    index_top_k: usize,
+    position: usize,
+) -> Result<CompressedAttentionIndexPlan, AttentionError> {
+    let mut storage = window_indices(window_size, 1, position)?
+        .into_iter()
+        .next()
+        .expect("one-token window plan must contain one row");
+    storage.retain(|&index| index >= 0);
+    let window_valid = storage.len();
+    if ratio == 4 {
+        let selected = ((position + 1) / ratio).min(index_top_k);
+        let attention_width = window_valid + selected;
+        storage.resize(window_valid + index_top_k, -1);
+        return Ok(CompressedAttentionIndexPlan {
+            storage,
+            attention_width,
+            indexer_output_offset: Some(window_valid),
+        });
+    }
+    storage.extend(
+        compressed_indices(ratio, 1, position, window_size)?
+            .into_iter()
+            .next()
+            .expect("one-token compressed plan must contain one row"),
+    );
+    Ok(CompressedAttentionIndexPlan {
+        attention_width: storage.len(),
+        storage,
+        indexer_output_offset: None,
+    })
+}
+
 /// Sliding-window positions for every query in a prefill, or the one query in
 /// an incremental decode call. `-1` is the official masked-position sentinel.
 pub fn window_indices(
@@ -221,6 +268,25 @@ mod tests {
         assert_eq!(got[7], vec![10, 11]);
         assert_eq!(got[9], vec![10, 11]);
         assert_eq!(compressed_indices(4, 1, 7, 10).unwrap(), vec![vec![10, 11]]);
+    }
+
+    #[test]
+    fn compressed_attention_plan_drops_only_masked_padding() {
+        let first = compressed_attention_index_plan(4, 128, 512, 0).unwrap();
+        assert_eq!(first.attention_width, 1);
+        assert_eq!(first.indexer_output_offset, Some(1));
+        assert_eq!(first.storage.len(), 513);
+        assert_eq!(&first.storage[..3], &[0, -1, -1]);
+
+        let ratio4 = compressed_attention_index_plan(4, 128, 512, 130).unwrap();
+        assert_eq!(ratio4.attention_width, 160);
+        assert_eq!(ratio4.indexer_output_offset, Some(128));
+        assert_eq!(ratio4.storage.len(), 640);
+
+        let ratio128 = compressed_attention_index_plan(128, 128, 512, 130).unwrap();
+        assert_eq!(ratio128.attention_width, 129);
+        assert_eq!(ratio128.indexer_output_offset, None);
+        assert_eq!(ratio128.storage.last(), Some(&128));
     }
 
     #[test]
