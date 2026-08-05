@@ -1274,10 +1274,26 @@ mod tests {
         // for Q5_K_M ftype falls through to the default base type Q5_K.
         // Pre-tied-detection-fix this test asserted token=Q6_K (the
         // BROKEN promote-as-tied behavior).
-        assert_eq!(token.ggml_type as u32, 5, "token_embd (non-tied) → Q5_K");
-        assert_eq!(output.ggml_type as u32, 6, "output → Q6_K");
-        assert_eq!(attn_q.ggml_type as u32, 5, "attn_q → Q5_K");
-        assert_eq!(ffn_down.ggml_type as u32, 6, "ffn_down (i=0) → Q6_K");
+        assert_eq!(
+            token.ggml_type,
+            mlx_native::GgmlType::Q5_K,
+            "token_embd (non-tied) → Q5_K"
+        );
+        assert_eq!(
+            output.ggml_type,
+            mlx_native::GgmlType::Q6_K,
+            "output → Q6_K"
+        );
+        assert_eq!(
+            attn_q.ggml_type,
+            mlx_native::GgmlType::Q5_K,
+            "attn_q → Q5_K"
+        );
+        assert_eq!(
+            ffn_down.ggml_type,
+            mlx_native::GgmlType::Q6_K,
+            "ffn_down (i=0) → Q6_K"
+        );
 
         assert_eq!(token.offset % 32, 0);
         assert_eq!(output.offset % 32, 0);
@@ -1337,9 +1353,10 @@ mod tests {
             .tensor_info("model.visual.patch_embd.weight")
             .expect("vision tensor present");
         assert_eq!(
-            visual.ggml_type as u32, 1,
-            "vision tensor must emit F16 (positional code 1), got {}",
-            visual.ggml_type as u32
+            visual.ggml_type,
+            mlx_native::GgmlType::F16,
+            "vision tensor must emit F16, got {:?}",
+            visual.ggml_type
         );
         assert_eq!(visual.byte_len, 60);
 
@@ -1347,7 +1364,8 @@ mod tests {
             .tensor_info("blk.0.attn_q.weight")
             .expect("policy tensor present");
         assert_eq!(
-            attn_q.ggml_type as u32, 5,
+            attn_q.ggml_type,
+            mlx_native::GgmlType::Q5_K,
             "non-vision sibling must still route through policy → Q5_K"
         );
     }
@@ -1681,7 +1699,7 @@ mod tests {
         let gguf = mlx_native::gguf::GgufFile::open(tmp.path()).expect("parse");
         assert_eq!(gguf.tensor_count(), 1);
         let t = gguf.tensor_info("blk.0.attn_q.weight").unwrap();
-        assert_eq!(t.ggml_type as u32, 5);
+        assert_eq!(t.ggml_type, mlx_native::GgmlType::Q5_K);
     }
 
     /// Regression test for ADR-033 §P1 quality-equivalence gate failure

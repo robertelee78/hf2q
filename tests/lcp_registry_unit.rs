@@ -24,7 +24,7 @@ use hf2q::serve::kv_persist::lcp_registry::{
     ByteSized, LcpKey, LcpRegistry, LcpStoreError, default_lcp_byte_budget,
 };
 use hf2q::serve::kv_persist::format::ModelFingerprint;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Marker payload for unit tests.
@@ -846,12 +846,19 @@ fn byte_budget_zero_panics() {
 //   (iii) A legacy bare-integer entry-count (< 4096) is converted via the
 //          300 MB heuristic.
 //
-// Env-isolation caveat: `default_lcp_byte_budget()` reads a process-global
-// env var. Tests that mutate env must restore it before returning to avoid
-// contaminating other tests running in the same process. There is no
-// `serial_test` dependency in this project; instead each env-mutating test
-// uses a guard struct that restores the original value via `Drop`.
+// `default_lcp_byte_budget()` reads a process-global env var. Tests that
+// inspect or mutate it must hold `ENV_LOCK` and restore mutations before
+// returning. A process-local mutex plus the RAII guard below provides that
+// isolation without adding a `serial_test` dependency.
 // ─────────────────────────────────────────────────────────────────────────────
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_env() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// RAII guard that restores `HF2Q_KV_LCP_RESUME_CAPACITY` to its original
 /// value (or removes it if it was absent) when dropped.
@@ -863,11 +870,8 @@ struct EnvGuard {
 impl EnvGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let original = std::env::var(key).ok();
-        // SAFETY: single-threaded test context; Rust test harness runs
-        // each test in a separate thread but std::env::set_var is not
-        // thread-safe in multi-threaded test contexts. Tests that mutate
-        // env should be run with `RUST_TEST_THREADS=1` to avoid races.
-        // This file documents that caveat in the test comment.
+        // SAFETY: every test in this process that reads or mutates this key
+        // holds ENV_LOCK for the full lifetime of this guard.
         unsafe { std::env::set_var(key, value) };
         Self { key, original }
     }
@@ -896,6 +900,7 @@ impl Drop for EnvGuard {
 #[test]
 fn default_lcp_byte_budget_within_clamp_range() {
     const GIB: u64 = 1024 * 1024 * 1024;
+    let _env_lock = lock_env();
     let budget = default_lcp_byte_budget();
     assert!(
         budget >= GIB,
@@ -916,6 +921,7 @@ fn default_lcp_byte_budget_within_clamp_range() {
 #[test]
 fn default_lcp_byte_budget_env_override_2g() {
     const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
+    let _env_lock = lock_env();
     let _guard = EnvGuard::set("HF2Q_KV_LCP_RESUME_CAPACITY", "2g");
     let budget = default_lcp_byte_budget();
     assert_eq!(
@@ -933,6 +939,7 @@ fn default_lcp_byte_budget_env_override_2g() {
 #[test]
 fn default_lcp_byte_budget_legacy_entry_count_8() {
     const EXPECTED: u64 = 8 * 300 * 1024 * 1024;
+    let _env_lock = lock_env();
     let _guard = EnvGuard::set("HF2Q_KV_LCP_RESUME_CAPACITY", "8");
     let budget = default_lcp_byte_budget();
     assert_eq!(

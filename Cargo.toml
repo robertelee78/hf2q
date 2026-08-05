@@ -2,7 +2,7 @@
 name = "hf2q"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81.0"
+rust-version = "1.88.0"
 authors = ["Robert E. Lee <robert@agidreams.us>"]
 description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats and serving them over an OpenAI-compatible API on Apple Silicon"
 license = "Apache-2.0 OR MIT"
