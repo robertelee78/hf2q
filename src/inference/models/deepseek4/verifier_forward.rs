@@ -9,6 +9,8 @@ use super::forward_support::{begin_prefill_pool_layer, end_prefill_pool_layer};
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
 use super::Deepseek4Model;
 
+pub(crate) const FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER: usize = 8;
+
 impl Deepseek4Model {
     /// Execute one bounded prompt chunk layer-major with true matrix rows.
     pub fn forward_verifier_prefill(
@@ -35,10 +37,10 @@ impl Deepseek4Model {
         }
     }
 
-    /// Prefill an arbitrarily long prompt. The compressor backend admits one
-    /// matrix prefill only at position zero; after that boundary, tokens use
-    /// the native incremental verifier. This still retains and extends the
-    /// committed cache without replaying earlier context.
+    /// Prefill the leading portion of a fresh prompt as one native matrix
+    /// transaction. Once a cache exists, extend it with the exact incremental
+    /// verifier so follow-up turns preserve decode-equivalent recurrent and
+    /// quantization semantics.
     pub fn forward_verifier_prompt(
         &mut self,
         token_ids: &[u32],
@@ -48,7 +50,9 @@ impl Deepseek4Model {
         let mut state = None;
         let mut offset = 0;
         if cache.position() == 0 {
-            let batch = token_ids.len().min(self.cfg.sliding_window as usize);
+            let batch = token_ids.len().min(
+                self.cfg.sliding_window as usize * FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER,
+            );
             state = Some(self.forward_verifier_prefill(&token_ids[..batch], cache)?);
             offset = batch;
         }

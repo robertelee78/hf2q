@@ -125,8 +125,6 @@ pub enum CacheError {
     EmptyPrefill,
     #[error("DeepSeek-V4 start-zero prefill requires an empty cache, currently at {position}")]
     PrefillNotEmpty { position: usize },
-    #[error("DeepSeek-V4 prefill length {requested} exceeds the {maximum}-token native window")]
-    PrefillWindow { requested: usize, maximum: usize },
     #[error("DeepSeek-V4 cache is poisoned by a partial token; reset and replay the request")]
     Poisoned,
     #[error("DeepSeek-V4 cache snapshot does not match the live cache plan")]

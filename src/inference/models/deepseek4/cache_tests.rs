@@ -359,7 +359,7 @@ fn start_zero_prefill_span_counts_complete_groups_and_publishes_once() {
 }
 
 #[test]
-fn bounded_prefill_chunks_append_across_window_and_compression_boundaries() {
+fn prefill_transactions_cross_window_and_compression_boundaries() {
     let cfg = config(vec![4, 128]);
     let plan = Deepseek4CachePlan::for_context(&cfg, 512).unwrap();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -393,13 +393,12 @@ fn bounded_prefill_chunks_append_across_window_and_compression_boundaries() {
     assert_eq!(next.layers[1].compressed_count, 1);
     assert_eq!(next.layers[1].compressed_valid_after, 2);
 
-    assert!(matches!(
-        cache.plan_prefill(129),
-        Err(CacheError::PrefillWindow {
-            requested: 129,
-            maximum: 128
-        })
-    ));
+    let wider_than_window = cache.plan_prefill(129).unwrap();
+    assert_eq!(wider_than_window.start_position, 129);
+    assert_eq!(wider_than_window.layers[0].window_write_start, 1);
+    assert_eq!(wider_than_window.layers[0].window_valid_after, 128);
+    assert_eq!(wider_than_window.layers[0].compressed_count, 32);
+    assert_eq!(wider_than_window.layers[1].compressed_count, 1);
 }
 
 #[test]

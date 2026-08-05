@@ -20,7 +20,7 @@ use tokenizers::Tokenizer;
 
 use crate::inference::models::deepseek4::{
     cache::{Deepseek4Cache, Deepseek4CacheSnapshot},
-    tokenizer as deepseek_tokenizer, Deepseek4Model,
+    tokenizer as deepseek_tokenizer, Deepseek4Model, FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER,
 };
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
@@ -34,6 +34,8 @@ use super::engine::LoadOptions;
 /// authoritative.
 pub const DEFAULT_CONTEXT_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
+const MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS: usize = 32;
+const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
 
 pub struct Deepseek4LoadedModel {
     pub model: Deepseek4Model,
@@ -175,7 +177,9 @@ impl Deepseek4LoadedModel {
         let mut state = None;
         let mut offset = 0;
         if self.cache.position() == 0 {
-            let batch = tokens.len().min(self.model.cfg.sliding_window as usize);
+            let batch = tokens.len().min(
+                self.model.cfg.sliding_window as usize * FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER,
+            );
             anyhow::ensure!(
                 !cancelled(),
                 "DeepSeek-V4 generation cancelled during prefill"
@@ -183,7 +187,7 @@ impl Deepseek4LoadedModel {
             state = Some(
                 self.model
                     .forward_verifier_prefill(&tokens[..batch], &mut self.cache)
-                    .context("execute DeepSeek-V4 position-zero batch prefill")?,
+                    .context("execute DeepSeek-V4 fresh-prompt matrix prefill")?,
             );
             self.committed_tokens.extend_from_slice(&tokens[..batch]);
             offset = batch;
@@ -216,18 +220,21 @@ impl Deepseek4LoadedModel {
             self.context_limit()
         );
 
-        let reuse = select_prefix_reuse(
-            prompt_tokens,
-            &self.committed_tokens,
-            if self.cache.is_poisoned() {
-                usize::MAX
-            } else {
-                self.cache.position()
-            },
-            &self.turn_anchor_tokens,
-            self.turn_anchor
-                .as_ref()
-                .map_or(0, Deepseek4CacheSnapshot::position),
+        let reuse = prefer_matrix_prefill(
+            prompt_tokens.len(),
+            select_prefix_reuse(
+                prompt_tokens,
+                &self.committed_tokens,
+                if self.cache.is_poisoned() {
+                    usize::MAX
+                } else {
+                    self.cache.position()
+                },
+                &self.turn_anchor_tokens,
+                self.turn_anchor
+                    .as_ref()
+                    .map_or(0, Deepseek4CacheSnapshot::position),
+            ),
         );
         let reset_from_scratch = matches!(reuse, PrefixReuse::Reset);
         let cached_tokens = match reuse {
@@ -338,6 +345,19 @@ enum PrefixReuse {
     Reset,
 }
 
+fn prefer_matrix_prefill(prompt_len: usize, reuse: PrefixReuse) -> PrefixReuse {
+    let cached = match reuse {
+        PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor(count) => count,
+        PrefixReuse::Reset => return PrefixReuse::Reset,
+    };
+    let suffix = prompt_len.saturating_sub(cached);
+    if suffix > MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS && cached < MIN_MATRIX_REUSE_PREFIX_TOKENS {
+        PrefixReuse::Reset
+    } else {
+        reuse
+    }
+}
+
 fn select_prefix_reuse(
     prompt: &[u32],
     live: &[u32],
@@ -410,7 +430,7 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_prefix_reuse, PrefixReuse};
+    use super::{prefer_matrix_prefill, select_prefix_reuse, PrefixReuse};
 
     #[test]
     fn growing_transcript_prefers_longest_live_prefix() {
@@ -433,6 +453,30 @@ mod tests {
         assert_eq!(
             select_prefix_reuse(&[4, 5, 6], &[1, 2, 3], 3, &[1, 2], 2),
             PrefixReuse::Reset
+        );
+    }
+
+    #[test]
+    fn trivial_prefix_reuse_yields_to_full_matrix_prefill() {
+        assert_eq!(
+            prefer_matrix_prefill(306, PrefixReuse::RecoveryAnchor(1)),
+            PrefixReuse::Reset
+        );
+        assert_eq!(
+            prefer_matrix_prefill(516, PrefixReuse::Live(16)),
+            PrefixReuse::Reset
+        );
+    }
+
+    #[test]
+    fn short_suffix_and_meaningful_prefix_still_reuse_cache() {
+        assert_eq!(
+            prefer_matrix_prefill(48, PrefixReuse::Live(37)),
+            PrefixReuse::Live(37)
+        );
+        assert_eq!(
+            prefer_matrix_prefill(180, PrefixReuse::RecoveryAnchor(140)),
+            PrefixReuse::RecoveryAnchor(140)
         );
     }
 }

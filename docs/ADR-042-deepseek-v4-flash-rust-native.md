@@ -23,13 +23,18 @@ Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
 evidence.
 
-The accepted base-model runtime executes a native position-zero batch of up to
-128 tokens, then appends the remaining prompt through the same transactional
-Rust/Metal decode path. The OpenAI server defaults to a 131,072-token serving
-context, may be configured with `HF2Q_DEEPSEEK_MAX_SEQ_LEN`, and is capped by
-the checkpoint's 1,048,576-token trained limit. The separate DSpark draft
-artifact remains follow-up work and is never silently represented as part of
-the accepted base GGUF.
+The accepted base-model runtime executes up to 1,024 leading tokens of a fresh
+prompt as one native matrix transaction, eight times wider than the 128-token
+physical attention window. Attention reads the transaction's compact KV source
+while only the final physical window is published to the circular cache. The
+bound prevents the dense sparse-mask adapter from growing quadratically without
+limit; a longer remainder and existing contexts retain exact token-wise suffix
+extension. Agentic follow-up turns therefore do not recalculate their committed
+prefix. The OpenAI server defaults to a 131,072-token serving context, may be
+configured with `HF2Q_DEEPSEEK_MAX_SEQ_LEN`, and is capped by the checkpoint's
+1,048,576-token trained limit. The separate DSpark draft artifact remains
+follow-up work and is never silently represented as part of the accepted base
+GGUF.
 
 Agentic serving is stateful. A growing rendered transcript reuses the exact
 live native KV/recurrent prefix and evaluates only its suffix. Because the
@@ -193,6 +198,12 @@ the longest safe prefix for each request:
    changes the recent suffix;
 3. reset and replay when neither token prefix matches.
 
+A short suffix of at most 32 tokens always keeps a valid prefix. For a larger
+suffix, a prefix shorter than the 128-token native window is not treated as a
+useful cache hit: the worker resets and uses full matrix prefill. This prevents
+a shared BOS/role prefix from forcing hundreds of tokens through the slower
+incremental path while retaining fast normal tool-result and follow-up turns.
+
 Cache mutation is transactional and partial-token failure poisons the live
 state until reset or checkpoint restoration. Decode is capped before the fixed
 context boundary, so an oversized `max_tokens` request terminates with
@@ -283,7 +294,7 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Bounded working vectors | Receipt maximum 4,670,627,840 bytes; 529,530,880 F32 elements in the largest row-aligned chunk |
 | DSpark boundary | 4,705 source tensors explicitly excluded from the base GGUF and receipt-marked for a separate draft artifact |
 | Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
-| Native primitive + serving regression | 69 DeepSeek-focused tests passed; 0 failed; three real-artifact hardware tests ignored by default |
+| Native primitive + serving regression | 71 DeepSeek-focused tests passed; 0 failed; three real-artifact hardware tests ignored by default |
 | Pinned compute dependency | `mlx-native` commit `7cc3d308c37161e6602c9218ad3a14b5f86d7d4a`; pushed, clean-checkout build verified, and pinned exactly in `Cargo.lock` |
 | Clean dependency regression | 27 mlx-native tests passed across indexer, MoE routing, Q2_K, sparse-prefill-mask, and dense-GEMM suites |
 | Official activation simulation | Owned Metal E4M3/E8M0 main-KV and Hadamard+E2M1/E8M0 indexer paths match exact BF16 CPU references; 3/3 focused tests passed |
@@ -300,17 +311,20 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Native inference telemetry | 20.80 s load; 8.15 s incremental six-token prefill (0.736 tok/s); 30.38 s total; 67,364,585,472-byte max RSS; zero swaps |
 | Reference inference telemetry | Pinned llama.cpp raw-completion oracle processed the same six tokens in 73.89 ms (81.20 tok/s) after load; not yet an H4 comparison because hf2q currently submits one-token graphs while the reference batches all six |
 | Official arithmetic coherence | Prompt `What is 2+2? Answer with only the number.` rendered to 17 source-parity token IDs; greedy output reasoned to `2+2 = 4` and terminated with final answer `4` |
-| Extended-context execution | Position-zero native batches cover up to 128 rows; longer prompts and cached suffixes append transactionally one token at a time; server default 131,072 tokens with a metadata-enforced 1,048,576-token ceiling |
+| Extended-context execution | Fresh prompts matrix-prefill up to 1,024 rows beyond the 128-row physical window, then extend exactly; cached suffixes retain exact token-wise extension; server default 131,072 tokens with a metadata-enforced 1,048,576-token ceiling |
+| Matrix-bound artifact proof | A fresh 1,036-token request crossed the 1,024-row matrix bound, completed its exact incremental tail coherently, and reached 356.03 prompt tok/s / 2.910 s TTFT on the warm shape |
+| Matched fresh-prefix prefill benchmark | Identical 306-token greedy request, warm shape, `cached_tokens=0`, three trials: committed baseline 5.4951/5.4957/5.4905 s (median 55.69 tok/s); matrix-prefill candidate 1.0004/1.0067/1.0035 s (median 304.94 tok/s), a 5.48x TTFT speedup |
+| Trivial-prefix policy proof | A one-token recovery-anchor hit followed by a 305-token suffix resets to `cached_tokens=0`; two real-artifact trials prefetched in 1.0034 and 0.9572 s instead of taking the incremental path |
 | Artifact-backed tests | Exact 1,328-tensor catalog, all 43 verifier layers plus finite vocabulary logits, greedy token selection, and embedded tokenizer parity passed against the 96.3 GB artifact |
 | Final native decode sample | 56 generated tokens in 1.24 s (45.308 tok/s) on the official arithmetic prompt after the clean pinned-dependency release build |
 | Matched five-run native benchmark | 45.1, 45.1, 37.7, 45.2, and 45.1 tok/s; median 45.1 tok/s, p95 45.2 tok/s; 63 verifier evaluations for 64 generated tokens; warm-prefill median 74.6 tok/s |
 | Matched llama.cpp reference | 41.58 tok/s on the same artifact and benchmark contract; hf2q median is 1.085x (+8.5%) |
 | Performance parity | Passed: native median exceeds the H4 0.90x decode floor and the pinned llama.cpp reference while retaining coherent greedy output |
 | Native OpenAI server load | Real 96.3 GB artifact loaded in 19.92 s as `DeepSeek-V4-Flash-0731-Q2_K_S`; `/v1/models` reports `deepseek4`, Q2_K, 256 experts/6 active, native MLX, and the configured 4,096-token validation context |
-| Exact growing-turn cache | Second unary transcript reused 16 of 28 prompt tokens; suffix prefill fell from 6.16 s on the cold first prompt to 1.21 s, then decoded at 43.6 tok/s |
+| Exact growing-turn cache | Final real-artifact unary check reused 16 of 27 prompt tokens; only the 11-token suffix ran, with 0.276 s TTFT; an earlier 37-of-48-token coding turn prefetched its suffix in 0.287 s |
 | Canonical reasoning recovery | Thinking-mode follow-up with old `reasoning_content` removed restored the native recovery checkpoint (`cached_tokens=4` of 21 on the deliberately tiny prompt) rather than replaying the whole prefix |
 | Required tool call | Real model returned OpenAI `read_file` with arguments `{"path":"/tmp/example.txt"}` and `finish_reason: "tool_calls"`; no raw DSML leaked |
 | Constrained tool performance | Greedy candidate-ranked grammar enforcement improved the same 51-token tool call from 2.9 to 25.4 tok/s while preserving the structured call |
 | SSE tool + cache | Streaming response emitted role, indexed `tool_calls`, `finish_reason: "tool_calls"`, usage, and `[DONE]`; it reused 290 of the 298 rendered tool-prompt tokens |
 | Unsupported surfaces | DeepSeek-V4 embeddings, multimodal injections, and slot-aware scheduling fail explicitly; no alternate family/runtime fallback is selected |
-| Full binary regression | 3,811 passed and 44 ignored; one unrelated concurrent Eagle3 Metal bit-parity assertion drifted during the full GPU-heavy run and passed immediately when rerun alone; all DeepSeek/serve/cache/tool tests remained green |
+| Full binary regression | 3,814 passed, 0 failed, and 44 ignored in 173.97 s after the matrix-prefill/cache-policy change |

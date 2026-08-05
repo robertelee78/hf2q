@@ -2,7 +2,7 @@
 
 use super::{CacheError, Deepseek4Cache};
 
-/// Physical writes and final visibility for one bounded prompt chunk.
+/// Physical writes and final visibility for one prompt transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayerCacheSpan {
     pub layer_index: usize,
@@ -24,9 +24,9 @@ pub struct CacheSpan {
 }
 
 impl Deepseek4Cache {
-    /// Plan one layer-major prompt chunk without publishing logical
-    /// visibility. A chunk is capped at the physical circular-window width;
-    /// callers process longer prompts as a sequence of transactions.
+    /// Plan one layer-major prompt transaction without publishing logical
+    /// visibility. Raw attention reads the transaction's compact KV source,
+    /// while the live circular cache retains only its final physical window.
     pub fn plan_prefill(&self, token_count: usize) -> Result<CacheSpan, CacheError> {
         if self.is_poisoned() {
             return Err(CacheError::Poisoned);
@@ -45,19 +45,6 @@ impl Deepseek4Cache {
             return Err(CacheError::ContextBound {
                 requested: end,
                 maximum: self.plan.context_length,
-            });
-        }
-        let maximum = self
-            .plan
-            .layers
-            .iter()
-            .map(|layer| layer.window_kv.shape[0])
-            .min()
-            .unwrap_or(0);
-        if token_count > maximum {
-            return Err(CacheError::PrefillWindow {
-                requested: token_count,
-                maximum,
             });
         }
         let layers = self
