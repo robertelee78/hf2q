@@ -1,8 +1,8 @@
-//! Atomic start-zero prompt transactions for the DeepSeek-V4 cache.
+//! Atomic bounded prompt transactions for the DeepSeek-V4 cache.
 
 use super::{CacheError, Deepseek4Cache};
 
-/// Physical writes and final visibility for one start-zero prompt prefill.
+/// Physical writes and final visibility for one bounded prompt chunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayerCacheSpan {
     pub layer_index: usize,
@@ -10,8 +10,10 @@ pub struct LayerCacheSpan {
     pub window_valid_after: usize,
     pub compressed_write_start: usize,
     pub compressed_count: usize,
+    pub compressed_valid_after: usize,
     pub indexer_write_start: usize,
     pub indexer_count: usize,
+    pub indexer_valid_after: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,22 +24,26 @@ pub struct CacheSpan {
 }
 
 impl Deepseek4Cache {
-    /// Plan one layer-major prompt without publishing logical visibility.
-    pub fn plan_prefill_start0(&self, token_count: usize) -> Result<CacheSpan, CacheError> {
+    /// Plan one layer-major prompt chunk without publishing logical
+    /// visibility. A chunk is capped at the physical circular-window width;
+    /// callers process longer prompts as a sequence of transactions.
+    pub fn plan_prefill(&self, token_count: usize) -> Result<CacheSpan, CacheError> {
         if self.is_poisoned() {
             return Err(CacheError::Poisoned);
         }
         if token_count == 0 {
             return Err(CacheError::EmptyPrefill);
         }
-        if self.next_position != 0 {
-            return Err(CacheError::PrefillNotEmpty {
-                position: self.next_position,
-            });
-        }
-        if token_count > self.plan.context_length {
+        let end = self
+            .next_position
+            .checked_add(token_count)
+            .ok_or(CacheError::ContextBound {
+                requested: usize::MAX,
+                maximum: self.plan.context_length,
+            })?;
+        if end > self.plan.context_length {
             return Err(CacheError::ContextBound {
-                requested: token_count,
+                requested: end,
                 maximum: self.plan.context_length,
             });
         }
@@ -59,28 +65,47 @@ impl Deepseek4Cache {
             .layers
             .iter()
             .map(|layer| {
-                let compressed_count = if layer.compress_ratio == 0 {
+                let ratio = layer.compress_ratio as usize;
+                let compressed_before = if ratio == 0 {
                     0
                 } else {
-                    token_count / layer.compress_ratio as usize
+                    self.next_position / ratio
                 };
+                let compressed_valid_after = if ratio == 0 { 0 } else { end / ratio };
+                let compressed_count = compressed_valid_after - compressed_before;
                 let indexer_count = usize::from(layer.compress_ratio == 4) * compressed_count;
+                let indexer_valid_after =
+                    usize::from(layer.compress_ratio == 4) * compressed_valid_after;
                 LayerCacheSpan {
                     layer_index: layer.layer_index,
-                    window_write_start: 0,
-                    window_valid_after: token_count,
-                    compressed_write_start: 0,
+                    window_write_start: self.next_position % layer.window_kv.shape[0],
+                    window_valid_after: end.min(layer.window_kv.shape[0]),
+                    compressed_write_start: compressed_before,
                     compressed_count,
-                    indexer_write_start: 0,
+                    compressed_valid_after,
+                    indexer_write_start: usize::from(layer.compress_ratio == 4)
+                        * compressed_before,
                     indexer_count,
+                    indexer_valid_after,
                 }
             })
             .collect();
         Ok(CacheSpan {
-            start_position: 0,
+            start_position: self.next_position,
             token_count,
             layers,
         })
+    }
+
+    /// Backward-compatible strict start-zero planner used by callers that
+    /// require an empty-cache transaction.
+    pub fn plan_prefill_start0(&self, token_count: usize) -> Result<CacheSpan, CacheError> {
+        if self.next_position != 0 {
+            return Err(CacheError::PrefillNotEmpty {
+                position: self.next_position,
+            });
+        }
+        self.plan_prefill(token_count)
     }
 
     /// Publish a fully drained start-zero prefill transaction atomically.
@@ -99,11 +124,6 @@ impl Deepseek4Cache {
             return Err(CacheError::StepOutOfOrder {
                 expected: self.next_position,
                 actual: start_position,
-            });
-        }
-        if start_position != 0 {
-            return Err(CacheError::PrefillNotEmpty {
-                position: start_position,
             });
         }
         let end = start_position

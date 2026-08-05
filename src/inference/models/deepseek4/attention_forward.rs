@@ -1,5 +1,5 @@
 //! Exact one-token uncompressed DeepSeek-V4 attention layers.
-use super::attention::window_indices;
+use super::attention::{append_prefill_window_indices, window_indices};
 use super::attention_weights::AttentionWeightsRef;
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::forward_support::{
@@ -299,8 +299,28 @@ impl Deepseek4Model {
                 )
             })
             .transpose()?;
+        let raw_prefix_len = usize::from(rows > 1 && start_position > 0) * window_capacity;
+        let compact_raw_kv_len = raw_prefix_len + rows;
+        let raw_prefix = (raw_prefix_len > 0)
+            .then(|| {
+                alloc(
+                    &device,
+                    DType::F16,
+                    vec![1, raw_prefix_len, 1, head_dim],
+                    "flash prefill raw-prefix snapshot",
+                )
+            })
+            .transpose()?;
         let prefill_flash = (rows > 1)
-            .then(|| DeepseekPrefillFlashArena::new(&device, rows, heads, head_dim, rows))
+            .then(|| {
+                DeepseekPrefillFlashArena::new(
+                    &device,
+                    rows,
+                    heads,
+                    head_dim,
+                    compact_raw_kv_len,
+                )
+            })
             .transpose()?;
 
         let hc_params = rms_params(&device, self.cfg.rms_norm_eps, hc_hidden, "HC RMS params")?;
@@ -334,7 +354,11 @@ impl Deepseek4Model {
         frequency_buffer
             .as_logical_mut_slice::<f32>()?
             .copy_from_slice(&frequencies);
-        let index_rows = window_indices(window_capacity, rows, start_position)?;
+        let index_rows = if raw_prefix_len > 0 {
+            append_prefill_window_indices(window_capacity, rows, start_position)?
+        } else {
+            window_indices(window_capacity, rows, start_position)?
+        };
         let index_width = index_rows
             .first()
             .context("DeepSeek-V4 window index row missing")?
@@ -594,7 +618,23 @@ impl Deepseek4Model {
             } else {
                 &kv_rope
             };
-            session.barrier_between(&[kv_cache_input], &[&layer_cache.window_kv]);
+            if let Some(prefix) = raw_prefix.as_ref() {
+                session.barrier_between(&[&layer_cache.window_kv], &[prefix]);
+                cast(
+                    session.encoder_mut(),
+                    registry,
+                    device.metal_device(),
+                    &layer_cache.window_kv,
+                    prefix,
+                    raw_prefix_len * head_dim,
+                    CastDirection::BF16ToF16,
+                )?;
+            }
+            let mut window_write_inputs = vec![kv_cache_input];
+            if let Some(prefix) = raw_prefix.as_ref() {
+                window_write_inputs.push(prefix);
+            }
+            session.barrier_between(&window_write_inputs, &[&layer_cache.window_kv]);
             dispatch_kv_cache_copy(
                 session.encoder_mut(),
                 registry,
@@ -619,6 +659,7 @@ impl Deepseek4Model {
                     registry,
                     &device,
                     &q_rope,
+                    raw_prefix.as_ref(),
                     &kv_rope,
                     None,
                     sinks,
@@ -626,8 +667,9 @@ impl Deepseek4Model {
                     &attention,
                     prefill_flash,
                     rows,
-                    rows,
-                    rows,
+                    raw_prefix_len,
+                    compact_raw_kv_len,
+                    compact_raw_kv_len,
                     index_width,
                     heads,
                     head_dim,

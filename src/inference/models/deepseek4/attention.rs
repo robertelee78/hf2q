@@ -127,19 +127,10 @@ pub fn compressed_indices(
     if ratio == 0 {
         return Err(AttentionError::EmptyWindow);
     }
-    if start_pos > 0 {
-        if seqlen != 1 {
-            return Err(AttentionError::IncrementalSequence { seqlen });
-        }
-        return Ok(vec![(0..((start_pos + 1) / ratio))
-            .map(|index| (offset + index) as i32)
-            .collect()]);
-    }
-
-    let groups = seqlen / ratio;
+    let groups = (start_pos + seqlen) / ratio;
     Ok((0..seqlen)
         .map(|query| {
-            let completed = (query + 1) / ratio;
+            let completed = (start_pos + query + 1) / ratio;
             (0..groups)
                 .map(|group| {
                     if group >= completed {
@@ -149,6 +140,40 @@ pub fn compressed_indices(
                     }
                 })
                 .collect()
+        })
+        .collect())
+}
+
+/// Raw-window indices for a multi-row append prefill whose compact KV input
+/// is `[prior physical ring slots][current chunk rows]`.
+///
+/// Prior rows retain their physical circular-cache indices. Current rows use
+/// the appended portion, so overwriting the live ring later in the command
+/// buffer cannot change any query's causal view.
+pub(super) fn append_prefill_window_indices(
+    window_size: usize,
+    seqlen: usize,
+    start_pos: usize,
+) -> Result<Vec<Vec<i32>>, AttentionError> {
+    if window_size == 0 {
+        return Err(AttentionError::EmptyWindow);
+    }
+    let width = (start_pos + seqlen).min(window_size);
+    Ok((0..seqlen)
+        .map(|query| {
+            let absolute = start_pos + query;
+            let first = absolute.saturating_sub(window_size - 1);
+            let mut row = (first..=absolute)
+                .map(|position| {
+                    if position < start_pos {
+                        (position % window_size) as i32
+                    } else {
+                        (window_size + position - start_pos) as i32
+                    }
+                })
+                .collect::<Vec<_>>();
+            row.resize(width, -1);
+            row
         })
         .collect())
 }
@@ -268,6 +293,22 @@ mod tests {
         assert_eq!(got[7], vec![10, 11]);
         assert_eq!(got[9], vec![10, 11]);
         assert_eq!(compressed_indices(4, 1, 7, 10).unwrap(), vec![vec![10, 11]]);
+        assert_eq!(
+            compressed_indices(4, 3, 6, 10).unwrap(),
+            vec![vec![10, -1], vec![10, 11], vec![10, 11]]
+        );
+    }
+
+    #[test]
+    fn append_prefill_window_keeps_prior_ring_and_current_rows_distinct() {
+        assert_eq!(
+            append_prefill_window_indices(4, 3, 3).unwrap(),
+            vec![vec![0, 1, 2, 4], vec![1, 2, 4, 5], vec![2, 4, 5, 6]]
+        );
+        assert_eq!(
+            append_prefill_window_indices(4, 2, 6).unwrap(),
+            vec![vec![3, 0, 1, 4], vec![0, 1, 4, 5]]
+        );
     }
 
     #[test]

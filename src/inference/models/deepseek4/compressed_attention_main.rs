@@ -32,6 +32,7 @@ impl MainCompressorArena {
         cfg: &Deepseek4Config,
         ratio: u32,
         rows: usize,
+        compressed_count: usize,
     ) -> Result<Self> {
         let dim = cfg.head_dim as usize;
         let coefficient = usize::from(ratio == 4) + 1;
@@ -52,13 +53,13 @@ impl MainCompressorArena {
             output: alloc(
                 device,
                 DType::BF16,
-                vec![1, (rows / ratio as usize).max(1), dim],
+                vec![1, compressed_count.max(1), dim],
                 "main compressor output",
             )?,
             rope: alloc(
                 device,
                 DType::BF16,
-                vec![1, (rows / ratio as usize).max(1), 1, dim],
+                vec![1, compressed_count.max(1), 1, dim],
                 "main compressor rotated output",
             )?,
         })

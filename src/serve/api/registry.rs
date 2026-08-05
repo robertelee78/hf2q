@@ -182,6 +182,8 @@ impl ModelRegistration {
                 .map_err(|e| e.to_string()),
             "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema, shape)
                 .map_err(|e| e.to_string()),
+            "deepseek4" => deepseek4_tool_call_gbnf(fn_name, params_schema, shape)
+                .map_err(|e| e.to_string()),
             other => Err(format!(
                 "tool_call_gbnf: no per-model grammar emitter for family '{}'",
                 other
@@ -206,6 +208,7 @@ impl ModelRegistration {
         match self.family {
             "gemma4" => "",
             "qwen35" => "\n",
+            "deepseek4" => "\n",
             _ => "",
         }
     }
@@ -239,6 +242,10 @@ impl ModelRegistration {
         match self.family {
             "gemma4" => "<|tool_call>",
             "qwen35" => "\n<tool_call>\n",
+            // DeepSeek puts multiple invokes inside one outer block. The
+            // dedicated emitter carries that repetition; multi-function
+            // combination uses a newline between body alternatives.
+            "deepseek4" => "\n",
             _ => "",
         }
     }
@@ -373,10 +380,23 @@ pub const QWEN35: ModelRegistration = ModelRegistration {
     tool_preamble: None,
 };
 
+/// DeepSeek-V4-Flash-0731. Tool calls use one outer DSML block containing
+/// one or more invoke elements; the body parser therefore returns a vector
+/// rather than assuming one marker pair equals one function call.
+pub const DEEPSEEK4: ModelRegistration = ModelRegistration {
+    family: "deepseek4",
+    id_substrings: &["deepseek-v4", "deepseek4", "deepseek_v4"],
+    reasoning_open: Some("<think>"),
+    reasoning_close: Some("</think>"),
+    tool_open: Some("<｜DSML｜tool_calls>"),
+    tool_close: Some("</｜DSML｜tool_calls>"),
+    tool_preamble: None,
+};
+
 /// All built-in registrations in priority order. Later entries override
 /// earlier ones when substrings overlap — but day-one substrings are
 /// disjoint.
-pub const BUILTIN_REGISTRATIONS: &[ModelRegistration] = &[GEMMA4, QWEN35];
+pub const BUILTIN_REGISTRATIONS: &[ModelRegistration] = &[GEMMA4, QWEN35, DEEPSEEK4];
 
 // ---------------------------------------------------------------------------
 // Registry (process-global)
@@ -906,6 +926,10 @@ const ALL_FAMILY_LEAK_MARKERS: &[&str] = &[
     // Qwen 3.5 / 3.6 reasoning + tool
     "<think>", "</think>",
     "<tool_call>", "</tool_call>",
+    // DeepSeek-V4 DSML tool block + inner records
+    "<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>",
+    "<｜DSML｜invoke", "</｜DSML｜invoke>",
+    "<｜DSML｜parameter", "</｜DSML｜parameter>",
 ];
 
 /// Scrub all registered family special-token markers from `body` so they
@@ -970,9 +994,30 @@ pub fn is_valid_tool_name(name: &str) -> bool {
 /// the engine can degrade gracefully — emit a `Content(raw_body)` fragment
 /// rather than a malformed tool-call delta).
 pub fn parse_tool_call_body(reg: &ModelRegistration, body: &str) -> Option<ParsedToolCall> {
+    parse_tool_call_bodies(reg, body)?.into_iter().next()
+}
+
+/// Parse all function calls represented by one registered outer tool block.
+/// Gemma/Qwen marker pairs each contain one call; DeepSeek DSML deliberately
+/// permits multiple invokes inside a single pair.
+pub fn parse_tool_call_bodies(
+    reg: &ModelRegistration,
+    body: &str,
+) -> Option<Vec<ParsedToolCall>> {
     match reg.family {
-        "gemma4" => parse_gemma4_tool_call(body),
-        "qwen35" => parse_qwen35_tool_call(body),
+        "gemma4" => parse_gemma4_tool_call(body).map(|call| vec![call]),
+        "qwen35" => parse_qwen35_tool_call(body).map(|call| vec![call]),
+        "deepseek4" => crate::core::deepseek_v4_encoding::parse_tool_calls_body(body)
+            .ok()
+            .map(|calls| {
+                calls
+                    .into_iter()
+                    .map(|call| ParsedToolCall {
+                        name: call.function.name,
+                        arguments_json: call.function.arguments,
+                    })
+                    .collect()
+            }),
         _ => None,
     }
 }
@@ -2562,6 +2607,233 @@ fn qwen35_tool_call_gbnf(
     Ok(out)
 }
 
+/// Emit DeepSeek-V4's native DSML tool-call syntax. The outer marker pair
+/// contains one or more invoke elements; parameter names are restricted to
+/// the declared schema and non-string values are constrained to valid JSON.
+fn deepseek4_tool_call_gbnf(
+    fn_name: &str,
+    params_schema: &serde_json::Value,
+    shape: GrammarShape,
+) -> Result<String, EmitterError> {
+    let mut rules: Vec<(String, String)> = vec![
+        (
+            "dsml-json-char".into(),
+            r#"[^"\\\x00-\x1F] | [\\] (["\\/bfnrt] | "u" [0-9a-fA-F]{4})"#.into(),
+        ),
+        (
+            "dsml-json-str".into(),
+            r#""\"" dsml-json-char* "\"""#.into(),
+        ),
+        (
+            "dsml-json-num".into(),
+            r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#.into(),
+        ),
+        (
+            "dsml-json-obj".into(),
+            r#""{" ("}" | dsml-json-str ":" dsml-json-val ("," dsml-json-str ":" dsml-json-val)* "}")"#.into(),
+        ),
+        (
+            "dsml-json-arr".into(),
+            r#""[" ("]" | dsml-json-val ("," dsml-json-val)* "]")"#.into(),
+        ),
+        (
+            "dsml-json-val".into(),
+            r#"dsml-json-str | dsml-json-num | "true" | "false" | "null" | dsml-json-obj | dsml-json-arr"#.into(),
+        ),
+        (
+            "dsml-string-char".into(),
+            // `<` begins the closing DSML parameter tag. Backslash escapes
+            // remain allowed so ordinary source-code/path arguments work.
+            r#"[^<\\] | [\\] [^\x00-\x1F]"#.into(),
+        ),
+        ("dsml-string-val".into(), "dsml-string-char*".into()),
+    ];
+
+    let newline = gbnf_literal("\n");
+    let parameter_close = gbnf_literal("</｜DSML｜parameter>");
+    let required_set: std::collections::HashSet<String> = params_schema
+        .as_object()
+        .and_then(|object| object.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if required_set.len() > MAX_REQUIRED_KEYS {
+        return Err(EmitterError::TooManyRequiredKeys {
+            fn_name: fn_name.to_string(),
+            count: required_set.len(),
+        });
+    }
+
+    let mut required_parameter_rules = Vec::new();
+    let mut optional_parameter_rules = Vec::new();
+    if let Some(properties) = params_schema
+        .as_object()
+        .and_then(|object| object.get("properties"))
+        .and_then(serde_json::Value::as_object)
+    {
+        let mut keys = properties.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            let schema = &properties[key];
+            let is_string = schema
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "string");
+            let value_rule = if is_string {
+                "dsml-string-val"
+            } else {
+                "dsml-json-val"
+            };
+            let open = gbnf_literal(&format!(
+                "<｜DSML｜parameter name=\"{}\" string=\"{}\">",
+                key,
+                if is_string { "true" } else { "false" }
+            ));
+            let rule_name = format!("dsml-param-{}", sanitize_rule_name_local(key));
+            rules.push((
+                rule_name.clone(),
+                format!("{} {} {} {}", open, value_rule, parameter_close, newline),
+            ));
+            if required_set.contains(key.as_str()) {
+                required_parameter_rules.push(rule_name);
+            } else {
+                optional_parameter_rules.push(rule_name);
+            }
+        }
+    }
+    let parameter_sequence = if required_parameter_rules.is_empty()
+        && optional_parameter_rules.is_empty()
+    {
+        None
+    } else if required_parameter_rules.is_empty() {
+        let item = "dsml-optional-param".to_string();
+        rules.push((
+            item.clone(),
+            format!("( {} )", optional_parameter_rules.join(" | ")),
+        ));
+        let list = "dsml-param-list".to_string();
+        rules.push((list.clone(), format!("{}*", item)));
+        Some(list)
+    } else {
+        let required = build_dsml_required_permutation(
+            fn_name,
+            &required_parameter_rules,
+            &mut rules,
+        );
+        if optional_parameter_rules.is_empty() {
+            Some(required)
+        } else {
+            let item = "dsml-optional-param".to_string();
+            rules.push((
+                item.clone(),
+                format!("( {} )", optional_parameter_rules.join(" | ")),
+            ));
+            let list = "dsml-param-list".to_string();
+            rules.push((list.clone(), format!("{} {}*", required, item)));
+            Some(list)
+        }
+    };
+
+    let invoke_open = gbnf_literal(&format!("<｜DSML｜invoke name=\"{}\">", fn_name));
+    let invoke_close = gbnf_literal("</｜DSML｜invoke>");
+    let invoke = if let Some(parameters) = parameter_sequence {
+        format!("{} {} {} {}", invoke_open, newline, parameters, invoke_close)
+    } else {
+        // The official formatter emits one blank line for an empty argument
+        // map: `<invoke>\n\n</invoke>`.
+        format!("{} {} {} {}", invoke_open, newline, newline, invoke_close)
+    };
+    rules.push(("dsml-invoke".into(), invoke));
+
+    let open = gbnf_literal("<｜DSML｜tool_calls>");
+    let close = gbnf_literal("</｜DSML｜tool_calls>");
+    let full_body = match shape {
+        GrammarShape::SingleBody => "dsml-invoke".to_string(),
+        GrammarShape::OneOrMoreCalls { parallel } => {
+            let invokes = if parallel {
+                format!("dsml-invoke ( {} dsml-invoke )*", newline)
+            } else {
+                "dsml-invoke".to_string()
+            };
+            format!("{} {} {} {} {}", open, newline, invokes, newline, close)
+        }
+        GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
+            let invokes = if parallel {
+                format!("dsml-invoke ( {} dsml-invoke )*", newline)
+            } else {
+                "dsml-invoke".to_string()
+            };
+            // The lazy splitter consumed only the outer open marker. The
+            // leading newline, invoke body, and outer close remain constrained.
+            format!("{} {} {} {}", newline, invokes, newline, close)
+        }
+    };
+    rules.push(("root".into(), full_body));
+
+    let mut output = String::new();
+    output.push_str(&format!("root ::= {}\n", rules.last().unwrap().1));
+    for (name, body) in rules.into_iter().filter(|(name, _)| name != "root") {
+        output.push_str(&format!("{} ::= {}\n", name, body));
+    }
+    Ok(output)
+}
+
+/// Required DSML parameter blocks may appear in any order, but each must be
+/// present exactly once. The recursive subset grammar matches the existing
+/// Gemma/Qwen required-key contract and is bounded by `MAX_REQUIRED_KEYS`.
+fn build_dsml_required_permutation(
+    fn_name: &str,
+    required: &[String],
+    rules: &mut Vec<(String, String)>,
+) -> String {
+    let mut sorted = required.to_vec();
+    sorted.sort();
+    if sorted.len() == 1 {
+        return sorted[0].clone();
+    }
+    let suffix = sorted
+        .iter()
+        .map(|name| name.trim_start_matches("dsml-param-"))
+        .collect::<Vec<_>>()
+        .join("-");
+    let rule_name = format!(
+        "dsml-required-{}-{}",
+        sanitize_rule_name_local(fn_name),
+        suffix
+    );
+    if rules.iter().any(|(name, _)| name == &rule_name) {
+        return rule_name;
+    }
+    rules.push((rule_name.clone(), String::new()));
+    let alternatives = sorted
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let remainder = sorted
+                .iter()
+                .enumerate()
+                .filter(|(candidate, _)| *candidate != index)
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            let tail = build_dsml_required_permutation(fn_name, &remainder, rules);
+            format!("{} {}", item, tail)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let (_, body) = rules
+        .iter_mut()
+        .find(|(name, _)| name == &rule_name)
+        .expect("inserted DSML permutation rule");
+    *body = alternatives;
+    rule_name
+}
+
 /// Build the any-order permutation grammar for a non-empty set of required
 /// Qwen parameter-block rule names.  Mirror of `build_gemma4_required_permutation`
 /// but without comma separators (Qwen blocks are self-delimiting XML tags).
@@ -4073,6 +4345,79 @@ mod tests {
         let gbnf = QWEN35.tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
             .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
         grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    fn deepseek4_runtime(
+        fn_name: &str,
+        schema_json: &str,
+        shape: GrammarShape,
+    ) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = DEEPSEEK4
+            .tool_call_gbnf(fn_name, &schema, shape)
+            .unwrap_or_else(|error| panic!("tool_call_gbnf error: {error}"));
+        grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    #[test]
+    fn deepseek4_registration_and_multi_invoke_parser_are_openai_compatible() {
+        let registration = find_for("DeepSeek-V4-Flash-0731").expect("DeepSeek registration");
+        assert_eq!(registration.family, "deepseek4");
+        let body = "\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"run_tests\">\n<｜DSML｜parameter name=\"all\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n";
+        let calls = parse_tool_call_bodies(&registration, body).expect("parse DSML block");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].arguments_json).unwrap(),
+            serde_json::json!({"path": "src/main.rs"})
+        );
+        assert_eq!(calls[1].name, "run_tests");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[1].arguments_json).unwrap(),
+            serde_json::json!({"all": true})
+        );
+    }
+
+    #[test]
+    fn deepseek4_required_grammar_enforces_required_parameter() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "line": {"type": "integer"}
+            },
+            "required": ["path"]
+        }"#;
+        let mut accepted = deepseek4_runtime(
+            "read_file",
+            schema,
+            GrammarShape::OneOrMoreCalls { parallel: false },
+        );
+        let valid = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">src/lib.rs</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert!(accepted.accept_bytes(valid.as_bytes()));
+        assert!(accepted.is_accepted());
+
+        let mut rejected = deepseek4_runtime(
+            "read_file",
+            schema,
+            GrammarShape::OneOrMoreCalls { parallel: false },
+        );
+        let missing = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"line\" string=\"false\">7</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let alive = rejected.accept_bytes(missing.as_bytes());
+        assert!(!(alive && rejected.is_accepted()));
+    }
+
+    #[test]
+    fn deepseek4_parallel_grammar_uses_one_outer_block() {
+        let schema = r#"{"type":"object","properties":{}}"#;
+        let mut runtime = deepseek4_runtime(
+            "ping",
+            schema,
+            GrammarShape::OneOrMoreCalls { parallel: true },
+        );
+        let calls = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"ping\">\n\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"ping\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert!(runtime.accept_bytes(calls.as_bytes()));
+        assert!(runtime.is_accepted());
     }
 
     // -----------------------------------------------------------------------

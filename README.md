@@ -33,6 +33,10 @@ Metal kernels we own end-to-end.
 >   (ADR-027 iter-34, regression-pinned by
 >   `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).  Default-on for Qwen
 >   3.5/3.6 as of 2026-05-17 — opt out with `HF2Q_TQ_KV=0`.
+> * **DeepSeek-V4-Flash-0731 Q2_K_S decode** — 45.1 t/s median on the
+>   official 89.65 GiB hf2q-converted artifact vs 41.58 t/s for the
+>   pinned llama.cpp reference. Required-tool grammar decode reaches
+>   25.4 t/s and returns structured OpenAI tool calls.
 >
 > Methodology references in
 > [`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md);
@@ -83,11 +87,12 @@ hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
    and a persistent block-prefix KV cache.
 
 Supported architectures today: **Gemma 4 (dense + MoE)**, **Qwen 3.5 /
-3.6 (dense + MoE + multi-token-prediction)**, **Qwen 3-VL (vision +
-text)**, **BERT / Nomic-BERT** (embedding-only). Each lives under a
-single `src/inference/models/<arch>/` module — the arch-registry
-(`src/arch/`) is the single source of truth for tensor catalogs,
-quality thresholds, smoke prompts and MTP/vision flags.
+3.6 (dense + MoE + multi-token-prediction)**, **DeepSeek-V4-Flash-0731
+(compressed-attention MoE)**, **Qwen 3-VL (vision + text)**, and **BERT /
+Nomic-BERT** (embedding-only). Each lives under a single
+`src/inference/models/<arch>/` module — the arch-registry (`src/arch/`)
+is the single source of truth for tensor catalogs, quality thresholds,
+smoke prompts and MTP/vision flags.
 
 ## Install
 
@@ -191,6 +196,29 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gemma4","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+### DeepSeek-V4 agentic serving
+
+The native DeepSeek-V4 worker is intended for OpenAI-compatible coding clients
+such as OpenCode. Point the client's OpenAI-compatible base URL at
+`http://127.0.0.1:8080/v1` and select the model ID returned by `/v1/models`
+(normally the GGUF file stem):
+
+```bash
+HF2Q_DEEPSEEK_MAX_SEQ_LEN=131072 hf2q serve \
+  --model ./out/DeepSeek-V4-Flash-0731-Q2_K_S.gguf \
+  --port 8080
+
+curl http://127.0.0.1:8080/v1/models
+```
+
+Unary and streaming chat completions support reasoning content, OpenAI tools,
+required/automatic tool choice, parallel DSML invokes, cancellation, and usage
+telemetry. Growing transcripts reuse the live native KV/recurrent prefix;
+DeepSeek's old-reasoning canonicalization restores a prompt-tail checkpoint, so
+normal agent turns do not prefill the full context again. DeepSeek serving is
+currently serialized (`fifo_serial`); embeddings, multimodal messages, and the
+slot-aware scheduler fail explicitly rather than selecting another runtime.
 
 For MoE models, pass an APEX tier instead of a standard ftype:
 

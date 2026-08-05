@@ -763,27 +763,30 @@ fn extract_tool_calls_from_text(
                 }
                 registry::ToolCallEvent::ToolCallClose => {
                     let body = std::mem::take(&mut tc_body);
-                    match registry::parse_tool_call_body(reg, &body) {
-                        Some(parsed) => {
-                            let id = format!(
-                                "call_hf2q_{:016x}",
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_nanos() as u64)
-                                    .unwrap_or(0)
-                                    ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-                            );
-                            tool_calls.push(super::schema::ToolCall {
-                                id,
-                                call_type: "function".to_string(),
-                                function: super::schema::ToolCallFunction {
-                                    name: parsed.name,
-                                    arguments: parsed.arguments_json,
-                                },
-                            });
-                            tc_index += 1;
+                    match registry::parse_tool_call_bodies(reg, &body) {
+                        Some(parsed_calls) if !parsed_calls.is_empty() => {
+                            for parsed in parsed_calls {
+                                let id = format!(
+                                    "call_hf2q_{:016x}",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_nanos() as u64)
+                                        .unwrap_or(0)
+                                        ^ (tc_index as u64)
+                                            .wrapping_mul(0x9e3779b97f4a7c15)
+                                );
+                                tool_calls.push(super::schema::ToolCall {
+                                    id,
+                                    call_type: "function".to_string(),
+                                    function: super::schema::ToolCallFunction {
+                                        name: parsed.name,
+                                        arguments: parsed.arguments_json,
+                                    },
+                                });
+                                tc_index += 1;
+                            }
                         }
-                        None => {
+                        _ => {
                             // Wave-2.5 A4 + Wave 3 W-B2: for any policy
                             // carrying an active body grammar (Constrained
                             // OR AutoLazyGrammar), signal failure instead
@@ -3716,7 +3719,13 @@ fn compile_tool_grammar(
     //     correctness" in
     //     /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt.
     let auto_lazy = matches!(tool_choice, ToolChoiceValue::Auto);
-    let per_fn_shape = if matching_tools.len() == 1 {
+    let deepseek_multi = reg.family == "deepseek4" && matching_tools.len() > 1;
+    let per_fn_shape = if deepseek_multi {
+        // DeepSeek parallel calls share one outer DSML block. Emit only each
+        // function's invoke body here; the family-specific combiner below
+        // owns the single outer marker pair.
+        registry::GrammarShape::SingleBody
+    } else if matching_tools.len() == 1 {
         if auto_lazy {
             registry::GrammarShape::OneOrMoreCallsBodyOnly { parallel }
         } else {
@@ -3765,7 +3774,9 @@ fn compile_tool_grammar(
     //     the open marker to reconstruct the chat-template emission
     //     shape — except for the FIRST call, where the splitter has
     //     already consumed the open marker (awaiting_trigger gate).
-    let combined_gbnf = if fn_gbnfs.len() == 1 {
+    let combined_gbnf = if deepseek_multi {
+        combine_deepseek4_function_grammars(fn_gbnfs, auto_lazy, parallel)
+    } else if fn_gbnfs.len() == 1 {
         fn_gbnfs.into_iter().next().unwrap()
     } else {
         let separator = if auto_lazy {
@@ -4998,6 +5009,48 @@ mod compile_tool_grammar_precondition_tests {
             String::from_utf8_lossy(&payload)
         );
     }
+
+    #[test]
+    fn compile_tool_grammar_deepseek_parallel_tools_share_outer_dsml_block() {
+        let search = Tool {
+            tool_type: "function".into(),
+            function: ToolFunction {
+                name: "search".into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                })),
+            },
+        };
+        let read = Tool {
+            tool_type: "function".into(),
+            function: ToolFunction {
+                name: "read".into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                })),
+            },
+        };
+        let req = req_with_parallel(
+            "DeepSeek-V4-Flash-0731",
+            Some(vec![search, read]),
+            true,
+        );
+        let grammar = compile_tool_grammar(&req, &ToolChoiceValue::Required)
+            .expect("compile DeepSeek multi-tool grammar")
+            .expect("required tools must produce grammar");
+        let root = grammar.rule_id("root").expect("root rule");
+        let mut runtime = grammar::sampler::GrammarRuntime::new(grammar, root)
+            .expect("DeepSeek grammar runtime");
+        let payload = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">kv cache</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert!(runtime.accept_bytes(payload.as_bytes()));
+        assert!(runtime.is_accepted());
+    }
 }
 
 /// Combine multiple per-function GBNF grammars into a single grammar whose
@@ -5162,6 +5215,55 @@ fn combine_function_grammars(
         );
     }
 
+    combined
+}
+
+/// Combine multiple DeepSeek invoke grammars under one official DSML outer
+/// block. Unlike Gemma/Qwen, DeepSeek represents parallel calls as sibling
+/// `<invoke>` elements inside a single `<tool_calls>` marker pair.
+fn combine_deepseek4_function_grammars(
+    gbnfs: Vec<String>,
+    auto_lazy: bool,
+    parallel: bool,
+) -> String {
+    use grammar::parser::parse;
+    use grammar::serialize::{rename_rules, serialize};
+
+    debug_assert!(gbnfs.len() > 1);
+    let alternatives = (0..gbnfs.len())
+        .map(|index| format!("fn-{index}-root"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut combined = format!("dsml-alt ::= {alternatives}\n");
+    let open = if auto_lazy {
+        String::new()
+    } else {
+        r#""<｜DSML｜tool_calls>" "#.to_string()
+    };
+    let invokes = if parallel {
+        r#"dsml-alt ( "\n" dsml-alt )*"#
+    } else {
+        "dsml-alt"
+    };
+    combined.push_str(&format!(
+        "root ::= {open}\"\\n\" {invokes} \"\\n\" \"</｜DSML｜tool_calls>\"\n"
+    ));
+
+    for (index, gbnf) in gbnfs.iter().enumerate() {
+        let parsed = parse(gbnf).unwrap_or_else(|error| {
+            panic!(
+                "combine_deepseek4_function_grammars: per-function grammar #{index} \
+                 failed to parse: {error}\ngrammar:\n{gbnf}"
+            )
+        });
+        let renamed = rename_rules(&parsed, |name| format!("fn-{index}-{name}"));
+        combined.push_str(&serialize(&renamed));
+    }
+    if let Err(error) = parse(&combined) {
+        panic!(
+            "combine_deepseek4_function_grammars produced invalid grammar: {error}\n{combined}"
+        );
+    }
     combined
 }
 

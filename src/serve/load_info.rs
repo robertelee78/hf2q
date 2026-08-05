@@ -46,9 +46,8 @@ const RESET: &str = "\x1b[0m";
 
 /// Origin of the chat template string actually in effect for a load.
 ///
-/// Three live origins (`GgufEmbedded`, `CliOverride`, `HardcodedFallback`)
-/// plus an explicit `None` for pre-Wedge-3 GGUFs that lack the key and
-/// haven't been routed through a fallback yet.
+/// Live origins plus an explicit `None` for pre-Wedge-3 GGUFs that lack the
+/// key and haven't been routed through a fallback yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatTemplateSource {
     /// Lifted verbatim from the GGUF metadata key
@@ -63,6 +62,12 @@ pub enum ChatTemplateSource {
     HardcodedFallback {
         /// Stable identifier for the fallback in effect.  `&'static str`
         /// because every fallback is a compile-time constant.
+        name: &'static str,
+    },
+    /// Architecture-owned encoder that implements the upstream prompt
+    /// protocol directly instead of interpreting a Jinja template.
+    NativeEncoding {
+        /// Stable protocol/encoder identifier shown in the load banner.
         name: &'static str,
     },
     /// Empty / not yet rendered.  Pre-Wedge-3 Qwen35 GGUFs lacked
@@ -146,6 +151,8 @@ pub enum ArchFamily {
     /// separate ViT (Wedge-4c) that produces image-token embeddings the
     /// text LM consumes. ADR-005 Wedge-4 / iter-228a.
     Qwen3VlText,
+    /// DeepSeek-V4-Flash verifier with compressed/indexed sparse attention.
+    Deepseek4,
     /// Reserved — Llama4 (placeholder; the dispatcher errors at the
     /// `LoadedModel::load` arch peek today).
     Llama4Reserved,
@@ -159,6 +166,7 @@ impl ArchFamily {
             ArchFamily::Gemma4 => "gemma4",
             ArchFamily::Qwen35 => "qwen35",
             ArchFamily::Qwen3VlText => "qwen3vl-text",
+            ArchFamily::Deepseek4 => "deepseek4",
             ArchFamily::Llama4Reserved => "llama4",
         }
     }
@@ -597,6 +605,7 @@ fn fmt_chat_template_source(source: &ChatTemplateSource) -> String {
         ChatTemplateSource::GgufEmbedded => "gguf-embedded".to_string(),
         ChatTemplateSource::CliOverride => "cli-override".to_string(),
         ChatTemplateSource::HardcodedFallback { name } => format!("hardcoded-fallback ({name})"),
+        ChatTemplateSource::NativeEncoding { name } => format!("native-encoding ({name})"),
         ChatTemplateSource::None => "none".to_string(),
     }
 }

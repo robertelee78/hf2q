@@ -12,7 +12,10 @@ mod parser;
 mod tests;
 mod types;
 
-pub use parser::{parse_completion, ParsedAssistant, ParsedToolCall, ParsedToolCallFunction};
+pub use parser::{
+    parse_completion, parse_tool_calls_body, ParsedAssistant, ParsedToolCall,
+    ParsedToolCallFunction,
+};
 pub use types::{Message, OrderedValue, ToolCall, ToolCallFunction, ToolDefinition};
 
 use std::collections::HashMap;

@@ -16,7 +16,10 @@ use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::{DType, GraphExecutor, MlxBuffer};
 
-use super::attention::{compressed_attention_index_plan, compressed_indices, window_indices};
+use super::attention::{
+    append_prefill_window_indices, compressed_attention_index_plan, compressed_indices,
+    window_indices,
+};
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::compressed_attention_common::{
     encode_compressed_attention_epilogue, encode_compressed_attention_prelude,
@@ -168,11 +171,12 @@ impl Deepseek4Model {
                 )
             });
         let valid_compressed = layer_span
-            .map(|span| span.compressed_count)
+            .map(|span| span.compressed_valid_after)
             .or_else(|| layer_step.map(|step| step.compressed_valid_after))
             .unwrap_or(0);
         let core = CompressedAttentionCoreArena::new(&device, &self.cfg, rows)?;
-        let main_compressor = MainCompressorArena::new(&device, &self.cfg, ratio, rows)?;
+        let main_compressor =
+            MainCompressorArena::new(&device, &self.cfg, ratio, rows, compressed_count)?;
         let indexer = (ratio == 4)
             .then(|| {
                 RatioFourIndexerArena::new(
@@ -225,7 +229,19 @@ impl Deepseek4Model {
             })
             .transpose()?;
         let physical_kv_len = window_capacity + compressed_capacity;
-        let compact_prefill_kv_len = rows + valid_compressed;
+        let raw_prefix_len = usize::from(rows > 1 && start_position > 0) * window_capacity;
+        let compact_raw_kv_len = raw_prefix_len + rows;
+        let compact_prefill_kv_len = compact_raw_kv_len + valid_compressed;
+        let raw_prefix = (raw_prefix_len > 0)
+            .then(|| {
+                alloc(
+                    &device,
+                    DType::F16,
+                    vec![1, raw_prefix_len, 1, head_dim],
+                    "compressed flash raw-prefix snapshot",
+                )
+            })
+            .transpose()?;
         let prefill_flash = (rows > 1)
             .then(|| {
                 DeepseekPrefillFlashArena::new(
@@ -252,14 +268,15 @@ impl Deepseek4Model {
             vec![compressed_count.max(1)],
             "compressed block positions",
         )?;
-        if prefill_span.is_some() {
+        if let Some(layer_span) = layer_span {
+            let first_group = layer_span.compressed_write_start;
             for (group, position) in compressed_positions
                 .as_logical_mut_slice::<u32>()?
                 .iter_mut()
                 .take(compressed_count)
                 .enumerate()
             {
-                *position = u32::try_from(group * ratio as usize)
+                *position = u32::try_from((first_group + group) * ratio as usize)
                     .context("DeepSeek-V4 compressed block position exceeds u32")?;
             }
         } else if compressed_count == 1 {
@@ -287,25 +304,46 @@ impl Deepseek4Model {
 
         let (index_storage, storage_stride, attention_width, indexer_output_offset) =
             if prefill_span.is_some() {
-                let window = window_indices(window_capacity, rows, 0)?;
+                let window = if raw_prefix_len > 0 {
+                    append_prefill_window_indices(window_capacity, rows, start_position)?
+                } else {
+                    window_indices(window_capacity, rows, start_position)?
+                };
                 let tail_width = if ratio == 4 {
                     self.cfg.index_top_k as usize
                 } else {
-                    compressed_count
+                    valid_compressed
                 };
-                let width = rows + tail_width;
+                let raw_index_width = window
+                    .first()
+                    .map(Vec::len)
+                    .context("DeepSeek-V4 append window index row missing")?;
+                let width = raw_index_width + tail_width;
                 let mut storage = vec![-1_i32; rows * width];
                 let compressed = (ratio == 128)
-                    .then(|| compressed_indices(ratio as usize, rows, 0, rows))
+                    .then(|| {
+                        compressed_indices(
+                            ratio as usize,
+                            rows,
+                            start_position,
+                            compact_raw_kv_len,
+                        )
+                    })
                     .transpose()?;
                 for query in 0..rows {
-                    storage[query * width..query * width + rows].copy_from_slice(&window[query]);
+                    storage[query * width..query * width + raw_index_width]
+                        .copy_from_slice(&window[query]);
                     if let Some(compressed) = compressed.as_ref() {
-                        storage[query * width + rows..(query + 1) * width]
+                        storage[query * width + raw_index_width..(query + 1) * width]
                             .copy_from_slice(&compressed[query]);
                     }
                 }
-                (storage, width, width, (ratio == 4).then_some(rows))
+                (
+                    storage,
+                    width,
+                    width,
+                    (ratio == 4).then_some(raw_index_width),
+                )
             } else {
                 let plan = compressed_attention_index_plan(
                     ratio as usize,
@@ -437,7 +475,23 @@ impl Deepseek4Model {
             } else {
                 &kv_rope
             };
-            session.barrier_between(&[kv_cache_input], &[&layer_cache.window_kv]);
+            if let Some(prefix) = raw_prefix.as_ref() {
+                session.barrier_between(&[&layer_cache.window_kv], &[prefix]);
+                cast(
+                    session.encoder_mut(),
+                    registry,
+                    device.metal_device(),
+                    &layer_cache.window_kv,
+                    prefix,
+                    raw_prefix_len * head_dim,
+                    CastDirection::BF16ToF16,
+                )?;
+            }
+            let mut window_write_inputs = vec![kv_cache_input];
+            if let Some(prefix) = raw_prefix.as_ref() {
+                window_write_inputs.push(prefix);
+            }
+            session.barrier_between(&window_write_inputs, &[&layer_cache.window_kv]);
             dispatch_kv_cache_copy(
                 session.encoder_mut(),
                 registry,
@@ -493,7 +547,7 @@ impl Deepseek4Model {
                     compressed_count,
                     valid_compressed,
                     if prefill_span.is_some() {
-                        rows
+                        compact_raw_kv_len
                     } else {
                         window_capacity
                     },
@@ -517,6 +571,7 @@ impl Deepseek4Model {
                     registry,
                     &device,
                     &q_rope,
+                    raw_prefix.as_ref(),
                     &kv_rope,
                     layer_cache.compressed_kv.as_ref(),
                     weights.attention.sinks,
@@ -524,7 +579,8 @@ impl Deepseek4Model {
                     &attention,
                     prefill_flash,
                     rows,
-                    rows,
+                    raw_prefix_len,
+                    compact_raw_kv_len,
                     compact_prefill_kv_len,
                     attention_width,
                     heads,

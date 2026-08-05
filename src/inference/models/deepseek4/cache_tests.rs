@@ -317,8 +317,11 @@ fn start_zero_prefill_span_counts_complete_groups_and_publishes_once() {
         assert_eq!(span.token_count, tokens);
         assert_eq!(span.layers[0].window_valid_after, tokens);
         assert_eq!(span.layers[0].compressed_count, ratio4);
+        assert_eq!(span.layers[0].compressed_valid_after, ratio4);
         assert_eq!(span.layers[0].indexer_count, ratio4);
+        assert_eq!(span.layers[0].indexer_valid_after, ratio4);
         assert_eq!(span.layers[1].compressed_count, ratio128);
+        assert_eq!(span.layers[1].compressed_valid_after, ratio128);
         assert_eq!(span.layers[1].indexer_count, 0);
     }
 
@@ -353,4 +356,164 @@ fn start_zero_prefill_span_counts_complete_groups_and_publishes_once() {
     ));
     cache.reset().unwrap();
     assert_eq!(cache.position(), 0);
+}
+
+#[test]
+fn bounded_prefill_chunks_append_across_window_and_compression_boundaries() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 512).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+
+    let first = cache.plan_prefill(127).unwrap();
+    assert_eq!(first.start_position, 0);
+    assert_eq!(first.layers[0].compressed_write_start, 0);
+    assert_eq!(first.layers[0].compressed_count, 31);
+    assert_eq!(first.layers[0].compressed_valid_after, 31);
+    cache.commit_prefill(0, 127).unwrap();
+
+    let boundary = cache.plan_prefill(2).unwrap();
+    assert_eq!(boundary.start_position, 127);
+    assert_eq!(boundary.layers[0].window_write_start, 127);
+    assert_eq!(boundary.layers[0].window_valid_after, 128);
+    assert_eq!(boundary.layers[0].compressed_write_start, 31);
+    assert_eq!(boundary.layers[0].compressed_count, 1);
+    assert_eq!(boundary.layers[0].compressed_valid_after, 32);
+    assert_eq!(boundary.layers[1].compressed_write_start, 0);
+    assert_eq!(boundary.layers[1].compressed_count, 1);
+    assert_eq!(boundary.layers[1].compressed_valid_after, 1);
+    cache.commit_prefill(127, 2).unwrap();
+
+    let next = cache.plan_prefill(128).unwrap();
+    assert_eq!(next.start_position, 129);
+    assert_eq!(next.layers[0].window_write_start, 1);
+    assert_eq!(next.layers[0].compressed_write_start, 32);
+    assert_eq!(next.layers[0].compressed_count, 32);
+    assert_eq!(next.layers[0].compressed_valid_after, 64);
+    assert_eq!(next.layers[1].compressed_count, 1);
+    assert_eq!(next.layers[1].compressed_valid_after, 2);
+
+    assert!(matches!(
+        cache.plan_prefill(129),
+        Err(CacheError::PrefillWindow {
+            requested: 129,
+            maximum: 128
+        })
+    ));
+}
+
+#[test]
+fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() {
+    let mut cfg = config(vec![0, 4, 128]);
+    cfg.max_position_embeddings = 128;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+
+    cache.layers_mut()[1]
+        .attention_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0x1234;
+    cache.layers_mut()[1]
+        .indexer_kv
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<u16>()
+        .unwrap()[2] = 0x5678;
+    cache.layers_mut()[1]
+        .main_kv_state
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<f32>()
+        .unwrap()[1] = 9.25;
+    for expected in 0..7 {
+        let step = cache.plan_next_step().unwrap();
+        assert_eq!(step.position, expected);
+        cache.commit_step(step.position).unwrap();
+    }
+
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(snapshot.position(), 7);
+    assert_eq!(snapshot.resident_bytes(), cache.resident_bytes());
+
+    cache.layers_mut()[1]
+        .attention_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0;
+    cache.layers_mut()[1]
+        .indexer_kv
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<u16>()
+        .unwrap()[2] = 0;
+    cache.layers_mut()[1]
+        .main_kv_state
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<f32>()
+        .unwrap()[1] = -1.0;
+    cache.commit_step(7).unwrap();
+
+    cache.restore(&snapshot).unwrap();
+    assert_eq!(cache.position(), 7);
+    assert_eq!(
+        cache.layers()[1]
+            .attention_kv
+            .as_slice::<u16>()
+            .unwrap()[3],
+        0x1234
+    );
+    assert_eq!(
+        cache.layers()[1]
+            .indexer_kv
+            .as_ref()
+            .unwrap()
+            .as_slice::<u16>()
+            .unwrap()[2],
+        0x5678
+    );
+    assert_eq!(
+        cache.layers()[1]
+            .main_kv_state
+            .as_ref()
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()[1],
+        9.25
+    );
+
+    // Mutating the live cache after restore must not mutate the snapshot.
+    cache.layers_mut()[1]
+        .attention_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0xabcd;
+    cache.restore(&snapshot).unwrap();
+    assert_eq!(
+        cache.layers()[1]
+            .attention_kv
+            .as_slice::<u16>()
+            .unwrap()[3],
+        0x1234
+    );
+}
+
+#[test]
+fn restore_rejects_a_snapshot_from_a_different_cache_plan() {
+    let mut cfg = config(vec![4]);
+    cfg.max_position_embeddings = 128;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let short = Deepseek4CachePlan::for_context(&cfg, 64).unwrap();
+    let long = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let short_cache = Deepseek4Cache::allocate(&short, MlxDevice::new().unwrap()).unwrap();
+    let snapshot = short_cache.snapshot().unwrap();
+    let mut long_cache = Deepseek4Cache::allocate(&long, MlxDevice::new().unwrap()).unwrap();
+
+    assert!(matches!(
+        long_cache.restore(&snapshot),
+        Err(CacheError::SnapshotPlanMismatch)
+    ));
 }

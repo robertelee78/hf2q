@@ -10,14 +10,14 @@ use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionCh
 use super::Deepseek4Model;
 
 impl Deepseek4Model {
-    /// Execute a complete start-zero prompt layer-major with true matrix rows.
+    /// Execute one bounded prompt chunk layer-major with true matrix rows.
     pub fn forward_verifier_prefill(
         &mut self,
         token_ids: &[u32],
         cache: &mut Deepseek4Cache,
     ) -> Result<MlxBuffer> {
         let span = cache
-            .plan_prefill_start0(token_ids.len())
+            .plan_prefill(token_ids.len())
             .context("plan DeepSeek-V4 batched prefill transaction")?;
         let result = self.forward_verifier_prefill_uncommitted(token_ids, cache, &span);
         match result {
@@ -33,6 +33,29 @@ impl Deepseek4Model {
                 Err(error).context("DeepSeek-V4 prefill partially executed; cache poisoned")
             }
         }
+    }
+
+    /// Prefill an arbitrarily long prompt. The compressor backend admits one
+    /// matrix prefill only at position zero; after that boundary, tokens use
+    /// the native incremental verifier. This still retains and extends the
+    /// committed cache without replaying earlier context.
+    pub fn forward_verifier_prompt(
+        &mut self,
+        token_ids: &[u32],
+        cache: &mut Deepseek4Cache,
+    ) -> Result<MlxBuffer> {
+        anyhow::ensure!(!token_ids.is_empty(), "DeepSeek-V4 prompt is empty");
+        let mut state = None;
+        let mut offset = 0;
+        if cache.position() == 0 {
+            let batch = token_ids.len().min(self.cfg.sliding_window as usize);
+            state = Some(self.forward_verifier_prefill(&token_ids[..batch], cache)?);
+            offset = batch;
+        }
+        for &token in &token_ids[offset..] {
+            state = Some(self.forward_verifier_one(token, cache)?);
+        }
+        state.context("DeepSeek-V4 prompt encoded zero chunks")
     }
 
     fn forward_verifier_prefill_uncommitted(

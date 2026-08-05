@@ -547,6 +547,8 @@ pub enum LoadedArch {
     /// [`crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL`]
     /// sentinel; iter-228b wires the live dense transformer forward.
     Qwen3VlText,
+    /// DeepSeek-V4-Flash native compressed-attention runtime.
+    Deepseek4,
 }
 
 // ---------------------------------------------------------------------------
@@ -1939,6 +1941,8 @@ pub enum LoadedModel {
     /// (the GGUF now opens cleanly and the model loads, but the chat
     /// arm short-circuits to 501 the same way Qwen35 did at iter-215).
     Qwen3VlText(super::engine_qwen3vl::Qwen3VlTextLoadedModel),
+    /// DeepSeek-V4-Flash native verifier + persistent appendable cache.
+    Deepseek4(super::engine_deepseek4::Deepseek4LoadedModel),
 }
 
 /// Gemma 4 (and Gemma-shaped) artifacts.  Pre-iter-215 these were the
@@ -2133,6 +2137,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => &g.model_id,
             LoadedModel::Qwen35(q) => &q.model_id,
             LoadedModel::Qwen3VlText(v) => &v.model_id,
+            LoadedModel::Deepseek4(d) => &d.model_id,
         }
     }
     pub fn context_length(&self) -> Option<usize> {
@@ -2140,6 +2145,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => g.context_length,
             LoadedModel::Qwen35(q) => q.context_length,
             LoadedModel::Qwen3VlText(v) => v.context_length,
+            LoadedModel::Deepseek4(d) => d.context_length,
         }
     }
     pub fn quant_type(&self) -> Option<&str> {
@@ -2147,6 +2153,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => g.quant_type.as_deref(),
             LoadedModel::Qwen35(q) => q.quant_type.as_deref(),
             LoadedModel::Qwen3VlText(v) => v.quant_type.as_deref(),
+            LoadedModel::Deepseek4(d) => d.quant_type.as_deref(),
         }
     }
     pub fn model_path(&self) -> &Path {
@@ -2154,6 +2161,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => &g.model_path,
             LoadedModel::Qwen35(q) => &q.model_path,
             LoadedModel::Qwen3VlText(v) => &v.model_path,
+            LoadedModel::Deepseek4(d) => &d.model_path,
         }
     }
     pub fn hidden_size(&self) -> usize {
@@ -2161,6 +2169,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => g.weights.hidden_size,
             LoadedModel::Qwen35(q) => q.hidden_size,
             LoadedModel::Qwen3VlText(v) => v.hidden_size,
+            LoadedModel::Deepseek4(d) => d.model.cfg.hidden_size as usize,
         }
     }
     pub fn vocab_size(&self) -> usize {
@@ -2168,6 +2177,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => g.weights.vocab_size,
             LoadedModel::Qwen35(q) => q.vocab_size,
             LoadedModel::Qwen3VlText(v) => v.vocab_size,
+            LoadedModel::Deepseek4(d) => d.model.cfg.vocab_size as usize,
         }
     }
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -2175,6 +2185,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => &g.tokenizer,
             LoadedModel::Qwen35(q) => &q.tokenizer,
             LoadedModel::Qwen3VlText(v) => &v.tokenizer,
+            LoadedModel::Deepseek4(d) => &d.tokenizer,
         }
     }
     pub fn chat_template(&self) -> &str {
@@ -2182,6 +2193,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => &g.chat_template,
             LoadedModel::Qwen35(q) => &q.chat_template,
             LoadedModel::Qwen3VlText(v) => &v.chat_template,
+            LoadedModel::Deepseek4(d) => &d.chat_template,
         }
     }
 
@@ -2195,6 +2207,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => g.provenance.clone(),
             LoadedModel::Qwen35(q) => q.provenance.clone(),
             LoadedModel::Qwen3VlText(v) => v.provenance.clone(),
+            LoadedModel::Deepseek4(d) => d.provenance.clone(),
         }
     }
     pub fn eos_token_ids(&self) -> &[u32] {
@@ -2202,6 +2215,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => &g.eos_token_ids,
             LoadedModel::Qwen35(q) => &q.eos_token_ids,
             LoadedModel::Qwen3VlText(v) => &v.eos_token_ids,
+            LoadedModel::Deepseek4(d) => &d.eos_token_ids,
         }
     }
     pub fn load_duration(&self) -> Duration {
@@ -2209,6 +2223,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => g.load_duration,
             LoadedModel::Qwen35(q) => q.load_duration,
             LoadedModel::Qwen3VlText(v) => v.load_duration,
+            LoadedModel::Deepseek4(d) => d.load_duration,
         }
     }
     /// Prompt cache is Gemma-only in iter-215 MVP.  The Qwen35 worker
@@ -2222,6 +2237,7 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => Some(&g.prompt_cache),
             LoadedModel::Qwen35(_) => None,
             LoadedModel::Qwen3VlText(_) => None,
+            LoadedModel::Deepseek4(_) => None,
         }
     }
 }
@@ -2843,11 +2859,10 @@ impl LoadedModel {
                 let g = GemmaLoadedModel::load(opts)?;
                 Ok(LoadedModel::Gemma(g))
             }
-            "deepseek4" => anyhow::bail!(
-                "DeepSeek-V4 GGUF is recognized, but the dedicated Rust/Metal runtime is not \
-                 available in this build; refusing to route it through Gemma. Model: {}",
-                model_path.display()
-            ),
+            "deepseek4" => {
+                let d = super::engine_deepseek4::Deepseek4LoadedModel::load(opts)?;
+                Ok(LoadedModel::Deepseek4(d))
+            }
             "" => anyhow::bail!(
                 "GGUF is missing required `general.architecture`; refusing to guess Gemma. \
                  Model: {}",
@@ -2855,7 +2870,7 @@ impl LoadedModel {
             ),
             other => anyhow::bail!(
                 "unsupported GGUF general.architecture={other:?}; supported runtimes in this \
-                 build are gemma4, qwen35, qwen35moe, and dense qwen3_vl. Model: {}",
+                 build are gemma4, qwen35, qwen35moe, dense qwen3_vl, and deepseek4. Model: {}",
                 model_path.display()
             ),
         }
@@ -3557,6 +3572,9 @@ impl LoadInfoBuilder for LoadedModel {
             LoadedModel::Qwen3VlText(v) => {
                 v.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
             }
+            LoadedModel::Deepseek4(d) => {
+                d.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
+            }
         }
     }
 }
@@ -3592,6 +3610,7 @@ impl Engine {
             LoadedModel::Gemma(_) => LoadedArch::Gemma,
             LoadedModel::Qwen35(_) => LoadedArch::Qwen35,
             LoadedModel::Qwen3VlText(_) => LoadedArch::Qwen3VlText,
+            LoadedModel::Deepseek4(_) => LoadedArch::Deepseek4,
         };
 
         // Phase B-dense.2 follow-up: snapshot the KV-spill shape
@@ -3656,6 +3675,7 @@ impl Engine {
                 // forward wiring will revisit (mirror the gemma branch
                 // shape against the dense Qwen3-VL KV cache).
                 LoadedModel::Qwen3VlText(_) => None,
+                LoadedModel::Deepseek4(_) => None,
             };
 
         // **ADR-017 §B-tq.4 iter-4** — capture the per-layer TQ-active
@@ -3691,7 +3711,9 @@ impl Engine {
                     }
                     // TQ-active KV-persist is Gemma-4-only at this iter
                     // (per family-scoping discipline established by B-dense.1).
-                    LoadedModel::Qwen35(_) | LoadedModel::Qwen3VlText(_) => None,
+                    LoadedModel::Qwen35(_)
+                    | LoadedModel::Qwen3VlText(_)
+                    | LoadedModel::Deepseek4(_) => None,
                 }
             } else {
                 None
@@ -4126,6 +4148,11 @@ impl Engine {
                     );
                     Ok(engine)
                 }
+                LoadedModel::Deepseek4(_) => Err(EngineSpawnError::ModeNotYetWired {
+                    iter_landed: "deepseek4-agentic-serving",
+                    iter_required: "DeepSeek-V4 currently supports Legacy single-session mode; \
+                                    SlotAware scheduling needs per-slot recurrent and compressed-KV state",
+                }),
         }
     }
 
@@ -4170,6 +4197,7 @@ impl Engine {
             LoadedModel::Gemma(_) => LoadedArch::Gemma,
             LoadedModel::Qwen35(_) => LoadedArch::Qwen35,
             LoadedModel::Qwen3VlText(_) => LoadedArch::Qwen3VlText,
+            LoadedModel::Deepseek4(_) => LoadedArch::Deepseek4,
         };
 
         // KV-spill descriptors: mirror Engine::spawn verbatim. The
@@ -4211,6 +4239,7 @@ impl Engine {
                 }
                 LoadedModel::Qwen35(_) => None,
                 LoadedModel::Qwen3VlText(_) => None,
+                LoadedModel::Deepseek4(_) => None,
             };
 
         let tq_packed_descriptor: Option<super::tq_packed_descriptor::TqPackedSpillDescriptor> =
@@ -4239,7 +4268,9 @@ impl Engine {
                             provenance_for_tq,
                         )
                     }
-                    LoadedModel::Qwen35(_) | LoadedModel::Qwen3VlText(_) => None,
+                    LoadedModel::Qwen35(_)
+                    | LoadedModel::Qwen3VlText(_)
+                    | LoadedModel::Deepseek4(_) => None,
                 }
             } else {
                 None
@@ -5886,6 +5917,13 @@ fn worker_run_slot_aware(
         // `capability_unsupported` surface the SerialFifo arm emits at
         // SlotId(N>0), so the operator-facing contract is unchanged.
         LoadedModel::Qwen3VlText(_) => {
+            run_slot_aware_qwen3vl_unsupported(rx);
+        }
+        LoadedModel::Deepseek4(_) => {
+            tracing::error!(
+                "DeepSeek-V4 reached SlotAware worker despite spawn-time rejection; \
+                 rejecting requests through the unsupported worker"
+            );
             run_slot_aware_qwen3vl_unsupported(rx);
         }
     }
@@ -7966,6 +8004,7 @@ fn worker_run(
                     // returns 501; warmup is a no-op so /readyz surfaces
                     // "model is loaded".
                     LoadedModel::Qwen3VlText(_) => Ok(()),
+                    LoadedModel::Deepseek4(_) => Ok(()),
                 };
                 let _ = reply.send(result);
             }
@@ -8387,6 +8426,14 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(q) => {
                         super::engine_qwen3vl::generate_qwen3vl_text_once(
                             q,
+                            &prompt_tokens,
+                            &params,
+                            registration.as_ref(),
+                        )
+                    }
+                    LoadedModel::Deepseek4(d) => {
+                        super::engine_deepseek4::generate_once(
+                            d,
                             &prompt_tokens,
                             &params,
                             registration.as_ref(),
@@ -8960,6 +9007,29 @@ fn worker_run(
                             );
                         }
                     }
+                    LoadedModel::Deepseek4(d) => {
+                        if !injections.is_empty()
+                            || ds_borrow_stream.is_some()
+                            || positions_flat.is_some()
+                        {
+                            let _ = events.blocking_send(
+                                super::sse::GenerationEvent::Error(
+                                    "DeepSeek-V4 does not support multimodal soft-token or \
+                                     DeepStack injections"
+                                        .to_string(),
+                                ),
+                            );
+                        } else {
+                            super::engine_deepseek4::generate_stream(
+                                d,
+                                &prompt_tokens,
+                                &params,
+                                &events,
+                                registration.as_ref(),
+                                cancellation_counter.as_deref(),
+                            );
+                        }
+                    }
                 }
 
                 // ADR-040 C2b post-pattern — issue the prefill advance
@@ -9324,6 +9394,9 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(_) => {
                         crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
                     }
+                    LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
+                        "embeddings are not supported by the DeepSeek-V4 generative runtime"
+                    )),
                 };
 
                 if let Some(handle) = admitted.handle {
@@ -9873,6 +9946,24 @@ fn worker_run(
                             registration.as_ref(),
                         )
                     }
+                    LoadedModel::Deepseek4(d) => {
+                        if !injections.is_empty()
+                            || ds_borrow.is_some()
+                            || positions_flat.is_some()
+                        {
+                            Err(anyhow::anyhow!(
+                                "DeepSeek-V4 does not support multimodal soft-token or \
+                                 DeepStack injections"
+                            ))
+                        } else {
+                            super::engine_deepseek4::generate_once(
+                                d,
+                                &prompt_tokens,
+                                &params,
+                                registration.as_ref(),
+                            )
+                        }
+                    }
                 };
 
                 // ADR-040 C2b post-pattern — same bookkeeping shape as
@@ -9922,6 +10013,7 @@ fn worker_run(
                     // hook treats it as "no snapshot available" rather
                     // than an error.
                     LoadedModel::Qwen3VlText(_) => Ok(None),
+                    LoadedModel::Deepseek4(_) => Ok(None),
                 };
                 let _ = reply.send(result);
             }
@@ -9951,6 +10043,10 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
                         "kv_restore: not yet supported on Qwen3-VL text variant \
                          (iter-228a is load-only; KV cache allocation lands in iter-228b)"
+                    )),
+                    LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
+                        "kv_restore: dense-KV restore is not applicable to DeepSeek-V4's \
+                         compressed/recurrent serving cache"
                     )),
                 };
                 let _ = reply.send(result);
@@ -9989,6 +10085,9 @@ fn worker_run(
                         "tq_packed_kv_snapshot: not supported on Qwen3-VL text \
                          variant (iter-228 is load-only; TQ-active wiring deferred)"
                     )),
+                    LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
+                        "tq_packed_kv_snapshot: not supported on DeepSeek-V4"
+                    )),
                 };
                 let _ = reply.send(result);
             }
@@ -10019,6 +10118,9 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
                         "tq_packed_kv_restore: not supported on Qwen3-VL text variant"
                     )),
+                    LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
+                        "tq_packed_kv_restore: not supported on DeepSeek-V4"
+                    )),
                 };
                 let _ = reply.send(result);
             }
@@ -10038,6 +10140,7 @@ fn worker_run(
                     ),
                     LoadedModel::Qwen35(_) => Ok(None),
                     LoadedModel::Qwen3VlText(_) => Ok(None),
+                    LoadedModel::Deepseek4(_) => Ok(None),
                 };
                 let _ = reply.send(result);
             }
@@ -10067,6 +10170,10 @@ fn worker_run(
                     )),
                     LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
                         "prompt_cache_restore: not yet supported on Qwen3-VL text variant"
+                    )),
+                    LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
+                        "prompt_cache_restore: use DeepSeek-V4's live exact-prefix cache; \
+                         serialized prompt-cache restore is not supported"
                     )),
                 };
                 let _ = reply.send(result);

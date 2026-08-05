@@ -141,7 +141,7 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
         state.context("DeepSeek-V4 sequential prompt produced no state")?
     } else {
         model
-            .forward_verifier_prefill(prompt_tokens, &mut cache)
+            .forward_verifier_prompt(prompt_tokens, &mut cache)
             .context("execute DeepSeek-V4 batched prompt prefill")?
     };
     let prefill_elapsed = prefill_started.elapsed();
@@ -255,7 +255,7 @@ fn run_benchmark(
         // token (llama.cpp reports these as its eval runs).
         let prefill_started = Instant::now();
         let final_state = model
-            .forward_verifier_prefill(prompt_tokens, cache)
+            .forward_verifier_prompt(prompt_tokens, cache)
             .context("execute DeepSeek-V4 benchmark prefill")?;
         let prompt_last_state = model
             .last_token_state(&final_state)

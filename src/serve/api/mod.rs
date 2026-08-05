@@ -29,6 +29,7 @@ pub mod middleware;
 pub mod engine;
 pub mod engine_qwen35;
 pub mod engine_qwen3vl;
+pub mod engine_deepseek4;
 pub mod grammar;
 pub mod kv_spill_descriptor;
 pub mod tq_packed_descriptor;

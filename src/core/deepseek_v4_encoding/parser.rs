@@ -49,7 +49,7 @@ pub fn parse_completion(text: &str, mode: ThinkingMode) -> Result<ParsedAssistan
                 "content after DSML tool calls or missing EOS".into(),
             ));
         }
-        (content, parse_tool_calls(body)?)
+        (content, parse_tool_calls_body(body)?)
     } else {
         let content = rest
             .strip_suffix(EOS)
@@ -73,7 +73,10 @@ pub fn parse_completion(text: &str, mode: ThinkingMode) -> Result<ParsedAssistan
     })
 }
 
-fn parse_tool_calls(mut body: &str) -> Result<Vec<ParsedToolCall>, ParseError> {
+/// Parse the contents of one DSML `tool_calls` block without requiring the
+/// surrounding completion/EOS. Serving uses this when the streaming boundary
+/// splitter has already consumed the outer markers.
+pub fn parse_tool_calls_body(mut body: &str) -> Result<Vec<ParsedToolCall>, ParseError> {
     let invoke = format!("<{DSML}invoke name=\"");
     let invoke_end = format!("</{DSML}invoke>");
     let parameter = format!("<{DSML}parameter name=\"");

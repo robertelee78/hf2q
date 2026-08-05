@@ -3746,6 +3746,9 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             api::engine::LoadedModel::Qwen3VlText(_) => {
                 // Qwen3VlText path doesn't have an LCP probe yet.
             }
+            api::engine::LoadedModel::Deepseek4(_) => {
+                // DeepSeek-V4 accounts exact-prefix hits in generation stats.
+            }
         }
     }
     // ADR-040 Phase C iter-4 (C4) — route through `spawn_with_mode` so
@@ -6394,10 +6397,11 @@ mod tests {
         );
     }
 
-    /// DeepSeek-V4 is a known architecture, but until its dedicated runtime
-    /// lands it must be rejected explicitly rather than routed through Gemma.
+    /// DeepSeek-V4 is routed into its dedicated native loader. A deliberately
+    /// incomplete GGUF must fail at DeepSeek validation, never at Gemma
+    /// tensor lookup or the retired "runtime unavailable" dispatch guard.
     #[test]
-    fn load_engine_rejects_deepseek4_without_gemma_fallback() {
+    fn load_engine_routes_deepseek4_to_native_loader_without_gemma_fallback() {
         let tmp = write_minimal_gguf_with_arch("deepseek4");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -6409,14 +6413,15 @@ mod tests {
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err(), "DeepSeek-V4 must fail until its runtime exists");
+        assert!(result.is_err(), "the minimal DeepSeek-V4 fixture must fail validation");
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            msg.contains("DeepSeek-V4") && msg.contains("refusing to route it through Gemma"),
-            "DeepSeek-V4 error must explain the fail-closed dispatch; got: {msg}"
+            msg.contains("DeepSeek-V4 tokenizer") || msg.contains("native DeepSeek-V4 model"),
+            "DeepSeek-V4 must reach its native loader; got: {msg}"
         );
         assert!(
-            !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
+            !msg.contains("refusing to route it through Gemma")
+                && !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
             "DeepSeek-V4 must not reach the Gemma loader; got: {msg}"
         );
     }

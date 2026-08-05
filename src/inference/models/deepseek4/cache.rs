@@ -129,6 +129,19 @@ pub enum CacheError {
     PrefillWindow { requested: usize, maximum: usize },
     #[error("DeepSeek-V4 cache is poisoned by a partial token; reset and replay the request")]
     Poisoned,
+    #[error("DeepSeek-V4 cache snapshot does not match the live cache plan")]
+    SnapshotPlanMismatch,
+    #[error("DeepSeek-V4 cache snapshot layer count {actual} does not match {expected}")]
+    SnapshotLayerCount { expected: usize, actual: usize },
+    #[error("failed to copy layer {layer} {kind:?} cache snapshot: {source}")]
+    SnapshotCopy {
+        layer: usize,
+        kind: CacheKind,
+        #[source]
+        source: MlxError,
+    },
+    #[error("layer {layer} {kind:?} cache snapshot shape or dtype does not match")]
+    SnapshotBufferMismatch { layer: usize, kind: CacheKind },
 }
 
 pub struct LayerCache {
@@ -150,6 +163,29 @@ pub struct Deepseek4Cache {
     poisoned: bool,
     resident_bytes: u64,
     _device: MlxDevice,
+}
+
+/// Exact, non-aliasing capture of a DeepSeek-V4 cache at a token boundary.
+///
+/// The attention allocation owns both the circular-window and compressed-KV
+/// views, so only that parent buffer is copied. Indexer KV and every recurrent
+/// compressor buffer are captured separately. Restoring all of them is
+/// required: restoring KV without the recurrent pooling state silently
+/// changes every later compressed token.
+pub struct Deepseek4CacheSnapshot {
+    layers: Vec<LayerCacheSnapshot>,
+    plan: Deepseek4CachePlan,
+    next_position: usize,
+    resident_bytes: u64,
+}
+
+struct LayerCacheSnapshot {
+    attention_kv: MlxBuffer,
+    indexer_kv: Option<MlxBuffer>,
+    main_kv_state: Option<MlxBuffer>,
+    main_score_state: Option<MlxBuffer>,
+    indexer_kv_state: Option<MlxBuffer>,
+    indexer_score_state: Option<MlxBuffer>,
 }
 
 impl Deepseek4CachePlan {
@@ -371,6 +407,11 @@ impl Deepseek4Cache {
         &self.layers
     }
 
+    #[cfg(test)]
+    pub(super) fn layers_mut(&mut self) -> &mut [LayerCache] {
+        &mut self.layers
+    }
+
     pub fn resident_bytes(&self) -> u64 {
         self.resident_bytes
     }
@@ -381,6 +422,121 @@ impl Deepseek4Cache {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Capture an exact prompt-boundary cache snapshot that can be restored
+    /// before prefilling only the suffix of a later, prefix-extending prompt.
+    pub fn snapshot(&self) -> Result<Deepseek4CacheSnapshot, CacheError> {
+        if self.poisoned {
+            return Err(CacheError::Poisoned);
+        }
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            layers.push(LayerCacheSnapshot {
+                attention_kv: snapshot_buffer(
+                    &self._device,
+                    &layer.attention_kv,
+                    layer_index,
+                    CacheKind::AttentionKv,
+                )?,
+                indexer_kv: snapshot_optional_buffer(
+                    &self._device,
+                    layer.indexer_kv.as_ref(),
+                    layer_index,
+                    CacheKind::IndexerKv,
+                )?,
+                main_kv_state: snapshot_optional_buffer(
+                    &self._device,
+                    layer.main_kv_state.as_ref(),
+                    layer_index,
+                    CacheKind::MainKvState,
+                )?,
+                main_score_state: snapshot_optional_buffer(
+                    &self._device,
+                    layer.main_score_state.as_ref(),
+                    layer_index,
+                    CacheKind::MainScoreState,
+                )?,
+                indexer_kv_state: snapshot_optional_buffer(
+                    &self._device,
+                    layer.indexer_kv_state.as_ref(),
+                    layer_index,
+                    CacheKind::IndexerKvState,
+                )?,
+                indexer_score_state: snapshot_optional_buffer(
+                    &self._device,
+                    layer.indexer_score_state.as_ref(),
+                    layer_index,
+                    CacheKind::IndexerScoreState,
+                )?,
+            });
+        }
+        Ok(Deepseek4CacheSnapshot {
+            layers,
+            plan: self.plan.clone(),
+            next_position: self.next_position,
+            resident_bytes: self.resident_bytes,
+        })
+    }
+
+    /// Restore a prior token-boundary snapshot into this fixed-capacity cache.
+    /// The cache remains allocated; only its bytes and logical position move.
+    pub fn restore(&mut self, snapshot: &Deepseek4CacheSnapshot) -> Result<(), CacheError> {
+        if snapshot.plan != self.plan || snapshot.resident_bytes != self.resident_bytes {
+            return Err(CacheError::SnapshotPlanMismatch);
+        }
+        if snapshot.layers.len() != self.layers.len() {
+            return Err(CacheError::SnapshotLayerCount {
+                expected: self.layers.len(),
+                actual: snapshot.layers.len(),
+            });
+        }
+        for (layer_index, (source, destination)) in snapshot
+            .layers
+            .iter()
+            .zip(self.layers.iter_mut())
+            .enumerate()
+        {
+            restore_buffer(
+                &source.attention_kv,
+                &mut destination.attention_kv,
+                layer_index,
+                CacheKind::AttentionKv,
+            )?;
+            restore_optional_buffer(
+                source.indexer_kv.as_ref(),
+                destination.indexer_kv.as_mut(),
+                layer_index,
+                CacheKind::IndexerKv,
+            )?;
+            restore_optional_buffer(
+                source.main_kv_state.as_ref(),
+                destination.main_kv_state.as_mut(),
+                layer_index,
+                CacheKind::MainKvState,
+            )?;
+            restore_optional_buffer(
+                source.main_score_state.as_ref(),
+                destination.main_score_state.as_mut(),
+                layer_index,
+                CacheKind::MainScoreState,
+            )?;
+            restore_optional_buffer(
+                source.indexer_kv_state.as_ref(),
+                destination.indexer_kv_state.as_mut(),
+                layer_index,
+                CacheKind::IndexerKvState,
+            )?;
+            restore_optional_buffer(
+                source.indexer_score_state.as_ref(),
+                destination.indexer_score_state.as_mut(),
+                layer_index,
+                CacheKind::IndexerScoreState,
+            )?;
+        }
+        self.next_position = snapshot.next_position;
+        self.poisoned = false;
+        Ok(())
     }
 
     /// Prevent retries after any submitted layer has mutated recurrent state.
@@ -489,4 +645,97 @@ impl Deepseek4Cache {
         self.poisoned = false;
         Ok(())
     }
+}
+
+impl Deepseek4CacheSnapshot {
+    pub fn position(&self) -> usize {
+        self.next_position
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+}
+
+fn snapshot_buffer(
+    device: &MlxDevice,
+    source: &MlxBuffer,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<MlxBuffer, CacheError> {
+    let mut destination = device
+        .alloc_buffer(source.byte_len(), source.dtype(), source.shape().to_vec())
+        .map_err(|source| CacheError::SnapshotCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    copy_buffer(source, &mut destination, layer, kind)?;
+    Ok(destination)
+}
+
+fn snapshot_optional_buffer(
+    device: &MlxDevice,
+    source: Option<&MlxBuffer>,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<Option<MlxBuffer>, CacheError> {
+    source
+        .map(|source| snapshot_buffer(device, source, layer, kind))
+        .transpose()
+}
+
+fn restore_buffer(
+    source: &MlxBuffer,
+    destination: &mut MlxBuffer,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    if source.byte_len() != destination.byte_len()
+        || source.dtype() != destination.dtype()
+        || source.shape() != destination.shape()
+    {
+        return Err(CacheError::SnapshotBufferMismatch { layer, kind });
+    }
+    copy_buffer(source, destination, layer, kind)
+}
+
+fn restore_optional_buffer(
+    source: Option<&MlxBuffer>,
+    destination: Option<&mut MlxBuffer>,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    match (source, destination) {
+        (Some(source), Some(destination)) => restore_buffer(source, destination, layer, kind),
+        (None, None) => Ok(()),
+        _ => Err(CacheError::SnapshotBufferMismatch { layer, kind }),
+    }
+}
+
+fn copy_buffer(
+    source: &MlxBuffer,
+    destination: &mut MlxBuffer,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    let source = source
+        .as_slice::<u8>()
+        .map_err(|source| CacheError::SnapshotCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    let destination = destination
+        .as_mut_slice::<u8>()
+        .map_err(|source| CacheError::SnapshotCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    if source.len() != destination.len() {
+        return Err(CacheError::SnapshotBufferMismatch { layer, kind });
+    }
+    destination.copy_from_slice(source);
+    Ok(())
 }

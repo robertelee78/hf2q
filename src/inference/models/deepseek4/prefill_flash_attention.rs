@@ -63,6 +63,7 @@ pub(super) fn encode_deepseek_flash_prefill(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     query_token_major: &MlxBuffer,
+    raw_prefix: Option<&MlxBuffer>,
     kv_source: &MlxBuffer,
     compressed_kv_source: Option<&MlxBuffer>,
     sinks: &MlxBuffer,
@@ -70,6 +71,7 @@ pub(super) fn encode_deepseek_flash_prefill(
     output_token_major: &MlxBuffer,
     arena: &DeepseekPrefillFlashArena,
     rows: usize,
+    raw_prefix_len: usize,
     raw_kv_len: usize,
     kv_len: usize,
     top_k: usize,
@@ -88,15 +90,32 @@ pub(super) fn encode_deepseek_flash_prefill(
         heads,
         head_dim,
     )?;
-    let raw_destination = arena.kv.slice_view(0, raw_kv_len * head_dim);
-    session.barrier_between(&[kv_source], &[&raw_destination]);
+    if let Some(prefix) = raw_prefix {
+        let prefix_destination = arena.kv.slice_view(0, raw_prefix_len * head_dim);
+        session.barrier_between(&[prefix], &[&prefix_destination]);
+        permute_021_f16(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            prefix,
+            &prefix_destination,
+            raw_prefix_len,
+            1,
+            head_dim,
+        )?;
+    }
+    let current_offset = raw_prefix_len * head_dim * DType::F16.size_of();
+    let current_destination = arena
+        .kv
+        .slice_view(current_offset as u64, rows * head_dim);
+    session.barrier_between(&[kv_source], &[&current_destination]);
     permute_021_f16(
         session.encoder_mut(),
         registry,
         device.metal_device(),
         kv_source,
-        &raw_destination,
-        raw_kv_len,
+        &current_destination,
+        rows,
         1,
         head_dim,
     )?;
