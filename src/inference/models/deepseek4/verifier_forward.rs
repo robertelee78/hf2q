@@ -9,7 +9,26 @@ use super::forward_support::{begin_prefill_pool_layer, end_prefill_pool_layer};
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
 use super::Deepseek4Model;
 
-pub(crate) const FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER: usize = 8;
+/// Keep the native 128-token raw window as the alignment unit, but batch
+/// enough windows to amortize the 43-layer command-buffer and mask setup.
+/// Match the 4K prompt batch used by llama.cpp for the same artifact while
+/// keeping longer conversations bounded to 32 native windows per graph.
+pub(crate) const MATRIX_PREFILL_WINDOW_MULTIPLIER: usize = 32;
+pub(crate) const MIN_MATRIX_APPEND_TOKENS: usize = 33;
+
+pub(crate) fn matrix_prefill_chunk_len(
+    cache_position: usize,
+    remaining: usize,
+    sliding_window: usize,
+) -> usize {
+    if remaining == 0 || sliding_window == 0 {
+        return 0;
+    }
+    if cache_position > 0 && remaining < MIN_MATRIX_APPEND_TOKENS {
+        return 0;
+    }
+    remaining.min(sliding_window.saturating_mul(MATRIX_PREFILL_WINDOW_MULTIPLIER))
+}
 
 impl Deepseek4Model {
     /// Execute one bounded prompt chunk layer-major with true matrix rows.
@@ -37,10 +56,10 @@ impl Deepseek4Model {
         }
     }
 
-    /// Prefill the leading portion of a fresh prompt as one native matrix
-    /// transaction. Once a cache exists, extend it with the exact incremental
-    /// verifier so follow-up turns preserve decode-equivalent recurrent and
-    /// quantization semantics.
+    /// Prefill an arbitrarily long prompt in bounded matrix chunks. Small
+    /// cached suffixes retain the exact incremental verifier; long suffixes
+    /// use nonzero-position matrix transactions so prompt ingestion never
+    /// degenerates into decode-style replay.
     pub fn forward_verifier_prompt(
         &mut self,
         token_ids: &[u32],
@@ -49,12 +68,17 @@ impl Deepseek4Model {
         anyhow::ensure!(!token_ids.is_empty(), "DeepSeek-V4 prompt is empty");
         let mut state = None;
         let mut offset = 0;
-        if cache.position() == 0 {
-            let batch = token_ids.len().min(
-                self.cfg.sliding_window as usize * FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER,
+        while offset < token_ids.len() {
+            let chunk = matrix_prefill_chunk_len(
+                cache.position(),
+                token_ids.len() - offset,
+                self.cfg.sliding_window as usize,
             );
-            state = Some(self.forward_verifier_prefill(&token_ids[..batch], cache)?);
-            offset = batch;
+            if chunk == 0 {
+                break;
+            }
+            state = Some(self.forward_verifier_prefill(&token_ids[offset..offset + chunk], cache)?);
+            offset += chunk;
         }
         for &token in &token_ids[offset..] {
             state = Some(self.forward_verifier_one(token, cache)?);
@@ -101,6 +125,11 @@ impl Deepseek4Model {
                         .finish()
                         .with_context(|| format!("execute DeepSeek-V4 prefill layer {layer}"))?;
                 }
+                self.dump_verifier_layer_state(
+                    &next_state,
+                    layer,
+                    span.start_position + span.token_count,
+                )?;
                 Ok(next_state)
             })();
             let reset_start = std::time::Instant::now();
@@ -126,6 +155,8 @@ impl Deepseek4Model {
         span: &CacheSpan,
         session: &mut GraphSession<'_>,
     ) -> Result<MlxBuffer> {
+        let dump_attention = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
+        let attention_session = (!dump_attention).then_some(&mut *session);
         let attention = if layer == 0 {
             anyhow::ensure!(state.is_none(), "DeepSeek-V4 layer 0 must embed the prompt");
             self.forward_uncompressed_attention_prefill(
@@ -135,7 +166,7 @@ impl Deepseek4Model {
                 cache,
                 span,
                 None,
-                Some(session),
+                attention_session,
             )
         } else {
             let state = state.context("DeepSeek-V4 nonzero prefill layer is missing state")?;
@@ -147,7 +178,7 @@ impl Deepseek4Model {
                     cache,
                     span,
                     None,
-                    Some(session),
+                    attention_session,
                 )
             } else {
                 self.forward_compressed_attention_prefill(
@@ -156,11 +187,27 @@ impl Deepseek4Model {
                     cache,
                     span,
                     None,
-                    Some(session),
+                    attention_session,
                 )
             }
         }
         .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} attention"))?;
+        self.dump_verifier_attention_state(
+            &attention,
+            layer,
+            span.start_position + span.token_count,
+        )?;
+        if std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1") {
+            session
+                .encoder_mut()
+                .profile_stage_boundary(match self.cfg.compress_ratios[layer] {
+                    0 => "DeepSeek-V4 uncompressed attention",
+                    4 => "DeepSeek-V4 compressed attention ratio-4",
+                    128 => "DeepSeek-V4 compressed attention ratio-128",
+                    _ => "DeepSeek-V4 compressed attention unknown-ratio",
+                })
+                .with_context(|| format!("profile DeepSeek-V4 layer-{layer} attention"))?;
+        }
         self.forward_ffn_rows(&attention, token_ids, layer, None, Some(session))
             .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
     }
@@ -203,11 +250,13 @@ impl Deepseek4Model {
         let layers = self.cfg.num_hidden_layers as usize;
         let retained = retained_reference_pipeline_enabled();
         let profile_stages = std::env::var("HF2Q_DEEPSEEK_STAGE_PROFILE").as_deref() == Ok("1");
-        if retained && !profile_stages {
+        let dump_layers = std::env::var_os("HF2Q_DEEPSEEK_DUMP_LAYER_DIR").is_some()
+            || std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
+        if retained && !profile_stages && !dump_layers {
             return self.forward_verifier_one_chunked(token_id, cache);
         }
 
-        let pipelined = retained;
+        let pipelined = retained && !dump_layers;
         let mut in_flight = SubmissionChain::with_capacity(layers.saturating_mul(2));
         let result =
             self.encode_verifier_layers(token_id, cache, None, pipelined.then_some(&mut in_flight));
@@ -290,16 +339,78 @@ impl Deepseek4Model {
         let layers = self.cfg.num_hidden_layers as usize;
         let mut state = None;
         for layer in 0..layers {
-            state = Some(self.encode_verifier_layer(
+            let next_state = self.encode_verifier_layer(
                 token_id,
                 layer,
                 state.as_ref(),
                 cache,
                 shared_session.as_deref_mut(),
                 in_flight.as_deref_mut(),
-            )?);
+            )?;
+            self.dump_verifier_layer_state(&next_state, layer, cache.position() + 1)?;
+            state = Some(next_state);
         }
         state.context("DeepSeek-V4 verifier encoded zero layers")
+    }
+
+    fn dump_verifier_layer_state(
+        &self,
+        state: &MlxBuffer,
+        layer: usize,
+        position: usize,
+    ) -> Result<()> {
+        let Some(directory) = std::env::var_os("HF2Q_DEEPSEEK_DUMP_LAYER_DIR") else {
+            return Ok(());
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).with_context(|| {
+            format!(
+                "create DeepSeek-V4 layer dump directory {}",
+                directory.display()
+            )
+        })?;
+        let last = self
+            .last_token_state(state)
+            .context("view DeepSeek-V4 diagnostic layer state")?;
+        let elements = self.cfg.hyper_connection_count as usize * self.cfg.hidden_size as usize;
+        crate::debug::dumps::dump_f32_to(
+            &last,
+            elements,
+            "deepseek_layer_state",
+            Some(layer),
+            position,
+            Some(&directory),
+        )
+    }
+
+    fn dump_verifier_attention_state(
+        &self,
+        state: &MlxBuffer,
+        layer: usize,
+        position: usize,
+    ) -> Result<()> {
+        let Some(directory) = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR") else {
+            return Ok(());
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).with_context(|| {
+            format!(
+                "create DeepSeek-V4 attention dump directory {}",
+                directory.display()
+            )
+        })?;
+        let last = self
+            .last_token_state(state)
+            .context("view DeepSeek-V4 diagnostic attention state")?;
+        let elements = self.cfg.hyper_connection_count as usize * self.cfg.hidden_size as usize;
+        crate::debug::dumps::dump_f32_to(
+            &last,
+            elements,
+            "deepseek_attention_state",
+            Some(layer),
+            position,
+            Some(&directory),
+        )
     }
 
     fn encode_verifier_layer(
@@ -351,6 +462,7 @@ impl Deepseek4Model {
             }
         }
         .with_context(|| format!("execute DeepSeek-V4 layer-{layer} attention"))?;
+        self.dump_verifier_attention_state(&attention, layer, cache.position() + 1)?;
         self.forward_ffn_one(
             &attention,
             token_id,
@@ -359,5 +471,28 @@ impl Deepseek4Model {
             shared_session.as_deref_mut(),
         )
         .with_context(|| format!("execute DeepSeek-V4 layer-{layer} FFN"))
+    }
+}
+
+#[cfg(test)]
+mod prompt_chunk_tests {
+    use super::{matrix_prefill_chunk_len, MIN_MATRIX_APPEND_TOKENS};
+
+    #[test]
+    fn long_prompts_continue_matrix_prefill_after_the_first_chunk() {
+        assert_eq!(matrix_prefill_chunk_len(0, 6_000, 128), 4_096);
+        assert_eq!(matrix_prefill_chunk_len(4_096, 1_904, 128), 1_904);
+    }
+
+    #[test]
+    fn only_small_cached_suffixes_use_incremental_replay() {
+        assert_eq!(
+            matrix_prefill_chunk_len(1_024, MIN_MATRIX_APPEND_TOKENS - 1, 128),
+            0
+        );
+        assert_eq!(
+            matrix_prefill_chunk_len(1_024, MIN_MATRIX_APPEND_TOKENS, 128),
+            MIN_MATRIX_APPEND_TOKENS
+        );
     }
 }

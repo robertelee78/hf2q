@@ -9,10 +9,8 @@ use mlx_native::ops::deepseek_sparse_attention::{
     dispatch_deepseek_sparse_attention, DeepSeekSparseAttentionParams,
 };
 use mlx_native::ops::deepseek_tail_rope::{
-    dispatch_deepseek_tail_rope_f32_to_bf16, dispatch_deepseek_tail_rope_f32_to_f16,
-    DeepSeekTailRopeParams,
+    dispatch_deepseek_tail_rope_f32_to_bf16, DeepSeekTailRopeParams,
 };
-use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::{DType, GraphExecutor, MlxBuffer};
 
@@ -160,7 +158,7 @@ impl Deepseek4Model {
         }
 
         let device = self.ctx.device().clone();
-        let use_f16_prefill = rows > 1;
+        let use_matrix_prefill = rows > 1;
         let compressed_count = layer_span
             .map(|span| span.compressed_count)
             .unwrap_or_else(|| {
@@ -190,59 +188,43 @@ impl Deepseek4Model {
             .transpose()?;
         let q_rope = alloc(
             &device,
-            if use_f16_prefill {
-                DType::F16
-            } else {
-                DType::BF16
-            },
+            DType::BF16,
             vec![1, rows, heads, head_dim],
             "compressed rotated query",
         )?;
         let kv_rope = alloc(
             &device,
-            if use_f16_prefill {
-                DType::F16
-            } else {
-                DType::BF16
-            },
+            DType::BF16,
             vec![1, rows, 1, head_dim],
             "compressed rotated raw KV",
         )?;
         let attention = alloc(
             &device,
-            if use_f16_prefill {
-                DType::F16
-            } else {
-                DType::BF16
-            },
+            DType::BF16,
             vec![1, rows, heads, head_dim],
             "compressed sparse attention",
         )?;
-        let kv_cache_source = use_f16_prefill
-            .then(|| {
-                alloc(
-                    &device,
-                    DType::BF16,
-                    vec![1, rows, 1, head_dim],
-                    "compressed raw KV cache source",
-                )
-            })
-            .transpose()?;
         let physical_kv_len = window_capacity + compressed_capacity;
-        let raw_prefix_len = usize::from(rows > 1 && start_position > 0) * window_capacity;
+        let raw_prefix_len =
+            usize::from(use_matrix_prefill && start_position > 0) * window_capacity;
         let compact_raw_kv_len = raw_prefix_len + rows;
         let compact_prefill_kv_len = compact_raw_kv_len + valid_compressed;
+        let compressed_attention_offset = if use_matrix_prefill {
+            compact_raw_kv_len
+        } else {
+            window_capacity
+        };
         let raw_prefix = (raw_prefix_len > 0)
             .then(|| {
                 alloc(
                     &device,
-                    DType::F16,
+                    DType::BF16,
                     vec![1, raw_prefix_len, 1, head_dim],
                     "compressed flash raw-prefix snapshot",
                 )
             })
             .transpose()?;
-        let prefill_flash = (rows > 1)
+        let prefill_flash = use_matrix_prefill
             .then(|| {
                 DeepseekPrefillFlashArena::new(
                     &device,
@@ -326,7 +308,7 @@ impl Deepseek4Model {
                             ratio as usize,
                             rows,
                             start_position,
-                            compact_raw_kv_len,
+                            compressed_attention_offset,
                         )
                     })
                     .transpose()?;
@@ -398,93 +380,54 @@ impl Deepseek4Model {
                 inverse: 0,
             };
             session.barrier_between(&[&core.q_norm, &positions, &frequency_buffer], &[&q_rope]);
-            if use_f16_prefill {
-                dispatch_deepseek_tail_rope_f32_to_f16(
-                    session.encoder_mut(),
-                    registry,
-                    &device,
-                    &core.q_norm,
-                    &positions,
-                    &frequency_buffer,
-                    &q_rope,
-                    &rope,
-                )?;
-            } else {
-                dispatch_deepseek_tail_rope_f32_to_bf16(
-                    session.encoder_mut(),
-                    registry,
-                    &device,
-                    &core.q_norm,
-                    &positions,
-                    &frequency_buffer,
-                    &q_rope,
-                    &rope,
-                )?;
-            }
+            dispatch_deepseek_tail_rope_f32_to_bf16(
+                session.encoder_mut(),
+                registry,
+                &device,
+                &core.q_norm,
+                &positions,
+                &frequency_buffer,
+                &q_rope,
+                &rope,
+            )?;
             session.barrier_between(&[&core.kv_norm, &positions, &frequency_buffer], &[&kv_rope]);
-            if use_f16_prefill {
-                dispatch_deepseek_tail_rope_f32_to_f16(
-                    session.encoder_mut(),
-                    registry,
-                    &device,
-                    &core.kv_norm,
-                    &positions,
-                    &frequency_buffer,
-                    &kv_rope,
-                    &DeepSeekTailRopeParams { heads: 1, ..rope },
-                )?;
-            } else {
-                dispatch_deepseek_tail_rope_f32_to_bf16(
-                    session.encoder_mut(),
-                    registry,
-                    &device,
-                    &core.kv_norm,
-                    &positions,
-                    &frequency_buffer,
-                    &kv_rope,
-                    &DeepSeekTailRopeParams { heads: 1, ..rope },
-                )?;
-            }
-            if !use_f16_prefill {
-                session.barrier_between(&[&kv_rope], &[&kv_rope]);
-                dispatch_deepseek_mxfp8_fake_quant_bf16(
-                    session.encoder_mut(),
-                    registry,
-                    &device,
-                    &kv_rope,
-                    &DeepSeekMxfp8Params {
-                        rows: rows as u32,
-                        row_width: head_dim as u32,
-                        quantized_width: (head_dim - self.cfg.rope_head_dim as usize) as u32,
-                        block_size: 64,
-                    },
-                )?;
-            }
-            let kv_cache_input = if let Some(cache_source) = kv_cache_source.as_ref() {
-                session.barrier_between(&[&kv_rope], &[cache_source]);
-                cast(
-                    session.encoder_mut(),
-                    registry,
-                    device.metal_device(),
-                    &kv_rope,
-                    cache_source,
-                    rows * head_dim,
-                    CastDirection::F16ToBF16,
-                )?;
-                cache_source
-            } else {
-                &kv_rope
-            };
+            dispatch_deepseek_tail_rope_f32_to_bf16(
+                session.encoder_mut(),
+                registry,
+                &device,
+                &core.kv_norm,
+                &positions,
+                &frequency_buffer,
+                &kv_rope,
+                &DeepSeekTailRopeParams { heads: 1, ..rope },
+            )?;
+            session.barrier_between(&[&kv_rope], &[&kv_rope]);
+            dispatch_deepseek_mxfp8_fake_quant_bf16(
+                session.encoder_mut(),
+                registry,
+                &device,
+                &kv_rope,
+                &DeepSeekMxfp8Params {
+                    rows: rows as u32,
+                    row_width: head_dim as u32,
+                    quantized_width: (head_dim - self.cfg.rope_head_dim as usize) as u32,
+                    block_size: 64,
+                },
+            )?;
+            let kv_cache_input = &kv_rope;
             if let Some(prefix) = raw_prefix.as_ref() {
                 session.barrier_between(&[&layer_cache.window_kv], &[prefix]);
-                cast(
+                dispatch_kv_cache_copy(
                     session.encoder_mut(),
                     registry,
                     device.metal_device(),
                     &layer_cache.window_kv,
                     prefix,
-                    raw_prefix_len * head_dim,
-                    CastDirection::BF16ToF16,
+                    0,
+                    head_dim as u32,
+                    raw_prefix_len as u32,
+                    window_capacity as u32,
+                    false,
                 )?;
             }
             let mut window_write_inputs = vec![kv_cache_input];
@@ -546,11 +489,7 @@ impl Deepseek4Model {
                         .unwrap_or(0),
                     compressed_count,
                     valid_compressed,
-                    if prefill_span.is_some() {
-                        compact_raw_kv_len
-                    } else {
-                        window_capacity
-                    },
+                    compressed_attention_offset,
                     layer_cache,
                     &core.attn_norm,
                     &core.q_a_norm,

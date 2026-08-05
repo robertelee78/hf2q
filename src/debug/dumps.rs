@@ -40,8 +40,7 @@ pub fn dump_u8(
         .map_err(|e| anyhow::anyhow!("dump_u8 {name} read: {e}"))?;
     let dump_dir = &INVESTIGATION_ENV.dump_dir;
     let path = format!("{dump_dir}/hf2q_{name}_layer{layer_idx:02}_pos{seq_pos}.u8.bin");
-    std::fs::write(&path, &data[..n_bytes])
-        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    std::fs::write(&path, &data[..n_bytes]).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
     eprintln!("[DUMP] {name} layer {layer_idx:02} ({n_bytes} u8) -> {path}");
     Ok(())
 }
@@ -49,16 +48,10 @@ pub fn dump_u8(
 /// Write a meta JSON sidecar to
 /// `<dump_dir>/hf2q_<name>_layer<LL>_pos<seq_pos>.json`.
 /// `json_str` should be a pretty-printed JSON string (use `serde_json::to_string_pretty`).
-pub fn dump_meta_json(
-    json_str: &str,
-    name: &str,
-    layer_idx: usize,
-    seq_pos: usize,
-) -> Result<()> {
+pub fn dump_meta_json(json_str: &str, name: &str, layer_idx: usize, seq_pos: usize) -> Result<()> {
     let dump_dir = &INVESTIGATION_ENV.dump_dir;
     let path = format!("{dump_dir}/hf2q_{name}_layer{layer_idx:02}_pos{seq_pos}.json");
-    std::fs::write(&path, json_str.as_bytes())
-        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    std::fs::write(&path, json_str.as_bytes()).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
     eprintln!("[DUMP] {name} layer {layer_idx:02} -> {path}");
     Ok(())
 }
@@ -101,7 +94,7 @@ pub fn dump_f32_to(
     dir_override: Option<&std::path::Path>,
 ) -> Result<()> {
     let data: &[f32] = buf
-        .as_slice()
+        .as_logical_slice()
         .map_err(|e| anyhow::anyhow!("dump {name} read: {e}"))?;
     let dump_dir_owned: String;
     let dump_dir: &str = match dir_override {
@@ -121,11 +114,50 @@ pub fn dump_f32_to(
             n_elems * std::mem::size_of::<f32>(),
         )
     };
-    std::fs::write(&path, bytes)
-        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
     match layer_idx {
         Some(l) => eprintln!("[DUMP] {name} layer {l:02} ({n_elems} f32) -> {path}"),
         None => eprintln!("[DUMP] {name} ({n_elems} f32) -> {path}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dump_f32_to;
+    use mlx_native::{DType, MlxDevice};
+
+    #[test]
+    fn f32_dump_honors_slice_view_offset() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device");
+        let mut buffer = device
+            .alloc_buffer(4 * DType::F32.size_of(), DType::F32, vec![4])
+            .expect("test buffer");
+        buffer
+            .as_logical_mut_slice::<f32>()
+            .expect("test values")
+            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let view = buffer
+            .slice_view((2 * DType::F32.size_of()) as u64, 2)
+            .with_shape(vec![2])
+            .expect("slice shape");
+        let directory = tempfile::tempdir().expect("temporary dump directory");
+        dump_f32_to(
+            &view,
+            2,
+            "slice_offset",
+            None,
+            7,
+            Some(directory.path()),
+        )
+        .expect("dump slice");
+        let bytes = std::fs::read(directory.path().join("hf2q_slice_offset_pos7.bin"))
+            .expect("read dump");
+        let actual = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, [3.0, 4.0]);
+    }
 }

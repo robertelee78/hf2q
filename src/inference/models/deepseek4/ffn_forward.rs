@@ -205,6 +205,11 @@ impl Deepseek4Model {
                 .context("DeepSeek-V4 token ID exceeds signed routing range")?;
         }
         let rows_u32 = u32::try_from(rows).context("DeepSeek-V4 FFN rows exceed u32")?;
+        let routed_projection = if lookup.is_some() && rows == 1 {
+            ExpertMatmulRoute::ForceMv
+        } else {
+            ExpertMatmulRoute::Auto
+        };
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {
@@ -333,11 +338,7 @@ impl Deepseek4Model {
                 experts,
                 inter,
                 hidden,
-                if lookup.is_some() {
-                    ExpertMatmulRoute::ForceMv
-                } else {
-                    ExpertMatmulRoute::Auto
-                },
+                routed_projection,
                 "routed gate",
             )?;
             expert_matmul(
@@ -353,11 +354,7 @@ impl Deepseek4Model {
                 experts,
                 inter,
                 hidden,
-                if lookup.is_some() {
-                    ExpertMatmulRoute::ForceMv
-                } else {
-                    ExpertMatmulRoute::Auto
-                },
+                routed_projection,
                 "routed up",
             )?;
             raw_matmul(

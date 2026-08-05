@@ -20,7 +20,7 @@ use tokenizers::Tokenizer;
 
 use crate::inference::models::deepseek4::{
     cache::{Deepseek4Cache, Deepseek4CacheSnapshot},
-    tokenizer as deepseek_tokenizer, Deepseek4Model, FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER,
+    matrix_prefill_chunk_len, tokenizer as deepseek_tokenizer, Deepseek4Model,
 };
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
@@ -89,7 +89,7 @@ impl Deepseek4LoadedModel {
         let eos = gguf
             .metadata_u32("tokenizer.ggml.eos_token_id")
             .unwrap_or(1);
-        let model =
+        let mut model =
             Deepseek4Model::load_from_gguf(&gguf).context("load native DeepSeek-V4 model")?;
         let requested_context = std::env::var("HF2Q_DEEPSEEK_MAX_SEQ_LEN")
             .ok()
@@ -107,9 +107,30 @@ impl Deepseek4LoadedModel {
             "DeepSeek-V4 serving context {context_length} must be at least the {}-token native window",
             model.cfg.sliding_window
         );
-        let cache = model
+        let mut cache = model
             .allocate_cache(context_length)
             .with_context(|| format!("allocate {context_length}-token DeepSeek-V4 cache"))?;
+
+        // Metal pipeline creation and the first page-in of the 43 verifier
+        // layers otherwise happen after the server has announced readiness,
+        // adding several silent seconds to the first OpenCode turn. Exercise
+        // an aligned matrix prefill and the output head before becoming ready,
+        // then discard every byte of logical conversation state.
+        if std::env::var("HF2Q_DEEPSEEK_SKIP_WARMUP").as_deref() != Ok("1") {
+            let warm_tokens = vec![eos; 64];
+            let warm_state = model
+                .forward_verifier_prefill(&warm_tokens, &mut cache)
+                .context("warm DeepSeek-V4 matrix prefill")?;
+            let warm_last = model
+                .last_token_state(&warm_state)
+                .context("view DeepSeek-V4 warmup state")?;
+            model
+                .forward_logits(&warm_last)
+                .context("warm DeepSeek-V4 output head")?;
+            cache
+                .reset()
+                .context("reset DeepSeek-V4 cache after warmup")?;
+        }
 
         Ok(Self {
             model,
@@ -176,21 +197,27 @@ impl Deepseek4LoadedModel {
         }
         let mut state = None;
         let mut offset = 0;
-        if self.cache.position() == 0 {
-            let batch = tokens.len().min(
-                self.model.cfg.sliding_window as usize * FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER,
+        while offset < tokens.len() {
+            let batch = matrix_prefill_chunk_len(
+                self.cache.position(),
+                tokens.len() - offset,
+                self.model.cfg.sliding_window as usize,
             );
+            if batch == 0 {
+                break;
+            }
             anyhow::ensure!(
                 !cancelled(),
                 "DeepSeek-V4 generation cancelled during prefill"
             );
             state = Some(
                 self.model
-                    .forward_verifier_prefill(&tokens[..batch], &mut self.cache)
-                    .context("execute DeepSeek-V4 fresh-prompt matrix prefill")?,
+                    .forward_verifier_prefill(&tokens[offset..offset + batch], &mut self.cache)
+                    .context("execute DeepSeek-V4 matrix prefill chunk")?,
             );
-            self.committed_tokens.extend_from_slice(&tokens[..batch]);
-            offset = batch;
+            self.committed_tokens
+                .extend_from_slice(&tokens[offset..offset + batch]);
+            offset += batch;
         }
         for &token in &tokens[offset..] {
             anyhow::ensure!(

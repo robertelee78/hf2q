@@ -1,11 +1,14 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
-- **Status:** Accepted; official conversion, native inference, agentic serving, prefix-cache, tool-call, coherence, and performance gates passed (2026-08-05)
+- **Status:** Conversion accepted; agentic serving and performance gates reopened
+  after long-context OpenCode revalidation (2026-08-05)
+- **Updated:** 2026-08-05 — published the required native append kernels as
+  `mlx-native 0.9.6` and strengthened the agentic serving gate
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
 - **Reference implementation:** `/opt/llama.cpp` at
-  `6ea215d171fd31df943bf1ac8227129f2b963160`
+  `360e1349f0009c5ad99d21e3c4546b707addc68a`
 - **Target host:** Apple M5 Max, 40-core GPU, 128 GiB unified memory
 
 ## Decision
@@ -23,18 +26,18 @@ Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
 evidence.
 
-The accepted base-model runtime executes up to 1,024 leading tokens of a fresh
-prompt as one native matrix transaction, eight times wider than the 128-token
-physical attention window. Attention reads the transaction's compact KV source
-while only the final physical window is published to the circular cache. The
-bound prevents the dense sparse-mask adapter from growing quadratically without
-limit; a longer remainder and existing contexts retain exact token-wise suffix
-extension. Agentic follow-up turns therefore do not recalculate their committed
-prefix. The OpenAI server defaults to a 131,072-token serving context, may be
-configured with `HF2Q_DEEPSEEK_MAX_SEQ_LEN`, and is capped by the checkpoint's
-1,048,576-token trained limit. The separate DSpark draft artifact remains
-follow-up work and is never silently represented as part of the accepted base
-GGUF.
+The revalidated runtime candidate executes prompts in bounded 4,096-token
+matrix transactions, 32 times wider than the 128-token physical attention
+window. Attention reads each transaction's compact KV source while only the
+final physical window is published to the circular cache. A suffix shorter than
+33 tokens retains exact token-wise extension; longer suffixes use another
+matrix transaction so an agentic follow-up does not degrade into full
+decode-style replay. This requires `mlx-native =0.9.6`, published from source
+commit `7b05016b1bc2b4cce06bb0c4336abf8bded1c394`; it must not be enabled against
+an older dependency that only accepts one-token nonzero-position appends. The
+OpenAI server context may be configured with `HF2Q_DEEPSEEK_MAX_SEQ_LEN` and is
+capped by checkpoint metadata. The separate DSpark draft artifact remains
+follow-up work and is never silently represented as part of the base GGUF.
 
 Agentic serving is stateful. A growing rendered transcript reuses the exact
 live native KV/recurrent prefix and evaluates only its suffix. Because the
@@ -50,6 +53,11 @@ required/automatic tool choice, structured tool-call responses, and multiple
 invocations in one DSML block. DeepSeek-V4 embeddings, multimodal inputs, and
 the slot-aware concurrent scheduler are explicitly rejected rather than routed
 to another model family.
+
+For SSE, `time_to_first_token_ms` measures the first API-visible reasoning,
+content, or structured tool-call event. Prefill completion alone is not TTFT:
+DSML text is intentionally withheld until a complete tool block can be parsed,
+so the metric includes that silent decode interval.
 
 ## Context and spike result
 
@@ -269,11 +277,45 @@ optimization reruns coherence before its speed result is accepted.
 
 Work occurs in isolated writer worktrees. The integration owner alone reconciles
 shared manifests and lockfiles. Focused tests precede regression, coherence,
-memory, and benchmark gates. Commits may be merged and pushed because the user
-authorized the full delivery workflow, but no artifact is described as ready
-until its exact-source receipt and all applicable acceptance gates are green.
+memory, and benchmark gates. Local commits and remote publication are separate
+actions; pushing requires explicit authorization. No artifact is described as
+ready until its exact-source receipt and all applicable acceptance gates are
+green.
 
-## Current evidence ledger
+## Agentic revalidation (2026-08-05)
+
+The earlier short-prompt acceptance did not represent OpenCode. A source-bound
+revalidation used a real repository prompt, OpenAI tool definitions, a required
+tool call, a tool-result continuation, SSE, and a growing live prefix. The
+following results supersede any readiness or H4-pass statement in the
+historical ledger below:
+
+| Check | Revalidated result |
+|---|---|
+| Reproducible dependency | The former `mlx-native` revision `7cc3d30` rejects the second 4K matrix transaction with `incremental calls require seq_len=1`. hf2q now pins the immutable crates.io release `mlx-native =0.9.6`, published from `7b05016b1bc2b4cce06bb0c4336abf8bded1c394`. Its registry checksum and downloaded crate SHA-256 are both `7a91af027a38c1cf606f00a39da90ba2353843b155529b4cd4d00c6d29f7b015`. |
+| Dependency parity tests | From the clean release source: 320 library tests passed; five compressor, three sparse-mask, and two F16/BF16 D512 skip-map-with-sinks tests passed; the optimized bit-width experiment passed; and `cargo package --locked` verified the 525-file crate. An external `/opt/llama.cpp` peer benchmark was corrected to remain explicit/ignored rather than making default crate tests depend on a machine-local checkout. |
+| Readiness warmup | The server now exercises matrix prefill and the vocabulary head before binding readiness, then resets logical cache state. Load-to-ready increased from about 20.2 s to 25.3 s, moving first-use pipeline work out of the first request. |
+| Realistic cold tool request | 8,957 prompt tokens, 25.558 s TTFT, 350.46 prompt tok/s, 29.505 s total, `cached_tokens=0`. This is responsive rather than hung, but not yet an agentic acceptance pass. |
+| Exact-prefix reuse | Repeating the request reused 8,949 of 8,957 tokens and reduced prefill to 1.138 s. A 9,056-token tool-result continuation reused the same 8,949-token prefix and prefetched only its suffix in 2.234 s. |
+| OpenAI/SSE protocol | Unary and SSE both emitted structured `tool_calls`, `finish_reason: "tool_calls"`, and a terminal `[DONE]`; no raw DSML leaked. |
+| Checked-in agentic gate | `scripts/test_deepseek4_agentic.sh` uses a unique run ID and deliberately withholds the requested manifest until the tool result. It requires a zero-cache first request, near-complete reuse on repeats and tool results, bounded wall-clock semantic response latency, reconstructed valid SSE tool-call JSON, matching call identity/arguments, `finish_reason: "tool_calls"`, usage, and exactly one terminal `[DONE]`. The 128-token completion budget prevents a valid but slightly longer DSML call from being mistaken for a grammar failure. The gate remains fail-closed on the Q2 tool-semantic defect below. |
+| Tool semantics at Q2 | Failed. Required-tool runs requested paths including `/home/robertl/agent/coding/1`, `/opt/hf2q/README.md`, and, after removing the initially embedded manifest from the fixture, `/cargo/1.0.0.1/daniel/hf2q/cargo.toml` instead of the explicit `/opt/hf2q/Cargo.toml`. One separate cold SSE run chose the correct path, demonstrating inconsistent artifact quality rather than a stable agentic pass. Automatic tool choice also failed to produce a reliable native call. |
+| Long-prompt throughput | A controlled 18,526-token candidate improved from 95.57 s / 193.85 tok/s at 512-row chunks to 70.52 s / 262.70 tok/s at 4K chunks. The matched llama.cpp reference was 361.89 tok/s, so hf2q reached about 72.6% and failed the H4 85% prompt-processing floor. |
+| Decode throughput | A warmed 6.2K agent prompt decoded at about 16.35 tok/s versus about 38.58 tok/s for the matched llama.cpp run. H4 decode parity is therefore reopened. |
+| Quality reference | llama.cpp on the same Q2 artifact also emitted malformed/non-actionable tool content in automatic and required modes. That implicates the aggressive quantization, but does not relax hf2q's agentic correctness gate. |
+
+DeepSeek-V4-Flash Q2 is therefore an experimental serving target. “Ready” now
+means the process and Metal pipelines are initialized; it does not mean the
+artifact has passed the agentic quality or llama.cpp parity gates. Release
+acceptance requires a realistic multi-turn coding fixture to produce the right
+tool call, consume its result, reuse the unchanged prefix, stream a timely first
+semantic token, and meet both H4 throughput floors.
+
+## Evidence ledger
+
+Rows below are retained as historical implementation evidence. Where they
+conflict with the agentic revalidation table, the revalidation table governs
+current readiness.
 
 | Evidence | Result |
 |---|---|

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
@@ -14,26 +14,44 @@ use crate::serve::api::sse::{DeltaKind, GenerationEvent, StreamStats};
 use super::sampling::{decode_token_limit, grammar_runtime, sample, sampler_config};
 use super::Deepseek4LoadedModel;
 
+fn send_visible(
+    events: &mpsc::Sender<GenerationEvent>,
+    event: GenerationEvent,
+    request_started: Instant,
+    first_visible_at: &mut Option<Duration>,
+) -> Result<()> {
+    events
+        .blocking_send(event)
+        .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
+    first_visible_at.get_or_insert_with(|| request_started.elapsed());
+    Ok(())
+}
+
 fn emit_tool_block(
     registration: &ModelRegistration,
     body: &mut String,
     events: &mpsc::Sender<GenerationEvent>,
     next_index: &mut usize,
+    request_started: Instant,
+    first_visible_at: &mut Option<Duration>,
 ) -> Result<bool> {
     let calls = registry::parse_tool_call_bodies(registration, body)
         .context("parse DeepSeek-V4 DSML tool call block")?;
     for call in calls {
         let index = *next_index;
         let id = format!("call_hf2q_{:016x}", next_call_id(index));
-        events
-            .blocking_send(GenerationEvent::ToolCallDelta {
+        send_visible(
+            events,
+            GenerationEvent::ToolCallDelta {
                 index,
                 id: Some(id),
                 call_type: Some("function".into()),
                 name: Some(call.name),
                 arguments: Some(call.arguments_json),
-            })
-            .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
+            },
+            request_started,
+            first_visible_at,
+        )?;
         *next_index += 1;
     }
     body.clear();
@@ -55,27 +73,35 @@ fn route_tool_content(
     runtime: &mut Option<GrammarRuntime>,
     registration: Option<&ModelRegistration>,
     events: &mpsc::Sender<GenerationEvent>,
+    request_started: Instant,
+    first_visible_at: &mut Option<Duration>,
 ) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     let Some(splitter) = tools.as_mut() else {
-        events
-            .blocking_send(GenerationEvent::Delta {
+        send_visible(
+            events,
+            GenerationEvent::Delta {
                 kind: DeltaKind::Content,
                 text,
-            })
-            .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
+            },
+            request_started,
+            first_visible_at,
+        )?;
         return Ok(());
     };
     for event in splitter.feed(&text) {
         match event {
-            ToolCallEvent::Content(text) => events
-                .blocking_send(GenerationEvent::Delta {
+            ToolCallEvent::Content(text) => send_visible(
+                events,
+                GenerationEvent::Delta {
                     kind: DeltaKind::Content,
                     text,
-                })
-                .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?,
+                },
+                request_started,
+                first_visible_at,
+            )?,
             ToolCallEvent::ToolCallOpen => {
                 body.clear();
                 if let Some(runtime) = runtime.as_mut() {
@@ -86,7 +112,14 @@ fn route_tool_content(
             ToolCallEvent::ToolCallClose => {
                 let registration =
                     registration.context("DeepSeek-V4 tool splitter lacks registration")?;
-                *saw |= emit_tool_block(registration, body, events, index)?;
+                *saw |= emit_tool_block(
+                    registration,
+                    body,
+                    events,
+                    index,
+                    request_started,
+                    first_visible_at,
+                )?;
             }
         }
     }
@@ -104,16 +137,21 @@ fn route_stream_fragment(
     runtime: &mut Option<GrammarRuntime>,
     registration: Option<&ModelRegistration>,
     events: &mpsc::Sender<GenerationEvent>,
+    request_started: Instant,
+    first_visible_at: &mut Option<Duration>,
 ) -> Result<()> {
     if let Some(splitter) = reasoning.as_mut() {
         for (slot, text) in splitter.feed(fragment) {
             match slot {
-                SplitSlot::Reasoning => events
-                    .blocking_send(GenerationEvent::Delta {
+                SplitSlot::Reasoning => send_visible(
+                    events,
+                    GenerationEvent::Delta {
                         kind: DeltaKind::Reasoning,
                         text,
-                    })
-                    .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?,
+                    },
+                    request_started,
+                    first_visible_at,
+                )?,
                 SplitSlot::Content => route_tool_content(
                     text,
                     tools,
@@ -123,6 +161,8 @@ fn route_stream_fragment(
                     runtime,
                     registration,
                     events,
+                    request_started,
+                    first_visible_at,
                 )?,
             }
         }
@@ -136,6 +176,8 @@ fn route_stream_fragment(
             runtime,
             registration,
             events,
+            request_started,
+            first_visible_at,
         )?;
     }
     Ok(())
@@ -151,7 +193,8 @@ pub fn generate_stream(
     cancellation_counter: Option<&AtomicU64>,
 ) {
     let run = (|| -> Result<()> {
-        let prefill_started = Instant::now();
+        let request_started = Instant::now();
+        let prefill_started = request_started;
         let (mut logits, cached_tokens) =
             loaded.prefill_suffix(prompt_tokens, || events.is_closed())?;
         let prefill_duration = prefill_started.elapsed();
@@ -164,6 +207,7 @@ pub fn generate_stream(
         let mut tool_body = String::new();
         let mut tool_index = 0usize;
         let mut saw_tool = false;
+        let mut first_visible_at = None;
         let max_tokens = decode_token_limit(
             params.max_tokens,
             prompt_tokens.len(),
@@ -205,6 +249,8 @@ pub fn generate_stream(
                     &mut runtime,
                     registration,
                     events,
+                    request_started,
+                    &mut first_visible_at,
                 )?;
             }
             if params
@@ -223,12 +269,15 @@ pub fn generate_stream(
         if let Some(splitter) = reasoning.as_mut() {
             if let Some((slot, text)) = splitter.finish() {
                 match slot {
-                    SplitSlot::Reasoning => events
-                        .blocking_send(GenerationEvent::Delta {
+                    SplitSlot::Reasoning => send_visible(
+                        events,
+                        GenerationEvent::Delta {
                             kind: DeltaKind::Reasoning,
                             text,
-                        })
-                        .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?,
+                        },
+                        request_started,
+                        &mut first_visible_at,
+                    )?,
                     SplitSlot::Content => route_tool_content(
                         text,
                         &mut tools,
@@ -238,6 +287,8 @@ pub fn generate_stream(
                         &mut runtime,
                         registration,
                         events,
+                        request_started,
+                        &mut first_visible_at,
                     )?,
                 }
             }
@@ -245,12 +296,15 @@ pub fn generate_stream(
         if let Some(splitter) = tools.as_mut() {
             if let Some(event) = splitter.finish() {
                 match event {
-                    ToolCallEvent::Content(text) => events
-                        .blocking_send(GenerationEvent::Delta {
+                    ToolCallEvent::Content(text) => send_visible(
+                        events,
+                        GenerationEvent::Delta {
                             kind: DeltaKind::Content,
                             text,
-                        })
-                        .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?,
+                        },
+                        request_started,
+                        &mut first_visible_at,
+                    )?,
                     ToolCallEvent::ToolCallText(text) => {
                         tool_body.push_str(&text);
                         anyhow::bail!("DeepSeek-V4 generation ended inside a DSML tool block");
@@ -263,6 +317,7 @@ pub fn generate_stream(
             finish_reason = "tool_calls";
         }
         let decode_duration = decode_started.elapsed();
+        let semantic_ttft = first_visible_at.unwrap_or_else(|| request_started.elapsed());
         events
             .blocking_send(GenerationEvent::Done {
                 finish_reason,
@@ -274,7 +329,7 @@ pub fn generate_stream(
                     total_time_secs: Some(
                         prefill_duration.as_secs_f64() + decode_duration.as_secs_f64(),
                     ),
-                    time_to_first_token_ms: Some(prefill_duration.as_secs_f64() * 1000.0),
+                    time_to_first_token_ms: Some(semantic_ttft.as_secs_f64() * 1000.0),
                     prefill_tokens_per_sec: Some(
                         (prompt_tokens.len().saturating_sub(cached_tokens)) as f64
                             / prefill_duration.as_secs_f64().max(f64::EPSILON),
@@ -300,5 +355,50 @@ pub fn generate_stream(
         } else {
             let _ = events.blocking_send(GenerationEvent::Error(format!("{error:#}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_visible;
+    use crate::serve::api::sse::{DeltaKind, GenerationEvent};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn semantic_ttft_is_recorded_once_on_the_first_visible_event() {
+        let (events, mut receiver) = mpsc::channel(1);
+        let request_started = Instant::now();
+        let mut first_visible_at = None;
+
+        send_visible(
+            &events,
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: "first".into(),
+            },
+            request_started,
+            &mut first_visible_at,
+        )
+        .expect("send first visible event");
+        assert!(matches!(
+            receiver.blocking_recv(),
+            Some(GenerationEvent::Delta { text, .. }) if text == "first"
+        ));
+        let first = first_visible_at.expect("first visible timestamp");
+
+        send_visible(
+            &events,
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: "second".into(),
+            },
+            request_started
+                .checked_sub(Duration::from_secs(1))
+                .expect("earlier instant"),
+            &mut first_visible_at,
+        )
+        .expect("send second visible event");
+        assert_eq!(first_visible_at, Some(first));
     }
 }

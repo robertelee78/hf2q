@@ -3,12 +3,12 @@
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_sparse_prefill_mask::{
-    dispatch_deepseek_sparse_prefill_mask_f16, DeepSeekSparsePrefillMaskParams,
+    dispatch_deepseek_sparse_prefill_mask, DeepSeekSparsePrefillMaskParams,
 };
-use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams;
-use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_f16_d512_with_sinks;
-use mlx_native::ops::transpose::permute_021_f16;
+use mlx_native::ops::flash_attn_prefill_blk::{dispatch_flash_attn_prefill_blk, BlkParams};
+use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks;
+use mlx_native::ops::transpose::permute_021_bf16;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::forward_support::alloc;
@@ -17,6 +17,7 @@ pub(super) struct DeepseekPrefillFlashArena {
     q_head_major: MlxBuffer,
     kv: MlxBuffer,
     mask: MlxBuffer,
+    blk: MlxBuffer,
     output_head_major: MlxBuffer,
 }
 
@@ -31,25 +32,31 @@ impl DeepseekPrefillFlashArena {
         Ok(Self {
             q_head_major: alloc(
                 device,
-                DType::F16,
+                DType::BF16,
                 vec![1, heads, rows, head_dim],
                 "flash prefill head-major query",
             )?,
             kv: alloc(
                 device,
-                DType::F16,
+                DType::BF16,
                 vec![1, 1, kv_len, head_dim],
                 "flash prefill KV",
             )?,
             mask: alloc(
                 device,
-                DType::F16,
-                vec![1, heads, rows, kv_len],
-                "flash prefill sparse mask",
+                DType::BF16,
+                vec![rows, kv_len],
+                "flash prefill broadcast sparse mask",
+            )?,
+            blk: alloc(
+                device,
+                DType::U8,
+                vec![rows.div_ceil(8), kv_len.div_ceil(64)],
+                "flash prefill sparse tile map",
             )?,
             output_head_major: alloc(
                 device,
-                DType::F16,
+                DType::BF16,
                 vec![1, heads, rows, head_dim],
                 "flash prefill head-major output",
             )?,
@@ -80,7 +87,7 @@ pub(super) fn encode_deepseek_flash_prefill(
     scale: f32,
 ) -> Result<()> {
     session.barrier_between(&[query_token_major], &[&arena.q_head_major]);
-    permute_021_f16(
+    permute_021_bf16(
         session.encoder_mut(),
         registry,
         device.metal_device(),
@@ -93,7 +100,7 @@ pub(super) fn encode_deepseek_flash_prefill(
     if let Some(prefix) = raw_prefix {
         let prefix_destination = arena.kv.slice_view(0, raw_prefix_len * head_dim);
         session.barrier_between(&[prefix], &[&prefix_destination]);
-        permute_021_f16(
+        permute_021_bf16(
             session.encoder_mut(),
             registry,
             device.metal_device(),
@@ -104,12 +111,10 @@ pub(super) fn encode_deepseek_flash_prefill(
             head_dim,
         )?;
     }
-    let current_offset = raw_prefix_len * head_dim * DType::F16.size_of();
-    let current_destination = arena
-        .kv
-        .slice_view(current_offset as u64, rows * head_dim);
+    let current_offset = raw_prefix_len * head_dim * DType::BF16.size_of();
+    let current_destination = arena.kv.slice_view(current_offset as u64, rows * head_dim);
     session.barrier_between(&[kv_source], &[&current_destination]);
-    permute_021_f16(
+    permute_021_bf16(
         session.encoder_mut(),
         registry,
         device.metal_device(),
@@ -124,24 +129,25 @@ pub(super) fn encode_deepseek_flash_prefill(
             .checked_sub(raw_kv_len)
             .context("DeepSeek-V4 compact prefill KV length underflow")?;
         let destination = arena.kv.slice_view(
-            (raw_kv_len * head_dim * DType::F16.size_of()) as u64,
+            (raw_kv_len * head_dim * DType::BF16.size_of()) as u64,
             compressed_len * head_dim,
         );
         if compressed_len > 0 {
             session.barrier_between(&[compressed], &[&destination]);
-            cast(
+            permute_021_bf16(
                 session.encoder_mut(),
                 registry,
                 device.metal_device(),
                 compressed,
                 &destination,
-                compressed_len * head_dim,
-                CastDirection::BF16ToF16,
+                compressed_len,
+                1,
+                head_dim,
             )?;
         }
     }
     session.barrier_between(&[indices], &[&arena.mask]);
-    dispatch_deepseek_sparse_prefill_mask_f16(
+    dispatch_deepseek_sparse_prefill_mask(
         session.encoder_mut(),
         registry,
         device,
@@ -155,18 +161,39 @@ pub(super) fn encode_deepseek_flash_prefill(
             heads: heads as u32,
         },
     )?;
+    session.barrier_between(&[&arena.mask], &[&arena.blk]);
+    dispatch_flash_attn_prefill_blk(
+        session.encoder_mut(),
+        device,
+        registry,
+        &arena.mask,
+        &arena.blk,
+        &BlkParams {
+            seq_len_q: rows as u32,
+            seq_len_k: kv_len as u32,
+            bq: 8,
+            bk: 64,
+        },
+    )?;
     session.barrier_between(
-        &[&arena.q_head_major, &arena.kv, &arena.mask, sinks],
+        &[
+            &arena.q_head_major,
+            &arena.kv,
+            &arena.mask,
+            &arena.blk,
+            sinks,
+        ],
         &[&arena.output_head_major],
     );
-    dispatch_flash_attn_prefill_f16_d512_with_sinks(
+    dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks(
         session.encoder_mut(),
         device,
         registry,
         &arena.q_head_major,
         &arena.kv,
         &arena.kv,
-        Some(&arena.mask),
+        &arena.mask,
+        &arena.blk,
         sinks,
         &arena.output_head_major,
         &FlashAttnPrefillParams {
@@ -181,7 +208,7 @@ pub(super) fn encode_deepseek_flash_prefill(
         },
     )?;
     session.barrier_between(&[&arena.output_head_major], &[output_token_major]);
-    permute_021_f16(
+    permute_021_bf16(
         session.encoder_mut(),
         registry,
         device.metal_device(),

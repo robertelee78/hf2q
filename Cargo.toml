@@ -98,10 +98,9 @@ anyhow = "1"
 thiserror = "2"
 
 # ADR-008: mlx-native is the sole inference/compute backend.
-# DeepSeek-V4 requires the native batched verifier kernels introduced after
-# the latest crates.io release. Pin the exact reviewed source revision so a
-# clean build cannot drift with the dependency's main branch.
-mlx-native = { git = "https://github.com/robertelee78/mlx-native.git", rev = "7cc3d308c37161e6602c9218ad3a14b5f86d7d4a" }
+# DeepSeek-V4 matrix appends and BF16 sparse prefill require mlx-native 0.9.6.
+# Pin the immutable registry release so clean builds cannot drift.
+mlx-native = "=0.9.6"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

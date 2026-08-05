@@ -69,11 +69,14 @@ fi
 
 # One-model-at-a-time guard: the Q2_K_S artifact is ~92 GiB and a second
 # inference process on a 128 GiB unified-memory host will exhaust headroom.
-if pgrep -x hf2q >/dev/null 2>&1; then
-    echo "another hf2q process is already running — refusing to start a second" >&2
-    echo "(kill it first: pkill -x hf2q)" >&2
-    exit 1
-fi
+for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
+    if RUNTIME_PIDS="$(pgrep -x "$RUNTIME_NAME" 2>/dev/null)"; then
+        echo "another inference runtime is already running — refusing before model load" >&2
+        echo "process: $RUNTIME_NAME (pid(s): ${RUNTIME_PIDS//$'\n'/, })" >&2
+        echo "stop that runtime before starting DeepSeek-V4" >&2
+        exit 1
+    fi
+done
 
 exec env \
     HF2Q_DEEPSEEK_MAX_SEQ_LEN="$CONTEXT_LEN" \

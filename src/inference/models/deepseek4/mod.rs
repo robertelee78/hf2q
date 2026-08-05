@@ -35,7 +35,7 @@ pub mod weights;
 pub use config::Deepseek4Config;
 pub use model::Deepseek4Model;
 pub use residency::Deepseek4Weights;
-pub(crate) use verifier_forward::FRESH_MATRIX_PREFILL_WINDOW_MULTIPLIER;
+pub(crate) use verifier_forward::matrix_prefill_chunk_len;
 
 #[cfg(test)]
 mod attention_forward_tests;
