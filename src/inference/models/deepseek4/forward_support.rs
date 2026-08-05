@@ -114,6 +114,82 @@ pub(super) fn raw_matmul(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn grouped_output_a(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &RawMatrixRef<'_>,
+    output: &MlxBuffer,
+    groups: usize,
+    rank: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let group_width = heads
+        .checked_mul(head_dim)
+        .and_then(|width| width.checked_div(groups))
+        .context("DeepSeek-V4 output-A group width overflow")?;
+    let output_width = groups
+        .checked_mul(rank)
+        .context("DeepSeek-V4 output-A width overflow")?;
+    if weight.shape != [output_width, group_width] {
+        bail!(
+            "DeepSeek-V4 output-A weight shape drift: got {:?}, expected [{output_width}, {group_width}]",
+            weight.shape
+        );
+    }
+    if weight.buffer.dtype() != DType::U8 {
+        bail!("DeepSeek-V4 output-A grouped projection requires block-quantized storage");
+    }
+    let block = weight.ggml_type.block_values() as usize;
+    if group_width % block != 0 {
+        bail!("DeepSeek-V4 output-A group width is not block aligned");
+    }
+    let row_bytes = group_width
+        .checked_div(block)
+        .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
+        .context("DeepSeek-V4 output-A row-byte overflow")?;
+    for group in 0..groups {
+        let input_view = input
+            .slice_view(
+                u64::try_from(group * group_width * DType::F32.size_of())
+                    .context("DeepSeek-V4 output-A input offset exceeds u64")?,
+                group_width,
+            )
+            .with_shape(vec![1, group_width])?;
+        let weight_view = weight.buffer.slice_view(
+            u64::try_from(group * rank * row_bytes)
+                .context("DeepSeek-V4 output-A weight offset exceeds u64")?,
+            rank * row_bytes,
+        );
+        let output_view = output
+            .slice_view(
+                u64::try_from(group * rank * DType::F32.size_of())
+                    .context("DeepSeek-V4 output-A output offset exceeds u64")?,
+                rank,
+            )
+            .with_shape(vec![1, rank])?;
+        session.barrier_between(&[&input_view, &weight_view], &[&output_view]);
+        session.quantized_matmul_ggml(
+            registry,
+            device,
+            &input_view,
+            &weight_view,
+            &output_view,
+            &GgmlQuantizedMatmulParams {
+                m: 1,
+                n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+                k: u32::try_from(group_width)
+                    .context("DeepSeek-V4 output-A group width exceeds u32")?,
+                ggml_type: weight.ggml_type,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn expert_matmul(
     session: &mut GraphSession<'_>,
     registry: &mut KernelRegistry,

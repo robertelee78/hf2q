@@ -1,7 +1,4 @@
-//! Exact one-token, layer-0 DeepSeek-V4 attention slice.
-//!
-//! The entire slice is encoded into one Metal command buffer. Logical cache
-//! visibility advances only after that command buffer completes successfully.
+//! Exact one-token uncompressed DeepSeek-V4 attention layers.
 
 use anyhow::{bail, Context, Result};
 use mlx_native::ops::deepseek_hyper_connection::{
@@ -16,37 +13,49 @@ use mlx_native::ops::deepseek_tail_rope::{
 };
 use mlx_native::ops::elementwise::dispatch_cast_bf16_to_f32_with_encoder;
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
-use mlx_native::ops::quantized_matmul_ggml::GgmlQuantizedMatmulParams;
 use mlx_native::{DType, MlxBuffer};
 
 use super::attention::window_indices;
+use super::attention_weights::AttentionWeightsRef;
 use super::cache::Deepseek4Cache;
-use super::forward_support::{alloc, raw_matmul, rms_params};
+use super::forward_support::{alloc, grouped_output_a, raw_matmul, rms_params};
 use super::rope::yarn_frequencies;
 use super::Deepseek4Model;
 
 impl Deepseek4Model {
-    /// Execute the exact verifier attention graph for one token in layer 0.
-    ///
-    /// This is the first coherent vertical slice: Q2_K embedding, HC-pre,
-    /// MLA projections and norms, interleaved tail-RoPE, BF16 cache write,
-    /// sparse attention, inverse RoPE, grouped output projection, and HC-post.
-    pub fn forward_layer0_attention_one(
+    /// Execute one uncompressed verifier attention layer.
+    /// `state=None` embeds layer 0; full-token callers defer cache publication.
+    pub(super) fn forward_uncompressed_attention_one(
         &mut self,
+        state: Option<&MlxBuffer>,
         token_id: u32,
+        layer: usize,
         cache: &mut Deepseek4Cache,
+        commit_cache: bool,
     ) -> Result<MlxBuffer> {
-        if self.cfg.compress_ratios.first().copied() != Some(0) {
-            bail!("DeepSeek-V4 layer-0 attention slice requires official compression ratio 0");
+        if layer >= self.cfg.num_hidden_layers as usize {
+            bail!(
+                "DeepSeek-V4 attention layer index {layer} is outside 0..{}",
+                self.cfg.num_hidden_layers
+            );
+        }
+        if self.cfg.compress_ratios.get(layer).copied() != Some(0) {
+            bail!("DeepSeek-V4 layer {layer} requires the compressed attention path");
+        }
+        if state.is_none() && layer != 0 {
+            bail!("DeepSeek-V4 token embedding is valid only at layer 0");
         }
         let cache_step = cache
             .plan_next_step()
             .context("plan DeepSeek-V4 cache transaction")?;
         let layer_step = cache_step
             .layers
-            .first()
-            .context("missing layer-0 cache plan")?;
-        let layer_cache = cache.layers().first().context("missing layer-0 cache")?;
+            .get(layer)
+            .with_context(|| format!("missing layer-{layer} cache plan"))?;
+        let layer_cache = cache
+            .layers()
+            .get(layer)
+            .with_context(|| format!("missing layer-{layer} cache"))?;
 
         let hidden = self.cfg.hidden_size as usize;
         let hc = self.cfg.hyper_connection_count as usize;
@@ -57,30 +66,49 @@ impl Deepseek4Model {
         let q_rank = self.cfg.q_lora_rank as usize;
         let o_rank = self.cfg.o_lora_rank as usize;
         let groups = self.cfg.output_groups as usize;
-        let group_width = heads * head_dim / groups;
         let output_a_width = groups * o_rank;
         let window_capacity = layer_cache.window_kv.shape()[0];
         if layer_cache.window_kv.shape() != [window_capacity, head_dim] {
             bail!("DeepSeek-V4 layer-0 window cache shape drift");
         }
 
-        let embedding_weight = self.weights.raw_matrix_ref("token_embd.weight")?;
-        let hc_fn = self.weights.raw_matrix_ref("blk.0.hc_attn_fn.weight")?;
-        let hc_base = self.weights.f32_state("blk.0.hc_attn_base.weight")?;
-        let hc_scale = self.weights.f32_state("blk.0.hc_attn_scale.weight")?;
-        let attn_norm_weight = self.weights.f32_state("blk.0.attn_norm.weight")?;
-        let q_a_weight = self.weights.raw_matrix_ref("blk.0.attn_q_a.weight")?;
-        let q_a_norm_weight = self.weights.f32_state("blk.0.attn_q_a_norm.weight")?;
-        let q_b_weight = self.weights.raw_matrix_ref("blk.0.attn_q_b.weight")?;
-        let kv_weight = self.weights.raw_matrix_ref("blk.0.attn_kv.weight")?;
-        let kv_norm_weight = self.weights.f32_state("blk.0.attn_kv_a_norm.weight")?;
-        let sinks = self.weights.f32_state("blk.0.attn_sinks.weight")?;
-        let output_a_weight = self.weights.raw_matrix_ref("blk.0.attn_output_a.weight")?;
-        let output_b_weight = self.weights.raw_matrix_ref("blk.0.attn_output_b.weight")?;
+        let embedding = state
+            .is_none()
+            .then(|| self.prepare_embedding_arena(&[token_id]))
+            .transpose()?;
+        let embedding_weight = embedding
+            .as_ref()
+            .map(|_| self.weights.raw_matrix_ref("token_embd.weight"))
+            .transpose()?;
+        let state = match (state, embedding.as_ref()) {
+            (Some(state), _) => state,
+            (None, Some(embedding)) => &embedding.state,
+            (None, None) => bail!("DeepSeek-V4 layer {layer} has no input state"),
+        };
+        if state.dtype() != DType::F32 || state.shape() != [1, hc, hidden] {
+            bail!(
+                "DeepSeek-V4 layer {layer} attention state must be F32 [1, {hc}, {hidden}], got {} {:?}",
+                state.dtype(),
+                state.shape()
+            );
+        }
+        let AttentionWeightsRef {
+            hc_fn,
+            hc_base,
+            hc_scale,
+            attn_norm: attn_norm_weight,
+            q_a: q_a_weight,
+            q_a_norm: q_a_norm_weight,
+            q_b: q_b_weight,
+            kv: kv_weight,
+            kv_norm: kv_norm_weight,
+            sinks,
+            output_a: output_a_weight,
+            output_b: output_b_weight,
+        } = AttentionWeightsRef::get(&self.weights, layer)?;
 
-        let embedding = self.prepare_embedding_arena(&[token_id])?;
         let device = self.ctx.device().clone();
-        let state_flat = embedding.state.with_shape(vec![1, hc_hidden])?;
+        let state_flat = state.with_shape(vec![1, hc_hidden])?;
         let state_norm = alloc(
             &device,
             DType::F32,
@@ -178,20 +206,24 @@ impl Deepseek4Model {
         let (executor, registry) = self.ctx.split();
         let mut session = executor
             .begin()
-            .context("begin DeepSeek-V4 layer-0 attention")?;
-        Self::encode_embedding_hyper_state(
-            &mut session,
-            registry,
-            executor.device(),
-            embedding_weight.buffer,
-            embedding_weight.ggml_type,
-            embedding_weight.shape,
-            &embedding,
-            1,
-            self.cfg.vocab_size as usize,
-            hidden,
-            self.cfg.hyper_connection_count,
-        )?;
+            .with_context(|| format!("begin DeepSeek-V4 layer {layer} attention"))?;
+        if let (Some(embedding_weight), Some(embedding)) =
+            (embedding_weight.as_ref(), embedding.as_ref())
+        {
+            Self::encode_embedding_hyper_state(
+                &mut session,
+                registry,
+                executor.device(),
+                embedding_weight.buffer,
+                embedding_weight.ggml_type,
+                embedding_weight.shape,
+                embedding,
+                1,
+                self.cfg.vocab_size as usize,
+                hidden,
+                self.cfg.hyper_connection_count,
+            )?;
+        }
 
         session.barrier_between(&[&state_flat], &[&state_norm]);
         session.rms_norm_no_scale_f32(
@@ -228,12 +260,12 @@ impl Deepseek4Model {
             &comb,
             1,
         )?;
-        session.barrier_between(&[&embedding.state, &pre], &[&attn_input]);
+        session.barrier_between(&[state, &pre], &[&attn_input]);
         dispatch_hc_pre(
             session.encoder_mut(),
             registry,
             &device,
-            &embedding.state,
+            state,
             &pre,
             &attn_input,
             1,
@@ -417,48 +449,18 @@ impl Deepseek4Model {
             (heads * head_dim) as u32,
         )?;
 
-        if output_a_weight.shape != [output_a_width, group_width] {
-            bail!(
-                "DeepSeek-V4 output-A weight shape drift: got {:?}",
-                output_a_weight.shape
-            );
-        }
-        if output_a_weight.buffer.dtype() != DType::U8 {
-            bail!("DeepSeek-V4 output-A grouped projection requires block-quantized storage");
-        }
-        let block = output_a_weight.ggml_type.block_values() as usize;
-        if group_width % block != 0 {
-            bail!("DeepSeek-V4 output-A group width is not block aligned");
-        }
-        let row_bytes = group_width / block * output_a_weight.ggml_type.block_bytes() as usize;
-        for group in 0..groups {
-            let input_view = attention_f32
-                .slice_view(
-                    (group * group_width * DType::F32.size_of()) as u64,
-                    group_width,
-                )
-                .with_shape(vec![1, group_width])?;
-            let weight_view = output_a_weight
-                .buffer
-                .slice_view((group * o_rank * row_bytes) as u64, o_rank * row_bytes);
-            let output_view = output_a
-                .slice_view((group * o_rank * DType::F32.size_of()) as u64, o_rank)
-                .with_shape(vec![1, o_rank])?;
-            session.barrier_between(&[&input_view, &weight_view], &[&output_view]);
-            session.quantized_matmul_ggml(
-                registry,
-                &device,
-                &input_view,
-                &weight_view,
-                &output_view,
-                &GgmlQuantizedMatmulParams {
-                    m: 1,
-                    n: o_rank as u32,
-                    k: group_width as u32,
-                    ggml_type: output_a_weight.ggml_type,
-                },
-            )?;
-        }
+        grouped_output_a(
+            &mut session,
+            registry,
+            &device,
+            &attention_f32,
+            &output_a_weight,
+            &output_a,
+            groups,
+            o_rank,
+            heads,
+            head_dim,
+        )?;
         raw_matmul(
             &mut session,
             registry,
@@ -471,16 +473,13 @@ impl Deepseek4Model {
             output_a_width,
             "output B",
         )?;
-        session.barrier_between(
-            &[&output_b, &embedding.state, &post, &comb],
-            &[&output_state],
-        );
+        session.barrier_between(&[&output_b, state, &post, &comb], &[&output_state]);
         dispatch_hc_post(
             session.encoder_mut(),
             registry,
             &device,
             &output_b,
-            &embedding.state,
+            state,
             &post,
             &comb,
             &output_state,
@@ -489,10 +488,12 @@ impl Deepseek4Model {
         )?;
         session
             .finish()
-            .context("execute DeepSeek-V4 layer-0 attention")?;
-        cache
-            .commit_step(cache_step.position)
-            .context("publish DeepSeek-V4 cache transaction")?;
+            .with_context(|| format!("execute DeepSeek-V4 layer {layer} attention"))?;
+        if commit_cache {
+            cache
+                .commit_step(cache_step.position)
+                .context("publish DeepSeek-V4 cache transaction")?;
+        }
         Ok(output_state)
     }
 }

@@ -30,25 +30,33 @@ fn official_artifact_metadata_and_catalog_are_exact() {
 
 #[test]
 #[ignore = "loads the locally converted 89.65 GiB official checkpoint onto Metal"]
-fn official_artifact_executes_native_layer_zero() {
+fn official_artifact_executes_native_uncompressed_prefix() {
     let (path, gguf) = official_artifact();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut model = Deepseek4Model::load_from_gguf(&gguf)
         .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
     let mut cache = model.allocate_cache(128).expect("allocate 128-token cache");
     let state = model
-        .forward_layer0_attention_one(0, &mut cache)
-        .expect("execute native layer-0 attention");
+        .forward_uncompressed_attention_one(None, 0, 0, &mut cache, false)
+        .expect("execute native layer-0 attention without early cache publication");
     let state = model
         .forward_layer0_ffn_one(&state, 0)
         .expect("execute native layer-0 hash-routed FFN");
+    assert_eq!(cache.position(), 0);
+    let state = model
+        .forward_uncompressed_attention_one(Some(&state), 0, 1, &mut cache, false)
+        .expect("execute native layer-1 attention from preceding HC state");
+    let state = model
+        .forward_ffn_one(&state, 0, 1)
+        .expect("execute native layer-1 hash-routed FFN");
+    cache.commit_step(0).expect("publish complete prefix state");
     let values = state.as_slice::<f32>().expect("read final HC state");
     assert_eq!(state.shape(), &[1, 4, 4096]);
     assert_eq!(cache.position(), 1);
     assert!(values.iter().all(|value| value.is_finite()));
     assert!(values.iter().any(|value| *value != 0.0));
     eprintln!(
-        "executed layer 0 from {} with {} resident weight bytes",
+        "executed uncompressed layers 0-1 from {} with {} resident weight bytes",
         path.display(),
         model.weights.resident_bytes()
     );

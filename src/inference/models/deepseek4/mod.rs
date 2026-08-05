@@ -5,7 +5,9 @@
 //! interchangeable with the Qwen or Gemma graphs.
 
 pub mod attention;
+mod attention_entry;
 mod attention_forward;
+mod attention_weights;
 pub mod cache;
 pub mod compressor;
 pub mod config;

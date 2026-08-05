@@ -230,6 +230,6 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
 | Native primitive regression | 41 DeepSeek-focused tests passed; two real-artifact hardware tests ignored by default |
 | Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
-| Official layer-0 Metal proof | Q2_K attention plus exact hash-routed/shared MoE passed in 31.22 s cold; 99,072,415,416-byte peak footprint |
-| Coherent real-model inference | Layer-0 vertical slice passed; full 43-layer generation and cache-coherence corpus pending |
+| Official uncompressed-prefix proof | Layers 0-1 Q2_K attention plus exact hash-routed/shared MoE passed transactionally in 28.36 s cold; 99,047,478,968-byte peak footprint |
+| Coherent real-model inference | Layers 0-1 passed; compressed layers 2-42, output head, generation, and cache-coherence corpus pending |
 | Performance parity | Pending coherent inference |
