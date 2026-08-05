@@ -34,6 +34,8 @@ mod forward_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]
+mod real_artifact_tests;
+#[cfg(test)]
 mod residency_tests;
 
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";

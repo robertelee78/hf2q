@@ -50,10 +50,39 @@ fn required_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("DeepSeek-V4 config: required u32 key {key:?} missing"))
 }
 
+fn required_vocab_size(gguf: &GgufFile, key: &str) -> Result<u32> {
+    if let Some(value) = gguf.metadata_u32(key) {
+        return Ok(value);
+    }
+    let vocab = gguf
+        .tensor_info("token_embd.weight")
+        .and_then(|tensor| tensor.shape.first().copied())
+        .ok_or_else(|| {
+            anyhow!(
+                "DeepSeek-V4 config: {key:?} is absent and token_embd.weight has no vocabulary dimension"
+            )
+        })?;
+    u32::try_from(vocab)
+        .map_err(|_| anyhow!("DeepSeek-V4 config: token embedding vocabulary exceeds u32"))
+}
+
 fn required_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
     let value = gguf
         .metadata_f32(key)
         .ok_or_else(|| anyhow!("DeepSeek-V4 config: required f32 key {key:?} missing"))?;
+    if !value.is_finite() {
+        bail!("DeepSeek-V4 config: key {key:?} must be finite");
+    }
+    Ok(value)
+}
+
+fn optional_f32(gguf: &GgufFile, key: &str, default: f32) -> Result<f32> {
+    let Some(value) = gguf.metadata(key) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_f32()
+        .ok_or_else(|| anyhow!("DeepSeek-V4 config: optional f32 key {key:?} has wrong type"))?;
     if !value.is_finite() {
         bail!("DeepSeek-V4 config: key {key:?} must be finite");
     }
@@ -116,8 +145,14 @@ impl Deepseek4Config {
         if rope_scaling_type != "yarn" {
             bail!("DeepSeek-V4 config: rope scaling must be yarn, got {rope_scaling_type:?}");
         }
-        let yarn_ext_factor = required_f32(gguf, &format!("{p}.rope.scaling.yarn_ext_factor"))?;
-        let yarn_attn_factor = required_f32(gguf, &format!("{p}.rope.scaling.yarn_attn_factor"))?;
+        // The official 0731 config and canonical converter omit both optional
+        // YaRN knobs. The reference model's custom frequency interpolation
+        // therefore uses no attention multiplier; preserve those defaults
+        // while still rejecting explicit incompatible values.
+        let yarn_ext_factor =
+            optional_f32(gguf, &format!("{p}.rope.scaling.yarn_ext_factor"), -1.0)?;
+        let yarn_attn_factor =
+            optional_f32(gguf, &format!("{p}.rope.scaling.yarn_attn_factor"), 1.0)?;
         if yarn_ext_factor != -1.0 || yarn_attn_factor != 1.0 {
             bail!(
                 "DeepSeek-V4 config: unsupported YaRN ext/attention factors ({yarn_ext_factor}, {yarn_attn_factor})"
@@ -128,7 +163,9 @@ impl Deepseek4Config {
             hidden_size_out: required_u32(gguf, &format!("{p}.embedding_length_out"))?,
             num_hidden_layers: required_u32(gguf, &format!("{p}.block_count"))?,
             max_position_embeddings: required_u32(gguf, &format!("{p}.context_length"))?,
-            vocab_size: required_u32(gguf, &format!("{p}.vocab_size"))?,
+            // Canonical DeepSeek-V4 GGUFs derive vocabulary size from the
+            // embedding tensor instead of emitting an architecture KV.
+            vocab_size: required_vocab_size(gguf, &format!("{p}.vocab_size"))?,
             num_attention_heads: required_u32(gguf, &format!("{p}.attention.head_count"))?,
             num_key_value_heads: required_u32(gguf, &format!("{p}.attention.head_count_kv"))?,
             head_dim: required_u32(gguf, &format!("{p}.attention.key_length"))?,
@@ -401,6 +438,17 @@ mod tests {
         assert_eq!(config.compress_ratios[2], 4);
         assert_eq!(config.num_experts_per_tok, 6);
         assert_eq!(config.hyper_connection_sinkhorn_iterations, 20);
+    }
+
+    #[test]
+    fn accepts_officially_omitted_optional_yarn_factors() {
+        let mut kv = official_metadata();
+        kv.retain(|(key, _)| {
+            key != "deepseek4.rope.scaling.yarn_ext_factor"
+                && key != "deepseek4.rope.scaling.yarn_attn_factor"
+        });
+        let (_dir, gguf) = open_fixture(&kv);
+        Deepseek4Config::from_gguf(&gguf).expect("official omitted YaRN defaults");
     }
 
     #[test]

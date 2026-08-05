@@ -390,6 +390,20 @@ mod tests {
     }
 
     #[test]
+    fn official_0731_omits_unspecified_optional_yarn_factors() {
+        let mut cfg = fixture();
+        let rope = cfg["rope_scaling"].as_object_mut().unwrap();
+        rope.remove("extrapolation_factor");
+        rope.remove("attention_factor");
+        let by_key: std::collections::HashMap<_, _> =
+            build_metadata(&cfg, 21, None, None, Some("DeepSeek-V4-Flash-0731"))
+                .into_iter()
+                .collect();
+        assert!(!by_key.contains_key("deepseek4.rope.scaling.yarn_ext_factor"));
+        assert!(!by_key.contains_key("deepseek4.rope.scaling.yarn_attn_factor"));
+    }
+
+    #[test]
     #[should_panic(expected = "head_dim")]
     fn head_dim_is_required_like_current_llama_converter() {
         let mut cfg = fixture();
