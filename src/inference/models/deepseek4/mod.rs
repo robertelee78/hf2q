@@ -5,10 +5,12 @@
 //! interchangeable with the Qwen or Gemma graphs.
 
 pub mod attention;
+mod attention_forward;
 pub mod cache;
 pub mod compressor;
 pub mod config;
 pub mod forward;
+mod forward_support;
 pub mod hyper_connection;
 pub mod model;
 pub mod residency;
@@ -22,6 +24,8 @@ pub use residency::Deepseek4Weights;
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod attention_forward_tests;
 #[cfg(test)]
 mod forward_tests;
 #[cfg(test)]

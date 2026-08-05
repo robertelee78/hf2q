@@ -9,10 +9,10 @@ use mlx_native::{DType, EmbeddingQ2KParams, KernelRegistry, MlxBuffer, MlxDevice
 use super::Deepseek4Model;
 
 /// Buffers that must stay alive until the active command buffer completes.
-struct EmbeddingArena {
-    ids: MlxBuffer,
-    gathered: MlxBuffer,
-    state: MlxBuffer,
+pub(super) struct EmbeddingArena {
+    pub(super) ids: MlxBuffer,
+    pub(super) gathered: MlxBuffer,
+    pub(super) state: MlxBuffer,
 }
 
 impl Deepseek4Model {
@@ -51,7 +51,7 @@ impl Deepseek4Model {
         Ok(arena.state)
     }
 
-    fn prepare_embedding_arena(&self, token_ids: &[u32]) -> Result<EmbeddingArena> {
+    pub(super) fn prepare_embedding_arena(&self, token_ids: &[u32]) -> Result<EmbeddingArena> {
         if token_ids.is_empty() {
             bail!("DeepSeek-V4 forward requires at least one token");
         }
@@ -85,7 +85,7 @@ impl Deepseek4Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_embedding_hyper_state(
+    pub(super) fn encode_embedding_hyper_state(
         session: &mut GraphSession<'_>,
         registry: &mut KernelRegistry,
         device: &MlxDevice,
