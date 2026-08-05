@@ -845,6 +845,63 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(false),
         ));
+    } else if arch == ArchName::Deepseek4 {
+        // DeepSeek-V4-Flash-0731 uses GPT-2 BPE plus the DeepSeek-V3
+        // pre-tokenizer regex bucket. Canonical `_set_vocab_gpt2` order:
+        // model, pre, tokens, token_type, merges, bos, eos, pad,
+        // add_bos_token, add_eos_token, then the 0731 chat template.
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        if !merges.is_empty() {
+            kv.push((
+                "tokenizer.ggml.merges".into(),
+                MetaValue::ArrayString(merges),
+            ));
+        }
+        if let Some(id) = bos_id {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = pad_id {
+            kv.push((
+                "tokenizer.ggml.padding_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        let add_bos = tokenizer_config
+            .as_ref()
+            .and_then(|v| v.get("add_bos_token"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let add_eos = tokenizer_config
+            .as_ref()
+            .and_then(|v| v.get("add_eos_token"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        kv.push((
+            "tokenizer.ggml.add_bos_token".into(),
+            MetaValue::Bool(add_bos),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_eos_token".into(),
+            MetaValue::Bool(add_eos),
+        ));
     } else if arch == ArchName::Llama3 {
         // Llama 3 BPE / gpt2 emit order — canonical
         // `_set_vocab_gpt2` at /opt/llama.cpp/conversion/base.py:1603-1611:
@@ -1280,6 +1337,9 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // (verified against canonical convert_hf_to_gguf.py output:
         // `tokenizer.ggml.pre = 'minimax-m2'`).
         ArchName::MiniMaxM2 => "minimax-m2".into(),
+        // DeepSeek-V4 shares the published DeepSeek-V3 tokenizer
+        // fingerprint (`877081d1...`) and therefore its regex bucket.
+        ArchName::Deepseek4 => "deepseek-v3".into(),
         // BERT: BAAI bge tokenizer hashes to the same chkhsh as
         // jinaai/jina-embeddings-v2-base-en
         // (`0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f`)
@@ -1669,6 +1729,66 @@ mod tests {
     }
 
     #[test]
+    fn deepseek4_emits_0731_tokenizer_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tokenizer = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "byte_fallback": false,
+                "vocab": {"x": 2, "y": 3},
+                "merges": ["x y"]
+            },
+            "added_tokens": [
+                {"id": 0, "content": "<｜begin▁of▁sentence｜>", "special": true},
+                {"id": 1, "content": "<｜end▁of▁sentence｜>", "special": true},
+                {"id": 4, "content": "<｜User｜>", "special": false},
+                {"id": 5, "content": "<｜Assistant｜>", "special": false},
+                {"id": 6, "content": "<think>", "special": false},
+                {"id": 7, "content": "</think>", "special": false},
+                {"id": 8, "content": "｜DSML｜", "special": false}
+            ]
+        });
+        fs::write(
+            tmp.path().join("tokenizer.json"),
+            serde_json::to_string_pretty(&tokenizer).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({"vocab_size": 9})).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "bos_token": "<｜begin▁of▁sentence｜>",
+                "eos_token": "<｜end▁of▁sentence｜>",
+                "pad_token": "<｜end▁of▁sentence｜>",
+                "add_bos_token": false,
+                "add_eos_token": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kv = build_tokenizer_metadata(tmp.path(), ArchName::Deepseek4).unwrap();
+        assert_eq!(lookup_str(&kv, "tokenizer.ggml.model"), "gpt2");
+        assert_eq!(lookup_str(&kv, "tokenizer.ggml.pre"), "deepseek-v3");
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.bos_token_id"), 0);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.eos_token_id"), 1);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.padding_token_id"), 1);
+        assert!(!lookup_bool(&kv, "tokenizer.ggml.add_bos_token"));
+        assert!(!lookup_bool(&kv, "tokenizer.ggml.add_eos_token"));
+        assert_eq!(
+            lookup_str(&kv, "tokenizer.chat_template"),
+            crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731
+        );
+        let keys: Vec<&str> = kv.iter().map(|(key, _)| key.as_str()).collect();
+        assert!(!keys.contains(&"tokenizer.ggml.scores"));
+        assert!(!keys.contains(&"tokenizer.ggml.add_space_prefix"));
+    }
+
+    #[test]
     fn does_token_look_special_pinned_pattern() {
         // Aligned with canonical TextModel.does_token_look_special at
         // /opt/llama.cpp/conversion/base.py:1232-1253 — STRICT bracket
@@ -1716,5 +1836,3 @@ mod tests {
         }
     }
 }
-
-

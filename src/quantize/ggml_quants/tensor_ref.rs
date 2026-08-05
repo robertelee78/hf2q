@@ -17,6 +17,15 @@ pub enum SourceDtype {
     /// `float8_e4m3fn` — 1-bit sign + 4-bit exp + 3-bit mantissa, no
     /// inf, single NaN encoding. Auto-dequantized to F32 in-memory.
     Fp8E4M3,
+    /// DeepSeek-V4 routed expert weights: two E2M1 values packed into
+    /// each I8/U8 byte and scaled in groups of 32 by E8M0.
+    Mxfp4E2M1,
+    /// E8M0 sidecar scale indexed by the reader but never emitted.
+    E8M0Scale,
+    /// Integer hash-routing table preserved as GGML I32.
+    I32,
+    /// I64 source route table range-checked into canonical GGML I32.
+    I64,
 }
 
 /// Closed enum of architectures recognized by `StandardPolicy::target_for`.
@@ -81,6 +90,8 @@ pub enum ArchName {
     Llama3,
     /// MiniMax M2.7 (FP8 source).
     MiniMaxM2,
+    /// DeepSeek-V4 hybrid-compressed-attention MoE decoder.
+    Deepseek4,
 
     // --- C-fidelity placeholders for `target_for` (no convert support yet) ---
     /// Falcon — explicitly checked in 6 places inside
@@ -103,6 +114,7 @@ impl ArchName {
             ArchName::NomicBert => "nomic-bert",
             ArchName::Llama3 => "llama",
             ArchName::MiniMaxM2 => "minimax-m2",
+            ArchName::Deepseek4 => "deepseek4",
             ArchName::Falcon => "falcon",
         }
     }
@@ -139,6 +151,7 @@ impl ArchName {
             "nomic-bert" => Some(ArchName::NomicBert),
             "llama" => Some(ArchName::Llama3),
             "minimax-m2" => Some(ArchName::MiniMaxM2),
+            "deepseek4" => Some(ArchName::Deepseek4),
             "falcon" => Some(ArchName::Falcon),
             _ => None,
         }

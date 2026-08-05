@@ -34,14 +34,18 @@ use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
 use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
-    bake, bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen35moe_full,
-    qwen3vl_text,
+    bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
+    nomic_bert, qwen35moe, qwen35moe_full, qwen3vl_text,
 };
 use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::orchestrator::PlanEntry;
+use crate::convert::receipt::{
+    clear_stale_receipt, write_success_receipt, PeakChunkBoundReceipt,
+    RemoteConversionSource, ReceiptError,
+};
 use crate::convert::source_reader::SourceError;
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
@@ -53,6 +57,7 @@ use crate::quantize::ggml_quants::apex::{
 };
 use crate::quantize::ggml_quants::standard_policy::HParams;
 use crate::quantize::ggml_quants::ArchName;
+use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 
 // ============================================================================
 // Public API
@@ -104,6 +109,8 @@ pub struct ConvertArgs {
     /// `--mmproj` flag: export the vision projector (mmproj) sidecar
     /// GGUF instead of the text decoder. See `ConvertCliArgs::mmproj`.
     pub mmproj: bool,
+    /// Verified exact-revision identity for `--repo` conversion.
+    pub remote_source: Option<RemoteConversionSource>,
 }
 
 /// Errors raised by [`run_convert`]. Wraps the typed errors from the
@@ -128,6 +135,10 @@ pub enum ConvertError {
     Orchestrator(OrchestratorError),
     /// Filesystem I/O failed (e.g. could not create the output file).
     Io(std::io::Error),
+    /// Remote source integrity or manifest verification failed.
+    Integrity(crate::core::integrity::IntegrityError),
+    /// Success-receipt construction or atomic persistence failed.
+    Receipt(ReceiptError),
     /// `config.json` did not name one of the 8 supported architectures.
     /// `arch_name` carries the offending raw string (from `model_type`
     /// or `architectures[0]`).
@@ -202,7 +213,13 @@ pub enum ConvertError {
     /// [[feedback-no-loop-suppression-2026-05-17]]: refuse rather than
     /// silently pick one.
     RepoAndDirMutuallyExclusive,
-    /// B1 — `huggingface-cli download <repo>` exited non-zero. Captures
+    /// Remote conversion must pin the exact immutable Hub commit.
+    ImmutableRevisionRequired { supplied: Option<String> },
+    /// `--revision` has no meaning for an already-local source directory.
+    RevisionRequiresRepo,
+    /// Repo id is unsafe or outside HuggingFace's path-shaped id grammar.
+    InvalidRepoId { repo: String },
+    /// B1 — the allowed `hf download <repo>` source fetch exited non-zero. Captures
     /// the exit code (`None` if the process was killed by a signal)
     /// plus the captured stderr so the operator can diagnose auth /
     /// network / missing-binary failures.
@@ -219,6 +236,8 @@ impl std::fmt::Display for ConvertError {
             ConvertError::Source(e) => write!(f, "convert/source: {e}"),
             ConvertError::Orchestrator(e) => write!(f, "convert/orchestrator: {e}"),
             ConvertError::Io(e) => write!(f, "convert/io: {e}"),
+            ConvertError::Integrity(e) => write!(f, "convert/integrity: {e}"),
+            ConvertError::Receipt(e) => write!(f, "convert/receipt: {e}"),
             ConvertError::UnsupportedArch { arch_name } => {
                 write!(
                     f,
@@ -284,13 +303,26 @@ impl std::fmt::Display for ConvertError {
                 "convert: `--repo <hf_repo>` and positional `<hf_dir>` are mutually exclusive — \
                  pass exactly one"
             ),
+            ConvertError::ImmutableRevisionRequired { supplied } => write!(
+                f,
+                "convert: `--repo` requires `--revision <40-hex-commit>`; got {}",
+                supplied.as_deref().unwrap_or("<missing>")
+            ),
+            ConvertError::RevisionRequiresRepo => write!(
+                f,
+                "convert: `--revision` is valid only with `--repo`; local directories are used as supplied"
+            ),
+            ConvertError::InvalidRepoId { repo } => write!(
+                f,
+                "convert: invalid HuggingFace repo id `{repo}`; expected slash-separated ASCII name components"
+            ),
             ConvertError::HfDownload {
                 repo,
                 exit_code,
                 stderr,
             } => write!(
                 f,
-                "convert: `huggingface-cli download {repo}` exited with status {} — stderr:\n{}",
+                "convert: HuggingFace download for {repo} exited with status {} — stderr:\n{}",
                 exit_code
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "<signal>".to_string()),
@@ -306,6 +338,8 @@ impl std::error::Error for ConvertError {
             ConvertError::Source(e) => Some(e),
             ConvertError::Orchestrator(e) => Some(e),
             ConvertError::Io(e) => Some(e),
+            ConvertError::Integrity(e) => Some(e),
+            ConvertError::Receipt(e) => Some(e),
             ConvertError::Apex(e) => Some(e),
             ConvertError::Tokenizer(e) => Some(e),
             ConvertError::Imatrix(e) => Some(e),
@@ -335,6 +369,18 @@ impl From<OrchestratorError> for ConvertError {
 impl From<std::io::Error> for ConvertError {
     fn from(e: std::io::Error) -> Self {
         ConvertError::Io(e)
+    }
+}
+
+impl From<crate::core::integrity::IntegrityError> for ConvertError {
+    fn from(e: crate::core::integrity::IntegrityError) -> Self {
+        ConvertError::Integrity(e)
+    }
+}
+
+impl From<ReceiptError> for ConvertError {
+    fn from(e: ReceiptError) -> Self {
+        ConvertError::Receipt(e)
     }
 }
 
@@ -369,8 +415,8 @@ impl From<TokenizerError> for ConvertError {
 ///    - `Drop` → discard (the arch mapper signed off explicitly).
 ///    - `None` → typed [`ConvertError::UnmappedTensor`].
 /// 5. Drain the expert accumulator: assert every group has exactly
-///    `n_experts` slices, sort by `expert_index`, flatten into the
-///    fused 3-D shape `[in, out, n_experts]`, push to the orchestrator.
+///    `n_experts` slices, sort by `expert_index`, then decode and
+///    quantize one expert at a time into the fused 3-D GGUF payload.
 /// 6. Emit metadata via the arch's `build_metadata`.
 /// 7. [`ConvertOrchestrator::write`] → BufWriter over the output file.
 pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
@@ -380,6 +426,14 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // mmaps each shard and records a flat tensor index. Payload bytes are
     // read one tensor at a time in the streaming stage below.
     let src = HfModelSource::open(&args.hf_dir)?;
+    let excluded_dspark_count = src.excluded_mtp_tensor_count();
+    if excluded_dspark_count > 0 {
+        tracing::warn!(
+            target: "convert",
+            excluded = excluded_dspark_count,
+            "DeepSeek-V4 MTP/DSpark tensors excluded from base GGUF; separate draft artifact remains required"
+        );
+    }
 
     // ----- 2. Detect arch ---------------------------------------------------
     let detected_arch = detect_arch(&src.config)?;
@@ -681,6 +735,16 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     for (k, v) in postlude {
         orch.add_metadata(k, v);
     }
+    if let Some(remote) = args.remote_source.as_ref() {
+        orch.add_metadata(
+            KEY_PRODUCER_VERSION.to_string(),
+            MetaValue::String(format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+        );
+        orch.add_metadata(
+            KEY_SOURCE_SHA256.to_string(),
+            MetaValue::String(remote.source_sha256.clone()),
+        );
+    }
 
     // ----- 5. Plan + stream tensors (with MoE expert fusion) -------------
     //
@@ -699,24 +763,80 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     orch.plan_tensors(plan_entries)?;
 
     // 5b. Begin writing — header + KVs + tensor-info reservations.
+    if args.remote_source.is_some() {
+        clear_stale_receipt(&args.output)?;
+    }
     let f = File::create(&args.output)?;
     let bw = BufWriter::new(f);
     let mut sw = orch.begin_write(bw)?;
+    let mut peak_chunk_bound = PeakChunkBoundReceipt::default();
 
-    // 5c. Stream every tensor's data in plan order. MoE fusion happens
-    // inline: each Fused step loads N expert slices in expert_index
-    // order, concatenates their F32 buffers, and pushes the fused
-    // payload to the writer. Per-call peak memory is bounded by the
-    // single largest tensor (Direct) or the largest fused group (Fused).
+    // 5c. Stream every tensor's data in plan order. A fused MoE tensor
+    // is emitted one expert at a time: decode → F16 roundtrip → quantize
+    // → exact payload chunk. The expert Vec drops before the next source
+    // tensor is opened, so 256-expert models never allocate the 3-D F32
+    // stack.
     for (idx, step) in plan.steps.iter().enumerate() {
-        let data: Vec<f32> = step.materialize(&src, &synthesized)?;
-        sw.stream_tensor(idx, &data)?;
-        // `data` drops here — the next iteration's allocation reuses
-        // the freed pages.
+        match step {
+            PlanStep::Fused {
+                gguf_name,
+                member_hf_names,
+                per_expert_py_shape,
+                ..
+            } => {
+                let per_expert_elems = per_expert_py_shape.iter().try_fold(
+                    1usize,
+                    |n, &d| n.checked_mul(d),
+                ).ok_or_else(|| {
+                    ConvertError::Source(SourceError::Safetensors(format!(
+                        "fused expert tensor `{gguf_name}` shape product overflow: {per_expert_py_shape:?}"
+                    )))
+                })?;
+                sw.begin_tensor_chunks(idx)?;
+                for name in member_hf_names {
+                    let ht = src.materialize_tensor(name)?;
+                    if ht.shape != *per_expert_py_shape || ht.data.len() != per_expert_elems {
+                        return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                            "fused expert slice `{name}`: shape {:?} / data len {} != expected {:?} / {}",
+                            ht.shape,
+                            ht.data.len(),
+                            per_expert_py_shape,
+                            per_expert_elems
+                        ))));
+                    }
+                    sw.stream_tensor_chunk(idx, &ht.data)?;
+                }
+                let stats = sw.finish_tensor_chunks(idx)?;
+                peak_chunk_bound.observe(stats);
+                debug_assert_eq!(stats.chunk_count, member_hf_names.len());
+                debug_assert_eq!(stats.max_chunk_elements, per_expert_elems);
+                tracing::debug!(
+                    target: "convert",
+                    tensor = gguf_name,
+                    experts = stats.chunk_count,
+                    max_live_f32_elements = stats.max_chunk_elements,
+                    "streamed fused expert tensor with bounded input chunks"
+                );
+            }
+            _ => {
+                let data: Vec<f32> = step.materialize(&src, &synthesized)?;
+                let stats = sw.stream_tensor(idx, &data)?;
+                peak_chunk_bound.observe(stats);
+            }
+        }
     }
 
     // 5d. Finalize — seek-back to fill tensor offsets, flush.
     sw.finalize()?;
+    if let Some(remote) = args.remote_source.as_ref() {
+        write_success_receipt(
+            &args.output,
+            remote,
+            &args.selector.receipt_name(),
+            excluded_dspark_count,
+            peak_chunk_bound,
+        )?;
+    }
     Ok(())
 }
 
@@ -888,6 +1008,7 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             "qwen3_5_moe" | "qwen3_5_moe_text" => return Ok(ArchName::Qwen35MoeFull),
             "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
             "minimax_m2" => return Ok(ArchName::MiniMaxM2),
+            "deepseek_v4" => return Ok(ArchName::Deepseek4),
             _ => {}
         }
     }
@@ -934,6 +1055,7 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
                 return Ok(ArchName::Qwen3VlText);
             }
             "MiniMaxM2ForCausalLM" => return Ok(ArchName::MiniMaxM2),
+            "DeepseekV4ForCausalLM" => return Ok(ArchName::Deepseek4),
             _ => {}
         }
     }
@@ -1051,6 +1173,7 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
     let n_expert = config
         .get("num_experts")
         .or_else(|| config.get("num_local_experts"))
+        .or_else(|| config.get("n_routed_experts"))
         .and_then(|v| v.as_u64())
         .map(|x| x as u32)
         .unwrap_or(0);
@@ -1230,6 +1353,13 @@ fn build_metadata_for_arch(
             sampling,
             model_dir_basename,
             size_label,
+        ),
+        ArchName::Deepseek4 => deepseek4_metadata::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
         ),
         // Falcon is a placeholder in ArchName for target_for's branch
         // expression; it is NOT a convert-v2 supported arch. Reaching
@@ -1490,6 +1620,7 @@ fn map_tensor(
             None => MapOutcome::Unmapped,
         },
         ArchName::MiniMaxM2 => lift_minimax_mapped(minimax_m2::map_tensor_name(hf_name)),
+        ArchName::Deepseek4 => lift_qwen_mapped(deepseek4::map_tensor_name(hf_name)),
         ArchName::Falcon => MapOutcome::Unmapped,
     }
 }
@@ -1774,10 +1905,9 @@ fn expert_role_to_kind(r: ExpertRole) -> ExpertKind {
 // metadata-only passes (plan + streaming-iteration index) and a single
 // data pass (one tensor's F32 buffer alive at a time).
 //
-// The MoE expert-fusion case is the only one where multiple HF tensors
-// fuse into one GGUF tensor, so the streaming data pass holds at most
-// one fused group's experts in memory simultaneously (e.g. Gemma 4 26B
-// with 128 experts at ~10 MB each = ~1.3 GB per group — fits easily).
+// The MoE expert-fusion case consumes multiple HF tensors into one GGUF
+// tensor. It streams complete expert slices in expert-index order, so
+// its input bound is ONE expert rather than the full fused group.
 
 /// One step of the convert plan: either a direct 1:1 HF→GGUF mapping,
 /// an MoE expert fusion that consumes N HF tensors, or a synthesized
@@ -1877,10 +2007,8 @@ impl PlanStep {
         }
     }
 
-    /// Pull the F32 data for this step from the source / synthesized
-    /// list. For `Direct` and `Synthesized` this is one allocation; for
-    /// `Fused` this is a single concatenated allocation containing
-    /// every expert slice's F32 data in expert_index order.
+    /// Pull the F32 data for a non-fused step. Fused tensors use the
+    /// begin/chunk/finish writer path and must never materialize here.
     fn materialize(
         &self,
         src: &HfModelSource,
@@ -1898,29 +2026,11 @@ impl PlanStep {
                     }),
                 }
             }
-            PlanStep::Fused {
-                member_hf_names,
-                per_expert_py_shape,
-                ..
-            } => {
-                let per_expert_elems: usize = per_expert_py_shape.iter().product();
-                let mut fused: Vec<f32> =
-                    Vec::with_capacity(per_expert_elems * member_hf_names.len());
-                for name in member_hf_names {
-                    let ht = src.materialize_tensor(name)?;
-                    if ht.data.len() != per_expert_elems {
-                        return Err(ConvertError::Source(SourceError::Safetensors(format!(
-                            "fused expert slice `{name}`: data len {} != expected per-expert {}",
-                            ht.data.len(),
-                            per_expert_elems
-                        ))));
-                    }
-                    fused.extend_from_slice(&ht.data);
-                    // `ht` drops here — only `fused` (which already
-                    // copied the bytes) stays live.
-                }
-                Ok(fused)
-            }
+            PlanStep::Fused { gguf_name, .. } => Err(ConvertError::Source(
+                SourceError::Safetensors(format!(
+                    "fused tensor `{gguf_name}` must use bounded chunk streaming"
+                )),
+            )),
             PlanStep::Synthesized { synth_idx, .. } => {
                 let t = synthesized.get(*synth_idx).ok_or_else(|| {
                     ConvertError::Source(SourceError::Safetensors(format!(
@@ -1936,9 +2046,9 @@ impl PlanStep {
 /// A complete convert plan: every step in deterministic emission order.
 /// Built once from the source's tensor metadata + the synthesized
 /// tensor list; consumed twice — once by the orchestrator's plan-phase
-/// (metadata only) and once by the streaming-write phase (one
-/// `materialize` call per step, F32 bytes allocated and dropped within
-/// one iteration).
+/// (metadata only) and once by the streaming-write phase. Direct steps
+/// materialize once; fused steps materialize and drop one expert slice
+/// per chunk.
 struct ConvertPlan {
     steps: Vec<PlanStep>,
 }
@@ -1975,6 +2085,7 @@ fn build_convert_plan(
     let n_experts = n_experts_cfg
         .get("num_experts")
         .or_else(|| n_experts_cfg.get("num_local_experts"))
+        .or_else(|| n_experts_cfg.get("n_routed_experts"))
         .and_then(|v| v.as_u64())
         .map(|x| x as usize);
 
@@ -3081,5 +3192,165 @@ mod tests {
         .unwrap();
         assert_eq!(data.tensor_pair_count(), 1);
     }
-}
 
+    #[test]
+    fn deepseek_detection_and_incomplete_expert_group_fail_closed() {
+        assert_eq!(
+            detect_arch(&json!({"model_type":"deepseek_v4"})).unwrap(),
+            ArchName::Deepseek4
+        );
+        assert_eq!(
+            detect_arch(&json!({"architectures":["DeepseekV4ForCausalLM"]})).unwrap(),
+            ArchName::Deepseek4
+        );
+
+        use safetensors::tensor::{Dtype, TensorView};
+        let dir = tempfile::tempdir().unwrap();
+        let expert_bytes = vec![0_u8; 16];
+        let scale_bytes = vec![127_u8];
+        let expert = TensorView::new(Dtype::I8, vec![1, 16], &expert_bytes).unwrap();
+        let scale = TensorView::new(Dtype::F8_E8M0, vec![1, 1], &scale_bytes).unwrap();
+        let tensors = vec![
+            ("layers.0.ffn.experts.0.w1.weight".to_string(), &expert),
+            ("layers.0.ffn.experts.0.w1.scale".to_string(), &scale),
+        ];
+        std::fs::write(
+            dir.path().join("model.safetensors"),
+            safetensors::tensor::serialize(tensors, None).unwrap(),
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&json!({
+                "model_type":"deepseek_v4", "n_routed_experts":2,
+                "quantization_config":{"quant_method":"fp8", "weight_block":[128,128]}
+            })).unwrap(),
+        ).unwrap();
+        let source = HfModelSource::open(dir.path()).unwrap();
+        let err = match build_convert_plan(ArchName::Deepseek4, &source, &[]) {
+            Ok(_) => panic!("one of two experts must not form a complete group"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConvertError::IncompleteExpertGroup {
+            present_count: 1, n_experts_config: 2, ..
+        }));
+    }
+
+    #[test]
+    fn deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end() {
+        use safetensors::tensor::{Dtype, TensorView};
+        let dir = tempfile::tempdir().unwrap();
+        let f16 = vec![0_u8; 32 * 256 * 2];
+        let packed = vec![0x21_u8; 256 * 128];
+        let scales = vec![127_u8; 256 * 8];
+        let mut owned: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = vec![
+            ("embed.weight".into(), Dtype::F16, vec![32, 256], f16.clone()),
+            ("head.weight".into(), Dtype::F16, vec![32, 256], f16),
+            ("norm.weight".into(), Dtype::F32, vec![256], vec![0; 256 * 4]),
+        ];
+        for expert in 0..2 {
+            for proj in ["w1", "w2", "w3"] {
+                owned.push((
+                    format!("layers.0.ffn.experts.{expert}.{proj}.weight"),
+                    Dtype::I8,
+                    vec![256, 128],
+                    packed.clone(),
+                ));
+                owned.push((
+                    format!("layers.0.ffn.experts.{expert}.{proj}.scale"),
+                    Dtype::U8,
+                    vec![256, 8],
+                    scales.clone(),
+                ));
+            }
+        }
+        let views: Vec<(String, TensorView<'_>)> = owned
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (name.clone(), TensorView::new(*dtype, shape.clone(), bytes).unwrap())
+            })
+            .collect();
+        let refs: Vec<(String, &TensorView<'_>)> =
+            views.iter().map(|(name, view)| (name.clone(), view)).collect();
+        std::fs::write(
+            dir.path().join("model.safetensors"),
+            safetensors::tensor::serialize(refs, None).unwrap(),
+        ).unwrap();
+
+        let cfg = json!({
+            "_name_or_path":"deepseek-ai/DeepSeek-V4-Flash-0731", "model_type":"deepseek_v4",
+            "architectures":["DeepseekV4ForCausalLM"], "hidden_size":256,
+            "num_hidden_layers":1, "num_attention_heads":4, "num_key_value_heads":1, "head_dim":64,
+            "max_position_embeddings":1024, "rms_norm_eps":1e-6, "vocab_size":32,
+            "n_routed_experts":2, "num_experts_per_tok":1, "n_shared_experts":1,
+            "moe_intermediate_size":256, "routed_scaling_factor":1.5,
+            "norm_topk_prob":true, "scoring_func":"sqrtsoftplus", "swiglu_limit":10.0,
+            "qk_rope_head_dim":64, "q_lora_rank":64, "sliding_window":128,
+            "index_n_heads":4, "index_head_dim":32, "index_topk":16,
+            "o_groups":2, "o_lora_rank":64, "compress_ratios":[0],
+            "compress_rope_theta":160000.0, "hc_mult":4, "hc_sinkhorn_iters":20,
+            "hc_eps":1e-6, "num_hash_layers":0,
+            "quantization_config":{"quant_method":"fp8", "weight_block":[128,128]}
+        });
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+
+        let mut vocab = serde_json::Map::new();
+        for i in 0..28 {
+            vocab.insert(format!("tok{i}"), json!(i));
+        }
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            serde_json::to_vec(&json!({
+                "model":{"type":"BPE", "byte_fallback":true, "vocab":vocab, "merges":[]},
+                "added_tokens":[
+                    {"id":28,"content":"<bos>","special":true},
+                    {"id":29,"content":"<eos>","special":true},
+                    {"id":30,"content":"<pad>","special":true},
+                    {"id":31,"content":"<unk>","special":true}
+                ]
+            })).unwrap(),
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::to_vec(&json!({
+                "bos_token":"<bos>", "eos_token":"<eos>", "pad_token":"<pad>",
+                "unk_token":"<unk>", "add_bos_token":true, "add_eos_token":false
+            })).unwrap(),
+        ).unwrap();
+
+        let output = dir.path().join("tiny-q2-k-s.gguf");
+        run_convert(ConvertArgs {
+            hf_dir: dir.path().to_path_buf(),
+            selector: QuantSelector::Standard(LlamaFtype::MostlyQ2_K_S),
+            output: output.clone(),
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mmproj: false,
+            remote_source: Some(RemoteConversionSource {
+                repo: "deepseek-ai/DeepSeek-V4-Flash-0731".into(),
+                revision: "a".repeat(40),
+                source_sha256: "b".repeat(64),
+                files: Vec::new(),
+            }),
+        }).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..4], b"GGUF");
+        assert!(bytes.windows(b"blk.0.ffn_gate_exps.weight".len())
+            .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
+        assert!(bytes.len() > 32 * 1024);
+        let producer = concat!("hf2q ", env!("CARGO_PKG_VERSION")).as_bytes();
+        assert!(bytes.windows(producer.len()).any(|window| window == producer));
+        let expected_source_sha = "b".repeat(64);
+        assert!(bytes
+            .windows(expected_source_sha.len())
+            .any(|window| window == expected_source_sha.as_bytes()));
+        let receipt: crate::convert::receipt::ConversionReceipt = serde_json::from_slice(
+            &std::fs::read(crate::convert::receipt::receipt_path(&output)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.source.revision, "a".repeat(40));
+        assert_eq!(receipt.quant_selector, "q2_k_s");
+        assert_eq!(receipt.output.size, bytes.len() as u64);
+    }
+}

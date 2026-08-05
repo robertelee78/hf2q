@@ -80,6 +80,16 @@ impl GpuContext {
         mlx_native::ops::flash_attn_prefill_d512::register(&mut registry);
         mlx_native::ops::flash_attn_prefill_mask::register(&mut registry);
         mlx_native::ops::flash_attn_prefill_blk::register(&mut registry);
+        mlx_native::ops::embedding_q2_k::register(&mut registry);
+        mlx_native::ops::deepseek_hyper_connection::register(&mut registry);
+        mlx_native::ops::deepseek_sparse_attention::register(&mut registry);
+        mlx_native::ops::deepseek_sparse_prefill_mask::register(&mut registry);
+        mlx_native::ops::deepseek_compressor::register(&mut registry);
+        mlx_native::ops::deepseek_indexer::register(&mut registry);
+        mlx_native::ops::deepseek_tail_rope::register(&mut registry);
+        mlx_native::ops::deepseek_moe_routing::register(&mut registry);
+        mlx_native::ops::deepseek_moe_activation::register(&mut registry);
+        mlx_native::ops::repeat_tiled::register(&mut registry);
 
         // ADR-031 Phase B (Option A): allocate a second identical registry for
         // the parallel-encode worker thread, but ONLY when opt-in is set.
@@ -101,14 +111,30 @@ impl GpuContext {
             mlx_native::ops::flash_attn_prefill_d512::register(&mut wreg);
             mlx_native::ops::flash_attn_prefill_mask::register(&mut wreg);
             mlx_native::ops::flash_attn_prefill_blk::register(&mut wreg);
-            tracing::info!("mlx-native GpuContext: worker KernelRegistry pre-warmed (HF2Q_PARALLEL_ENCODE=1)");
+            mlx_native::ops::embedding_q2_k::register(&mut wreg);
+            mlx_native::ops::deepseek_hyper_connection::register(&mut wreg);
+            mlx_native::ops::deepseek_sparse_attention::register(&mut wreg);
+            mlx_native::ops::deepseek_sparse_prefill_mask::register(&mut wreg);
+            mlx_native::ops::deepseek_compressor::register(&mut wreg);
+            mlx_native::ops::deepseek_indexer::register(&mut wreg);
+            mlx_native::ops::deepseek_tail_rope::register(&mut wreg);
+            mlx_native::ops::deepseek_moe_routing::register(&mut wreg);
+            mlx_native::ops::deepseek_moe_activation::register(&mut wreg);
+            mlx_native::ops::repeat_tiled::register(&mut wreg);
+            tracing::info!(
+                "mlx-native GpuContext: worker KernelRegistry pre-warmed (HF2Q_PARALLEL_ENCODE=1)"
+            );
             Some(wreg)
         } else {
             None
         };
 
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
-        Ok(Self { executor, registry, worker_registry })
+        Ok(Self {
+            executor,
+            registry,
+            worker_registry,
+        })
     }
 
     /// Borrow the underlying `MlxDevice`.
@@ -173,7 +199,10 @@ mod tests {
     fn test_gpu_context_init() {
         let ctx = GpuContext::new().expect("GpuContext::new should succeed on Apple Silicon");
         assert!(!ctx.gpu_name().is_empty());
-        assert!(ctx.worker_registry.is_none(), "worker_registry should be None when HF2Q_PARALLEL_ENCODE is unset");
+        assert!(
+            ctx.worker_registry.is_none(),
+            "worker_registry should be None when HF2Q_PARALLEL_ENCODE is unset"
+        );
         println!("GpuContext GPU: {}", ctx.gpu_name());
     }
 

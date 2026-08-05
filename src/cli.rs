@@ -160,24 +160,31 @@ pub struct ConvertCliArgs {
     /// HuggingFace model directory (must contain `config.json` plus
     /// either `model.safetensors` or `model.safetensors.index.json` +
     /// shards). Optional: when omitted, `--repo <hf_repo>` must be
-    /// supplied so the driver can shell out to `huggingface-cli download`
+    /// supplied so the driver can invoke `hf download`
     /// before the convert proceeds. Mutually exclusive with `--repo`.
     #[arg(conflicts_with = "repo")]
     pub hf_dir: Option<PathBuf>,
 
-    /// Auto-download a HuggingFace repo via `huggingface-cli download`
+    /// Auto-download HuggingFace source files via `hf download`
     /// before converting. The repo is cached at
-    /// `~/.cache/hf2q/repos/<sanitized_repo>/` (forward slashes replaced
-    /// with `__`); a subsequent `--repo <same>` reuses the cached
-    /// directory. Mutually exclusive with the positional `<hf_dir>`;
+    /// `~/.cache/hf2q/repos/<sanitized_repo>/<revision>/` (forward slashes
+    /// replaced with `__`); a subsequent request for the same repo and
+    /// revision reuses the cached directory. Mutually exclusive with the
+    /// positional `<hf_dir>`;
     /// exactly one of the two must be supplied.
     ///
-    /// Operator must have `huggingface-cli` on PATH and (for gated
+    /// Operator must have `hf` on PATH and (for gated
     /// repos) a valid token at `~/.huggingface/token` or
     /// `HF_TOKEN` env. Partial downloads resume on re-invocation per
-    /// `huggingface-cli`'s own logic.
+    /// `hf`'s own logic.
     #[arg(long, conflicts_with = "hf_dir")]
     pub repo: Option<String>,
+
+    /// Exact immutable HuggingFace commit for `--repo` conversion.
+    /// Branches, tags, and abbreviated SHAs are rejected so integrity
+    /// verification and the success receipt bind one stable source.
+    #[arg(long, requires = "repo", conflicts_with = "hf_dir", value_name = "REVISION")]
+    pub revision: Option<String>,
 
     /// File-type to quantize to. Accepts:
     ///   - Standard llama.cpp ftypes: `f32`, `f16`, `bf16`, `q4_0`,
@@ -1015,5 +1022,44 @@ mod tests {
             panic!("expected Serve");
         };
         assert!(args.no_integrity);
+    }
+
+    #[test]
+    fn convert_revision_is_bound_to_repo_download() {
+        let cli = Cli::parse_from([
+            "hf2q",
+            "convert",
+            "--repo",
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "--revision",
+            "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+            "--quant",
+            "q2_k_s",
+            "-o",
+            "/tmp/deepseek4.gguf",
+        ]);
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert_eq!(
+            args.revision.as_deref(),
+            Some("7872f01b1d1fe23eabc4c98b48bffcef5a386062")
+        );
+    }
+
+    #[test]
+    fn convert_revision_without_repo_is_rejected() {
+        let result = Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "/tmp/source",
+            "--revision",
+            "main",
+            "--quant",
+            "q2_k_s",
+            "-o",
+            "/tmp/deepseek4.gguf",
+        ]);
+        assert!(result.is_err(), "--revision must require --repo");
     }
 }

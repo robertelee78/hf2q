@@ -79,6 +79,22 @@ pub enum WriterError {
         expected: usize,
         actual: usize,
     },
+
+    /// A chunked payload was begun while another tensor still owns the
+    /// payload stream. Interleaving would corrupt both tensor offsets.
+    PayloadAlreadyActive {
+        active_tensor_idx: usize,
+        requested_tensor_idx: usize,
+    },
+
+    /// A chunk write or finish was requested without a matching begin.
+    NoActivePayload { tensor_idx: usize },
+
+    /// A chunk targets a different tensor than the active payload.
+    WrongActivePayload {
+        active_tensor_idx: usize,
+        requested_tensor_idx: usize,
+    },
 }
 
 impl std::fmt::Display for WriterError {
@@ -100,6 +116,23 @@ impl std::fmt::Display for WriterError {
             WriterError::PayloadSizeMismatch { tensor_idx, expected, actual } => write!(
                 f,
                 "tensor_idx {tensor_idx}: payload size mismatch (expected {expected} bytes, got {actual})"
+            ),
+            WriterError::PayloadAlreadyActive {
+                active_tensor_idx,
+                requested_tensor_idx,
+            } => write!(
+                f,
+                "cannot begin tensor_idx {requested_tensor_idx}: tensor_idx {active_tensor_idx} payload is still active"
+            ),
+            WriterError::NoActivePayload { tensor_idx } => {
+                write!(f, "tensor_idx {tensor_idx}: no active chunked payload")
+            }
+            WriterError::WrongActivePayload {
+                active_tensor_idx,
+                requested_tensor_idx,
+            } => write!(
+                f,
+                "chunk targets tensor_idx {requested_tensor_idx}, but tensor_idx {active_tensor_idx} is active"
             ),
         }
     }
@@ -133,6 +166,13 @@ struct OffsetFixup {
     expected_byte_len: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ActivePayload {
+    tensor_idx: usize,
+    relative_offset: u64,
+    written: usize,
+}
+
 /// Seek-back single-pass GGUF v3 writer.
 ///
 /// The writer wraps any `Write + Seek` sink (typically `std::fs::File`).
@@ -152,6 +192,9 @@ pub struct GgufWriter<W: Write + Seek> {
     /// (after the header-padding to ALIGNMENT). Computed at
     /// `pad_to_alignment` time.
     tensor_data_start: Option<u64>,
+    /// At most one tensor payload may be written in chunks. The offset
+    /// is committed only after its exact aggregate length is validated.
+    active_payload: Option<ActivePayload>,
 }
 
 impl<W: Write + Seek> GgufWriter<W> {
@@ -164,6 +207,7 @@ impl<W: Write + Seek> GgufWriter<W> {
             fixups: Vec::new(),
             tensor_offsets: Vec::new(),
             tensor_data_start: None,
+            active_payload: None,
         }
     }
 
@@ -273,6 +317,100 @@ impl<W: Write + Seek> GgufWriter<W> {
         Ok(())
     }
 
+    /// Begin a bounded, chunked payload for one tensor.
+    pub fn begin_tensor_payload(&mut self, tensor_idx: usize) -> Result<()> {
+        if tensor_idx >= self.fixups.len() {
+            return Err(WriterError::UnknownTensorIndex {
+                tensor_idx,
+                reserved: self.fixups.len(),
+            });
+        }
+        if self.tensor_offsets[tensor_idx].is_some() {
+            return Err(WriterError::DuplicateTensorPayload { tensor_idx });
+        }
+        if let Some(active) = self.active_payload {
+            return Err(WriterError::PayloadAlreadyActive {
+                active_tensor_idx: active.tensor_idx,
+                requested_tensor_idx: tensor_idx,
+            });
+        }
+        let data_start = self.tensor_data_start.expect(
+            "pad_to_alignment must be called before begin_tensor_payload (caller-side bug)",
+        );
+        let cur = self.writer.stream_position()?;
+        self.active_payload = Some(ActivePayload {
+            tensor_idx,
+            relative_offset: cur - data_start,
+            written: 0,
+        });
+        Ok(())
+    }
+
+    /// Append one exact payload byte chunk. The aggregate may never
+    /// exceed the reserved tensor's row-format size.
+    pub fn write_tensor_payload_chunk(&mut self, tensor_idx: usize, payload: &[u8]) -> Result<()> {
+        let active = self
+            .active_payload
+            .ok_or(WriterError::NoActivePayload { tensor_idx })?;
+        if active.tensor_idx != tensor_idx {
+            return Err(WriterError::WrongActivePayload {
+                active_tensor_idx: active.tensor_idx,
+                requested_tensor_idx: tensor_idx,
+            });
+        }
+        let expected = self.fixups[tensor_idx].expected_byte_len;
+        let actual = active
+            .written
+            .checked_add(payload.len())
+            .unwrap_or(usize::MAX);
+        if actual > expected {
+            return Err(WriterError::PayloadSizeMismatch {
+                tensor_idx,
+                expected,
+                actual,
+            });
+        }
+        self.writer.write_all(payload)?;
+        self.active_payload
+            .as_mut()
+            .expect("validated active payload")
+            .written = actual;
+        Ok(())
+    }
+
+    /// Finish a chunked payload, validating its exact aggregate byte
+    /// length before committing its offset and alignment padding.
+    pub fn finish_tensor_payload(&mut self, tensor_idx: usize) -> Result<()> {
+        let active = self
+            .active_payload
+            .ok_or(WriterError::NoActivePayload { tensor_idx })?;
+        if active.tensor_idx != tensor_idx {
+            return Err(WriterError::WrongActivePayload {
+                active_tensor_idx: active.tensor_idx,
+                requested_tensor_idx: tensor_idx,
+            });
+        }
+        let expected = self.fixups[tensor_idx].expected_byte_len;
+        if active.written != expected {
+            return Err(WriterError::PayloadSizeMismatch {
+                tensor_idx,
+                expected,
+                actual: active.written,
+            });
+        }
+
+        let after = self.writer.stream_position()?;
+        let target = align_up(after, ALIGNMENT);
+        let pad = (target - after) as usize;
+        if pad > 0 {
+            let zeros = [0u8; 32];
+            self.writer.write_all(&zeros[..pad])?;
+        }
+        self.tensor_offsets[tensor_idx] = Some(active.relative_offset);
+        self.active_payload = None;
+        Ok(())
+    }
+
     /// Stream one tensor's payload at the current file position.
     ///
     /// Records the relative offset (current_pos - tensor_data_start)
@@ -298,30 +436,21 @@ impl<W: Write + Seek> GgufWriter<W> {
                 actual: payload.len(),
             });
         }
-        let data_start = self.tensor_data_start.expect(
-            "pad_to_alignment must be called before stream_tensor_payload (caller-side bug)",
-        );
-        let cur = self.writer.stream_position()?;
-        let rel = cur - data_start;
-
-        self.writer.write_all(payload)?;
-
-        // Inter-tensor alignment padding (also spec-required).
-        let after = cur + payload.len() as u64;
-        let target = align_up(after, ALIGNMENT);
-        let pad = (target - after) as usize;
-        if pad > 0 {
-            let zeros = [0u8; 32];
-            self.writer.write_all(&zeros[..pad])?;
-        }
-
-        self.tensor_offsets[tensor_idx] = Some(rel);
-        Ok(())
+        self.begin_tensor_payload(tensor_idx)?;
+        self.write_tensor_payload_chunk(tensor_idx, payload)?;
+        self.finish_tensor_payload(tensor_idx)
     }
 
     /// Finalize: seek back to each tensor-info entry's offset field and
     /// write the actual offset there. Flushes the underlying writer.
     pub fn finalize(&mut self) -> Result<()> {
+        if let Some(active) = self.active_payload {
+            return Err(WriterError::PayloadSizeMismatch {
+                tensor_idx: active.tensor_idx,
+                expected: self.fixups[active.tensor_idx].expected_byte_len,
+                actual: active.written,
+            });
+        }
         let streamed = self.tensor_offsets.iter().filter(|o| o.is_some()).count();
         if streamed != self.fixups.len() {
             return Err(WriterError::MissingTensorPayloads {
@@ -543,6 +672,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunked_payload_requires_exact_aggregate_length() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = GgufWriter::new(buf);
+        w.write_header(1, 0).unwrap();
+        w.reserve_tensor_info("chunked.weight", &[32], GgmlType::Q4_0)
+            .unwrap();
+        w.pad_to_alignment().unwrap();
+
+        w.begin_tensor_payload(0).unwrap();
+        w.write_tensor_payload_chunk(0, &[1; 8]).unwrap();
+        let err = w.finish_tensor_payload(0).unwrap_err();
+        assert!(matches!(
+            err,
+            WriterError::PayloadSizeMismatch {
+                tensor_idx: 0,
+                expected: 18,
+                actual: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn chunked_payload_matches_single_payload_bytes() {
+        fn write(chunked: bool) -> Vec<u8> {
+            let buf = Cursor::new(Vec::new());
+            let mut w = GgufWriter::new(buf);
+            w.write_header(1, 0).unwrap();
+            w.reserve_tensor_info("chunked.weight", &[32], GgmlType::Q4_0)
+                .unwrap();
+            w.pad_to_alignment().unwrap();
+            let payload: Vec<u8> = (0..18).collect();
+            if chunked {
+                w.begin_tensor_payload(0).unwrap();
+                w.write_tensor_payload_chunk(0, &payload[..7]).unwrap();
+                w.write_tensor_payload_chunk(0, &payload[7..]).unwrap();
+                w.finish_tensor_payload(0).unwrap();
+            } else {
+                w.stream_tensor_payload(0, &payload).unwrap();
+            }
+            w.finalize().unwrap();
+            w.into_inner().into_inner()
+        }
+
+        assert_eq!(write(true), write(false));
+    }
+
     // ---- extra structural tests ----
 
     #[test]
@@ -635,5 +811,30 @@ mod tests {
         // Header is 24 bytes; padding rounds to next 32-byte boundary
         assert_eq!(bytes.len() % ALIGNMENT as usize, 0);
         assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn i32_hash_route_tensor_preserves_wire_type_and_payload() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = GgufWriter::new(buf);
+        let name = "blk.0.ffn_gate_tid2eid.weight";
+        w.write_header(1, 0).unwrap();
+        w.reserve_tensor_info(name, &[3], GgmlType::I32).unwrap();
+        w.pad_to_alignment().unwrap();
+        let payload: Vec<u8> = [0_i32, 3, 255]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        w.stream_tensor_payload(0, &payload).unwrap();
+        w.finalize().unwrap();
+        let bytes = w.into_inner().into_inner();
+
+        let type_offset = 24 + 8 + name.len() + 4 + 8;
+        assert_eq!(
+            u32::from_le_bytes(bytes[type_offset..type_offset + 4].try_into().unwrap()),
+            26
+        );
+        let data_start = align_up((type_offset + 4 + 8) as u64, ALIGNMENT) as usize;
+        assert_eq!(&bytes[data_start..data_start + payload.len()], payload);
     }
 }

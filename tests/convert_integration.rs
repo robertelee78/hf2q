@@ -214,7 +214,7 @@ fn synthesize_tiny_llama3_no_norms(dir: &Path) {
 
 /// Drive `hf2q convert` end-to-end over a tiny Llama-3 fixture and
 /// assert the output GGUF round-trips. Targets `q8_0` so every 2-D
-/// weight lands on Q8_0 (positional code 3 in mlx_native's enum).
+/// weight lands on Q8_0.
 ///
 /// Acceptance:
 /// - exit code 0
@@ -259,9 +259,8 @@ fn convert_llama3_tiny_round_trip() {
     // file_type round-trips as the LlamaFtype u32 (MostlyQ8_0 = 7).
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(7));
 
-    // Per-tensor name + ggml_type assertions. mlx_native's GgmlType
-    // enum is positional: F32=0, F16=1, Q4_0=2, Q8_0=3, ... For Q8_0
-    // every quantizable tensor lands on Q8_0 (positional 3).
+    // Per-tensor name + ggml_type assertions. Compare named variants:
+    // enum positions are not part of mlx-native's public contract.
     let expected_names: &[&str] = &[
         "token_embd.weight",
         "output.weight",
@@ -285,9 +284,10 @@ fn convert_llama3_tiny_round_trip() {
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
         assert_eq!(
-            info.ggml_type as u32, 3,
-            "tensor `{name}` expected positional Q8_0 (3), got {}",
-            info.ggml_type as u32
+            info.ggml_type,
+            mlx_native::GgmlType::Q8_0,
+            "tensor `{name}` expected Q8_0, got {:?}",
+            info.ggml_type
         );
         // ALIGNMENT round-trip — every offset must be 32-aligned per spec.
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
@@ -500,7 +500,7 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
 /// - attn_{q,k,v,output} (EDGE)        → balanced.edge_attn = Q6_K
 /// - ffn_{gate,up,down}_exps (EDGE)    → balanced.edge_exp  = Q6_K
 ///
-/// All 16 expected tensors → Q6_K (mlx-native positional code 6).
+/// All 16 expected tensors → Q6_K.
 ///
 /// Acceptance:
 /// - exit code 0 (CLI parses `apex-balanced`, builds ApexPolicy,
@@ -508,7 +508,7 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
 /// - 16 tensors emitted (2 globals + 4 attn × 2 layers + 3 expert-groups × 2 layers)
 /// - `general.file_type` byte = approximate_for_apex(Balanced) =
 ///   MostlyQ5_K_M = 17 (cosmetic header pick; tensors themselves are Q6_K)
-/// - every tensor's recorded ggml_type is Q6_K (positional code 6)
+/// - every tensor's recorded ggml_type is Q6_K
 ///
 /// Per [[feedback-no-loop-suppression-2026-05-17]]: the apex path must
 /// reject genuinely-unsupported configs with a typed error, never silent
@@ -582,17 +582,17 @@ fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
         "blk.1.ffn_down_exps.weight",
     ];
 
-    // mlx_native's GgmlType is positional: F32=0, F16=1, Q4_0=2, Q8_0=3,
-    // Q4_K=4, Q5_K=5, Q6_K=6. We assert every tensor lands on Q6_K (6).
+    // Compare named variants so adding a backend type cannot invalidate
+    // this conversion assertion without changing conversion behavior.
     for name in expected_names {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
         assert_eq!(
-            info.ggml_type as u32, 6,
-            "tensor `{name}`: expected Q6_K (positional 6) per Apex Balanced \
-             EDGE-region rule, got {}",
-            info.ggml_type as u32
+            info.ggml_type,
+            mlx_native::GgmlType::Q6_K,
+            "tensor `{name}`: expected Q6_K per Apex Balanced EDGE-region rule, got {:?}",
+            info.ggml_type
         );
         // ALIGNMENT round-trip — every offset must be 32-aligned per spec.
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
@@ -606,10 +606,10 @@ fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
 /// Re-uses the `synthesize_tiny_qwen35moe_for_apex` fixture (HIDDEN=256
 /// = exactly one Q4_K block per row → no K-quant misalignment fallback)
 /// but invokes `hf2q convert --quant q4_k_m` so the standard policy
-/// routes FFN-expert tensors to Q4_K (positional 4). Verifies:
+/// routes FFN-expert tensors to Q4_K. Verifies:
 ///  - exit code 0
 ///  - tensor count 16 (same shape as apex-balanced sibling test)
-///  - at least one tensor lands on Q4_K (positional 4) — confirms
+///  - at least one tensor lands on Q4_K — confirms
 ///    `q4_k::quantize`'s `par_chunks_exact_mut` rayon path ran via
 ///    the full CLI → cli_driver → orchestrator → dispatch chain
 ///  - all offsets 32-aligned
@@ -668,16 +668,15 @@ fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
         "blk.1.ffn_down_exps.weight",
     ];
 
-    // mlx_native positional GgmlType: F32=0, F16=1, Q4_0=2, Q8_0=3,
-    // Q4_K=4, Q5_K=5, Q6_K=6. Assert AT LEAST ONE tensor lands on Q4_K
-    // (positional 4) — proves the rayon-parallel Q4_K dispatch ran
+    // Assert AT LEAST ONE tensor lands on Q4_K — proves the
+    // rayon-parallel Q4_K dispatch ran
     // through the full CLI→orchestrator→kernel chain.
     let mut saw_q4k = false;
     for name in expected_names {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
-        if info.ggml_type as u32 == 4 {
+        if info.ggml_type == mlx_native::GgmlType::Q4_K {
             saw_q4k = true;
         }
         // All offsets must be 32-aligned per GGUF spec, regardless of type.
@@ -685,7 +684,7 @@ fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
     }
     assert!(
         saw_q4k,
-        "expected at least one tensor at Q4_K (positional 4) — \
+        "expected at least one tensor at Q4_K — \
          Q4_K rayon path did not execute through CLI subprocess. \
          (Q4_K_M routes some tensors to Q4_K via StandardPolicy.)"
     );
@@ -694,7 +693,7 @@ fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
 /// CLI-subprocess sibling to `convert_q4_k_m_tiny_qwen35moe_round_trip`
 /// — exercises the Q5_K rayon dispatch path via `--quant q5_k_m`.
 /// Same fixture (HIDDEN=256 → exactly one block per row), different
-/// quant flag. Asserts ≥1 tensor lands on positional Q5_K (5).
+/// quant flag. Asserts ≥1 tensor lands on Q5_K.
 #[test]
 fn convert_q5_k_m_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
@@ -743,28 +742,28 @@ fn convert_q5_k_m_tiny_qwen35moe_round_trip() {
         "blk.1.ffn_down_exps.weight",
     ];
 
-    // Assert ≥1 tensor at positional Q5_K (5) — proves Q5_K rayon
+    // Assert ≥1 tensor at Q5_K — proves Q5_K rayon
     // dispatch ran through CLI subprocess.
     let mut saw_q5k = false;
     for name in expected_names {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
-        if info.ggml_type as u32 == 5 {
+        if info.ggml_type == mlx_native::GgmlType::Q5_K {
             saw_q5k = true;
         }
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
     assert!(
         saw_q5k,
-        "expected at least one tensor at Q5_K (positional 5) — \
+        "expected at least one tensor at Q5_K — \
          Q5_K rayon path did not execute through CLI subprocess. \
          (Q5_K_M routes some tensors to Q5_K via StandardPolicy.)"
     );
 }
 
 /// CLI-subprocess sibling — exercises Q6_K via `--quant q6_k`.
-/// Same fixture; asserts ≥1 tensor lands on positional Q6_K (6).
+/// Same fixture; asserts ≥1 tensor lands on Q6_K.
 #[test]
 fn convert_q6_k_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
@@ -812,12 +811,12 @@ fn convert_q6_k_tiny_qwen35moe_round_trip() {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
-        if info.ggml_type as u32 == 6 {
+        if info.ggml_type == mlx_native::GgmlType::Q6_K {
             saw_q6k = true;
         }
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
-    assert!(saw_q6k, "expected ≥1 tensor at Q6_K (positional 6)");
+    assert!(saw_q6k, "expected ≥1 tensor at Q6_K");
 }
 
 /// CLI-subprocess sibling — exercises IQ4_NL via `--quant iq4_nl`.
@@ -826,7 +825,7 @@ fn convert_q6_k_tiny_qwen35moe_round_trip() {
 /// `w*q*xb[j]` FMA patterns documented at b05b5297 (kernel matches
 /// canonical -ffp-contract=off behavior). Block size is 32 (not 256
 /// like K-quants) so the HIDDEN=256 fixture works without alignment
-/// concerns. Asserts ≥1 tensor at positional IQ4_NL (20).
+/// concerns. Asserts ≥1 tensor at IQ4_NL.
 #[test]
 fn convert_iq4_nl_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
@@ -869,28 +868,25 @@ fn convert_iq4_nl_tiny_qwen35moe_round_trip() {
         "blk.1.ffn_down_exps.weight",
     ];
 
-    // Rust-enum positional discriminants (mlx_native::ops::quantized_matmul_ggml::GgmlType):
-    // F32=0, F16=1, Q4_0=2, Q8_0=3, Q4_K=4, Q5_K=5, Q6_K=6, I16=7, Q5_1=8, IQ4_NL=9.
-    // (These are Rust enum order — NOT GGML wire codes. The on-disk GGUF
-    // uses wire codes, but mlx-native's GgmlFile::open maps wire → enum.)
+    // The on-disk GGUF uses wire codes; the reader maps those to named
+    // variants. Do not depend on Rust enum declaration order here.
     let mut saw_iq4_nl = false;
     for name in expected_names {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
-        if info.ggml_type as u32 == 9 {
+        if info.ggml_type == mlx_native::GgmlType::IQ4_NL {
             saw_iq4_nl = true;
         }
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
-    assert!(saw_iq4_nl, "expected ≥1 tensor at IQ4_NL (positional 9)");
+    assert!(saw_iq4_nl, "expected ≥1 tensor at IQ4_NL");
 }
 
 /// CLI-subprocess sibling — exercises Q4_0 via `--quant q4_0`.
 /// Q4_0 is the simplest legacy quant: block size 32, 18 bytes per
 /// block, no `make_qkx2`-style scale refinement loop. Used as a
 /// CLI regression net for the simplest dispatch path.
-/// Positional Q4_0 = 2 in mlx_native's GgmlType enum.
 #[test]
 fn convert_q4_0_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
@@ -938,20 +934,19 @@ fn convert_q4_0_tiny_qwen35moe_round_trip() {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
-        if info.ggml_type as u32 == 2 {
+        if info.ggml_type == mlx_native::GgmlType::Q4_0 {
             saw_q4_0 = true;
         }
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
-    assert!(saw_q4_0, "expected ≥1 tensor at Q4_0 (positional 2)");
+    assert!(saw_q4_0, "expected ≥1 tensor at Q4_0");
 }
 
 /// CLI-subprocess sibling — exercises Q5_1 via `--quant q5_1`.
 /// Q5_1 is the 5-bit legacy quant with per-block `m` (min) term in
 /// addition to scale `d`. mlx_native::ops::quantized_matmul_ggml::GgmlType
-/// includes Q5_1 at positional 8 (per ADR-022 Phase 1) so the output
-/// GGUF can be parsed by mlx-native (unlike Q5_0 which has no
-/// positional discriminant — see prior iteration revert).
+/// includes Q5_1 (per ADR-022 Phase 1) so the output GGUF can be parsed
+/// by mlx-native (unlike Q5_0, which is unsupported by its reader).
 #[test]
 fn convert_q5_1_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
@@ -994,19 +989,17 @@ fn convert_q5_1_tiny_qwen35moe_round_trip() {
         "blk.1.ffn_down_exps.weight",
     ];
 
-    // Positional Q5_1 = 8 in mlx_native's GgmlType enum
-    // (F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, I16, Q5_1, IQ4_NL).
     let mut saw_q5_1 = false;
     for name in expected_names {
         let info = gguf
             .tensor_info(name)
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
-        if info.ggml_type as u32 == 8 {
+        if info.ggml_type == mlx_native::GgmlType::Q5_1 {
             saw_q5_1 = true;
         }
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
-    assert!(saw_q5_1, "expected ≥1 tensor at Q5_1 (positional 8)");
+    assert!(saw_q5_1, "expected ≥1 tensor at Q5_1");
 }
 
 // ----------------------------------------------------------------------------
@@ -1203,7 +1196,7 @@ fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
 ///    vision-tower tensor is silently dropped via `MappedTensor::Drop`)
 ///  - `general.architecture = "gemma4"` (NOT `"gemma3"` — the prior
 ///    mapper got this wrong; locked in per `gemma4.rs` quirk #8)
-///  - every expected GGUF tensor name present with Q8_0 (positional 3)
+///  - every expected GGUF tensor name present with Q8_0
 ///  - the fused expert tensors land as 3-D with the right inner dim
 #[test]
 fn convert_gemma4_real_arch_round_trip() {
@@ -1299,11 +1292,11 @@ fn convert_gemma4_real_arch_round_trip() {
     let rope_freqs = gguf
         .tensor_info("rope_freqs.weight")
         .expect("rope_freqs.weight present (synthesized by build_synthesized_tensors)");
-    // F32 = positional 0 in mlx_native's GgmlType enum.
     assert_eq!(
-        rope_freqs.ggml_type as u32, 0,
-        "rope_freqs.weight must be F32 (positional 0), got {}",
-        rope_freqs.ggml_type as u32
+        rope_freqs.ggml_type,
+        mlx_native::GgmlType::F32,
+        "rope_freqs.weight must be F32, got {:?}",
+        rope_freqs.ggml_type
     );
     // Shape: 1-D of length global_head_dim/2 = 8/2 = 4.
     assert_eq!(
@@ -1349,7 +1342,7 @@ fn convert_gemma4_real_arch_round_trip() {
          (gemma.py:713-715: n_rot_full=1, n_unrot_full=3 for global_head_dim=8, prf=0.25)"
     );
 
-    // Per-tensor name + ggml_type. Q8_0 = positional 3.
+    // Per-tensor name + ggml_type.
     let expected_names: &[&str] = &[
         "token_embd.weight",
         // layer 0
@@ -1381,16 +1374,16 @@ fn convert_gemma4_real_arch_round_trip() {
             .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
         // `ffn_gate_inp.weight` (router-gate projection) is F32-keep per
         // /opt/llama.cpp/src/llama-quant.cpp:307. Every other tensor here
-        // is a regular 2-D weight that lands on Q8_0 (positional code 3).
-        let expected_ggml_type: u32 = if name.contains("ffn_gate_inp.weight") {
-            0 // F32
+        // is a regular 2-D weight that lands on Q8_0.
+        let expected_ggml_type = if name.contains("ffn_gate_inp.weight") {
+            mlx_native::GgmlType::F32
         } else {
-            3 // Q8_0
+            mlx_native::GgmlType::Q8_0
         };
         assert_eq!(
-            info.ggml_type as u32, expected_ggml_type,
-            "tensor `{name}` expected ggml_type {}, got {}",
-            expected_ggml_type, info.ggml_type as u32
+            info.ggml_type, expected_ggml_type,
+            "tensor `{name}` expected ggml_type {:?}, got {:?}",
+            expected_ggml_type, info.ggml_type
         );
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }

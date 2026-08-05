@@ -24,6 +24,7 @@ pub mod cli_driver;
 pub mod model_card;
 pub mod orchestrator;
 pub mod quant_selector;
+pub mod receipt;
 pub mod sleef_expf;
 pub mod source_dtype;
 pub mod source_reader;
@@ -32,6 +33,7 @@ pub mod tokenizer;
 pub use cli_driver::{run_convert, ConvertArgs, ConvertError};
 pub use orchestrator::{ConvertOrchestrator, OrchestratorError, PlanEntry, StreamingWriter};
 pub use quant_selector::{approximate_for_apex, QuantSelector, QuantSelectorError};
+pub use receipt::{ReceiptError, RemoteConversionSource};
 pub use source_reader::{HfModelSource, HfTensor, SourceError, TensorMeta};
 pub use tokenizer::{build_tokenizer_metadata, TokenizerError};
 
@@ -417,4 +419,3 @@ mod tests {
         }
     }
 }
-

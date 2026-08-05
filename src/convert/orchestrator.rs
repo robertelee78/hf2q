@@ -24,10 +24,10 @@
 //! 4. [`begin_write`] — emit the GGUF header, every KV, every
 //!    tensor-info reservation, and pad-to-alignment. Returns a
 //!    [`StreamingWriter`] handle that owns the underlying sink.
-//! 5. [`StreamingWriter::stream_tensor`] — one call per planned tensor,
-//!    in plan order. Caller hands over the F32 row-major data; the
-//!    orchestrator quantizes inline, streams the payload, and discards
-//!    both the F32 + quantized buffers before returning.
+//! 5. [`StreamingWriter::stream_tensor`] — one call per ordinary tensor,
+//!    or `begin_tensor_chunks` → repeated row-aligned
+//!    `stream_tensor_chunk` → `finish_tensor_chunks` for a fused tensor.
+//!    Chunk mode bounds working memory to one expert/row batch.
 //! 6. [`StreamingWriter::finalize`] — seek-back to fill tensor offsets,
 //!    flush, return the underlying writer.
 //!
@@ -414,7 +414,10 @@ impl ConvertOrchestrator {
                 && (e.name.contains("ffn_gate_inp.weight")
                     || e.name.contains("ffn_gate_inp_shexp.weight"));
 
-            let ggml_type = if is_vision_tensor_pattern(&e.name)
+            let ggml_type = if matches!(e.source_dtype, SourceDtype::I32 | SourceDtype::I64) {
+                // Hash routing is a lookup table, not a float weight.
+                GgmlType::I32
+            } else if is_vision_tensor_pattern(&e.name)
                 || is_audio_tensor_pattern(&e.name)
                 || mtp_ffn_gate_inp_demote
             {
@@ -533,6 +536,7 @@ impl ConvertOrchestrator {
             writer: w,
             planned,
             next_idx: 0,
+            active_chunks: None,
             imatrix,
             coverage_quantized: 0,
             coverage_with_imatrix: 0,
@@ -543,14 +547,15 @@ impl ConvertOrchestrator {
 
 /// Streaming GGUF writer returned by [`ConvertOrchestrator::begin_write`].
 ///
-/// Owns the underlying sink + the plan. Each call to `stream_tensor`
-/// quantizes one tensor's F32 data, emits its payload, and discards
-/// both buffers before returning. Peak resident set per call:
-/// `expected_numel × 4 bytes` (F32) + the quantized payload.
+/// Owns the underlying sink + the plan. Ordinary tensors may use one
+/// `stream_tensor` call. Fused tensors use row-aligned chunks so peak
+/// working memory is `max_chunk_elements × 4` for the caller buffer,
+/// the same-sized F16-roundtrip F32 buffer, and one chunk payload.
 pub struct StreamingWriter<W: Write + Seek> {
     writer: GgufWriter<W>,
     planned: Vec<PlannedTensor>,
     next_idx: usize,
+    active_chunks: Option<ActiveTensorChunks>,
     /// ADR-033 §P4b — optional imatrix data for per-tensor row-importance
     /// weighting at `quantizer.quantize`. Looked up per tensor by name in
     /// `tensor_imatrix`. None for non-i-tier convert runs.
@@ -563,6 +568,31 @@ pub struct StreamingWriter<W: Write + Seek> {
     coverage_quantized: usize,
     coverage_with_imatrix: usize,
     coverage_missing: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ActiveTensorChunks {
+    tensor_idx: usize,
+    total_elements: usize,
+    chunk_count: usize,
+    max_chunk_elements: usize,
+    max_input_f32_bytes: usize,
+    max_f16_roundtrip_f32_bytes: usize,
+    max_quantized_payload_bytes: usize,
+    max_working_vec_bytes: usize,
+    imatrix: Option<Vec<f32>>,
+}
+
+/// Observable bound receipt for one chunk-streamed tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorChunkStats {
+    pub total_elements: usize,
+    pub chunk_count: usize,
+    pub max_chunk_elements: usize,
+    pub max_input_f32_bytes: usize,
+    pub max_f16_roundtrip_f32_bytes: usize,
+    pub max_quantized_payload_bytes: usize,
+    pub max_working_vec_bytes: usize,
 }
 
 impl<W: Write + Seek> StreamingWriter<W> {
@@ -655,51 +685,119 @@ impl<W: Write + Seek> StreamingWriter<W> {
         self.planned.len()
     }
 
-    /// Stream one tensor's F32 row-major data. The orchestrator
-    /// quantizes inline, writes the payload, and drops the quantized
-    /// buffer before returning. The caller's F32 buffer is borrowed
-    /// (not consumed) and may be dropped after this returns.
-    ///
-    /// Must be called in plan order — the orchestrator validates this
-    /// via `tensor_idx == self.next_idx` and rejects out-of-order calls
-    /// per the no-loop-suppression rule.
-    ///
-    /// `data.len()` must equal the planned tensor's
-    /// `shape.iter().product()`; otherwise this returns
-    /// [`OrchestratorError::StreamProtocol`].
-    pub fn stream_tensor(
-        &mut self,
+    fn validate_next_tensor(
+        &self,
         tensor_idx: usize,
-        data: &[f32],
+        caller: &str,
     ) -> Result<(), OrchestratorError> {
         if tensor_idx >= self.planned.len() {
             return Err(OrchestratorError::StreamProtocol(format!(
-                "stream_tensor: idx {tensor_idx} out of range (planned {})",
+                "{caller}: idx {tensor_idx} out of range (planned {})",
                 self.planned.len()
             )));
         }
         if tensor_idx != self.next_idx {
             return Err(OrchestratorError::StreamProtocol(format!(
-                "stream_tensor: out-of-order call (got idx {tensor_idx}, expected {})",
+                "{caller}: out-of-order call (got idx {tensor_idx}, expected {})",
                 self.next_idx
+            )));
+        }
+        Ok(())
+    }
+
+    /// Begin streaming one planned tensor as row-aligned F32 chunks.
+    /// At most one tensor may be active and tensors remain strictly in
+    /// plan order.
+    pub fn begin_tensor_chunks(&mut self, tensor_idx: usize) -> Result<(), OrchestratorError> {
+        self.validate_next_tensor(tensor_idx, "begin_tensor_chunks")?;
+        if let Some(active) = self.active_chunks.as_ref() {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "begin_tensor_chunks: tensor {} is already active",
+                active.tensor_idx
             )));
         }
 
         let p = &self.planned[tensor_idx];
-        if data.len() != p.expected_numel {
+        let quantized = !matches!(p.ggml_type, GgmlType::F16 | GgmlType::F32 | GgmlType::I32);
+        let imatrix = if quantized {
+            self.tensor_imatrix(&p.name, p.n_per_row)?
+        } else {
+            None
+        };
+        self.writer.begin_tensor_payload(tensor_idx)?;
+        if quantized {
+            self.coverage_quantized += 1;
+            if imatrix.is_some() {
+                self.coverage_with_imatrix += 1;
+            } else if self.imatrix.is_some() {
+                self.coverage_missing.push(p.name.clone());
+            }
+        }
+        self.active_chunks = Some(ActiveTensorChunks {
+            tensor_idx,
+            total_elements: 0,
+            chunk_count: 0,
+            max_chunk_elements: 0,
+            max_input_f32_bytes: 0,
+            max_f16_roundtrip_f32_bytes: 0,
+            max_quantized_payload_bytes: 0,
+            max_working_vec_bytes: 0,
+            imatrix,
+        });
+        Ok(())
+    }
+
+    /// Quantize and write one complete-row chunk of the active tensor.
+    /// The temporary F16-roundtrip and quantized buffers are bounded by
+    /// this chunk, then dropped before the caller materializes the next.
+    pub fn stream_tensor_chunk(
+        &mut self,
+        tensor_idx: usize,
+        data: &[f32],
+    ) -> Result<(), OrchestratorError> {
+        let active = self.active_chunks.as_ref().ok_or_else(|| {
+            OrchestratorError::StreamProtocol(format!(
+                "stream_tensor_chunk: tensor {tensor_idx} was not begun"
+            ))
+        })?;
+        if active.tensor_idx != tensor_idx {
             return Err(OrchestratorError::StreamProtocol(format!(
-                "stream_tensor: tensor `{}` data length {} != planned numel {}",
-                p.name,
-                data.len(),
-                p.expected_numel
+                "stream_tensor_chunk: tensor {tensor_idx} does not match active tensor {}",
+                active.tensor_idx
+            )));
+        }
+        if data.is_empty() {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor_chunk: tensor `{}` received an empty chunk",
+                self.planned[tensor_idx].name
             )));
         }
 
-        // Build payload inline — three branches mirror the policy
-        // decisions made in `plan_tensors`:
-        //   - F16: vision/audio gate, fixed F16 cast (2 bytes/elem).
-        //   - F32: rope_freqs.weight & co. (4 bytes/elem, identity).
-        //   - Other: `quantizer_for(ggml_type).quantize(...)`.
+        let p = &self.planned[tensor_idx];
+        if data.len() % p.n_per_row != 0 {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor_chunk: tensor `{}` chunk length {} is not row-aligned to {}",
+                p.name,
+                data.len(),
+                p.n_per_row
+            )));
+        }
+        let total_elements = active
+            .total_elements
+            .checked_add(data.len())
+            .ok_or_else(|| {
+                OrchestratorError::StreamProtocol(format!(
+                    "stream_tensor_chunk: tensor `{}` element count overflow",
+                    p.name
+                ))
+            })?;
+        if total_elements > p.expected_numel {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor_chunk: tensor `{}` cumulative length {} exceeds planned numel {}",
+                p.name, total_elements, p.expected_numel
+            )));
+        }
+
         let payload: Vec<u8> = match p.ggml_type {
             GgmlType::F16 => {
                 let mut v = Vec::with_capacity(data.len() * 2);
@@ -715,56 +813,136 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 }
                 v
             }
+            GgmlType::I32 => {
+                let mut v = Vec::with_capacity(data.len() * 4);
+                for &x in data {
+                    if !x.is_finite()
+                        || x.fract() != 0.0
+                        || x < i32::MIN as f32
+                        || x > i32::MAX as f32
+                    {
+                        return Err(OrchestratorError::StreamProtocol(format!(
+                            "tensor `{}` contains non-I32 routing value {x}",
+                            p.name
+                        )));
+                    }
+                    v.extend_from_slice(&(x as i32).to_le_bytes());
+                }
+                v
+            }
             _ => {
                 let quantizer = quantizer_for(p.ggml_type)?;
-                // ADR-033 §P1 F16-round-trip: convert_hf_to_gguf.py stores
-                // weight tensors as F16 in the intermediate GGUF (see
-                // /opt/llama.cpp/conversion/base.py:875-876), and
-                // llama-quantize reads them back to F32 with F16-precision
-                // loss before quantizing. To byte-match canonical output we
-                // mirror that round-trip here — BF16/F32 source values
-                // below F16's normal range (~6.1e-5) get rounded to F16
-                // subnormals, propagating identical inputs into the K-quant
-                // kernel. Per-element scalar round-trip; matches numpy's
-                // ndarray.astype(float16).astype(float32) used by canonical.
-                // Parallel par_iter attempted 2026-05-21 → 183s → 194s
-                // (FALSIFIED; rayon overhead > gain since the quantize
-                // kernel that follows is already rayon-parallel per-row).
-                // Buffer-reuse via `StreamingWriter` field attempted
-                // 2026-05-21 → 183s → 190s (FALSIFIED; allocation was
-                // not the bottleneck either). The 1.62×-canonical wall
-                // characteristic needs a real profiler to localize, not
-                // blind hypothesis-testing — see ADR-033 perf section.
+                // Canonical first writes an F16 intermediate and reads
+                // it back before quantizing. Apply that exact roundtrip
+                // independently per row-aligned chunk; row-local kernels
+                // therefore produce the same byte concatenation as one
+                // whole-tensor call without the whole-tensor allocation.
                 let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
-                // ADR-033 §P4b — pass per-tensor row-importance to the
-                // imatrix-aware quantize codepath when the convert run has
-                // `--imatrix <file>` (or equivalent) attached. Pre-P4b, this
-                // call hardcoded `None` and apex-i-quality produced
-                // byte-identical output to apex-quality. The aggregation
-                // policy mirrors llama-quant.cpp's `imatrix_data->at(name)`
-                // semantics: dense tensors take values directly; MoE
-                // tensors sum-across-experts and divide by total counts
-                // (one importance vector per tensor — the quantizer dispatch
-                // reuses the same pointer per row).
-                //
-                // Coverage tracking: a tensor that the policy routed to a
-                // quant variant (this `_` branch) BUT has no matching
-                // imatrix entry counts as a "missing-coverage" gap, logged
-                // at finalize so the operator can audit partial collections.
-                let imatrix_vec = self.tensor_imatrix(&p.name, p.n_per_row)?;
-                self.coverage_quantized += 1;
-                if imatrix_vec.is_some() {
-                    self.coverage_with_imatrix += 1;
-                } else if self.imatrix.is_some() {
-                    self.coverage_missing.push(p.name.clone());
-                }
-                quantizer.quantize(&f16_rt, p.n_per_row, imatrix_vec.as_deref())?
+                quantizer.quantize(&f16_rt, p.n_per_row, active.imatrix.as_deref())?
             }
         };
 
-        self.writer.stream_tensor_payload(tensor_idx, &payload)?;
-        self.next_idx += 1;
+        let input_f32_bytes = data.len().checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+            OrchestratorError::StreamProtocol(format!(
+                "stream_tensor_chunk: tensor `{}` input byte count overflow",
+                p.name
+            ))
+        })?;
+        let quantized = !matches!(p.ggml_type, GgmlType::F16 | GgmlType::F32 | GgmlType::I32);
+        let f16_roundtrip_f32_bytes = if quantized { input_f32_bytes } else { 0 };
+        let quantized_payload_bytes = if quantized { payload.len() } else { 0 };
+        let working_vec_bytes = input_f32_bytes
+            .checked_add(f16_roundtrip_f32_bytes)
+            .and_then(|bytes| bytes.checked_add(payload.len()))
+            .ok_or_else(|| {
+                OrchestratorError::StreamProtocol(format!(
+                    "stream_tensor_chunk: tensor `{}` working byte count overflow",
+                    p.name
+                ))
+            })?;
+
+        self.writer
+            .write_tensor_payload_chunk(tensor_idx, &payload)?;
+        let active = self
+            .active_chunks
+            .as_mut()
+            .expect("active tensor validated above");
+        active.total_elements = total_elements;
+        active.chunk_count += 1;
+        active.max_chunk_elements = active.max_chunk_elements.max(data.len());
+        active.max_input_f32_bytes = active.max_input_f32_bytes.max(input_f32_bytes);
+        active.max_f16_roundtrip_f32_bytes = active
+            .max_f16_roundtrip_f32_bytes
+            .max(f16_roundtrip_f32_bytes);
+        active.max_quantized_payload_bytes = active
+            .max_quantized_payload_bytes
+            .max(quantized_payload_bytes);
+        active.max_working_vec_bytes = active.max_working_vec_bytes.max(working_vec_bytes);
         Ok(())
+    }
+
+    /// Finish the active tensor after validating its exact planned
+    /// element and payload lengths.
+    pub fn finish_tensor_chunks(
+        &mut self,
+        tensor_idx: usize,
+    ) -> Result<TensorChunkStats, OrchestratorError> {
+        let active = self.active_chunks.as_ref().ok_or_else(|| {
+            OrchestratorError::StreamProtocol(format!(
+                "finish_tensor_chunks: tensor {tensor_idx} was not begun"
+            ))
+        })?;
+        if active.tensor_idx != tensor_idx {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "finish_tensor_chunks: tensor {tensor_idx} does not match active tensor {}",
+                active.tensor_idx
+            )));
+        }
+        let expected = self.planned[tensor_idx].expected_numel;
+        if active.total_elements != expected {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "finish_tensor_chunks: tensor `{}` received {} elements, expected {}",
+                self.planned[tensor_idx].name, active.total_elements, expected
+            )));
+        }
+
+        self.writer.finish_tensor_payload(tensor_idx)?;
+        let active = self.active_chunks.take().expect("validated active tensor");
+        self.next_idx += 1;
+        Ok(TensorChunkStats {
+            total_elements: active.total_elements,
+            chunk_count: active.chunk_count,
+            max_chunk_elements: active.max_chunk_elements,
+            max_input_f32_bytes: active.max_input_f32_bytes,
+            max_f16_roundtrip_f32_bytes: active.max_f16_roundtrip_f32_bytes,
+            max_quantized_payload_bytes: active.max_quantized_payload_bytes,
+            max_working_vec_bytes: active.max_working_vec_bytes,
+        })
+    }
+
+    /// Stream one complete tensor. This compatibility wrapper uses the
+    /// same begin/chunk/finish protocol as bounded fused-expert writes.
+    pub fn stream_tensor(
+        &mut self,
+        tensor_idx: usize,
+        data: &[f32],
+    ) -> Result<TensorChunkStats, OrchestratorError> {
+        self.validate_next_tensor(tensor_idx, "stream_tensor")?;
+
+        let p = &self.planned[tensor_idx];
+        if data.len() != p.expected_numel {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor: tensor `{}` data length {} != planned numel {}",
+                p.name,
+                data.len(),
+                p.expected_numel
+            )));
+        }
+        self.begin_tensor_chunks(tensor_idx)?;
+        if !data.is_empty() {
+            self.stream_tensor_chunk(tensor_idx, data)?;
+        }
+        self.finish_tensor_chunks(tensor_idx)
     }
 
     /// Seek-back to fill tensor offsets and flush. Must be called after
@@ -772,6 +950,12 @@ impl<W: Write + Seek> StreamingWriter<W> {
     /// surfaces `WriterError::MissingTensorPayloads` per the existing
     /// `GgufWriter::finalize` contract.
     pub fn finalize(mut self) -> Result<(), OrchestratorError> {
+        if let Some(active) = self.active_chunks.as_ref() {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "finalize: tensor {} still has an active chunk stream",
+                active.tensor_idx
+            )));
+        }
         if self.next_idx != self.planned.len() {
             return Err(OrchestratorError::StreamProtocol(format!(
                 "finalize: only {} of {} planned tensors streamed",
@@ -1090,10 +1274,26 @@ mod tests {
         // for Q5_K_M ftype falls through to the default base type Q5_K.
         // Pre-tied-detection-fix this test asserted token=Q6_K (the
         // BROKEN promote-as-tied behavior).
-        assert_eq!(token.ggml_type as u32, 5, "token_embd (non-tied) → Q5_K");
-        assert_eq!(output.ggml_type as u32, 6, "output → Q6_K");
-        assert_eq!(attn_q.ggml_type as u32, 5, "attn_q → Q5_K");
-        assert_eq!(ffn_down.ggml_type as u32, 6, "ffn_down (i=0) → Q6_K");
+        assert_eq!(
+            token.ggml_type,
+            mlx_native::GgmlType::Q5_K,
+            "token_embd (non-tied) → Q5_K"
+        );
+        assert_eq!(
+            output.ggml_type,
+            mlx_native::GgmlType::Q6_K,
+            "output → Q6_K"
+        );
+        assert_eq!(
+            attn_q.ggml_type,
+            mlx_native::GgmlType::Q5_K,
+            "attn_q → Q5_K"
+        );
+        assert_eq!(
+            ffn_down.ggml_type,
+            mlx_native::GgmlType::Q6_K,
+            "ffn_down (i=0) → Q6_K"
+        );
 
         assert_eq!(token.offset % 32, 0);
         assert_eq!(output.offset % 32, 0);
@@ -1153,9 +1353,10 @@ mod tests {
             .tensor_info("model.visual.patch_embd.weight")
             .expect("vision tensor present");
         assert_eq!(
-            visual.ggml_type as u32, 1,
-            "vision tensor must emit F16 (positional code 1), got {}",
-            visual.ggml_type as u32
+            visual.ggml_type,
+            mlx_native::GgmlType::F16,
+            "vision tensor must emit F16, got {:?}",
+            visual.ggml_type
         );
         assert_eq!(visual.byte_len, 60);
 
@@ -1163,7 +1364,8 @@ mod tests {
             .tensor_info("blk.0.attn_q.weight")
             .expect("policy tensor present");
         assert_eq!(
-            attn_q.ggml_type as u32, 5,
+            attn_q.ggml_type,
+            mlx_native::GgmlType::Q5_K,
             "non-vision sibling must still route through policy → Q5_K"
         );
     }
@@ -1274,6 +1476,160 @@ mod tests {
         );
     }
 
+    fn one_deepseek_q2_tensor(shape: Vec<usize>) -> ConvertOrchestrator {
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ2_K_S,
+            ArchName::Deepseek4,
+            HParams {
+                n_expert: shape.last().copied().unwrap_or(0) as u32,
+                n_head: 4,
+                n_head_kv: 1,
+                n_layer: 1,
+                n_mtp_layers: 0,
+            },
+        );
+        orch.plan_tensors(vec![PlanEntry {
+            name: "blk.0.ffn_gate_exps.weight".into(),
+            shape,
+            source_dtype: SourceDtype::Mxfp4E2M1,
+            layer_index: Some(0),
+        }])
+        .expect("plan DeepSeek expert tensor");
+        orch
+    }
+
+    #[test]
+    fn q2_k_s_chunked_rows_are_byte_identical_to_whole_tensor() {
+        let n_per_row = 256;
+        let rows_per_expert = 4;
+        let experts = 2;
+        let per_expert = n_per_row * rows_per_expert;
+        let data = deterministic_data(per_expert * experts, 0x5eed);
+
+        let mut whole = std::io::Cursor::new(Vec::new());
+        {
+            let mut sw = one_deepseek_q2_tensor(vec![n_per_row, rows_per_expert, experts])
+                .begin_write(&mut whole)
+                .unwrap();
+            sw.stream_tensor(0, &data).unwrap();
+            sw.finalize().unwrap();
+        }
+
+        let mut chunked = std::io::Cursor::new(Vec::new());
+        {
+            let mut sw = one_deepseek_q2_tensor(vec![n_per_row, rows_per_expert, experts])
+                .begin_write(&mut chunked)
+                .unwrap();
+            sw.begin_tensor_chunks(0).unwrap();
+            sw.stream_tensor_chunk(0, &data[..per_expert]).unwrap();
+            sw.stream_tensor_chunk(0, &data[per_expert..]).unwrap();
+            let stats = sw.finish_tensor_chunks(0).unwrap();
+            assert_eq!(stats.chunk_count, experts);
+            assert_eq!(stats.max_chunk_elements, per_expert);
+            assert_eq!(stats.max_input_f32_bytes, per_expert * 4);
+            assert_eq!(stats.max_f16_roundtrip_f32_bytes, per_expert * 4);
+            assert_eq!(
+                stats.max_quantized_payload_bytes,
+                rows_per_expert * GgmlType::Q2_K.row_size(n_per_row)
+            );
+            assert_eq!(
+                stats.max_working_vec_bytes,
+                stats.max_input_f32_bytes
+                    + stats.max_f16_roundtrip_f32_bytes
+                    + stats.max_quantized_payload_bytes
+            );
+            sw.finalize().unwrap();
+        }
+
+        assert_eq!(chunked.into_inner(), whole.into_inner());
+    }
+
+    #[test]
+    fn chunked_stream_preserves_256_expert_order_with_one_expert_live() {
+        const EXPERTS: usize = 256;
+        const N_PER_ROW: usize = 256;
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ2_K_S,
+            ArchName::Deepseek4,
+            HParams {
+                n_expert: EXPERTS as u32,
+                n_head: 4,
+                n_head_kv: 1,
+                n_layer: 1,
+                n_mtp_layers: 0,
+            },
+        );
+        let name = "blk.0.ffn_gate_tid2eid.weight";
+        orch.plan_tensors(vec![PlanEntry {
+            name: name.into(),
+            shape: vec![N_PER_ROW, 1, EXPERTS],
+            source_dtype: SourceDtype::I64,
+            layer_index: Some(0),
+        }])
+        .unwrap();
+
+        let mut out = std::io::Cursor::new(Vec::new());
+        {
+            let mut sw = orch.begin_write(&mut out).unwrap();
+            sw.begin_tensor_chunks(0).unwrap();
+            for expert in 0..EXPERTS {
+                let one_expert = vec![expert as f32; N_PER_ROW];
+                sw.stream_tensor_chunk(0, &one_expert).unwrap();
+            }
+            let stats = sw.finish_tensor_chunks(0).unwrap();
+            assert_eq!(stats.chunk_count, EXPERTS);
+            assert_eq!(stats.total_elements, EXPERTS * N_PER_ROW);
+            assert_eq!(stats.max_chunk_elements, N_PER_ROW);
+            sw.finalize().unwrap();
+        }
+
+        let bytes = out.into_inner();
+        let header_bytes = 24 + 8 + name.len() + 4 + 3 * 8 + 4 + 8;
+        let data_start = (header_bytes + 31) / 32 * 32;
+        let payload = &bytes[data_start..data_start + EXPERTS * N_PER_ROW * 4];
+        for (index, word) in payload.chunks_exact(4).enumerate() {
+            assert_eq!(
+                i32::from_le_bytes(word.try_into().unwrap()),
+                (index / N_PER_ROW) as i32,
+                "expert-major ordering changed at element {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn official_deepseek_expert_chunk_has_a_66_625_mib_working_set_bound() {
+        const EXPERTS: usize = 256;
+        const ROWS: usize = 2048;
+        const N_PER_ROW: usize = 4096;
+        let decoded_f32 = ROWS * N_PER_ROW * std::mem::size_of::<f32>();
+        let f16_roundtrip_f32 = decoded_f32;
+        let q2_payload = ROWS * GgmlType::Q2_K.row_size(N_PER_ROW);
+        let bounded_peak = decoded_f32 + f16_roundtrip_f32 + q2_payload;
+        let former_whole_tensor_peak = bounded_peak * EXPERTS;
+
+        assert_eq!(decoded_f32, 32 * 1024 * 1024);
+        assert_eq!(q2_payload, 2_752_512);
+        assert_eq!(bounded_peak, 69_861_376); // 66.625 MiB
+        assert_eq!(former_whole_tensor_peak / bounded_peak, EXPERTS);
+        assert_eq!(former_whole_tensor_peak, 17_884_512_256);
+    }
+
+    #[test]
+    fn chunked_stream_rejects_misaligned_and_incomplete_input() {
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut sw = one_deepseek_q2_tensor(vec![256, 2, 2])
+            .begin_write(&mut out)
+            .unwrap();
+        sw.begin_tensor_chunks(0).unwrap();
+        let err = sw.stream_tensor_chunk(0, &[0.0; 1280]).unwrap_err();
+        assert!(matches!(err, OrchestratorError::StreamProtocol(_)));
+        let err = sw.stream_tensor_chunk(0, &[0.0; 255]).unwrap_err();
+        assert!(matches!(err, OrchestratorError::StreamProtocol(_)));
+        sw.stream_tensor_chunk(0, &[0.0; 256]).unwrap();
+        let err = sw.finish_tensor_chunks(0).unwrap_err();
+        assert!(matches!(err, OrchestratorError::StreamProtocol(_)));
+    }
+
     /// `finalize` rejects incomplete streaming.
     #[test]
     fn finalize_rejects_incomplete_stream() {
@@ -1343,7 +1699,7 @@ mod tests {
         let gguf = mlx_native::gguf::GgufFile::open(tmp.path()).expect("parse");
         assert_eq!(gguf.tensor_count(), 1);
         let t = gguf.tensor_info("blk.0.attn_q.weight").unwrap();
-        assert_eq!(t.ggml_type as u32, 5);
+        assert_eq!(t.ggml_type, mlx_native::GgmlType::Q5_K);
     }
 
     /// Regression test for ADR-033 §P1 quality-equivalence gate failure

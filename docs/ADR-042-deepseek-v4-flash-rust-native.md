@@ -1,0 +1,263 @@
+# ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
+
+- **Status:** Accepted; official base conversion, native inference, coherence, and performance gates passed (2026-08-04)
+- **Owner:** hf2q integration lane
+- **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
+- **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
+- **Reference implementation:** `/opt/llama.cpp` at
+  `6ea215d171fd31df943bf1ac8227129f2b963160`
+- **Target host:** Apple M5 Max, 40-core GPU, 128 GiB unified memory
+
+## Decision
+
+hf2q will download the **official Hugging Face checkpoint** and convert it to a
+`Q2_K_S` GGUF itself. Conversion, quantization, loading, and inference are
+implemented in-process in Rust (with owned Metal kernels in `mlx-native`).
+
+The product may invoke `hf`, `wget`, or `curl` solely to fetch official source
+repository files. It must not invoke Python, llama.cpp, or another converter,
+quantizer, or inference runtime. A separate developer-only parity harness may
+invoke the pinned llama.cpp build as an oracle.
+
+Prebuilt quantized weights are not an input, fallback, cache seed, or release
+artifact. Their published sizes may be used only as non-authoritative capacity
+evidence.
+
+The accepted base-model runtime supports native prefill through 128 tokens and
+fails closed before cache publication above that boundary. The metadata/cache
+planner validates the official one-million-token schedule, but that is not a
+claim that the current execution path admits a million-token request. Extending
+the execution window and integrating the separate DSpark draft artifact are
+follow-up work; neither is silently represented as part of the accepted base
+GGUF.
+
+## Context and spike result
+
+The official repository is approximately 166.9 GB (48 safetensor shards) and
+contains about 304.18 billion logical parameters. About 284.34B belong to the
+target model and 19.85B to the attached DSpark namespaces. A four-bit artifact is
+larger than host memory before scales, higher-precision tensors, KV state,
+scratch space, Metal allocations, and macOS. The existing hf2q `Q2_K_S` policy
+is therefore the first feasible target; the reference artifact size is about
+98.6 GB decimal (91.8 GiB).
+
+The checkpoint is not an ordinary BF16 model:
+
+- dense weights use FP8 E4M3 with E8M0/UE8M0 block scales;
+- expert weights pack two E2M1 FP4 values in each I8 byte with E8M0 scales;
+- the first three MoE layers use integer token-hash routing tables;
+- 43 layers combine 256 routed experts (top 6) and one shared expert;
+- the graph uses compressed sparse attention, a learned indexer, attention
+  sinks, four-stream hyperconnections, clamped SwiGLU, and YaRN;
+- the repository includes one attached DSpark next-token prediction stage made
+  of three `mtp.{0,1,2}` blocks (4,705 checkpoint tensors).
+
+At spike time, the converter rejected the source dtypes and architecture, expert
+fusion created a multi-gigabyte F32 aggregate, and the runtime had no
+DeepSeek-V4 graph or cache. The accepted implementation now converts the pinned
+source, executes every verifier layer and the vocabulary head, performs batched
+prefill, maintains the compressed cache transactionally, and generates coherent
+greedy text entirely through the owned Rust/Metal path.
+
+## Hypotheses and falsifiers
+
+### H1 — exact source decoding
+
+For every official source block, Rust E4M3 + E8M0 and packed E2M1 + E8M0
+decoding produces the same F32 bit pattern as the pinned reference formulas.
+
+**Falsifier:** any exhaustive E2M1 codebook mismatch, E8M0 exponent mismatch,
+block-scale indexing mismatch, or accepted malformed dtype/shape.
+
+### H2 — bounded streaming conversion
+
+One tensor or bounded row group can be decoded and requantized without a full
+model copy or an 8 GiB fused-expert F32 allocation.
+
+**Falsifier:** conversion private RSS exceeds 20 GiB, conversion requires all
+experts resident, resume can publish a partial tensor, or source/output identity
+is not bound to a receipt.
+
+### H3 — Q2_K_S fits and remains coherent
+
+The produced main-model artifact is at most 100 GB decimal and loads with enough
+headroom for Metal state and useful KV capacity on the 128 GiB host.
+
+**Falsifier:** peak process footprint exceeds 116 GiB at the acceptance context,
+macOS enters critical memory pressure, swap grows materially during steady-state
+decode, or deterministic prompts become incoherent relative to the reference.
+
+### H4 — owned low-bit kernels reach parity
+
+The Rust/Metal Q2_K path matches a scalar Rust decoder within the declared
+numeric tolerance and reaches at least 0.90x the pinned llama.cpp decode rate
+and 0.85x its prompt-processing rate under the same model, prompt, context,
+threading, and sampling settings.
+
+**Falsifier:** decoded blocks differ, token decisions diverge outside documented
+floating-point ties, or three-run medians miss either throughput floor after
+profiling and measured optimization.
+
+### H5 — architecture state is exact
+
+Compressed attention, index selection, hash routing, hyperconnections, and cache
+mutation reproduce the pinned reference on small deterministic fixtures and on
+incremental-vs-one-shot real-model prompts.
+
+**Falsifier:** layer checkpoints exceed tolerance, cache rewind/fork changes
+tokens, slot interleaving perturbs a peer, or unknown architecture metadata can
+fall through to another model family.
+
+## Architecture contract
+
+### Source ingest
+
+The source reader gains typed views for packed I8/U8, integer routing tensors,
+E8M0 scales, and FP8 payloads. Dtype, rank, logical shape, scale shape, block
+size, and source revision are validated before allocation. Missing or ambiguous
+scale siblings are typed errors.
+
+The converter decodes and requantizes bounded rows directly into the incremental
+GGUF writer. Expert fusion must preserve canonical expert-major layout while
+streaming; it must not build a complete F32 fused projection. Checkpoints bind
+the source revision, shard hashes, converter commit, tensor name, output offset,
+length, quant type, and payload checksum. Resume revalidates all of them.
+
+### GGUF identity
+
+The architecture string is `deepseek4`. Metadata and tensor names follow the
+pinned llama.cpp registry, including:
+
+- q/o low-rank projection parameters and output groups;
+- compressor ratios and rotary base;
+- indexer head count, key length, and top-k;
+- hyperconnection stream count, Sinkhorn iterations, and epsilon;
+- routed/shared expert counts, top-k, scoring, scaling, and normalization;
+- hash-layer count, sliding window, attention sinks, and YaRN settings.
+
+MTP/DSpark tensors are never silently dropped. The main model may be emitted and
+accepted before the optional draft artifact only when the receipt explicitly
+marks DSpark as a separate pending artifact and the parity benchmark disables
+draft decoding on both runtimes.
+
+### Runtime ownership
+
+hf2q owns model dispatch, tokenization/chat encoding, generation, cache policy,
+sampling, tool-call framing, and server behavior. `mlx-native` owns buffer
+management plus dense, low-bit, routing, hyperconnection, compressor, indexer,
+and sparse-attention Metal operations. No runtime branch may default an unknown
+architecture to Gemma or Qwen.
+
+The implementation sequence is:
+
+1. exact router and clamped SwiGLU;
+2. hyperconnection/Sinkhorn;
+3. learned compression and indexer;
+4. sparse top-k attention with sinks and its dedicated cache;
+5. full block/model integration;
+6. DSpark draft integration after base-model parity.
+
+Dense D512 attention is allowed only as a small-fixture correctness oracle. It is
+not the production path.
+
+The official `encoding/` implementation, not an older DeepSeek chat template,
+defines prompt behavior. The Rust encoder must pin BOS/EOS, user/assistant,
+thinking, DSML, and DSpark-noise token IDs from the source manifest and reproduce
+0731 system/chat/thinking/tool-call framing. A crafted 0731 template from the
+pinned reference may be ported as an owned asset, but it is not executed by or
+loaded from llama.cpp at runtime.
+
+## Acceptance gates
+
+### Converter gate
+
+- A synthetic official-layout checkpoint converts to `Q2_K_S` in-process.
+- Positive tests cover E4M3, all E2M1 nibbles, E8M0 edges, integer routing,
+  canonical metadata, tensor naming, expert ordering, and GGUF round-trip.
+- Negative tests cover missing/malformed scales, wrong dtypes and ranks,
+  incomplete expert groups, invalid route tables, truncation, and corrupt resume.
+- The converter never spawns a converter/runtime process.
+- Existing Gemma 4 and Qwen 3.5 conversion regressions remain green.
+
+### Official conversion gate
+
+- The downloader records the exact official revision and every downloaded file
+  hash before conversion.
+- Output is reproducible from that manifest and carries an immutable receipt.
+- Peak private RSS, wall time, output bytes, and per-type byte totals are saved.
+- GGUF metadata, tensor names/shapes/types, and sampled dequantized payloads are
+  compared with the pinned reference. Whole-payload byte identity is the target;
+  any exception requires a tensor-local numeric proof and an ADR amendment.
+
+### Inference gate
+
+- Tiny exact fixtures pass CPU-reference-vs-Metal checks for every new primitive.
+- Real-model greedy runs pass repeated determinism, one-shot-vs-incremental,
+  cache rewind, cache fork, context-boundary, and interleaved-slot coherence.
+- A fixed prompt corpus covers plain chat, thinking, reasoning-effort controls,
+  tool calls/DSML, long context, Unicode, and stop/EOS behavior.
+- Token/logit parity is measured against the same source-bound llama.cpp build.
+- Three-run median prompt/decode throughput and peak memory meet H3/H4.
+- Existing public API and model-family regression suites remain green.
+
+## Benchmark discipline
+
+The parity harness is outside product code. It records exact hf2q, mlx-native,
+llama.cpp, source-model, and artifact commits/hashes; prompt bytes; context and
+batch sizes; sampling parameters; cache state; thermals; memory pressure; and
+all raw timing samples. Warm and cold-cache results are not mixed. Optimization
+is allowed only after a profile identifies the limiting operation, and every
+optimization reruns coherence before its speed result is accepted.
+
+## Delivery and publication
+
+Work occurs in isolated writer worktrees. The integration owner alone reconciles
+shared manifests and lockfiles. Focused tests precede regression, coherence,
+memory, and benchmark gates. Commits may be merged and pushed because the user
+authorized the full delivery workflow, but no artifact is described as ready
+until its exact-source receipt and all applicable acceptance gates are green.
+
+## Current evidence ledger
+
+| Evidence | Result |
+|---|---|
+| Hardware/storage audit | 128 GiB M5 Max; about 1.8 TiB free |
+| Official repository metadata | 48 shards; about 166.9 GB; 304.18B params |
+| Pinned `hf download --dry-run` | 74 official files; 166.9 GB; no payload fetched |
+| Official source download | 73 receipt-bound files, including all 48 shards; 166,898,659,555 bytes |
+| Exact source bundle | `a8544e6469f8f392e72f953e9a2b4ee33a23c50a859f47dd354d37ab0093993d` |
+| hf2q Q2_K_S converter | Rust in-process; FP8/FP4/E8M0 ingest, bounded expert fusion, atomic provenance receipt |
+| mlx-native Q2_K loader/matvec | Dense + expert-ID Metal paths; exact routing, activation, sparse-attention, compressor, indexer, HC, and tail-RoPE primitives |
+| Q2_K decode microbench | 55.81 us / 98.63 GB/s at M=1, N=K=4096 (integration rerun) |
+| Pinned llama.cpp conversion and graph | Present at reference commit |
+| Pinned llama.cpp oracle binaries | Rebuilt locally as version 10276 (`6ea215d17`) |
+| Synthetic converter proof | Positive/negative dtype, shape, scale, fusion, receipt, and round-trip suites green |
+| Official full conversion | Passed from pinned source with hf2q converter commit `a8e00a24c1ac043182761e9df3347853b2d74d41` |
+| Official output | 96,265,459,008 bytes (89.65 GiB), SHA-256 `0318b99b4ece1222d8cf4d93a705458d339907910af5af3a175bc3989dcb01a1` |
+| Conversion telemetry | 1,823.71 s wall; 120,490,524,672-byte max RSS including file mappings; 5,196,469,928-byte peak footprint; zero process swaps |
+| Bounded working vectors | Receipt maximum 4,670,627,840 bytes; 529,530,880 F32 elements in the largest row-aligned chunk |
+| DSpark boundary | 4,705 source tensors explicitly excluded from the base GGUF and receipt-marked for a separate draft artifact |
+| Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
+| Native primitive regression | 46 DeepSeek-focused tests passed; 0 failed; three real-artifact hardware tests ignored by default |
+| Pinned compute dependency | `mlx-native` commit `7cc3d308c37161e6602c9218ad3a14b5f86d7d4a`; pushed, clean-checkout build verified, and pinned exactly in `Cargo.lock` |
+| Clean dependency regression | 27 mlx-native tests passed across indexer, MoE routing, Q2_K, sparse-prefill-mask, and dense-GEMM suites |
+| Official activation simulation | Owned Metal E4M3/E8M0 main-KV and Hadamard+E2M1/E8M0 indexer paths match exact BF16 CPU references; 3/3 focused tests passed |
+| Compressed cache ownership | Fixed-offset contiguous raw/compressed KV views plus exact main/indexer F32 recurrent states; 1M-token resident plan 7,232,045,056 bytes |
+| Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
+| Official uncompressed-prefix proof | Layers 0-1 Q2_K attention plus exact hash-routed/shared MoE passed transactionally in 28.36 s cold; 99,047,478,968-byte peak footprint |
+| Official compressed-prefix proof | Layers 0-3 passed through ratio-4 and ratio-128 attention plus hash/learned MoE in 25.25 s after load/build; 68,298,014,720-byte max RSS; zero swaps |
+| Official full-verifier proof | All 43 layers passed for one token in 25.52 s after load/build; 67,200,876,544-byte max RSS; zero swaps; finite nonzero `[1, 4, 4096]` state and transactional cache publication |
+| Partial-token failure safety | Any failure after verifier execution begins poisons the request cache; reset atomically clears recurrent state, cache visibility, and poison before replay |
+| Official vocabulary-logits proof | Owned HC collapse, final RMSNorm, and Q6_K output projection passed with the 43-layer verifier in 27.81 s; 62,708,498,432-byte max RSS; zero swaps; finite nonzero `[1, 129280]` logits |
+| Official tokenizer parity | GGUF-driven Rust GPT-2 BPE emitted the same IDs as the pinned source `tokenizer.json` for the fixed Unicode, numeric, punctuation, and 0731 prompt-atom corpus |
+| Coherent real-model inference | Rust-native `hf2q generate` rendered the 0731 chat prompt, crossed the position-3 ratio-four compression boundary, selected the greedy token on Metal, and decoded `Hello` for the fixed six-token prompt |
+| One-token reference parity | Pinned llama.cpp `llama-simple` on the exact same GGUF and rendered six-token prompt also greedily decoded `Hello`; no product path invoked the oracle |
+| Native inference telemetry | 20.80 s load; 8.15 s incremental six-token prefill (0.736 tok/s); 30.38 s total; 67,364,585,472-byte max RSS; zero swaps |
+| Reference inference telemetry | Pinned llama.cpp raw-completion oracle processed the same six tokens in 73.89 ms (81.20 tok/s) after load; not yet an H4 comparison because hf2q currently submits one-token graphs while the reference batches all six |
+| Official arithmetic coherence | Prompt `What is 2+2? Answer with only the number.` rendered to 17 source-parity token IDs; greedy output reasoned to `2+2 = 4` and terminated with final answer `4` |
+| Batched prefill boundary | 125 prompt tokens executed in 6.85 s (18.257 tok/s) through native compressed prefill; a 510-token request was rejected before cache publication because the accepted execution window is 128 tokens |
+| Artifact-backed tests | Exact 1,328-tensor catalog, all 43 verifier layers plus finite vocabulary logits, greedy token selection, and embedded tokenizer parity passed against the 96.3 GB artifact |
+| Final native decode sample | 56 generated tokens in 1.24 s (45.308 tok/s) on the official arithmetic prompt after the clean pinned-dependency release build |
+| Matched five-run native benchmark | 45.1, 45.1, 37.7, 45.2, and 45.1 tok/s; median 45.1 tok/s, p95 45.2 tok/s; 63 verifier evaluations for 64 generated tokens; warm-prefill median 74.6 tok/s |
+| Matched llama.cpp reference | 41.58 tok/s on the same artifact and benchmark contract; hf2q median is 1.085x (+8.5%) |
+| Performance parity | Passed: native median exceeds the H4 0.90x decode floor and the pinned llama.cpp reference while retaining coherent greedy output |

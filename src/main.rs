@@ -224,7 +224,9 @@ fn cmd_tokenizer(args: cli::TokenizerArgs) -> Result<(), AppError> {
 /// issues) vs `AppError::Conversion` (source read, orchestrator, IO —
 /// pipeline-internal issues).
 fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
-    use crate::convert::{run_convert, ConvertArgs, ConvertError, QuantSelector};
+    use crate::convert::{
+        run_convert, ConvertArgs, ConvertError, QuantSelector, RemoteConversionSource,
+    };
 
     // QuantSelector parses both standard ftypes (`q5_k_m`, `q8_0`, ...)
     // and Apex tiers (`apex-balanced`, `apex-i-quality`, ...). Reserved
@@ -238,18 +240,43 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
     // clap's `conflicts_with` rejects the "both set" case at parse time;
     // we still guard here as defense-in-depth so the typed error variant
     // survives any future plumbing change that bypasses clap.
-    let hf_dir = match (args.hf_dir, args.repo) {
-        (Some(_), Some(_)) => {
+    let (hf_dir, remote_source) = match (args.hf_dir, args.repo, args.revision) {
+        (Some(_), Some(_), _) => {
             return Err(AppError::Input(anyhow::anyhow!(
                 "{}",
                 ConvertError::RepoAndDirMutuallyExclusive
             )));
         }
-        (Some(path), None) => path,
-        (None, Some(repo)) => {
-            download_repo_via_hf_cli(&repo).map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?
+        (Some(_), None, Some(_)) => {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "{}",
+                ConvertError::RevisionRequiresRepo
+            )));
         }
-        (None, None) => {
+        (Some(path), None, None) => (path, None),
+        (None, Some(repo), revision) => {
+            validate_hf_repo_id(&repo)
+                .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+            let revision = immutable_hf_revision(revision.as_deref())
+                .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+            let path = download_repo_via_hf_cli(&repo, &revision)
+                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+            let verified = crate::input::integrity::verify_remote_conversion_source(
+                &repo,
+                &revision,
+                &path,
+            )
+            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+            let source = RemoteConversionSource::from_verified(
+                repo,
+                revision,
+                &path,
+                &verified,
+            )
+            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+            (path, Some(source))
+        }
+        (None, None, _) => {
             return Err(AppError::Input(anyhow::anyhow!(
                 "convert: either positional `<hf_dir>` or `--repo <hf_repo>` is required"
             )));
@@ -265,6 +292,7 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         imatrix_out: args.imatrix_out,
         imatrix_n_ctx: args.imatrix_n_ctx,
         mmproj: args.mmproj,
+        remote_source,
     };
     run_convert(resolved).map_err(|e| match e {
         ConvertError::UnsupportedArch { .. }
@@ -279,12 +307,17 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         | ConvertError::Imatrix(_)
         | ConvertError::ImatrixRequiredForITier { .. }
         | ConvertError::ImatrixNCtxInvalid { .. }
-        | ConvertError::RepoAndDirMutuallyExclusive => {
+        | ConvertError::RepoAndDirMutuallyExclusive
+        | ConvertError::ImmutableRevisionRequired { .. }
+        | ConvertError::RevisionRequiresRepo
+        | ConvertError::InvalidRepoId { .. } => {
             AppError::Input(anyhow::anyhow!("{e}"))
         }
         ConvertError::Source(_)
         | ConvertError::Orchestrator(_)
         | ConvertError::Io(_)
+        | ConvertError::Integrity(_)
+        | ConvertError::Receipt(_)
         | ConvertError::HfDownload { .. } => {
             AppError::Conversion(anyhow::anyhow!("{e}"))
         }
@@ -298,39 +331,63 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
 /// Centralized as a pure function so the unit test can pin the contract
 /// without invoking the download subprocess.
 fn sanitize_repo_for_cache_dir(repo: &str) -> String {
-    repo.replace('/', "__")
+    let mut sanitized = String::with_capacity(repo.len() + 4);
+    for c in repo.chars() {
+        match c {
+            '/' => sanitized.push_str("__"),
+            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') => sanitized.push(c),
+            _ => sanitized.push('_'),
+        }
+    }
+    if matches!(sanitized.as_str(), "" | "." | "..") {
+        sanitized.insert(0, '_');
+    }
+    sanitized
 }
 
-/// Pick the HuggingFace download CLI binary to invoke.
-///
-/// The legacy `huggingface-cli` is now a deprecated shim that exits 1 and
-/// tells the operator to use `hf` instead, so we prefer `hf` whenever it is
-/// on PATH and only fall back to `huggingface-cli` for older environments
-/// that predate the rename. Returns a `&'static str` binary name.
-fn resolve_hf_cli() -> &'static str {
-    let hf_available = std::process::Command::new("hf")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+fn immutable_hf_revision(revision: Option<&str>) -> Result<String, crate::convert::ConvertError> {
+    let Some(revision) = revision else {
+        return Err(crate::convert::ConvertError::ImmutableRevisionRequired { supplied: None });
+    };
+    if revision.len() != 40 || !revision.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(crate::convert::ConvertError::ImmutableRevisionRequired {
+            supplied: Some(revision.to_string()),
+        });
+    }
+    Ok(revision.to_ascii_lowercase())
+}
 
-    if hf_available {
-        "hf"
+fn validate_hf_repo_id(repo: &str) -> Result<(), crate::convert::ConvertError> {
+    let valid = !repo.is_empty()
+        && !repo.starts_with('-')
+        && repo.split('/').all(|component| {
+            !component.is_empty()
+                && !matches!(component, "." | "..")
+                && component
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        });
+    if valid {
+        Ok(())
     } else {
-        "huggingface-cli"
+        Err(crate::convert::ConvertError::InvalidRepoId {
+            repo: repo.to_string(),
+        })
     }
 }
 
-/// B1 — shell out to `hf download <repo> --local-dir <cache>` (falling back
-/// to the legacy `huggingface-cli`) and return the cache directory on success.
+/// Download source artifacts with the explicitly allowed `hf` CLI and
+/// return the revision-scoped cache directory on success.
 ///
-/// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/`.
+/// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/<revision>/`.
 /// The directory is created if missing; existing partial downloads are
-/// resumed by `huggingface-cli`'s own logic. Stdout/stderr stream
-/// through to the operator's terminal so download progress is visible;
-/// on non-zero exit we capture the tail of stderr into the typed
+/// resumed by `hf`'s own logic. On non-zero exit, captured stderr is
+/// returned through the typed
 /// `ConvertError::HfDownload` variant.
-fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::ConvertError> {
+fn download_repo_via_hf_cli(
+    repo: &str,
+    revision: &str,
+) -> Result<PathBuf, crate::convert::ConvertError> {
     use crate::convert::ConvertError;
 
     // Resolve cache root: ~/.cache/hf2q/repos/<sanitized>/.
@@ -344,30 +401,20 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
         .join(".cache")
         .join("hf2q")
         .join("repos")
-        .join(sanitize_repo_for_cache_dir(repo));
+        .join(sanitize_repo_for_cache_dir(repo))
+        .join(revision);
     std::fs::create_dir_all(&cache_dir).map_err(|e| ConvertError::HfDownload {
         repo: repo.to_string(),
         exit_code: None,
         stderr: format!("failed to create cache dir `{}`: {e}", cache_dir.display()),
     })?;
 
-    // Prefer the modern `hf` CLI; the legacy `huggingface-cli` is a
-    // deprecated stub that now exits non-zero. Both accept the same
-    // `download <repo> --local-dir <dir>` interface, so fall back to the
-    // old name only if `hf` is not on PATH.
-    let hf_cli = resolve_hf_cli();
-
     eprintln!(
-        "[hf2q convert --repo] downloading {repo} → {} via {hf_cli}",
+        "[hf2q convert --repo] downloading {repo}@{revision} → {} via hf",
         cache_dir.display()
     );
 
-    let output = std::process::Command::new(hf_cli)
-        .arg("download")
-        .arg(repo)
-        .arg("--local-dir")
-        .arg(&cache_dir)
-        .output();
+    let output = hf_download_command(repo, revision, &cache_dir).output();
 
     let output = match output {
         Ok(o) => o,
@@ -376,7 +423,7 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
                 repo: repo.to_string(),
                 exit_code: None,
                 stderr: format!(
-                    "failed to spawn `{hf_cli}`: {e} \
+                    "failed to spawn `hf`: {e} \
                      (is the HuggingFace CLI on PATH? `pip install -U huggingface_hub[cli]`)"
                 ),
             });
@@ -393,6 +440,30 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
     }
 
     Ok(cache_dir)
+}
+
+fn hf_download_command(
+    repo: &str,
+    revision: &str,
+    cache_dir: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("hf");
+    command
+        .arg("download")
+        .arg(repo)
+        .arg("--revision")
+        .arg(revision)
+        .arg("--local-dir")
+        .arg(cache_dir);
+    for pattern in ["*.safetensors", "*.json", "tokenizer.model", "README.md"] {
+        command.arg("--include").arg(pattern);
+    }
+    for pattern in [
+        "*.gguf", "*.bin", "*.pt", "*.pth", "*.onnx", "*.h5", "*.msgpack",
+    ] {
+        command.arg("--exclude").arg(pattern);
+    }
+    command
 }
 
 fn cmd_gguf_patch(args: cli::GgufPatchArgs) -> Result<(), AppError> {
@@ -558,6 +629,7 @@ mod tests {
         let args = cli::ConvertCliArgs {
             hf_dir: Some(PathBuf::from("/tmp/example")),
             repo: Some("org/repo".to_string()),
+            revision: Some("a".repeat(40)),
             quant: "q8_0".to_string(),
             output: PathBuf::from("/tmp/out.gguf"),
             imatrix: None,
@@ -578,5 +650,79 @@ mod tests {
             other => panic!("expected AppError::Input, got {other:?}"),
         }
     }
-}
 
+    #[test]
+    fn immutable_revision_accepts_and_normalizes_exact_sha() {
+        let upper = "A".repeat(40);
+        assert_eq!(immutable_hf_revision(Some(&upper)).unwrap(), "a".repeat(40));
+    }
+
+    #[test]
+    fn immutable_revision_rejects_missing_branch_and_short_sha() {
+        assert!(matches!(
+            immutable_hf_revision(None),
+            Err(crate::convert::ConvertError::ImmutableRevisionRequired { supplied: None })
+        ));
+        for mutable in ["main", "v1.0", "deadbeef"] {
+            assert!(matches!(
+                immutable_hf_revision(Some(mutable)),
+                Err(crate::convert::ConvertError::ImmutableRevisionRequired { supplied: Some(_) })
+            ));
+        }
+    }
+
+    #[test]
+    fn cmd_convert_rejects_mutable_remote_revision_before_download() {
+        let args = cli::ConvertCliArgs {
+            hf_dir: None,
+            repo: Some("org/model".into()),
+            revision: Some("main".into()),
+            quant: "q8_0".into(),
+            output: PathBuf::from("unused.gguf"),
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mmproj: false,
+        };
+        let err = cmd_convert(args).expect_err("mutable revision must fail before download");
+        assert!(matches!(err, AppError::Input(_)));
+        assert!(err.to_string().contains("40-hex-commit"));
+    }
+
+    #[test]
+    fn cache_slug_cannot_resolve_to_parent_component() {
+        assert_eq!(sanitize_repo_for_cache_dir(".."), "_..");
+        assert_eq!(sanitize_repo_for_cache_dir("org/../../model"), "org__..__..__model");
+    }
+
+    #[test]
+    fn repo_validation_blocks_option_and_path_injection() {
+        for invalid in ["", "--help", "../model", "org//model", "org/model?"] {
+            assert!(validate_hf_repo_id(invalid).is_err(), "accepted {invalid:?}");
+        }
+        validate_hf_repo_id("deepseek-ai/DeepSeek-V4").unwrap();
+    }
+
+    #[test]
+    fn hf_download_command_repeats_source_include_and_quant_exclude_flags() {
+        let command = hf_download_command(
+            "org/model",
+            &"a".repeat(40),
+            std::path::Path::new("/tmp/hf2q-fixture"),
+        );
+        assert_eq!(command.get_program(), "hf");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.iter().filter(|arg| *arg == "--include").count(), 4);
+        assert_eq!(args.iter().filter(|arg| *arg == "--exclude").count(), 7);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--revision" && pair[1] == "a".repeat(40)));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--exclude" && pair[1] == "*.gguf"));
+    }
+}

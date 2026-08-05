@@ -27,12 +27,150 @@
 //! "summary mode" that prints all mismatches and continues, because
 //! corruption is a refuse-to-proceed event.
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path};
 
 use hf_hub::api::sync::ApiBuilder;
 use tracing::{debug, info, warn};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
+
+/// Type-state proof that every local source file was checked and every
+/// index-required weight shard matched a strong HuggingFace LFS identity.
+#[derive(Debug, Clone)]
+pub struct VerifiedSourceManifest {
+    records: Vec<ShardIntegrity>,
+}
+
+impl VerifiedSourceManifest {
+    pub fn records(&self) -> &[ShardIntegrity] {
+        &self.records
+    }
+}
+
+fn validate_relative_source_path(filename: &str) -> Result<(), IntegrityError> {
+    let path = Path::new(filename);
+    if filename.is_empty()
+        || path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(IntegrityError::InvalidSourceManifest {
+            reason: format!("unsafe relative source path `{filename}`"),
+        });
+    }
+    Ok(())
+}
+
+/// Read the exact safetensors shard set consumed by conversion.
+pub fn required_weight_shards(local_dir: &Path) -> Result<Vec<String>, IntegrityError> {
+    let index_path = local_dir.join("model.safetensors.index.json");
+    let mut required = BTreeSet::new();
+    if index_path.exists() {
+        let raw = std::fs::read_to_string(&index_path)?;
+        let index: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|error| IntegrityError::InvalidSourceManifest {
+                reason: format!("parse {}: {error}", index_path.display()),
+            })?;
+        let weight_map = index
+            .get("weight_map")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| IntegrityError::InvalidSourceManifest {
+                reason: format!("{} has no `weight_map` object", index_path.display()),
+            })?;
+        for (tensor, value) in weight_map {
+            let filename = value
+                .as_str()
+                .ok_or_else(|| IntegrityError::InvalidSourceManifest {
+                    reason: format!("weight_map[{tensor:?}] is not a string"),
+                })?;
+            validate_relative_source_path(filename)?;
+            if !filename.ends_with(".safetensors") {
+                return Err(IntegrityError::InvalidSourceManifest {
+                    reason: format!(
+                        "weight_map[{tensor:?}] references non-safetensors `{filename}`"
+                    ),
+                });
+            }
+            required.insert(filename.to_string());
+        }
+    } else {
+        required.insert("model.safetensors".to_string());
+    }
+    if required.is_empty() {
+        return Err(IntegrityError::InvalidSourceManifest {
+            reason: "weight_map does not reference any safetensors shards".into(),
+        });
+    }
+    Ok(required.into_iter().collect())
+}
+
+/// Offline verification seam used by remote conversion and hermetic tests.
+pub fn verify_conversion_manifest(
+    repo: &str,
+    revision: &str,
+    local_dir: &Path,
+    manifest: Vec<ShardIntegrity>,
+) -> Result<VerifiedSourceManifest, IntegrityError> {
+    if !local_dir.join("config.json").is_file() {
+        return Err(IntegrityError::LocalFileMissing {
+            filename: "config.json".into(),
+            path: local_dir.join("config.json").display().to_string(),
+        });
+    }
+    let required = required_weight_shards(local_dir)?;
+    let mut by_name = BTreeMap::new();
+    for record in &manifest {
+        validate_relative_source_path(&record.filename)?;
+        if by_name.insert(record.filename.as_str(), record).is_some() {
+            return Err(IntegrityError::DuplicateManifestEntry {
+                filename: record.filename.clone(),
+            });
+        }
+    }
+    for filename in &required {
+        let record =
+            by_name
+                .get(filename.as_str())
+                .ok_or_else(|| IntegrityError::RequiredShardMissing {
+                    filename: filename.clone(),
+                })?;
+        let strong_lfs_identity = record.is_lfs
+            && record
+                .sha256
+                .as_deref()
+                .is_some_and(|sha| sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+        if !strong_lfs_identity {
+            return Err(IntegrityError::RequiredShardNotLfs {
+                filename: filename.clone(),
+                etag: record.hf_etag.clone(),
+            });
+        }
+    }
+    for record in &manifest {
+        verify_shard(repo, revision, &local_dir.join(&record.filename), record)?;
+    }
+    let mut records = manifest;
+    records.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(VerifiedSourceManifest { records })
+}
+
+/// Fetch the live manifest at an immutable revision and verify it before
+/// remote conversion opens any safetensors shard.
+pub fn verify_remote_conversion_source(
+    repo: &str,
+    revision: &str,
+    local_dir: &Path,
+) -> Result<VerifiedSourceManifest, IntegrityError> {
+    if revision.len() != 40 || !revision.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(IntegrityError::InvalidSourceManifest {
+            reason: format!("remote revision `{revision}` is not an exact 40-hex commit"),
+        });
+    }
+    let manifest = fetch_repo_shard_metadata(repo, revision, local_dir)?;
+    verify_conversion_manifest(repo, revision, local_dir, manifest)
+}
 
 /// Fetch the per-shard integrity manifest for a HuggingFace repo.
 ///
@@ -76,13 +214,13 @@ pub fn fetch_repo_shard_metadata(
     for filename in &local_files {
         let url = repo_handle.url(filename);
         debug!(repo, revision, filename, "Fetching HF metadata for shard");
-        let metadata =
-            api.metadata(&url)
-                .map_err(|e| IntegrityError::MetadataFetchFailed {
-                    repo: repo.to_string(),
-                    revision: revision.to_string(),
-                    reason: format!("HEAD {url}: {e}"),
-                })?;
+        let metadata = api
+            .metadata(&url)
+            .map_err(|e| IntegrityError::MetadataFetchFailed {
+                repo: repo.to_string(),
+                revision: revision.to_string(),
+                reason: format!("HEAD {url}: {e}"),
+            })?;
         out.push(ShardIntegrity::from_metadata(
             filename,
             metadata.etag(),
@@ -175,6 +313,7 @@ pub fn verify_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::sha256::compute_file_sha256;
     use std::fs;
     use tempfile::TempDir;
 
@@ -187,7 +326,17 @@ mod tests {
         p
     }
 
-    // ── enumerate_local_files ────────────────────────────────────────────
+    fn record(tmp: &Path, name: &str, lfs: bool) -> ShardIntegrity {
+        let path = tmp.join(name);
+        let sha = compute_file_sha256(&path).unwrap();
+        ShardIntegrity {
+            filename: name.to_string(),
+            bytes: fs::metadata(path).unwrap().len(),
+            sha256: lfs.then_some(sha.clone()),
+            hf_etag: if lfs { sha } else { "git-etag".into() },
+            is_lfs: lfs,
+        }
+    }
 
     #[test]
     fn enumerate_local_files_returns_relative_paths_sorted() {
@@ -195,9 +344,7 @@ mod tests {
         make_shard_file(tmp.path(), "config.json", b"{}");
         make_shard_file(tmp.path(), "model-00001-of-00002.safetensors", b"a");
         make_shard_file(tmp.path(), "model-00002-of-00002.safetensors", b"b");
-        // Hidden file must be excluded.
         make_shard_file(tmp.path(), ".locks/foo.lock", b"");
-        // Nested file must be included with its relative path.
         make_shard_file(tmp.path(), "subdir/extra.txt", b"x");
 
         let files = enumerate_local_files(tmp.path()).unwrap();
@@ -212,14 +359,108 @@ mod tests {
         );
     }
 
-    // ── verify_repo (offline / fixture path) ────────────────────────────
+    #[test]
+    fn conversion_manifest_verifies_exact_index_shards_offline() {
+        let tmp = TempDir::new().unwrap();
+        make_shard_file(tmp.path(), "config.json", b"{}");
+        make_shard_file(tmp.path(), "model-00001-of-00002.safetensors", b"first");
+        make_shard_file(tmp.path(), "model-00002-of-00002.safetensors", b"second");
+        make_shard_file(
+            tmp.path(),
+            "model.safetensors.index.json",
+            br#"{"weight_map":{"a":"model-00002-of-00002.safetensors","b":"model-00001-of-00002.safetensors"}}"#,
+        );
+        let records = vec![
+            record(tmp.path(), "model-00002-of-00002.safetensors", true),
+            record(tmp.path(), "config.json", false),
+            record(tmp.path(), "model.safetensors.index.json", false),
+            record(tmp.path(), "model-00001-of-00002.safetensors", true),
+        ];
+
+        let verified =
+            verify_conversion_manifest("org/model", &"a".repeat(40), tmp.path(), records)
+                .expect("valid fixture");
+        let names: Vec<_> = verified
+            .records()
+            .iter()
+            .map(|r| r.filename.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "config.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model.safetensors.index.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn conversion_manifest_fails_closed_on_missing_required_shard() {
+        let tmp = TempDir::new().unwrap();
+        make_shard_file(tmp.path(), "config.json", b"{}");
+        make_shard_file(
+            tmp.path(),
+            "model.safetensors.index.json",
+            br#"{"weight_map":{"a":"missing.safetensors"}}"#,
+        );
+        let err = verify_conversion_manifest(
+            "org/model",
+            &"b".repeat(40),
+            tmp.path(),
+            vec![record(tmp.path(), "config.json", false)],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            IntegrityError::RequiredShardMissing { filename } if filename == "missing.safetensors"
+        ));
+    }
+
+    #[test]
+    fn conversion_manifest_requires_strong_lfs_identity_for_weights() {
+        let tmp = TempDir::new().unwrap();
+        make_shard_file(tmp.path(), "config.json", b"{}");
+        make_shard_file(tmp.path(), "model.safetensors", b"weights");
+        let err = verify_conversion_manifest(
+            "org/model",
+            &"c".repeat(40),
+            tmp.path(),
+            vec![
+                record(tmp.path(), "config.json", false),
+                record(tmp.path(), "model.safetensors", false),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            IntegrityError::RequiredShardNotLfs { filename, .. } if filename == "model.safetensors"
+        ));
+    }
+
+    #[test]
+    fn conversion_manifest_rejects_index_traversal() {
+        let tmp = TempDir::new().unwrap();
+        make_shard_file(tmp.path(), "config.json", b"{}");
+        make_shard_file(
+            tmp.path(),
+            "model.safetensors.index.json",
+            br#"{"weight_map":{"a":"../escape.safetensors"}}"#,
+        );
+        let err = required_weight_shards(tmp.path()).unwrap_err();
+        assert!(matches!(err, IntegrityError::InvalidSourceManifest { .. }));
+    }
+
+    #[test]
+    fn remote_verifier_rejects_mutable_revision_before_network() {
+        let tmp = TempDir::new().unwrap();
+        let err = verify_remote_conversion_source("org/model", "main", tmp.path()).unwrap_err();
+        assert!(matches!(err, IntegrityError::InvalidSourceManifest { .. }));
+    }
 
     #[test]
     fn verify_repo_empty_dir_returns_empty_vec_and_warns() {
-        // Local dir exists but is empty → enumerate yields nothing →
-        // network call NEVER fires (we go straight to the empty case).
-        // This is the single execution path that's network-free for
-        // verify_repo, and the only one safe to assert on in unit tests.
         let tmp = TempDir::new().unwrap();
         let shards = verify_repo("org/empty", "main", tmp.path()).unwrap();
         assert!(shards.is_empty());
