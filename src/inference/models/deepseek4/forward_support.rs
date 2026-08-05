@@ -118,6 +118,13 @@ pub(super) fn expert_matmul(
         .checked_mul(k / block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 expert stride overflow")?;
+    let n_tokens = u32::try_from(n_tokens).context("DeepSeek-V4 expert token count exceeds u32")?;
+    let top_k = u32::try_from(top_k).context("DeepSeek-V4 expert top-k exceeds u32")?;
+    let n = u32::try_from(n).context("DeepSeek-V4 expert output width exceeds u32")?;
+    let k = u32::try_from(k).context("DeepSeek-V4 expert input width exceeds u32")?;
+    let n_experts = u32::try_from(experts).context("DeepSeek-V4 expert count exceeds u32")?;
+    let expert_stride =
+        u64::try_from(expert_stride).context("DeepSeek-V4 expert stride exceeds u64")?;
     session.barrier_between(&[input, weight.buffer, safe_ids], &[output]);
     session
         .quantized_matmul_id_ggml(
@@ -128,12 +135,12 @@ pub(super) fn expert_matmul(
             safe_ids,
             output,
             &GgmlQuantizedMatmulIdParams {
-                n_tokens: n_tokens as u32,
-                top_k: top_k as u32,
-                n: n as u32,
-                k: k as u32,
-                n_experts: experts as u32,
-                expert_stride: expert_stride as u64,
+                n_tokens,
+                top_k,
+                n,
+                k,
+                n_experts,
+                expert_stride,
                 ggml_type: weight.ggml_type,
             },
         )

@@ -1,4 +1,4 @@
-//! Exact one-token DeepSeek-V4 layer-0 hash-routed MoE slice.
+//! Exact one-token DeepSeek-V4 hash- and score-routed MoE layers.
 
 use anyhow::{bail, Context, Result};
 use mlx_native::ops::deepseek_hyper_connection::{
@@ -9,8 +9,8 @@ use mlx_native::ops::deepseek_moe_activation::{
     DEEPSEEK_MOE_INTER_DIM,
 };
 use mlx_native::ops::deepseek_moe_routing::{
-    dispatch_deepseek_moe_hash_route, dispatch_deepseek_moe_sanitize_indices, DEEPSEEK_MOE_EXPERTS,
-    DEEPSEEK_MOE_TOP_K,
+    dispatch_deepseek_moe_hash_route, dispatch_deepseek_moe_sanitize_indices,
+    dispatch_deepseek_moe_score_route, DEEPSEEK_MOE_EXPERTS, DEEPSEEK_MOE_TOP_K,
 };
 use mlx_native::{DType, MlxBuffer};
 
@@ -27,6 +27,26 @@ impl Deepseek4Model {
         state: &MlxBuffer,
         token_id: u32,
     ) -> Result<MlxBuffer> {
+        self.forward_ffn_one(state, token_id, 0)
+    }
+
+    /// Run one verifier FFN layer for one token.
+    ///
+    /// Layers in the checkpoint hash prefix preserve the stored expert order;
+    /// later layers select with the learned bias and weight with unbiased
+    /// sqrt-softplus scores.
+    pub(super) fn forward_ffn_one(
+        &mut self,
+        state: &MlxBuffer,
+        token_id: u32,
+        layer: usize,
+    ) -> Result<MlxBuffer> {
+        if layer >= self.cfg.num_hidden_layers as usize {
+            bail!(
+                "DeepSeek-V4 FFN layer index {layer} is outside 0..{}",
+                self.cfg.num_hidden_layers
+            );
+        }
         let hidden = self.cfg.hidden_size as usize;
         let hc = self.cfg.hyper_connection_count as usize;
         let experts = self.cfg.num_experts as usize;
@@ -39,12 +59,12 @@ impl Deepseek4Model {
             || self.cfg.hash_layer_count == 0
         {
             bail!(
-                "DeepSeek-V4 native layer-0 MoE requires hidden/expert/top-k/inter/hash = 4096/256/6/2048/enabled"
+                "DeepSeek-V4 native MoE requires hidden/expert/top-k/inter/hash = 4096/256/6/2048/enabled"
             );
         }
         if state.dtype() != DType::F32 || state.shape() != [1, hc, hidden] {
             bail!(
-                "DeepSeek-V4 layer-0 FFN state must be F32 [1, {hc}, {hidden}], got {} {:?}",
+                "DeepSeek-V4 layer {layer} FFN state must be F32 [1, {hc}, {hidden}], got {} {:?}",
                 state.dtype(),
                 state.shape()
             );
@@ -52,18 +72,52 @@ impl Deepseek4Model {
 
         let hc_hidden = hc * hidden;
         let mix_width = (2 + hc) * hc;
-        let hc_fn = self.weights.raw_matrix_ref("blk.0.hc_ffn_fn.weight")?;
-        let hc_base = self.weights.f32_state("blk.0.hc_ffn_base.weight")?;
-        let hc_scale = self.weights.f32_state("blk.0.hc_ffn_scale.weight")?;
-        let ffn_norm_weight = self.weights.f32_state("blk.0.ffn_norm.weight")?;
-        let gate_weight = self.weights.raw_matrix_ref("blk.0.ffn_gate_inp.weight")?;
-        let lookup = self.weights.i32_lookup("blk.0.ffn_gate_tid2eid.weight")?;
-        let gate_experts = self.weights.raw_matrix_ref("blk.0.ffn_gate_exps.weight")?;
-        let up_experts = self.weights.raw_matrix_ref("blk.0.ffn_up_exps.weight")?;
-        let down_experts = self.weights.raw_matrix_ref("blk.0.ffn_down_exps.weight")?;
-        let gate_shared = self.weights.raw_matrix_ref("blk.0.ffn_gate_shexp.weight")?;
-        let up_shared = self.weights.raw_matrix_ref("blk.0.ffn_up_shexp.weight")?;
-        let down_shared = self.weights.raw_matrix_ref("blk.0.ffn_down_shexp.weight")?;
+        let prefix = format!("blk.{layer}");
+        let hc_fn = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.hc_ffn_fn.weight"))?;
+        let hc_base = self
+            .weights
+            .f32_state(&format!("{prefix}.hc_ffn_base.weight"))?;
+        let hc_scale = self
+            .weights
+            .f32_state(&format!("{prefix}.hc_ffn_scale.weight"))?;
+        let ffn_norm_weight = self
+            .weights
+            .f32_state(&format!("{prefix}.ffn_norm.weight"))?;
+        let gate_weight = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_gate_inp.weight"))?;
+        let lookup = (layer < self.cfg.hash_layer_count as usize)
+            .then(|| {
+                self.weights
+                    .i32_lookup(&format!("{prefix}.ffn_gate_tid2eid.weight"))
+            })
+            .transpose()?;
+        let selection_bias = (layer >= self.cfg.hash_layer_count as usize)
+            .then(|| {
+                self.weights
+                    .f32_state(&format!("{prefix}.exp_probs_b.bias"))
+            })
+            .transpose()?;
+        let gate_experts = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_gate_exps.weight"))?;
+        let up_experts = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_up_exps.weight"))?;
+        let down_experts = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_down_exps.weight"))?;
+        let gate_shared = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_gate_shexp.weight"))?;
+        let up_shared = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_up_shexp.weight"))?;
+        let down_shared = self
+            .weights
+            .raw_matrix_ref(&format!("{prefix}.ffn_down_shexp.weight"))?;
 
         let device = self.ctx.device().clone();
         let state_flat = state.with_shape(vec![1, hc_hidden])?;
@@ -95,7 +149,9 @@ impl Deepseek4Model {
             i32::try_from(token_id).context("DeepSeek-V4 token ID exceeds signed routing range")?;
 
         let (executor, registry) = self.ctx.split();
-        let mut session = executor.begin().context("begin DeepSeek-V4 layer-0 FFN")?;
+        let mut session = executor
+            .begin()
+            .with_context(|| format!("begin DeepSeek-V4 layer {layer} FFN"))?;
         session.barrier_between(&[&state_flat], &[&state_norm]);
         session.rms_norm_no_scale_f32(
             registry,
@@ -165,19 +221,35 @@ impl Deepseek4Model {
             hidden,
             "MoE gate",
         )?;
-        session.barrier_between(&[&logits, &token_ids, lookup], &[&indices, &route_weights]);
-        dispatch_deepseek_moe_hash_route(
-            session.encoder_mut(),
-            registry,
-            &device,
-            &logits,
-            &token_ids,
-            lookup,
-            &indices,
-            &route_weights,
-            1,
-            self.cfg.vocab_size as usize,
-        )?;
+        if let Some(lookup) = lookup {
+            session.barrier_between(&[&logits, &token_ids, lookup], &[&indices, &route_weights]);
+            dispatch_deepseek_moe_hash_route(
+                session.encoder_mut(),
+                registry,
+                &device,
+                &logits,
+                &token_ids,
+                lookup,
+                &indices,
+                &route_weights,
+                1,
+                self.cfg.vocab_size as usize,
+            )?;
+        } else if let Some(selection_bias) = selection_bias {
+            session.barrier_between(&[&logits, selection_bias], &[&indices, &route_weights]);
+            dispatch_deepseek_moe_score_route(
+                session.encoder_mut(),
+                registry,
+                &device,
+                &logits,
+                selection_bias,
+                &indices,
+                &route_weights,
+                1,
+            )?;
+        } else {
+            bail!("DeepSeek-V4 FFN layer {layer} has no routing source");
+        }
         session.barrier_between(&[&indices], &[&safe_indices]);
         dispatch_deepseek_moe_sanitize_indices(
             session.encoder_mut(),
@@ -321,7 +393,7 @@ impl Deepseek4Model {
         )?;
         session
             .finish()
-            .context("execute DeepSeek-V4 layer-0 FFN")?;
+            .with_context(|| format!("execute DeepSeek-V4 layer {layer} FFN"))?;
         Ok(output_state)
     }
 }
