@@ -1,0 +1,327 @@
+//! Exact one-token DeepSeek-V4 layer-0 hash-routed MoE slice.
+
+use anyhow::{bail, Context, Result};
+use mlx_native::ops::deepseek_hyper_connection::{
+    dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn,
+};
+use mlx_native::ops::deepseek_moe_activation::{
+    dispatch_deepseek_moe_swiglu, dispatch_deepseek_moe_weighted_reduce, DEEPSEEK_MOE_HIDDEN_DIM,
+    DEEPSEEK_MOE_INTER_DIM,
+};
+use mlx_native::ops::deepseek_moe_routing::{
+    dispatch_deepseek_moe_hash_route, dispatch_deepseek_moe_sanitize_indices, DEEPSEEK_MOE_EXPERTS,
+    DEEPSEEK_MOE_TOP_K,
+};
+use mlx_native::{DType, MlxBuffer};
+
+use super::forward_support::{alloc, expert_matmul, raw_matmul, rms_params};
+use super::Deepseek4Model;
+
+impl Deepseek4Model {
+    /// Run layer-0 FFN for one token with checkpoint hash routing.
+    ///
+    /// The projection, safe-ID bridge, six routed experts, shared expert,
+    /// weighted reduction, and HC-post all share one Metal command buffer.
+    pub fn forward_layer0_ffn_one(
+        &mut self,
+        state: &MlxBuffer,
+        token_id: u32,
+    ) -> Result<MlxBuffer> {
+        let hidden = self.cfg.hidden_size as usize;
+        let hc = self.cfg.hyper_connection_count as usize;
+        let experts = self.cfg.num_experts as usize;
+        let top_k = self.cfg.num_experts_per_tok as usize;
+        let inter = self.cfg.expert_intermediate_size as usize;
+        if hidden != DEEPSEEK_MOE_HIDDEN_DIM
+            || experts != DEEPSEEK_MOE_EXPERTS
+            || top_k != DEEPSEEK_MOE_TOP_K
+            || inter != DEEPSEEK_MOE_INTER_DIM
+            || self.cfg.hash_layer_count == 0
+        {
+            bail!(
+                "DeepSeek-V4 native layer-0 MoE requires hidden/expert/top-k/inter/hash = 4096/256/6/2048/enabled"
+            );
+        }
+        if state.dtype() != DType::F32 || state.shape() != [1, hc, hidden] {
+            bail!(
+                "DeepSeek-V4 layer-0 FFN state must be F32 [1, {hc}, {hidden}], got {} {:?}",
+                state.dtype(),
+                state.shape()
+            );
+        }
+
+        let hc_hidden = hc * hidden;
+        let mix_width = (2 + hc) * hc;
+        let hc_fn = self.weights.raw_matrix_ref("blk.0.hc_ffn_fn.weight")?;
+        let hc_base = self.weights.f32_state("blk.0.hc_ffn_base.weight")?;
+        let hc_scale = self.weights.f32_state("blk.0.hc_ffn_scale.weight")?;
+        let ffn_norm_weight = self.weights.f32_state("blk.0.ffn_norm.weight")?;
+        let gate_weight = self.weights.raw_matrix_ref("blk.0.ffn_gate_inp.weight")?;
+        let lookup = self.weights.i32_lookup("blk.0.ffn_gate_tid2eid.weight")?;
+        let gate_experts = self.weights.raw_matrix_ref("blk.0.ffn_gate_exps.weight")?;
+        let up_experts = self.weights.raw_matrix_ref("blk.0.ffn_up_exps.weight")?;
+        let down_experts = self.weights.raw_matrix_ref("blk.0.ffn_down_exps.weight")?;
+        let gate_shared = self.weights.raw_matrix_ref("blk.0.ffn_gate_shexp.weight")?;
+        let up_shared = self.weights.raw_matrix_ref("blk.0.ffn_up_shexp.weight")?;
+        let down_shared = self.weights.raw_matrix_ref("blk.0.ffn_down_shexp.weight")?;
+
+        let device = self.ctx.device().clone();
+        let state_flat = state.with_shape(vec![1, hc_hidden])?;
+        let state_norm = alloc(&device, DType::F32, vec![1, hc_hidden], "FFN HC norm")?;
+        let mixes = alloc(&device, DType::F32, vec![1, mix_width], "FFN HC mixes")?;
+        let pre = alloc(&device, DType::F32, vec![1, hc], "FFN HC pre")?;
+        let post = alloc(&device, DType::F32, vec![1, hc], "FFN HC post")?;
+        let comb = alloc(&device, DType::F32, vec![1, hc, hc], "FFN HC combination")?;
+        let ffn_input = alloc(&device, DType::F32, vec![1, hidden], "FFN input")?;
+        let ffn_norm = alloc(&device, DType::F32, vec![1, hidden], "FFN norm")?;
+        let logits = alloc(&device, DType::F32, vec![1, experts], "MoE logits")?;
+        let indices = alloc(&device, DType::I32, vec![1, top_k], "MoE indices")?;
+        let safe_indices = alloc(&device, DType::U32, vec![1, top_k], "safe MoE indices")?;
+        let route_weights = alloc(&device, DType::F32, vec![1, top_k], "MoE weights")?;
+        let routed_gate = alloc(&device, DType::F32, vec![top_k, inter], "routed gate")?;
+        let routed_up = alloc(&device, DType::F32, vec![top_k, inter], "routed up")?;
+        let routed_activated = alloc(&device, DType::F32, vec![top_k, inter], "routed activation")?;
+        let routed_down = alloc(&device, DType::F32, vec![1, top_k, hidden], "routed output")?;
+        let shared_gate = alloc(&device, DType::F32, vec![1, inter], "shared gate")?;
+        let shared_up = alloc(&device, DType::F32, vec![1, inter], "shared up")?;
+        let shared_activated = alloc(&device, DType::F32, vec![1, inter], "shared activation")?;
+        let shared_down = alloc(&device, DType::F32, vec![1, hidden], "shared output")?;
+        let ffn_output = alloc(&device, DType::F32, vec![1, hidden], "FFN output")?;
+        let output_state = alloc(&device, DType::F32, vec![1, hc, hidden], "FFN HC output")?;
+        let hc_params = rms_params(&device, self.cfg.rms_norm_eps, hc_hidden, "FFN HC params")?;
+        let hidden_params = rms_params(&device, self.cfg.rms_norm_eps, hidden, "FFN norm params")?;
+        let mut token_ids = alloc(&device, DType::I32, vec![1], "MoE token ID")?;
+        token_ids.as_mut_slice::<i32>()?[0] =
+            i32::try_from(token_id).context("DeepSeek-V4 token ID exceeds signed routing range")?;
+
+        let (executor, registry) = self.ctx.split();
+        let mut session = executor.begin().context("begin DeepSeek-V4 layer-0 FFN")?;
+        session.barrier_between(&[&state_flat], &[&state_norm]);
+        session.rms_norm_no_scale_f32(
+            registry,
+            device.metal_device(),
+            &state_flat,
+            &state_norm,
+            &hc_params,
+            1,
+            hc_hidden as u32,
+        )?;
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &state_norm,
+            &hc_fn,
+            &mixes,
+            1,
+            mix_width,
+            hc_hidden,
+            "HC FFN function",
+        )?;
+        session.barrier_between(&[&mixes, hc_scale, hc_base], &[&pre, &post, &comb]);
+        dispatch_hc_split_sinkhorn(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &mixes,
+            hc_scale,
+            hc_base,
+            &pre,
+            &post,
+            &comb,
+            1,
+        )?;
+        session.barrier_between(&[state, &pre], &[&ffn_input]);
+        dispatch_hc_pre(
+            session.encoder_mut(),
+            registry,
+            &device,
+            state,
+            &pre,
+            &ffn_input,
+            1,
+            hidden as u32,
+        )?;
+        session.barrier_between(&[&ffn_input, ffn_norm_weight], &[&ffn_norm]);
+        session.rms_norm(
+            registry,
+            device.metal_device(),
+            &ffn_input,
+            ffn_norm_weight,
+            &ffn_norm,
+            &hidden_params,
+            1,
+            hidden as u32,
+        )?;
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &ffn_norm,
+            &gate_weight,
+            &logits,
+            1,
+            experts,
+            hidden,
+            "MoE gate",
+        )?;
+        session.barrier_between(&[&logits, &token_ids, lookup], &[&indices, &route_weights]);
+        dispatch_deepseek_moe_hash_route(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &logits,
+            &token_ids,
+            lookup,
+            &indices,
+            &route_weights,
+            1,
+            self.cfg.vocab_size as usize,
+        )?;
+        session.barrier_between(&[&indices], &[&safe_indices]);
+        dispatch_deepseek_moe_sanitize_indices(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &indices,
+            &safe_indices,
+            1,
+        )?;
+        expert_matmul(
+            &mut session,
+            registry,
+            &device,
+            &ffn_norm,
+            &gate_experts,
+            &safe_indices,
+            &routed_gate,
+            1,
+            top_k,
+            experts,
+            inter,
+            hidden,
+            "routed gate",
+        )?;
+        expert_matmul(
+            &mut session,
+            registry,
+            &device,
+            &ffn_norm,
+            &up_experts,
+            &safe_indices,
+            &routed_up,
+            1,
+            top_k,
+            experts,
+            inter,
+            hidden,
+            "routed up",
+        )?;
+        session.barrier_between(&[&routed_gate, &routed_up], &[&routed_activated]);
+        dispatch_deepseek_moe_swiglu(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &routed_gate,
+            &routed_up,
+            None,
+            &routed_activated,
+            top_k,
+        )?;
+        expert_matmul(
+            &mut session,
+            registry,
+            &device,
+            &routed_activated,
+            &down_experts,
+            &safe_indices,
+            &routed_down,
+            top_k,
+            1,
+            experts,
+            hidden,
+            inter,
+            "routed down",
+        )?;
+
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &ffn_norm,
+            &gate_shared,
+            &shared_gate,
+            1,
+            inter,
+            hidden,
+            "shared gate",
+        )?;
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &ffn_norm,
+            &up_shared,
+            &shared_up,
+            1,
+            inter,
+            hidden,
+            "shared up",
+        )?;
+        session.barrier_between(&[&shared_gate, &shared_up], &[&shared_activated]);
+        dispatch_deepseek_moe_swiglu(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &shared_gate,
+            &shared_up,
+            None,
+            &shared_activated,
+            1,
+        )?;
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &shared_activated,
+            &down_shared,
+            &shared_down,
+            1,
+            hidden,
+            inter,
+            "shared down",
+        )?;
+        session.barrier_between(
+            &[&indices, &route_weights, &routed_down, &shared_down],
+            &[&ffn_output],
+        );
+        dispatch_deepseek_moe_weighted_reduce(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &indices,
+            &route_weights,
+            &routed_down,
+            &shared_down,
+            &ffn_output,
+            1,
+        )?;
+        session.barrier_between(&[&ffn_output, state, &post, &comb], &[&output_state]);
+        dispatch_hc_post(
+            session.encoder_mut(),
+            registry,
+            &device,
+            &ffn_output,
+            state,
+            &post,
+            &comb,
+            &output_state,
+            1,
+            hidden as u32,
+        )?;
+        session
+            .finish()
+            .context("execute DeepSeek-V4 layer-0 FFN")?;
+        Ok(output_state)
+    }
+}

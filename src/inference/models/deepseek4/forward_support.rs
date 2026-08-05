@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
+use mlx_native::ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::residency::RawMatrixRef;
@@ -78,6 +79,61 @@ pub(super) fn raw_matmul(
                 m: u32::try_from(m).context("DeepSeek-V4 matmul rows exceed u32")?,
                 n: u32::try_from(n).context("DeepSeek-V4 matmul outputs exceed u32")?,
                 k: u32::try_from(k).context("DeepSeek-V4 matmul input exceeds u32")?,
+                ggml_type: weight.ggml_type,
+            },
+        )
+        .with_context(|| format!("encode DeepSeek-V4 {label}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn expert_matmul(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &RawMatrixRef<'_>,
+    safe_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    n_tokens: usize,
+    top_k: usize,
+    experts: usize,
+    n: usize,
+    k: usize,
+    label: &str,
+) -> Result<()> {
+    if weight.shape != [experts, n, k] {
+        bail!(
+            "DeepSeek-V4 {label} shape drift: got {:?}, expected [{experts}, {n}, {k}]",
+            weight.shape
+        );
+    }
+    if safe_ids.dtype() != DType::U32 {
+        bail!("DeepSeek-V4 {label} expert IDs must be sanitized U32");
+    }
+    let block = weight.ggml_type.block_values() as usize;
+    if k % block != 0 {
+        bail!("DeepSeek-V4 {label} input dimension is not quant-block aligned");
+    }
+    let expert_stride = n
+        .checked_mul(k / block)
+        .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
+        .context("DeepSeek-V4 expert stride overflow")?;
+    session.barrier_between(&[input, weight.buffer, safe_ids], &[output]);
+    session
+        .quantized_matmul_id_ggml(
+            registry,
+            device,
+            input,
+            weight.buffer,
+            safe_ids,
+            output,
+            &GgmlQuantizedMatmulIdParams {
+                n_tokens: n_tokens as u32,
+                top_k: top_k as u32,
+                n: n as u32,
+                k: k as u32,
+                n_experts: experts as u32,
+                expert_stride: expert_stride as u64,
                 ggml_type: weight.ggml_type,
             },
         )
