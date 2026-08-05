@@ -51,6 +51,7 @@ fn native_output_head_produces_finite_vocab_logits_and_rejects_shape_drift() {
         .unwrap()
         .iter()
         .all(|value| value.is_finite()));
+    assert_eq!(model.greedy_token(&logits).unwrap(), 0);
 
     let wrong = model
         .ctx
@@ -58,4 +59,5 @@ fn native_output_head_produces_finite_vocab_logits_and_rejects_shape_drift() {
         .alloc_buffer(8 * 4, DType::F32, vec![1, 2, 4])
         .unwrap();
     assert!(model.forward_logits(&wrong).is_err());
+    assert!(model.greedy_token(&wrong).is_err());
 }

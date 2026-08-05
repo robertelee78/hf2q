@@ -253,15 +253,16 @@ pub(super) fn encode_ratio_four_indexer(
         },
     )?;
     if let Some(slot) = layer_step.indexer_write_slot {
+        let rope_input = arena.compressor_output.with_shape(vec![1, 1, 1, dim])?;
         session.barrier_between(
-            &[&arena.compressor_output, compressed_positions, frequencies],
+            &[&rope_input, compressed_positions, frequencies],
             &[&arena.compressor_rope],
         );
         dispatch_deepseek_tail_rope_bf16(
             session.encoder_mut(),
             registry,
             device,
-            &arena.compressor_output,
+            &rope_input,
             compressed_positions,
             frequencies,
             &arena.compressor_rope,

@@ -8,6 +8,7 @@ pub mod auto_pipeline;
 #[allow(dead_code)]
 pub mod cache;
 pub mod config;
+mod deepseek4_cli;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
 pub mod forward_mlx_shared;
@@ -873,12 +874,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 return cmd_generate_qwen35(args, gguf_peek);
             }
             if arch == "deepseek4" {
-                anyhow::bail!(
-                    "DeepSeek-V4 GGUF is recognized, but the dedicated Rust/Metal generate \
-                     path is not available in this build; refusing to route it through Gemma. \
-                     Model: {}",
-                    model_path.display(),
-                );
+                tracing::info!("Detected architecture 'deepseek4' → routing to native path");
+                return deepseek4_cli::cmd_generate(args, gguf_peek);
             }
             if arch != "gemma4" {
                 anyhow::bail!(

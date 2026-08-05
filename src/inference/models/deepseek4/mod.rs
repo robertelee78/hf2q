@@ -26,6 +26,7 @@ mod output_forward;
 pub mod residency;
 pub mod rope;
 pub mod routing;
+pub mod tokenizer;
 mod verifier_forward;
 pub mod weights;
 

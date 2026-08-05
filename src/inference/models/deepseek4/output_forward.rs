@@ -1,6 +1,7 @@
 //! Native DeepSeek-V4 Hyper-Connection output head and vocabulary logits.
 
 use anyhow::{bail, Context, Result};
+use mlx_native::ops::argmax::dispatch_argmax_f32;
 use mlx_native::ops::deepseek_hyper_connection::{dispatch_hc_head_weights, dispatch_hc_pre};
 use mlx_native::{DType, MlxBuffer};
 
@@ -157,5 +158,43 @@ impl Deepseek4Model {
             .finish()
             .context("execute DeepSeek-V4 output head")?;
         Ok(logits)
+    }
+
+    /// Select the first maximum from one vocabulary-logit row on Metal.
+    pub fn greedy_token(&mut self, logits: &MlxBuffer) -> Result<u32> {
+        let vocab = self.cfg.vocab_size as usize;
+        if logits.dtype() != DType::F32 || logits.shape() != [1, vocab] {
+            bail!(
+                "DeepSeek-V4 greedy logits must be F32 [1, {vocab}], got {} {:?}",
+                logits.dtype(),
+                logits.shape()
+            );
+        }
+        let vocab_u32 = u32::try_from(vocab).context("DeepSeek-V4 vocabulary size exceeds u32")?;
+        let device = self.ctx.device().clone();
+        let out_index = alloc(&device, DType::U32, vec![1], "greedy token index")?;
+        let out_value = alloc(&device, DType::F32, vec![1], "greedy token value")?;
+        let mut params = alloc(&device, DType::U32, vec![1], "greedy token params")?;
+        params.as_mut_slice::<u32>()?[0] = vocab_u32;
+
+        let (executor, registry) = self.ctx.split();
+        let mut session = executor
+            .begin()
+            .context("begin DeepSeek-V4 greedy argmax")?;
+        session.barrier_between(&[logits, &params], &[&out_index, &out_value]);
+        dispatch_argmax_f32(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            logits,
+            &out_index,
+            &out_value,
+            &params,
+            vocab_u32,
+        )?;
+        session
+            .finish()
+            .context("execute DeepSeek-V4 greedy argmax")?;
+        Ok(out_index.as_slice::<u32>()?[0])
     }
 }

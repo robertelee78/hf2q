@@ -51,9 +51,14 @@ fn official_artifact_executes_native_verifier_and_logits() {
     assert_eq!(logits.shape(), &[1, 129_280]);
     assert!(logit_values.iter().all(|value| value.is_finite()));
     assert!(logit_values.iter().any(|value| *value != 0.0));
+    let greedy = model
+        .greedy_token(&logits)
+        .expect("select greedy token on Metal");
+    assert!(greedy < 129_280);
     eprintln!(
-        "executed all verifier layers from {} with {} resident weight bytes",
+        "executed all verifier layers from {} with {} resident weight bytes; greedy token {}",
         path.display(),
-        model.weights.resident_bytes()
+        model.weights.resident_bytes(),
+        greedy
     );
 }

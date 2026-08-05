@@ -154,15 +154,16 @@ pub(super) fn encode_main_compressor(
     let Some(slot) = layer_step.compressed_write_slot else {
         return Ok(());
     };
+    let rope_input = arena.output.with_shape(vec![1, 1, 1, dim])?;
     session.barrier_between(
-        &[&arena.output, compressed_positions, frequencies],
+        &[&rope_input, compressed_positions, frequencies],
         &[&arena.rope],
     );
     dispatch_deepseek_tail_rope_bf16(
         session.encoder_mut(),
         registry,
         device,
-        &arena.output,
+        &rope_input,
         compressed_positions,
         frequencies,
         &arena.rope,
