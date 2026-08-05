@@ -58,6 +58,20 @@ pub enum IntegrityError {
         reason: String,
     },
 
+    #[error("Invalid remote conversion source manifest: {reason}")]
+    InvalidSourceManifest { reason: String },
+
+    #[error("Required source shard '{filename}' is absent from the HuggingFace manifest")]
+    RequiredShardMissing { filename: String },
+
+    #[error(
+        "Required source shard '{filename}' has no HuggingFace LFS SHA-256 identity (etag: {etag})"
+    )]
+    RequiredShardNotLfs { filename: String, etag: String },
+
+    #[error("Duplicate source-manifest entry for '{filename}'")]
+    DuplicateManifestEntry { filename: String },
+
     #[error(
         "Local file missing during integrity check: shard '{filename}' \
          expected at {path}"

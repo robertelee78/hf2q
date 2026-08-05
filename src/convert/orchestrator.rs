@@ -576,6 +576,10 @@ struct ActiveTensorChunks {
     total_elements: usize,
     chunk_count: usize,
     max_chunk_elements: usize,
+    max_input_f32_bytes: usize,
+    max_f16_roundtrip_f32_bytes: usize,
+    max_quantized_payload_bytes: usize,
+    max_working_vec_bytes: usize,
     imatrix: Option<Vec<f32>>,
 }
 
@@ -585,6 +589,10 @@ pub struct TensorChunkStats {
     pub total_elements: usize,
     pub chunk_count: usize,
     pub max_chunk_elements: usize,
+    pub max_input_f32_bytes: usize,
+    pub max_f16_roundtrip_f32_bytes: usize,
+    pub max_quantized_payload_bytes: usize,
+    pub max_working_vec_bytes: usize,
 }
 
 impl<W: Write + Seek> StreamingWriter<W> {
@@ -730,6 +738,10 @@ impl<W: Write + Seek> StreamingWriter<W> {
             total_elements: 0,
             chunk_count: 0,
             max_chunk_elements: 0,
+            max_input_f32_bytes: 0,
+            max_f16_roundtrip_f32_bytes: 0,
+            max_quantized_payload_bytes: 0,
+            max_working_vec_bytes: 0,
             imatrix,
         });
         Ok(())
@@ -830,6 +842,25 @@ impl<W: Write + Seek> StreamingWriter<W> {
             }
         };
 
+        let input_f32_bytes = data.len().checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+            OrchestratorError::StreamProtocol(format!(
+                "stream_tensor_chunk: tensor `{}` input byte count overflow",
+                p.name
+            ))
+        })?;
+        let quantized = !matches!(p.ggml_type, GgmlType::F16 | GgmlType::F32 | GgmlType::I32);
+        let f16_roundtrip_f32_bytes = if quantized { input_f32_bytes } else { 0 };
+        let quantized_payload_bytes = if quantized { payload.len() } else { 0 };
+        let working_vec_bytes = input_f32_bytes
+            .checked_add(f16_roundtrip_f32_bytes)
+            .and_then(|bytes| bytes.checked_add(payload.len()))
+            .ok_or_else(|| {
+                OrchestratorError::StreamProtocol(format!(
+                    "stream_tensor_chunk: tensor `{}` working byte count overflow",
+                    p.name
+                ))
+            })?;
+
         self.writer
             .write_tensor_payload_chunk(tensor_idx, &payload)?;
         let active = self
@@ -839,6 +870,14 @@ impl<W: Write + Seek> StreamingWriter<W> {
         active.total_elements = total_elements;
         active.chunk_count += 1;
         active.max_chunk_elements = active.max_chunk_elements.max(data.len());
+        active.max_input_f32_bytes = active.max_input_f32_bytes.max(input_f32_bytes);
+        active.max_f16_roundtrip_f32_bytes = active
+            .max_f16_roundtrip_f32_bytes
+            .max(f16_roundtrip_f32_bytes);
+        active.max_quantized_payload_bytes = active
+            .max_quantized_payload_bytes
+            .max(quantized_payload_bytes);
+        active.max_working_vec_bytes = active.max_working_vec_bytes.max(working_vec_bytes);
         Ok(())
     }
 
@@ -874,6 +913,10 @@ impl<W: Write + Seek> StreamingWriter<W> {
             total_elements: active.total_elements,
             chunk_count: active.chunk_count,
             max_chunk_elements: active.max_chunk_elements,
+            max_input_f32_bytes: active.max_input_f32_bytes,
+            max_f16_roundtrip_f32_bytes: active.max_f16_roundtrip_f32_bytes,
+            max_quantized_payload_bytes: active.max_quantized_payload_bytes,
+            max_working_vec_bytes: active.max_working_vec_bytes,
         })
     }
 
@@ -883,7 +926,7 @@ impl<W: Write + Seek> StreamingWriter<W> {
         &mut self,
         tensor_idx: usize,
         data: &[f32],
-    ) -> Result<(), OrchestratorError> {
+    ) -> Result<TensorChunkStats, OrchestratorError> {
         self.validate_next_tensor(tensor_idx, "stream_tensor")?;
 
         let p = &self.planned[tensor_idx];
@@ -899,8 +942,7 @@ impl<W: Write + Seek> StreamingWriter<W> {
         if !data.is_empty() {
             self.stream_tensor_chunk(tensor_idx, data)?;
         }
-        self.finish_tensor_chunks(tensor_idx)?;
-        Ok(())
+        self.finish_tensor_chunks(tensor_idx)
     }
 
     /// Seek-back to fill tensor offsets and flush. Must be called after
@@ -1466,6 +1508,18 @@ mod tests {
             let stats = sw.finish_tensor_chunks(0).unwrap();
             assert_eq!(stats.chunk_count, experts);
             assert_eq!(stats.max_chunk_elements, per_expert);
+            assert_eq!(stats.max_input_f32_bytes, per_expert * 4);
+            assert_eq!(stats.max_f16_roundtrip_f32_bytes, per_expert * 4);
+            assert_eq!(
+                stats.max_quantized_payload_bytes,
+                rows_per_expert * GgmlType::Q2_K.row_size(n_per_row)
+            );
+            assert_eq!(
+                stats.max_working_vec_bytes,
+                stats.max_input_f32_bytes
+                    + stats.max_f16_roundtrip_f32_bytes
+                    + stats.max_quantized_payload_bytes
+            );
             sw.finalize().unwrap();
         }
 

@@ -504,6 +504,8 @@ pub fn compute_imatrix(
         // The inner convert is always text-decoder; mmproj sidecar
         // export is operator-initiated via the top-level CLI flag.
         mmproj: false,
+        // Inner imatrix conversion consumes the already-local source.
+        remote_source: None,
     };
     crate::convert::cli_driver::run_convert(convert_args).map_err(|e| {
         ImatrixError::ConvertFailed {

@@ -160,35 +160,30 @@ pub struct ConvertCliArgs {
     /// HuggingFace model directory (must contain `config.json` plus
     /// either `model.safetensors` or `model.safetensors.index.json` +
     /// shards). Optional: when omitted, `--repo <hf_repo>` must be
-    /// supplied so the driver can shell out to `hf download`
+    /// supplied so the driver can invoke `hf download`
     /// before the convert proceeds. Mutually exclusive with `--repo`.
     #[arg(conflicts_with = "repo")]
     pub hf_dir: Option<PathBuf>,
 
-    /// Auto-download a HuggingFace repo via `hf download`
+    /// Auto-download HuggingFace source files via `hf download`
     /// before converting. The repo is cached at
-    /// `~/.cache/hf2q/repos/<sanitized_repo>/` (forward slashes replaced
-    /// with `__`); a subsequent `--repo <same>` reuses the cached
-    /// directory. Mutually exclusive with the positional `<hf_dir>`;
+    /// `~/.cache/hf2q/repos/<sanitized_repo>/<revision>/` (forward slashes
+    /// replaced with `__`); a subsequent request for the same repo and
+    /// revision reuses the cached directory. Mutually exclusive with the
+    /// positional `<hf_dir>`;
     /// exactly one of the two must be supplied.
     ///
     /// Operator must have `hf` on PATH and (for gated
     /// repos) a valid token at `~/.huggingface/token` or
     /// `HF_TOKEN` env. Partial downloads resume on re-invocation per
-    /// the HF CLI's own logic.
+    /// `hf`'s own logic.
     #[arg(long, conflicts_with = "hf_dir")]
     pub repo: Option<String>,
 
-    /// Immutable Hugging Face revision to download (normally a 40-character
-    /// commit SHA). Passed directly as the `hf download --revision` argument
-    /// and included in the local cache path. Requires `--repo` so a local
-    /// directory can never be mislabeled as a pinned remote source.
-    #[arg(
-        long,
-        requires = "repo",
-        conflicts_with = "hf_dir",
-        value_name = "REVISION"
-    )]
+    /// Exact immutable HuggingFace commit for `--repo` conversion.
+    /// Branches, tags, and abbreviated SHAs are rejected so integrity
+    /// verification and the success receipt bind one stable source.
+    #[arg(long, requires = "repo", conflicts_with = "hf_dir", value_name = "REVISION")]
     pub revision: Option<String>,
 
     /// File-type to quantize to. Accepts:

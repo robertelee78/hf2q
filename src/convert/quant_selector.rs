@@ -124,6 +124,15 @@ pub enum QuantSelectorError {
 }
 
 impl QuantSelector {
+    /// Canonical spelling persisted in conversion receipts.
+    pub fn receipt_name(&self) -> String {
+        match self {
+            QuantSelector::Standard(ftype) => ftype.name().to_string(),
+            QuantSelector::Apex(tier) => format!("apex-{}", tier.cli_name()),
+            QuantSelector::ApexCustom(path) => format!("apex-custom:{}", path.display()),
+        }
+    }
+
     /// Parse a `--quant <name>` string into the matching selector.
     ///
     /// Resolution order:

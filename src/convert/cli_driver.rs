@@ -42,6 +42,10 @@ use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::orchestrator::PlanEntry;
+use crate::convert::receipt::{
+    clear_stale_receipt, write_success_receipt, PeakChunkBoundReceipt,
+    RemoteConversionSource, ReceiptError,
+};
 use crate::convert::source_reader::SourceError;
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
@@ -53,6 +57,7 @@ use crate::quantize::ggml_quants::apex::{
 };
 use crate::quantize::ggml_quants::standard_policy::HParams;
 use crate::quantize::ggml_quants::ArchName;
+use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 
 // ============================================================================
 // Public API
@@ -104,6 +109,8 @@ pub struct ConvertArgs {
     /// `--mmproj` flag: export the vision projector (mmproj) sidecar
     /// GGUF instead of the text decoder. See `ConvertCliArgs::mmproj`.
     pub mmproj: bool,
+    /// Verified exact-revision identity for `--repo` conversion.
+    pub remote_source: Option<RemoteConversionSource>,
 }
 
 /// Errors raised by [`run_convert`]. Wraps the typed errors from the
@@ -128,6 +135,10 @@ pub enum ConvertError {
     Orchestrator(OrchestratorError),
     /// Filesystem I/O failed (e.g. could not create the output file).
     Io(std::io::Error),
+    /// Remote source integrity or manifest verification failed.
+    Integrity(crate::core::integrity::IntegrityError),
+    /// Success-receipt construction or atomic persistence failed.
+    Receipt(ReceiptError),
     /// `config.json` did not name one of the 8 supported architectures.
     /// `arch_name` carries the offending raw string (from `model_type`
     /// or `architectures[0]`).
@@ -202,7 +213,13 @@ pub enum ConvertError {
     /// [[feedback-no-loop-suppression-2026-05-17]]: refuse rather than
     /// silently pick one.
     RepoAndDirMutuallyExclusive,
-    /// B1 — `huggingface-cli download <repo>` exited non-zero. Captures
+    /// Remote conversion must pin the exact immutable Hub commit.
+    ImmutableRevisionRequired { supplied: Option<String> },
+    /// `--revision` has no meaning for an already-local source directory.
+    RevisionRequiresRepo,
+    /// Repo id is unsafe or outside HuggingFace's path-shaped id grammar.
+    InvalidRepoId { repo: String },
+    /// B1 — the allowed `hf download <repo>` source fetch exited non-zero. Captures
     /// the exit code (`None` if the process was killed by a signal)
     /// plus the captured stderr so the operator can diagnose auth /
     /// network / missing-binary failures.
@@ -219,6 +236,8 @@ impl std::fmt::Display for ConvertError {
             ConvertError::Source(e) => write!(f, "convert/source: {e}"),
             ConvertError::Orchestrator(e) => write!(f, "convert/orchestrator: {e}"),
             ConvertError::Io(e) => write!(f, "convert/io: {e}"),
+            ConvertError::Integrity(e) => write!(f, "convert/integrity: {e}"),
+            ConvertError::Receipt(e) => write!(f, "convert/receipt: {e}"),
             ConvertError::UnsupportedArch { arch_name } => {
                 write!(
                     f,
@@ -284,13 +303,26 @@ impl std::fmt::Display for ConvertError {
                 "convert: `--repo <hf_repo>` and positional `<hf_dir>` are mutually exclusive — \
                  pass exactly one"
             ),
+            ConvertError::ImmutableRevisionRequired { supplied } => write!(
+                f,
+                "convert: `--repo` requires `--revision <40-hex-commit>`; got {}",
+                supplied.as_deref().unwrap_or("<missing>")
+            ),
+            ConvertError::RevisionRequiresRepo => write!(
+                f,
+                "convert: `--revision` is valid only with `--repo`; local directories are used as supplied"
+            ),
+            ConvertError::InvalidRepoId { repo } => write!(
+                f,
+                "convert: invalid HuggingFace repo id `{repo}`; expected slash-separated ASCII name components"
+            ),
             ConvertError::HfDownload {
                 repo,
                 exit_code,
                 stderr,
             } => write!(
                 f,
-                "convert: `huggingface-cli download {repo}` exited with status {} — stderr:\n{}",
+                "convert: HuggingFace download for {repo} exited with status {} — stderr:\n{}",
                 exit_code
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "<signal>".to_string()),
@@ -306,6 +338,8 @@ impl std::error::Error for ConvertError {
             ConvertError::Source(e) => Some(e),
             ConvertError::Orchestrator(e) => Some(e),
             ConvertError::Io(e) => Some(e),
+            ConvertError::Integrity(e) => Some(e),
+            ConvertError::Receipt(e) => Some(e),
             ConvertError::Apex(e) => Some(e),
             ConvertError::Tokenizer(e) => Some(e),
             ConvertError::Imatrix(e) => Some(e),
@@ -335,6 +369,18 @@ impl From<OrchestratorError> for ConvertError {
 impl From<std::io::Error> for ConvertError {
     fn from(e: std::io::Error) -> Self {
         ConvertError::Io(e)
+    }
+}
+
+impl From<crate::core::integrity::IntegrityError> for ConvertError {
+    fn from(e: crate::core::integrity::IntegrityError) -> Self {
+        ConvertError::Integrity(e)
+    }
+}
+
+impl From<ReceiptError> for ConvertError {
+    fn from(e: ReceiptError) -> Self {
+        ConvertError::Receipt(e)
     }
 }
 
@@ -380,10 +426,11 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // mmaps each shard and records a flat tensor index. Payload bytes are
     // read one tensor at a time in the streaming stage below.
     let src = HfModelSource::open(&args.hf_dir)?;
-    if src.excluded_mtp_tensor_count() > 0 {
+    let excluded_dspark_count = src.excluded_mtp_tensor_count();
+    if excluded_dspark_count > 0 {
         tracing::warn!(
             target: "convert",
-            excluded = src.excluded_mtp_tensor_count(),
+            excluded = excluded_dspark_count,
             "DeepSeek-V4 MTP/DSpark tensors excluded from base GGUF; separate draft artifact remains required"
         );
     }
@@ -688,6 +735,16 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     for (k, v) in postlude {
         orch.add_metadata(k, v);
     }
+    if let Some(remote) = args.remote_source.as_ref() {
+        orch.add_metadata(
+            KEY_PRODUCER_VERSION.to_string(),
+            MetaValue::String(format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+        );
+        orch.add_metadata(
+            KEY_SOURCE_SHA256.to_string(),
+            MetaValue::String(remote.source_sha256.clone()),
+        );
+    }
 
     // ----- 5. Plan + stream tensors (with MoE expert fusion) -------------
     //
@@ -706,9 +763,13 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     orch.plan_tensors(plan_entries)?;
 
     // 5b. Begin writing — header + KVs + tensor-info reservations.
+    if args.remote_source.is_some() {
+        clear_stale_receipt(&args.output)?;
+    }
     let f = File::create(&args.output)?;
     let bw = BufWriter::new(f);
     let mut sw = orch.begin_write(bw)?;
+    let mut peak_chunk_bound = PeakChunkBoundReceipt::default();
 
     // 5c. Stream every tensor's data in plan order. A fused MoE tensor
     // is emitted one expert at a time: decode → F16 roundtrip → quantize
@@ -746,6 +807,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                     sw.stream_tensor_chunk(idx, &ht.data)?;
                 }
                 let stats = sw.finish_tensor_chunks(idx)?;
+                peak_chunk_bound.observe(stats);
                 debug_assert_eq!(stats.chunk_count, member_hf_names.len());
                 debug_assert_eq!(stats.max_chunk_elements, per_expert_elems);
                 tracing::debug!(
@@ -758,13 +820,23 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
             }
             _ => {
                 let data: Vec<f32> = step.materialize(&src, &synthesized)?;
-                sw.stream_tensor(idx, &data)?;
+                let stats = sw.stream_tensor(idx, &data)?;
+                peak_chunk_bound.observe(stats);
             }
         }
     }
 
     // 5d. Finalize — seek-back to fill tensor offsets, flush.
     sw.finalize()?;
+    if let Some(remote) = args.remote_source.as_ref() {
+        write_success_receipt(
+            &args.output,
+            remote,
+            &args.selector.receipt_name(),
+            excluded_dspark_count,
+            peak_chunk_bound,
+        )?;
+    }
     Ok(())
 }
 
@@ -3255,11 +3327,30 @@ mod tests {
             imatrix_out: None,
             imatrix_n_ctx: None,
             mmproj: false,
+            remote_source: Some(RemoteConversionSource {
+                repo: "deepseek-ai/DeepSeek-V4-Flash-0731".into(),
+                revision: "a".repeat(40),
+                source_sha256: "b".repeat(64),
+                files: Vec::new(),
+            }),
         }).unwrap();
-        let bytes = std::fs::read(output).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..4], b"GGUF");
         assert!(bytes.windows(b"blk.0.ffn_gate_exps.weight".len())
             .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
         assert!(bytes.len() > 32 * 1024);
+        let producer = concat!("hf2q ", env!("CARGO_PKG_VERSION")).as_bytes();
+        assert!(bytes.windows(producer.len()).any(|window| window == producer));
+        let expected_source_sha = "b".repeat(64);
+        assert!(bytes
+            .windows(expected_source_sha.len())
+            .any(|window| window == expected_source_sha.as_bytes()));
+        let receipt: crate::convert::receipt::ConversionReceipt = serde_json::from_slice(
+            &std::fs::read(crate::convert::receipt::receipt_path(&output)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.source.revision, "a".repeat(40));
+        assert_eq!(receipt.quant_selector, "q2_k_s");
+        assert_eq!(receipt.output.size, bytes.len() as u64);
     }
 }
