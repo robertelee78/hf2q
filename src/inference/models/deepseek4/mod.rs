@@ -22,6 +22,7 @@ pub mod forward;
 mod forward_support;
 pub mod hyper_connection;
 pub mod model;
+mod output_forward;
 pub mod residency;
 pub mod rope;
 pub mod routing;

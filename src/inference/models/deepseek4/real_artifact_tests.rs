@@ -30,7 +30,7 @@ fn official_artifact_metadata_and_catalog_are_exact() {
 
 #[test]
 #[ignore = "loads the locally converted 89.65 GiB official checkpoint onto Metal"]
-fn official_artifact_executes_native_verifier_prefix() {
+fn official_artifact_executes_native_verifier_and_logits() {
     let (path, gguf) = official_artifact();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut model = Deepseek4Model::load_from_gguf(&gguf)
@@ -44,6 +44,13 @@ fn official_artifact_executes_native_verifier_prefix() {
     assert_eq!(cache.position(), 1);
     assert!(values.iter().all(|value| value.is_finite()));
     assert!(values.iter().any(|value| *value != 0.0));
+    let logits = model
+        .forward_logits(&state)
+        .expect("collapse final HC state and execute vocabulary projection");
+    let logit_values = logits.as_slice::<f32>().expect("read vocabulary logits");
+    assert_eq!(logits.shape(), &[1, 129_280]);
+    assert!(logit_values.iter().all(|value| value.is_finite()));
+    assert!(logit_values.iter().any(|value| *value != 0.0));
     eprintln!(
         "executed all verifier layers from {} with {} resident weight bytes",
         path.display(),

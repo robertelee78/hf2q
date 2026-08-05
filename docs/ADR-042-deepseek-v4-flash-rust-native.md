@@ -228,7 +228,7 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Bounded working vectors | Receipt maximum 4,670,627,840 bytes; 529,530,880 F32 elements in the largest row-aligned chunk |
 | DSpark boundary | 4,705 source tensors explicitly excluded from the base GGUF and receipt-marked for a separate draft artifact |
 | Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
-| Native primitive regression | 42 DeepSeek-focused tests passed; two real-artifact hardware tests ignored by default |
+| Native primitive regression | 43 DeepSeek-focused tests passed; two real-artifact hardware tests ignored by default |
 | Official activation simulation | Owned Metal E4M3/E8M0 main-KV and Hadamard+E2M1/E8M0 indexer paths match exact BF16 CPU references; 3/3 focused tests passed |
 | Compressed cache ownership | Fixed-offset contiguous raw/compressed KV views plus exact main/indexer F32 recurrent states; 1M-token resident plan 7,232,045,056 bytes |
 | Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
@@ -236,5 +236,6 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Official compressed-prefix proof | Layers 0-3 passed through ratio-4 and ratio-128 attention plus hash/learned MoE in 25.25 s after load/build; 68,298,014,720-byte max RSS; zero swaps |
 | Official full-verifier proof | All 43 layers passed for one token in 25.52 s after load/build; 67,200,876,544-byte max RSS; zero swaps; finite nonzero `[1, 4, 4096]` state and transactional cache publication |
 | Partial-token failure safety | Any failure after verifier execution begins poisons the request cache; reset atomically clears recurrent state, cache visibility, and poison before replay |
-| Coherent real-model inference | One-token full verifier passed; output head, generation, and cache-coherence corpus pending |
+| Official vocabulary-logits proof | Owned HC collapse, final RMSNorm, and Q6_K output projection passed with the 43-layer verifier in 27.81 s; 62,708,498,432-byte max RSS; zero swaps; finite nonzero `[1, 129280]` logits |
+| Coherent real-model inference | Full one-token model compute passed; greedy selection, tokenizer-driven generation, parity, and cache-coherence corpus pending |
 | Performance parity | Pending coherent inference |
