@@ -1,37 +1,61 @@
 //! First native DeepSeek-V4 forward boundary: token IDs to HC state.
 
 use anyhow::{bail, Context, Result};
+use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
-use mlx_native::{DType, EmbeddingQ2KParams, MlxBuffer};
+use mlx_native::{DType, EmbeddingQ2KParams, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::Deepseek4Model;
+
+/// Buffers that must stay alive until the active command buffer completes.
+struct EmbeddingArena {
+    ids: MlxBuffer,
+    gathered: MlxBuffer,
+    state: MlxBuffer,
+}
 
 impl Deepseek4Model {
     /// Gather Q2_K token rows and expand each activation into the four
     /// official Hyper-Connection streams in one Metal command buffer.
     pub fn embed_hyper_state(&mut self, token_ids: &[u32]) -> Result<MlxBuffer> {
-        if token_ids.is_empty() {
-            bail!("DeepSeek-V4 forward requires at least one token");
-        }
+        let arena = self.prepare_embedding_arena(token_ids)?;
         let embedding = self
             .weights
             .raw_matrix_ref("token_embd.weight")
             .context("DeepSeek-V4 token embedding residency")?;
-        if embedding.ggml_type != GgmlType::Q2_K {
-            bail!(
-                "DeepSeek-V4 optimized runtime requires Q2_K token embeddings, got {:?}",
-                embedding.ggml_type
-            );
-        }
         let vocab = self.cfg.vocab_size as usize;
         let hidden = self.cfg.hidden_size as usize;
-        if embedding.shape != [vocab, hidden] {
-            bail!(
-                "DeepSeek-V4 token embedding shape drift: got {:?}, expected [{vocab}, {hidden}]",
-                embedding.shape
-            );
+        let hc = self.cfg.hyper_connection_count;
+        let tokens = token_ids.len();
+        let (executor, registry) = self.ctx.split();
+        let mut session = executor
+            .begin()
+            .context("begin DeepSeek-V4 embedding graph")?;
+        Self::encode_embedding_hyper_state(
+            &mut session,
+            registry,
+            executor.device(),
+            embedding.buffer,
+            embedding.ggml_type,
+            embedding.shape,
+            &arena,
+            tokens,
+            vocab,
+            hidden,
+            hc,
+        )?;
+        session
+            .finish()
+            .context("execute DeepSeek-V4 embedding graph")?;
+        Ok(arena.state)
+    }
+
+    fn prepare_embedding_arena(&self, token_ids: &[u32]) -> Result<EmbeddingArena> {
+        if token_ids.is_empty() {
+            bail!("DeepSeek-V4 forward requires at least one token");
         }
+        let hidden = self.cfg.hidden_size as usize;
         let tokens = token_ids.len();
         let device = self.ctx.device().clone();
         let mut ids = device
@@ -53,19 +77,46 @@ impl Deepseek4Model {
                 vec![tokens, hc, hidden],
             )
             .context("allocate DeepSeek-V4 Hyper-Connection state")?;
+        Ok(EmbeddingArena {
+            ids,
+            gathered,
+            state,
+        })
+    }
 
-        let (executor, registry) = self.ctx.split();
-        let mut session = executor
-            .begin()
-            .context("begin DeepSeek-V4 embedding graph")?;
-        session.barrier_between(&[embedding.buffer, &ids], &[&gathered]);
+    #[allow(clippy::too_many_arguments)]
+    fn encode_embedding_hyper_state(
+        session: &mut GraphSession<'_>,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        embedding: &MlxBuffer,
+        embedding_type: GgmlType,
+        embedding_shape: &[usize],
+        arena: &EmbeddingArena,
+        tokens: usize,
+        vocab: usize,
+        hidden: usize,
+        hc: u32,
+    ) -> Result<()> {
+        if embedding_type != GgmlType::Q2_K {
+            bail!(
+                "DeepSeek-V4 optimized runtime requires Q2_K token embeddings, got {:?}",
+                embedding_type
+            );
+        }
+        if embedding_shape != [vocab, hidden] {
+            bail!(
+                "DeepSeek-V4 token embedding shape drift: got {embedding_shape:?}, expected [{vocab}, {hidden}]"
+            );
+        }
+        session.barrier_between(&[embedding, &arena.ids], &[&arena.gathered]);
         session
             .embedding_gather_q2_k(
                 registry,
-                executor.device(),
-                embedding.buffer,
-                &ids,
-                &gathered,
+                device,
+                embedding,
+                &arena.ids,
+                &arena.gathered,
                 &EmbeddingQ2KParams {
                     vocab_size: vocab,
                     embed_dim: hidden,
@@ -73,24 +124,21 @@ impl Deepseek4Model {
                 },
             )
             .context("encode DeepSeek-V4 Q2_K embedding gather")?;
-        session.barrier_between(&[&gathered], &[&state]);
+        session.barrier_between(&[&arena.gathered], &[&arena.state]);
         dispatch_repeat_tiled_f32(
             session.encoder_mut(),
             registry,
-            executor.device().metal_device(),
-            &gathered,
-            &state,
+            device.metal_device(),
+            &arena.gathered,
+            &arena.state,
             &RepeatTiledParams {
                 seq: u32::try_from(tokens).context("DeepSeek-V4 token count exceeds u32")?,
                 hg: 1,
-                h: self.cfg.hyper_connection_count,
-                k: self.cfg.hidden_size,
+                h: hc,
+                k: u32::try_from(hidden).context("DeepSeek-V4 hidden size exceeds u32")?,
             },
         )
         .context("encode DeepSeek-V4 Hyper-Connection expansion")?;
-        session
-            .finish()
-            .context("execute DeepSeek-V4 embedding graph")?;
-        Ok(state)
+        Ok(())
     }
 }
