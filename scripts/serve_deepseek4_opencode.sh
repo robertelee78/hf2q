@@ -36,7 +36,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-Q2_K_S.gguf}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8084}"
+PORT="${PORT:-8080}"
 CONTEXT_LEN="${CONTEXT_LEN:-131072}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 
