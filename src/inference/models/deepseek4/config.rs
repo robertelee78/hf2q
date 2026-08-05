@@ -198,6 +198,15 @@ impl Deepseek4Config {
                 self.hyper_connection_count
             );
         }
+        if self.hyper_connection_sinkhorn_iterations != 20
+            || self.hyper_connection_epsilon.to_bits() != 1e-6f32.to_bits()
+        {
+            bail!(
+                "DeepSeek-V4 config: native Hyper-Connection kernel requires exactly 20 Sinkhorn iterations and epsilon 1e-6, got {} and {}",
+                self.hyper_connection_sinkhorn_iterations,
+                self.hyper_connection_epsilon
+            );
+        }
         if self.hidden_size_out != self.hidden_size * self.hyper_connection_count {
             bail!("DeepSeek-V4 config: embedding_length_out must equal embedding_length * hyper_connection.count");
         }
@@ -248,8 +257,6 @@ impl Deepseek4Config {
         if !self.normalize_topk
             || self.route_scale <= 0.0
             || self.rms_norm_eps <= 0.0
-            || self.hyper_connection_epsilon <= 0.0
-            || self.hyper_connection_sinkhorn_iterations == 0
             || self.hash_layer_count > self.num_hidden_layers
             || self.rope_factor <= 0.0
             || self.original_context_length == 0
@@ -417,5 +424,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("compress_ratios"));
+    }
+
+    #[test]
+    fn rejects_hyper_connection_constants_that_drift_from_native_kernel() {
+        for (key, value) in [
+            (
+                "deepseek4.hyper_connection.sinkhorn_iterations",
+                MetaValue::U32(19),
+            ),
+            ("deepseek4.hyper_connection.epsilon", MetaValue::F32(2e-6)),
+        ] {
+            let mut kv = official_metadata();
+            kv.iter_mut()
+                .find(|(candidate, _)| candidate == key)
+                .expect("official HC key")
+                .1 = value;
+            let (_dir, gguf) = open_fixture(&kv);
+            let error = Deepseek4Config::from_gguf(&gguf)
+                .expect_err("drifted fixed HC parameter must fail closed")
+                .to_string();
+            assert!(error.contains("requires exactly 20 Sinkhorn iterations and epsilon 1e-6"));
+        }
     }
 }
