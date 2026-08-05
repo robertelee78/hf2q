@@ -79,10 +79,10 @@ jobs:
           fi
           echo "path=$p" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust toolchain (1.81.0)
+      - name: Install Rust toolchain (1.88.0, as pinned in Cargo.toml)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: "1.88.0"
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -95,7 +95,7 @@ jobs:
           restore-keys: release-cargo-${{ runner.os }}-
 
       - name: cargo build --release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: scripts/release-check.sh
         env:
