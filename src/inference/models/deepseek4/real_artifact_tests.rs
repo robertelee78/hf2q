@@ -30,7 +30,7 @@ fn official_artifact_metadata_and_catalog_are_exact() {
 
 #[test]
 #[ignore = "loads the locally converted 89.65 GiB official checkpoint onto Metal"]
-fn official_artifact_executes_native_uncompressed_prefix() {
+fn official_artifact_executes_native_verifier_prefix() {
     let (path, gguf) = official_artifact();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut model = Deepseek4Model::load_from_gguf(&gguf)
@@ -49,6 +49,18 @@ fn official_artifact_executes_native_uncompressed_prefix() {
     let state = model
         .forward_ffn_one(&state, 0, 1)
         .expect("execute native layer-1 hash-routed FFN");
+    let state = model
+        .forward_compressed_attention_one(&state, 2, &mut cache, false)
+        .expect("execute native layer-2 ratio-four compressed attention");
+    let state = model
+        .forward_ffn_one(&state, 0, 2)
+        .expect("execute native layer-2 hash-routed FFN");
+    let state = model
+        .forward_compressed_attention_one(&state, 3, &mut cache, false)
+        .expect("execute native layer-3 ratio-128 compressed attention");
+    let state = model
+        .forward_ffn_one(&state, 0, 3)
+        .expect("execute native layer-3 learned score-routed FFN");
     cache.commit_step(0).expect("publish complete prefix state");
     let values = state.as_slice::<f32>().expect("read final HC state");
     assert_eq!(state.shape(), &[1, 4, 4096]);
@@ -56,7 +68,7 @@ fn official_artifact_executes_native_uncompressed_prefix() {
     assert!(values.iter().all(|value| value.is_finite()));
     assert!(values.iter().any(|value| *value != 0.0));
     eprintln!(
-        "executed uncompressed layers 0-1 from {} with {} resident weight bytes",
+        "executed verifier layers 0-3 from {} with {} resident weight bytes",
         path.display(),
         model.weights.resident_bytes()
     );

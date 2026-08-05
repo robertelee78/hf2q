@@ -229,7 +229,10 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | DSpark boundary | 4,705 source tensors explicitly excluded from the base GGUF and receipt-marked for a separate draft artifact |
 | Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
 | Native primitive regression | 41 DeepSeek-focused tests passed; two real-artifact hardware tests ignored by default |
+| Official activation simulation | Owned Metal E4M3/E8M0 main-KV and Hadamard+E2M1/E8M0 indexer paths match exact BF16 CPU references; 3/3 focused tests passed |
+| Compressed cache ownership | Fixed-offset contiguous raw/compressed KV views plus exact main/indexer F32 recurrent states; 1M-token resident plan 7,232,045,056 bytes |
 | Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
 | Official uncompressed-prefix proof | Layers 0-1 Q2_K attention plus exact hash-routed/shared MoE passed transactionally in 28.36 s cold; 99,047,478,968-byte peak footprint |
-| Coherent real-model inference | Layers 0-1 passed; compressed layers 2-42, output head, generation, and cache-coherence corpus pending |
+| Official compressed-prefix proof | Layers 0-3 passed through ratio-4 and ratio-128 attention plus hash/learned MoE in 25.25 s after load/build; 68,298,014,720-byte max RSS; zero swaps |
+| Coherent real-model inference | Layers 0-3 passed; compressed layers 4-42, output head, generation, and cache-coherence corpus pending |
 | Performance parity | Pending coherent inference |
