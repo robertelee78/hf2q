@@ -118,6 +118,8 @@ pub enum CacheError {
     ContextExhausted { maximum: usize },
     #[error("cache step committed out of order: expected position {expected}, got {actual}")]
     StepOutOfOrder { expected: usize, actual: usize },
+    #[error("DeepSeek-V4 cache is poisoned by a partial token; reset and replay the request")]
+    Poisoned,
 }
 
 pub struct LayerCache {
@@ -136,6 +138,7 @@ pub struct Deepseek4Cache {
     layers: Vec<LayerCache>,
     plan: Deepseek4CachePlan,
     next_position: usize,
+    poisoned: bool,
     resident_bytes: u64,
     _device: MlxDevice,
 }
@@ -347,6 +350,7 @@ impl Deepseek4Cache {
             layers,
             plan: plan.clone(),
             next_position: 0,
+            poisoned: false,
             resident_bytes: actual,
             _device: device,
         };
@@ -366,10 +370,23 @@ impl Deepseek4Cache {
         self.next_position
     }
 
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Prevent retries after any submitted layer has mutated recurrent state.
+    /// Resetting the request clears the poison and recurrent state together.
+    pub(super) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     /// Return the write slots and post-write visibility bounds for the next
     /// token without changing logical cache state. The caller commits only
     /// after its Metal command buffer completes successfully.
     pub fn plan_next_step(&self) -> Result<CacheStep, CacheError> {
+        if self.poisoned {
+            return Err(CacheError::Poisoned);
+        }
         if self.next_position >= self.plan.context_length {
             return Err(CacheError::ContextExhausted {
                 maximum: self.plan.context_length,
@@ -411,6 +428,9 @@ impl Deepseek4Cache {
 
     /// Advance logical visibility after the planned GPU writes complete.
     pub fn commit_step(&mut self, position: usize) -> Result<(), CacheError> {
+        if self.poisoned {
+            return Err(CacheError::Poisoned);
+        }
         if position != self.next_position {
             return Err(CacheError::StepOutOfOrder {
                 expected: self.next_position,
@@ -457,6 +477,7 @@ impl Deepseek4Cache {
             )?;
         }
         self.next_position = 0;
+        self.poisoned = false;
         Ok(())
     }
 }

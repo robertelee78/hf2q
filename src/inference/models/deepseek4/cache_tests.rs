@@ -287,3 +287,18 @@ fn cache_steps_publish_only_complete_groups_and_commit_transactionally() {
         Err(CacheError::ContextExhausted { maximum: 128 })
     ));
 }
+
+#[test]
+fn partial_token_poison_requires_reset_before_replay() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+    cache.poison();
+    assert!(cache.is_poisoned());
+    assert!(matches!(cache.plan_next_step(), Err(CacheError::Poisoned)));
+    assert!(matches!(cache.commit_step(0), Err(CacheError::Poisoned)));
+    cache.reset().unwrap();
+    assert!(!cache.is_poisoned());
+    assert_eq!(cache.plan_next_step().unwrap().position, 0);
+}

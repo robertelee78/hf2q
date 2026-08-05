@@ -11,9 +11,9 @@ mod attention_weights;
 pub mod cache;
 mod cache_buffers;
 mod compressed_attention;
+mod compressed_attention_common;
 mod compressed_attention_indexer;
 mod compressed_attention_main;
-mod compressed_attention_common;
 mod compressed_attention_weights;
 pub mod compressor;
 pub mod config;
@@ -25,6 +25,7 @@ pub mod model;
 pub mod residency;
 pub mod rope;
 pub mod routing;
+mod verifier_forward;
 pub mod weights;
 
 pub use config::Deepseek4Config;

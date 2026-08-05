@@ -37,38 +37,15 @@ fn official_artifact_executes_native_verifier_prefix() {
         .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
     let mut cache = model.allocate_cache(128).expect("allocate 128-token cache");
     let state = model
-        .forward_uncompressed_attention_one(None, 0, 0, &mut cache, false)
-        .expect("execute native layer-0 attention without early cache publication");
-    let state = model
-        .forward_layer0_ffn_one(&state, 0)
-        .expect("execute native layer-0 hash-routed FFN");
-    assert_eq!(cache.position(), 0);
-    let state = model
-        .forward_uncompressed_attention_one(Some(&state), 0, 1, &mut cache, false)
-        .expect("execute native layer-1 attention from preceding HC state");
-    let state = model
-        .forward_ffn_one(&state, 0, 1)
-        .expect("execute native layer-1 hash-routed FFN");
-    let state = model
-        .forward_compressed_attention_one(&state, 2, &mut cache, false)
-        .expect("execute native layer-2 ratio-four compressed attention");
-    let state = model
-        .forward_ffn_one(&state, 0, 2)
-        .expect("execute native layer-2 hash-routed FFN");
-    let state = model
-        .forward_compressed_attention_one(&state, 3, &mut cache, false)
-        .expect("execute native layer-3 ratio-128 compressed attention");
-    let state = model
-        .forward_ffn_one(&state, 0, 3)
-        .expect("execute native layer-3 learned score-routed FFN");
-    cache.commit_step(0).expect("publish complete prefix state");
+        .forward_verifier_one(0, &mut cache)
+        .expect("execute all native verifier layers and publish one token");
     let values = state.as_slice::<f32>().expect("read final HC state");
     assert_eq!(state.shape(), &[1, 4, 4096]);
     assert_eq!(cache.position(), 1);
     assert!(values.iter().all(|value| value.is_finite()));
     assert!(values.iter().any(|value| *value != 0.0));
     eprintln!(
-        "executed verifier layers 0-3 from {} with {} resident weight bytes",
+        "executed all verifier layers from {} with {} resident weight bytes",
         path.display(),
         model.weights.resident_bytes()
     );
