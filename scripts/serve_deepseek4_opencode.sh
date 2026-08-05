@@ -30,21 +30,41 @@
 #
 # Usage:
 #   scripts/serve_deepseek4_opencode.sh             # foreground (default)
-#   PORT=8084 scripts/serve_deepseek4_opencode.sh   # override port
+#   PORT=8090 scripts/serve_deepseek4_opencode.sh   # override port
 #   CONTEXT_LEN=262144 scripts/serve_deepseek4_opencode.sh
 set -euo pipefail
 
 MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-Q2_K_S.gguf}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8083}"
+PORT="${PORT:-8084}"
 CONTEXT_LEN="${CONTEXT_LEN:-131072}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
+    exit 3
+fi
 if ! [[ "$CONTEXT_LEN" =~ ^[0-9]+$ ]] || (( CONTEXT_LEN < 128 )); then
     echo "CONTEXT_LEN must be an integer of at least 128 (got: $CONTEXT_LEN)" >&2
     exit 3
+fi
+
+# Fail before loading the ~92 GiB model when another service owns the port.
+# macOS ships lsof; nc is a portable fallback for leaner environments.
+if command -v lsof >/dev/null 2>&1; then
+    PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$PORT_LISTENER" ]]; then
+        echo "$HOST:$PORT is already in use — refusing before model load" >&2
+        printf '%s\n' "$PORT_LISTENER" >&2
+        echo "choose a free port, for example: PORT=8090 $0" >&2
+        exit 2
+    fi
+elif command -v nc >/dev/null 2>&1 && nc -z "$HOST" "$PORT" >/dev/null 2>&1; then
+    echo "$HOST:$PORT is already in use — refusing before model load" >&2
+    echo "choose a free port, for example: PORT=8090 $0" >&2
+    exit 2
 fi
 
 # One-model-at-a-time guard: the Q2_K_S artifact is ~92 GiB and a second
