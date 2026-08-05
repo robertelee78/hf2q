@@ -1,6 +1,6 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
-- **Status:** Accepted for implementation (2026-08-04); evidence gates open
+- **Status:** Accepted; official conversion gate passed (2026-08-04), inference gates in progress
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -44,10 +44,10 @@ The checkpoint is not an ordinary BF16 model:
 - the repository includes one attached DSpark next-token prediction stage made
   of three `mtp.{0,1,2}` blocks (4,705 checkpoint tensors).
 
-The existing converter rejects the source dtypes and architecture. Its current
-expert fusion creates a multi-gigabyte F32 aggregate, and the runtime has no
-DeepSeek-V4 graph or cache. `mlx-native` can parse only four-bit-and-higher GGUF
-types, so it cannot load the selected target until Q2_K support lands.
+At spike time, the converter rejected the source dtypes and architecture, expert
+fusion created a multi-gigabyte F32 aggregate, and the runtime had no
+DeepSeek-V4 graph or cache. The converter and Q2_K residency boundary now pass
+their official-artifact gates; full graph integration remains in progress.
 
 ## Hypotheses and falsifiers
 
@@ -214,13 +214,22 @@ until its exact-source receipt and all applicable acceptance gates are green.
 | Hardware/storage audit | 128 GiB M5 Max; about 1.8 TiB free |
 | Official repository metadata | 48 shards; about 166.9 GB; 304.18B params |
 | Pinned `hf download --dry-run` | 74 official files; 166.9 GB; no payload fetched |
-| Existing hf2q Q2_K_S encoder | Present; source-format ingest absent |
-| mlx-native Q2_K loader/matvec | Commit `3a0e8ab`; 6/6 exact tests, dense + expert-ID Metal |
+| Official source download | 73 receipt-bound files, including all 48 shards; 166,898,659,555 bytes |
+| Exact source bundle | `a8544e6469f8f392e72f953e9a2b4ee33a23c50a859f47dd354d37ab0093993d` |
+| hf2q Q2_K_S converter | Rust in-process; FP8/FP4/E8M0 ingest, bounded expert fusion, atomic provenance receipt |
+| mlx-native Q2_K loader/matvec | Dense + expert-ID Metal paths; exact routing, activation, sparse-attention, compressor, indexer, HC, and tail-RoPE primitives |
 | Q2_K decode microbench | 55.81 us / 98.63 GB/s at M=1, N=K=4096 (integration rerun) |
-| Existing DeepSeek-V4 converter/runtime | Absent |
 | Pinned llama.cpp conversion and graph | Present at reference commit |
 | Pinned llama.cpp oracle binaries | Rebuilt locally as version 10276 (`6ea215d17`) |
-| Synthetic converter proof | Pending implementation |
-| Official full conversion | Pending converter gate |
-| Coherent real-model inference | Pending full conversion/runtime |
+| Synthetic converter proof | Positive/negative dtype, shape, scale, fusion, receipt, and round-trip suites green |
+| Official full conversion | Passed from pinned source with hf2q converter commit `a8e00a24c1ac043182761e9df3347853b2d74d41` |
+| Official output | 96,265,459,008 bytes (89.65 GiB), SHA-256 `0318b99b4ece1222d8cf4d93a705458d339907910af5af3a175bc3989dcb01a1` |
+| Conversion telemetry | 1,823.71 s wall; 120,490,524,672-byte max RSS including file mappings; 5,196,469,928-byte peak footprint; zero process swaps |
+| Bounded working vectors | Receipt maximum 4,670,627,840 bytes; 529,530,880 F32 elements in the largest row-aligned chunk |
+| DSpark boundary | 4,705 source tensors explicitly excluded from the base GGUF and receipt-marked for a separate draft artifact |
+| Official GGUF catalog | Strict metadata and all 1,328 verifier tensors validated exactly |
+| Native primitive regression | 41 DeepSeek-focused tests passed; two real-artifact hardware tests ignored by default |
+| Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
+| Official layer-0 Metal proof | Q2_K attention plus exact hash-routed/shared MoE passed in 31.22 s cold; 99,072,415,416-byte peak footprint |
+| Coherent real-model inference | Layer-0 vertical slice passed; full 43-layer generation and cache-coherence corpus pending |
 | Performance parity | Pending coherent inference |

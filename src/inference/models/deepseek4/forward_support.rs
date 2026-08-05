@@ -2,6 +2,8 @@
 
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
+use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
+use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -58,18 +60,43 @@ pub(super) fn raw_matmul(
             weight.shape
         );
     }
-    if matches!(
-        weight.ggml_type,
-        GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32
-    ) {
-        bail!(
-            "DeepSeek-V4 optimized {label} requires block-quantized storage, got {:?}",
-            weight.ggml_type
-        );
-    }
     session.barrier_between(&[input, weight.buffer], &[output]);
-    session
-        .quantized_matmul_ggml(
+    match weight.ggml_type {
+        GgmlType::F32 => dense_matmul_f32_f32_tensor(
+            session.encoder_mut(),
+            registry,
+            device,
+            weight.buffer,
+            input,
+            output,
+            &DenseMmF32F32Params {
+                m: u32::try_from(m).context("DeepSeek-V4 matmul rows exceed u32")?,
+                n: u32::try_from(n).context("DeepSeek-V4 matmul outputs exceed u32")?,
+                k: u32::try_from(k).context("DeepSeek-V4 matmul input exceeds u32")?,
+                src0_batch: 1,
+                src1_batch: 1,
+            },
+        ),
+        GgmlType::F16 => dense_matmul_f16_f32_tensor(
+            session.encoder_mut(),
+            registry,
+            device,
+            weight.buffer,
+            input,
+            output,
+            &DenseMmF16F32Params {
+                m: u32::try_from(m).context("DeepSeek-V4 matmul rows exceed u32")?,
+                n: u32::try_from(n).context("DeepSeek-V4 matmul outputs exceed u32")?,
+                k: u32::try_from(k).context("DeepSeek-V4 matmul input exceeds u32")?,
+                src0_batch: 1,
+                src1_batch: 1,
+            },
+        ),
+        GgmlType::I16 | GgmlType::I32 => Err(mlx_native::MlxError::InvalidArgument(format!(
+            "DeepSeek-V4 {label} cannot use integer-only matrix storage {:?}",
+            weight.ggml_type
+        ))),
+        _ => session.quantized_matmul_ggml(
             registry,
             device,
             input,
@@ -81,8 +108,9 @@ pub(super) fn raw_matmul(
                 k: u32::try_from(k).context("DeepSeek-V4 matmul input exceeds u32")?,
                 ggml_type: weight.ggml_type,
             },
-        )
-        .with_context(|| format!("encode DeepSeek-V4 {label}"))
+        ),
+    }
+    .with_context(|| format!("encode DeepSeek-V4 {label}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -145,4 +173,52 @@ pub(super) fn expert_matmul(
             },
         )
         .with_context(|| format!("encode DeepSeek-V4 {label}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::gpu::GpuContext;
+
+    #[test]
+    fn raw_matmul_accepts_quality_sensitive_f32_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        let mut input = alloc(&device, DType::F32, vec![1, 32], "test input").unwrap();
+        let mut weight = alloc(&device, DType::F32, vec![32, 32], "test weight").unwrap();
+        let output = alloc(&device, DType::F32, vec![1, 32], "test output").unwrap();
+        for (index, value) in input.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            *value = index as f32 * 0.25 - 2.0;
+        }
+        for row in 0..32 {
+            weight.as_mut_slice::<f32>().unwrap()[row * 32 + row] = 1.0;
+        }
+        let shape = [32, 32];
+        let weight = RawMatrixRef {
+            buffer: &weight,
+            ggml_type: GgmlType::F32,
+            shape: &shape,
+        };
+        let (executor, registry) = ctx.split();
+        let mut session = executor.begin().unwrap();
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &input,
+            &weight,
+            &output,
+            1,
+            32,
+            32,
+            "F32 identity",
+        )
+        .unwrap();
+        session.finish().unwrap();
+        assert_eq!(
+            output.as_slice::<f32>().unwrap(),
+            input.as_slice::<f32>().unwrap()
+        );
+    }
 }
