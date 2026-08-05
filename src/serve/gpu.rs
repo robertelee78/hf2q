@@ -86,6 +86,8 @@ impl GpuContext {
         mlx_native::ops::deepseek_compressor::register(&mut registry);
         mlx_native::ops::deepseek_indexer::register(&mut registry);
         mlx_native::ops::deepseek_tail_rope::register(&mut registry);
+        mlx_native::ops::deepseek_moe_routing::register(&mut registry);
+        mlx_native::ops::deepseek_moe_activation::register(&mut registry);
         mlx_native::ops::repeat_tiled::register(&mut registry);
 
         // ADR-031 Phase B (Option A): allocate a second identical registry for
@@ -114,6 +116,8 @@ impl GpuContext {
             mlx_native::ops::deepseek_compressor::register(&mut wreg);
             mlx_native::ops::deepseek_indexer::register(&mut wreg);
             mlx_native::ops::deepseek_tail_rope::register(&mut wreg);
+            mlx_native::ops::deepseek_moe_routing::register(&mut wreg);
+            mlx_native::ops::deepseek_moe_activation::register(&mut wreg);
             mlx_native::ops::repeat_tiled::register(&mut wreg);
             tracing::info!("mlx-native GpuContext: worker KernelRegistry pre-warmed (HF2Q_PARALLEL_ENCODE=1)");
             Some(wreg)
