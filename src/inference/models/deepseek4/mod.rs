@@ -9,6 +9,7 @@ mod attention_entry;
 mod attention_forward;
 mod attention_weights;
 pub mod cache;
+mod cache_buffers;
 pub mod compressor;
 pub mod config;
 mod ffn_forward;

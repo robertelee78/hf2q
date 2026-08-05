@@ -3,14 +3,16 @@
 use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
 use thiserror::Error;
 
+use super::cache_buffers::{
+    allocate_buffer, allocate_optional, buffer_plan, completed_group_step, compressor_state_plans,
+    fill_state, optional_buffer_plan, validate_request, view_buffer,
+};
 use super::Deepseek4Config;
-
-const REQUIRED_WINDOW: u32 = 128;
-const CACHE_DTYPE: DType = DType::BF16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheBufferPlan {
     pub shape: Vec<usize>,
+    pub dtype: DType,
     pub bytes: u64,
 }
 
@@ -18,9 +20,16 @@ pub struct CacheBufferPlan {
 pub struct LayerCachePlan {
     pub layer_index: usize,
     pub compress_ratio: u32,
+    /// Physical BF16 allocation addressed as window rows followed by
+    /// compressed rows. The two fields below are zero-copy views.
+    pub attention_kv: CacheBufferPlan,
     pub window_kv: CacheBufferPlan,
     pub compressed_kv: Option<CacheBufferPlan>,
     pub indexer_kv: Option<CacheBufferPlan>,
+    pub main_kv_state: Option<CacheBufferPlan>,
+    pub main_score_state: Option<CacheBufferPlan>,
+    pub indexer_kv_state: Option<CacheBufferPlan>,
+    pub indexer_score_state: Option<CacheBufferPlan>,
     pub resident_bytes: u64,
 }
 
@@ -52,9 +61,14 @@ pub struct CacheStep {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKind {
+    AttentionKv,
     WindowKv,
     CompressedKv,
     IndexerKv,
+    MainKvState,
+    MainScoreState,
+    IndexerKvState,
+    IndexerScoreState,
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +98,20 @@ pub enum CacheError {
         #[source]
         source: MlxError,
     },
+    #[error("failed to create layer {layer} {kind:?} cache view: {source}")]
+    View {
+        layer: usize,
+        kind: CacheKind,
+        #[source]
+        source: MlxError,
+    },
+    #[error("failed to initialize layer {layer} {kind:?} cache state: {source}")]
+    Initialize {
+        layer: usize,
+        kind: CacheKind,
+        #[source]
+        source: MlxError,
+    },
     #[error("allocated cache byte accounting mismatch: planned {planned}, actual {actual}")]
     Accounting { planned: u64, actual: u64 },
     #[error("DeepSeek-V4 cache is full at context bound {maximum}")]
@@ -93,9 +121,15 @@ pub enum CacheError {
 }
 
 pub struct LayerCache {
+    /// Owns the allocation shared by `window_kv` and `compressed_kv`.
+    pub attention_kv: MlxBuffer,
     pub window_kv: MlxBuffer,
     pub compressed_kv: Option<MlxBuffer>,
     pub indexer_kv: Option<MlxBuffer>,
+    pub main_kv_state: Option<MlxBuffer>,
+    pub main_score_state: Option<MlxBuffer>,
+    pub indexer_kv_state: Option<MlxBuffer>,
+    pub indexer_score_state: Option<MlxBuffer>,
 }
 
 pub struct Deepseek4Cache {
@@ -116,8 +150,8 @@ impl Deepseek4CachePlan {
             let window_kv = buffer_plan(
                 layer,
                 CacheKind::WindowKv,
-                window_capacity,
-                cfg.head_dim as usize,
+                vec![window_capacity, cfg.head_dim as usize],
+                DType::BF16,
             )?;
             let compressed_kv = if ratio == 0 {
                 None
@@ -125,24 +159,52 @@ impl Deepseek4CachePlan {
                 optional_buffer_plan(
                     layer,
                     CacheKind::CompressedKv,
-                    context_length / ratio as usize,
-                    cfg.head_dim as usize,
+                    vec![context_length / ratio as usize, cfg.head_dim as usize],
+                    DType::BF16,
                 )?
             };
+            let compressed_capacity = compressed_kv.as_ref().map_or(0, |plan| plan.shape[0]);
+            let attention_kv = buffer_plan(
+                layer,
+                CacheKind::AttentionKv,
+                vec![window_capacity + compressed_capacity, cfg.head_dim as usize],
+                DType::BF16,
+            )?;
             let indexer_kv = if ratio == 4 {
                 optional_buffer_plan(
                     layer,
                     CacheKind::IndexerKv,
-                    context_length / 4,
-                    cfg.index_head_dim as usize,
+                    vec![context_length / 4, cfg.index_head_dim as usize],
+                    DType::BF16,
                 )?
             } else {
                 None
             };
-            let mut layer_bytes = window_kv.bytes;
+            let (main_kv_state, main_score_state) = compressor_state_plans(
+                layer,
+                ratio,
+                cfg.head_dim as usize,
+                CacheKind::MainKvState,
+                CacheKind::MainScoreState,
+            )?;
+            let (indexer_kv_state, indexer_score_state) = if ratio == 4 {
+                compressor_state_plans(
+                    layer,
+                    ratio,
+                    cfg.index_head_dim as usize,
+                    CacheKind::IndexerKvState,
+                    CacheKind::IndexerScoreState,
+                )?
+            } else {
+                (None, None)
+            };
+            let mut layer_bytes = attention_kv.bytes;
             for (kind, plan) in [
-                (CacheKind::CompressedKv, compressed_kv.as_ref()),
                 (CacheKind::IndexerKv, indexer_kv.as_ref()),
+                (CacheKind::MainKvState, main_kv_state.as_ref()),
+                (CacheKind::MainScoreState, main_score_state.as_ref()),
+                (CacheKind::IndexerKvState, indexer_kv_state.as_ref()),
+                (CacheKind::IndexerScoreState, indexer_score_state.as_ref()),
             ] {
                 if let Some(plan) = plan {
                     layer_bytes = layer_bytes
@@ -155,14 +217,19 @@ impl Deepseek4CachePlan {
                     .checked_add(layer_bytes)
                     .ok_or(CacheError::ByteOverflow {
                         layer,
-                        kind: CacheKind::WindowKv,
+                        kind: CacheKind::AttentionKv,
                     })?;
             layers.push(LayerCachePlan {
                 layer_index: layer,
                 compress_ratio: ratio,
+                attention_kv,
                 window_kv,
                 compressed_kv,
                 indexer_kv,
+                main_kv_state,
+                main_score_state,
+                indexer_kv_state,
+                indexer_score_state,
                 resident_bytes: layer_bytes,
             });
         }
@@ -179,8 +246,15 @@ impl Deepseek4Cache {
         let mut layers = Vec::with_capacity(plan.layers.len());
         let mut resident_bytes = 0_u64;
         for layer in &plan.layers {
-            let window_kv = allocate_buffer(
+            let attention_kv = allocate_buffer(
                 &device,
+                layer.layer_index,
+                CacheKind::AttentionKv,
+                &layer.attention_kv,
+            )?;
+            let window_kv = view_buffer(
+                &attention_kv,
+                0,
                 layer.layer_index,
                 CacheKind::WindowKv,
                 &layer.window_kv,
@@ -189,7 +263,13 @@ impl Deepseek4Cache {
                 .compressed_kv
                 .as_ref()
                 .map(|buffer| {
-                    allocate_buffer(&device, layer.layer_index, CacheKind::CompressedKv, buffer)
+                    view_buffer(
+                        &attention_kv,
+                        layer.window_kv.bytes,
+                        layer.layer_index,
+                        CacheKind::CompressedKv,
+                        buffer,
+                    )
                 })
                 .transpose()?;
             let indexer_kv = layer
@@ -199,6 +279,30 @@ impl Deepseek4Cache {
                     allocate_buffer(&device, layer.layer_index, CacheKind::IndexerKv, buffer)
                 })
                 .transpose()?;
+            let main_kv_state = allocate_optional(
+                &device,
+                layer.layer_index,
+                CacheKind::MainKvState,
+                layer.main_kv_state.as_ref(),
+            )?;
+            let main_score_state = allocate_optional(
+                &device,
+                layer.layer_index,
+                CacheKind::MainScoreState,
+                layer.main_score_state.as_ref(),
+            )?;
+            let indexer_kv_state = allocate_optional(
+                &device,
+                layer.layer_index,
+                CacheKind::IndexerKvState,
+                layer.indexer_kv_state.as_ref(),
+            )?;
+            let indexer_score_state = allocate_optional(
+                &device,
+                layer.layer_index,
+                CacheKind::IndexerScoreState,
+                layer.indexer_score_state.as_ref(),
+            )?;
             resident_bytes = resident_bytes.checked_add(layer.resident_bytes).ok_or(
                 CacheError::ByteOverflow {
                     layer: layer.layer_index,
@@ -206,15 +310,23 @@ impl Deepseek4Cache {
                 },
             )?;
             layers.push(LayerCache {
+                attention_kv,
                 window_kv,
                 compressed_kv,
                 indexer_kv,
+                main_kv_state,
+                main_score_state,
+                indexer_kv_state,
+                indexer_score_state,
             });
         }
         let actual = layers.iter().try_fold(0_u64, |total, layer| {
-            std::iter::once(&layer.window_kv)
-                .chain(layer.compressed_kv.iter())
+            std::iter::once(&layer.attention_kv)
                 .chain(layer.indexer_kv.iter())
+                .chain(layer.main_kv_state.iter())
+                .chain(layer.main_score_state.iter())
+                .chain(layer.indexer_kv_state.iter())
+                .chain(layer.indexer_score_state.iter())
                 .try_fold(total, |bytes, buffer| {
                     u64::try_from(buffer.byte_len())
                         .ok()
@@ -223,7 +335,7 @@ impl Deepseek4Cache {
         });
         let actual = actual.ok_or(CacheError::ByteOverflow {
             layer: layers.len().saturating_sub(1),
-            kind: CacheKind::WindowKv,
+            kind: CacheKind::AttentionKv,
         })?;
         if actual != plan.resident_bytes || resident_bytes != plan.resident_bytes {
             return Err(CacheError::Accounting {
@@ -231,13 +343,15 @@ impl Deepseek4Cache {
                 actual,
             });
         }
-        Ok(Self {
+        let mut cache = Self {
             layers,
             plan: plan.clone(),
             next_position: 0,
             resident_bytes: actual,
             _device: device,
-        })
+        };
+        cache.reset()?;
+        Ok(cache)
     }
 
     pub fn layers(&self) -> &[LayerCache] {
@@ -312,107 +426,37 @@ impl Deepseek4Cache {
         Ok(())
     }
 
-    /// Reset logical visibility. Buffers need not be cleared because every
-    /// read is bounded by the validity counts returned in `CacheStep`.
-    pub fn reset(&mut self) {
+    /// Reset logical visibility and all recurrent compressor state. KV rows
+    /// remain validity-bounded, but pooling state participates in future
+    /// writes and therefore must be restored exactly between requests.
+    pub fn reset(&mut self) -> Result<(), CacheError> {
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            fill_state(
+                layer.main_kv_state.as_mut(),
+                0.0,
+                layer_index,
+                CacheKind::MainKvState,
+            )?;
+            fill_state(
+                layer.main_score_state.as_mut(),
+                f32::NEG_INFINITY,
+                layer_index,
+                CacheKind::MainScoreState,
+            )?;
+            fill_state(
+                layer.indexer_kv_state.as_mut(),
+                0.0,
+                layer_index,
+                CacheKind::IndexerKvState,
+            )?;
+            fill_state(
+                layer.indexer_score_state.as_mut(),
+                f32::NEG_INFINITY,
+                layer_index,
+                CacheKind::IndexerScoreState,
+            )?;
+        }
         self.next_position = 0;
+        Ok(())
     }
-}
-
-fn completed_group_step(tokens_after: usize, ratio: u32) -> (Option<usize>, usize) {
-    if ratio == 0 {
-        return (None, 0);
-    }
-    let ratio = ratio as usize;
-    let completed = tokens_after / ratio;
-    let write = (tokens_after % ratio == 0).then(|| completed - 1);
-    (write, completed)
-}
-
-fn validate_request(cfg: &Deepseek4Config, context_length: usize) -> Result<(), CacheError> {
-    if context_length == 0 {
-        return Err(CacheError::EmptyContext);
-    }
-    let maximum = cfg.max_position_embeddings as usize;
-    if context_length > maximum {
-        return Err(CacheError::ContextBound {
-            requested: context_length,
-            maximum,
-        });
-    }
-    if cfg.sliding_window != REQUIRED_WINDOW {
-        return Err(CacheError::SlidingWindow {
-            actual: cfg.sliding_window,
-        });
-    }
-    let expected = cfg.num_hidden_layers as usize;
-    if cfg.compress_ratios.len() != expected {
-        return Err(CacheError::LayerCount {
-            expected,
-            actual: cfg.compress_ratios.len(),
-        });
-    }
-    if let Some((layer, &ratio)) = cfg
-        .compress_ratios
-        .iter()
-        .enumerate()
-        .find(|(_, ratio)| !matches!(ratio, 0 | 4 | 128))
-    {
-        return Err(CacheError::CompressionRatio { layer, ratio });
-    }
-    Ok(())
-}
-
-fn optional_buffer_plan(
-    layer: usize,
-    kind: CacheKind,
-    capacity: usize,
-    width: usize,
-) -> Result<Option<CacheBufferPlan>, CacheError> {
-    (capacity > 0)
-        .then(|| buffer_plan(layer, kind, capacity, width))
-        .transpose()
-}
-
-fn buffer_plan(
-    layer: usize,
-    kind: CacheKind,
-    capacity: usize,
-    width: usize,
-) -> Result<CacheBufferPlan, CacheError> {
-    let elements = u64::try_from(capacity)
-        .ok()
-        .and_then(|capacity| {
-            u64::try_from(width)
-                .ok()
-                .and_then(|width| capacity.checked_mul(width))
-        })
-        .ok_or(CacheError::ByteOverflow { layer, kind })?;
-    let bytes = elements
-        .checked_mul(CACHE_DTYPE.size_of() as u64)
-        .ok_or(CacheError::ByteOverflow { layer, kind })?;
-    Ok(CacheBufferPlan {
-        shape: vec![capacity, width],
-        bytes,
-    })
-}
-
-fn allocate_buffer(
-    device: &MlxDevice,
-    layer: usize,
-    kind: CacheKind,
-    plan: &CacheBufferPlan,
-) -> Result<MlxBuffer, CacheError> {
-    let bytes = usize::try_from(plan.bytes).map_err(|_| CacheError::AddressSpace {
-        layer,
-        kind,
-        bytes: plan.bytes,
-    })?;
-    device
-        .alloc_buffer(bytes, CACHE_DTYPE, plan.shape.clone())
-        .map_err(|source| CacheError::Allocate {
-            layer,
-            kind,
-            source,
-        })
 }

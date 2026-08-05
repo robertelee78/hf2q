@@ -65,8 +65,9 @@ fn official_config() -> Deepseek4Config {
 fn official_one_million_context_plan_has_exact_shapes_and_bytes() {
     let plan = Deepseek4CachePlan::for_context(&official_config(), 1_048_576).unwrap();
     assert_eq!(plan.layers.len(), 43);
-    assert_eq!(plan.resident_bytes, 7_219_838_976);
+    assert_eq!(plan.resident_bytes, 7_232_045_056);
 
+    assert_eq!(plan.layers[0].attention_kv.shape, vec![128, 512]);
     assert_eq!(plan.layers[0].window_kv.shape, vec![128, 512]);
     assert!(plan.layers[0].compressed_kv.is_none());
     assert!(plan.layers[0].indexer_kv.is_none());
@@ -77,16 +78,39 @@ fn official_one_million_context_plan_has_exact_shapes_and_bytes() {
         ratio_four.compressed_kv.as_ref().unwrap().shape,
         vec![262_144, 512]
     );
+    assert_eq!(ratio_four.attention_kv.shape, vec![262_272, 512]);
     assert_eq!(
         ratio_four.indexer_kv.as_ref().unwrap().shape,
         vec![262_144, 128]
     );
+    assert_eq!(
+        ratio_four.main_kv_state.as_ref().unwrap().shape,
+        vec![1, 8, 1024]
+    );
+    assert_eq!(
+        ratio_four.main_score_state.as_ref().unwrap().shape,
+        vec![1, 8, 1024]
+    );
+    assert_eq!(
+        ratio_four.indexer_kv_state.as_ref().unwrap().shape,
+        vec![1, 8, 256]
+    );
+    assert_eq!(
+        ratio_four.indexer_score_state.as_ref().unwrap().shape,
+        vec![1, 8, 256]
+    );
+    assert_eq!(ratio_four.main_kv_state.as_ref().unwrap().dtype, DType::F32);
 
     let ratio_128 = &plan.layers[3];
     assert_eq!(ratio_128.compress_ratio, 128);
     assert_eq!(
         ratio_128.compressed_kv.as_ref().unwrap().shape,
         vec![8192, 512]
+    );
+    assert_eq!(ratio_128.attention_kv.shape, vec![8320, 512]);
+    assert_eq!(
+        ratio_128.main_kv_state.as_ref().unwrap().shape,
+        vec![1, 128, 512]
     );
     assert!(ratio_128.indexer_kv.is_none());
     assert_eq!(
@@ -136,7 +160,7 @@ fn malformed_context_schedule_and_overflow_fail_closed() {
         Deepseek4CachePlan::for_context(&overflowing, u32::MAX as usize),
         Err(CacheError::ByteOverflow {
             layer: 1,
-            kind: CacheKind::WindowKv
+            kind: CacheKind::AttentionKv
         })
     ));
 }
@@ -148,12 +172,14 @@ fn allocator_materializes_the_plan_as_zeroed_bf16_buffers() {
     cfg.head_dim = 32;
     cfg.index_head_dim = 16;
     let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
-    assert_eq!(plan.resident_bytes, 27_712);
+    assert_eq!(plan.resident_bytes, 66_624);
 
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
     assert_eq!(cache.resident_bytes(), plan.resident_bytes);
     assert_eq!(cache.layers().len(), 3);
+    assert_eq!(cache.layers()[1].attention_kv.dtype(), DType::BF16);
+    assert_eq!(cache.layers()[1].attention_kv.shape(), &[160, 32]);
     assert_eq!(cache.layers()[1].window_kv.dtype(), DType::BF16);
     assert_eq!(cache.layers()[1].window_kv.shape(), &[128, 32]);
     assert_eq!(
@@ -164,6 +190,26 @@ fn allocator_materializes_the_plan_as_zeroed_bf16_buffers() {
         cache.layers()[1].indexer_kv.as_ref().unwrap().shape(),
         &[32, 16]
     );
+    assert_eq!(
+        cache.layers()[1]
+            .compressed_kv
+            .as_ref()
+            .unwrap()
+            .byte_offset(),
+        (128 * 32 * DType::BF16.size_of()) as u64
+    );
+    assert_eq!(
+        cache.layers()[1].main_kv_state.as_ref().unwrap().shape(),
+        &[1, 8, 64]
+    );
+    assert_eq!(
+        cache.layers()[1]
+            .indexer_score_state
+            .as_ref()
+            .unwrap()
+            .shape(),
+        &[1, 8, 32]
+    );
     assert!(cache.layers()[1]
         .indexer_kv
         .as_ref()
@@ -172,6 +218,22 @@ fn allocator_materializes_the_plan_as_zeroed_bf16_buffers() {
         .unwrap()
         .iter()
         .all(|value| *value == 0));
+    assert!(cache.layers()[1]
+        .main_kv_state
+        .as_ref()
+        .unwrap()
+        .as_slice::<f32>()
+        .unwrap()
+        .iter()
+        .all(|value| *value == 0.0));
+    assert!(cache.layers()[1]
+        .main_score_state
+        .as_ref()
+        .unwrap()
+        .as_slice::<f32>()
+        .unwrap()
+        .iter()
+        .all(|value| *value == f32::NEG_INFINITY));
 }
 
 #[test]
@@ -205,7 +267,7 @@ fn cache_steps_publish_only_complete_groups_and_commit_transactionally() {
     assert_eq!(after_boundary.layers[0].compressed_write_slot, None);
     assert_eq!(after_boundary.layers[0].compressed_valid_after, 1);
 
-    cache.reset();
+    cache.reset().unwrap();
     for expected in 0..128 {
         let step = cache.plan_next_step().unwrap();
         assert_eq!(step.position, expected);
