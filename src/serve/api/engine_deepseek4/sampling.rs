@@ -11,7 +11,7 @@ use crate::serve::api::registry::{self, ModelRegistration, SplitSlot};
 use crate::serve::sampler_pure;
 
 use super::progress::RequestProgress;
-use super::Deepseek4LoadedModel;
+use super::{release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard};
 
 pub(super) fn sampler_config(params: &SamplingParams) -> sampler_pure::SamplingParams {
     sampler_pure::SamplingParams {
@@ -208,12 +208,14 @@ pub fn generate_once(
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
 ) -> Result<GenerationResult> {
+    let scratch_guard = RequestScratchGuard::new();
     let mut progress = RequestProgress::start("unary", prompt_tokens.len(), params.max_tokens);
     let prefill_started = Instant::now();
     let (mut logits, cached_tokens) =
         loaded.prefill_suffix(prompt_tokens, params.max_tokens, || false, &mut progress)?;
     let prefill_duration = prefill_started.elapsed();
     progress.finish_prefill(prefill_duration);
+    release_completed_prefill_scratch();
     let sampler = sampler_config(params);
     let mut runtime = grammar_runtime(params)?;
     let max_tokens = decode_token_limit(
@@ -266,6 +268,7 @@ pub fn generate_once(
 
     let (text, reasoning_text) = split_reasoning(&raw, registration, params.reasoning_forced_open);
     progress.complete(finish_reason, generated.len(), None);
+    scratch_guard.complete();
     Ok(GenerationResult {
         text,
         reasoning_text,

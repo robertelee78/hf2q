@@ -16,40 +16,120 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
 
 use super::residency::RawMatrixRef;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransientPoolPhase {
+    Inactive,
+    Prefill,
+    Decode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransientScratchStats {
+    pub free_buffers: usize,
+    pub free_bytes: usize,
+}
+
 thread_local! {
-    static TRANSIENT_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
-    static TRANSIENT_POOL_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    // Prefill scratch grows with prompt position (notably the ratio-four
+    // indexer score/top-k workspaces). Keeping it in the decode arena retains
+    // the cold prompt's multi-gigabyte high-water for the rest of an agentic
+    // session. Separate arenas let serving release prefill scratch after TTFT
+    // while preserving the small steady-state decode working set.
+    static PREFILL_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+    static DECODE_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+    static TRANSIENT_POOL_PHASE: Cell<TransientPoolPhase> = const { Cell::new(TransientPoolPhase::Inactive) };
 }
 
 pub(super) fn begin_prefill_pool_layer() {
-    begin_transient_pool_cycle();
+    begin_transient_pool_cycle(TransientPoolPhase::Prefill);
 }
 
 pub(super) fn end_prefill_pool_layer() {
-    end_transient_pool_cycle();
+    end_transient_pool_cycle(TransientPoolPhase::Prefill);
 }
 
 pub(super) fn begin_decode_pool_token() {
-    begin_transient_pool_cycle();
+    begin_transient_pool_cycle(TransientPoolPhase::Decode);
 }
 
 pub(super) fn end_decode_pool_token() {
-    end_transient_pool_cycle();
+    end_transient_pool_cycle(TransientPoolPhase::Decode);
 }
 
-fn begin_transient_pool_cycle() {
-    TRANSIENT_POOL_ACTIVE.with(|active| {
-        debug_assert!(!active.get(), "nested DeepSeek-V4 transient pool cycle");
-        active.set(true);
+fn begin_transient_pool_cycle(phase: TransientPoolPhase) {
+    TRANSIENT_POOL_PHASE.with(|active| {
+        debug_assert_eq!(
+            active.get(),
+            TransientPoolPhase::Inactive,
+            "nested DeepSeek-V4 transient pool cycle"
+        );
+        active.set(phase);
     });
 }
 
-fn end_transient_pool_cycle() {
-    TRANSIENT_POOL_ACTIVE.with(|active| {
-        debug_assert!(active.get(), "inactive DeepSeek-V4 transient pool cycle");
-        active.set(false);
+fn end_transient_pool_cycle(phase: TransientPoolPhase) {
+    TRANSIENT_POOL_PHASE.with(|active| {
+        debug_assert_eq!(
+            active.get(),
+            phase,
+            "DeepSeek-V4 transient pool phase drift"
+        );
+        active.set(TransientPoolPhase::Inactive);
     });
-    TRANSIENT_POOL.with(|pool| pool.borrow_mut().reset());
+    match phase {
+        TransientPoolPhase::Prefill => PREFILL_POOL.with(|pool| pool.borrow_mut().reset()),
+        TransientPoolPhase::Decode => DECODE_POOL.with(|pool| pool.borrow_mut().reset()),
+        TransientPoolPhase::Inactive => unreachable!("cannot end an inactive transient pool"),
+    }
+}
+
+fn pool_stats(pool: &RefCell<MlxBufferPool>) -> TransientScratchStats {
+    let pool = pool.borrow();
+    TransientScratchStats {
+        free_buffers: pool.free_count(),
+        free_bytes: pool.free_bytes(),
+    }
+}
+
+fn release_pool(pool: &RefCell<MlxBufferPool>) -> TransientScratchStats {
+    let mut pool = pool.borrow_mut();
+    debug_assert_eq!(
+        pool.in_use_count(),
+        0,
+        "cannot release active DeepSeek-V4 transient scratch"
+    );
+    let stats = TransientScratchStats {
+        free_buffers: pool.free_count(),
+        free_bytes: pool.free_bytes(),
+    };
+    pool.clear();
+    stats
+}
+
+pub(crate) fn prefill_scratch_stats() -> TransientScratchStats {
+    PREFILL_POOL.with(pool_stats)
+}
+
+pub(crate) fn decode_scratch_stats() -> TransientScratchStats {
+    DECODE_POOL.with(pool_stats)
+}
+
+pub(crate) fn release_prefill_scratch() -> TransientScratchStats {
+    debug_assert_eq!(
+        TRANSIENT_POOL_PHASE.with(Cell::get),
+        TransientPoolPhase::Inactive,
+        "cannot release DeepSeek-V4 prefill scratch during a graph"
+    );
+    PREFILL_POOL.with(release_pool)
+}
+
+pub(crate) fn release_decode_scratch() -> TransientScratchStats {
+    debug_assert_eq!(
+        TRANSIENT_POOL_PHASE.with(Cell::get),
+        TransientPoolPhase::Inactive,
+        "cannot release DeepSeek-V4 decode scratch during a graph"
+    );
+    DECODE_POOL.with(release_pool)
 }
 
 pub(super) fn alloc(
@@ -65,15 +145,16 @@ pub(super) fn alloc(
     let bytes = elements
         .checked_mul(dtype.size_of())
         .with_context(|| format!("DeepSeek-V4 {label} byte size overflow"))?;
-    let pooled = TRANSIENT_POOL_ACTIVE.with(Cell::get);
-    if pooled {
-        TRANSIENT_POOL
+    match TRANSIENT_POOL_PHASE.with(Cell::get) {
+        TransientPoolPhase::Prefill => PREFILL_POOL
             .with(|pool| pool.borrow_mut().alloc(device, bytes, dtype, shape))
-            .with_context(|| format!("allocate pooled DeepSeek-V4 {label}"))
-    } else {
-        device
+            .with_context(|| format!("allocate pooled DeepSeek-V4 prefill {label}")),
+        TransientPoolPhase::Decode => DECODE_POOL
+            .with(|pool| pool.borrow_mut().alloc(device, bytes, dtype, shape))
+            .with_context(|| format!("allocate pooled DeepSeek-V4 decode {label}")),
+        TransientPoolPhase::Inactive => device
             .alloc_buffer(bytes, dtype, shape)
-            .with_context(|| format!("allocate DeepSeek-V4 {label}"))
+            .with_context(|| format!("allocate DeepSeek-V4 {label}")),
     }
 }
 
@@ -562,5 +643,40 @@ mod tests {
         end_decode_pool_token();
 
         assert_eq!(second_ptr, first_ptr);
+    }
+
+    #[test]
+    fn prefill_and_decode_scratch_have_independent_release_lifecycles() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        release_prefill_scratch();
+        release_decode_scratch();
+
+        begin_prefill_pool_layer();
+        {
+            let _buffer = alloc(&device, DType::F32, vec![16], "prefill lifecycle test")
+                .expect("allocate prefill test buffer");
+        }
+        end_prefill_pool_layer();
+        assert!(prefill_scratch_stats().free_bytes >= 64);
+        assert_eq!(decode_scratch_stats().free_bytes, 0);
+
+        let released_prefill = release_prefill_scratch();
+        assert!(released_prefill.free_bytes >= 64);
+        assert_eq!(prefill_scratch_stats().free_bytes, 0);
+
+        begin_decode_pool_token();
+        {
+            let _buffer = alloc(&device, DType::F32, vec![32], "decode lifecycle test")
+                .expect("allocate decode test buffer");
+        }
+        end_decode_pool_token();
+        assert!(decode_scratch_stats().free_bytes >= 128);
+        assert_eq!(prefill_scratch_stats().free_bytes, 0);
+
+        let released_decode = release_decode_scratch();
+        assert!(released_decode.free_bytes >= 128);
+        assert_eq!(decode_scratch_stats().free_bytes, 0);
     }
 }

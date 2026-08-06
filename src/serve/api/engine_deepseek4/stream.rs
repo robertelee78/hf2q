@@ -13,7 +13,7 @@ use crate::serve::api::sse::{DeltaKind, GenerationEvent, StreamStats};
 
 use super::progress::RequestProgress;
 use super::sampling::{decode_token_limit, grammar_runtime, sample, sampler_config};
-use super::Deepseek4LoadedModel;
+use super::{release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard};
 
 fn send_visible(
     events: &mpsc::Sender<GenerationEvent>,
@@ -266,6 +266,7 @@ pub fn generate_stream(
     registration: Option<&ModelRegistration>,
     cancellation_counter: Option<&AtomicU64>,
 ) {
+    let scratch_guard = RequestScratchGuard::new();
     let mut progress = RequestProgress::start("stream", prompt_tokens.len(), params.max_tokens);
     let run = (|| -> Result<()> {
         let request_started = Instant::now();
@@ -278,6 +279,7 @@ pub fn generate_stream(
         )?;
         let prefill_duration = prefill_started.elapsed();
         progress.finish_prefill(prefill_duration);
+        release_completed_prefill_scratch();
         let sampler = sampler_config(params);
         let mut runtime = grammar_runtime(params)?;
         let mut reasoning = registration.and_then(|registration| {
@@ -448,14 +450,16 @@ pub fn generate_stream(
         Ok(())
     })();
 
-    if let Err(error) = run {
-        if error.to_string().contains("disconnected") || events.is_closed() {
+    match run {
+        Ok(()) => scratch_guard.complete(),
+        Err(error) if error.to_string().contains("disconnected") || events.is_closed() => {
             if let Some(counter) = cancellation_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             progress.cancelled();
             tracing::info!("DeepSeek-V4 SSE stream dropped; generation cancelled");
-        } else {
+        }
+        Err(error) => {
             progress.failed(&error);
             let _ = events.blocking_send(GenerationEvent::Error(format!("{error:#}")));
         }

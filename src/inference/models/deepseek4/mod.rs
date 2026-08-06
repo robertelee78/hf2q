@@ -33,6 +33,10 @@ mod verifier_forward;
 pub mod weights;
 
 pub use config::Deepseek4Config;
+pub(crate) use forward_support::{
+    decode_scratch_stats, prefill_scratch_stats, release_decode_scratch, release_prefill_scratch,
+    TransientScratchStats,
+};
 pub use model::Deepseek4Model;
 pub use residency::Deepseek4Weights;
 pub(crate) use verifier_forward::matrix_prefill_chunk_len;

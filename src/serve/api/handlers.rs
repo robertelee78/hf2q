@@ -78,6 +78,17 @@ pub(crate) fn probe_bos_token_id(tokenizer: &tokenizers::Tokenizer) -> Option<u3
         .find_map(|t| tokenizer.token_to_id(t))
 }
 
+fn prefill_tokens_per_second(
+    prompt_tokens: usize,
+    cached_tokens: usize,
+    prefill_time_secs: f64,
+) -> f64 {
+    if prefill_time_secs <= 0.0 {
+        return 0.0;
+    }
+    prompt_tokens.saturating_sub(cached_tokens) as f64 / prefill_time_secs
+}
+
 // ---------------------------------------------------------------------------
 // Pool-routing helper (ADR-005 Phase 4 iter-209 — Decision #26 auto-swap)
 // ---------------------------------------------------------------------------
@@ -559,11 +570,11 @@ async fn chat_completions_with_prepared(
     let prefill_time_secs = result.prefill_duration.as_secs_f64();
     let decode_time_secs = result.decode_duration.as_secs_f64();
     let total_time_secs = total_time.as_secs_f64();
-    let prefill_tokens_per_sec = if prefill_time_secs > 0.0 {
-        result.prompt_tokens as f64 / prefill_time_secs
-    } else {
-        0.0
-    };
+    let prefill_tokens_per_sec = prefill_tokens_per_second(
+        result.prompt_tokens,
+        result.cached_tokens,
+        prefill_time_secs,
+    );
     let decode_tokens_per_sec = if decode_time_secs > 0.0 {
         result.completion_tokens as f64 / decode_time_secs
     } else {
@@ -7771,6 +7782,13 @@ pub(crate) fn test_scan(dir: &Path) -> std::io::Result<Vec<ModelObject>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_rate_counts_only_uncached_work() {
+        assert_eq!(prefill_tokens_per_second(10_000, 9_000, 2.0), 500.0);
+        assert_eq!(prefill_tokens_per_second(10_000, 10_000, 0.001), 0.0);
+        assert_eq!(prefill_tokens_per_second(10_000, 0, 0.0), 0.0);
+    }
 
     #[test]
     fn scan_missing_dir_returns_empty() {

@@ -21,6 +21,7 @@ pub(super) struct RequestProgress {
     prefill_work_tokens: usize,
     prefill_completed_tokens: usize,
     last_prefill_report: Duration,
+    last_prefill_report_tokens: usize,
     decode_started: Option<Instant>,
     last_decode_report: Duration,
     first_semantic_reported: bool,
@@ -45,6 +46,7 @@ impl RequestProgress {
             prefill_work_tokens: 0,
             prefill_completed_tokens: 0,
             last_prefill_report: Duration::ZERO,
+            last_prefill_report_tokens: 0,
             decode_started: None,
             last_decode_report: Duration::ZERO,
             first_semantic_reported: false,
@@ -61,6 +63,7 @@ impl RequestProgress {
         self.prefill_work_tokens = work_tokens;
         self.prefill_completed_tokens = 0;
         self.last_prefill_report = self.started.elapsed();
+        self.last_prefill_report_tokens = 0;
         tracing::info!(
             request_id = self.id,
             prompt_tokens = self.prompt_tokens,
@@ -86,8 +89,12 @@ impl RequestProgress {
         ) {
             return;
         }
-        self.last_prefill_report = elapsed;
-        let rate = self.prefill_completed_tokens as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        let interval_tokens = self
+            .prefill_completed_tokens
+            .saturating_sub(self.last_prefill_report_tokens);
+        let interval_elapsed = elapsed.saturating_sub(self.last_prefill_report);
+        let rate = tokens_per_second(self.prefill_completed_tokens, elapsed);
+        let interval_rate = tokens_per_second(interval_tokens, interval_elapsed);
         let percent = if self.prefill_work_tokens == 0 {
             100.0
         } else {
@@ -99,14 +106,19 @@ impl RequestProgress {
             work_tokens = self.prefill_work_tokens,
             percent,
             tokens_per_second = rate,
+            interval_tokens,
+            interval_seconds = interval_elapsed.as_secs_f64(),
+            interval_tokens_per_second = interval_rate,
             elapsed_seconds = elapsed.as_secs_f64(),
             "DeepSeek-V4 prefill progress"
         );
+        self.last_prefill_report = elapsed;
+        self.last_prefill_report_tokens = self.prefill_completed_tokens;
     }
 
     pub(super) fn finish_prefill(&mut self, duration: Duration) {
         let suffix_tokens = self.prompt_tokens.saturating_sub(self.cached_tokens);
-        let rate = suffix_tokens as f64 / duration.as_secs_f64().max(f64::EPSILON);
+        let rate = tokens_per_second(suffix_tokens, duration);
         tracing::info!(
             request_id = self.id,
             prompt_tokens = self.prompt_tokens,
@@ -142,7 +154,7 @@ impl RequestProgress {
             return;
         }
         self.last_decode_report = elapsed;
-        let rate = generated_tokens as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        let rate = tokens_per_second(generated_tokens, elapsed);
         tracing::info!(
             request_id = self.id,
             generated_tokens,
@@ -209,14 +221,24 @@ impl RequestProgress {
     }
 }
 
+fn tokens_per_second(tokens: usize, duration: Duration) -> f64 {
+    tokens as f64 / duration.as_secs_f64().max(f64::EPSILON)
+}
+
 fn should_report(previous: Duration, now: Duration, completed: usize, total: usize) -> bool {
     total > 0 && (completed >= total || now.saturating_sub(previous) >= REPORT_INTERVAL)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{should_report, REPORT_INTERVAL};
+    use super::{should_report, tokens_per_second, REPORT_INTERVAL};
     use std::time::Duration;
+
+    #[test]
+    fn interval_rate_uses_only_the_latest_progress_window() {
+        assert_eq!(tokens_per_second(2_048, Duration::from_secs(8)), 256.0);
+        assert_eq!(tokens_per_second(4_096, Duration::from_secs(8)), 512.0);
+    }
 
     #[test]
     fn progress_is_throttled_until_interval_or_completion() {

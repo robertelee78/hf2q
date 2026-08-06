@@ -21,7 +21,9 @@ use tokenizers::Tokenizer;
 
 use crate::inference::models::deepseek4::{
     cache::{Deepseek4Cache, Deepseek4CacheSnapshot},
-    matrix_prefill_chunk_len, tokenizer as deepseek_tokenizer, Deepseek4Model,
+    decode_scratch_stats, matrix_prefill_chunk_len, prefill_scratch_stats, release_decode_scratch,
+    release_prefill_scratch, tokenizer as deepseek_tokenizer, Deepseek4Model,
+    TransientScratchStats,
 };
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
@@ -39,6 +41,70 @@ const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
 const MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS: usize = 32;
 const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
+/// Preserve a modest hot decode arena across successful agent turns, but do
+/// not leave a multi-gigabyte working set idle beside a 100 GiB model.
+const MAX_RETAINED_DECODE_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+
+fn should_retain_decode_scratch(stats: TransientScratchStats) -> bool {
+    stats.free_bytes <= MAX_RETAINED_DECODE_SCRATCH_BYTES
+}
+
+fn log_scratch(action: &'static str, phase: &'static str, stats: TransientScratchStats) {
+    if stats.free_buffers == 0 && stats.free_bytes == 0 {
+        return;
+    }
+    tracing::info!(
+        action,
+        phase,
+        buffers = stats.free_buffers,
+        bytes = stats.free_bytes,
+        "DeepSeek-V4 transient scratch"
+    );
+}
+
+pub(super) fn release_completed_prefill_scratch() {
+    let stats = prefill_scratch_stats();
+    if stats.free_bytes > 0 {
+        log_scratch("release", "prefill-complete", release_prefill_scratch());
+    }
+}
+
+/// Fail-safe cleanup for early returns. Successful requests keep a bounded
+/// decode arena hot; failed/cancelled requests release both arenas.
+pub(super) struct RequestScratchGuard {
+    completed: bool,
+}
+
+impl RequestScratchGuard {
+    pub(super) fn new() -> Self {
+        Self { completed: false }
+    }
+
+    pub(super) fn complete(mut self) {
+        release_completed_prefill_scratch();
+        let decode = decode_scratch_stats();
+        if !should_retain_decode_scratch(decode) {
+            log_scratch("release", "decode-retention-cap", release_decode_scratch());
+        } else {
+            log_scratch("retain", "decode-hot", decode);
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for RequestScratchGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        log_scratch(
+            "release",
+            "request-abort-prefill",
+            release_prefill_scratch(),
+        );
+        log_scratch("release", "request-abort-decode", release_decode_scratch());
+    }
+}
 
 pub struct Deepseek4LoadedModel {
     pub model: Deepseek4Model,
@@ -141,6 +207,7 @@ impl Deepseek4LoadedModel {
             cache
                 .reset()
                 .context("reset DeepSeek-V4 cache after warmup")?;
+            log_scratch("release", "startup-warmup", release_prefill_scratch());
         }
 
         Ok(Self {
@@ -555,8 +622,21 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_capacity_for_request, prefer_matrix_prefill, select_prefix_reuse, PrefixReuse,
+        cache_capacity_for_request, prefer_matrix_prefill, select_prefix_reuse,
+        should_retain_decode_scratch, PrefixReuse, TransientScratchStats,
     };
+
+    #[test]
+    fn decode_scratch_retention_is_bounded() {
+        assert!(should_retain_decode_scratch(TransientScratchStats {
+            free_buffers: 1,
+            free_bytes: 256 * 1024 * 1024,
+        }));
+        assert!(!should_retain_decode_scratch(TransientScratchStats {
+            free_buffers: 1,
+            free_bytes: 256 * 1024 * 1024 + 1,
+        }));
+    }
 
     #[test]
     fn advertised_context_does_not_eagerly_allocate_unused_kv() {

@@ -1,11 +1,12 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
 - **Status:** Accepted for hf2q 0.1.1
-- **Updated:** 2026-08-06 — the mixed-quant candidate passed real OpenCode and
-  97K/119.8K tool-result cache reuse, including source-code tool arguments;
-  repeated 121K cold-prefill variance keeps stable H4 parity subject to the
-  required controlled median, and publication remains controlled by the
-  exact-SHA release workflow
+- **Updated:** 2026-08-06 — corrected a kernel-confirmed macOS memory-pressure
+  kill caused by retained transient prefill arenas; a 98K cache-continuation
+  run and the full agentic gate passed with a 107 GB peak and 102 GB
+  post-request footprint. Repeated 121K cold-prefill variance still keeps
+  stable H4 parity subject to the required controlled median, and publication
+  remains controlled by the exact-SHA release workflow
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -70,6 +71,58 @@ suffix counts, throttled prefill and decode progress, first semantic stream
 event, and terminal timing or error. The canonical DeepSeek OpenCode launcher
 enables `-v` so a long cold prefill or buffered DSML tool call is visibly
 progressing without exposing prompt text, decoded text, or tool arguments.
+Prefill progress reports both the request-wide average and the latest interval
+rate; the latter exposes context-position cost instead of making every later
+sample look like an unexplained cumulative slowdown. API prefill throughput
+counts only uncached tokens, so an exact cache hit reports zero prefill work
+rather than dividing the entire prompt by a near-zero cache lookup duration.
+
+Completed prefill scratch has a request-bounded lifetime. Prefill and decode
+use separate `mlx-native` buffer arenas; once prompt logits and transactional
+KV state are committed, hf2q clears the prefill arena before decode. Successful
+requests may retain at most 256 MiB of decode scratch, while cancellation or an
+error clears both arenas. Logical KV/recurrent cache state, recovery snapshots,
+weights, and prompt logits are not allocated from either transient arena.
+
+## Memory-pressure incident and correction (2026-08-06)
+
+The earlier memory-safety acceptance statement was falsified by a real OpenCode
+session. At `2026-08-06 10:06:41.847` macOS logged `triggering no paging space
+action` followed by `killing largest compressed process hf2q [74158] 108840
+MB`. The shell's unqualified `zsh: killed` was therefore a kernel SIGKILL, not
+an hf2q inference error, an operator interrupt, or an agent-issued signal.
+
+Source inspection localized the retained footprint to the transient Metal
+arena rather than the logical DeepSeek cache. `MlxBufferPool::reset()` moves
+in-use buffers into power-of-two free buckets for reuse; it does not release
+those buckets. DeepSeek previously shared one thread-local arena between
+matrix prefill and decode, so successively larger context-dependent score,
+top-k, attention, and activation workspaces from the cold prompt remained
+resident through every later cached agent turn. Small 15-1,030-token suffixes
+therefore reused KV correctly but could not return the multi-gigabyte cold-
+prefill high-water to macOS.
+
+The corrected release build produced the following exact evidence on the same
+M5 Max and 107,431,343,104-byte artifact:
+
+| Gate | Result |
+|---|---|
+| Startup warmup | Released 106,832,652 transient bytes before readiness. |
+| 32,777-token cold prompt | 90.393 s, 362.60 tok/s request average; interval rate declined from 526.92 tok/s at 4K to 269.58 tok/s at 32K as ratio-four history grew; released 3,990,399,216 prefill bytes before decode. |
+| 98,009-token continuation | Reused 32,769 tokens, evaluated 65,240 in 292.049 s (223.39 tok/s), released 4,275,579,120 prefill bytes, and survived. |
+| Exact 98,009-token repeat | Reported all 98,009 tokens cached and returned `OK` in 0.798 s, proving scratch release did not discard logical cache state. |
+| Process/host memory | 107 GB peak, 102 GB after requests, 94% system free, and no increase in swapouts during the 98K run. |
+| Agentic semantics after the long run | `scripts/test_deepseek4_agentic.sh` passed required/automatic tools, unary/SSE, exact Rust source arguments, tool-result continuation, and 6,252/6,260 prefix reuse; cached TTFT was 259 ms. |
+
+The context-position throughput slope is not itself an arena leak. Ratio-four
+index selection must score an expanding compressed history, and the pinned
+llama.cpp graph also scans the valid lightning-indexer history. The new interval
+metric makes that workload visible. No new matched llama.cpp run was performed
+for this memory correction, so the existing H4 parity qualification remains.
+The reviewed phase-adaptive DSpark bundle is a CUDA/vLLM speculative-decoding
+patch; the accepted base artifact explicitly excludes DSpark tensors, so that
+work cannot correct this prefill-arena lifetime defect and remains a separate
+future optimization.
 
 ## Context and spike result
 
@@ -345,7 +398,7 @@ changes. The measured candidate is
 | 98K OpenCode-scale revalidation | A fresh 97,127-token required-tool request completed cold prefill in 424.522 s (228.79 tok/s). Its 97,214-token tool-result turn restored the compact recovery anchor, reused 97,119 tokens (99.90%), evaluated a 95-token suffix in 1.378 s TTFT, and completed in 2 s. |
 | Repeated 121K variance | A later fresh 119,835-token run completed cold prefill in 573.954 s (208.79 tok/s) and failed the checked-in 540 s bound; decode was 21.98 tok/s. This single hot-host run is slower than the matched 217.5 tok/s llama.cpp result and prevents claiming stable cold-prefill parity from a favorable run. H4 remains subject to a controlled three-run median. |
 | Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
-| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate without GPU failure or growing swap. Eagerly allocating the full 524,288-token cache beside this artifact also OOMed, motivating demand growth. Only one 100 GiB-class runtime was resident during every comparison. |
+| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate. A later OpenCode session falsified the steady-state claim when macOS killed hf2q at 108,840 MB after the shared transient arena retained cold-prefill buckets. The corrected split-arena build released 4.28 GB after a 98K continuation, held 102 GB after the request with a 107 GB peak, preserved the exact cache hit, and did not grow swapouts during that run. Eagerly allocating the full 524,288-token cache beside this artifact still OOMs, so demand growth remains required. Only one 100 GiB-class runtime was resident during every comparison. |
 
 The performance result comes from two measured defaults. Decode groups two
 verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two
