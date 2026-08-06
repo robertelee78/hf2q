@@ -4,16 +4,23 @@
 #
 # The DeepSeek cache is native and in-memory:
 #
-#   HF2Q_DEEPSEEK_MAX_SEQ_LEN=131072
-#                           Allocates the live cache plus one equally sized
-#                           prompt-tail recovery checkpoint (~1.71 GiB total
-#                           at 131K). Growing transcripts prefill only their
+#   HF2Q_DEEPSEEK_MAX_SEQ_LEN=524288
+#                           Advertises a 512K serving limit while initially
+#                           allocating a 131K live cache (~877 MiB). Capacity
+#                           grows in 131K steps only when the transcript needs
+#                           it; the prompt-tail checkpoint stays ~17 MiB.
+#                           Growing transcripts prefill only their
 #                           suffix; reasoning canonicalization restores the
 #                           checkpoint and replays the rewritten tail.
 #   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
 #                           Gentle loop mitigation when a sampling client omits
 #                           repetition_penalty. Explicit request values win;
 #                           temperature-zero greedy decoding is unchanged.
+#   HF2Q_DEEPSEEK_PREFILL_WINDOWS=adaptive
+#                           Uses the measured 2,048-token transaction while
+#                           the live cache is 131K, then 1,024 after capacity
+#                           grows. Set PREFILL_WINDOWS explicitly only when
+#                           benchmarking a measured alternative.
 #   --overflow-policy reject
 #                           OpenCode manages conversation compaction, so the
 #                           server reports context overflow instead of silently
@@ -22,6 +29,9 @@
 #                           Required by the current single-session DeepSeek
 #                           prefix-cache worker. Concurrent requests queue;
 #                           slot-aware serving is rejected explicitly.
+#   -v                      Enables request/cache/prefill/decode progress at
+#                           info level. Direct `hf2q serve` remains quiet by
+#                           default; this foreground launcher is observable.
 #
 # Unlike the Qwen launcher, this does not set HF2Q_KV_LCP_RESUME or configure
 # --kv-persist. DeepSeek-V4 owns a family-specific live cache and recovery
@@ -31,13 +41,14 @@
 # Usage:
 #   scripts/serve_deepseek4_opencode.sh             # foreground (default)
 #   PORT=8090 scripts/serve_deepseek4_opencode.sh   # override port
-#   CONTEXT_LEN=262144 scripts/serve_deepseek4_opencode.sh
+#   CONTEXT_LEN=131072 scripts/serve_deepseek4_opencode.sh  # lower-memory
+#   CONTEXT_LEN=1048576 scripts/serve_deepseek4_opencode.sh # full trained window
 set -euo pipefail
 
 MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
-CONTEXT_LEN="${CONTEXT_LEN:-131072}"
+CONTEXT_LEN="${CONTEXT_LEN:-524288}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
@@ -49,6 +60,13 @@ fi
 if ! [[ "$CONTEXT_LEN" =~ ^[0-9]+$ ]] || (( CONTEXT_LEN < 128 )); then
     echo "CONTEXT_LEN must be an integer of at least 128 (got: $CONTEXT_LEN)" >&2
     exit 3
+fi
+if [[ -n "${PREFILL_WINDOWS:-}" ]]; then
+    if ! [[ "$PREFILL_WINDOWS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "PREFILL_WINDOWS must be a positive integer (got: $PREFILL_WINDOWS)" >&2
+        exit 3
+    fi
+    export HF2Q_DEEPSEEK_PREFILL_WINDOWS="$PREFILL_WINDOWS"
 fi
 
 # Fail before loading the ~100 GiB model when another service owns the port.
@@ -81,7 +99,7 @@ done
 exec env \
     HF2Q_DEEPSEEK_MAX_SEQ_LEN="$CONTEXT_LEN" \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
-    "$HF2Q_BIN" serve \
+    "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \
         --port "$PORT" \

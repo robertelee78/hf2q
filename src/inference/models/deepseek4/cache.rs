@@ -163,13 +163,15 @@ pub struct Deepseek4Cache {
     _device: MlxDevice,
 }
 
-/// Exact, non-aliasing capture of a DeepSeek-V4 cache at a token boundary.
+/// Exact rollback state for a DeepSeek-V4 cache at a token boundary.
 ///
-/// The attention allocation owns both the circular-window and compressed-KV
-/// views, so only that parent buffer is copied. Indexer KV and every recurrent
-/// compressor buffer are captured separately. Restoring all of them is
-/// required: restoring KV without the recurrent pooling state silently
-/// changes every later compressed token.
+/// Compressed and indexer KV rows are append-only: decode after the anchor can
+/// only write rows at or beyond the anchor's logical position, and restoring
+/// `next_position` makes those future rows invisible until replay overwrites
+/// them. The 128-token circular window and recurrent compressor state *are*
+/// overwritten by decode, so the snapshot owns compact, non-aliasing copies
+/// of exactly those buffers. This keeps rollback exact without duplicating a
+/// context-linear multi-gigabyte allocation.
 pub struct Deepseek4CacheSnapshot {
     layers: Vec<LayerCacheSnapshot>,
     plan: Deepseek4CachePlan,
@@ -178,8 +180,7 @@ pub struct Deepseek4CacheSnapshot {
 }
 
 struct LayerCacheSnapshot {
-    attention_kv: MlxBuffer,
-    indexer_kv: Option<MlxBuffer>,
+    window_kv: MlxBuffer,
     main_kv_state: Option<MlxBuffer>,
     main_score_state: Option<MlxBuffer>,
     indexer_kv_state: Option<MlxBuffer>,
@@ -418,30 +419,29 @@ impl Deepseek4Cache {
         self.next_position
     }
 
+    pub fn capacity(&self) -> usize {
+        self.plan.context_length
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// Capture an exact prompt-boundary cache snapshot that can be restored
-    /// before prefilling only the suffix of a later, prefix-extending prompt.
+    /// Capture exact prompt-boundary rollback state before generation mutates
+    /// the circular window and recurrent compressor state.
     pub fn snapshot(&self) -> Result<Deepseek4CacheSnapshot, CacheError> {
         if self.poisoned {
             return Err(CacheError::Poisoned);
         }
         let mut layers = Vec::with_capacity(self.layers.len());
+        let mut resident_bytes = 0_u64;
         for (layer_index, layer) in self.layers.iter().enumerate() {
-            layers.push(LayerCacheSnapshot {
-                attention_kv: snapshot_buffer(
+            let snapshot = LayerCacheSnapshot {
+                window_kv: snapshot_buffer(
                     &self._device,
-                    &layer.attention_kv,
+                    &layer.window_kv,
                     layer_index,
-                    CacheKind::AttentionKv,
-                )?,
-                indexer_kv: snapshot_optional_buffer(
-                    &self._device,
-                    layer.indexer_kv.as_ref(),
-                    layer_index,
-                    CacheKind::IndexerKv,
+                    CacheKind::WindowKv,
                 )?,
                 main_kv_state: snapshot_optional_buffer(
                     &self._device,
@@ -467,20 +467,42 @@ impl Deepseek4Cache {
                     layer_index,
                     CacheKind::IndexerScoreState,
                 )?,
-            });
+            };
+            let layer_bytes = std::iter::once(&snapshot.window_kv)
+                .chain(snapshot.main_kv_state.iter())
+                .chain(snapshot.main_score_state.iter())
+                .chain(snapshot.indexer_kv_state.iter())
+                .chain(snapshot.indexer_score_state.iter())
+                .try_fold(0_u64, |total, buffer| {
+                    u64::try_from(buffer.byte_len())
+                        .ok()
+                        .and_then(|bytes| total.checked_add(bytes))
+                })
+                .ok_or(CacheError::ByteOverflow {
+                    layer: layer_index,
+                    kind: CacheKind::WindowKv,
+                })?;
+            resident_bytes =
+                resident_bytes
+                    .checked_add(layer_bytes)
+                    .ok_or(CacheError::ByteOverflow {
+                        layer: layer_index,
+                        kind: CacheKind::WindowKv,
+                    })?;
+            layers.push(snapshot);
         }
         Ok(Deepseek4CacheSnapshot {
             layers,
             plan: self.plan.clone(),
             next_position: self.next_position,
-            resident_bytes: self.resident_bytes,
+            resident_bytes,
         })
     }
 
     /// Restore a prior token-boundary snapshot into this fixed-capacity cache.
     /// The cache remains allocated; only its bytes and logical position move.
     pub fn restore(&mut self, snapshot: &Deepseek4CacheSnapshot) -> Result<(), CacheError> {
-        if snapshot.plan != self.plan || snapshot.resident_bytes != self.resident_bytes {
+        if snapshot.plan != self.plan {
             return Err(CacheError::SnapshotPlanMismatch);
         }
         if snapshot.layers.len() != self.layers.len() {
@@ -496,16 +518,10 @@ impl Deepseek4Cache {
             .enumerate()
         {
             restore_buffer(
-                &source.attention_kv,
-                &mut destination.attention_kv,
+                &source.window_kv,
+                &mut destination.window_kv,
                 layer_index,
-                CacheKind::AttentionKv,
-            )?;
-            restore_optional_buffer(
-                source.indexer_kv.as_ref(),
-                destination.indexer_kv.as_mut(),
-                layer_index,
-                CacheKind::IndexerKv,
+                CacheKind::WindowKv,
             )?;
             restore_optional_buffer(
                 source.main_kv_state.as_ref(),

@@ -11,6 +11,7 @@ use crate::serve::api::registry::{
 };
 use crate::serve::api::sse::{DeltaKind, GenerationEvent, StreamStats};
 
+use super::progress::RequestProgress;
 use super::sampling::{decode_token_limit, grammar_runtime, sample, sampler_config};
 use super::Deepseek4LoadedModel;
 
@@ -265,12 +266,18 @@ pub fn generate_stream(
     registration: Option<&ModelRegistration>,
     cancellation_counter: Option<&AtomicU64>,
 ) {
+    let mut progress = RequestProgress::start("stream", prompt_tokens.len(), params.max_tokens);
     let run = (|| -> Result<()> {
         let request_started = Instant::now();
         let prefill_started = request_started;
-        let (mut logits, cached_tokens) =
-            loaded.prefill_suffix(prompt_tokens, || events.is_closed())?;
+        let (mut logits, cached_tokens) = loaded.prefill_suffix(
+            prompt_tokens,
+            params.max_tokens,
+            || events.is_closed(),
+            &mut progress,
+        )?;
         let prefill_duration = prefill_started.elapsed();
+        progress.finish_prefill(prefill_duration);
         let sampler = sampler_config(params);
         let mut runtime = grammar_runtime(params)?;
         let mut reasoning = registration.and_then(|registration| {
@@ -288,6 +295,7 @@ pub fn generate_stream(
             loaded.context_limit(),
         );
         let decode_started = Instant::now();
+        progress.start_decode();
         let mut generated = Vec::with_capacity(max_tokens);
         let mut decoded_running = String::new();
         let mut finish_reason = "length";
@@ -331,6 +339,9 @@ pub fn generate_stream(
                     request_started,
                     &mut first_visible_at,
                 )?;
+                if let Some(ttft) = first_visible_at {
+                    progress.first_semantic_token(ttft);
+                }
             }
             if params
                 .stop_strings
@@ -343,6 +354,7 @@ pub fn generate_stream(
             if step + 1 < max_tokens {
                 logits = loaded.commit_generated_token(token)?;
             }
+            progress.advance_decode(generated.len());
         }
 
         if let Some(splitter) = reasoning.as_mut() {
@@ -432,6 +444,7 @@ pub fn generate_stream(
                 },
             })
             .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
+        progress.complete(finish_reason, generated.len(), Some(semantic_ttft));
         Ok(())
     })();
 
@@ -440,8 +453,10 @@ pub fn generate_stream(
             if let Some(counter) = cancellation_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
+            progress.cancelled();
             tracing::info!("DeepSeek-V4 SSE stream dropped; generation cancelled");
         } else {
+            progress.failed(&error);
             let _ = events.blocking_send(GenerationEvent::Error(format!("{error:#}")));
         }
     }

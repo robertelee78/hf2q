@@ -10,6 +10,7 @@ use crate::serve::api::grammar::GrammarRuntime;
 use crate::serve::api::registry::{self, ModelRegistration, SplitSlot};
 use crate::serve::sampler_pure;
 
+use super::progress::RequestProgress;
 use super::Deepseek4LoadedModel;
 
 pub(super) fn sampler_config(params: &SamplingParams) -> sampler_pure::SamplingParams {
@@ -207,9 +208,12 @@ pub fn generate_once(
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
 ) -> Result<GenerationResult> {
+    let mut progress = RequestProgress::start("unary", prompt_tokens.len(), params.max_tokens);
     let prefill_started = Instant::now();
-    let (mut logits, cached_tokens) = loaded.prefill_suffix(prompt_tokens, || false)?;
+    let (mut logits, cached_tokens) =
+        loaded.prefill_suffix(prompt_tokens, params.max_tokens, || false, &mut progress)?;
     let prefill_duration = prefill_started.elapsed();
+    progress.finish_prefill(prefill_duration);
     let sampler = sampler_config(params);
     let mut runtime = grammar_runtime(params)?;
     let max_tokens = decode_token_limit(
@@ -218,6 +222,7 @@ pub fn generate_once(
         loaded.context_limit(),
     );
     let decode_started = Instant::now();
+    progress.start_decode();
     let mut generated = Vec::with_capacity(max_tokens);
     let mut logprobs = params.logprobs.then(|| Vec::with_capacity(max_tokens));
     let tokenizer = loaded.tokenizer.clone();
@@ -256,9 +261,11 @@ pub fn generate_once(
         if step + 1 < max_tokens {
             logits = loaded.commit_generated_token(token)?;
         }
+        progress.advance_decode(generated.len());
     }
 
     let (text, reasoning_text) = split_reasoning(&raw, registration, params.reasoning_forced_open);
+    progress.complete(finish_reason, generated.len(), None);
     Ok(GenerationResult {
         text,
         reasoning_text,

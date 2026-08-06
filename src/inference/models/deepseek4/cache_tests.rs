@@ -402,7 +402,7 @@ fn prefill_transactions_cross_window_and_compression_boundaries() {
 }
 
 #[test]
-fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() {
+fn compact_snapshot_restores_overwritten_window_state_and_position_without_aliasing() {
     let mut cfg = config(vec![0, 4, 128]);
     cfg.max_position_embeddings = 128;
     cfg.head_dim = 8;
@@ -412,7 +412,7 @@ fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() 
     let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
 
     cache.layers_mut()[1]
-        .attention_kv
+        .window_kv
         .as_mut_slice::<u16>()
         .unwrap()[3] = 0x1234;
     cache.layers_mut()[1]
@@ -435,18 +435,12 @@ fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() 
 
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.position(), 7);
-    assert_eq!(snapshot.resident_bytes(), cache.resident_bytes());
+    assert!(snapshot.resident_bytes() < cache.resident_bytes());
 
     cache.layers_mut()[1]
-        .attention_kv
+        .window_kv
         .as_mut_slice::<u16>()
         .unwrap()[3] = 0;
-    cache.layers_mut()[1]
-        .indexer_kv
-        .as_mut()
-        .unwrap()
-        .as_mut_slice::<u16>()
-        .unwrap()[2] = 0;
     cache.layers_mut()[1]
         .main_kv_state
         .as_mut()
@@ -458,7 +452,7 @@ fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() 
     cache.restore(&snapshot).unwrap();
     assert_eq!(cache.position(), 7);
     assert_eq!(
-        cache.layers()[1].attention_kv.as_slice::<u16>().unwrap()[3],
+        cache.layers()[1].window_kv.as_slice::<u16>().unwrap()[3],
         0x1234
     );
     assert_eq!(
@@ -480,14 +474,15 @@ fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() 
         9.25
     );
 
-    // Mutating the live cache after restore must not mutate the snapshot.
+    // Mutating the live circular window after restore must not mutate the
+    // compact snapshot.
     cache.layers_mut()[1]
-        .attention_kv
+        .window_kv
         .as_mut_slice::<u16>()
         .unwrap()[3] = 0xabcd;
     cache.restore(&snapshot).unwrap();
     assert_eq!(
-        cache.layers()[1].attention_kv.as_slice::<u16>().unwrap()[3],
+        cache.layers()[1].window_kv.as_slice::<u16>().unwrap()[3],
         0x1234
     );
 }

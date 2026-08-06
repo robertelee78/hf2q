@@ -2650,9 +2650,13 @@ fn deepseek4_tool_call_gbnf(
         ),
         (
             "dsml-string-char".into(),
-            // `<` begins the closing DSML parameter tag. Backslash escapes
-            // remain allowed so ordinary source-code/path arguments work.
-            r#"[^<\\] | [\\] [^\x00-\x1F]"#.into(),
+            // String-valued DSML parameters carry raw tool arguments, so
+            // source code and shell syntax must be able to contain `<`.
+            // The following literal close-tag rule still delimits the value;
+            // GrammarRuntime retains both branches while a `<` prefix is
+            // ambiguous. Excluding every `<` forced coding calls such as
+            // `fmt::Formatter<'_>` to close at `fmt::Formatter`.
+            r#"[^\\] | [\\] [^\x00-\x1F]"#.into(),
         ),
         ("dsml-string-val".into(), "dsml-string-char*".into()),
     ];
@@ -4402,6 +4406,45 @@ mod tests {
         let missing = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"line\" string=\"false\">7</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
         let alive = rejected.accept_bytes(missing.as_bytes());
         assert!(!(alive && rejected.is_accepted()));
+    }
+
+    #[test]
+    fn deepseek4_string_parameter_accepts_source_code_with_angle_brackets() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"}
+            },
+            "required": ["content"]
+        }"#;
+        let mut runtime = deepseek4_runtime(
+            "write",
+            schema,
+            GrammarShape::OneOrMoreCalls { parallel: false },
+        );
+        let call = r#"<｜DSML｜tool_calls>
+<｜DSML｜invoke name="write">
+<｜DSML｜parameter name="content" string="true">impl fmt::Display for Bottles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bottles", self.0)
+    }
+}</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"#;
+        assert!(runtime.accept_bytes(call.as_bytes()));
+        assert!(runtime.is_accepted());
+
+        let body = call
+            .strip_prefix("<｜DSML｜tool_calls>")
+            .and_then(|value| value.strip_suffix("</｜DSML｜tool_calls>"))
+            .expect("outer DSML block");
+        let parsed = parse_tool_call_bodies(&DEEPSEEK4, body).expect("parse DSML tool call");
+        assert_eq!(parsed.len(), 1);
+        let arguments: serde_json::Value =
+            serde_json::from_str(&parsed[0].arguments_json).expect("arguments JSON");
+        let content = arguments["content"].as_str().expect("content string");
+        assert!(content.contains("fmt::Formatter<'_>"));
+        assert!(content.contains("-> fmt::Result"));
     }
 
     #[test]

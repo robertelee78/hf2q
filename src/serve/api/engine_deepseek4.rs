@@ -4,6 +4,7 @@
 //! committed into it. Growing OpenAI transcripts reuse that live prefix and
 //! prefill only the rendered suffix; divergent/compacted transcripts reset.
 
+mod progress;
 mod sampling;
 mod stream;
 
@@ -26,6 +27,7 @@ use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
 };
 
+use self::progress::RequestProgress;
 use super::engine::LoadOptions;
 
 /// First practical OpenCode target: enough headroom for the ~100K-token
@@ -33,6 +35,7 @@ use super::engine::LoadOptions;
 /// can lower/raise it with `HF2Q_DEEPSEEK_MAX_SEQ_LEN`; model metadata remains
 /// authoritative.
 pub const DEFAULT_CONTEXT_LENGTH: usize = 131_072;
+const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
 const MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS: usize = 32;
 const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
@@ -107,9 +110,17 @@ impl Deepseek4LoadedModel {
             "DeepSeek-V4 serving context {context_length} must be at least the {}-token native window",
             model.cfg.sliding_window
         );
+        let initial_cache_length = context_length.min(INITIAL_CACHE_LENGTH);
         let mut cache = model
-            .allocate_cache(context_length)
-            .with_context(|| format!("allocate {context_length}-token DeepSeek-V4 cache"))?;
+            .allocate_cache(initial_cache_length)
+            .with_context(|| {
+                format!("allocate initial {initial_cache_length}-token DeepSeek-V4 cache")
+            })?;
+        tracing::info!(
+            serving_context = context_length,
+            allocated_cache_context = initial_cache_length,
+            "DeepSeek-V4 cache admitted with demand-grown capacity"
+        );
 
         // Metal pipeline creation and the first page-in of the 43 verifier
         // layers otherwise happen after the server has announced readiness,
@@ -168,6 +179,45 @@ impl Deepseek4LoadedModel {
         Ok(())
     }
 
+    fn ensure_cache_capacity(&mut self, prompt_tokens: usize, max_tokens: usize) -> Result<bool> {
+        let target = cache_capacity_for_request(
+            self.context_limit(),
+            self.cache.capacity(),
+            prompt_tokens,
+            max_tokens,
+        );
+        if target <= self.cache.capacity() {
+            return Ok(false);
+        }
+
+        let previous = self.cache.capacity();
+        // Drop the context-linear allocation before creating its larger
+        // replacement. A one-window placeholder keeps the model in a valid,
+        // resettable state if the larger allocation is rejected by Metal.
+        let placeholder_capacity = self.model.cfg.sliding_window as usize;
+        let placeholder = self
+            .model
+            .allocate_cache(placeholder_capacity)
+            .context("allocate DeepSeek-V4 cache-growth placeholder")?;
+        let old = std::mem::replace(&mut self.cache, placeholder);
+        drop(old);
+        self.committed_tokens.clear();
+        self.live_logits = None;
+        self.turn_anchor = None;
+        self.turn_anchor_tokens.clear();
+
+        self.cache = self.model.allocate_cache(target).with_context(|| {
+            format!("grow DeepSeek-V4 cache from {previous} to {target} tokens")
+        })?;
+        tracing::info!(
+            previous_cache_context = previous,
+            allocated_cache_context = target,
+            serving_context = self.context_limit(),
+            "DeepSeek-V4 cache capacity grown for request"
+        );
+        Ok(true)
+    }
+
     fn capture_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
         // Release the old fixed-capacity copy before allocating its replacement.
         self.turn_anchor = None;
@@ -191,13 +241,22 @@ impl Deepseek4LoadedModel {
         &mut self,
         tokens: &[u32],
         cancelled: &impl Fn() -> bool,
+        progress: &mut RequestProgress,
     ) -> Result<Option<MlxBuffer>> {
         if tokens.is_empty() {
             return Ok(None);
         }
         let mut state = None;
         let mut offset = 0;
-        let window_multiplier = self.model.matrix_prefill_window_multiplier()?;
+        let explicit_prefill_windows = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_WINDOWS").is_some();
+        let mut window_multiplier = self.model.matrix_prefill_window_multiplier()?;
+        if !explicit_prefill_windows && self.cache.capacity() > INITIAL_CACHE_LENGTH {
+            // A grown context-linear cache leaves less unified-memory scratch
+            // than the initial 131K allocation. Preserve the measured 2K
+            // transaction for ordinary agent sessions, but halve it after a
+            // real request crosses the first capacity boundary.
+            window_multiplier = window_multiplier.min(8);
+        }
         while offset < tokens.len() {
             let batch = matrix_prefill_chunk_len(
                 self.cache.position(),
@@ -220,6 +279,7 @@ impl Deepseek4LoadedModel {
             self.committed_tokens
                 .extend_from_slice(&tokens[offset..offset + batch]);
             offset += batch;
+            progress.advance_prefill(batch);
         }
         for &token in &tokens[offset..] {
             anyhow::ensure!(
@@ -232,6 +292,7 @@ impl Deepseek4LoadedModel {
                     .context("execute DeepSeek-V4 cached-prefix append token")?,
             );
             self.committed_tokens.push(token);
+            progress.advance_prefill(1);
         }
         Ok(state)
     }
@@ -239,7 +300,9 @@ impl Deepseek4LoadedModel {
     fn prefill_suffix(
         &mut self,
         prompt_tokens: &[u32],
+        max_tokens: usize,
         cancelled: impl Fn() -> bool,
+        progress: &mut RequestProgress,
     ) -> Result<(MlxBuffer, usize)> {
         anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
         anyhow::ensure!(
@@ -248,6 +311,7 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
+        let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 
         let reuse = prefer_matrix_prefill(
             prompt_tokens.len(),
@@ -266,8 +330,8 @@ impl Deepseek4LoadedModel {
             ),
         );
         let reset_from_scratch = matches!(reuse, PrefixReuse::Reset);
-        let cached_tokens = match reuse {
-            PrefixReuse::Live(count) => count,
+        let (cached_tokens, cache_action) = match reuse {
+            PrefixReuse::Live(count) => (count, "live"),
             PrefixReuse::RecoveryAnchor(count) => {
                 let snapshot = self
                     .turn_anchor
@@ -278,13 +342,26 @@ impl Deepseek4LoadedModel {
                     .context("restore DeepSeek-V4 prompt-boundary cache")?;
                 self.committed_tokens.clone_from(&self.turn_anchor_tokens);
                 self.live_logits = None;
-                count
+                (count, "recovery-anchor")
             }
             PrefixReuse::Reset => {
                 self.reset_live_cache()?;
-                0
+                (0, if cache_grew { "grow-reset" } else { "reset" })
             }
         };
+        let recovery_position = prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS);
+        let native_prefill_rows = self.model.cfg.sliding_window as usize;
+        let short_recovery_prepass =
+            reset_from_scratch && recovery_position > 0 && recovery_position < native_prefill_rows;
+        let work_tokens = prompt_tokens
+            .len()
+            .saturating_sub(cached_tokens)
+            .saturating_add(
+                short_recovery_prepass
+                    .then_some(recovery_position)
+                    .unwrap_or(0),
+            );
+        progress.plan_prefill(cached_tokens, work_tokens, cache_action);
         if prompt_tokens.len() == cached_tokens {
             return self
                 .live_logits
@@ -293,13 +370,10 @@ impl Deepseek4LoadedModel {
                 .context("DeepSeek-V4 exact-prefix cache hit has no aligned live logits");
         }
 
-        let recovery_position = prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS);
-        let native_prefill_rows = self.model.cfg.sliding_window as usize;
-
         // Short position-zero prompts must execute as one verifier batch.
         // Build their small recovery checkpoint in a separate prepass.
-        if reset_from_scratch && recovery_position > 0 && recovery_position < native_prefill_rows {
-            self.append_prompt_tokens(&prompt_tokens[..recovery_position], &cancelled)?;
+        if short_recovery_prepass {
+            self.append_prompt_tokens(&prompt_tokens[..recovery_position], &cancelled, progress)?;
             self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
             self.cache
                 .reset()
@@ -308,7 +382,7 @@ impl Deepseek4LoadedModel {
             self.live_logits = None;
 
             let final_state = self
-                .append_prompt_tokens(prompt_tokens, &cancelled)?
+                .append_prompt_tokens(prompt_tokens, &cancelled, progress)?
                 .context("DeepSeek-V4 prompt produced no verifier state")?;
             return self.finish_prefill(final_state, 0);
         }
@@ -316,13 +390,16 @@ impl Deepseek4LoadedModel {
         let mut cursor = cached_tokens;
         let mut final_state = None;
         if recovery_position > cursor {
-            final_state =
-                self.append_prompt_tokens(&prompt_tokens[cursor..recovery_position], &cancelled)?;
+            final_state = self.append_prompt_tokens(
+                &prompt_tokens[cursor..recovery_position],
+                &cancelled,
+                progress,
+            )?;
             cursor = recovery_position;
             self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
         }
         final_state = self
-            .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled)?
+            .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled, progress)?
             .or(final_state);
         self.finish_prefill(
             final_state.context("DeepSeek-V4 suffix produced no verifier state")?,
@@ -365,6 +442,24 @@ impl Deepseek4LoadedModel {
         self.live_logits = Some(logits.clone());
         Ok(logits)
     }
+}
+
+fn cache_capacity_for_request(
+    serving_context: usize,
+    current_capacity: usize,
+    prompt_tokens: usize,
+    max_tokens: usize,
+) -> usize {
+    let required = prompt_tokens
+        .saturating_add(max_tokens.max(1).saturating_sub(1))
+        .min(serving_context);
+    if required <= current_capacity {
+        return current_capacity;
+    }
+    required
+        .div_ceil(INITIAL_CACHE_LENGTH)
+        .saturating_mul(INITIAL_CACHE_LENGTH)
+        .min(serving_context)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,15 +546,33 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
             kv_cache_budget_bytes,
             kv_spill_active,
             tq_kv_active: false,
-            // Live cache + one equally sized recovery snapshot.
-            kv_bytes_per_token_override: Some(13_760),
+            // Context-linear live cache. Recovery rollback is a fixed ~17 MiB.
+            kv_bytes_per_token_override: Some(6_880),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{prefer_matrix_prefill, select_prefix_reuse, PrefixReuse};
+    use super::{
+        cache_capacity_for_request, prefer_matrix_prefill, select_prefix_reuse, PrefixReuse,
+    };
+
+    #[test]
+    fn advertised_context_does_not_eagerly_allocate_unused_kv() {
+        assert_eq!(
+            cache_capacity_for_request(524_288, 131_072, 98_000, 8_192),
+            131_072
+        );
+        assert_eq!(
+            cache_capacity_for_request(524_288, 131_072, 131_000, 8_192),
+            262_144
+        );
+        assert_eq!(
+            cache_capacity_for_request(524_288, 262_144, 510_000, 32_768),
+            524_288
+        );
+    }
 
     #[test]
     fn growing_transcript_prefers_longest_live_prefix() {

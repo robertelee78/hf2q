@@ -1,10 +1,11 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
 - **Status:** Accepted for hf2q 0.1.1
-- **Updated:** 2026-08-06 — the mixed-quant candidate passed a real OpenCode
-  two-turn coding run, a 119.8K-token tool/caching gate, and same-artifact
-  llama.cpp throughput comparison; publication is controlled by the exact-SHA
-  release workflow
+- **Updated:** 2026-08-06 — the mixed-quant candidate passed real OpenCode and
+  97K/119.8K tool-result cache reuse, including source-code tool arguments;
+  repeated 121K cold-prefill variance keeps stable H4 parity subject to the
+  required controlled median, and publication remains controlled by the
+  exact-SHA release workflow
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -62,6 +63,13 @@ For SSE, `time_to_first_token_ms` measures the first API-visible reasoning,
 content, or structured tool-call event. Prefill completion alone is not TTFT:
 DSML text is intentionally withheld until a complete tool block can be parsed,
 so the metric includes that silent decode interval.
+
+Serving stays quiet at the default warning log filter. With `-v`, the native
+worker reports a content-free request identifier, cache action, prompt/cached/
+suffix counts, throttled prefill and decode progress, first semantic stream
+event, and terminal timing or error. The canonical DeepSeek OpenCode launcher
+enables `-v` so a long cold prefill or buffered DSML tool call is visibly
+progressing without exposing prompt text, decoded text, or tool arguments.
 
 ## Context and spike result
 
@@ -234,18 +242,32 @@ context boundary, so an oversized `max_tokens` request terminates with
 `finish_reason: "length"` instead of writing out of bounds.
 
 For a context capacity `C` divisible by 128, one native cache allocation is
-`17,842,176 + 6,880*C` bytes. The default `C=131,072` allocation is
-919,617,536 bytes (about 877 MiB); the recovery snapshot has the same fixed
-capacity, so admission accounts for 13,760 bytes per context token and about
-1.71 GiB across both allocations. At the trained one-million-token limit, each
-allocation is 7,232,045,056 bytes. Operators must choose a serving context that
-leaves sufficient unified-memory headroom for both cache copies and scratch.
+`17,842,176 + 6,880*C` bytes. The canonical OpenCode launcher now requests
+`C=524,288`: a fully grown live allocation is 3,624,943,616 bytes. Serving
+capacity and physical cache capacity are distinct: the canonical launcher
+advertises 512K but initially allocates 131,072 tokens and grows in 131K steps
+only when a request needs more space. Ordinary 100K-class OpenCode sessions do
+not pay for unused half-million-token KV. Recovery snapshots copy only the
+mutable 128-token circular windows and recurrent compressor state; compressed
+and indexer history is append-only and becomes invisible when the logical
+position rolls back. The compact snapshot is therefore context-independent
+(17,842,176 bytes for the official 43-layer schedule) instead of duplicating
+the entire live cache. At the trained one-million-token limit a fully grown
+live allocation is 7,232,045,056 bytes. Operators must still leave sufficient
+unified-memory headroom for Metal scratch. The previously validated 131,072-
+token gate remains the performance baseline until a larger real prompt crosses
+the first growth boundary. Matrix prefill remains at the measured 2,048-token
+transaction while physical capacity is 131K and drops to 1,024 tokens after
+growth unless an operator supplies an explicit benchmark override.
 
 Tool definitions are rendered by the owned 0731 encoder. Grammar-constrained
 generation emits one official `<｜DSML｜tool_calls>` envelope containing one or
 more invokes, validates required parameters, and converts the completed block
 to OpenAI `tool_calls` objects for both unary JSON and SSE. Raw DSML framing is
-not exposed to API clients.
+not exposed to API clients. String parameters admit ordinary source-code angle
+brackets. An earlier `[^<\\]` grammar rule forced calls containing Rust generic
+or lifetime syntax such as `fmt::Formatter<'_>` to close immediately before
+the `<`, yielding valid but semantically truncated tool arguments.
 
 ## Acceptance gates
 
@@ -313,15 +335,17 @@ changes. The measured candidate is
 | Quant plan | 1,328 verifier tensors: 172 Q2_K, 86 Q3_K, 532 Q8_0, 535 F32, and 3 I32; 4,705 DSpark tensors explicitly excluded from the base artifact |
 | Conversion bound | Rust-native row-aligned streaming; maximum working vector bound 4,798,873,600 bytes; no external converter or inference process |
 | Arithmetic coherence | Greedy `What is 2+2? Reply with only number.` returned exactly `4` |
-| Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. A real OpenCode two-turn run then issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
+| Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. The source-argument regression also returned `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result` byte-for-byte in one `emit_source` call (4 s response), proving the formerly truncated `<` syntax through the real model. A real OpenCode two-turn run issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
 | Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
-| Prefix reuse | Repeated, auto, SSE, and post-tool turns each reused 6,242 of 6,250 rendered prompt tokens; cached TTFT was 233-244 ms |
-| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and the near-boundary cache gate at its default 131,072-token capacity. |
+| Prefix reuse | The current checked-in gate used a 6,253-token prompt and reused 6,245 tokens on repeated, auto, SSE, and post-tool turns. Cold semantic response was 19 s; cached and automatic turns were 2 s, SSE tool-call delivery was 2 s, and the tool-result continuation was 7 s. |
+| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and near-boundary cache gates at 131,072 physical tokens. It now advertises 524,288 tokens and demand-allocates 131K initially. A 97K operator-shaped prompt is validated under that default; neither a prompt crossing 131K nor a near-512K physical allocation is yet accepted on this 128 GiB host. |
 | Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; llama.cpp build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
 | 121K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced a coherent tool call for 119,821 prompt tokens in 494.449 s TTFT. The same artifact under llama.cpp build 10293 processed the 121K-class source-bound prompt at 217.5 tok/s, about 556 s. hf2q completed about 61 s sooner. |
 | 121K continuation cache | Appending the real tool result produced a 119,916-token request that reused 119,813 tokens (99.91%), processed only a 103-token suffix, and returned its first semantic token in 1.275 s. |
+| 98K OpenCode-scale revalidation | A fresh 97,127-token required-tool request completed cold prefill in 424.522 s (228.79 tok/s). Its 97,214-token tool-result turn restored the compact recovery anchor, reused 97,119 tokens (99.90%), evaluated a 95-token suffix in 1.378 s TTFT, and completed in 2 s. |
+| Repeated 121K variance | A later fresh 119,835-token run completed cold prefill in 573.954 s (208.79 tok/s) and failed the checked-in 540 s bound; decode was 21.98 tok/s. This single hot-host run is slower than the matched 217.5 tok/s llama.cpp result and prevents claiming stable cold-prefill parity from a favorable run. H4 remains subject to a controlled three-run median. |
 | Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
-| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate without GPU failure or growing swap. Only one 100 GiB-class runtime was resident during every comparison. |
+| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate without GPU failure or growing swap. Eagerly allocating the full 524,288-token cache beside this artifact also OOMed, motivating demand growth. Only one 100 GiB-class runtime was resident during every comparison. |
 
 The performance result comes from two measured defaults. Decode groups two
 verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two
@@ -409,7 +433,7 @@ current readiness.
 | Pinned compute dependency | `mlx-native` commit `7cc3d308c37161e6602c9218ad3a14b5f86d7d4a`; pushed, clean-checkout build verified, and pinned exactly in `Cargo.lock` |
 | Clean dependency regression | 27 mlx-native tests passed across indexer, MoE routing, Q2_K, sparse-prefill-mask, and dense-GEMM suites |
 | Official activation simulation | Owned Metal E4M3/E8M0 main-KV and Hadamard+E2M1/E8M0 indexer paths match exact BF16 CPU references; 3/3 focused tests passed |
-| Compressed cache ownership | Fixed-offset contiguous raw/compressed KV views plus exact main/indexer F32 recurrent states; snapshots copy all attention/indexer/recurrent state without aliasing; 1M-token resident plan 7,232,045,056 bytes per live cache or checkpoint |
+| Compressed cache ownership | Fixed-offset contiguous raw/compressed KV views plus exact main/indexer F32 recurrent states; compact rollback snapshots copy the overwritten circular windows and recurrent state without aliasing, while append-only compressed/indexer rows are hidden by restored logical position; the 1M-token live-cache plan is 7,232,045,056 bytes and the official compact snapshot is context-independent at 17,842,176 bytes |
 | Official native residency | 96,265,327,964 resident weight bytes; 128-token cache admitted; zero process swaps |
 | Official uncompressed-prefix proof | Layers 0-1 Q2_K attention plus exact hash-routed/shared MoE passed transactionally in 28.36 s cold; 99,047,478,968-byte peak footprint |
 | Official compressed-prefix proof | Layers 0-3 passed through ratio-4 and ratio-128 attention plus hash/learned MoE in 25.25 s after load/build; 68,298,014,720-byte max RSS; zero swaps |

@@ -18,7 +18,9 @@ MAX_CACHED_SEMANTIC_MS=${MAX_CACHED_SEMANTIC_MS:-10000}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-60}
 MAX_TOKENS=${MAX_TOKENS:-128}
+SOURCE_MAX_TOKENS=${SOURCE_MAX_TOKENS:-256}
 SENTINEL=${SENTINEL:-SENTINEL_CARGO_HF2Q_AGENTIC}
+EXPECTED_SOURCE=${EXPECTED_SOURCE:-"fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result"}
 
 for command in curl date jq rg; do
   command -v "$command" >/dev/null || {
@@ -26,7 +28,7 @@ for command in curl date jq rg; do
     exit 2
   }
 done
-for setting in MAX_TOKENS CURL_CONNECT_TIMEOUT_SECONDS CURL_MAX_TIME_SECONDS; do
+for setting in MAX_TOKENS SOURCE_MAX_TOKENS CURL_CONNECT_TIMEOUT_SECONDS CURL_MAX_TIME_SECONDS; do
   value=${!setting}
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "$setting must be a positive integer (got: $value)" >&2
@@ -44,11 +46,13 @@ stream_json_file=$(mktemp -t hf2q-deepseek-agentic-stream-json.XXXXXX)
 stream_timing_file=$(mktemp -t hf2q-deepseek-agentic-stream-timing.XXXXXX)
 continuation_file=$(mktemp -t hf2q-deepseek-agentic-continuation.XXXXXX)
 continuation_response=$(mktemp -t hf2q-deepseek-agentic-continuation-response.XXXXXX)
+source_request_file=$(mktemp -t hf2q-deepseek-agentic-source-request.XXXXXX)
+source_response_file=$(mktemp -t hf2q-deepseek-agentic-source-response.XXXXXX)
 cleanup() {
   rm -f "$request_file" "$first_file" "$second_file" "$auto_request_file" \
     "$auto_file" "$stream_file" \
     "$stream_json_file" "$stream_timing_file" "$continuation_file" \
-    "$continuation_response"
+    "$continuation_response" "$source_request_file" "$source_response_file"
 }
 trap cleanup EXIT
 
@@ -318,6 +322,59 @@ if (( continuation_response_ms > MAX_CACHED_RESPONSE_MS )); then
   exit 1
 fi
 
+# Regression for a real OpenCode failure: the DeepSeek DSML grammar used to
+# reject every `<` inside string parameters, so Rust lifetimes/generics forced
+# an otherwise valid tool call to close at `fmt::Formatter`. Exercise the real
+# model and require byte-exact source preservation, not merely valid JSON.
+jq -n \
+  --arg model "$MODEL" \
+  --arg expected_source "$EXPECTED_SOURCE" \
+  --argjson max_tokens "$SOURCE_MAX_TOKENS" '{
+    model: $model,
+    messages: [
+      {
+        role: "system",
+        content: "You are a coding agent. Use the provided tool exactly once and preserve source code byte for byte."
+      },
+      {
+        role: "user",
+        content: ("Call emit_source exactly once with content equal to the following line. Do not explain.\n" + $expected_source)
+      }
+    ],
+    tools: [{
+      type: "function",
+      function: {
+        name: "emit_source",
+        description: "Emit source code without changing it",
+        parameters: {
+          type: "object",
+          properties: {content: {type: "string"}},
+          required: ["content"],
+          additionalProperties: false
+        }
+      }
+    }],
+    tool_choice: "required",
+    temperature: 0,
+    max_tokens: $max_tokens,
+    stream: false
+  }' >"$source_request_file"
+
+source_started=$(epoch_ms)
+post_json "$source_request_file" "$source_response_file"
+source_response_ms=$(( $(epoch_ms) - source_started ))
+if ! jq -e --arg expected "$EXPECTED_SOURCE" '
+  (.choices | length) == 1
+  and .choices[0].finish_reason == "tool_calls"
+  and ((.choices[0].message.tool_calls // []) | length) == 1
+  and .choices[0].message.tool_calls[0].function.name == "emit_source"
+  and ((.choices[0].message.tool_calls[0].function.arguments | fromjson).content == $expected)
+' "$source_response_file" >/dev/null; then
+  echo "agentic gate failed: source tool argument lost or changed angle-bracket syntax" >&2
+  jq '.choices[0]' "$source_response_file" >&2
+  exit 1
+fi
+
 jq -n \
   --argjson prompt_tokens "$prompt_tokens" \
   --argjson cached_tokens "$cached_tokens" \
@@ -329,7 +386,8 @@ jq -n \
   --argjson cached_response_ms "$cached_response_ms" \
   --argjson auto_response_ms "$auto_response_ms" \
   --argjson stream_semantic_ms "$stream_semantic_ms" \
-  --argjson continuation_response_ms "$continuation_response_ms" '{
+  --argjson continuation_response_ms "$continuation_response_ms" \
+  --argjson source_response_ms "$source_response_ms" '{
     status: "pass",
     prompt_tokens: $prompt_tokens,
     cached_tokens: $cached_tokens,
@@ -341,5 +399,6 @@ jq -n \
     cached_semantic_response_ms: $cached_response_ms,
     auto_semantic_response_ms: $auto_response_ms,
     cached_sse_tool_call_ms: $stream_semantic_ms,
-    tool_result_response_ms: $continuation_response_ms
+    tool_result_response_ms: $continuation_response_ms,
+    source_tool_response_ms: $source_response_ms
   }'

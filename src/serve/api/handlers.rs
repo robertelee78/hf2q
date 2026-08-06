@@ -339,6 +339,13 @@ pub async fn chat_completions(
 ) -> Response {
     use std::sync::atomic::Ordering;
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        model = %req.model,
+        stream = req.stream.unwrap_or(false),
+        messages = req.messages.len(),
+        tools = req.tools.as_ref().map_or(0, |tools| tools.len()),
+        "chat completion request received"
+    );
 
     // Shared prelude: engine gate, model-id match, chat-template render,
     // tokenize, sampling-params build. Returns either a prepared context or
@@ -357,6 +364,13 @@ pub async fn chat_completions(
         .metrics
         .chat_completions_started
         .fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        model = %req.model,
+        stream = req.stream.unwrap_or(false),
+        prompt_tokens = prepared.prompt_tokens.len(),
+        max_tokens = prepared.params.max_tokens,
+        "chat completion prepared; dispatching to inference worker"
+    );
 
     // ── ADR-005 Phase 4 reopen iter-216 Wedge-3 — Qwen3.5/3.6 chat live ──
     //
@@ -627,6 +641,15 @@ async fn chat_completions_with_prepared(
                 "tool_calls".to_string(),
             )
         };
+    tracing::info!(
+        model = %req.model,
+        finish_reason = %effective_finish_reason,
+        tool_calls = message_tool_calls.as_ref().map_or(0, Vec::len),
+        prompt_tokens = result.prompt_tokens,
+        cached_tokens = result.cached_tokens,
+        completion_tokens = result.completion_tokens,
+        "chat completion response ready"
+    );
 
     let resp = ChatCompletionResponse {
         id: request_id,
@@ -1831,6 +1854,8 @@ async fn chat_completions_stream(
     // `dispatch_qwen3vl_seam_split` call (handlers.rs:1326).
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+    let prompt_token_count = prepared.prompt_tokens.len();
+    let max_token_count = prepared.params.max_tokens;
     // Worker bumps this counter if it aborts because the SSE receiver was
     // dropped (client disconnect per Decision #18). Shared atomic lives on
     // ServerMetrics so /metrics surfaces it.
@@ -1896,6 +1921,12 @@ async fn chat_completions_stream(
         tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
         return ApiError::generation_error(msg).into_response();
     }
+    tracing::info!(
+        model = %req.model,
+        prompt_tokens = prompt_token_count,
+        max_tokens = max_token_count,
+        "streaming request enqueued; awaiting inference worker"
+    );
 
     // SSE options: include_usage follows Decision #22 (Tier 2 — `stream_options.include_usage`).
     // logprobs follow Tier 4 — the grammar-aware sampler will feed Logprobs
