@@ -845,6 +845,12 @@ pub fn emit_tracing(info: &LoadInfo) {
 /// histogram algorithm can grow atomically (e.g. to surface BPW alongside
 /// the label) without re-syncing two private copies.
 pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
+    if let Some(profile) =
+        gguf.metadata_string(crate::quantize::ggml_quants::DEEPSEEK4_AGENTIC_Q2_METADATA_KEY)
+    {
+        return Some(profile.to_string());
+    }
+
     use mlx_native::GgmlType;
     use std::collections::HashMap;
 
@@ -862,6 +868,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
             GgmlType::Q4_0 => "Q4_0",
             GgmlType::Q8_0 => "Q8_0",
             GgmlType::Q2_K => "Q2_K",
+            GgmlType::Q3_K => "Q3_K",
             GgmlType::Q4_K => "Q4_K",
             GgmlType::Q5_K => "Q5_K",
             GgmlType::Q6_K => "Q6_K",
@@ -1148,6 +1155,33 @@ mod tests {
     }
 
     #[test]
+    fn infer_quant_label_prefers_explicit_mixed_profile() {
+        let path = tmp_path("explicit_mixed_profile");
+        let tensors = vec![TensorSpec {
+            name: "blk.0.ffn_down_exps.weight",
+            shape: vec![BLOCK_VALUES_Q4_K, 4],
+            ggml_type_id: GGML_TYPE_Q4_K,
+            byte_len: 4 * BLOCK_BYTES_Q4_K,
+        }];
+        write_synthetic_gguf_with_metadata(
+            &path,
+            &[KvSpec::String(
+                crate::quantize::ggml_quants::DEEPSEEK4_AGENTIC_Q2_METADATA_KEY,
+                crate::quantize::ggml_quants::DEEPSEEK4_AGENTIC_Q2_NAME,
+            )],
+            &tensors,
+        );
+
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open synthetic gguf");
+        assert_eq!(
+            infer_quant_label(&gguf),
+            Some(crate::quantize::ggml_quants::DEEPSEEK4_AGENTIC_Q2_NAME.to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn infer_quant_label_returns_none_for_pure_fp() {
         let path = tmp_path("pure_fp");
         let tensors = vec![
@@ -1202,6 +1236,7 @@ mod tests {
                     GgmlType::Q4_0 => "Q4_0",
                     GgmlType::Q8_0 => "Q8_0",
                     GgmlType::Q2_K => "Q2_K",
+                    GgmlType::Q3_K => "Q3_K",
                     GgmlType::Q4_K => "Q4_K",
                     GgmlType::Q5_K => "Q5_K",
                     GgmlType::Q6_K => "Q6_K",

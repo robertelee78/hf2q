@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact main-branch commit to publish
+        required: true
+        type: string
+      version:
+        description: Exact crate version to publish
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      EXPECTED_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Verify immutable release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$EXPECTED_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$actual_sha" origin/main
+          actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$actual_version" = "$EXPECTED_VERSION"
+          test -n "$CARGO_REGISTRY_TOKEN"
+          git diff --exit-code
+
+      - name: Require successful exact-SHA CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          successes=$(gh run list \
+            --commit "$EXPECTED_SHA" \
+            --workflow CI \
+            --json conclusion,event \
+            --jq '[.[] | select(.event == "push" and .conclusion == "success")] | length')
+          test "$successes" -ge 1
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Package exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          crate="target/package/hf2q-${EXPECTED_VERSION}.crate"
+          test -s "$crate"
+          shasum -a 256 "$crate" | tee "$RUNNER_TEMP/release-crate.sha256"
+
+      - name: Install and smoke-test packed artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/hf2q-install"
+          cargo install \
+            --path "target/package/hf2q-${EXPECTED_VERSION}" \
+            --locked \
+            --root "$install_root"
+          "$install_root/bin/hf2q" --help >/dev/null
+
+      - name: Publish exact package
+        shell: bash
+        run: |
+          set -euo pipefail
+          published="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}-published.crate"
+          if curl --fail --location --silent --show-error \
+            "https://static.crates.io/crates/hf2q/hf2q-${EXPECTED_VERSION}.crate" \
+            --output "$published"; then
+            echo "hf2q ${EXPECTED_VERSION} is already published; verifying exact bytes"
+          else
+            cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+          fi
+
+      - name: Verify crates.io bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk '{print $1}' "$RUNNER_TEMP/release-crate.sha256")
+          downloaded="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}.crate"
+          for _ in $(seq 1 24); do
+            if curl --fail --location --silent --show-error \
+              "https://static.crates.io/crates/hf2q/hf2q-${EXPECTED_VERSION}.crate" \
+              --output "$downloaded"; then
+              actual=$(shasum -a 256 "$downloaded" | awk '{print $1}')
+              test "$actual" = "$expected"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Tag and create GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${EXPECTED_VERSION}"
+          git tag "$tag" "$EXPECTED_SHA"
+          git push origin "$tag"
+          gh release create "$tag" \
+            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
+            "$RUNNER_TEMP/release-crate.sha256" \
+            --target "$EXPECTED_SHA" \
+            --title "hf2q ${EXPECTED_VERSION}" \
+            --generate-notes \
+            --verify-tag

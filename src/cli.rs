@@ -191,6 +191,27 @@ pub struct ConvertCliArgs {
     )]
     pub revision: Option<String>,
 
+    /// Provenance repo for an already-downloaded positional `<hf_dir>`.
+    /// This does not download anything; hf2q verifies the local bytes against
+    /// the exact Hugging Face revision before conversion and writes the same
+    /// immutable receipt produced by `--repo` conversions.
+    #[arg(
+        long,
+        requires = "hf_dir",
+        conflicts_with = "repo",
+        value_name = "HF_REPO"
+    )]
+    pub source_repo: Option<String>,
+
+    /// Exact 40-hex Hugging Face commit for `--source-repo`.
+    #[arg(
+        long,
+        requires = "source_repo",
+        conflicts_with = "repo",
+        value_name = "REVISION"
+    )]
+    pub source_revision: Option<String>,
+
     /// File-type to quantize to. Accepts:
     ///   - Standard llama.cpp ftypes: `f32`, `f16`, `bf16`, `q4_0`,
     ///     `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_s/m/l`,
@@ -198,6 +219,8 @@ pub struct ConvertCliArgs {
     ///   - Apex algorithmic tiers (MoE arches only): `apex-quality`,
     ///     `apex-i-quality`, `apex-balanced`, `apex-i-balanced`,
     ///     `apex-compact`, `apex-i-compact`, `apex-mini`.
+    ///   - DeepSeek-V4 agent profile: `deepseek4-agentic-q2` (Q2_K
+    ///     expert gate/up, Q3_K expert down, Q8_0 context path).
     ///
     /// Reserved / out-of-scope names (per ADR §P7 AC#1 + Decision §6).
     /// Each surfaces a typed `QuantSelectorError` variant with an
@@ -225,6 +248,16 @@ pub struct ConvertCliArgs {
     /// Destination GGUF file. Existing files are overwritten.
     #[arg(short, long)]
     pub output: PathBuf,
+
+    /// Build and report the exact tensor/type/byte plan without creating the
+    /// output GGUF. Source download or provenance hashing may still read the
+    /// complete input; no tensor payload is materialized by the converter.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["imatrix_corpus", "imatrix_out"]
+    )]
+    pub dry_run: bool,
 
     /// Pre-computed imatrix file (`.imatrix.gguf`). Required for I-tier
     /// APEX variants (`apex-i-quality`, `apex-i-balanced`, `apex-i-compact`)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # serve_deepseek4_opencode.sh — canonical hf2q serve launcher for the
-# DeepSeek-V4-Flash-0731 Q2_K_S GGUF, tuned for OpenCode agentic coding.
+# DeepSeek-V4-Flash-0731 agentic Q2/Q3/Q8 GGUF, tuned for OpenCode coding.
 #
 # The DeepSeek cache is native and in-memory:
 #
@@ -34,7 +34,7 @@
 #   CONTEXT_LEN=262144 scripts/serve_deepseek4_opencode.sh
 set -euo pipefail
 
-MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-Q2_K_S.gguf}"
+MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 CONTEXT_LEN="${CONTEXT_LEN:-131072}"
@@ -51,7 +51,7 @@ if ! [[ "$CONTEXT_LEN" =~ ^[0-9]+$ ]] || (( CONTEXT_LEN < 128 )); then
     exit 3
 fi
 
-# Fail before loading the ~92 GiB model when another service owns the port.
+# Fail before loading the ~100 GiB model when another service owns the port.
 # macOS ships lsof; nc is a portable fallback for leaner environments.
 if command -v lsof >/dev/null 2>&1; then
     PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
@@ -67,7 +67,7 @@ elif command -v nc >/dev/null 2>&1 && nc -z "$HOST" "$PORT" >/dev/null 2>&1; the
     exit 2
 fi
 
-# One-model-at-a-time guard: the Q2_K_S artifact is ~92 GiB and a second
+# One-model-at-a-time guard: the agentic artifact is ~100 GiB and a second
 # inference process on a 128 GiB unified-memory host will exhaust headroom.
 for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
     if RUNTIME_PIDS="$(pgrep -x "$RUNTIME_NAME" 2>/dev/null)"; then

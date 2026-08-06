@@ -143,17 +143,9 @@ mod tests {
             .with_shape(vec![2])
             .expect("slice shape");
         let directory = tempfile::tempdir().expect("temporary dump directory");
-        dump_f32_to(
-            &view,
-            2,
-            "slice_offset",
-            None,
-            7,
-            Some(directory.path()),
-        )
-        .expect("dump slice");
-        let bytes = std::fs::read(directory.path().join("hf2q_slice_offset_pos7.bin"))
-            .expect("read dump");
+        dump_f32_to(&view, 2, "slice_offset", None, 7, Some(directory.path())).expect("dump slice");
+        let bytes =
+            std::fs::read(directory.path().join("hf2q_slice_offset_pos7.bin")).expect("read dump");
         let actual = bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))

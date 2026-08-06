@@ -34,6 +34,7 @@
 //! No silent F16 demotion outside the vision/audio gate — any other
 //! quantization / shape failure surfaces as [`OrchestratorError`].
 
+use std::collections::HashMap;
 use std::io::{Seek, Write};
 
 use half::f16;
@@ -46,8 +47,8 @@ use crate::quantize::ggml_quants::standard_policy::{
     tensor_type_fallback, HParams, LlmType, QsState, StandardPolicy, TensorCategory,
 };
 use crate::quantize::ggml_quants::{
-    is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for, ArchName, GgmlType,
-    LlamaFtype, QuantizeError, SourceDtype, TensorRef,
+    is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for, ArchName,
+    Deepseek4AgenticQ2Policy, GgmlType, LlamaFtype, QuantizeError, SourceDtype, TensorRef,
 };
 
 /// Errors raised by [`ConvertOrchestrator::plan_tensors`] /
@@ -169,6 +170,26 @@ struct PlannedTensor {
     n_per_row: usize,
 }
 
+/// One GGML storage type's contribution to a metadata-only convert plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedTypeSize {
+    pub ggml_type: GgmlType,
+    pub tensor_count: usize,
+    pub payload_bytes: u64,
+}
+
+/// Exact tensor-payload estimate available before any source weight is
+/// materialized or output file is created. `aligned_payload_bytes` includes
+/// the GGUF-required 32-byte padding after every tensor; the small metadata
+/// header is intentionally reported separately by the caller as overhead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSizeSummary {
+    pub tensor_count: usize,
+    pub payload_bytes: u64,
+    pub aligned_payload_bytes: u64,
+    pub by_type: Vec<PlannedTypeSize>,
+}
+
 /// Pipeline driver for the new ADR-033 convert path. See module-level
 /// docs for the lifecycle contract.
 ///
@@ -188,6 +209,10 @@ pub struct ConvertOrchestrator {
     /// the StandardPolicy path. The two policies cannot run in the same
     /// convert invocation.
     apex_policy: Option<ApexPolicy>,
+    /// Architecture-specific overlay for the DeepSeek-V4 agent profile.
+    /// Mutually exclusive with `apex_policy`; its base policy is standard
+    /// `MostlyQ2_K`, so expert down projections receive Q3_K.
+    deepseek4_agentic_q2: bool,
     metadata: Vec<(String, MetaValue)>,
     /// Populated by `plan_tensors`. Empty before planning, in plan order
     /// during/after planning. Drained slot-by-slot during streaming.
@@ -215,6 +240,7 @@ impl ConvertOrchestrator {
             arch,
             hparams,
             apex_policy: None,
+            deepseek4_agentic_q2: false,
             metadata: Vec::new(),
             planned: Vec::new(),
             imatrix: None,
@@ -242,6 +268,28 @@ impl ConvertOrchestrator {
             arch,
             hparams,
             apex_policy: Some(apex_policy),
+            deepseek4_agentic_q2: false,
+            metadata: Vec::new(),
+            planned: Vec::new(),
+            imatrix: None,
+        }
+    }
+
+    /// Construct the DeepSeek-V4 agent profile. This is deliberately a
+    /// distinct constructor so other architectures' standard Q2_K output is
+    /// byte-stable and cannot inherit V4-specific Q8 pins accidentally.
+    pub fn new_deepseek4_agentic_q2(arch: ArchName, hparams: HParams) -> Self {
+        assert_eq!(
+            arch,
+            ArchName::Deepseek4,
+            "DeepSeek-V4 agentic quantization cannot be applied to another architecture"
+        );
+        Self {
+            ftype: LlamaFtype::MostlyQ2_K,
+            arch,
+            hparams,
+            apex_policy: None,
+            deepseek4_agentic_q2: true,
             metadata: Vec::new(),
             planned: Vec::new(),
             imatrix: None,
@@ -466,7 +514,16 @@ impl ConvertOrchestrator {
                         let picked = ap.target_for(&tref)?;
                         tensor_type_fallback(picked, tref.n_per_row())?
                     }
-                    None => policy.target_for(&mut qs, &tref, category)?,
+                    None => {
+                        let picked = policy.target_for(&mut qs, &tref, category)?;
+                        if self.deepseek4_agentic_q2 {
+                            let promoted =
+                                Deepseek4AgenticQ2Policy::new().target_for(&tref, picked);
+                            tensor_type_fallback(promoted, tref.n_per_row())?
+                        } else {
+                            picked
+                        }
+                    }
                 }
             };
 
@@ -491,6 +548,69 @@ impl ConvertOrchestrator {
     /// Number of planned tensors. Zero before `plan_tensors` runs.
     pub fn planned_count(&self) -> usize {
         self.planned.len()
+    }
+
+    /// Calculate exact payload bytes for the current metadata-only plan.
+    pub fn planned_size_summary(&self) -> Result<PlannedSizeSummary, OrchestratorError> {
+        let mut payload_bytes = 0u64;
+        let mut aligned_payload_bytes = 0u64;
+        let mut by_type: HashMap<GgmlType, (usize, u64)> = HashMap::new();
+
+        for tensor in &self.planned {
+            if tensor.n_per_row == 0 || tensor.expected_numel % tensor.n_per_row != 0 {
+                return Err(OrchestratorError::StreamProtocol(format!(
+                    "planned tensor `{}` has invalid numel/row shape {}/{}",
+                    tensor.name, tensor.expected_numel, tensor.n_per_row
+                )));
+            }
+            let rows = tensor.expected_numel / tensor.n_per_row;
+            let bytes = rows
+                .checked_mul(tensor.ggml_type.row_size(tensor.n_per_row))
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| {
+                    OrchestratorError::StreamProtocol(format!(
+                        "planned payload size overflow for `{}`",
+                        tensor.name
+                    ))
+                })?;
+            payload_bytes = payload_bytes.checked_add(bytes).ok_or_else(|| {
+                OrchestratorError::StreamProtocol("planned payload total overflow".into())
+            })?;
+            let aligned = bytes
+                .checked_add(31)
+                .map(|value| value & !31)
+                .ok_or_else(|| {
+                    OrchestratorError::StreamProtocol("planned aligned payload overflow".into())
+                })?;
+            aligned_payload_bytes =
+                aligned_payload_bytes.checked_add(aligned).ok_or_else(|| {
+                    OrchestratorError::StreamProtocol("planned aligned total overflow".into())
+                })?;
+            let entry = by_type.entry(tensor.ggml_type).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.checked_add(bytes).ok_or_else(|| {
+                OrchestratorError::StreamProtocol("planned per-type total overflow".into())
+            })?;
+        }
+
+        let mut by_type: Vec<_> = by_type
+            .into_iter()
+            .map(
+                |(ggml_type, (tensor_count, payload_bytes))| PlannedTypeSize {
+                    ggml_type,
+                    tensor_count,
+                    payload_bytes,
+                },
+            )
+            .collect();
+        by_type.sort_by_key(|entry| entry.ggml_type.name());
+
+        Ok(PlannedSizeSummary {
+            tensor_count: self.planned.len(),
+            payload_bytes,
+            aligned_payload_bytes,
+            by_type,
+        })
     }
 
     /// Open the GGUF writer in streaming mode.
@@ -1501,6 +1621,83 @@ mod tests {
         orch
     }
 
+    fn one_deepseek_agentic_tensor(name: &str, shape: Vec<usize>) -> ConvertOrchestrator {
+        let mut orch = ConvertOrchestrator::new_deepseek4_agentic_q2(
+            ArchName::Deepseek4,
+            HParams {
+                n_expert: shape.last().copied().unwrap_or(0) as u32,
+                n_head: 4,
+                n_head_kv: 1,
+                n_layer: 1,
+                n_mtp_layers: 0,
+            },
+        );
+        orch.plan_tensors(vec![PlanEntry {
+            name: name.into(),
+            shape,
+            source_dtype: SourceDtype::Mxfp4E2M1,
+            layer_index: Some(0),
+        }])
+        .expect("plan DeepSeek agentic tensor");
+        orch
+    }
+
+    #[test]
+    fn deepseek4_agentic_q2_plan_pins_context_path_and_keeps_mixed_experts() {
+        let mut orch = ConvertOrchestrator::new_deepseek4_agentic_q2(
+            ArchName::Deepseek4,
+            HParams {
+                n_expert: 256,
+                n_head: 64,
+                n_head_kv: 1,
+                n_layer: 43,
+                n_mtp_layers: 0,
+            },
+        );
+        let entry = |name: &str| PlanEntry {
+            name: name.into(),
+            shape: vec![4096, 256],
+            source_dtype: SourceDtype::F32,
+            layer_index: name
+                .strip_prefix("blk.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|layer| layer.parse().ok()),
+        };
+        orch.plan_tensors(vec![
+            entry("output.weight"),
+            entry("token_embd.weight"),
+            entry("blk.2.attn_compressor_gate.weight"),
+            entry("blk.2.attn_q_b.weight"),
+            entry("blk.2.hc_attn_fn.weight"),
+            entry("blk.2.indexer.attn_q_b.weight"),
+            entry("blk.2.ffn_gate_exps.weight"),
+            entry("blk.2.ffn_up_exps.weight"),
+            entry("blk.2.ffn_down_exps.weight"),
+            entry("blk.2.ffn_down_shexp.weight"),
+        ])
+        .unwrap();
+
+        let planned: std::collections::HashMap<_, _> = orch
+            .planned
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor.ggml_type))
+            .collect();
+        for name in [
+            "output.weight",
+            "token_embd.weight",
+            "blk.2.attn_compressor_gate.weight",
+            "blk.2.attn_q_b.weight",
+            "blk.2.hc_attn_fn.weight",
+            "blk.2.indexer.attn_q_b.weight",
+        ] {
+            assert_eq!(planned[name], GgmlType::Q8_0, "{name}");
+        }
+        assert_eq!(planned["blk.2.ffn_gate_exps.weight"], GgmlType::Q2_K);
+        assert_eq!(planned["blk.2.ffn_up_exps.weight"], GgmlType::Q2_K);
+        assert_eq!(planned["blk.2.ffn_down_exps.weight"], GgmlType::Q3_K);
+        assert_eq!(planned["blk.2.ffn_down_shexp.weight"], GgmlType::Q3_K);
+    }
+
     #[test]
     fn q2_k_s_chunked_rows_are_byte_identical_to_whole_tensor() {
         let n_per_row = 256;
@@ -1542,6 +1739,43 @@ mod tests {
                     + stats.max_quantized_payload_bytes
             );
             sw.finalize().unwrap();
+        }
+
+        assert_eq!(chunked.into_inner(), whole.into_inner());
+    }
+
+    #[test]
+    fn agentic_q3_k_expert_down_chunks_are_byte_identical_to_whole_tensor() {
+        let n_per_row = 256;
+        let rows_per_expert = 4;
+        let experts = 3;
+        let per_expert = n_per_row * rows_per_expert;
+        let shape = vec![n_per_row, rows_per_expert, experts];
+        let data = deterministic_data(per_expert * experts, 0x43d0_0003);
+
+        let make = || one_deepseek_agentic_tensor("blk.0.ffn_down_exps.weight", shape.clone());
+        let mut whole = std::io::Cursor::new(Vec::new());
+        {
+            let mut stream = make().begin_write(&mut whole).unwrap();
+            stream.stream_tensor(0, &data).unwrap();
+            stream.finalize().unwrap();
+        }
+
+        let mut chunked = std::io::Cursor::new(Vec::new());
+        {
+            let mut stream = make().begin_write(&mut chunked).unwrap();
+            stream.begin_tensor_chunks(0).unwrap();
+            for expert in data.chunks_exact(per_expert) {
+                stream.stream_tensor_chunk(0, expert).unwrap();
+            }
+            let stats = stream.finish_tensor_chunks(0).unwrap();
+            assert_eq!(stats.chunk_count, experts);
+            assert_eq!(stats.max_chunk_elements, per_expert);
+            assert_eq!(
+                stats.max_quantized_payload_bytes,
+                rows_per_expert * GgmlType::Q3_K.row_size(n_per_row)
+            );
+            stream.finalize().unwrap();
         }
 
         assert_eq!(chunked.into_inner(), whole.into_inner());

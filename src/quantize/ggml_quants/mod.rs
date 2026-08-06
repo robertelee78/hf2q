@@ -16,6 +16,7 @@
 
 pub mod apex;
 pub mod common;
+pub mod deepseek4_agentic;
 pub mod error;
 pub mod ggml_type;
 pub mod iq4_nl;
@@ -37,6 +38,9 @@ pub mod tensor_ref;
 pub mod vision;
 
 // P1 trait surface — per ADR-033 Decision §"Quantizer trait" + §"Per-tensor IR".
+pub use deepseek4_agentic::{
+    Deepseek4AgenticQ2Policy, DEEPSEEK4_AGENTIC_Q2_METADATA_KEY, DEEPSEEK4_AGENTIC_Q2_NAME,
+};
 pub use error::QuantizeError;
 pub use ggml_type::GgmlType;
 pub use llama_ftype::LlamaFtype;

@@ -390,7 +390,7 @@ pub const QWEN35: ModelRegistration = ModelRegistration {
 /// rather than assuming one marker pair equals one function call.
 pub const DEEPSEEK4: ModelRegistration = ModelRegistration {
     family: "deepseek4",
-    id_substrings: &["deepseek-v4", "deepseek4", "deepseek_v4"],
+    id_substrings: &["deepseek-v4", "deepseek v4", "deepseek4", "deepseek_v4"],
     reasoning_open: Some("<think>"),
     reasoning_close: Some("</think>"),
     tool_open: Some("<｜DSML｜tool_calls>"),
@@ -4354,6 +4354,12 @@ mod tests {
     fn deepseek4_registration_and_multi_invoke_parser_are_openai_compatible() {
         let registration = find_for("DeepSeek-V4-Flash-0731").expect("DeepSeek registration");
         assert_eq!(registration.family, "deepseek4");
+        assert_eq!(
+            find_for("Deepseek v4 Flash 0731 Source")
+                .expect("converted general.name registration")
+                .family,
+            "deepseek4"
+        );
         let body = "\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"run_tests\">\n<｜DSML｜parameter name=\"all\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n";
         let calls = parse_tool_call_bodies(&registration, body).expect("parse DSML block");
         assert_eq!(calls.len(), 2);

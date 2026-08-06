@@ -26,9 +26,8 @@
 //! the single source of truth.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
@@ -43,8 +42,8 @@ use crate::convert::arch::{
 use crate::convert::orchestrator::PlanEntry;
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::receipt::{
-    clear_stale_receipt, write_success_receipt, PeakChunkBoundReceipt, ReceiptError,
-    RemoteConversionSource,
+    clear_stale_receipt, prepare_success_receipt, promote_success_receipt,
+    require_converter_git_commit, PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource,
 };
 use crate::convert::source_reader::SourceError;
 use crate::convert::tokenizer::TokenizerError;
@@ -83,6 +82,9 @@ pub struct ConvertArgs {
     pub selector: QuantSelector,
     /// Destination GGUF path. Existing files are overwritten.
     pub output: PathBuf,
+    /// Report the metadata-only quantization plan and predicted payload size
+    /// without materializing source tensors or creating an output file.
+    pub dry_run: bool,
     /// ADR-033 §Pi: pre-computed imatrix file (`.imatrix.gguf`). Required
     /// for I-tier APEX (`apex-i-*`) variants. Mutually exclusive with
     /// `imatrix_corpus`. Phase A's load path; round-trip-tested against
@@ -418,7 +420,8 @@ impl From<TokenizerError> for ConvertError {
 ///    `n_experts` slices, sort by `expert_index`, then decode and
 ///    quantize one expert at a time into the fused 3-D GGUF payload.
 /// 6. Emit metadata via the arch's `build_metadata`.
-/// 7. [`ConvertOrchestrator::write`] → BufWriter over the output file.
+/// 7. Stream into a same-directory temporary GGUF, sync it, then atomically
+///    replace the requested output only after successful finalization.
 pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
@@ -510,6 +513,17 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         QuantSelector::Standard(ftype) => {
             let orch = ConvertOrchestrator::new(*ftype, arch, hparams);
             (orch, *ftype)
+        }
+        QuantSelector::Deepseek4AgenticQ2 => {
+            if arch != ArchName::Deepseek4 {
+                return Err(ConvertError::UnsupportedArch {
+                    arch_name: format!(
+                        "--quant deepseek4-agentic-q2 requires DeepSeek-V4, detected {arch:?}"
+                    ),
+                });
+            }
+            let orch = ConvertOrchestrator::new_deepseek4_agentic_q2(arch, hparams);
+            (orch, crate::quantize::ggml_quants::LlamaFtype::MostlyQ2_K)
         }
         QuantSelector::Apex(tier) => {
             let n_layers =
@@ -728,6 +742,15 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     for (k, v) in postlude {
         orch.add_metadata(k, v);
     }
+    if matches!(&args.selector, QuantSelector::Deepseek4AgenticQ2) {
+        use crate::quantize::ggml_quants::{
+            DEEPSEEK4_AGENTIC_Q2_METADATA_KEY, DEEPSEEK4_AGENTIC_Q2_NAME,
+        };
+        orch.add_metadata(
+            DEEPSEEK4_AGENTIC_Q2_METADATA_KEY.to_string(),
+            MetaValue::String(DEEPSEEK4_AGENTIC_Q2_NAME.to_string()),
+        );
+    }
     if let Some(remote) = args.remote_source.as_ref() {
         orch.add_metadata(
             KEY_PRODUCER_VERSION.to_string(),
@@ -755,12 +778,41 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     let plan_entries: Vec<PlanEntry> = plan.steps.iter().map(|s| s.plan_entry()).collect();
     orch.plan_tensors(plan_entries)?;
 
-    // 5b. Begin writing — header + KVs + tensor-info reservations.
-    if args.remote_source.is_some() {
-        clear_stale_receipt(&args.output)?;
+    if args.dry_run {
+        let summary = orch.planned_size_summary()?;
+        eprintln!(
+            "hf2q convert dry-run: selector={} tensors={} payload={} bytes ({:.3} GiB) aligned={} bytes ({:.3} GiB)",
+            args.selector.receipt_name(),
+            summary.tensor_count,
+            summary.payload_bytes,
+            summary.payload_bytes as f64 / 1024_f64.powi(3),
+            summary.aligned_payload_bytes,
+            summary.aligned_payload_bytes as f64 / 1024_f64.powi(3),
+        );
+        for entry in summary.by_type {
+            eprintln!(
+                "  {:<8} tensors={:<5} payload={} bytes ({:.3} GiB)",
+                entry.ggml_type.name(),
+                entry.tensor_count,
+                entry.payload_bytes,
+                entry.payload_bytes as f64 / 1024_f64.powi(3),
+            );
+        }
+        return Ok(());
     }
-    let f = File::create(&args.output)?;
-    let bw = BufWriter::new(f);
+
+    let converter_git_commit = args
+        .remote_source
+        .as_ref()
+        .map(|_| require_converter_git_commit())
+        .transpose()?;
+
+    // 5b. Begin writing — header + KVs + tensor-info reservations. The
+    // canonical output is never opened until the complete temporary GGUF has
+    // finalized and synced, so an interrupted conversion cannot publish or
+    // overwrite it with a partial tensor stream.
+    let mut temporary_output = create_temporary_output(&args.output)?;
+    let bw = BufWriter::new(temporary_output.as_file_mut());
     let mut sw = orch.begin_write(bw)?;
     let mut peak_chunk_bound = PeakChunkBoundReceipt::default();
 
@@ -819,17 +871,62 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         }
     }
 
-    // 5d. Finalize — seek-back to fill tensor offsets, flush.
+    // 5d. Finalize — seek-back to fill tensor offsets, flush, durably sync,
+    // and atomically promote the complete file. Any failure before artifact
+    // promotion leaves the previous output intact; restarting deterministically
+    // begins from source.
     sw.finalize()?;
-    if let Some(remote) = args.remote_source.as_ref() {
-        write_success_receipt(
-            &args.output,
-            remote,
-            &args.selector.receipt_name(),
-            excluded_dspark_count,
-            peak_chunk_bound,
-        )?;
+    temporary_output.as_file().sync_all()?;
+    let prepared_receipt = args
+        .remote_source
+        .as_ref()
+        .zip(converter_git_commit.as_deref())
+        .map(|(remote, commit)| {
+            prepare_success_receipt(
+                temporary_output.path(),
+                &args.output,
+                remote,
+                commit,
+                &args.selector.receipt_name(),
+                excluded_dspark_count,
+                peak_chunk_bound,
+            )
+        })
+        .transpose()?;
+    promote_temporary_output(temporary_output, &args.output)?;
+    if let Some(receipt) = prepared_receipt {
+        if let Err(error) = promote_success_receipt(receipt) {
+            // The GGUF rename has already succeeded. Remove any older sidecar
+            // so complete new bytes can never be mistaken for the artifact it
+            // described; the caller still receives the promotion failure and
+            // must rerun conversion to obtain a provenance-complete result.
+            clear_stale_receipt(&args.output)?;
+            return Err(error.into());
+        }
+    } else {
+        // A local conversion has no verified remote-source identity. Never
+        // leave a sidecar from an older remote artifact beside new bytes.
+        clear_stale_receipt(&args.output)?;
     }
+    Ok(())
+}
+
+fn create_temporary_output(output: &Path) -> Result<tempfile::NamedTempFile, ConvertError> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(tempfile::NamedTempFile::new_in(parent)?)
+}
+
+fn promote_temporary_output(
+    temporary: tempfile::NamedTempFile,
+    output: &Path,
+) -> Result<(), ConvertError> {
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(output)
+        .map_err(|error| ConvertError::Io(error.error))?;
     Ok(())
 }
 
@@ -2571,6 +2668,36 @@ mod tests {
     use crate::quantize::ggml_quants::apex::ApexTier;
     use crate::quantize::ggml_quants::LlamaFtype;
     use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn temporary_conversion_output_is_fail_safe_and_promotes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("model.gguf");
+        std::fs::write(&output, b"previous-complete-artifact").unwrap();
+        let receipt = crate::convert::receipt::receipt_path(&output);
+        std::fs::write(&receipt, b"previous-valid-receipt").unwrap();
+
+        {
+            let mut interrupted = create_temporary_output(&output).unwrap();
+            interrupted.write_all(b"partial-new-artifact").unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"previous-complete-artifact",
+            "dropping an unpromoted temporary must preserve the prior artifact"
+        );
+        assert_eq!(
+            std::fs::read(&receipt).unwrap(),
+            b"previous-valid-receipt",
+            "a failed conversion must preserve the prior artifact receipt"
+        );
+
+        let mut complete = create_temporary_output(&output).unwrap();
+        complete.write_all(b"complete-new-artifact").unwrap();
+        promote_temporary_output(complete, &output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete-new-artifact");
+    }
 
     /// model_type=llama → ArchName::Llama3.
     #[test]
@@ -3352,6 +3479,7 @@ mod tests {
             hf_dir: dir.path().to_path_buf(),
             selector: QuantSelector::Standard(LlamaFtype::MostlyQ2_K_S),
             output: output.clone(),
+            dry_run: false,
             imatrix: None,
             imatrix_corpus: None,
             imatrix_out: None,

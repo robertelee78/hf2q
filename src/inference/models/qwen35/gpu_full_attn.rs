@@ -7480,8 +7480,9 @@ pub fn apply_gated_attn_layer_decode_into(
 
 #[cfg(test)]
 mod tests {
-    use super::super::full_attn::{FullAttnLayerWeights, FullAttnShape};
     use super::*;
+
+    use super::super::full_attn::{FullAttnLayerWeights, FullAttnShape};
     use crate::inference::spec_decode::eagle3::config::Eagle3DrafterConfig;
     use crate::inference::spec_decode::eagle3::forward::dispatch_eagle3_tree_attention;
     use mlx_native::ops::tree_attention::{TREE_MASK_ATTENDED, TREE_MASK_MASKED};
@@ -10536,9 +10537,7 @@ mod tests {
     /// should match a direct invocation that skips the cache-write-and-readback
     /// path. We allow |diff|_inf < 1e-3 due to the encoder-commit boundary
     /// at step 6 which may reorder Metal dispatch ordering.
-    #[test]
-    fn qwen35_tree_verify_attention_block_prefix0_chain_parity_2026_05_22() {
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
+    fn assert_tree_verify_attention_block_prefix0_chain_parity() {
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10653,6 +10652,22 @@ mod tests {
             "T6 FAIL: prefix=0 chain parity |diff|_inf = {max_diff:.6e} >= 1e-3"
         );
         eprintln!("T6 PASS: prefix=0 chain parity |diff|_inf = {max_diff:.6e} < 1e-3");
+    }
+
+    #[test]
+    fn qwen35_tree_verify_attention_block_prefix0_chain_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        assert_tree_verify_attention_block_prefix0_chain_parity();
+    }
+
+    /// Cross-family regression for the process-global Metal state corruption
+    /// exposed by the retained-reference full suite. The Nomic synthetic
+    /// forward must not change two identical Qwen tree-verifier runs.
+    #[test]
+    fn nomic_forward_then_qwen_tree_verify_repeat_parity_2026_08_06() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        crate::inference::models::nomic_bert::forward::tests::run_synthetic_min_forward_for_cross_family_test();
+        assert_tree_verify_attention_block_prefix0_chain_parity();
     }
 
     /// T7 — Determinism: 3 repeat calls with identical inputs produce byte-identical output.

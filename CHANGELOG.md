@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-06
+
+### Added — DeepSeek V4 Flash agentic conversion and serving
+
+- Rust-native conversion of the official
+  `deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint to the owned
+  `deepseek4-agentic-q2` Q2_K/Q3_K/Q8_0 profile; no external converter,
+  quantizer, or inference runtime is invoked.
+- OpenAI-compatible DeepSeek serving for unary and SSE completions,
+  reasoning, official DSML tool calls, required/automatic tool choice,
+  multiple calls, and real OpenCode multi-turn coding sessions.
+- Native live-prefix caching and reasoning-tail recovery. A 119,916-token
+  post-tool request reused 119,813 tokens (99.91%) and reached its first
+  semantic token in 1.275 seconds instead of recomputing the conversation.
+- Adaptive gathered sparse prefill for long ratio-four compressed history,
+  backed by `mlx-native` 0.10.1. On the source-bound M5 Max gate, hf2q
+  completed the 119,821-token cold tool prompt in 494.449 seconds versus
+  roughly 556 seconds for the same artifact under llama.cpp build 10293.
+- Canonical OpenCode launcher and fail-closed agentic/long-context gates:
+  `scripts/serve_deepseek4_opencode.sh`,
+  `scripts/test_deepseek4_agentic.sh`,
+  `scripts/test_deepseek4_opencode.sh`, and
+  `scripts/test_deepseek4_long_context_cache.sh`.
+
 ### Added — Gemma 4 LCP long-resume past sliding_window + production hardening ("gemma-hybrid-lcp" follow-up)
 
 - **LCP now works past `sliding_window` (1024) under the hybrid regime.**
@@ -229,4 +253,6 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/robertelee78/hf2q/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/robertelee78/hf2q/releases/tag/v0.1.0

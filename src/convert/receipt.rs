@@ -11,6 +11,8 @@ use crate::core::provenance::source_shard::{compute_source_bundle_sha256, Source
 use crate::core::sha256::compute_file_sha256;
 use crate::input::integrity::VerifiedSourceManifest;
 
+pub const CONVERSION_RECEIPT_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
     #[error("receipt I/O: {0}")]
@@ -19,6 +21,10 @@ pub enum ReceiptError {
     Json(#[from] serde_json::Error),
     #[error("verified source manifest has no canonical LFS bundle SHA-256")]
     SourceBundleUnavailable,
+    #[error(
+        "remote conversion requires an exact 40-hex converter commit; use the crates.io package or rebuild hf2q with GIT_COMMIT_SHA set"
+    )]
+    ConverterCommitUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,8 +144,7 @@ pub struct SourceReceipt {
 pub struct ConverterReceipt {
     pub package: String,
     pub version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_commit: Option<String>,
+    pub git_commit: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,16 +174,34 @@ pub fn clear_stale_receipt(output: &Path) -> Result<(), ReceiptError> {
     }
 }
 
-pub fn write_success_receipt(
+pub struct PreparedSuccessReceipt {
+    temporary: tempfile::NamedTempFile,
+    path: PathBuf,
+}
+
+pub fn require_converter_git_commit() -> Result<String, ReceiptError> {
+    build_git_commit().ok_or(ReceiptError::ConverterCommitUnavailable)
+}
+
+pub fn prepare_success_receipt(
+    artifact: &Path,
     output: &Path,
     remote: &RemoteConversionSource,
+    converter_git_commit: &str,
     quant_selector: &str,
     excluded_dspark_count: usize,
     peak_chunk_bound: PeakChunkBoundReceipt,
-) -> Result<PathBuf, ReceiptError> {
-    let output_meta = fs::metadata(output)?;
+) -> Result<PreparedSuccessReceipt, ReceiptError> {
+    if converter_git_commit.len() != 40
+        || !converter_git_commit
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(ReceiptError::ConverterCommitUnavailable);
+    }
+    let output_meta = fs::metadata(artifact)?;
     let receipt = ConversionReceipt {
-        schema_version: 1,
+        schema_version: CONVERSION_RECEIPT_SCHEMA_VERSION,
         source: SourceReceipt {
             repo: remote.repo.clone(),
             revision: remote.revision.clone(),
@@ -188,13 +211,13 @@ pub fn write_success_receipt(
         converter: ConverterReceipt {
             package: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            git_commit: build_git_commit(),
+            git_commit: converter_git_commit.to_ascii_lowercase(),
         },
         quant_selector: quant_selector.to_string(),
         output: OutputReceipt {
             path: output.display().to_string(),
             size: output_meta.len(),
-            sha256: compute_file_sha256(output)?,
+            sha256: compute_file_sha256(artifact)?,
         },
         excluded_dspark: ExcludedDsparkReceipt {
             tensor_count: excluded_dspark_count,
@@ -214,12 +237,23 @@ pub fn write_success_receipt(
     serde_json::to_writer_pretty(&mut tmp, &receipt)?;
     tmp.write_all(b"\n")?;
     tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|error| error.error)?;
-    Ok(path)
+    Ok(PreparedSuccessReceipt {
+        temporary: tmp,
+        path,
+    })
+}
+
+pub fn promote_success_receipt(prepared: PreparedSuccessReceipt) -> Result<PathBuf, ReceiptError> {
+    prepared
+        .temporary
+        .persist(&prepared.path)
+        .map_err(|error| error.error)?;
+    Ok(prepared.path)
 }
 
 fn build_git_commit() -> Option<String> {
     [
+        option_env!("HF2Q_BUILD_GIT_SHA"),
         option_env!("GIT_COMMIT_SHA"),
         option_env!("VERGEN_GIT_SHA"),
         option_env!("GITHUB_SHA"),
@@ -228,6 +262,7 @@ fn build_git_commit() -> Option<String> {
     .flatten()
     .find(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
     .map(|sha| sha.to_ascii_lowercase())
+    .or_else(|| cfg!(test).then(|| "0".repeat(40)))
 }
 
 #[cfg(test)]
@@ -301,14 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn success_receipt_binds_output_and_replaces_stale_atomically() {
+    fn prepared_success_receipt_binds_output_and_replaces_stale_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("model.gguf");
         fs::write(&output, b"GGUFfixture").unwrap();
         fs::write(receipt_path(&output), b"stale").unwrap();
-        let path = write_success_receipt(
+        let prepared = prepare_success_receipt(
+            &output,
             &output,
             &remote(),
+            &"d".repeat(40),
             "q4_k_m",
             3,
             PeakChunkBoundReceipt {
@@ -322,13 +359,54 @@ mod tests {
             },
         )
         .unwrap();
+        let path = promote_success_receipt(prepared).unwrap();
         let parsed: ConversionReceipt = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(parsed.quant_selector, "q4_k_m");
+        assert_eq!(parsed.schema_version, CONVERSION_RECEIPT_SCHEMA_VERSION);
         assert_eq!(parsed.output.size, 11);
         assert_eq!(parsed.output.sha256, compute_file_sha256(&output).unwrap());
         assert_eq!(parsed.excluded_dspark.tensor_count, 3);
         assert_eq!(parsed.source.revision, "a".repeat(40));
+        assert_eq!(parsed.converter.git_commit, "d".repeat(40));
         assert_eq!(parsed.peak_chunk_bound.max_working_vec_bytes, 80);
+    }
+
+    #[test]
+    fn receipt_preparation_rejects_missing_or_malformed_converter_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("model.gguf");
+        fs::write(&output, b"GGUFfixture").unwrap();
+        let error = prepare_success_receipt(
+            &output,
+            &output,
+            &remote(),
+            "not-a-commit",
+            "q4_k_m",
+            0,
+            PeakChunkBoundReceipt::default(),
+        )
+        .err()
+        .expect("malformed converter commit must fail closed");
+        assert!(matches!(error, ReceiptError::ConverterCommitUnavailable));
+    }
+
+    #[test]
+    fn receipt_schema_rejects_a_missing_converter_commit() {
+        let mut value = serde_json::json!({
+            "schema_version": CONVERSION_RECEIPT_SCHEMA_VERSION,
+            "source": {
+                "repo": "org/model",
+                "revision": "a".repeat(40),
+                "bundle_sha256": "b".repeat(64),
+                "files": []
+            },
+            "converter": { "package": "hf2q", "version": "0.1.0" },
+            "quant_selector": "q4_k_m",
+            "output": { "path": "model.gguf", "size": 1, "sha256": "c".repeat(64) },
+            "excluded_dspark": { "tensor_count": 0, "status": "none_detected" },
+            "peak_chunk_bound": PeakChunkBoundReceipt::default()
+        });
+        assert!(serde_json::from_value::<ConversionReceipt>(value.take()).is_err());
     }
 
     #[test]

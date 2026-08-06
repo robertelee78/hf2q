@@ -197,11 +197,13 @@ impl Deepseek4LoadedModel {
         }
         let mut state = None;
         let mut offset = 0;
+        let window_multiplier = self.model.matrix_prefill_window_multiplier()?;
         while offset < tokens.len() {
             let batch = matrix_prefill_chunk_len(
                 self.cache.position(),
                 tokens.len() - offset,
                 self.model.cfg.sliding_window as usize,
+                window_multiplier,
             );
             if batch == 0 {
                 break;

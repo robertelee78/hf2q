@@ -17,17 +17,39 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
 use super::residency::RawMatrixRef;
 
 thread_local! {
-    static PREFILL_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
-    static PREFILL_POOL_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static TRANSIENT_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+    static TRANSIENT_POOL_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(super) fn begin_prefill_pool_layer() {
-    PREFILL_POOL_ACTIVE.with(|active| active.set(true));
+    begin_transient_pool_cycle();
 }
 
 pub(super) fn end_prefill_pool_layer() {
-    PREFILL_POOL_ACTIVE.with(|active| active.set(false));
-    PREFILL_POOL.with(|pool| pool.borrow_mut().reset());
+    end_transient_pool_cycle();
+}
+
+pub(super) fn begin_decode_pool_token() {
+    begin_transient_pool_cycle();
+}
+
+pub(super) fn end_decode_pool_token() {
+    end_transient_pool_cycle();
+}
+
+fn begin_transient_pool_cycle() {
+    TRANSIENT_POOL_ACTIVE.with(|active| {
+        debug_assert!(!active.get(), "nested DeepSeek-V4 transient pool cycle");
+        active.set(true);
+    });
+}
+
+fn end_transient_pool_cycle() {
+    TRANSIENT_POOL_ACTIVE.with(|active| {
+        debug_assert!(active.get(), "inactive DeepSeek-V4 transient pool cycle");
+        active.set(false);
+    });
+    TRANSIENT_POOL.with(|pool| pool.borrow_mut().reset());
 }
 
 pub(super) fn alloc(
@@ -43,9 +65,9 @@ pub(super) fn alloc(
     let bytes = elements
         .checked_mul(dtype.size_of())
         .with_context(|| format!("DeepSeek-V4 {label} byte size overflow"))?;
-    let pooled = PREFILL_POOL_ACTIVE.with(Cell::get);
+    let pooled = TRANSIENT_POOL_ACTIVE.with(Cell::get);
     if pooled {
-        PREFILL_POOL
+        TRANSIENT_POOL
             .with(|pool| pool.borrow_mut().alloc(device, bytes, dtype, shape))
             .with_context(|| format!("allocate pooled DeepSeek-V4 {label}"))
     } else {
@@ -519,5 +541,26 @@ mod tests {
             output.as_slice::<f32>().unwrap(),
             input.as_slice::<f32>().unwrap()
         );
+    }
+
+    #[test]
+    fn decode_pool_reuses_transient_metal_allocations_between_tokens() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+
+        begin_decode_pool_token();
+        let first = alloc(&device, DType::F32, vec![257], "first decode scratch").unwrap();
+        let first_ptr = first.contents_ptr();
+        drop(first);
+        end_decode_pool_token();
+
+        begin_decode_pool_token();
+        let second = alloc(&device, DType::F32, vec![257], "second decode scratch").unwrap();
+        let second_ptr = second.contents_ptr();
+        drop(second);
+        end_decode_pool_token();
+
+        assert_eq!(second_ptr, first_ptr);
     }
 }

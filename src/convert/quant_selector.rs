@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::quantize::ggml_quants::apex::{ApexTier, SUPPORTED_APEX_TIERS};
-use crate::quantize::ggml_quants::LlamaFtype;
+use crate::quantize::ggml_quants::{LlamaFtype, DEEPSEEK4_AGENTIC_Q2_NAME};
 
 /// One resolved `--quant <name>` selector.
 ///
@@ -42,6 +42,9 @@ pub enum QuantSelector {
     /// with `StandardPolicy` and emits `general.file_type` = the
     /// underlying [`LlamaFtype`] discriminant.
     Standard(LlamaFtype),
+    /// DeepSeek-V4 agent profile: a standard Q2_K expert body with Q3_K
+    /// down projections and Q8_0 context-discrimination tensors.
+    Deepseek4AgenticQ2,
     /// Apex algorithmic tier. The driver builds an `ApexPolicy { tier,
     /// n_layers, n_expert }` from the source model's `config.json`.
     /// `general.file_type` carries the closest standard LlamaFtype
@@ -120,6 +123,7 @@ impl QuantSelector {
     pub fn receipt_name(&self) -> String {
         match self {
             QuantSelector::Standard(ftype) => ftype.name().to_string(),
+            QuantSelector::Deepseek4AgenticQ2 => DEEPSEEK4_AGENTIC_Q2_NAME.to_string(),
             QuantSelector::Apex(tier) => format!("apex-{}", tier.cli_name()),
             QuantSelector::ApexCustom(path) => format!("apex-custom:{}", path.display()),
         }
@@ -137,6 +141,10 @@ impl QuantSelector {
     /// Per [[feedback-no-backwards-compat-2026-05-18]]: no compat aliases
     /// for legacy `--quant` values.
     pub fn from_name(s: &str) -> Result<Self, QuantSelectorError> {
+        if s == DEEPSEEK4_AGENTIC_Q2_NAME {
+            return Ok(QuantSelector::Deepseek4AgenticQ2);
+        }
+
         // 1. Standard llama.cpp ftypes. TQ1_0 / TQ2_0 are members of
         //    LlamaFtype but the convert-v2 pipeline has no Quantizer impl
         //    for them today — surface a more diagnostic error rather than
@@ -250,6 +258,13 @@ mod tests {
             QuantSelector::from_name("iq4_nl").unwrap(),
             QuantSelector::Standard(LlamaFtype::MostlyIQ4_NL)
         );
+    }
+
+    #[test]
+    fn parse_deepseek4_agentic_q2_round_trip() {
+        let selector = QuantSelector::from_name(DEEPSEEK4_AGENTIC_Q2_NAME).unwrap();
+        assert_eq!(selector, QuantSelector::Deepseek4AgenticQ2);
+        assert_eq!(selector.receipt_name(), DEEPSEEK4_AGENTIC_Q2_NAME);
     }
 
     #[test]

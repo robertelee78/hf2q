@@ -491,6 +491,7 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
         hf_dir: params.hf_dir.clone(),
         selector: crate::convert::quant_selector::QuantSelector::Standard(inner_ftype),
         output: f16_path.clone(),
+        dry_run: false,
         imatrix: None,
         imatrix_corpus: None,
         imatrix_out: None,

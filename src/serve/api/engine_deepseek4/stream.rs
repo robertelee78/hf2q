@@ -27,6 +27,46 @@ fn send_visible(
     Ok(())
 }
 
+fn emit_or_buffer_content(
+    text: String,
+    pending_whitespace: &mut String,
+    events: &mpsc::Sender<GenerationEvent>,
+    request_started: Instant,
+    first_visible_at: &mut Option<Duration>,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if text.trim().is_empty() {
+        pending_whitespace.push_str(&text);
+        return Ok(());
+    }
+
+    if pending_whitespace.is_empty() {
+        send_visible(
+            events,
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text,
+            },
+            request_started,
+            first_visible_at,
+        )
+    } else {
+        let mut visible = std::mem::take(pending_whitespace);
+        visible.push_str(&text);
+        send_visible(
+            events,
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: visible,
+            },
+            request_started,
+            first_visible_at,
+        )
+    }
+}
+
 fn emit_tool_block(
     registration: &ModelRegistration,
     body: &mut String,
@@ -36,7 +76,7 @@ fn emit_tool_block(
     first_visible_at: &mut Option<Duration>,
 ) -> Result<bool> {
     let calls = registry::parse_tool_call_bodies(registration, body)
-        .context("parse DeepSeek-V4 DSML tool call block")?;
+        .with_context(|| format!("parse DeepSeek-V4 DSML tool call block: body={body:?}"))?;
     for call in calls {
         let index = *next_index;
         let id = format!("call_hf2q_{:016x}", next_call_id(index));
@@ -63,11 +103,39 @@ fn next_call_id(index: usize) -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed) ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
+fn trigger_tool_grammar_on_raw_marker(
+    decoded: &str,
+    runtime: &mut Option<GrammarRuntime>,
+    registration: Option<&ModelRegistration>,
+) -> Result<()> {
+    let Some(runtime) = runtime
+        .as_mut()
+        .filter(|runtime| runtime.is_awaiting_trigger())
+    else {
+        return Ok(());
+    };
+    let Some(open) = registration.and_then(|registration| registration.tool_open) else {
+        return Ok(());
+    };
+    let Some(position) = decoded.rfind(open) else {
+        return Ok(());
+    };
+
+    runtime.trigger();
+    let suffix = &decoded[position + open.len()..];
+    anyhow::ensure!(
+        suffix.is_empty() || runtime.accept_bytes(suffix.as_bytes()),
+        "DeepSeek-V4 tool grammar rejected bytes decoded with its open marker"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn route_tool_content(
     text: String,
     tools: &mut Option<ToolCallSplitter>,
     body: &mut String,
+    pending_whitespace: &mut String,
     index: &mut usize,
     saw: &mut bool,
     runtime: &mut Option<GrammarRuntime>,
@@ -93,16 +161,18 @@ fn route_tool_content(
     };
     for event in splitter.feed(&text) {
         match event {
-            ToolCallEvent::Content(text) => send_visible(
+            ToolCallEvent::Content(text) => emit_or_buffer_content(
+                text,
+                pending_whitespace,
                 events,
-                GenerationEvent::Delta {
-                    kind: DeltaKind::Content,
-                    text,
-                },
                 request_started,
                 first_visible_at,
             )?,
             ToolCallEvent::ToolCallOpen => {
+                // DSML commonly begins with formatting newlines. They are not
+                // semantic assistant content on a pure tool turn and OpenAI-
+                // compatible clients expect content to be null/empty.
+                pending_whitespace.clear();
                 body.clear();
                 if let Some(runtime) = runtime.as_mut() {
                     runtime.trigger();
@@ -132,6 +202,7 @@ fn route_stream_fragment(
     reasoning: &mut Option<ReasoningSplitter>,
     tools: &mut Option<ToolCallSplitter>,
     body: &mut String,
+    pending_whitespace: &mut String,
     index: &mut usize,
     saw: &mut bool,
     runtime: &mut Option<GrammarRuntime>,
@@ -156,6 +227,7 @@ fn route_stream_fragment(
                     text,
                     tools,
                     body,
+                    pending_whitespace,
                     index,
                     saw,
                     runtime,
@@ -171,6 +243,7 @@ fn route_stream_fragment(
             fragment.to_string(),
             tools,
             body,
+            pending_whitespace,
             index,
             saw,
             runtime,
@@ -205,6 +278,7 @@ pub fn generate_stream(
         });
         let mut tools = registration.and_then(ToolCallSplitter::from_registration);
         let mut tool_body = String::new();
+        let mut pending_content_whitespace = String::new();
         let mut tool_index = 0usize;
         let mut saw_tool = false;
         let mut first_visible_at = None;
@@ -239,11 +313,16 @@ pub fn generate_stream(
                 .map_err(|error| anyhow::anyhow!("decode DeepSeek-V4 token {token}: {error}"))?
             {
                 decoded_running.push_str(&fragment);
+                // Activate the lazy tool grammar at the raw decoded marker,
+                // before the reasoning splitter's boundary tail can delay the
+                // structured ToolCallOpen event by several bytes.
+                trigger_tool_grammar_on_raw_marker(&decoded_running, &mut runtime, registration)?;
                 route_stream_fragment(
                     &fragment,
                     &mut reasoning,
                     &mut tools,
                     &mut tool_body,
+                    &mut pending_content_whitespace,
                     &mut tool_index,
                     &mut saw_tool,
                     &mut runtime,
@@ -282,6 +361,7 @@ pub fn generate_stream(
                         text,
                         &mut tools,
                         &mut tool_body,
+                        &mut pending_content_whitespace,
                         &mut tool_index,
                         &mut saw_tool,
                         &mut runtime,
@@ -296,12 +376,10 @@ pub fn generate_stream(
         if let Some(splitter) = tools.as_mut() {
             if let Some(event) = splitter.finish() {
                 match event {
-                    ToolCallEvent::Content(text) => send_visible(
+                    ToolCallEvent::Content(text) => emit_or_buffer_content(
+                        text,
+                        &mut pending_content_whitespace,
                         events,
-                        GenerationEvent::Delta {
-                            kind: DeltaKind::Content,
-                            text,
-                        },
                         request_started,
                         &mut first_visible_at,
                     )?,
@@ -312,6 +390,17 @@ pub fn generate_stream(
                     ToolCallEvent::ToolCallOpen | ToolCallEvent::ToolCallClose => {}
                 }
             }
+        }
+        if !saw_tool && !pending_content_whitespace.is_empty() {
+            send_visible(
+                events,
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: std::mem::take(&mut pending_content_whitespace),
+                },
+                request_started,
+                &mut first_visible_at,
+            )?;
         }
         if saw_tool {
             finish_reason = "tool_calls";
@@ -360,7 +449,9 @@ pub fn generate_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::send_visible;
+    use super::{route_tool_content, send_visible, trigger_tool_grammar_on_raw_marker};
+    use crate::serve::api::grammar::{self, GrammarRuntime};
+    use crate::serve::api::registry::{self, ToolCallSplitter};
     use crate::serve::api::sse::{DeltaKind, GenerationEvent};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -400,5 +491,72 @@ mod tests {
         )
         .expect("send second visible event");
         assert_eq!(first_visible_at, Some(first));
+    }
+
+    #[test]
+    fn whitespace_before_deepseek_tool_call_is_not_visible_content() {
+        let registration =
+            registry::find_for("DeepSeek-V4-Flash-0731").expect("DeepSeek-V4 registration");
+        let mut tools = ToolCallSplitter::from_registration(&registration);
+        let mut body = String::new();
+        let mut pending_whitespace = String::new();
+        let mut index = 0;
+        let mut saw = false;
+        let mut runtime = None;
+        let (events, mut receiver) = mpsc::channel(4);
+        let mut first_visible_at = None;
+        let raw = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/Cargo.toml</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+
+        route_tool_content(
+            raw.into(),
+            &mut tools,
+            &mut body,
+            &mut pending_whitespace,
+            &mut index,
+            &mut saw,
+            &mut runtime,
+            Some(&registration),
+            &events,
+            Instant::now(),
+            &mut first_visible_at,
+        )
+        .expect("route DSML tool call");
+
+        assert!(pending_whitespace.is_empty());
+        assert!(saw);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(GenerationEvent::ToolCallDelta { name: Some(name), .. }) if name == "read_file"
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "no content delta may precede the tool call"
+        );
+    }
+
+    #[test]
+    fn raw_tool_marker_triggers_lazy_grammar_before_splitter_tail_drains() {
+        let registration =
+            registry::find_for("DeepSeek-V4-Flash-0731").expect("DeepSeek-V4 registration");
+        let grammar = grammar::parse("root ::= \"\\n\" \"<｜DSML｜invoke name=\\\"bash\\\">\"\n")
+            .expect("parse synthetic DSML body grammar");
+        let root = grammar.rule_id("root").expect("root rule");
+        let mut grammar_runtime = GrammarRuntime::new(grammar, root).expect("grammar runtime");
+        grammar_runtime.set_awaiting_trigger(true);
+        let mut runtime = Some(grammar_runtime);
+
+        trigger_tool_grammar_on_raw_marker(
+            "preamble<｜DSML｜tool_calls>",
+            &mut runtime,
+            Some(&registration),
+        )
+        .expect("trigger raw tool marker");
+        let runtime = runtime.as_mut().expect("runtime");
+        assert!(!runtime.is_awaiting_trigger());
+        assert!(runtime.accept_bytes(b"\n"));
+        assert!(
+            !runtime.accept_bytes("<｜DSML｜\n".as_bytes()),
+            "the formerly unconstrained bare DSML prefix must be rejected"
+        );
     }
 }

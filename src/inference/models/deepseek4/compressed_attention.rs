@@ -6,13 +6,15 @@ use mlx_native::ops::deepseek_activation_quant::{
     dispatch_deepseek_mxfp8_fake_quant_bf16, DeepSeekMxfp8Params,
 };
 use mlx_native::ops::deepseek_sparse_attention::{
-    dispatch_deepseek_sparse_attention, DeepSeekSparseAttentionParams,
+    dispatch_deepseek_sparse_attention_flash_decode,
+    dispatch_deepseek_sparse_attention_with_scratch, DeepSeekSparseAttentionParams,
+    DEEPSEEK_SPARSE_HEADS,
 };
 use mlx_native::ops::deepseek_tail_rope::{
     dispatch_deepseek_tail_rope_f32_to_bf16, DeepSeekTailRopeParams,
 };
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
-use mlx_native::{DType, GraphExecutor, MlxBuffer};
+use mlx_native::{DType, GraphExecutor, MlxBuffer, MlxDevice};
 
 use super::attention::{
     append_prefill_window_indices, compressed_attention_index_plan, compressed_indices,
@@ -27,10 +29,72 @@ use super::compressed_attention_indexer::{encode_ratio_four_indexer, RatioFourIn
 use super::compressed_attention_main::{encode_main_compressor, MainCompressorArena};
 use super::compressed_attention_weights::CompressedAttentionWeightsRef;
 use super::forward_support::alloc;
-use super::prefill_flash_attention::{encode_deepseek_flash_prefill, DeepseekPrefillFlashArena};
+use super::prefill_flash_attention::{
+    encode_deepseek_flash_prefill, encode_deepseek_sparse_flash_prefill, DeepseekPrefillFlashArena,
+    DeepseekSparsePrefillFlashArena,
+};
 use super::rope::yarn_frequencies;
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
+
+const SPARSE_FLASH_MIN_TOP_K: usize = 384;
+/// The dense-mask flash kernel wins while the compressed history is short;
+/// gathered sparse flash becomes faster once ratio-four history reaches this
+/// measured crossover (roughly 24K raw tokens). Keeping the decision on the
+/// compressed count makes it independent of prompt chunk size.
+const SPARSE_PREFILL_MIN_COMPRESSED: usize = 6_144;
+
+fn use_gathered_sparse_prefill(ratio: u32, valid_compressed: usize) -> bool {
+    ratio == 4 && valid_compressed >= SPARSE_PREFILL_MIN_COMPRESSED
+}
+
+fn sparse_attention_scratch_shape(rows: usize, attention_width: usize) -> Vec<usize> {
+    vec![1, rows, DEEPSEEK_SPARSE_HEADS, attention_width]
+}
+
+struct SparseFlashDecodeArena {
+    gathered_kv: MlxBuffer,
+    mask: MlxBuffer,
+    invalid_global: MlxBuffer,
+    invalid_heads: MlxBuffer,
+}
+
+impl SparseFlashDecodeArena {
+    fn new(device: &MlxDevice, top_k: usize, head_dim: usize) -> Result<Self> {
+        let gathered_kv = alloc(
+            device,
+            DType::BF16,
+            vec![1, 1, top_k, head_dim],
+            "compressed gathered flash KV",
+        )?;
+        let mask = alloc(
+            device,
+            DType::BF16,
+            vec![1, top_k],
+            "compressed gathered flash mask",
+        )?;
+        let mut invalid_global = alloc(
+            device,
+            DType::U32,
+            vec![1],
+            "compressed gathered flash global validity",
+        )?;
+        invalid_global.as_logical_mut_slice::<u32>()?.fill(0);
+        let mut invalid_heads = alloc(
+            device,
+            DType::U32,
+            vec![DEEPSEEK_SPARSE_HEADS],
+            "compressed gathered flash head validity",
+        )?;
+        invalid_heads.as_logical_mut_slice::<u32>()?.fill(0);
+        Ok(Self {
+            gathered_kv,
+            mask,
+            invalid_global,
+            invalid_heads,
+        })
+    }
+}
 
 impl Deepseek4Model {
     pub(super) fn forward_compressed_attention_one(
@@ -84,6 +148,8 @@ impl Deepseek4Model {
         in_flight: Option<&mut SubmissionChain>,
         shared_session: Option<&mut GraphSession<'_>>,
     ) -> Result<MlxBuffer> {
+        let profile_stages =
+            std::env::var("HF2Q_DEEPSEEK_COMPRESSED_STAGE_PROFILE").as_deref() == Ok("1");
         let ratio = self
             .cfg
             .compress_ratios
@@ -224,17 +290,6 @@ impl Deepseek4Model {
                 )
             })
             .transpose()?;
-        let prefill_flash = use_matrix_prefill
-            .then(|| {
-                DeepseekPrefillFlashArena::new(
-                    &device,
-                    rows,
-                    heads,
-                    head_dim,
-                    compact_prefill_kv_len,
-                )
-            })
-            .transpose()?;
         let mut positions = alloc(&device, DType::U32, vec![rows], "compressed positions")?;
         for (offset, position) in positions
             .as_logical_mut_slice::<u32>()?
@@ -357,6 +412,46 @@ impl Deepseek4Model {
                 .slice_view(indices.byte_offset(), rows * attention_width)
                 .with_shape(vec![1, rows, attention_width])?
         };
+        let use_sparse_prefill_flash =
+            use_matrix_prefill && use_gathered_sparse_prefill(ratio, valid_compressed);
+        let prefill_flash = (use_matrix_prefill && !use_sparse_prefill_flash)
+            .then(|| {
+                DeepseekPrefillFlashArena::new(
+                    &device,
+                    rows,
+                    heads,
+                    head_dim,
+                    compact_prefill_kv_len,
+                )
+            })
+            .transpose()?;
+        let sparse_prefill_flash = use_sparse_prefill_flash
+            .then(|| {
+                DeepseekSparsePrefillFlashArena::new(
+                    &device,
+                    rows,
+                    heads,
+                    head_dim,
+                    compact_prefill_kv_len,
+                    attention_width,
+                )
+            })
+            .transpose()?;
+        let use_sparse_flash_decode =
+            !use_matrix_prefill && ratio == 4 && attention_width >= SPARSE_FLASH_MIN_TOP_K;
+        let sparse_attention_scratch = (!use_matrix_prefill && !use_sparse_flash_decode)
+            .then(|| {
+                alloc(
+                    &device,
+                    DType::F32,
+                    sparse_attention_scratch_shape(rows, attention_width),
+                    "compressed sparse attention logits",
+                )
+            })
+            .transpose()?;
+        let sparse_flash_decode = use_sparse_flash_decode
+            .then(|| SparseFlashDecodeArena::new(&device, attention_width, head_dim))
+            .transpose()?;
         let weights = CompressedAttentionWeightsRef::get(&self.weights, layer, ratio)?;
 
         let registry = &mut self.ctx.registry;
@@ -503,8 +598,43 @@ impl Deepseek4Model {
                     indexer_output_offset,
                 )?;
             }
+            if profile_stages {
+                session
+                    .encoder_mut()
+                    .profile_stage_boundary(match ratio {
+                        4 => "DeepSeek-V4 ratio-4 cache prep and indexer",
+                        128 => "DeepSeek-V4 ratio-128 cache prep",
+                        _ => "DeepSeek-V4 compressed cache prep",
+                    })
+                    .context("profile DeepSeek-V4 compressed cache preparation")?;
+            }
 
-            if let Some(prefill_flash) = prefill_flash.as_ref() {
+            if let Some(sparse_prefill_flash) = sparse_prefill_flash.as_ref() {
+                encode_deepseek_sparse_flash_prefill(
+                    session,
+                    registry,
+                    &device,
+                    &q_rope,
+                    raw_prefix.as_ref(),
+                    &kv_rope,
+                    layer_cache
+                        .compressed_kv
+                        .as_ref()
+                        .context("DeepSeek-V4 sparse prefill compressed KV is missing")?,
+                    weights.attention.sinks,
+                    &attention_indices,
+                    &attention,
+                    sparse_prefill_flash,
+                    rows,
+                    raw_prefix_len,
+                    compact_raw_kv_len,
+                    compact_prefill_kv_len,
+                    attention_width,
+                    heads,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                )?;
+            } else if let Some(prefill_flash) = prefill_flash.as_ref() {
                 encode_deepseek_flash_prefill(
                     session,
                     registry,
@@ -531,34 +661,81 @@ impl Deepseek4Model {
                     layer_cache
                         .attention_kv
                         .with_shape(vec![1, physical_kv_len, head_dim])?;
-                session.barrier_between(
-                    &[
+                let params = DeepSeekSparseAttentionParams {
+                    batch: 1,
+                    query_len: rows as u32,
+                    kv_len: physical_kv_len as u32,
+                    top_k: attention_width as u32,
+                    heads: heads as u32,
+                    head_dim: head_dim as u32,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                };
+                if let Some(flash) = sparse_flash_decode.as_ref() {
+                    session.barrier_between(
+                        &[
+                            &q_rope,
+                            &cache_view,
+                            weights.attention.sinks,
+                            &attention_indices,
+                        ],
+                        &[
+                            &flash.gathered_kv,
+                            &flash.mask,
+                            &flash.invalid_global,
+                            &flash.invalid_heads,
+                            &attention,
+                        ],
+                    );
+                    dispatch_deepseek_sparse_attention_flash_decode(
+                        session.encoder_mut(),
+                        registry,
+                        &device,
                         &q_rope,
                         &cache_view,
                         weights.attention.sinks,
                         &attention_indices,
-                    ],
-                    &[&attention],
-                );
-                dispatch_deepseek_sparse_attention(
-                    session.encoder_mut(),
-                    registry,
-                    &device,
-                    &q_rope,
-                    &cache_view,
-                    weights.attention.sinks,
-                    &attention_indices,
-                    &attention,
-                    &DeepSeekSparseAttentionParams {
-                        batch: 1,
-                        query_len: rows as u32,
-                        kv_len: physical_kv_len as u32,
-                        top_k: attention_width as u32,
-                        heads: heads as u32,
-                        head_dim: head_dim as u32,
-                        scale: 1.0 / (head_dim as f32).sqrt(),
-                    },
-                )?;
+                        &flash.gathered_kv,
+                        &flash.mask,
+                        &flash.invalid_global,
+                        &flash.invalid_heads,
+                        &attention,
+                        &params,
+                    )?;
+                } else {
+                    session.barrier_between(
+                        &[
+                            &q_rope,
+                            &cache_view,
+                            weights.attention.sinks,
+                            &attention_indices,
+                        ],
+                        &[&attention],
+                    );
+                    dispatch_deepseek_sparse_attention_with_scratch(
+                        session.encoder_mut(),
+                        registry,
+                        &device,
+                        &q_rope,
+                        &cache_view,
+                        weights.attention.sinks,
+                        &attention_indices,
+                        sparse_attention_scratch
+                            .as_ref()
+                            .context("DeepSeek-V4 decode sparse-attention scratch is missing")?,
+                        &attention,
+                        &params,
+                    )?;
+                }
+            }
+            if profile_stages {
+                session
+                    .encoder_mut()
+                    .profile_stage_boundary(match ratio {
+                        4 => "DeepSeek-V4 ratio-4 sparse attention",
+                        128 => "DeepSeek-V4 ratio-128 sparse attention",
+                        _ => "DeepSeek-V4 compressed sparse attention",
+                    })
+                    .context("profile DeepSeek-V4 compressed sparse attention")?;
             }
             encode_compressed_attention_epilogue(
                 session,
@@ -573,6 +750,16 @@ impl Deepseek4Model {
                 &frequency_buffer,
                 rows,
             )?;
+            if profile_stages {
+                session
+                    .encoder_mut()
+                    .profile_stage_boundary(match ratio {
+                        4 => "DeepSeek-V4 ratio-4 attention epilogue",
+                        128 => "DeepSeek-V4 ratio-128 attention epilogue",
+                        _ => "DeepSeek-V4 compressed attention epilogue",
+                    })
+                    .context("profile DeepSeek-V4 compressed attention epilogue")?;
+            }
             Ok(())
         };
         if let Some(session) = shared_session {
@@ -600,5 +787,33 @@ impl Deepseek4Model {
                 .context("publish compressed DeepSeek-V4 cache transaction")?;
         }
         Ok(core.output_state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn early_decode_sparse_scratch_tracks_live_attention_width() {
+        assert_eq!(sparse_attention_scratch_shape(1, 22), vec![1, 1, 64, 22]);
+        assert_ne!(
+            sparse_attention_scratch_shape(1, 22),
+            vec![1, 1, 64, 640],
+            "early decode must not allocate the eventual full top-k width"
+        );
+    }
+
+    #[test]
+    fn gathered_sparse_prefill_activates_only_after_measured_ratio_four_crossover() {
+        assert!(!use_gathered_sparse_prefill(
+            4,
+            SPARSE_PREFILL_MIN_COMPRESSED - 1
+        ));
+        assert!(use_gathered_sparse_prefill(
+            4,
+            SPARSE_PREFILL_MIN_COMPRESSED
+        ));
+        assert!(!use_gathered_sparse_prefill(128, usize::MAX));
     }
 }

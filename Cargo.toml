@@ -1,8 +1,9 @@
 [package]
 name = "hf2q"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88.0"
+build = "src/build_script.rs"
 authors = ["Robert E. Lee <robert@agidreams.us>"]
 description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats and serving them over an OpenAI-compatible API on Apple Silicon"
 license = "Apache-2.0 OR MIT"
@@ -98,9 +99,10 @@ anyhow = "1"
 thiserror = "2"
 
 # ADR-008: mlx-native is the sole inference/compute backend.
-# DeepSeek-V4 matrix appends and BF16 sparse prefill require mlx-native 0.9.6.
+# DeepSeek-V4 Q3_K, Q8 embeddings, scalable indexer, and sparse decode
+# optimizations require mlx-native 0.10.1.
 # Pin the immutable registry release so clean builds cannot drift.
-mlx-native = "=0.9.6"
+mlx-native = "=0.10.1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

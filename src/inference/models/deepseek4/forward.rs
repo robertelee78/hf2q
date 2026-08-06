@@ -4,7 +4,9 @@ use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
-use mlx_native::{DType, EmbeddingQ2KParams, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{
+    DType, EmbeddingQ2KParams, EmbeddingQ8_0Params, KernelRegistry, MlxBuffer, MlxDevice,
+};
 
 use super::Deepseek4Model;
 
@@ -16,7 +18,7 @@ pub(super) struct EmbeddingArena {
 }
 
 impl Deepseek4Model {
-    /// Gather Q2_K token rows and expand each activation into the four
+    /// Gather quantized token rows and expand each activation into the four
     /// official Hyper-Connection streams in one Metal command buffer.
     pub fn embed_hyper_state(&mut self, token_ids: &[u32]) -> Result<MlxBuffer> {
         let arena = self.prepare_embedding_arena(token_ids)?;
@@ -98,32 +100,45 @@ impl Deepseek4Model {
         hidden: usize,
         hc: u32,
     ) -> Result<()> {
-        if embedding_type != GgmlType::Q2_K {
-            bail!(
-                "DeepSeek-V4 optimized runtime requires Q2_K token embeddings, got {:?}",
-                embedding_type
-            );
-        }
         if embedding_shape != [vocab, hidden] {
             bail!(
                 "DeepSeek-V4 token embedding shape drift: got {embedding_shape:?}, expected [{vocab}, {hidden}]"
             );
         }
         session.barrier_between(&[embedding, &arena.ids], &[&arena.gathered]);
-        session
-            .embedding_gather_q2_k(
-                registry,
-                device,
-                embedding,
-                &arena.ids,
-                &arena.gathered,
-                &EmbeddingQ2KParams {
-                    vocab_size: vocab,
-                    embed_dim: hidden,
-                    n_tokens: tokens,
-                },
-            )
-            .context("encode DeepSeek-V4 Q2_K embedding gather")?;
+        match embedding_type {
+            GgmlType::Q2_K => session
+                .embedding_gather_q2_k(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &EmbeddingQ2KParams {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q2_K embedding gather")?,
+            GgmlType::Q8_0 => session
+                .embedding_gather_q8_0(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &EmbeddingQ8_0Params {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q8_0 embedding gather")?,
+            other => bail!(
+                "DeepSeek-V4 optimized runtime requires Q2_K or Q8_0 token embeddings, got {other:?}"
+            ),
+        }
         session.barrier_between(&[&arena.gathered], &[&arena.state]);
         dispatch_repeat_tiled_f32(
             session.encoder_mut(),

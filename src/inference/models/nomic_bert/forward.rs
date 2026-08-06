@@ -1142,7 +1142,7 @@ pub fn apply_nomic_bert_full_forward_gpu(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::collections::HashMap;
@@ -1282,20 +1282,16 @@ mod tests {
         Ok(tensors)
     }
 
-    #[test]
-    fn full_forward_at_synthetic_min_config_produces_unit_norm_output() {
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
+    pub(crate) fn run_synthetic_min_forward_for_cross_family_test() {
         let cfg = synthetic_min_cfg(2);
         let device = MlxDevice::new().expect("create device");
         let mut registry = KernelRegistry::new();
         register_nomic_bert_kernels(&mut registry);
 
         let tensors = synthetic_weights(&device, &cfg).expect("build synthetic weights");
-        // MlxDevice doesn't impl Clone; create a separate handle. On Apple
-        // Silicon both `MlxDevice::new()` instances bind to the same shared
-        // Metal device — buffers allocated via `device` work in `weights`
-        // (loaded-weights only holds the device for RAII).
-        let weights_device = MlxDevice::new().expect("create weights device");
+        // The helper pre-casts the supplied tensors through this handle.
+        // Clone the owner so its queue and residency set match the buffers.
+        let weights_device = device.clone();
         let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, weights_device);
 
         // 32 input ids in vocab range [0, 100).
@@ -1350,6 +1346,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_forward_at_synthetic_min_config_produces_unit_norm_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_synthetic_min_forward_for_cross_family_test();
+    }
+
     /// Iter-90: `head_dim` must be exactly 64 (only D=64 flash-attn
     /// instantiation registered).  Verify the precondition rejects a
     /// non-64 head_dim with a clear error before any GPU dispatch.
@@ -1383,7 +1385,9 @@ mod tests {
         // function can reach the head_dim check.  Use the same synthetic
         // builder; it generates buffers sized to the cfg.
         let tensors = synthetic_weights(&device, &cfg).expect("build synthetic weights");
-        let weights_device = MlxDevice::new().expect("create weights device");
+        // Match the owning device even on this precondition-only path; the
+        // test helper pre-casts linear tensors before the forward rejects.
+        let weights_device = device.clone();
         let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, weights_device);
 
         let seq_len: u32 = 32;

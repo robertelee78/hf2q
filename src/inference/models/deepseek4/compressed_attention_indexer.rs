@@ -7,7 +7,8 @@ use mlx_native::ops::deepseek_compressor::{
     dispatch_deepseek_compressor, DeepSeekCompressorParams,
 };
 use mlx_native::ops::deepseek_indexer::{
-    dispatch_deepseek_indexer_into, DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
+    deepseek_indexer_topk_scratch_elements, dispatch_deepseek_indexer_into_mma,
+    DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
 };
 use mlx_native::ops::deepseek_tail_rope::{
     dispatch_deepseek_tail_rope_bf16, dispatch_deepseek_tail_rope_f32_to_bf16,
@@ -32,6 +33,7 @@ pub(super) struct RatioFourIndexerArena {
     compressor_output: MlxBuffer,
     compressor_rope: MlxBuffer,
     score_scratch: MlxBuffer,
+    topk_scratch: MlxBuffer,
 }
 
 impl RatioFourIndexerArena {
@@ -95,6 +97,16 @@ impl RatioFourIndexerArena {
                 vec![1, rows, valid_compressed.max(1)],
                 "index score scratch",
             )?,
+            topk_scratch: {
+                let elements =
+                    deepseek_indexer_topk_scratch_elements(1, rows, valid_compressed.max(1))?;
+                alloc(
+                    device,
+                    DType::I32,
+                    vec![1, rows, elements / rows],
+                    "index top-k scratch",
+                )?
+            },
         })
     }
 }
@@ -322,7 +334,7 @@ pub(super) fn encode_ratio_four_indexer(
             &[&arena.query_bf16, &cache_view, &arena.scaled_weights],
             &[&scratch, output_indices],
         );
-        dispatch_deepseek_indexer_into(
+        dispatch_deepseek_indexer_into_mma(
             session.encoder_mut(),
             registry,
             device,
@@ -330,6 +342,7 @@ pub(super) fn encode_ratio_four_indexer(
             &cache_view,
             &arena.scaled_weights,
             &scratch,
+            &arena.topk_scratch,
             output_indices,
             output_row_stride,
             output_column_offset,

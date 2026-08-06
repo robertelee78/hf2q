@@ -1,21 +1,25 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
-- **Status:** Conversion accepted; agentic serving and performance gates reopened
-  after long-context OpenCode revalidation (2026-08-05)
-- **Updated:** 2026-08-05 — published the required native append kernels as
-  `mlx-native 0.9.6` and strengthened the agentic serving gate
+- **Status:** Accepted for hf2q 0.1.1
+- **Updated:** 2026-08-06 — the mixed-quant candidate passed a real OpenCode
+  two-turn coding run, a 119.8K-token tool/caching gate, and same-artifact
+  llama.cpp throughput comparison; publication is controlled by the exact-SHA
+  release workflow
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
 - **Reference implementation:** `/opt/llama.cpp` at
-  `360e1349f0009c5ad99d21e3c4546b707addc68a`
+  `a1f96d4fc2c9e4101a6666a9d87f547e7e880df6` (build 10293)
 - **Target host:** Apple M5 Max, 40-core GPU, 128 GiB unified memory
 
 ## Decision
 
-hf2q will download the **official Hugging Face checkpoint** and convert it to a
-`Q2_K_S` GGUF itself. Conversion, quantization, loading, and inference are
-implemented in-process in Rust (with owned Metal kernels in `mlx-native`).
+hf2q downloads the **official Hugging Face checkpoint** and converts it to the
+owned `deepseek4-agentic-q2` mixed profile. Expert gate/up tensors use Q2_K,
+expert and shared down tensors use Q3_K, and the token/output, HC, indexer, and
+compressed-attention context paths use Q8_0. Conversion, quantization, loading,
+and inference are implemented in-process in Rust with owned Metal kernels in
+`mlx-native`.
 
 The product may invoke `hf`, `wget`, or `curl` solely to fetch official source
 repository files. It must not invoke Python, llama.cpp, or another converter,
@@ -26,18 +30,18 @@ Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
 evidence.
 
-The revalidated runtime candidate executes prompts in bounded 4,096-token
-matrix transactions, 32 times wider than the 128-token physical attention
+The accepted runtime executes prompts in bounded 2,048-token matrix
+transactions, 16 times wider than the 128-token physical attention
 window. Attention reads each transaction's compact KV source while only the
 final physical window is published to the circular cache. A suffix shorter than
 33 tokens retains exact token-wise extension; longer suffixes use another
 matrix transaction so an agentic follow-up does not degrade into full
-decode-style replay. This requires `mlx-native =0.9.6`, published from source
-commit `7b05016b1bc2b4cce06bb0c4336abf8bded1c394`; it must not be enabled against
-an older dependency that only accepts one-token nonzero-position appends. The
-OpenAI server context may be configured with `HF2Q_DEEPSEEK_MAX_SEQ_LEN` and is
-capped by checkpoint metadata. The separate DSpark draft artifact remains
-follow-up work and is never silently represented as part of the base GGUF.
+decode-style replay. The 2K bound is measured: 4K prefill exceeded the Metal
+command-buffer working-set limit beside the 100.05 GiB artifact, while 2K
+preserved matrix prefill without OOM. The OpenAI server context is configured
+with `HF2Q_DEEPSEEK_MAX_SEQ_LEN` and capped by checkpoint metadata. The separate
+DSpark draft artifact remains follow-up work and is never silently represented
+as part of the base GGUF.
 
 Agentic serving is stateful. A growing rendered transcript reuses the exact
 live native KV/recurrent prefix and evaluates only its suffix. Because the
@@ -103,24 +107,25 @@ One tensor or bounded row group can be decoded and requantized without a full
 model copy or an 8 GiB fused-expert F32 allocation.
 
 **Falsifier:** conversion private RSS exceeds 20 GiB, conversion requires all
-experts resident, resume can publish a partial tensor, or source/output identity
-is not bound to a receipt.
+experts resident, an interrupted run replaces the requested output with a
+partial tensor stream, or source/output identity is not bound to a receipt.
 
-### H3 — Q2_K_S fits and remains coherent
+### H3 — the agentic mixed profile fits and remains coherent
 
-The produced main-model artifact is at most 100 GB decimal and loads with enough
-headroom for Metal state and useful KV capacity on the 128 GiB host.
+The produced main-model artifact is at most 108 GB decimal (100.6 GiB) and loads
+with enough headroom for Metal state and a 131,072-token live cache plus recovery
+checkpoint on the 128 GiB host.
 
 **Falsifier:** peak process footprint exceeds 116 GiB at the acceptance context,
 macOS enters critical memory pressure, swap grows materially during steady-state
 decode, or deterministic prompts become incoherent relative to the reference.
 
-### H4 — owned low-bit kernels reach parity
+### H4 — owned low-bit kernels meet or exceed llama.cpp
 
 The Rust/Metal Q2_K path matches a scalar Rust decoder within the declared
-numeric tolerance and reaches at least 0.90x the pinned llama.cpp decode rate
-and 0.85x its prompt-processing rate under the same model, prompt, context,
-threading, and sampling settings.
+numeric tolerance, and the complete runtime reaches at least 1.00x the pinned
+llama.cpp decode and prompt-processing rates under the same artifact, prompt,
+context, threading, and sampling settings.
 
 **Falsifier:** decoded blocks differ, token decisions diverge outside documented
 floating-point ties, or three-run medians miss either throughput floor after
@@ -147,9 +152,20 @@ scale siblings are typed errors.
 
 The converter decodes and requantizes bounded rows directly into the incremental
 GGUF writer. Expert fusion must preserve canonical expert-major layout while
-streaming; it must not build a complete F32 fused projection. Checkpoints bind
-the source revision, shard hashes, converter commit, tensor name, output offset,
-length, quant type, and payload checksum. Resume revalidates all of them.
+streaming; it must not build a complete F32 fused projection. The writer uses a
+same-directory temporary, finalizes and syncs the complete GGUF, and only then
+atomically replaces the requested output. An interruption before promotion
+therefore preserves the previous complete artifact. If receipt promotion fails
+after artifact promotion, the new GGUF remains complete but hf2q removes any
+stale sidecar, returns an error, and does not treat the result as provenance-
+complete. Restart deterministically regenerates from the pinned source; this
+implementation does not claim per-tensor resume.
+Before artifact promotion, hf2q prepares and durably syncs a sidecar receipt that
+binds source revision and file hashes, converter commit, quant selector, final
+output size and checksum, excluded DSpark count, and peak streaming bounds. The
+GGUF and sidecar are each promoted with a same-filesystem atomic rename. Artifact
+acceptance independently verifies the recorded output hash; the two renames are
+not claimed as one filesystem transaction.
 
 ### GGUF identity
 
@@ -239,7 +255,8 @@ not exposed to API clients.
 - Positive tests cover E4M3, all E2M1 nibbles, E8M0 edges, integer routing,
   canonical metadata, tensor naming, expert ordering, and GGUF round-trip.
 - Negative tests cover missing/malformed scales, wrong dtypes and ranks,
-  incomplete expert groups, invalid route tables, truncation, and corrupt resume.
+  incomplete expert groups, invalid route tables, truncation, and interrupted
+  temporary-output preservation.
 - The converter never spawns a converter/runtime process.
 - Existing Gemma 4 and Qwen 3.5 conversion regressions remain green.
 
@@ -282,7 +299,59 @@ actions; pushing requires explicit authorization. No artifact is described as
 ready until its exact-source receipt and all applicable acceptance gates are
 green.
 
-## Agentic revalidation (2026-08-05)
+## Agentic acceptance revalidation (2026-08-06)
+
+The following source-bound measurements validate the mixed profile and runtime
+changes. The measured candidate is
+`/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2.gguf`:
+
+| Evidence | Candidate result |
+|---|---|
+| Source identity | Official revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062`; 73-file bundle SHA-256 `a8544e6469f8f392e72f953e9a2b4ee33a23c50a859f47dd354d37ab0093993d` |
+| Artifact identity | 107,431,343,104 bytes (100.05 GiB); SHA-256 `914e9de7f6bad70d795179fedf68ac4336880c93c3a8c7c09ad019f0b28f6bc4` |
+| Native dependency | `mlx-native` 0.10.1 from implementation commit `08282dad5392708621cadad3caba83a4e1cdd6b2`; crates.io registry checksum and downloaded archive SHA-256 `bc66c3409f1955c006f74070cea586fa0147fbf9a3c020ff1de0643a80e8c8e5` |
+| Quant plan | 1,328 verifier tensors: 172 Q2_K, 86 Q3_K, 532 Q8_0, 535 F32, and 3 I32; 4,705 DSpark tensors explicitly excluded from the base artifact |
+| Conversion bound | Rust-native row-aligned streaming; maximum working vector bound 4,798,873,600 bytes; no external converter or inference process |
+| Arithmetic coherence | Greedy `What is 2+2? Reply with only number.` returned exactly `4` |
+| Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. A real OpenCode two-turn run then issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
+| Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
+| Prefix reuse | Repeated, auto, SSE, and post-tool turns each reused 6,242 of 6,250 rendered prompt tokens; cached TTFT was 233-244 ms |
+| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and the near-boundary cache gate at its default 131,072-token capacity. |
+| Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; llama.cpp build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
+| 121K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced a coherent tool call for 119,821 prompt tokens in 494.449 s TTFT. The same artifact under llama.cpp build 10293 processed the 121K-class source-bound prompt at 217.5 tok/s, about 556 s. hf2q completed about 61 s sooner. |
+| 121K continuation cache | Appending the real tool result produced a 119,916-token request that reused 119,813 tokens (99.91%), processed only a 103-token suffix, and returned its first semantic token in 1.275 s. |
+| Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
+| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate without GPU failure or growing swap. Only one 100 GiB-class runtime was resident during every comparison. |
+
+The performance result comes from two measured defaults. Decode groups two
+verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two
+reached 33.10, four plateaued at 33.05, and eight regressed to 32.80. The Q8_0
+matvec uses llama.cpp's peer geometry (`N_SG=4`, `N_R0=2`); enabling it raised
+the accepted path to 35.55 tok/s with byte-identical Q8 parity tests. The Q3_K
+expert-down choice was retained after an exact production-shape spike measured
+201 us for six decode rows versus 351 us for Q2_K. These results falsify both
+"more command-buffer grouping is always faster" and "Q2 expert downs would
+close decode parity."
+
+The checked-in gate is `scripts/test_deepseek4_agentic.sh`. It intentionally
+uses a unique first turn, keeps the requested manifest out of the prompt,
+checks cold and cached timing, exercises required and automatic tool choice,
+reconstructs SSE arguments, requires one terminal `[DONE]`, appends a real tool
+result, and verifies that the continuation reuses the unchanged prefix. A
+short-output smoke test is not an acceptance substitute.
+
+The near-boundary companion is
+`scripts/test_deepseek4_long_context_cache.sh`. It calibrates with the server's
+actual tokenizer, constructs a 116K-125K prompt, requires a valid tool call,
+then appends its tool result and fails unless almost the entire prefix is
+reported as cached with bounded continuation TTFT. This is the release guard
+against the original agentic failure mode: recomputing the whole conversation
+on every turn.
+
+## Historical agentic revalidation (superseded, 2026-08-05)
+
+This section records the rejected 89.65 GiB Q2_K_S artifact and the defects that
+motivated the mixed profile. It is not the current acceptance result.
 
 The earlier short-prompt acceptance did not represent OpenCode. A source-bound
 revalidation used a real repository prompt, OpenAI tool definitions, a required

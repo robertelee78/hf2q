@@ -390,6 +390,10 @@ impl FullAttnKvSlot {
     ///   `mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(...)`
     ///   (only used when NWG > 1; the kernel writes directly to
     ///   `output` when NWG == 1).
+    /// - If K/V were encoded earlier on the same command encoder, the caller
+    ///   MUST issue `encoder.memory_barrier()` before this dispatch. Metal may
+    ///   overlap concurrent compute dispatches otherwise; production Qwen
+    ///   decode does this at both cache-write call sites.
     ///
     /// **Iter-10 scope (this method):** dispatch wrapper + GPU sanity
     /// tests (output is finite + non-zero on real Metal). The full
@@ -5420,6 +5424,10 @@ mod tests {
             &device,
         )
         .expect("encode");
+        // RAW dependency: SDPA below reads the packed K/V and norms written by
+        // the two encode dispatches above. This is part of the production
+        // pattern, not an optional test synchronization aid.
+        encoder.memory_barrier();
 
         // Build Q (FWHT-rotation skipped — sanity test only checks
         // finite/non-zero output, not numerical correctness).
@@ -5533,6 +5541,7 @@ mod tests {
             &device,
         )
         .expect("encode pos 1");
+        encoder.memory_barrier();
 
         let (mut q_buf, output, tmp) = alloc_sdpa_buffers(&device, num_heads, head_dim);
         {
@@ -6895,6 +6904,10 @@ mod tests {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut enc_ref = device.command_encoder().expect("encoder ref");
         let stride = (n_kv_heads as usize) * (head_dim as usize);
+        // MLX_UNRETAINED_REFS=1 matches production command-buffer ownership:
+        // every dispatch input must outlive the command buffer. Keep the
+        // extracted per-token sources alive until `enc_ref` completes.
+        let mut token_sources = Vec::with_capacity(n_tokens_to_encode as usize);
         for (cache_slot, src_pos) in
             (src_tok_offset..src_tok_offset + n_tokens_to_encode).enumerate()
         {
@@ -6928,6 +6941,7 @@ mod tests {
                     &device,
                 )
                 .expect("encode token");
+            token_sources.push(tok_buf);
         }
         enc_ref.commit_and_wait().expect("ref commit");
 
@@ -10010,7 +10024,7 @@ mod tests {
     /// mirrors `partial_copy_slot`'s per-head stride math.
     fn read_head_prefix(buf: &MlxBuffer, head: usize, n_tokens: usize) -> Vec<u8> {
         let shape = buf.shape();
-        let (n_kv, max_seq, inner) = (shape[1], shape[2], shape[3]);
+        let (_n_kv, max_seq, inner) = (shape[1], shape[2], shape[3]);
         let elem = buf.dtype().size_of();
         let head_stride = max_seq * inner * elem;
         let all = buf.as_slice::<u8>().expect("slice");

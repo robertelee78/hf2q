@@ -33330,33 +33330,28 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
             .find("\n}\n")
             .expect("H91: GemmaLoadedModel struct close brace not found");
         let struct_window = &src[struct_idx..struct_idx + struct_end];
+        let compact: String = struct_window
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
         // C2c field PRESERVED.
         assert!(
-            struct_window.contains("pub multi_seq_kv: Option<"),
+            compact.contains(
+                "pubmulti_seq_kv:Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>>"
+            ),
             "H91 FALSIFIED: C2c `multi_seq_kv: Option<Vec<MultiSeqHbKvBuffers>>` \
              field is MISSING — H94 PRESERVED constraint violated. \
              iter-C2c-cont must be ADDITIVE."
         );
-        assert!(
-            struct_window.contains("MultiSeqHbKvBuffers"),
-            "H91 FALSIFIED: C2c field's element type \
-             `MultiSeqHbKvBuffers` removed from GemmaLoadedModel; \
-             H94 violated."
-        );
         // NEW iter-C2c-cont field PRESENT.
         assert!(
-            struct_window.contains("pub multi_seq_kv_hybrid: Option<"),
+            compact.contains(
+                "pubmulti_seq_kv_hybrid:Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>>"
+            ),
             "H91 FALSIFIED: NEW field `multi_seq_kv_hybrid: Option<Vec<\
              MultiSeqHybridKvBuffers>>` is MISSING from GemmaLoadedModel. \
              iter-C2c-cont load-bearing primitive not landed — iter-2B \
              hybrid kernel-dispatch refactor has no destination."
-        );
-        assert!(
-            struct_window.contains("MultiSeqHybridKvBuffers"),
-            "H91 FALSIFIED: new field's element type \
-             `MultiSeqHybridKvBuffers` is MISSING. iter-C2c-cont must \
-             provision the production-default hybrid F16-K + TQ-HB-V \
-             scaffold per H10 falsification §6.1.11."
         );
     }
 
@@ -33518,6 +33513,10 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
     #[test]
     fn h94_c2c_hb_provisioning_surface_preserved() {
         let src = include_str!("engine.rs");
+        let compact: String = src
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
         // C2c typed-error variant present.
         assert!(
             src.contains("Gemma4SlotAwareProvisionFailed {"),
@@ -33526,7 +33525,9 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
         );
         // C2c field present with correct element type.
         assert!(
-            src.contains("pub multi_seq_kv: Option<\n"),
+            compact.contains(
+                "pubmulti_seq_kv:Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>>"
+            ),
             "H94 FALSIFIED: `multi_seq_kv` field declaration changed; \
              H22 access pattern broken."
         );

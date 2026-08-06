@@ -81,6 +81,7 @@ impl GpuContext {
         mlx_native::ops::flash_attn_prefill_mask::register(&mut registry);
         mlx_native::ops::flash_attn_prefill_blk::register(&mut registry);
         mlx_native::ops::embedding_q2_k::register(&mut registry);
+        mlx_native::ops::embedding_q8_0::register(&mut registry);
         mlx_native::ops::deepseek_hyper_connection::register(&mut registry);
         mlx_native::ops::deepseek_sparse_attention::register(&mut registry);
         mlx_native::ops::deepseek_sparse_prefill_mask::register(&mut registry);
@@ -90,6 +91,12 @@ impl GpuContext {
         mlx_native::ops::deepseek_moe_routing::register(&mut registry);
         mlx_native::ops::deepseek_moe_activation::register(&mut registry);
         mlx_native::ops::repeat_tiled::register(&mut registry);
+        // EAGLE3 speculative decode helpers are not part of
+        // KernelRegistry::new(); register them once at model load so the
+        // first draft step can compile and cache the pipelines.
+        crate::inference::spec_decode::eagle3::forward::register_eagle3_forward_kernels(
+            &mut registry,
+        );
 
         // ADR-031 Phase B (Option A): allocate a second identical registry for
         // the parallel-encode worker thread, but ONLY when opt-in is set.
@@ -112,6 +119,7 @@ impl GpuContext {
             mlx_native::ops::flash_attn_prefill_mask::register(&mut wreg);
             mlx_native::ops::flash_attn_prefill_blk::register(&mut wreg);
             mlx_native::ops::embedding_q2_k::register(&mut wreg);
+            mlx_native::ops::embedding_q8_0::register(&mut wreg);
             mlx_native::ops::deepseek_hyper_connection::register(&mut wreg);
             mlx_native::ops::deepseek_sparse_attention::register(&mut wreg);
             mlx_native::ops::deepseek_sparse_prefill_mask::register(&mut wreg);
@@ -121,6 +129,9 @@ impl GpuContext {
             mlx_native::ops::deepseek_moe_routing::register(&mut wreg);
             mlx_native::ops::deepseek_moe_activation::register(&mut wreg);
             mlx_native::ops::repeat_tiled::register(&mut wreg);
+            crate::inference::spec_decode::eagle3::forward::register_eagle3_forward_kernels(
+                &mut wreg,
+            );
             tracing::info!(
                 "mlx-native GpuContext: worker KernelRegistry pre-warmed (HF2Q_PARALLEL_ENCODE=1)"
             );

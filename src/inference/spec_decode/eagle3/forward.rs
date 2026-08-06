@@ -30,14 +30,29 @@ use super::kv_cache::DrafterKvCache;
 use super::tensors::Eagle3DrafterTensors;
 use crate::inference::models::qwen35::gpu_full_attn::{apply_imrope, apply_linear_projection_f32};
 use anyhow::{anyhow, Context, Result};
-use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
+use mlx_native::ops::add_bias_row_2d::{
+    dispatch_add_bias_row_2d_f32, register as register_add_bias_row_2d,
+};
 use mlx_native::ops::elementwise::elementwise_add;
-use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
+use mlx_native::ops::feature_concat::{
+    dispatch_feature_concat_f32, register as register_feature_concat,
+};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::ops::tree_attention::{self as tree_attn_ops, TreeAttentionParams};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+
+/// Register the mlx-native kernels used only by the EAGLE3 forward path.
+///
+/// `KernelRegistry::new()` intentionally does not include these optional
+/// shader families. Call this once when constructing a long-lived inference
+/// registry; calling it from the per-token path would invalidate cached
+/// pipelines because `register_source` replaces existing entries.
+pub fn register_eagle3_forward_kernels(registry: &mut KernelRegistry) {
+    register_feature_concat(registry);
+    register_add_bias_row_2d(registry);
+}
 
 /// EAGLE-3 FC projection.
 ///
@@ -2577,6 +2592,12 @@ mod tests {
     use safetensors::tensor::{Dtype as SafeDtype, TensorView};
     use std::collections::BTreeMap;
 
+    fn eagle3_test_kernel_registry() -> KernelRegistry {
+        let mut registry = KernelRegistry::new();
+        register_eagle3_forward_kernels(&mut registry);
+        registry
+    }
+
     /// Small config so synthetic-blob tests run fast.
     fn tiny_cfg() -> Eagle3DrafterConfig {
         Eagle3DrafterConfig {
@@ -3121,7 +3142,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let cfg = tiny_cfg();
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
@@ -3402,7 +3423,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let cfg = cfg_with_bias();
         let seq_len: u32 = 4;
         let qkv_in = cfg.qkv_input_width();
@@ -5378,7 +5399,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let cfg = cfg_for_full_forward_test();
         let seq_len: u32 = 2;
         let hidden = cfg.hidden_size;
@@ -5869,7 +5890,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
             Some(t) => t,
             None => return,
@@ -6004,7 +6025,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
             Some(t) => t,
             None => return,
@@ -6061,7 +6082,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
             Some(t) => t,
             None => return,
@@ -6122,7 +6143,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
             Some(t) => t,
             None => return,

@@ -566,6 +566,14 @@ mod tests {
     use safetensors::tensor::{Dtype as SafeDtype, TensorView};
     use std::collections::BTreeMap;
 
+    fn eagle3_test_kernel_registry() -> KernelRegistry {
+        let mut registry = KernelRegistry::new();
+        crate::inference::spec_decode::eagle3::forward::register_eagle3_forward_kernels(
+            &mut registry,
+        );
+        registry
+    }
+
     /// Replicates the deterministic-weight pattern from E4b.10b.2 full
     /// forward test.
     fn build_test_blob(manifest: &[ExpectedTensor]) -> Vec<u8> {
@@ -702,7 +710,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let cfg = cfg_for_drafter_test();
         let manifest = expected_manifest(&cfg);
         let blob = build_test_blob(&manifest);
@@ -1073,7 +1081,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_buf, embed_table) =
             match step3_build_drafter_scaffolding(&device) {
                 Some(t) => t,
@@ -1114,7 +1122,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_buf, embed_table) =
             match step3_build_drafter_scaffolding(&device) {
                 Some(t) => t,
@@ -1206,7 +1214,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_buf, embed_table) =
             match step3_build_drafter_scaffolding(&device) {
                 Some(t) => t,
@@ -1243,7 +1251,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_buf, embed_table) =
             match step3_build_drafter_scaffolding(&device) {
                 Some(t) => t,
@@ -1298,7 +1306,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_buf, embed_table) =
             match step3_build_drafter_scaffolding(&device) {
                 Some(t) => t,
@@ -1608,7 +1616,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = eagle3_test_kernel_registry();
         let (cfg, tensors, target_aux_buf, embed_table) =
             match step3_build_drafter_scaffolding(&device) {
                 Some(t) => t,
@@ -1734,8 +1742,8 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut registry_false = KernelRegistry::new();
-        let mut registry_true = KernelRegistry::new();
+        let mut registry_false = eagle3_test_kernel_registry();
+        let mut registry_true = eagle3_test_kernel_registry();
 
         // Use a config with fc_norm=false so hidden_norm IS the only norm on
         // the residual stream — making the two branches maximally distinct.

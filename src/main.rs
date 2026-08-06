@@ -247,13 +247,15 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
     // errors per ADR §6 reserved-name stubs.
     let selector = QuantSelector::from_name(&args.quant)
         .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+    let source_repo = args.source_repo.clone();
+    let source_revision = args.source_revision.clone();
 
     // ----- B1: resolve HF input directory ---------------------------------
     // Exactly one of {positional <hf_dir>, --repo <hf_repo>} must be set.
     // clap's `conflicts_with` rejects the "both set" case at parse time;
     // we still guard here as defense-in-depth so the typed error variant
     // survives any future plumbing change that bypasses clap.
-    let (hf_dir, remote_source) = match (args.hf_dir, args.repo, args.revision) {
+    let (hf_dir, mut remote_source) = match (args.hf_dir, args.repo, args.revision) {
         (Some(_), Some(_), _) => {
             return Err(AppError::Input(anyhow::anyhow!(
                 "{}",
@@ -287,10 +289,24 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         }
     };
 
+    if let Some(repo) = source_repo {
+        validate_hf_repo_id(&repo).map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+        let revision = immutable_hf_revision(source_revision.as_deref())
+            .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+        let verified =
+            crate::input::integrity::verify_remote_conversion_source(&repo, &revision, &hf_dir)
+                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+        remote_source = Some(
+            RemoteConversionSource::from_verified(repo, revision, &hf_dir, &verified)
+                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?,
+        );
+    }
+
     let resolved = ConvertArgs {
         hf_dir,
         selector,
         output: args.output,
+        dry_run: args.dry_run,
         imatrix: args.imatrix,
         imatrix_corpus: args.imatrix_corpus,
         imatrix_out: args.imatrix_out,
@@ -633,8 +649,11 @@ mod tests {
             hf_dir: Some(PathBuf::from("/tmp/example")),
             repo: Some("org/repo".to_string()),
             revision: Some("a".repeat(40)),
+            source_repo: None,
+            source_revision: None,
             quant: "q8_0".to_string(),
             output: PathBuf::from("/tmp/out.gguf"),
+            dry_run: false,
             imatrix: None,
             imatrix_corpus: None,
             imatrix_out: None,
@@ -680,8 +699,11 @@ mod tests {
             hf_dir: None,
             repo: Some("org/model".into()),
             revision: Some("main".into()),
+            source_repo: None,
+            source_revision: None,
             quant: "q8_0".into(),
             output: PathBuf::from("unused.gguf"),
+            dry_run: false,
             imatrix: None,
             imatrix_corpus: None,
             imatrix_out: None,
@@ -689,6 +711,28 @@ mod tests {
             mmproj: false,
         };
         let err = cmd_convert(args).expect_err("mutable revision must fail before download");
+        assert!(matches!(err, AppError::Input(_)));
+        assert!(err.to_string().contains("40-hex-commit"));
+    }
+
+    #[test]
+    fn cmd_convert_rejects_mutable_local_source_revision_before_hashing() {
+        let args = cli::ConvertCliArgs {
+            hf_dir: Some(PathBuf::from("/tmp/example")),
+            repo: None,
+            revision: None,
+            source_repo: Some("org/model".into()),
+            source_revision: Some("main".into()),
+            quant: "deepseek4-agentic-q2".into(),
+            output: PathBuf::from("unused.gguf"),
+            dry_run: false,
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mmproj: false,
+        };
+        let err = cmd_convert(args).expect_err("mutable revision must fail before hashing");
         assert!(matches!(err, AppError::Input(_)));
         assert!(err.to_string().contains("40-hex-commit"));
     }

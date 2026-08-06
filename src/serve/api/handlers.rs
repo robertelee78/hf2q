@@ -17,7 +17,6 @@
 //! scaffolding here (AppState threading, error envelope, JSON responses) is
 //! what every future handler is built on.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use axum::extract::{Path as AxPath, State};
@@ -619,11 +618,7 @@ async fn chat_completions_with_prepared(
         } else {
             // Tool calls found: content is whatever remained outside the markers
             // (may be empty when the model emitted only tool-call spans).
-            let content = if extracted.content.is_empty() {
-                None
-            } else {
-                Some(MessageContent::Text(extracted.content))
-            };
+            let content = tool_turn_message_content(extracted.content);
             // OpenAI spec: finish_reason == "tool_calls" whenever at least one
             // structured tool call was emitted.
             (
@@ -725,6 +720,10 @@ struct ExtractedToolCalls {
     /// under `Constrained` policy.  The caller should treat this as a
     /// `500 tool_call_parse_failure` response.
     pub constrained_parse_failure: Option<String>,
+}
+
+fn tool_turn_message_content(content: String) -> Option<MessageContent> {
+    (!content.trim().is_empty()).then_some(MessageContent::Text(content))
 }
 
 /// Run `text` through the ReasoningSplitter → ToolCallSplitter chain and
@@ -5110,6 +5109,57 @@ mod compile_tool_grammar_precondition_tests {
         assert!(runtime.accept_bytes(payload.as_bytes()));
         assert!(runtime.is_accepted());
     }
+
+    #[test]
+    fn compile_tool_grammar_deepseek_auto_rejects_bare_dsml_atom_before_invoke() {
+        let bash = Tool {
+            tool_type: "function".into(),
+            function: ToolFunction {
+                name: "bash".into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                })),
+            },
+        };
+        let read = Tool {
+            tool_type: "function".into(),
+            function: ToolFunction {
+                name: "read".into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"filePath": {"type": "string"}},
+                    "required": ["filePath"]
+                })),
+            },
+        };
+        let req = req_with_parallel("DeepSeek-V4-Flash-0731", Some(vec![bash, read]), false);
+        let grammar = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("compile DeepSeek auto multi-tool grammar")
+            .expect("auto tools must produce a lazy grammar");
+        let root = grammar.rule_id("root").expect("root rule");
+
+        let valid = "\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let mut valid_runtime = grammar::sampler::GrammarRuntime::new(grammar.clone(), root)
+            .expect("DeepSeek auto grammar runtime");
+        valid_runtime.set_awaiting_trigger(true);
+        valid_runtime.trigger();
+        assert!(valid_runtime.accept_bytes(valid.as_bytes()));
+        assert!(valid_runtime.is_accepted());
+
+        let leaked = "\n<｜DSML｜\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let mut leaked_runtime = grammar::sampler::GrammarRuntime::new(grammar, root)
+            .expect("DeepSeek auto grammar runtime");
+        leaked_runtime.set_awaiting_trigger(true);
+        leaked_runtime.trigger();
+        assert!(
+            !leaked_runtime.accept_bytes(leaked.as_bytes()),
+            "bare DSML atom before invoke must be rejected by the lazy grammar"
+        );
+    }
 }
 
 /// Combine multiple per-function GBNF grammars into a single grammar whose
@@ -7663,61 +7713,10 @@ fn context_length_for_arch(gguf: &mlx_native::gguf::GgufFile) -> Option<usize> {
 
 /// Infer a quant-type label for the GGUF.
 ///
-/// Strategy: compute a histogram of ggml tensor types, skip fp bookkeeping
-/// types (F32 / F16 for norms and embeds), and report the most common
-/// non-fp quant type as the label. Matches how llama.cpp's `gguf-tools show`
-/// reports a file.
-///
-/// Returns `None` if every tensor is fp (e.g. a pre-quantization safetensors
-/// conversion artifact).
-///
-/// Note: mlx-native's `GgmlType` currently enumerates only the six types
-/// hf2q's kernels support (F32, F16, Q4_0, Q8_0, Q4_K, Q6_K). A GGUF that
-/// contains only those six types will be fully listed; anything with
-/// unsupported types fails to open earlier in `inspect_gguf` and never
-/// reaches this function. This matches the correctness contract — we only
-/// advertise models we can actually serve.
+/// Mixed-profile hf2q artifacts carry an explicit profile label; ordinary
+/// GGUFs fall back to the shared dominant-tensor-type inference.
 fn infer_quant_type(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
-    use mlx_native::GgmlType;
-
-    let mut histogram: HashMap<&'static str, usize> = HashMap::new();
-    for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else {
-            continue;
-        };
-        let label = ggml_type_label(info.ggml_type);
-        // Skip fp types — we want the dominant quantization, not the norm/embed dtype.
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
-            continue;
-        }
-        *histogram.entry(label).or_insert(0) += 1;
-    }
-    histogram
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(k, _)| k.to_string())
-}
-
-/// Map a ggml type enum into a short, well-known label.
-/// This centralizes the string convention for `/v1/models` so different
-/// handlers never disagree.
-fn ggml_type_label(t: mlx_native::GgmlType) -> &'static str {
-    use mlx_native::GgmlType;
-    match t {
-        GgmlType::F32 => "F32",
-        GgmlType::F16 => "F16",
-        GgmlType::Q4_0 => "Q4_0",
-        GgmlType::Q8_0 => "Q8_0",
-        GgmlType::Q2_K => "Q2_K",
-        GgmlType::Q4_K => "Q4_K",
-        GgmlType::Q5_K => "Q5_K",
-        GgmlType::Q6_K => "Q6_K",
-        GgmlType::I16 => "I16",
-        GgmlType::I32 => "I32",
-        GgmlType::Q5_1 => "Q5_1",
-        GgmlType::IQ4_NL => "IQ4_NL",
-        GgmlType::IQ4_XS => "IQ4_XS",
-    }
+    crate::serve::load_info::infer_quant_label(gguf)
 }
 
 // ---------------------------------------------------------------------------
@@ -9399,7 +9398,13 @@ mod iter215_qwen35_chat_501_tests {
 
 #[cfg(test)]
 mod test_a3_tool_call_extraction {
-    use super::{engine, extract_tool_calls_from_text, registry};
+    use super::{engine, extract_tool_calls_from_text, registry, tool_turn_message_content};
+
+    #[test]
+    fn pure_tool_turn_discards_whitespace_only_content() {
+        assert!(tool_turn_message_content("\n\n".to_string()).is_none());
+        assert!(tool_turn_message_content(" explanation".to_string()).is_some());
+    }
 
     /// Build a minimal ModelRegistration with Gemma4 tool markers so tests
     /// can exercise the splitter without a live model.
