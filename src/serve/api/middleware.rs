@@ -2,8 +2,8 @@
 //!
 //! Three orthogonal layers:
 //!
-//!   1. **CORS** (Decision #9) — restrictive allowlist when configured,
-//!      wide-open `*` only for empty allowlist (localhost dev default).
+//!   1. **CORS** (Decision #9) — restrictive whitelist when configured,
+//!      wide-open `*` only for an empty whitelist (localhost dev default).
 //!   2. **Bearer auth** (Decision #8) — when `auth_token` is configured,
 //!      every request must carry `Authorization: Bearer <token>` or receive
 //!      401. When not configured, the middleware is a no-op (not even
@@ -35,7 +35,7 @@ pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// Build a CORS layer from the server config's allowed-origins list.
 ///
 /// - Empty list → wide-open `Any` (localhost dev default, per Decision #9).
-/// - Non-empty list → explicit allowlist (restrictive default for LAN /
+/// - Non-empty list → explicit whitelist (restrictive default for LAN /
 ///   production).
 ///
 /// Allowed methods are the set the API surface actually uses:
@@ -63,7 +63,7 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
                     tracing::warn!(
                         origin = %origin,
                         error = %e,
-                        "Dropping malformed CORS origin from allowlist"
+                        "Dropping malformed CORS origin from whitelist"
                     );
                 }
             }
@@ -238,12 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn cors_layer_with_empty_allowlist_constructs() {
+    fn cors_layer_with_empty_whitelist_constructs() {
         let _layer = cors_layer(&[]);
     }
 
     #[test]
-    fn cors_layer_with_explicit_allowlist_constructs() {
+    fn cors_layer_with_explicit_whitelist_constructs() {
         let _layer = cors_layer(&["http://localhost:3000".to_string()]);
     }
 

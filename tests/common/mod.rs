@@ -32,7 +32,7 @@
 //! - the harness inspects `wall_s == -1.0` to surface
 //!   `Verdict::NotMeasured` for that cell.
 //!
-//! Allow-list rationale: `dead_code` is permitted at the module level
+//! Whitelist rationale: `dead_code` is permitted at the module level
 //! because individual integration test binaries only consume a subset
 //! of these helpers (each `tests/*.rs` becomes its own crate per
 //! Cargo's integration-test model — symbols not referenced by that

@@ -10,7 +10,7 @@
 // eval-callback on the ViT scheduler, and runs the standard
 // mtmd_tokenize → mtmd_encode_chunk path on a real PNG image.  Every
 // tensor produced by the ViT graph fires the callback; we capture the
-// ones whose names are in our parity-stage allowlist and write them to
+// ones whose names are in our parity-stage whitelist and write them to
 // disk in the same on-disk format as hf2q's `vit_dump.rs`:
 //
 //   <name>.bin   — raw F32 LE, contiguous
@@ -291,7 +291,7 @@ static inline bool intra_layer_probed(int idx) {
 }
 
 // Match ggml tensor name to a hf2q stage name. Returns "" when not in
-// the parity-stage allowlist.
+// the parity-stage whitelist.
 static std::string map_to_stage(const std::string & ggml_name,
                                 const capture_state & st) {
     auto direct = st.name_map.find(ggml_name);

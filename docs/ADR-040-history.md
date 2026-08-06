@@ -423,7 +423,7 @@ The dossier §4 step 3 sketched `Box<dyn Scheduler>` for the worker's scheduler 
 
 This deviation does NOT affect the dossier's hypothesis matrix (H1–H4 all hold with the concrete shape) and is documented inline at `engine.rs:3470-3477`.
 
-**Scope-deviation note (load_info.rs test fixture)**: the dossier R6 ("multi_model.rs may have a live `Engine::spawn` callsite I missed") flagged that struct-construction sites needed verification. The actual gap surfaced was that `src/serve/load_info.rs:1378` contains a test-fixture struct-literal construction of `Qwen35LoadedModel`. Adding the `persistent_kv_cache` field forced a one-line `persistent_kv_cache: None` addition there (+ at `engine.rs:9890` which was already in the allow-list). The `load_info.rs` edit is the minimum mechanical maintenance required by the field addition; the production `Qwen35LoadedModel::load` path at `engine_qwen35.rs:489-498` is the canonical production wiring. No semantic test changes — both test fixtures construct `None` to mirror production iter-2a behaviour.
+**Scope-deviation note (load_info.rs test fixture)**: the dossier R6 ("multi_model.rs may have a live `Engine::spawn` callsite I missed") flagged that struct-construction sites needed verification. The actual gap surfaced was that `src/serve/load_info.rs:1378` contains a test-fixture struct-literal construction of `Qwen35LoadedModel`. Adding the `persistent_kv_cache` field forced a one-line `persistent_kv_cache: None` addition there (+ at `engine.rs:9890` which was already in the whitelist). The `load_info.rs` edit is the minimum mechanical maintenance required by the field addition; the production `Qwen35LoadedModel::load` path at `engine_qwen35.rs:489-498` is the canonical production wiring. No semantic test changes — both test fixtures construct `None` to mirror production iter-2a behaviour.
 
 **Production code changes (LOC delta)**:
 - `src/serve/api/engine.rs`: +~410 LOC, -~3 LOC.
@@ -5083,4 +5083,3 @@ Per the §6.1.55 deferral table (revised in this section) — nothing changes st
 - A4 gate defect site: `src/serve/api/engine.rs:3743-3755` (`spawn_with_mode` EngineMode::SlotAware arm)
 
 ---
-

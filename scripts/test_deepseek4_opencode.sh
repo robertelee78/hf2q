@@ -318,7 +318,7 @@ cat >"$code_sandbox_profile" <<EOF
       (literal "/dev/dtracehelper"))))
 
 ; Ancestor directory data is needed for path traversal to the pinned Rust
-; toolchain, but directory enumeration is not. Deny listings explicitly.
+; toolchain, but directory enumeration is not. Blacklist listings explicitly.
 (deny file-read-data
   (require-any
     (literal "/Users")
@@ -386,7 +386,7 @@ command=\$2
 case "\$command" in
   cargo\ test*|cargo\ check*|cargo\ fmt*|git\ diff*|git\ status*) ;;
   *)
-    echo "hf2q OpenCode gate: command is outside the acceptance allowlist" >&2
+    echo "hf2q OpenCode gate: command is outside the acceptance whitelist" >&2
     exit 126
     ;;
 esac

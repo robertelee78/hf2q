@@ -58,7 +58,7 @@ pub struct ServerConfig {
 
     // --- CORS (Decision #9) ---
     /// Allowed origins for CORS. Empty = wide-open `*` (localhost dev
-    /// default); populated = restrictive allowlist.
+    /// default); populated = restrictive whitelist.
     pub cors_allowed_origins: Vec<String>,
 
     // --- Queue (Decision #19) ---

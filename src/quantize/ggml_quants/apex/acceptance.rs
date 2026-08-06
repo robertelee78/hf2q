@@ -86,7 +86,7 @@ mod tests {
     /// reasons will fail the test loudly — `KNOWN_NON_CANONICAL` must
     /// be updated AT THE SAME COMMIT as the new vendored file, with a
     /// rationale comment. Per [[feedback-no-loop-suppression-2026-05-17]]
-    /// this is the explicit-allowlist pattern, not a silent skip.
+    /// this is the explicit-whitelist pattern, not a silent skip.
     const KNOWN_NON_CANONICAL: &[(&str, &str)] = &[(
         "vendor/apex-quant/configs/qwen35a3b_mini.txt",
         "Hand-generated with `--near-exp iq2_s` (non-default for `mini` tier; \
@@ -147,7 +147,7 @@ mod tests {
         if !known_non_canonical_now_clean.is_empty() {
             panic!(
                 "KNOWN_NON_CANONICAL entries now match algorithmic — remove from \
-                 the allowlist (and verify with `bash scripts/generate_config.sh`):\n  {}",
+                 the whitelist (and verify with `bash scripts/generate_config.sh`):\n  {}",
                 known_non_canonical_now_clean.join("\n  "),
             );
         }

@@ -629,10 +629,10 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 - `apex-custom` without `--tensor-type-file` returns `ApexError::CustomRequiresTensorTypeFile`.
 - Pa exit gate: `cargo test --bin hf2q --lib quantize::ggml_quants::apex::acceptance::` is green.
 
-**§Pa exit gate CLOSED 2026-05-19** (shipped at commit `25931974` — see `src/quantize/ggml_quants/apex/acceptance.rs`): 20/21 vendored configs byte-equivalent to algorithmic `ApexPolicy::target_for`; 1/21 (`qwen35a3b_mini.txt`) verified non-canonical via direct `bash generate_config.sh --profile mini --layers 40` comparison (hand-generated with `--near-exp iq2_s` override). The non-canonical entry is documented in `KNOWN_NON_CANONICAL` allowlist with rationale; future port-drift would fail the test (closed-list invariant). Tests added:
+**§Pa exit gate CLOSED 2026-05-19** (shipped at commit `25931974` — see `src/quantize/ggml_quants/apex/acceptance.rs`): 20/21 vendored configs byte-equivalent to algorithmic `ApexPolicy::target_for`; 1/21 (`qwen35a3b_mini.txt`) verified non-canonical via direct `bash generate_config.sh --profile mini --layers 40` comparison (hand-generated with `--near-exp iq2_s` override). The non-canonical entry is documented in the `KNOWN_NON_CANONICAL` whitelist with rationale; future port-drift would fail the test (closed-list invariant). Tests added:
   - `manifest_pins_at_21_entries` — entry-count regression guard.
   - `every_manifest_entry_has_baked_config` — vendor-time integrity check.
-  - `target_for_matches_every_vendored_config_line_for_line` — exhaustive line-for-line diff with allowlist enforcement.
+  - `target_for_matches_every_vendored_config_line_for_line` — exhaustive line-for-line diff with whitelist enforcement.
 
 ### P4a — ApexPolicy non-I tiers ship
 

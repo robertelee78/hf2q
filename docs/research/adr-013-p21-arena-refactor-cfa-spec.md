@@ -65,7 +65,7 @@ All must pass on `/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq
 6. **Decode parity.** 3-rep cold tg64 median ≥ 120 t/s (vs current ~124 t/s, allow 3% drift budget).
 7. **Memory budget.** Peak Metal heap usage at pp4096 ≤ 30 GB (current ~21 GB load + scratch). Verify via `vm_stat` delta or `/proc/<pid>/io` if available; conservatively run `host_vm_info` snapshot pre/post.
 8. **No iter58b regression flicker.** `cargo test --release qwen35::gpu_delta_net::tests::chunk_path_first_token_matches_autoregressive_at_seq128` PASSES on 5 consecutive cold runs (Heisenbug guard).
-9. **Build cleanliness.** `cargo build --release --bin hf2q` 0 warnings introduced. `cargo clippy --release` doesn't add new warnings under the existing allow-list.
+9. **Build cleanliness.** `cargo build --release --bin hf2q` 0 warnings introduced. `cargo clippy --release` doesn't add new warnings under the existing whitelist.
 
 Queen scoring: each criterion 0–10. Hard fail if any < 6. Promote winner: max total. Tie → reviewer (Codex if Claude won, Claude if Codex won) cross-reviews and queen reconciles.
 

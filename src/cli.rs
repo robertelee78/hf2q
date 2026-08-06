@@ -759,7 +759,7 @@ pub struct ServeArgs {
     pub auth_token: Option<String>,
 
     /// CORS allowed origin. Repeatable. Empty = allow any (localhost dev);
-    /// non-empty = restrictive allowlist (Decision #9).
+    /// non-empty = restrictive whitelist (Decision #9).
     #[arg(long = "cors-origin", value_name = "ORIGIN")]
     pub cors_origins: Vec<String>,
 
