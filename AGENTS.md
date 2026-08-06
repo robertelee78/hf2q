@@ -130,6 +130,20 @@ open the serve path before conversion and forward-pass correctness are proven.
 
 ## Working method
 
+Apply the hf2q operating Kata before and throughout the numbered workflow:
+
+- Need it? If no, it is out of scope; do not spend effort on it.
+- If yes, ask whether it is possible. If possible, do it. If it is not yet
+  possible, research exhaustively until there is an evidence-backed path.
+- Execute the complete loop: hypothesis -> smallest spike or test ->
+  reformulate from measured results -> update the governing ADR/docs ->
+  implement -> prove correctness, quality, and performance -> commit -> push
+  -> merge.
+
+A failed spike is useful evidence, not a shippable change. Remove it from the
+landing diff and record the measured conclusion before pursuing the revised
+hypothesis. Stopping short of the complete loop is a Kata violation.
+
 1. Recall Ruflo decisions/evidence and read the governing ADR.
 2. Inspect `git status`, relevant source, tests, dependency pins, runtime state,
    and any existing user changes before editing.

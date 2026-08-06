@@ -69,8 +69,9 @@
 #   1. HybridPromptCache — exact-repeat requests replay in ~2 ms
 #      (greedy-only, single-slot).
 #   2. LCP partial-prefill resume — shared-prefix requests (every
-#      agentic turn) restore stride-1024 checkpoints; measured 9.0×
-#      TTFT on a 2.7K-token prompt (2920 ms → 326 ms).
+#      agentic turn) restore configured checkpoints (stride 4096 here).
+#      The earlier stride-1024 fixture measured 9.0× TTFT on a
+#      2.7K-token prompt (2920 ms → 326 ms).
 #   3. Disk persistence — checkpoints survive server restarts
 #      (QH35 codec v4, substrate-namespaced fingerprint).
 #
@@ -88,7 +89,25 @@ HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
-mkdir -p "$KV_DIR"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
+    exit 3
+fi
+
+# Refuse before loading the model when another service already owns the port.
+if command -v lsof >/dev/null 2>&1; then
+    PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$PORT_LISTENER" ]]; then
+        echo "$HOST:$PORT is already in use — refusing before model load" >&2
+        printf '%s\n' "$PORT_LISTENER" >&2
+        echo "choose a free port, for example: PORT=8090 $0" >&2
+        exit 2
+    fi
+elif command -v nc >/dev/null 2>&1 && nc -z "$HOST" "$PORT" >/dev/null 2>&1; then
+    echo "$HOST:$PORT is already in use — refusing before model load" >&2
+    echo "choose a free port, for example: PORT=8090 $0" >&2
+    exit 2
+fi
 
 # One-model-at-a-time guard (feedback_oom_prevention): a 35B-class model
 # holds ~30 GB of unified memory; a second concurrent inference process
@@ -102,6 +121,8 @@ for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
     fi
 done
 
+mkdir -p "$KV_DIR"
+
 exec env \
     HF2Q_QWEN36_AUTOREG=1 \
     HF2Q_KV_LCP_RESUME=1 \
@@ -109,7 +130,7 @@ exec env \
     HF2Q_KV_PERSIST="$KV_DIR" \
     HF2Q_KV_PERSIST_BUDGET_BYTES="$KV_BUDGET_BYTES" \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
-    "$HF2Q_BIN" serve \
+    "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \
         --port "$PORT" \

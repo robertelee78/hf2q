@@ -4511,3 +4511,24 @@ match). `restore_partial` median 6.0 ms.
 The `2026-05-05 "FUNCTIONALLY COMPLETE"` framing remains historical
 record; current production status is `2026-05-06 DEFAULT-ON` with
 counter-accuracy fix and peer-baseline arm.
+
+## Agentic continuation corrections (2026-08-06)
+
+Real OpenCode continuations found two cross-family accounting and admission
+defects. Gemma's long-resume snapshot deliberately allocates sliding-layer
+storage linearly, but restore reduced every sliding write cursor modulo the
+physical window. The restored cursor now remains absolute for a linear
+long-resume snapshot and remains modulo only for a true ring. LCP admission
+also compares the uncached suffix with the viable cold batched route: a tiny
+shared prefix no longer forces almost the whole request through the slower
+linear path, while ordinary short tool-result suffixes retain LCP reuse.
+Snapshot admission reports the capacity actually present in the payload rather
+than recomputing a smaller value from the current request.
+
+On a real 6,749-token Gemma coding prompt, the follow-up reused 6,700 tokens,
+reached its first semantic result in about 1.06 seconds, and returned the exact
+sentinel. Qwen3.6 unary and SSE telemetry now reports the actual partial LCP
+resume position and computes prefill throughput from uncached suffix tokens.
+The real 16,407-token tool-result continuation reused 12,288 tokens and
+returned the exact sentinel; a repeated SSE request reused 16,384 tokens and
+emitted exactly one terminal `[DONE]`.

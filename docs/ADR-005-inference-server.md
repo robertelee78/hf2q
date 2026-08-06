@@ -10145,3 +10145,26 @@ failing ruvnet-brain-shaped request: pre-fix HTTP 400
 conforming to `^[a-z][a-z0-9-]*$` under the active grammar.
 
 **Full sweep.** `cargo test --bin hf2q`: 3686 passed / 0 failed.
+
+## Agentic grammar hot-path revalidation (2026-08-06)
+
+OpenCode tool calls exposed two shared defects after the original phase
+closure. First, temperature-zero tool grammars cloned and advanced the entire
+grammar runtime for every vocabulary token on every decode step. The accepted
+sampler now probes the 64 highest-logit candidates in rank order and falls back
+to the exhaustive mask only when none is valid. Parsed grammar structure is
+shared through `Arc`; mutable stacks remain request-local. The result is the
+same highest-logit valid token as exhaustive mask-then-argmax. On the real
+Gemma 4 `read_file` tool fixture, grammar-constrained decode improved from
+about 0.96 tok/s to 76.5 tok/s while preserving the exact call.
+
+Second, a tokenizer may emit the native tool-open marker and the first body
+bytes in one token, or split the marker across tokens. The old output-splitter
+trigger could leave grammar state one token behind. Lazy grammar runtimes now
+scan accepted bytes for the registered family marker, retain only the bounded
+partial-marker tail, and feed same-token body bytes immediately. Unit tests
+cover both merged and split markers. The canonical fifo-serial Qwen3.6 unary
+and SSE paths now apply request grammar, logit bias, effective repetition
+penalty, and the real tool-call policy; constrained no-call and truncated-call
+outcomes fail closed. The older Qwen slot-aware/vision decode loops remain
+explicitly outside this canonical grammar-aware contract.

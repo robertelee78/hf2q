@@ -538,3 +538,19 @@ overlay on top of the iter-23 chain's KV-active cache infrastructure.
 3. Acceptance criterion? Direct copy of MTP reddit's 2.5× target, or
    measure-then-set after iter-83b empirical baseline?
 
+## Canonical OpenCode serving revalidation (2026-08-06)
+
+The `scripts/serve_qwen36_opencode.sh` fifo-serial path was revalidated with
+the canonical `qwen36-abliterix-t63-APEX` artifact and real OpenAI tool
+definitions. Required unary, required SSE, and automatic unary requests all
+returned a valid `read_file` tool call; measured decode was about 82, 114, and
+112 tok/s respectively. A 16,314-token cold required-tool prompt prefilled at
+1,958 tok/s and returned the correct path. Its 16,407-token tool-result
+continuation restored a 12,288-token LCP checkpoint, prefetched the suffix in
+2.710 seconds, and returned the exact requested sentinel at 101.8 tok/s decode.
+A repeat SSE continuation restored 16,384 tokens and produced one `[DONE]`.
+
+This acceptance applies to the canonical fifo-serial launcher. Slot-aware and
+vision-augmented Qwen decode loops still use their older unconstrained sampler
+surface and must not be represented as grammar-equivalent until they receive
+their own real agentic gate.

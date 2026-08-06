@@ -87,15 +87,37 @@ HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
+    exit 3
+fi
+
+# Refuse before loading the model when another service already owns the port.
+if command -v lsof >/dev/null 2>&1; then
+    PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$PORT_LISTENER" ]]; then
+        echo "$HOST:$PORT is already in use — refusing before model load" >&2
+        printf '%s\n' "$PORT_LISTENER" >&2
+        echo "choose a free port, for example: PORT=8090 $0" >&2
+        exit 2
+    fi
+elif command -v nc >/dev/null 2>&1 && nc -z "$HOST" "$PORT" >/dev/null 2>&1; then
+    echo "$HOST:$PORT is already in use — refusing before model load" >&2
+    echo "choose a free port, for example: PORT=8090 $0" >&2
+    exit 2
+fi
 
 # One-model-at-a-time guard (feedback_oom_prevention): a 26B-class model
 # holds ~25-35 GB of unified memory; concurrent inference processes on
 # one box OOM it (measured 2026-08-03).
-if pgrep -x hf2q >/dev/null 2>&1; then
-    echo "another hf2q process is already running — refusing to start a second" >&2
-    echo "(kill it first: pkill -x hf2q)" >&2
-    exit 1
-fi
+for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
+    if RUNTIME_PIDS="$(pgrep -x "$RUNTIME_NAME" 2>/dev/null)"; then
+        echo "another inference runtime is already running — refusing before model load" >&2
+        echo "process: $RUNTIME_NAME (pid(s): ${RUNTIME_PIDS//$'\n'/, })" >&2
+        echo "stop that runtime before starting Gemma" >&2
+        exit 1
+    fi
+done
 
 # BATCHED unset = engine auto-routes per request (recommended; see
 # header). BATCHED=0 forces the linear route; BATCHED=1 forces batched
@@ -120,7 +142,7 @@ if [[ -f "$MMPROJ" ]]; then
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
-        "$HF2Q_BIN" serve \
+        "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
             --mmproj "$MMPROJ" \
             --host "$HOST" \
@@ -134,7 +156,7 @@ else
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
-        "$HF2Q_BIN" serve \
+        "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
             --host "$HOST" \
             --port "$PORT" \

@@ -1,17 +1,18 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
 - **Status:** Accepted for hf2q 0.1.1
-- **Updated:** 2026-08-06 — corrected a kernel-confirmed macOS memory-pressure
-  kill caused by retained transient prefill arenas; a 98K cache-continuation
-  run and the full agentic gate passed with a 107 GB peak and 102 GB
-  post-request footprint. Repeated 121K cold-prefill variance still keeps
-  stable H4 parity subject to the required controlled median, and publication
-  remains controlled by the exact-SHA release workflow
+- **Updated:** 2026-08-06 — file-backed GGUF weights removed the anonymous
+  100 GiB copy; packing eight physical heads into each D=512 sparse-attention
+  tile raised the exact 120K cold-prefill gate to 331.53 tok/s. The required
+  tool call remained exact, the next turn reused 99.91% of its prefix with
+  1.289 s TTFT, and the process completed without the former memory-pressure
+  kill. The final `mlx-native` 0.10.2 view-semantics revalidation reused 6,254
+  of 6,262 prompt tokens with 235 ms cached TTFT
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
 - **Reference implementation:** `/opt/llama.cpp` at
-  `a1f96d4fc2c9e4101a6666a9d87f547e7e880df6` (build 10293)
+  `15586e2d7165570fb3aa7c26e0d442e289ef69de` (build 10298)
 - **Target host:** Apple M5 Max, 40-core GPU, 128 GiB unified memory
 
 ## Decision
@@ -117,12 +118,79 @@ M5 Max and 107,431,343,104-byte artifact:
 The context-position throughput slope is not itself an arena leak. Ratio-four
 index selection must score an expanding compressed history, and the pinned
 llama.cpp graph also scans the valid lightning-indexer history. The new interval
-metric makes that workload visible. No new matched llama.cpp run was performed
-for this memory correction, so the existing H4 parity qualification remains.
+metric makes that workload visible. A later matched reference and optimized
+native run are recorded below and supersede the earlier H4 qualification.
 The reviewed phase-adaptive DSpark bundle is a CUDA/vLLM speculative-decoding
 patch; the accepted base artifact explicitly excludes DSpark tensors, so that
 work cannot correct this prefill-arena lifetime defect and remains a separate
 future optimization.
+
+## Long-context prefill root cause and correction (2026-08-06)
+
+Stage timing falsified the hypothesis that model arithmetic or the lightning
+indexer was the primary remaining gap. The sparse D=512 adapter represented
+each original token as a Metal batch with `qL=1` and 64 heads. The inherited
+flash tile is physically eight query rows wide, so seven of eight query rows
+were idle for every head and token. The accepted `mlx-native` dispatcher views
+the unchanged contiguous `[tokens, 64, 512]` storage as
+`[tokens, 8, 8, 512]`: eight physical heads become the eight query rows, eight
+logical heads cover all 64 physical heads, and no transpose or copy is added.
+The mask remains token-specific and broadcasts across those rows; learned
+attention sinks remain physical-head-specific.
+
+A strict A/B test with 16 query tokens, 64 distinct sinks, and a mixed mask is
+bit-exact against the former one-head-per-tile path. Six existing sparse-
+attention parity cases also pass. The production-shape benchmark measured the
+following packed-attention speedups:
+
+| Queries | Former tile | Heads-as-rows tile | Speedup |
+|---:|---:|---:|---:|
+| 64 | 4.991 ms | 0.827 ms | 6.03x |
+| 128 | 9.708 ms | 1.460 ms | 6.65x |
+| 256 | 19.212 ms | 2.643 ms | 7.27x |
+| 512 | 38.087 ms | 5.037 ms | 7.56x |
+| 1,024 | 75.910 ms | 9.760 ms | 7.78x |
+
+The speedup changed the dense/sparse crossover. Dense compressed attention was
+about tied at 2K raw tokens but reached 0.98 s per transaction at 4K, while
+the packed sparse path was about 0.69 s. hf2q therefore selects sparse prefill
+at 1,024 compressed entries rather than the former 6,144-entry threshold. A
+Q=1/one-simdgroup variant, an F16 path with conversion kernels, and temporary
+index-overlap instrumentation were rejected after their spikes and are absent
+from the production diff.
+
+The other memory copy was architectural, not model policy. `mlx-native` now
+owns read-only GGUF mmap-backed Metal resources, typed tensor views, nested
+view offsets, and strict mapped-versus-owned kernel parity. hf2q chooses that
+mechanism for immutable DeepSeek raw matrices and reports the logical split;
+`HF2Q_DEEPSEEK_MMAP_WEIGHTS=0` is the diagnostic rollback. On this artifact,
+107,422,652,416 weight bytes were file-backed, 7,518,556 bytes remained
+anonymous, and two Metal resources covered the file because of the device's
+per-buffer limit. Weight residency setup fell from about 40 seconds to
+0.85-0.98 seconds; the complete post-reboot server load, including the
+remaining model setup, was 10.79 seconds. After the 120K gate, process RSS was
+2.0 GiB and the server shut down normally.
+
+## Logical-view snapshot correction (2026-08-06)
+
+The first agentic gate against the published `mlx-native` 0.10.2 release
+falsified cache compatibility with
+`WindowKv cache snapshot shape or dtype does not match`. Version 0.10.2
+correctly made `MlxBuffer::as_slice` and `as_mut_slice` honor a view's logical
+`data_byte_len` and `byte_offset`. DeepSeek's snapshot helper still allocated
+and compared `byte_len`, which is the parent Metal allocation length. A
+128-row `window_kv` view over a context-linear `attention_kv` buffer therefore
+tried to snapshot the entire backing allocation while copying only the logical
+view.
+
+Snapshots, restores, and their resident-byte accounting now use
+`data_byte_len`. The focused regression asserts the compact snapshot equals
+the sum of the cache plan's logical snapshot buffers, restores overwritten
+window state and position, and preserves non-aliasing. All nine DeepSeek cache
+tests pass. The post-correction real gate processed a 6,262-token cold prompt
+at 505.81 tok/s, reused 6,254 tokens on the next turn, reduced cached TTFT to
+234.6 ms, decoded at about 32.3 tok/s, and passed required/automatic tools,
+source-code arguments, tool-result continuation, unary, and SSE assertions.
 
 ## Context and spike result
 
@@ -384,21 +452,21 @@ changes. The measured candidate is
 |---|---|
 | Source identity | Official revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062`; 73-file bundle SHA-256 `a8544e6469f8f392e72f953e9a2b4ee33a23c50a859f47dd354d37ab0093993d` |
 | Artifact identity | 107,431,343,104 bytes (100.05 GiB); SHA-256 `914e9de7f6bad70d795179fedf68ac4336880c93c3a8c7c09ad019f0b28f6bc4` |
-| Native dependency | `mlx-native` 0.10.1 from implementation commit `08282dad5392708621cadad3caba83a4e1cdd6b2`; crates.io registry checksum and downloaded archive SHA-256 `bc66c3409f1955c006f74070cea586fa0147fbf9a3c020ff1de0643a80e8c8e5` |
+| Native dependency | Exact crates.io pin `mlx-native =0.10.2`, published from implementation commit `9b496c475f2200eb968bafc861dba6f65dade0e6`; registry checksum and downloaded crate SHA-256 `e1d02b2f8f401bf6afe100144884b5d76c2c1154ee7c9a79299856f4aee0506e` |
 | Quant plan | 1,328 verifier tensors: 172 Q2_K, 86 Q3_K, 532 Q8_0, 535 F32, and 3 I32; 4,705 DSpark tensors explicitly excluded from the base artifact |
 | Conversion bound | Rust-native row-aligned streaming; maximum working vector bound 4,798,873,600 bytes; no external converter or inference process |
 | Arithmetic coherence | Greedy `What is 2+2? Reply with only number.` returned exactly `4` |
 | Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. The source-argument regression also returned `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result` byte-for-byte in one `emit_source` call (4 s response), proving the formerly truncated `<` syntax through the real model. A real OpenCode two-turn run issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
 | Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
-| Prefix reuse | The current checked-in gate used a 6,253-token prompt and reused 6,245 tokens on repeated, auto, SSE, and post-tool turns. Cold semantic response was 19 s; cached and automatic turns were 2 s, SSE tool-call delivery was 2 s, and the tool-result continuation was 7 s. |
-| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and near-boundary cache gates at 131,072 physical tokens. It now advertises 524,288 tokens and demand-allocates 131K initially. A 97K operator-shaped prompt is validated under that default; neither a prompt crossing 131K nor a near-512K physical allocation is yet accepted on this 128 GiB host. |
+| Prefix reuse | The current checked-in gate used a 6,262-token prompt and reused 6,254 tokens on repeated, automatic, SSE, and post-tool turns. Cold TTFT was 12.380 s and cached TTFT was 235 ms; every required/automatic tool, source-argument, tool-result, unary, and SSE assertion passed. |
+| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and the 120K cache gate. It advertises 524,288 tokens and demand-allocates 131K initially. Memory/port preflight now refuses an unsafe 100 GiB load before model mapping. A prompt crossing the initial 131K allocation and a near-512K physical allocation remain unproven on this 128 GiB host. |
 | Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; llama.cpp build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
-| 121K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced a coherent tool call for 119,821 prompt tokens in 494.449 s TTFT. The same artifact under llama.cpp build 10293 processed the 121K-class source-bound prompt at 217.5 tok/s, about 556 s. hf2q completed about 61 s sooner. |
-| 121K continuation cache | Appending the real tool result produced a 119,916-token request that reused 119,813 tokens (99.91%), processed only a 103-token suffix, and returned its first semantic token in 1.275 s. |
+| 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 361.384 s TTFT (331.525 tok/s); decode was 21.742 tok/s. The same source-bound prompt and artifact under llama.cpp build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.07x the reference prompt rate and 1.11x its decode rate for this run. |
+| 120K continuation cache | Appending the real tool result produced a 119,907-token request that reused 119,800 tokens (99.91%), evaluated only a 107-token suffix, returned its first semantic event in 1.289 s, and emitted the exact requested sentinel. |
 | 98K OpenCode-scale revalidation | A fresh 97,127-token required-tool request completed cold prefill in 424.522 s (228.79 tok/s). Its 97,214-token tool-result turn restored the compact recovery anchor, reused 97,119 tokens (99.90%), evaluated a 95-token suffix in 1.378 s TTFT, and completed in 2 s. |
-| Repeated 121K variance | A later fresh 119,835-token run completed cold prefill in 573.954 s (208.79 tok/s) and failed the checked-in 540 s bound; decode was 21.98 tok/s. This single hot-host run is slower than the matched 217.5 tok/s llama.cpp result and prevents claiming stable cold-prefill parity from a favorable run. H4 remains subject to a controlled three-run median. |
+| Before/after control | The earlier identical-class hf2q run required 594.575 s for 119,808 tokens (201.502 tok/s). The accepted path reduced cold-prefill time by 39.2% and increased its token rate by 64.5%. At the shorter exact 26,024-token gate, the threshold retune improved 388.846 tok/s to 497.277 tok/s while retaining the exact tool call; the cached continuation reused 26,016 tokens and reached 927 ms TTFT. |
 | Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
-| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate. A later OpenCode session falsified the steady-state claim when macOS killed hf2q at 108,840 MB after the shared transient arena retained cold-prefill buckets. The corrected split-arena build released 4.28 GB after a 98K continuation, held 102 GB after the request with a 107 GB peak, preserved the exact cache hit, and did not grow swapouts during that run. Eagerly allocating the full 524,288-token cache beside this artifact still OOMs, so demand growth remains required. Only one 100 GiB-class runtime was resident during every comparison. |
+| Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate. A later OpenCode session falsified the steady-state claim when macOS killed hf2q at 108,840 MB after the shared transient arena retained cold-prefill buckets. The split-arena build releases prefill scratch before decode; the new file-backed build released 4,933,917,968 transient bytes after the 120K prefill, remained alive through its cached continuation, reported 2.0 GiB RSS, and shut down cleanly. Eagerly allocating the full 524,288-token cache beside this artifact still OOMs, so demand growth remains required. Only one 100 GiB-class runtime was resident during every comparison. |
 
 The performance result comes from two measured defaults. Decode groups two
 verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two
