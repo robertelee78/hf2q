@@ -365,14 +365,8 @@ mod tests {
             PoolingStrategy::from_pooling_type(PoolingType::Last),
             Some(PoolingStrategy::EosLastToken)
         );
-        assert_eq!(
-            PoolingStrategy::from_pooling_type(PoolingType::None),
-            None
-        );
-        assert_eq!(
-            PoolingStrategy::from_pooling_type(PoolingType::Rank),
-            None
-        );
+        assert_eq!(PoolingStrategy::from_pooling_type(PoolingType::None), None);
+        assert_eq!(PoolingStrategy::from_pooling_type(PoolingType::Rank), None);
     }
 
     #[test]

@@ -182,8 +182,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let zeros = vec![0.0f32; 32];
-        let buf =
-            quantize_f32_to_q8_0_buffer(&zeros, vec![32], &device).expect("quantize");
+        let buf = quantize_f32_to_q8_0_buffer(&zeros, vec![32], &device).expect("quantize");
         // 1 block × 34 bytes; check via slice byte length (element_count
         // returns shape product = 32, not byte count).
         let bytes = buf.as_slice::<u8>().expect("slice");
@@ -207,8 +206,7 @@ mod tests {
         for i in 0..32 {
             input.push((i as f32) - 15.5);
         }
-        let buf =
-            quantize_f32_to_q8_0_buffer(&input, vec![32], &device).expect("quantize");
+        let buf = quantize_f32_to_q8_0_buffer(&input, vec![32], &device).expect("quantize");
         let bytes = buf.as_slice::<u8>().expect("slice");
 
         // Decode scale (fp16 → f32)

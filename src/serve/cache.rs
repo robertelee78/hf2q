@@ -161,15 +161,9 @@ pub struct ModelEntry {
 pub enum SourcePointer {
     /// Bytes live in the HuggingFace hf-hub cache.  We never copy from
     /// here — `iter-204` will read directly from `path` during quantize.
-    HfHub {
-        path: PathBuf,
-        revision: String,
-    },
+    HfHub { path: PathBuf, revision: String },
     /// User-provided local directory of safetensors + tokenizer + config.
-    Local {
-        path: PathBuf,
-        sha256: String,
-    },
+    Local { path: PathBuf, sha256: String },
 }
 
 /// One cached quantized GGUF variant.
@@ -243,10 +237,7 @@ pub fn slug_repo_id(repo_id: &str) -> Result<String> {
         return Err(anyhow!("repo_id is empty"));
     }
     if repo_id.contains('\0') {
-        return Err(anyhow!(
-            "repo_id contains NUL byte: {:?}",
-            repo_id
-        ));
+        return Err(anyhow!("repo_id contains NUL byte: {:?}", repo_id));
     }
     if repo_id.contains("..") {
         return Err(anyhow!(
@@ -353,9 +344,7 @@ impl CacheLock {
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 Ok(None)
             } else {
-                Err(err).with_context(|| {
-                    format!("flock LOCK_EX|LOCK_NB: {}", path.display())
-                })
+                Err(err).with_context(|| format!("flock LOCK_EX|LOCK_NB: {}", path.display()))
             }
         }
     }
@@ -568,13 +557,13 @@ impl ModelCache {
     /// Naming + wording is asserted on by tests; do not change without
     /// updating the tests.
     pub fn verify_quantized(&self, repo_id: &str, quant: QuantType) -> Result<()> {
-        let entry = self
-            .lookup(repo_id, quant)
-            .ok_or_else(|| anyhow!(
+        let entry = self.lookup(repo_id, quant).ok_or_else(|| {
+            anyhow!(
                 "verify_quantized: no manifest entry for {}@{}",
                 repo_id,
                 quant.as_str()
-            ))?;
+            )
+        })?;
         if !entry.gguf_path.exists() {
             return Err(anyhow!(
                 "verify_quantized: cached GGUF missing on disk: {}",
@@ -673,14 +662,12 @@ impl ModelCache {
     /// - `unknown_quant` if the model entry has no `quant` quantization.
     pub fn invalidate(&mut self, repo_id: &str, quant: QuantType) -> Result<u64> {
         let _lock = self.lock_quant(repo_id, quant)?;
-        let model = self
-            .manifest
-            .models
-            .get(repo_id)
-            .ok_or_else(|| anyhow!(
+        let model = self.manifest.models.get(repo_id).ok_or_else(|| {
+            anyhow!(
                 "invalidate: unknown_repo: no manifest entry for {}",
                 repo_id
-            ))?;
+            )
+        })?;
         if !model.quantizations.contains_key(quant.as_str()) {
             return Err(anyhow!(
                 "invalidate: unknown_quant: {} has no {} quantization cached",
@@ -725,33 +712,27 @@ impl ModelCache {
     /// Errors:
     /// - `unknown_repo` if `repo_id` has no manifest entry.
     pub fn invalidate_repo(&mut self, repo_id: &str) -> Result<u64> {
-        let model = self
-            .manifest
-            .models
-            .get(repo_id)
-            .ok_or_else(|| anyhow!(
+        let model = self.manifest.models.get(repo_id).ok_or_else(|| {
+            anyhow!(
                 "invalidate_repo: unknown_repo: no manifest entry for {}",
                 repo_id
-            ))?;
+            )
+        })?;
 
         // Collect every quant string up front (deterministic
         // BTreeMap-iteration order) so the lock-acquisition order is
         // stable across processes — prevents AB/BA deadlocks.
-        let quant_strs: Vec<String> = model
-            .quantizations
-            .keys()
-            .cloned()
-            .collect();
+        let quant_strs: Vec<String> = model.quantizations.keys().cloned().collect();
 
         // Acquire every per-quant lock.  We hold these across the
         // remove + flush so concurrent serve sees a coherent before
         // /after.
         let mut locks: Vec<CacheLock> = Vec::with_capacity(quant_strs.len());
         for q in &quant_strs {
-            let lock_path = self
-                .root
-                .join("locks")
-                .join(format!("{}__{}.lock", slug_repo_id(repo_id)?, q));
+            let lock_path =
+                self.root
+                    .join("locks")
+                    .join(format!("{}__{}.lock", slug_repo_id(repo_id)?, q));
             locks.push(CacheLock::acquire(&lock_path)?);
         }
 
@@ -834,11 +815,7 @@ impl ModelCache {
 
     /// Non-blocking variant of [`lock_quant`].  Returns `Ok(None)` if
     /// another process holds the lock.
-    pub fn try_lock_quant(
-        &self,
-        repo_id: &str,
-        quant: QuantType,
-    ) -> Result<Option<CacheLock>> {
+    pub fn try_lock_quant(&self, repo_id: &str, quant: QuantType) -> Result<Option<CacheLock>> {
         let path = self.lock_path(repo_id, quant)?;
         CacheLock::try_acquire(&path)
     }
@@ -881,11 +858,7 @@ impl ModelCache {
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             let revision = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if best
-                .as_ref()
-                .map(|(t, _, _)| modified > *t)
-                .unwrap_or(true)
-            {
+            if best.as_ref().map(|(t, _, _)| modified > *t).unwrap_or(true) {
                 best = Some((modified, path, revision));
             }
         }
@@ -927,8 +900,8 @@ fn ensure_layout(root: &Path) -> Result<()> {
 }
 
 fn read_manifest(path: &Path) -> Result<CacheManifest> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read manifest: {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read manifest: {}", path.display()))?;
     let mut m: CacheManifest = serde_json::from_str(&text)
         .with_context(|| format!("parse manifest JSON: {}", path.display()))?;
     // Schema range: any version in [MIN_SUPPORTED, CURRENT] loads.  v1
@@ -984,13 +957,8 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         f.sync_all()
             .with_context(|| format!("fsync temp: {}", tmp_path.display()))?;
     }
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "rename {} → {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
@@ -1021,7 +989,12 @@ fn resolve_hf_hub_root() -> Option<PathBuf> {
     }
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
-            return Some(PathBuf::from(home).join(".cache").join("huggingface").join("hub"));
+            return Some(
+                PathBuf::from(home)
+                    .join(".cache")
+                    .join("huggingface")
+                    .join("hub"),
+            );
         }
     }
     None
@@ -1134,7 +1107,10 @@ mod tests {
 
     #[test]
     fn slug_simple_repo() {
-        assert_eq!(slug_repo_id("google/gemma-4-27b-it").unwrap(), "google__gemma-4-27b-it");
+        assert_eq!(
+            slug_repo_id("google/gemma-4-27b-it").unwrap(),
+            "google__gemma-4-27b-it"
+        );
     }
 
     #[test]
@@ -1243,7 +1219,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let env = EnvGuard::new(&["HF2Q_CACHE_DIR", "XDG_CACHE_HOME", "HOME"]);
         env.set("HOME", "/users/robert");
-        assert_eq!(default_root().unwrap(), PathBuf::from("/users/robert/.cache/hf2q"));
+        assert_eq!(
+            default_root().unwrap(),
+            PathBuf::from("/users/robert/.cache/hf2q")
+        );
     }
 
     #[test]
@@ -1260,7 +1239,10 @@ mod tests {
         env.set("HF2Q_CACHE_DIR", "");
         env.set("XDG_CACHE_HOME", "");
         env.set("HOME", "/users/robert");
-        assert_eq!(default_root().unwrap(), PathBuf::from("/users/robert/.cache/hf2q"));
+        assert_eq!(
+            default_root().unwrap(),
+            PathBuf::from("/users/robert/.cache/hf2q")
+        );
     }
 
     // ── ModelCache open/lookup ────────────────────────────────────────
@@ -1304,7 +1286,9 @@ mod tests {
         assert_eq!(m.revision, "abc123def");
         assert!(matches!(m.source, Some(SourcePointer::HfHub { .. })));
         // No quantizations yet
-        assert!(cache.lookup("google/gemma-4-27b-it", QuantType::Q4_K_M).is_none());
+        assert!(cache
+            .lookup("google/gemma-4-27b-it", QuantType::Q4_K_M)
+            .is_none());
         // repo_meta.json companion landed
         assert!(tmp
             .path()
@@ -1753,7 +1737,9 @@ mod tests {
 
         assert_eq!(compute_file_sha256(&path).unwrap(), expected);
         assert_eq!(expected.len(), 64);
-        assert!(expected.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(expected
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]
@@ -1870,7 +1856,11 @@ mod tests {
 
     // ── record_source_with_shards ───────────────────────────────────────
 
-    fn fake_shard(filename: &str, bytes: u64, sha256: Option<&str>) -> crate::core::integrity::ShardIntegrity {
+    fn fake_shard(
+        filename: &str,
+        bytes: u64,
+        sha256: Option<&str>,
+    ) -> crate::core::integrity::ShardIntegrity {
         crate::core::integrity::ShardIntegrity {
             filename: filename.to_string(),
             bytes,
@@ -2140,7 +2130,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
         let err = cache
-            .invalidate("org/m", QuantType::Q3_K_M)  // not cached
+            .invalidate("org/m", QuantType::Q3_K_M) // not cached
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unknown_quant"), "msg: {msg}");
@@ -2173,9 +2163,7 @@ mod tests {
         let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
         cache.invalidate("org/m", QuantType::Q4_K_M).unwrap();
         // Lock must be released — try_lock returns Some.
-        let l = cache
-            .try_lock_quant("org/m", QuantType::Q4_K_M)
-            .unwrap();
+        let l = cache.try_lock_quant("org/m", QuantType::Q4_K_M).unwrap();
         assert!(
             l.is_some(),
             "post-invalidate lock must be released (RAII Drop fires before flush returns)"

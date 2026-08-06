@@ -43,8 +43,7 @@ fn find_dense_gguf() -> Option<PathBuf> {
         }
         let name = dir.file_name()?.to_string_lossy().to_lowercase();
         let dense_arch_marker = name.contains("qwen35") || name.contains("qwen3.5");
-        let moe_marker =
-            name.contains("moe") || name.contains("-a3b") || name.contains("-a4b");
+        let moe_marker = name.contains("moe") || name.contains("-a3b") || name.contains("-a4b");
         if !dense_arch_marker || moe_marker {
             continue;
         }

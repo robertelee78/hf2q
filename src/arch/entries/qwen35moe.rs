@@ -219,7 +219,10 @@ pub const ENTRY: ArchEntry = ArchEntry {
     // Both HF architecture aliases — see src/arch/entries/qwen35.rs for
     // rationale. Registry must list both so get_by_hf_architecture
     // matches arch_gguf_name's four-alias acceptance.
-    hf_architectures: &["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
+    hf_architectures: &[
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
     tensor_catalog: &MOE_CATALOG,
     has_mtp: true,
     // The Robert-named 35B-A3B MoE target dropped vision_config from config.json
@@ -275,7 +278,10 @@ mod tests {
     fn hf_architectures_routes_to_moe_entry() {
         assert_eq!(
             ENTRY.hf_architectures,
-            &["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"]
+            &[
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration"
+            ]
         );
         assert_eq!(ENTRY.arch, "qwen35moe");
     }

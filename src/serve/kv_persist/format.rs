@@ -133,7 +133,9 @@ impl Serialize for BlockHash {
 impl<'de> Deserialize<'de> for BlockHash {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
-        hex_decode_32(&s).map(Self).map_err(serde::de::Error::custom)
+        hex_decode_32(&s)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -197,7 +199,9 @@ impl Serialize for ModelFingerprint {
 impl<'de> Deserialize<'de> for ModelFingerprint {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
-        hex_decode_32(&s).map(Self).map_err(serde::de::Error::custom)
+        hex_decode_32(&s)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -570,17 +574,12 @@ mod tests {
         let fp = fixture_fp();
         let tokens = vec![1u32, 2, 3, 4];
         let h_none = compute_block_hash(&fp, &ParentBlockHash(None), &tokens);
-        let h_zero =
-            compute_block_hash(&fp, &ParentBlockHash(Some(BlockHash::zero())), &tokens);
+        let h_zero = compute_block_hash(&fp, &ParentBlockHash(Some(BlockHash::zero())), &tokens);
         assert_eq!(h_none, h_zero, "None-parent ≡ zero-parent (intentional)");
 
         // A non-zero parent diverges from None.
         let nonzero_parent = compute_block_hash(&fp, &ParentBlockHash(None), &[42u32]);
-        let h_nonzero = compute_block_hash(
-            &fp,
-            &ParentBlockHash(Some(nonzero_parent)),
-            &tokens,
-        );
+        let h_nonzero = compute_block_hash(&fp, &ParentBlockHash(Some(nonzero_parent)), &tokens);
         assert_ne!(h_none, h_nonzero);
     }
 
@@ -607,13 +606,7 @@ mod tests {
     #[test]
     fn model_fingerprint_changes_on_input_perturbation() {
         // Flip one byte in source_sha256 → fingerprint MUST change.
-        let base = compute_model_fingerprint(
-            "test/repo",
-            "Q4_0",
-            "v1",
-            "deadbeef",
-            "tpl",
-        );
+        let base = compute_model_fingerprint("test/repo", "Q4_0", "v1", "deadbeef", "tpl");
         // Perturb each component independently and assert each flips
         // the fingerprint.
         let perturbations = [
@@ -773,7 +766,9 @@ mod tests {
         let h = compute_block_hash(&fp, &ParentBlockHash(None), &[1, 2, 3, 4, 5]);
         let s = h.to_string();
         assert_eq!(s.len(), 64, "hex length is 64");
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         let parsed: BlockHash = s.parse().expect("parse hex");
         assert_eq!(parsed, h);
 

@@ -487,10 +487,7 @@ pub fn gemma4_exact_kv_bytes_per_token(cfg: &crate::serve::config::Gemma4Config)
         // `layer_types[i]`, but pinning the branch here keeps the
         // intent local to this helper.
         let (nkv, hd) = match layer_type {
-            LayerType::Sliding => (
-                cfg.num_key_value_heads as u64,
-                cfg.head_dim as u64,
-            ),
+            LayerType::Sliding => (cfg.num_key_value_heads as u64, cfg.head_dim as u64),
             LayerType::Full => (
                 cfg.num_global_key_value_heads as u64,
                 cfg.global_head_dim as u64,
@@ -502,14 +499,18 @@ pub fn gemma4_exact_kv_bytes_per_token(cfg: &crate::serve::config::Gemma4Config)
         // can corrupt the budget calculation. In release builds the
         // helper still uses the local mapping (the public accessor IS
         // the same logic per `src/serve/config.rs:346-353`).
-        debug_assert_eq!(cfg.num_kv_heads_for_layer(i) as u64, nkv,
-            "L{i}: num_kv_heads_for_layer drift vs LayerType mapping");
-        debug_assert_eq!(cfg.head_dim_for_layer(i) as u64, hd,
-            "L{i}: head_dim_for_layer drift vs LayerType mapping");
-        // Per-layer per-token bytes: nkv × hd × 4 (F32) × 2 (K + V).
-        total = total.saturating_add(
-            nkv.saturating_mul(hd).saturating_mul(4).saturating_mul(2),
+        debug_assert_eq!(
+            cfg.num_kv_heads_for_layer(i) as u64,
+            nkv,
+            "L{i}: num_kv_heads_for_layer drift vs LayerType mapping"
         );
+        debug_assert_eq!(
+            cfg.head_dim_for_layer(i) as u64,
+            hd,
+            "L{i}: head_dim_for_layer drift vs LayerType mapping"
+        );
+        // Per-layer per-token bytes: nkv × hd × 4 (F32) × 2 (K + V).
+        total = total.saturating_add(nkv.saturating_mul(hd).saturating_mul(4).saturating_mul(2));
     }
     total
 }
@@ -1592,8 +1593,7 @@ mod tests {
             load_duration: Duration::from_millis(7),
             provenance: Provenance::External,
             prompt_cache: HybridPromptCache::new(),
-            lcp_registry:
-                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
@@ -1840,16 +1840,17 @@ mod tests {
     fn kv_bytes_per_token_zero_when_arch_facts_missing() {
         let mut info = golden_qwen35moe_info();
         info.n_layers = 0;
-        assert_eq!(info.kv_bytes_per_token(), 0,
-            "zero n_layers ⇒ 0 (synthetic loader / test fixture)");
+        assert_eq!(
+            info.kv_bytes_per_token(),
+            0,
+            "zero n_layers ⇒ 0 (synthetic loader / test fixture)"
+        );
         let mut info = golden_qwen35moe_info();
         info.n_key_value_heads = 0;
-        assert_eq!(info.kv_bytes_per_token(), 0,
-            "zero n_key_value_heads ⇒ 0");
+        assert_eq!(info.kv_bytes_per_token(), 0, "zero n_key_value_heads ⇒ 0");
         let mut info = golden_qwen35moe_info();
         info.head_dim = 0;
-        assert_eq!(info.kv_bytes_per_token(), 0,
-            "zero head_dim ⇒ 0");
+        assert_eq!(info.kv_bytes_per_token(), 0, "zero head_dim ⇒ 0");
     }
 
     #[test]
@@ -1902,7 +1903,13 @@ mod tests {
     fn canonical_gemma4_27b_config() -> crate::serve::config::Gemma4Config {
         use crate::serve::config::{Gemma4Config, LayerType};
         let layer_types: Vec<LayerType> = (0..30)
-            .map(|i| if (i + 1) % 6 == 0 { LayerType::Full } else { LayerType::Sliding })
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    LayerType::Full
+                } else {
+                    LayerType::Sliding
+                }
+            })
             .collect();
         Gemma4Config {
             vocab_size: 262_144,
@@ -1955,8 +1962,10 @@ mod tests {
             exact, expected,
             "Gemma 4 27B exact: 25 sliding (8×256) + 5 full (2×512) × 4 × 2 = {expected}",
         );
-        assert_eq!(exact, 450_560,
-            "Gemma 4 27B canonical per-token bytes = 450 KiB-minus-1");
+        assert_eq!(
+            exact, 450_560,
+            "Gemma 4 27B canonical per-token bytes = 450 KiB-minus-1"
+        );
     }
 
     /// **CRITICAL #1 GOLDEN** — when `LoadInfo` carries the override, the
@@ -2005,22 +2014,29 @@ mod tests {
             kv_bytes_per_token_override: Some(exact),
         };
         // Override wins over the flattened formula.
-        assert_eq!(info.kv_bytes_per_token(), exact,
-            "kv_bytes_per_token MUST honour the override when present");
+        assert_eq!(
+            info.kv_bytes_per_token(),
+            exact,
+            "kv_bytes_per_token MUST honour the override when present"
+        );
         // Flat formula sanity-check — if the implementation accidentally
         // ignored the override, this would be the answer it returned, and
         // it differs from `exact` by exactly the (full - sliding) shape
         // delta documented in `gemma4_exact_kv_bytes_per_token`.
         let flat: u64 = 30 * 8 * 256 * 4 * 2;
-        assert_ne!(exact, flat,
+        assert_ne!(
+            exact, flat,
             "exact and flat MUST differ — otherwise the test could pass even \
-             if `kv_bytes_per_token` ignored the override");
+             if `kv_bytes_per_token` ignored the override"
+        );
         assert_eq!(flat, 491_520, "canonical flat formula sanity");
         // Falsifier: if the override were ignored, the getter would
         // return the flat scalar, which is HIGHER than exact.
-        assert!(info.kv_bytes_per_token() < flat,
+        assert!(
+            info.kv_bytes_per_token() < flat,
             "exact override MUST be < flattened over-count (proves override \
-             is being honoured; not just a coincidence of identical values)");
+             is being honoured; not just a coincidence of identical values)"
+        );
     }
 
     /// **CRITICAL #1 GOLDEN** — falsifier for the flat path: when override
@@ -2029,12 +2045,17 @@ mod tests {
     #[test]
     fn a5c_load_info_kv_bytes_per_token_falls_back_to_flat_when_no_override() {
         let info = golden_qwen35moe_info();
-        assert!(info.kv_bytes_per_token_override.is_none(),
+        assert!(
+            info.kv_bytes_per_token_override.is_none(),
             "Qwen35 golden fixture MUST NOT carry an override — Qwen35 layers \
-             are homogeneous and the flat formula is exact");
+             are homogeneous and the flat formula is exact"
+        );
         let flat: u64 = 64 * 4 * 128 * 4 * 2;
-        assert_eq!(info.kv_bytes_per_token(), flat,
-            "no override ⇒ flat formula path (homogeneous arch)");
+        assert_eq!(
+            info.kv_bytes_per_token(),
+            flat,
+            "no override ⇒ flat formula path (homogeneous arch)"
+        );
     }
 
     /// **CRITICAL #1** — symmetric falsifier: a Gemma 4 fixture with the
@@ -2052,7 +2073,10 @@ mod tests {
         let mut info = golden_qwen35moe_info();
         info.arch_family = ArchFamily::Gemma4;
         info.kv_bytes_per_token_override = Some(exact);
-        assert_eq!(info.kv_bytes_per_token(), exact,
-            "override MUST short-circuit the flat formula");
+        assert_eq!(
+            info.kv_bytes_per_token(),
+            exact,
+            "override MUST short-circuit the flat formula"
+        );
     }
 }

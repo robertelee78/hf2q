@@ -36,8 +36,8 @@ fn test_info_displays_metadata() {
         .success()
         .stdout(predicate::str::contains("TinyTestModel"))
         .stdout(predicate::str::contains("tiny_test"))
-        .stdout(predicate::str::contains("8"))  // hidden_size
-        .stdout(predicate::str::contains("2"));  // layers
+        .stdout(predicate::str::contains("8")) // hidden_size
+        .stdout(predicate::str::contains("2")); // layers
 }
 
 #[test]
@@ -94,6 +94,6 @@ fn test_info_moe_model() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Gemma4ForConditionalGeneration"))
-        .stdout(predicate::str::contains("128"))  // experts
+        .stdout(predicate::str::contains("128")) // experts
         .stdout(predicate::str::contains("MoE"));
 }

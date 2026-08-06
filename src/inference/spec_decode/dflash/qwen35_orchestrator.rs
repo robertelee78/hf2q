@@ -291,9 +291,7 @@ pub fn dispatch_qwen35_dflash_generate(
         let t0 = profile_on.then(std::time::Instant::now);
         let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
         block.push(last_token);
-        block.extend(
-            std::iter::repeat(drafter_cfg.mask_token_id).take((block_size - 1) as usize),
-        );
+        block.extend(std::iter::repeat(drafter_cfg.mask_token_id).take((block_size - 1) as usize));
         let h = target
             .model
             .embed_tokens_gpu(&block)
@@ -347,9 +345,7 @@ pub fn dispatch_qwen35_dflash_generate(
                     DType::F32,
                     vec![drafter_new_rows.max(1), row_stride],
                 )
-                .map_err(|e| {
-                    anyhow!("alloc target_hidden_concat: {e}")
-                })?;
+                .map_err(|e| anyhow!("alloc target_hidden_concat: {e}"))?;
             if drafter_new_rows > 0 {
                 buf.as_mut_slice::<f32>()
                     .map_err(|e| anyhow!("target_hidden_concat slice: {e}"))?
@@ -363,20 +359,22 @@ pub fn dispatch_qwen35_dflash_generate(
 
         // 4. Drafter forward.
         let t0 = profile_on.then(std::time::Instant::now);
-        let h_final = target.model.with_gpu_cache_mut(|device, registry| {
-            super::forward::dispatch_dflash_model_forward(
-                registry,
-                device,
-                &h,
-                &target_hidden_concat,
-                drafter_tensors,
-                drafter_cache,
-                drafter_cfg,
-                block_size,
-                drafter_new_rows as u32,
-            )
-        })
-        .context("drafter forward")?;
+        let h_final = target
+            .model
+            .with_gpu_cache_mut(|device, registry| {
+                super::forward::dispatch_dflash_model_forward(
+                    registry,
+                    device,
+                    &h,
+                    &target_hidden_concat,
+                    drafter_tensors,
+                    drafter_cache,
+                    drafter_cfg,
+                    block_size,
+                    drafter_new_rows as u32,
+                )
+            })
+            .context("drafter forward")?;
         if let Some(t) = t0 {
             t_drafter_fwd_ms += t.elapsed().as_secs_f64() * 1000.0;
         }
@@ -477,9 +475,8 @@ pub fn dispatch_qwen35_dflash_generate(
         // 10. Append accepted positions from verify_captured onto
         //     prior_captured.
         let t0 = profile_on.then(std::time::Instant::now);
-        prior_captured =
-            append_capture_positions(&prior_captured, &verify_captured, n_committed)
-                .context("append accepted positions")?;
+        prior_captured = append_capture_positions(&prior_captured, &verify_captured, n_committed)
+            .context("append accepted positions")?;
         if let Some(t) = t0 {
             t_trim_ms += t.elapsed().as_secs_f64() * 1000.0;
         }
@@ -498,8 +495,12 @@ pub fn dispatch_qwen35_dflash_generate(
             t_drafter_argmax_ms / n,
             t_verify_ms / n,
             t_trim_ms / n,
-            (t_embed_ms + t_extract_ms + t_drafter_fwd_ms + t_drafter_argmax_ms
-                + t_verify_ms + t_trim_ms)
+            (t_embed_ms
+                + t_extract_ms
+                + t_drafter_fwd_ms
+                + t_drafter_argmax_ms
+                + t_verify_ms
+                + t_trim_ms)
                 / n,
         );
     }

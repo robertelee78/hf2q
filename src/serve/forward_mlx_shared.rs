@@ -8,14 +8,12 @@
 //! via the `pub use` shim in `forward_mlx.rs`; remove that shim after
 //! ADR-038 Step 3 retires `forward_mlx.rs`.
 
-use anyhow::Result;
-use mlx_native::{
-    GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
-};
-use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use crate::core::mlx_safetensors_loader::MlxAffineLinear;
 use crate::quantize::imatrix::{intercept_qmatmul_with_hint, ImatrixHint};
 use crate::serve::gpu::QuantWeightInfo;
+use anyhow::Result;
+use mlx_native::ops::dense_gemm::DenseGemmF16Params;
+use mlx_native::{GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice};
 
 // ---------------------------------------------------------------------------
 // Cluster 1 — Quantized weight types
@@ -105,10 +103,7 @@ impl MlxQWeight {
     /// The `info.ggml_dtype` is stamped to `GgmlType::F32` as a sentinel
     /// (unused on the affine path; routing gates on `affine.is_some()`
     /// before the F32 check).  `info.rows = N`, `info.cols = K`.
-    pub fn from_mlx_affine_linear(
-        device: &MlxDevice,
-        linear: &MlxAffineLinear,
-    ) -> Result<Self> {
+    pub fn from_mlx_affine_linear(device: &MlxDevice, linear: &MlxAffineLinear) -> Result<Self> {
         if linear.bits != 4 {
             anyhow::bail!(
                 "MlxQWeight::from_mlx_affine_linear: only bits=4 supported in AC#5 Iter B; got {}",
@@ -247,14 +242,20 @@ pub(crate) fn load_gguf_qweight(
     } else {
         format!("{name}.weight")
     };
-    let info = gguf.tensor_info(&full_name)
+    let info = gguf
+        .tensor_info(&full_name)
         .ok_or_else(|| anyhow::anyhow!("tensor '{}' not found in GGUF", full_name))?;
-    let buffer = gguf.load_tensor(&full_name, device)
+    let buffer = gguf
+        .load_tensor(&full_name, device)
         .map_err(|e| anyhow::anyhow!("load {}: {e}", full_name))?;
 
     // Shape: [rows, cols] for 2D weight matrices.
     let rows = info.shape.first().copied().unwrap_or(1);
-    let cols = if info.shape.len() > 1 { info.shape[1] } else { 1 };
+    let cols = if info.shape.len() > 1 {
+        info.shape[1]
+    } else {
+        1
+    };
 
     Ok(MlxQWeight {
         buffer,
@@ -369,32 +370,25 @@ pub fn dispatch_qmatmul(
     // Per ADR-033 §Risk 2 amendment (2026-05-19): Metal-native
     // accumulation is acceptable; we read the input buffer post-sync on
     // this same Metal-backed GraphSession instead of re-running on CPU.
-    intercept_qmatmul_with_hint(
-        imatrix_hint,
-        m as usize,
-        weight.info.cols,
-        || {
-            // Materialize the input buffer. We must drain any pending GPU
-            // work that wrote to `input` before reading it on the host,
-            // AND rotate to a fresh CB so subsequent dispatches don't
-            // hit Metal's `MTLCommandBufferStatusCommitted` assertion.
-            // `commit_wait_and_rotate` is a hard sync — only acceptable
-            // because this closure is gated on collector-present.
-            if let Err(e) = session.encoder_mut().commit_wait_and_rotate() {
-                eprintln!("[hf2q imatrix intercept] commit_wait_and_rotate failed: {e}");
-                return None;
+    intercept_qmatmul_with_hint(imatrix_hint, m as usize, weight.info.cols, || {
+        // Materialize the input buffer. We must drain any pending GPU
+        // work that wrote to `input` before reading it on the host,
+        // AND rotate to a fresh CB so subsequent dispatches don't
+        // hit Metal's `MTLCommandBufferStatusCommitted` assertion.
+        // `commit_wait_and_rotate` is a hard sync — only acceptable
+        // because this closure is gated on collector-present.
+        if let Err(e) = session.encoder_mut().commit_wait_and_rotate() {
+            eprintln!("[hf2q imatrix intercept] commit_wait_and_rotate failed: {e}");
+            return None;
+        }
+        match input.as_slice::<f32>() {
+            Ok(slice) => Some(slice.to_vec()),
+            Err(e) => {
+                eprintln!("[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}");
+                None
             }
-            match input.as_slice::<f32>() {
-                Ok(slice) => Some(slice.to_vec()),
-                Err(e) => {
-                    eprintln!(
-                        "[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}"
-                    );
-                    None
-                }
-            }
-        },
-    )
+        }
+    })
     .map_err(|e| anyhow::anyhow!("imatrix intercept: {e}"))?;
 
     // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
@@ -430,10 +424,7 @@ pub fn dispatch_qmatmul(
                 let start = output.contents_ptr() as usize;
                 (start, start + output.byte_len())
             };
-            encoder.set_pending_buffer_ranges(
-                vec![input_range],
-                vec![output_range],
-            );
+            encoder.set_pending_buffer_ranges(vec![input_range], vec![output_range]);
         }
     }
 
@@ -531,9 +522,7 @@ pub fn dispatch_qmatmul(
             .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
         if m == 1 && f32_matvec_default {
-            let params = DenseGemmF16Params {
-                m, n, k,
-            };
+            let params = DenseGemmF16Params { m, n, k };
             return mlx_native::ops::dense_gemm::dispatch_dense_matvec_f32(
                 session.encoder_mut(),
                 registry,
@@ -596,7 +585,9 @@ pub fn dispatch_qmatmul(
                 output,
                 &params,
             )
-            .map_err(|e| anyhow::anyhow!("dispatch_dense_matvec_f16w_f32io (native F16) failed: {e}"));
+            .map_err(|e| {
+                anyhow::anyhow!("dispatch_dense_matvec_f16w_f32io (native F16) failed: {e}")
+            });
         }
         return mlx_native::ops::quantized_matmul_ggml::dispatch_mm_v2_f16(
             session.encoder_mut(),
@@ -643,23 +634,17 @@ pub fn dispatch_qmatmul(
             .flatten()
         });
         if let Some(record) = record_opt {
-            session.encoder_mut().dispatch_record(
-                record,
-                &[&weight.buffer, input, output],
-            );
+            session
+                .encoder_mut()
+                .dispatch_record(record, &[&weight.buffer, input, output]);
             return Ok(());
         }
     }
 
     let params = weight.matmul_params(m)?;
-    session.quantized_matmul_ggml(
-        registry,
-        device,
-        input,
-        &weight.buffer,
-        output,
-        &params,
-    ).map_err(|e| anyhow::anyhow!("quantized_matmul_ggml failed: {e}"))
+    session
+        .quantized_matmul_ggml(registry, device, input, &weight.buffer, output, &params)
+        .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -827,7 +812,8 @@ pub fn dispatch_rms_norm_unit_perhead(
     } else {
         "rms_norm_no_scale_f32"
     };
-    let pipeline = registry.get_pipeline(kernel_name, device)
+    let pipeline = registry
+        .get_pipeline(kernel_name, device)
         .map_err(|e| anyhow::anyhow!("{kernel_name} pipeline: {e}"))?;
     let mut tg_size = std::cmp::min(256, args.dim.next_power_of_two()) as u64;
     if use_v2 && tg_size < 32 {
@@ -881,14 +867,18 @@ pub fn dispatch_rms_norm_unit_perhead_dual_perm(
     dim: u32,
 ) -> Result<()> {
     use mlx_native::ops::encode_helpers::{encode_threadgroups_with_args_and_shared, KernelArg};
-    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32_dual_perm", device)
+    let pipeline = registry
+        .get_pipeline("rms_norm_no_scale_f32_dual_perm", device)
         .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32_dual_perm pipeline: {e}"))?;
     let rows = (n_heads as u64) * (seq_len as u64);
     let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
     let shared_mem_bytes = tg_size * 4;
     let aux_bytes: [u32; 2] = [n_heads, seq_len];
     let aux_bytes_b: &[u8] = unsafe {
-        std::slice::from_raw_parts(aux_bytes.as_ptr() as *const u8, std::mem::size_of_val(&aux_bytes))
+        std::slice::from_raw_parts(
+            aux_bytes.as_ptr() as *const u8,
+            std::mem::size_of_val(&aux_bytes),
+        )
     };
     encode_threadgroups_with_args_and_shared(
         encoder,
@@ -944,16 +934,23 @@ pub(crate) fn rms_norm_f32_hs_cached(
 ) -> Result<()> {
     let rec = cache.get_or_init(|| {
         mlx_native::ops::rms_norm::build_rms_norm_decode_record(
-            reg, metal_dev, mlx_native::DType::F32, 1, hs,
+            reg,
+            metal_dev,
+            mlx_native::DType::F32,
+            1,
+            hs,
         )
         .ok()
         .flatten()
     });
     if let Some(r) = rec {
-        session.encoder_mut().dispatch_record(r, &[input, weight, output, params]);
+        session
+            .encoder_mut()
+            .dispatch_record(r, &[input, weight, output, params]);
         return Ok(());
     }
-    session.rms_norm(reg, metal_dev, input, weight, output, params, 1, hs)
+    session
+        .rms_norm(reg, metal_dev, input, weight, output, params, 1, hs)
         .map_err(|e| anyhow::anyhow!("rms_norm cached fallback: {e}"))
 }
 
@@ -1025,7 +1022,10 @@ mod cosine_tests {
         assert!(s.is_nan(), "zero-norm cosine should be NaN, got {s}");
         // And symmetric: nonzero on the left, zero on the right.
         let s2 = cosine_pairwise_f32(&b, &a);
-        assert!(s2.is_nan(), "zero-norm cosine (rhs) should be NaN, got {s2}");
+        assert!(
+            s2.is_nan(),
+            "zero-norm cosine (rhs) should be NaN, got {s2}"
+        );
         // Both zero → NaN.
         let z = vec![0.0_f32; 32];
         let s3 = cosine_pairwise_f32(&z, &z);
@@ -1051,13 +1051,22 @@ mod cosine_tests {
         // We compare against the explicit numpy-style formula to make sure
         // our F64 accumulation tracks the audit-binary numbers.
         let a: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.013).sin()).collect();
-        let b: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.013).sin() + 1e-3).collect();
+        let b: Vec<f32> = (0..512)
+            .map(|i| ((i as f32) * 0.013).sin() + 1e-3)
+            .collect();
         let s = cosine_pairwise_f32(&a, &b);
-        let py_dot: f64 = a.iter().zip(&b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let py_dot: f64 = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum();
         let py_na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         let py_nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         let py = (py_dot / (py_na * py_nb)) as f32;
-        assert!((s - py).abs() < 1e-6, "rust cosine={s} vs python-equiv={py}");
+        assert!(
+            (s - py).abs() < 1e-6,
+            "rust cosine={s} vs python-equiv={py}"
+        );
     }
 }
 
@@ -1259,10 +1268,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
         let mut x_buf = device
             .alloc_buffer(m * k * 4, mlx_native::DType::F32, vec![m, k])
             .expect("x");
-        x_buf
-            .as_mut_slice::<f32>()
-            .unwrap()
-            .copy_from_slice(&x);
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
 
         let y_buf = device
             .alloc_buffer(m * n * 4, mlx_native::DType::F32, vec![m, n])
@@ -1492,9 +1498,9 @@ mod ac5_iter_b_affine_qweight_roundtrip {
         let mut meta = device
             .alloc_buffer(16, mlx_native::DType::U32, vec![4])
             .unwrap();
-        meta.as_mut_slice::<u32>().unwrap().copy_from_slice(&[
-            m as u32, n as u32, k as u32, gs as u32,
-        ]);
+        meta.as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&[m as u32, n as u32, k as u32, gs as u32]);
 
         // Direct kernel call.
         let mut encoder = device.command_encoder().unwrap();
@@ -1508,7 +1514,11 @@ mod ac5_iter_b_affine_qweight_roundtrip {
             &extra.biases,
             &y_direct,
             &meta,
-            m as u32, n as u32, k as u32, gs as u32, bits,
+            m as u32,
+            n as u32,
+            k as u32,
+            gs as u32,
+            bits,
         )
         .unwrap();
         encoder.commit_and_wait().unwrap();
@@ -1713,11 +1723,8 @@ mod ac5_iter_b_affine_qweight_roundtrip {
         metadata.insert("bits".to_string(), bits.to_string());
         metadata.insert("group_size".to_string(), group_size.to_string());
 
-        let serialized = serialize(
-            pairs.iter().map(|(k, v)| (k.as_str(), v)),
-            Some(metadata),
-        )
-        .unwrap();
+        let serialized =
+            serialize(pairs.iter().map(|(k, v)| (k.as_str(), v)), Some(metadata)).unwrap();
 
         // Verify metadata round-trips via read_metadata.
         let (_n, md) = safetensors::SafeTensors::read_metadata(&serialized).unwrap();
@@ -1726,8 +1733,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
         assert_eq!(meta_map.get("bits").unwrap(), "4");
         assert_eq!(meta_map.get("group_size").unwrap(), "32");
 
-        let (parsed_bits, parsed_gs) =
-            super::parse_dwq_overlay_metadata(Some(meta_map)).unwrap();
+        let (parsed_bits, parsed_gs) = super::parse_dwq_overlay_metadata(Some(meta_map)).unwrap();
         assert_eq!(parsed_bits, bits);
         assert_eq!(parsed_gs, group_size);
 

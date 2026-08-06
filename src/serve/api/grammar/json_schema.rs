@@ -148,8 +148,8 @@ fn primitive_exact(name: &str) -> Option<(&'static str, &'static str, &'static [
 }
 
 #[allow(dead_code)]
-const _UNUSED_PRIMITIVE: fn(&str) -> Option<(&'static str, &'static str, &'static [&'static str])>
-    = primitive;
+const _UNUSED_PRIMITIVE: fn(&str) -> Option<(&'static str, &'static str, &'static [&'static str])> =
+    primitive;
 
 // ---------------------------------------------------------------------------
 // Literal escape helpers
@@ -213,7 +213,11 @@ pub enum SchemaError {
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SchemaError::TooManyRequiredKeys { fn_name, count, max } => write!(
+            SchemaError::TooManyRequiredKeys {
+                fn_name,
+                count,
+                max,
+            } => write!(
                 f,
                 "json-schema-to-grammar error at {}: object has {} required \
                  properties; ADR-005 grammar enforcement supports at most {} \
@@ -224,11 +228,9 @@ impl std::fmt::Display for SchemaError {
                 count,
                 max,
             ),
-            SchemaError::Generic { path, message } => write!(
-                f,
-                "json-schema-to-grammar error at {}: {}",
-                path, message
-            ),
+            SchemaError::Generic { path, message } => {
+                write!(f, "json-schema-to-grammar error at {}: {}", path, message)
+            }
         }
     }
 }
@@ -322,10 +324,11 @@ impl Converter {
                         // Literal string value in JSON → double-quoted literal
                         // in the emitted JSON. The grammar must match the
                         // quoted form, so embed `"value"` literally.
-                        let quoted_value = serde_json::to_string(s).map_err(|e| SchemaError::Generic {
-                            path: path.to_string(),
-                            message: format!("enum serialize: {e}"),
-                        })?;
+                        let quoted_value =
+                            serde_json::to_string(s).map_err(|e| SchemaError::Generic {
+                                path: path.to_string(),
+                                message: format!("enum serialize: {e}"),
+                            })?;
                         alts.push(format_literal(&quoted_value));
                     }
                     Value::Number(_) | Value::Bool(_) | Value::Null => {
@@ -339,8 +342,7 @@ impl Converter {
                     Value::Array(_) | Value::Object(_) => {
                         return Err(SchemaError::Generic {
                             path: format!("{}/enum", path),
-                            message: "enum values must be scalars (string/number/bool/null)"
-                                .into(),
+                            message: "enum values must be scalars (string/number/bool/null)".into(),
                         });
                     }
                 }
@@ -372,7 +374,8 @@ impl Converter {
                     })?;
                     let mut stub = serde_json::Map::new();
                     stub.insert("type".into(), Value::String(tstr.into()));
-                    let body = self.visit(&Value::Object(stub), &format!("{}/type[{}]", path, i))?;
+                    let body =
+                        self.visit(&Value::Object(stub), &format!("{}/type[{}]", path, i))?;
                     alts.push(body);
                 }
                 return Ok(alts.join(" | "));
@@ -380,10 +383,7 @@ impl Converter {
             Some(other) => {
                 return Err(SchemaError::Generic {
                     path: format!("{}/type", path),
-                    message: format!(
-                        "type must be a string or array of strings, got {:?}",
-                        other
-                    ),
+                    message: format!("type must be a string or array of strings, got {:?}", other),
                 });
             }
         };
@@ -655,10 +655,7 @@ impl Converter {
         kv_rule_name: &HashMap<String, String>,
         allow_extra_kv: bool,
     ) -> String {
-        let rule_name = format!(
-            "{}-up-r{:08x}-o{:08x}",
-            slug, req_remaining, opt_remaining
-        );
+        let rule_name = format!("{}-up-r{:08x}-o{:08x}", slug, req_remaining, opt_remaining);
 
         if self.rules.contains_key(&rule_name) {
             return rule_name;
@@ -843,7 +840,9 @@ impl Converter {
                 self.add_primitive("value");
                 "value".to_string()
             }
-            Some(Value::Object(_)) => self.visit(item_schema.unwrap(), &format!("{}/items", path))?,
+            Some(Value::Object(_)) => {
+                self.visit(item_schema.unwrap(), &format!("{}/items", path))?
+            }
             Some(Value::Array(_)) => {
                 return Err(SchemaError::Generic {
                     path: format!("{}/items", path),
@@ -858,7 +857,10 @@ impl Converter {
             }
         };
         // [ items ] with zero-or-more elements, comma-separated.
-        Ok(format!(r#""[" space ( {0} ("," space {0})* )? "]" space"#, item_rule))
+        Ok(format!(
+            r#""[" space ( {0} ("," space {0})* )? "]" space"#,
+            item_rule
+        ))
     }
 }
 
@@ -894,9 +896,9 @@ fn path_slug(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::parser::parse;
     use super::super::sampler::GrammarRuntime;
+    use super::*;
 
     fn compile(schema_json: &str) -> String {
         let schema: Value = serde_json::from_str(schema_json).unwrap();
@@ -1015,11 +1017,17 @@ mod tests {
         }"#;
         // age first (alphabetical).
         let mut rt = runtime(schema);
-        assert!(rt.accept_bytes(b"{\"age\":30,\"name\":\"Bob\"}"), "age-first rejected");
+        assert!(
+            rt.accept_bytes(b"{\"age\":30,\"name\":\"Bob\"}"),
+            "age-first rejected"
+        );
         assert!(rt.is_accepted());
         // name first (non-alphabetical — was broken before iter 75).
         let mut rt2 = runtime(schema);
-        assert!(rt2.accept_bytes(b"{\"name\":\"Bob\",\"age\":30}"), "name-first rejected");
+        assert!(
+            rt2.accept_bytes(b"{\"name\":\"Bob\",\"age\":30}"),
+            "name-first rejected"
+        );
         assert!(rt2.is_accepted());
     }
 
@@ -1088,22 +1096,17 @@ mod tests {
         }"#;
         // arguments-first (alphabetical).
         let mut rt = runtime(schema);
-        assert!(rt.accept_bytes(
-            b"{\"arguments\":{\"city\":\"NYC\"},\"name\":\"get_weather\"}"
-        ));
+        assert!(rt.accept_bytes(b"{\"arguments\":{\"city\":\"NYC\"},\"name\":\"get_weather\"}"));
         assert!(rt.is_accepted());
         // name-first (non-alphabetical — iter 75 fix).
         let mut rt2 = runtime(schema);
-        assert!(rt2.accept_bytes(
-            b"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"NYC\"}}"
-        ));
+        assert!(rt2.accept_bytes(b"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"NYC\"}}"));
         assert!(rt2.is_accepted());
     }
 
     #[test]
     fn unsupported_type_rejected_at_compile_time() {
-        let schema: Value =
-            serde_json::from_str(r#"{"type":"notathing"}"#).unwrap();
+        let schema: Value = serde_json::from_str(r#"{"type":"notathing"}"#).unwrap();
         let err = schema_to_gbnf(&schema).unwrap_err();
         assert!(err.to_string().contains("unsupported type"));
     }
@@ -1174,7 +1177,10 @@ mod tests {
         // Reject if required field is missing.
         let mut rt = runtime(schema);
         let ok = rt.accept_bytes(br#"{}"#);
-        assert!(!(ok && rt.is_accepted()), "accepted empty object missing required city");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted empty object missing required city"
+        );
     }
 
     #[test]
@@ -1202,23 +1208,20 @@ mod tests {
         }"#;
         // filters before query (alphabetical — old behavior).
         let mut rt = runtime(schema);
-        let payload =
-            br#"{"filters":{"max_price":2000,"min_price":500},"query":"laptops"}"#;
+        let payload = br#"{"filters":{"max_price":2000,"min_price":500},"query":"laptops"}"#;
         assert!(rt.accept_bytes(payload), "rejected nested (filters-first)");
         assert!(rt.is_accepted());
 
         // query before filters (non-alphabetical — iter 75 fix).
         let mut rt2 = runtime(schema);
-        let payload2 =
-            br#"{"query":"laptops","filters":{"max_price":2000,"min_price":500}}"#;
+        let payload2 = br#"{"query":"laptops","filters":{"max_price":2000,"min_price":500}}"#;
         assert!(rt2.accept_bytes(payload2), "rejected nested (query-first)");
         assert!(rt2.is_accepted());
 
         // Critical bug-fix anchor: missing the SECOND required field
         // (query) must be REJECTED. Pre-iter-74 this was falsely accepted.
         let mut rt = runtime(schema);
-        let missing =
-            br#"{"filters":{"max_price":2000,"min_price":500}}"#;
+        let missing = br#"{"filters":{"max_price":2000,"min_price":500}}"#;
         let ok = rt.accept_bytes(missing);
         assert!(
             !(ok && rt.is_accepted()),
@@ -1265,7 +1268,10 @@ mod tests {
         // Missing required 'unit' rejected.
         let mut rt = runtime(schema);
         let ok = rt.accept_bytes(br#"{"city":"London"}"#);
-        assert!(!(ok && rt.is_accepted()), "accepted object missing required 'unit'");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted object missing required 'unit'"
+        );
     }
 
     #[test]
@@ -1285,16 +1291,12 @@ mod tests {
         }"#;
         // tags first (alphabetical).
         let mut rt = runtime(schema);
-        assert!(rt.accept_bytes(
-            br#"{"tags":["news","tech"],"url":"https://example.com"}"#
-        ));
+        assert!(rt.accept_bytes(br#"{"tags":["news","tech"],"url":"https://example.com"}"#));
         assert!(rt.is_accepted());
 
         // url first (non-alphabetical — iter 75).
         let mut rt = runtime(schema);
-        assert!(rt.accept_bytes(
-            br#"{"url":"https://example.com","tags":["news","tech"]}"#
-        ));
+        assert!(rt.accept_bytes(br#"{"url":"https://example.com","tags":["news","tech"]}"#));
         assert!(rt.is_accepted());
 
         // Empty tags array allowed.
@@ -1355,12 +1357,18 @@ mod tests {
         // Missing required 'c'.
         let mut rt = runtime(schema);
         let ok = rt.accept_bytes(br#"{"a":1,"b":2}"#);
-        assert!(!(ok && rt.is_accepted()), "accepted object missing required 'c'");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted object missing required 'c'"
+        );
 
         // Missing required 'a'.
         let mut rt = runtime(schema);
         let ok = rt.accept_bytes(br#"{"b":2,"c":3}"#);
-        assert!(!(ok && rt.is_accepted()), "accepted object missing required 'a'");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted object missing required 'a'"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1472,7 +1480,10 @@ mod tests {
             rt.accept_bytes(br#"{"title":"Dr","name":"Alice"}"#),
             "optional key before required key was rejected"
         );
-        assert!(rt.is_accepted(), "not accepted after optional-before-required");
+        assert!(
+            rt.is_accepted(),
+            "not accepted after optional-before-required"
+        );
     }
 
     /// T1.8 prereq object: extra keys interspersed around required key.
@@ -1774,8 +1785,7 @@ mod tests {
 
         // Spot-check: any-position must be enforced — reversed order accepted.
         let gbnf = result.unwrap();
-        let g = super::super::parser::parse(&gbnf)
-            .unwrap_or_else(|e| panic!("parse gbnf: {}", e));
+        let g = super::super::parser::parse(&gbnf).unwrap_or_else(|e| panic!("parse gbnf: {}", e));
         let rid = g.rule_id("root").unwrap();
         let mut rt = GrammarRuntime::new(g, rid).unwrap();
         // Emit keys in reverse alphabetical order (k7..k0).
@@ -1784,7 +1794,10 @@ mod tests {
             rt.accept_bytes(reversed),
             "8-key schema rejected reversed-order input (any-position not enforced)"
         );
-        assert!(rt.is_accepted(), "8-key schema not accepted after reversed input");
+        assert!(
+            rt.is_accepted(),
+            "8-key schema not accepted after reversed input"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1860,12 +1873,21 @@ mod tests {
         // Must be Generic variant.
         assert!(
             matches!(&err, SchemaError::Generic { message, .. } if message.contains("unsupported type")),
-            "unsupported-type error must be SchemaError::Generic; got {:?}", err
+            "unsupported-type error must be SchemaError::Generic; got {:?}",
+            err
         );
         // Display must include the path and message.
         let s = err.to_string();
-        assert!(s.contains("json-schema-to-grammar error"), "Display must contain prefix: {}", s);
-        assert!(s.contains("unsupported type"), "Display must contain message: {}", s);
+        assert!(
+            s.contains("json-schema-to-grammar error"),
+            "Display must contain prefix: {}",
+            s
+        );
+        assert!(
+            s.contains("unsupported type"),
+            "Display must contain message: {}",
+            s
+        );
     }
 
     /// W-ζ LOW: >8-required-keys path emits TooManyRequiredKeys variant
@@ -1886,7 +1908,11 @@ mod tests {
         });
         let err = schema_to_gbnf(&schema).unwrap_err();
         match &err {
-            SchemaError::TooManyRequiredKeys { fn_name, count, max } => {
+            SchemaError::TooManyRequiredKeys {
+                fn_name,
+                count,
+                max,
+            } => {
                 // fn_name holds the path (empty = root in schema_to_gbnf context).
                 let _ = fn_name; // path is empty string at root; just assert presence
                 assert_eq!(*count, 9, "TooManyRequiredKeys must carry count=9");

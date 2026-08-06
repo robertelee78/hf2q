@@ -99,11 +99,13 @@ impl LayerActivations {
     pub fn element_count(&self) -> usize {
         let per_layer = (self.seq_len as usize) * (self.hidden_size as usize) * 2;
         match self.target_layer_filter.as_ref() {
-            Some(filter) => filter
-                .iter()
-                .filter(|&&i| i < (self.num_layers as usize))
-                .count()
-                * per_layer,
+            Some(filter) => {
+                filter
+                    .iter()
+                    .filter(|&&i| i < (self.num_layers as usize))
+                    .count()
+                    * per_layer
+            }
             None => (self.num_layers as usize) * per_layer,
         }
     }
@@ -276,9 +278,7 @@ impl ActivationCapture for MockActivationCapture {
             let mut out = vec![0.0f32; seq * h];
             for t in 0..seq {
                 for j in 0..h {
-                    let base = (tokens[t] as f32) * 0.001
-                        + (l as f32) * 0.01
-                        + (j as f32) * 0.0001;
+                    let base = (tokens[t] as f32) * 0.001 + (l as f32) * 0.01 + (j as f32) * 0.0001;
                     inp[t * h + j] = base;
                     out[t * h + j] = base + 1.0;
                 }
@@ -368,11 +368,7 @@ mod tests {
                 vec![], // non-target, empty allowed
                 vec![0.0; 8],
             ],
-            layer_outputs: vec![
-                vec![0.0; 8],
-                vec![],
-                vec![0.0; 8],
-            ],
+            layer_outputs: vec![vec![0.0; 8], vec![], vec![0.0; 8]],
             num_layers: 3,
             seq_len: 2,
             hidden_size: 4,
@@ -400,7 +396,11 @@ mod tests {
         // Non-target index with a non-empty Vec is treated as a writer
         // bug (filter not honored).
         let act = LayerActivations {
-            layer_inputs: vec![vec![0.0; 8], vec![0.0; 8] /* should be empty */, vec![0.0; 8]],
+            layer_inputs: vec![
+                vec![0.0; 8],
+                vec![0.0; 8], /* should be empty */
+                vec![0.0; 8],
+            ],
             layer_outputs: vec![vec![0.0; 8], vec![], vec![0.0; 8]],
             num_layers: 3,
             seq_len: 2,
@@ -477,12 +477,8 @@ mod tests {
     #[test]
     fn mock_differs_between_tokens() {
         let mut mock = MockActivationCapture::new(1, 4);
-        let a1 = mock
-            .run_calibration_prompt(&[1u32, 2, 3])
-            .unwrap();
-        let a2 = mock
-            .run_calibration_prompt(&[100u32, 200, 300])
-            .unwrap();
+        let a1 = mock.run_calibration_prompt(&[1u32, 2, 3]).unwrap();
+        let a2 = mock.run_calibration_prompt(&[100u32, 200, 300]).unwrap();
         // Different tokens → different inputs.
         let mut any_differ = false;
         for i in 0..12 {
@@ -491,7 +487,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_differ, "mock token content is not encoded in activations");
+        assert!(
+            any_differ,
+            "mock token content is not encoded in activations"
+        );
     }
 
     #[test]
@@ -527,7 +526,12 @@ mod tests {
         // Means should be finite and strictly monotonic in layer index
         // because mock formula adds 0.01 per layer.
         for i in 1..means.len() {
-            assert!(means[i] > means[i - 1], "layer {} mean should exceed layer {}", i, i - 1);
+            assert!(
+                means[i] > means[i - 1],
+                "layer {} mean should exceed layer {}",
+                i,
+                i - 1
+            );
         }
     }
 }

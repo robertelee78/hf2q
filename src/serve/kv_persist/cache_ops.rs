@@ -110,8 +110,8 @@ pub fn list_namespaces(kv_root: &Path) -> Result<Vec<KvNamespaceEntry>> {
     }
 
     let mut out = Vec::new();
-    for entry in fs::read_dir(&models_dir)
-        .with_context(|| format!("read_dir {}", models_dir.display()))?
+    for entry in
+        fs::read_dir(&models_dir).with_context(|| format!("read_dir {}", models_dir.display()))?
     {
         let entry = entry.with_context(|| format!("read entry under {}", models_dir.display()))?;
         let path = entry.path();
@@ -199,11 +199,7 @@ pub fn clear_namespace(
 
     if existed {
         fs::remove_dir_all(&target).map_err(|e| {
-            ClearRefusalErr::Io(format!(
-                "remove_dir_all({}): {}",
-                target.display(),
-                e
-            ))
+            ClearRefusalErr::Io(format!("remove_dir_all({}): {}", target.display(), e))
         })?;
     }
 
@@ -248,11 +244,7 @@ pub fn clear_namespace_all_quants(
         let bytes_freed = if existed { dir_total_bytes(&target) } else { 0 };
         if existed {
             fs::remove_dir_all(&target).map_err(|e| {
-                ClearRefusalErr::Io(format!(
-                    "remove_dir_all({}): {}",
-                    target.display(),
-                    e
-                ))
+                ClearRefusalErr::Io(format!("remove_dir_all({}): {}", target.display(), e))
             })?;
         }
         outcomes.push(ClearOutcome {
@@ -360,7 +352,9 @@ fn count_block_files(kv_dir: &Path) -> u64 {
         if !path.is_dir() {
             continue;
         }
-        let Ok(inner) = fs::read_dir(&path) else { continue };
+        let Ok(inner) = fs::read_dir(&path) else {
+            continue;
+        };
         for f in inner.flatten() {
             let p = f.path();
             if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
@@ -389,10 +383,8 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!(
-            "hf2q-cache-ops-{}-{}-{}-{}",
-            label, pid, n, nanos
-        ));
+        let p =
+            std::env::temp_dir().join(format!("hf2q-cache-ops-{}-{}-{}-{}", label, pid, n, nanos));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -412,9 +404,7 @@ mod tests {
         // Mirror `block_store.rs::new_with_index` lines 117-121.
         fs::create_dir_all(kv_root.join("locks")).unwrap();
         fs::write(
-            kv_root
-                .join("locks")
-                .join(format!("{}__ab.lock", fp_short)),
+            kv_root.join("locks").join(format!("{}__ab.lock", fp_short)),
             b"",
         )
         .unwrap();
@@ -427,9 +417,24 @@ mod tests {
         let kv = temp_dir("list-per-repo");
         // Two synthetic <fp_short> dirs with different block counts +
         // sizes. Hex0 fanout matches block_path layout (D5).
-        touch_block(&kv, "aaaaaaaaaaaaaaaa", "a000000000000000000000000000000000000000000000000000000000000000", &vec![0u8; 1024]);
-        touch_block(&kv, "aaaaaaaaaaaaaaaa", "a111111111111111111111111111111111111111111111111111111111111111", &vec![0u8; 2048]);
-        touch_block(&kv, "bbbbbbbbbbbbbbbb", "b222222222222222222222222222222222222222222222222222222222222222", &vec![0u8; 4096]);
+        touch_block(
+            &kv,
+            "aaaaaaaaaaaaaaaa",
+            "a000000000000000000000000000000000000000000000000000000000000000",
+            &vec![0u8; 1024],
+        );
+        touch_block(
+            &kv,
+            "aaaaaaaaaaaaaaaa",
+            "a111111111111111111111111111111111111111111111111111111111111111",
+            &vec![0u8; 2048],
+        );
+        touch_block(
+            &kv,
+            "bbbbbbbbbbbbbbbb",
+            "b222222222222222222222222222222222222222222222222222222222222222",
+            &vec![0u8; 4096],
+        );
 
         let entries = list_namespaces(&kv).unwrap();
         assert_eq!(entries.len(), 2, "two namespaces");
@@ -627,9 +632,13 @@ mod tests {
         drop(_held);
         // Re-acquire to prove --force still wins under contention.
         let _held2 = active_serve_guard(&kv).expect("reacquire sentinel");
-        let outcome =
-            clear_namespace(&kv, "acme/repo-locked", QuantType::Q4_K_M, /*force=*/ true)
-                .unwrap();
+        let outcome = clear_namespace(
+            &kv,
+            "acme/repo-locked",
+            QuantType::Q4_K_M,
+            /*force=*/ true,
+        )
+        .unwrap();
         assert!(outcome.existed);
         assert!(!kv.join("models").join(&target_fp).exists());
 

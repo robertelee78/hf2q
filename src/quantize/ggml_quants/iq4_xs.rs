@@ -67,10 +67,10 @@ const KVALUES_IQ4NL: [i8; 16] = [
 /// proved the contraction policy for THIS kernel — IQ4_XS reuses the
 /// same inner kernel so the same policy applies.
 fn quantize_block_iq4_xs(
-    x: &[f32],                       // length QK_K = 256
-    out: &mut [u8],                  // length BLOCK_BYTES = 136
-    values: &[i8],                   // KVALUES_IQ4NL
-    quant_weights: Option<&[f32]>,   // length QK_K when Some
+    x: &[f32],                     // length QK_K = 256
+    out: &mut [u8],                // length BLOCK_BYTES = 136
+    values: &[i8],                 // KVALUES_IQ4NL
+    quant_weights: Option<&[f32]>, // length QK_K when Some
     ntry: i32,
 ) {
     debug_assert_eq!(x.len(), QK_K);
@@ -362,8 +362,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set by cargo test");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo test");
         PathBuf::from(manifest)
             .join("tests/fixtures/ggml_quants")
             .join(name)

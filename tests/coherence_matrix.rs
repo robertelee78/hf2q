@@ -30,8 +30,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const BIN: &str = "target/release/hf2q";
-const CHAT_TEMPLATE_RAW: &str =
-    "{% for message in messages %}{{ message.content }}{% endfor %}";
+const CHAT_TEMPLATE_RAW: &str = "{% for message in messages %}{{ message.content }}{% endfor %}";
 
 #[derive(Debug)]
 struct Cell {
@@ -283,18 +282,16 @@ fn classify(actual: &str, golden: &str) -> Verdict {
     // Combined with phrase_repetition to avoid false positives on legitimate
     // short outputs.
     let distinct_count = {
-        let mut set: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for w in &words {
             set.insert(*w);
         }
         set.len()
     };
-    let low_distinct_ratio = words.len() >= 10
-        && (distinct_count as f32) < (words.len() as f32 * 0.4);
+    let low_distinct_ratio =
+        words.len() >= 10 && (distinct_count as f32) < (words.len() as f32 * 0.4);
 
-    let dominated_by_one_word =
-        !words.is_empty() && (max_rep as f32) > (words.len() as f32 * 0.6);
+    let dominated_by_one_word = !words.is_empty() && (max_rep as f32) > (words.len() as f32 * 0.6);
 
     if has_marker
         || single_token_repetition
@@ -463,10 +460,7 @@ fn coherence_matrix_all_cells() {
         let actual = match run_hf2q(cell) {
             Ok(a) => a,
             Err(e) if e.starts_with("MODEL_MISSING") => {
-                eprintln!(
-                    "SKIP {}/{}: {}",
-                    cell.fixture, cell.prompt_slug, e
-                );
+                eprintln!("SKIP {}/{}: {}", cell.fixture, cell.prompt_slug, e);
                 skipped.push(format!("{}/{}", cell.fixture, cell.prompt_slug));
                 continue;
             }
@@ -483,7 +477,9 @@ fn coherence_matrix_all_cells() {
             Verdict::Exact => {
                 eprintln!(
                     "EXACT     {}/{}: {:?}",
-                    cell.fixture, cell.prompt_slug, actual.trim()
+                    cell.fixture,
+                    cell.prompt_slug,
+                    actual.trim()
                 );
                 exact += 1;
             }

@@ -126,8 +126,8 @@ pub fn surviving_token_ids(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::parser::parse;
+    use super::*;
 
     fn rt(grammar_src: &str, start: &str) -> GrammarRuntime {
         let g = parse(grammar_src).expect("parse");
@@ -443,10 +443,7 @@ mod tests {
     /// SAME mechanism as `Engine::token_bytes_table`
     /// (`tok.decode(&[id], false)`). Returns `Vec<Vec<u8>>` indexed by
     /// id from 0 to `up_to` exclusive.
-    fn token_bytes_table_for_range(
-        tok: &tokenizers::Tokenizer,
-        up_to: u32,
-    ) -> Vec<Vec<u8>> {
+    fn token_bytes_table_for_range(tok: &tokenizers::Tokenizer, up_to: u32) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(up_to as usize);
         for id in 0..up_to {
             let s = tok.decode(&[id], false).unwrap_or_default();
@@ -552,10 +549,7 @@ mod tests {
         // (intentional contract — see mask.rs:77-79). Verify at least
         // some such tokens exist in the special-token block to confirm
         // we are exercising the contract.
-        let empty_byte_tokens: usize = token_bytes
-            .iter()
-            .filter(|b| b.is_empty())
-            .count();
+        let empty_byte_tokens: usize = token_bytes.iter().filter(|b| b.is_empty()).count();
         // We don't assert a specific number — it depends on the
         // tokenizer's special-token registration shape — but assert
         // the table is non-trivial.

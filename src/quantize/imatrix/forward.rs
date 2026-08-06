@@ -441,9 +441,7 @@ pub struct ComputeImatrixParams {
 /// apex-i-balanced --imatrix-corpus cdv3` (Stage 3c.2 CLI wiring
 /// SHIPPED 2026-05-19; `--imatrix-n-ctx <N>` flag SHIPPED at
 /// commit `71abbed5` overrides the 512 default).
-pub fn compute_imatrix(
-    params: &ComputeImatrixParams,
-) -> Result<super::ImatrixData, ImatrixError> {
+pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixData, ImatrixError> {
     use crate::quantize::ggml_quants::ArchName as Arch;
     use std::sync::{Arc, Mutex};
 
@@ -556,7 +554,10 @@ pub fn compute_imatrix(
     // matches the canonical chunk-boundary tokenization.
     let tokenizer = loaded.tokenizer();
     let encoding = tokenizer
-        .encode(params.corpus.text.as_str(), /* add_special_tokens */ true)
+        .encode(
+            params.corpus.text.as_str(),
+            /* add_special_tokens */ true,
+        )
         .map_err(|e| ImatrixError::TokenizationFailed {
             detail: format!("{e:?}"),
         })?;
@@ -604,15 +605,21 @@ pub fn compute_imatrix(
     }
     impl ImatrixCollector for SharedCollector {
         fn record(&mut self, name: &str, row: &[f32]) {
-            let mut reg = self.registry.lock().expect("imatrix registry mutex poisoned");
-            let acc = reg
-                .register(name, row.len(), 1)
-                .expect("imatrix dense register: shape mismatch (re-register with different n_per_row)");
+            let mut reg = self
+                .registry
+                .lock()
+                .expect("imatrix registry mutex poisoned");
+            let acc = reg.register(name, row.len(), 1).expect(
+                "imatrix dense register: shape mismatch (re-register with different n_per_row)",
+            );
             acc.absorb_dense(row)
                 .expect("imatrix dense absorb: row length mismatch (intercept should have caught)");
         }
         fn record_moe(&mut self, name: &str, expert_id: usize, row: &[f32]) {
-            let mut reg = self.registry.lock().expect("imatrix registry mutex poisoned");
+            let mut reg = self
+                .registry
+                .lock()
+                .expect("imatrix registry mutex poisoned");
             let acc = reg
                 .register(name, row.len(), self.n_experts)
                 .expect("imatrix moe register: shape mismatch (re-register with different shape)");
@@ -640,7 +647,10 @@ pub fn compute_imatrix(
             .as_ref()
             .map(|m| m.num_experts as usize)
             .ok_or_else(|| ImatrixError::UnsupportedArchForDriver {
-                arch: format!("{} (dense — imatrix driver is MoE-only)", params.arch.name()),
+                arch: format!(
+                    "{} (dense — imatrix driver is MoE-only)",
+                    params.arch.name()
+                ),
                 supported: &["gemma4", "qwen35moe"],
             })?,
         _ => {
@@ -703,17 +713,13 @@ pub fn compute_imatrix(
                         positions[axis * chunk_len + t] = t as i32;
                     }
                 }
-                let mut kv_cache = HybridKvCache::new(
-                    &qwen.model.cfg,
-                    &device,
-                    max_seq,
-                    /* n_parallel */ 1,
-                )
-                .map_err(|e| ImatrixError::ForwardPassFailed {
-                    chunk_index,
-                    chunk_count,
-                    detail: format!("HybridKvCache::new: {e:?}"),
-                })?;
+                let mut kv_cache =
+                    HybridKvCache::new(&qwen.model.cfg, &device, max_seq, /* n_parallel */ 1)
+                        .map_err(|e| ImatrixError::ForwardPassFailed {
+                            chunk_index,
+                            chunk_count,
+                            detail: format!("HybridKvCache::new: {e:?}"),
+                        })?;
                 let collector = SharedCollector {
                     registry: Arc::clone(&registry),
                     n_experts,
@@ -750,9 +756,8 @@ pub fn compute_imatrix(
         .map_err(|_| ImatrixError::ForwardPassFailed {
             chunk_index: 0,
             chunk_count: 0,
-            detail:
-                "internal: registry Arc had outstanding clones at pack time (collector leak)"
-                    .to_string(),
+            detail: "internal: registry Arc had outstanding clones at pack time (collector leak)"
+                .to_string(),
         })?
         .into_inner()
         .expect("imatrix registry mutex poisoned");
@@ -783,7 +788,10 @@ mod tests {
     fn intercept_noop_without_collector() {
         let mut materialized = false;
         let result = intercept_qmatmul_with_hint(
-            ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+            ImatrixHint::Layered {
+                tag: "attn_q",
+                layer: 0,
+            },
             /* m */ 1,
             /* n_per_row */ 2,
             || {
@@ -829,7 +837,10 @@ mod tests {
         struct StaticCollector;
         impl ImatrixCollector for StaticCollector {
             fn record(&mut self, name: &str, row: &[f32]) {
-                RECORDS.lock().unwrap().push((name.to_string(), row.to_vec()));
+                RECORDS
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), row.to_vec()));
             }
             fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
                 unreachable!("dense-only test collector — record_moe not exercised");
@@ -839,7 +850,10 @@ mod tests {
         RECORDS.lock().unwrap().clear();
         with_collector(StaticCollector, || {
             let result = intercept_qmatmul_with_hint(
-                ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+                ImatrixHint::Layered {
+                    tag: "attn_q",
+                    layer: 0,
+                },
                 /* m */ 1,
                 /* n_per_row */ 3,
                 || Some(vec![1.0, 2.0, 3.0]),
@@ -864,7 +878,10 @@ mod tests {
         struct StaticCollector;
         impl ImatrixCollector for StaticCollector {
             fn record(&mut self, name: &str, row: &[f32]) {
-                RECORDS.lock().unwrap().push((name.to_string(), row.to_vec()));
+                RECORDS
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), row.to_vec()));
             }
             fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
                 unreachable!("dense-only test collector — record_moe not exercised");
@@ -875,7 +892,10 @@ mod tests {
         with_collector(StaticCollector, || {
             // m=3 tokens × n_per_row=2 = 6-wide buffer.
             let result = intercept_qmatmul_with_hint(
-                ImatrixHint::Layered { tag: "ffn_gate", layer: 5 },
+                ImatrixHint::Layered {
+                    tag: "ffn_gate",
+                    layer: 5,
+                },
                 /* m */ 3,
                 /* n_per_row */ 2,
                 || Some(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -914,9 +934,12 @@ mod tests {
         RECORDS.lock().unwrap().clear();
         with_collector(C, || {
             let result = intercept_qmatmul_with_hint(
-                ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+                ImatrixHint::Layered {
+                    tag: "attn_q",
+                    layer: 0,
+                },
                 /* m */ 2,
-                /* n_per_row */ 4, // expects 8 floats
+                /* n_per_row */ 4,                     // expects 8 floats
                 || Some(vec![1.0; 5]), // returns 5 — mismatch
             );
             match result {
@@ -936,7 +959,10 @@ mod tests {
                 other => panic!("expected ShapeMismatch, got {other:?}"),
             }
         });
-        assert!(RECORDS.lock().unwrap().is_empty(), "no records on shape mismatch");
+        assert!(
+            RECORDS.lock().unwrap().is_empty(),
+            "no records on shape mismatch"
+        );
     }
 
     /// `Global` hint records under the verbatim name (no formatting).
@@ -1115,7 +1141,10 @@ mod tests {
         let mut input_materialized = false;
         let mut ids_materialized = false;
         let result = intercept_qmatmul_id_with_hint(
-            ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 0 },
+            ImatrixHint::Layered {
+                tag: "ffn_gate_up_exps",
+                layer: 0,
+            },
             /* n_tokens */ 2,
             /* top_k */ 2,
             /* n_per_row */ 4,
@@ -1194,7 +1223,10 @@ mod tests {
         RECORDS.lock().unwrap().clear();
         with_collector(MoeCollector, || {
             let result = intercept_qmatmul_id_with_hint(
-                ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 5 },
+                ImatrixHint::Layered {
+                    tag: "ffn_gate_up_exps",
+                    layer: 5,
+                },
                 /* n_tokens */ 2,
                 /* top_k */ 2,
                 /* n_per_row */ 3,
@@ -1237,15 +1269,23 @@ mod tests {
         *CALLS.lock().unwrap() = 0;
         with_collector(C, || {
             let result = intercept_qmatmul_id_with_hint(
-                ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 0 },
+                ImatrixHint::Layered {
+                    tag: "ffn_gate_up_exps",
+                    layer: 0,
+                },
                 /* n_tokens */ 2,
                 /* top_k */ 2,
-                /* n_per_row */ 4, // expects 8 input floats
+                /* n_per_row */ 4,                     // expects 8 input floats
                 || Some(vec![1.0; 5]), // returns 5 — mismatch
                 || Some(vec![0u32; 4]),
             );
             match result {
-                Err(ImatrixError::ShapeMismatch { tensor, expected, got, .. }) => {
+                Err(ImatrixError::ShapeMismatch {
+                    tensor,
+                    expected,
+                    got,
+                    ..
+                }) => {
                     assert_eq!(tensor, "blk.0.ffn_gate_up_exps.weight");
                     assert_eq!(expected, 8);
                     assert_eq!(got, 5);
@@ -1264,15 +1304,23 @@ mod tests {
     fn moe_intercept_errors_typed_on_expert_ids_shape_mismatch() {
         with_collector(RecorderCollector::default(), || {
             let result = intercept_qmatmul_id_with_hint(
-                ImatrixHint::Layered { tag: "ffn_down_exps", layer: 3 },
+                ImatrixHint::Layered {
+                    tag: "ffn_down_exps",
+                    layer: 3,
+                },
                 /* n_tokens */ 2,
                 /* top_k */ 4,
                 /* n_per_row */ 2,
-                || Some(vec![1.0; 4]), // input ok (2*2=4)
+                || Some(vec![1.0; 4]),  // input ok (2*2=4)
                 || Some(vec![0u32; 7]), // expert_ids expects 2*4=8, got 7
             );
             match result {
-                Err(ImatrixError::ShapeMismatch { tensor, expected, got, .. }) => {
+                Err(ImatrixError::ShapeMismatch {
+                    tensor,
+                    expected,
+                    got,
+                    ..
+                }) => {
                     assert_eq!(tensor, "blk.3.ffn_down_exps.weight::expert_ids");
                     assert_eq!(expected, 8);
                     assert_eq!(got, 7);
@@ -1296,13 +1344,14 @@ mod tests {
                 *CALLS.lock().unwrap() += 1;
             }
         }
-        for (n_tokens, top_k, n_per_row) in
-            [(0usize, 2usize, 4usize), (2, 0, 4), (2, 2, 0)]
-        {
+        for (n_tokens, top_k, n_per_row) in [(0usize, 2usize, 4usize), (2, 0, 4), (2, 2, 0)] {
             *CALLS.lock().unwrap() = 0;
             with_collector(C, || {
                 let result = intercept_qmatmul_id_with_hint(
-                    ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 0 },
+                    ImatrixHint::Layered {
+                        tag: "ffn_gate_up_exps",
+                        layer: 0,
+                    },
                     n_tokens,
                     top_k,
                     n_per_row,

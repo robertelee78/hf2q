@@ -27,9 +27,7 @@
 
 use std::path::PathBuf;
 
-use crate::quantize::ggml_quants::apex::{
-    ApexTier, SUPPORTED_APEX_TIERS,
-};
+use crate::quantize::ggml_quants::apex::{ApexTier, SUPPORTED_APEX_TIERS};
 use crate::quantize::ggml_quants::LlamaFtype;
 
 /// One resolved `--quant <name>` selector.
@@ -70,9 +68,7 @@ pub enum QuantSelectorError {
     /// `--quant apex-<X>` where `<X>` isn't in the v1 supported tier
     /// set. v1 tiers per ADR §6:
     /// `quality / i-quality / balanced / i-balanced / compact / i-compact / mini`.
-    #[error(
-        "unknown Apex tier `apex-{tier}`; v1 supports {supported:?}"
-    )]
+    #[error("unknown Apex tier `apex-{tier}`; v1 supports {supported:?}")]
     UnknownApexTier {
         tier: String,
         supported: &'static [&'static str],
@@ -105,12 +101,8 @@ pub enum QuantSelectorError {
 
     /// Bare `apex` without a tier suffix. Per ADR §6 the operator MUST
     /// pick a tier explicitly — there is no implicit Apex default.
-    #[error(
-        "--quant apex is unqualified; use one of {supported:?} or `apex-custom`"
-    )]
-    ApexUnqualified {
-        supported: &'static [&'static str],
-    },
+    #[error("--quant apex is unqualified; use one of {supported:?} or `apex-custom`")]
+    ApexUnqualified { supported: &'static [&'static str] },
 
     /// TQ1_0 / TQ2_0 are valid `LlamaFtype` variants but out of v1
     /// convert-v2 scope (no quantizer implementation — see
@@ -388,7 +380,10 @@ mod tests {
     #[test]
     fn p7_ac3_hint_dwq_reserved() {
         let msg = QuantSelectorError::DwqReserved.to_string();
-        assert!(msg.contains("dwq"), "msg should name the rejected flag: {msg}");
+        assert!(
+            msg.contains("dwq"),
+            "msg should name the rejected flag: {msg}"
+        );
         assert!(
             msg.contains("reserved") || msg.contains("future"),
             "msg should hint at the reserved/future-pipeline status: {msg}"
@@ -404,7 +399,10 @@ mod tests {
         assert!(msg.contains("apex"), "msg should name the flag: {msg}");
         // Must enumerate the supported tier names so the operator
         // can immediately pick one.
-        assert!(msg.contains("balanced"), "msg should list `balanced`: {msg}");
+        assert!(
+            msg.contains("balanced"),
+            "msg should list `balanced`: {msg}"
+        );
         assert!(msg.contains("mini"), "msg should list `mini`: {msg}");
         assert!(
             msg.contains("apex-custom"),
@@ -418,7 +416,10 @@ mod tests {
             name: "tq1_0".to_string(),
         }
         .to_string();
-        assert!(msg.contains("tq1_0"), "msg should echo the rejected name: {msg}");
+        assert!(
+            msg.contains("tq1_0"),
+            "msg should echo the rejected name: {msg}"
+        );
         assert!(
             msg.contains("out of v1") || msg.contains("scope"),
             "msg should hint at the scope reason: {msg}"
@@ -458,7 +459,10 @@ mod tests {
             tier: "nano".to_string(),
         }
         .to_string();
-        assert!(msg.contains("nano"), "msg should echo the rejected tier: {msg}");
+        assert!(
+            msg.contains("nano"),
+            "msg should echo the rejected tier: {msg}"
+        );
         assert!(
             msg.contains("apex-custom") || msg.contains("scope"),
             "msg should hint at the escape hatch or scope reason: {msg}"
@@ -471,13 +475,22 @@ mod tests {
             name: "garbage".to_string(),
         }
         .to_string();
-        assert!(msg.contains("garbage"), "msg should echo the bad name: {msg}");
+        assert!(
+            msg.contains("garbage"),
+            "msg should echo the bad name: {msg}"
+        );
     }
 
     #[test]
     fn approximate_for_apex_table() {
-        assert_eq!(approximate_for_apex(ApexTier::Quality), LlamaFtype::MostlyQ6_K);
-        assert_eq!(approximate_for_apex(ApexTier::IQuality), LlamaFtype::MostlyQ6_K);
+        assert_eq!(
+            approximate_for_apex(ApexTier::Quality),
+            LlamaFtype::MostlyQ6_K
+        );
+        assert_eq!(
+            approximate_for_apex(ApexTier::IQuality),
+            LlamaFtype::MostlyQ6_K
+        );
         assert_eq!(
             approximate_for_apex(ApexTier::Balanced),
             LlamaFtype::MostlyQ5_K_M
@@ -494,6 +507,9 @@ mod tests {
             approximate_for_apex(ApexTier::ICompact),
             LlamaFtype::MostlyQ4_K_M
         );
-        assert_eq!(approximate_for_apex(ApexTier::Mini), LlamaFtype::MostlyQ3_K_S);
+        assert_eq!(
+            approximate_for_apex(ApexTier::Mini),
+            LlamaFtype::MostlyQ3_K_S
+        );
     }
 }

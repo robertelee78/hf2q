@@ -159,7 +159,9 @@ impl Drop for ServerGuard {
 fn http_get_status(host: &str, port: u16, path: &str) -> std::io::Result<u16> {
     use std::net::TcpStream;
     let mut s = TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().map_err(std::io::Error::other)?,
+        &format!("{host}:{port}")
+            .parse()
+            .map_err(std::io::Error::other)?,
         Duration::from_secs(5),
     )?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -175,9 +177,7 @@ fn http_get_status(host: &str, port: u16, path: &str) -> std::io::Result<u16> {
     let code = parts
         .next()
         .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| {
-            std::io::Error::other(format!("malformed HTTP status line: {head_s:?}"))
-        })?;
+        .ok_or_else(|| std::io::Error::other(format!("malformed HTTP status line: {head_s:?}")))?;
     Ok(code)
 }
 
@@ -255,9 +255,8 @@ async fn post_chat(
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
     let elapsed = t0.elapsed();
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
-        panic!("non-JSON chat response (status={status}, err={e}): {text}")
-    });
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("non-JSON chat response (status={status}, err={e}): {text}"));
     (status, json, elapsed)
 }
 
@@ -279,9 +278,7 @@ fn parse_gauge(body: &str, name: &str) -> u64 {
     body.lines()
         .find_map(|l| l.strip_prefix(&prefix))
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            panic!("could not parse `{name}` gauge from /metrics body:\n{body}")
-        })
+        .unwrap_or_else(|| panic!("could not parse `{name}` gauge from /metrics body:\n{body}"))
 }
 
 /// Smoke: `hf2q --version` returns 0.  Always-on; verifies the
@@ -391,8 +388,7 @@ fn multi_model_swap_two_ggufs_e2e() {
     );
 
     // Hold the server guard for the lifetime of the test.
-    let _server = ServerGuard::spawn(&model_a.to_string_lossy())
-        .expect("spawn hf2q serve");
+    let _server = ServerGuard::spawn(&model_a.to_string_lossy()).expect("spawn hf2q serve");
     wait_for_readyz();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -429,9 +425,7 @@ fn multi_model_swap_two_ggufs_e2e() {
         !t2_text.trim().is_empty(),
         "turn 2 response content empty: {b2}"
     );
-    eprintln!(
-        "multi_model_swap: turn 2 (swap to MODEL_B) elapsed={t_swap:?}; content={t2_text:?}"
-    );
+    eprintln!("multi_model_swap: turn 2 (swap to MODEL_B) elapsed={t_swap:?}; content={t2_text:?}");
 
     // **AC 5466 assertion** — swap wall-clock must be under 10 s on M5 Max.
     let swap_budget = Duration::from_secs(SWAP_BUDGET_SECS);

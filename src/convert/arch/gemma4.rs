@@ -512,7 +512,8 @@ pub fn build_metadata(
         .expect("config.json missing required key `num_attention_heads`") as u32;
     let ctx_len = config["max_position_embeddings"]
         .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+        .expect("config.json missing required key `max_position_embeddings`")
+        as u32;
     let rms_eps = config["rms_norm_eps"]
         .as_f64()
         .expect("config.json missing required key `rms_norm_eps`") as f32;
@@ -568,11 +569,7 @@ pub fn build_metadata(
     }
     let sliding_window_pattern: Vec<bool> = layer_types_raw
         .iter()
-        .map(|v| {
-            v.as_str()
-                .expect("`layer_types[i]` must be a string")
-                == "sliding_attention"
-        })
+        .map(|v| v.as_str().expect("`layer_types[i]` must be a string") == "sliding_attention")
         .collect();
 
     // ---- Gemma 4-specific optional hparams --------------------------------
@@ -700,10 +697,7 @@ pub fn build_metadata(
         MetaValue::U32(hidden_size),
     ));
     kv.push(("gemma4.feed_forward_length".into(), feed_forward_length_kv));
-    kv.push((
-        "gemma4.attention.head_count".into(),
-        MetaValue::U32(n_head),
-    ));
+    kv.push(("gemma4.attention.head_count".into(), MetaValue::U32(n_head)));
     // Position 18: attention.head_count_kv (base.py:1130 — scalar;
     // Gemma4Model overwrites with array via dict-update at gemma.py:693).
     kv.push(("gemma4.attention.head_count_kv".into(), head_count_kv_kv));
@@ -880,8 +874,7 @@ pub const GEMMA4_ROPE_FREQS_TENSOR_NAME: &str = "rope_freqs.weight";
 pub fn build_synthesized_tensors(config: &serde_json::Value) -> Vec<HfTensor> {
     let head_dim = config["head_dim"]
         .as_u64()
-        .expect("config.json missing required key `head_dim`")
-        as u32;
+        .expect("config.json missing required key `head_dim`") as u32;
     let global_head_dim = config
         .get("global_head_dim")
         .and_then(|v| v.as_u64())
@@ -1024,10 +1017,7 @@ mod tests {
         }
 
         // `model.norm.weight` → `output_norm.weight` (both wrappings).
-        for hf in [
-            "model.norm.weight",
-            "model.language_model.norm.weight",
-        ] {
+        for hf in ["model.norm.weight", "model.language_model.norm.weight"] {
             assert_eq!(
                 map_tensor_name(hf),
                 Some(MappedTensor::Direct("output_norm.weight".into())),
@@ -1447,8 +1437,14 @@ mod tests {
         // `Gemma4Model.set_gguf_parameters:671-672`; SWA uses `head_dim`.
         assert_eq!(by_key["gemma4.attention.key_length"], MetaValue::U32(512));
         assert_eq!(by_key["gemma4.attention.value_length"], MetaValue::U32(512));
-        assert_eq!(by_key["gemma4.attention.key_length_swa"], MetaValue::U32(256));
-        assert_eq!(by_key["gemma4.attention.value_length_swa"], MetaValue::U32(256));
+        assert_eq!(
+            by_key["gemma4.attention.key_length_swa"],
+            MetaValue::U32(256)
+        );
+        assert_eq!(
+            by_key["gemma4.attention.value_length_swa"],
+            MetaValue::U32(256)
+        );
         assert_eq!(
             by_key["gemma4.attention.layer_norm_rms_epsilon"],
             MetaValue::F32(1.0e-6)
@@ -1458,7 +1454,10 @@ mod tests {
             MetaValue::F32(1_000_000.0),
             "rope_theta must come from rope_parameters.full_attention.rope_theta"
         );
-        assert_eq!(by_key["gemma4.attention.sliding_window"], MetaValue::U32(1024));
+        assert_eq!(
+            by_key["gemma4.attention.sliding_window"],
+            MetaValue::U32(1024)
+        );
         // MoE KV
         assert_eq!(by_key["gemma4.expert_count"], MetaValue::U32(128));
         assert_eq!(by_key["gemma4.expert_used_count"], MetaValue::U32(4));
@@ -1484,7 +1483,11 @@ mod tests {
             MetaValue::ArrayBool(v) => v.clone(),
             other => panic!("expected ArrayBool, got {other:?}"),
         };
-        assert_eq!(swa_pattern.len(), 30, "swa pattern must have one entry per layer");
+        assert_eq!(
+            swa_pattern.len(),
+            30,
+            "swa pattern must have one entry per layer"
+        );
         // Layer indices 5, 11, 17, 23, 29 are `full_attention` → false; rest true.
         for (i, &is_swa) in swa_pattern.iter().enumerate() {
             let expected_swa = !matches!(i, 5 | 11 | 17 | 23 | 29);
@@ -1511,11 +1514,17 @@ mod tests {
         // `add_head_count_kv(list)` emit type.
         let hck = match &by_key["gemma4.attention.head_count_kv"] {
             MetaValue::ArrayI32(v) => v.clone(),
-            other => panic!("expected ArrayI32 for head_count_kv (global=2 ≠ swa=8), got {other:?}"),
+            other => {
+                panic!("expected ArrayI32 for head_count_kv (global=2 ≠ swa=8), got {other:?}")
+            }
         };
         assert_eq!(hck.len(), 30, "head_count_kv array length = block_count");
         for (i, &hck_i) in hck.iter().enumerate() {
-            let expected = if matches!(i, 5 | 11 | 17 | 23 | 29) { 2 } else { 8 };
+            let expected = if matches!(i, 5 | 11 | 17 | 23 | 29) {
+                2
+            } else {
+                8
+            };
             assert_eq!(hck_i, expected, "layer {i} head_count_kv mismatch");
         }
 
@@ -1562,10 +1571,7 @@ mod tests {
         // When `_name_or_path` is absent, falls back to literal
         // "model" string → title-cased to "Model" by the canonical
         // `id_to_title` heuristic.
-        assert_eq!(
-            by_key["general.name"],
-            MetaValue::String("Model".into()),
-        );
+        assert_eq!(by_key["general.name"], MetaValue::String("Model".into()),);
         assert_eq!(
             by_key["gemma4.attention.head_count_kv"],
             MetaValue::U32(4),
@@ -1625,7 +1631,10 @@ mod tests {
         // RoPE dims: global = global_head_dim = head_dim = 16; swa =
         // head_dim * 1.0 = 16 (partial_rotary_factor defaults to 1.0).
         assert_eq!(by_key["gemma4.rope.dimension_count"], MetaValue::U32(16));
-        assert_eq!(by_key["gemma4.rope.dimension_count_swa"], MetaValue::U32(16));
+        assert_eq!(
+            by_key["gemma4.rope.dimension_count_swa"],
+            MetaValue::U32(16)
+        );
         // head_count_kv stays scalar (num_global_key_value_heads absent).
         assert_eq!(
             by_key["gemma4.attention.head_count_kv"],
@@ -1915,7 +1924,11 @@ mod tests {
             },
         });
         let tensors = build_synthesized_tensors(&cfg);
-        assert_eq!(tensors.len(), 1, "exactly one synthesized tensor for Gemma 4");
+        assert_eq!(
+            tensors.len(),
+            1,
+            "exactly one synthesized tensor for Gemma 4"
+        );
         let t = &tensors[0];
         assert_eq!(t.name, "rope_freqs.weight");
         assert_eq!(t.shape, vec![256]);

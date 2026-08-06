@@ -749,8 +749,7 @@ mod tests {
         // type plumbs through, mirroring cmd_serve's
         // `spiller.register_family(repo, quant, Arc::new(Mutex::new(StubGemma4Spill)))`
         // call).
-        let _kv_hook: Arc<Mutex<dyn KvCacheSpill>> =
-            Arc::new(Mutex::new(StubGemma4Spill));
+        let _kv_hook: Arc<Mutex<dyn KvCacheSpill>> = Arc::new(Mutex::new(StubGemma4Spill));
 
         let wrapper: LoaderWrapper<TestEngine> = LoaderWrapper::new(
             inner.clone() as Arc<dyn ModelLoader<TestEngine>>,
@@ -1112,11 +1111,7 @@ mod tests {
             fn block_alignment(&self) -> u32 {
                 111
             }
-            fn snapshot_block(
-                &self,
-                _: usize,
-                _: std::ops::Range<u32>,
-            ) -> Option<Vec<u8>> {
+            fn snapshot_block(&self, _: usize, _: std::ops::Range<u32>) -> Option<Vec<u8>> {
                 None
             }
             fn restore_block(
@@ -1135,17 +1130,13 @@ mod tests {
 
         // Probe captures the kv_hook Arc the factory produces so the
         // test can assert ptr_eq against the spiller-side registration.
-        let probe: Arc<Mutex<Option<Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>>>> =
-            Arc::new(Mutex::new(None));
+        let probe: Arc<
+            Mutex<Option<Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>>>,
+        > = Arc::new(Mutex::new(None));
 
         struct ProbingFactory {
-            probe: Arc<
-                Mutex<
-                    Option<
-                        Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
-                    >,
-                >,
-            >,
+            probe:
+                Arc<Mutex<Option<Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>>>>,
         }
         impl FamilyHookFactory for ProbingFactory {
             fn try_construct(
@@ -1159,11 +1150,10 @@ mod tests {
                     .downcast::<LwExpectedHandle>()
                     .ok()
                     .map(|_handle_arc| {
-                        let kv: Arc<
-                            Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>,
-                        > = Arc::new(Mutex::new(LwMockKvSpill {
-                            block_alignment_value: 256,
-                        }));
+                        let kv: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+                            Arc::new(Mutex::new(LwMockKvSpill {
+                                block_alignment_value: 256,
+                            }));
                         // Capture a clone of the kv Arc for the
                         // post-condition ptr_eq assertion.
                         {
@@ -1189,9 +1179,8 @@ mod tests {
         registry.register_factory("acme/m1".to_string(), QuantType::Q4_K_M, factory);
 
         let inner: Arc<dyn ModelLoader<LwExpectedHandle>> = Arc::new(LwMockLoaderHandle);
-        let wrapper: Arc<LoaderWrapper<LwExpectedHandle>> = Arc::new(
-            LoaderWrapper::new(inner, Arc::clone(&registry)),
-        );
+        let wrapper: Arc<LoaderWrapper<LwExpectedHandle>> =
+            Arc::new(LoaderWrapper::new(inner, Arc::clone(&registry)));
         wrapper.set_spiller(Arc::clone(&spiller));
         wrapper.set_pending_bind("acme/m1".to_string(), QuantType::Q4_K_M);
 

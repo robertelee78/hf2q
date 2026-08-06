@@ -17,19 +17,21 @@
 //! * `profile.rs` — kernel/token profile + accumulator.
 //! * `tokenizer.rs` — GGUF-embedded tokenizer (unchanged).
 
-pub mod model;
-pub mod kv_cache;
-pub mod gpu_full_attn;
-pub mod gpu_ffn;
-pub mod forward_gpu;
-pub mod batched_head;
 pub mod batched_body;
+pub mod batched_head;
+pub mod forward_gpu;
+pub mod gpu_ffn;
+pub mod gpu_full_attn;
 pub mod io_heads;
+pub mod kv_cache;
 pub mod kv_persist;
+pub mod model;
 pub mod profile;
 pub mod tokenizer;
 
 // Re-exports collapse import-site churn for the most-touched types.
+pub use kv_cache::{
+    DecodeRegime, DenseKvBuffers, GemmaLcpLayerKv, HbKvBuffers, HybridKvBuffers, MlxKvCache,
+};
 pub use model::MlxModelWeights;
-pub use profile::{ProfileAccumulator, TokenProfile, KernelTypeProfile};
-pub use kv_cache::{DenseKvBuffers, GemmaLcpLayerKv, HbKvBuffers, HybridKvBuffers, MlxKvCache, DecodeRegime};
+pub use profile::{KernelTypeProfile, ProfileAccumulator, TokenProfile};

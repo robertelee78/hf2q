@@ -235,7 +235,10 @@ mod tests {
         assert_eq!(detect(&empty_version), Provenance::External);
 
         // Empty source_sha256 → External.
-        let empty_sha = meta(&[(KEY_PRODUCER_VERSION, "hf2q 0.1.0"), (KEY_SOURCE_SHA256, "")]);
+        let empty_sha = meta(&[
+            (KEY_PRODUCER_VERSION, "hf2q 0.1.0"),
+            (KEY_SOURCE_SHA256, ""),
+        ]);
         assert_eq!(detect(&empty_sha), Provenance::External);
     }
 

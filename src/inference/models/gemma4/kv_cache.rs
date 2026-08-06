@@ -448,12 +448,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST (iter-1.5 cfa-finding-F5 ordering).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — MultiSeqHbKvBuffers does
         //    not expose Paged.
@@ -473,12 +471,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST (iter-1.5 cfa-finding-F5).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only.
         // 3. Budget: SeparateSlots cannot SlotOom on append (buffers
@@ -501,12 +497,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Budget: drop is a pure release; SlotOom unreachable.
@@ -532,20 +526,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
         //    victim deterministically; matches the trait doc + the
         //    NoopMultiSeqKvCache fixture-parity contract).
         if src.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: self.n_seqs,
+            });
         }
         if dst.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Same-slot fork is a no-op per trait spec.
@@ -570,38 +560,34 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqHbKvBuffers k_packed copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqHbKvBuffers k_norms copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqHbKvBuffers v_packed copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqHbKvBuffers v_norms copy failed ({e})"
-                    )),
-                }
-            })?;
+        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqHbKvBuffers k_packed copy failed ({e})"
+                )),
+            },
+        )?;
+        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqHbKvBuffers k_norms copy failed ({e})"
+                )),
+            },
+        )?;
+        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqHbKvBuffers v_packed copy failed ({e})"
+                )),
+            },
+        )?;
+        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqHbKvBuffers v_norms copy failed ({e})"
+                )),
+            },
+        )?;
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
         Ok(())
@@ -731,12 +717,10 @@ impl MultiSeqHbKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // Reset the per-slot cursor.  K/V packed + norms bytes are NOT
         // zeroed (cursor-masked read path — see layout proof above;
@@ -949,9 +933,7 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for GemmaLcpLayerKv {
     /// leg alone — no estimation, same discipline as the sibling impls.
     fn byte_len(&self) -> u64 {
         match self {
-            Self::Dense(d) => {
-                crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(d)
-            }
+            Self::Dense(d) => crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(d),
             Self::DenseAndHybrid(d, h) => {
                 crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(d)
                     + crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(h)
@@ -980,8 +962,8 @@ pub(crate) fn alloc_hybrid_kv_for_layer(
     let norms_per_pos = (hd / 256).max(1);
     let norms_n = nkv * cap * norms_per_pos;
     // F16 K: byte_count = elements * 2.
-    let k = dev.alloc_buffer(nkv * cap * hd * 2, DType::F16,
-        vec![nkv, cap, hd])
+    let k = dev
+        .alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd])
         .map_err(|e| anyhow!("hybrid F16 K L{layer_idx}: {e}"))?;
     // ADR-029 iter-20 H27: when HF2Q_FULL_F16_KV is set, V is F16 (2 bytes/elem)
     // and v_norms is a small dummy buffer (kernel ignores it when v_is_f16=1).
@@ -991,20 +973,29 @@ pub(crate) fn alloc_hybrid_kv_for_layer(
         .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
         .unwrap_or(false);
     let (v_packed, v_norms) = if full_f16_v {
-        let v_f16 = dev.alloc_buffer(nkv * cap * hd * 2, DType::F16,
-            vec![nkv, cap, hd])
+        let v_f16 = dev
+            .alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd])
             .map_err(|e| anyhow!("hybrid F16 V L{layer_idx}: {e}"))?;
         // Dummy norms buffer (unused but kept for ABI compat with hybrid SDPA
         // signature; kernel's v_is_f16 FC=1 skips the read).
-        let v_norms_dummy = dev.alloc_buffer(4, DType::F32, vec![1])
+        let v_norms_dummy = dev
+            .alloc_buffer(4, DType::F32, vec![1])
             .map_err(|e| anyhow!("hybrid V norms (dummy) L{layer_idx}: {e}"))?;
         (v_f16, v_norms_dummy)
     } else {
-        let v_p = dev.alloc_buffer(nkv * cap * hd, DType::U8,
-            vec![nkv, cap, hd])
+        let v_p = dev
+            .alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd])
             .map_err(|e| anyhow!("hybrid V packed L{layer_idx}: {e}"))?;
-        let v_n = dev.alloc_buffer(norms_n * 4, DType::F32,
-            if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] })
+        let v_n = dev
+            .alloc_buffer(
+                norms_n * 4,
+                DType::F32,
+                if norms_per_pos == 1 {
+                    vec![nkv, cap]
+                } else {
+                    vec![nkv, cap, norms_per_pos]
+                },
+            )
             .map_err(|e| anyhow!("hybrid V norms L{layer_idx}: {e}"))?;
         (v_p, v_n)
     };
@@ -1012,17 +1003,26 @@ pub(crate) fn alloc_hybrid_kv_for_layer(
     // Saves ~55MB at gemma-4 when xlen mode disabled.
     let xlen_mode = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
     let (bf16_xlen_k, bf16_xlen_v) = if xlen_mode {
-        let bk = dev.alloc_buffer(nkv * cap * hd * 2, DType::BF16,
-            vec![nkv, cap, hd])
+        let bk = dev
+            .alloc_buffer(nkv * cap * hd * 2, DType::BF16, vec![nkv, cap, hd])
             .map_err(|e| anyhow!("bf16 xlen K L{layer_idx}: {e}"))?;
-        let bv = dev.alloc_buffer(nkv * cap * hd * 2, DType::BF16,
-            vec![nkv, cap, hd])
+        let bv = dev
+            .alloc_buffer(nkv * cap * hd * 2, DType::BF16, vec![nkv, cap, hd])
             .map_err(|e| anyhow!("bf16 xlen V L{layer_idx}: {e}"))?;
         (Some(bk), Some(bv))
     } else {
         (None, None)
     };
-    Ok(HybridKvBuffers { k, v_packed, v_norms, capacity: cap, is_sliding: is_ring, norms_per_pos, bf16_xlen_k, bf16_xlen_v })
+    Ok(HybridKvBuffers {
+        k,
+        v_packed,
+        v_norms,
+        capacity: cap,
+        is_sliding: is_ring,
+        norms_per_pos,
+        bf16_xlen_k,
+        bf16_xlen_v,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1126,9 +1126,8 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for MultiSeqHybridKvBuffe
     /// — the lift to N slots scales every buffer by N at alloc-time, so
     /// `byte_len()` automatically reports the per-slot totals × N.
     fn byte_len(&self) -> u64 {
-        let mut sum = (self.k.byte_len()
-            + self.v_packed.byte_len()
-            + self.v_norms.byte_len()) as u64;
+        let mut sum =
+            (self.k.byte_len() + self.v_packed.byte_len() + self.v_norms.byte_len()) as u64;
         if let Some(ref bk) = self.bf16_xlen_k {
             sum += bk.byte_len() as u64;
         }
@@ -1293,12 +1292,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST (iter-1.5 cfa-finding-F5 ordering).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — MultiSeqHybridKvBuffers
         //    does not expose Paged.
@@ -1316,12 +1313,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only.
         // 3. Budget: SeparateSlots cannot SlotOom on append (buffers
@@ -1343,12 +1338,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Budget: drop is a pure release; SlotOom unreachable.
@@ -1369,20 +1362,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds — src FIRST per iter-1.5 cfa-finding-F5.
         if src.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: self.n_seqs,
+            });
         }
         if dst.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Same-slot fork is a no-op per trait spec.
@@ -1411,57 +1400,52 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqHybridKvBuffers k copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqHybridKvBuffers v_packed copy failed ({e})"
-                    )),
-                }
-            })?;
+        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs).map_err(|e| {
+            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqHybridKvBuffers k copy failed ({e})"
+                )),
+            }
+        })?;
+        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqHybridKvBuffers v_packed copy failed ({e})"
+                )),
+            },
+        )?;
         // v_norms: skip if it's the 4-byte dummy (HF2Q_FULL_F16_KV=1
         // path — alloc'd at `alloc_multi_seq_hybrid_kv_for_layer:996-998`
         // with byte_len=4 shared across slots).  Detection: byte_len
         // < n_seqs ⇒ structurally cannot be a per-slot buffer.
         if self.v_norms.byte_len() >= n_seqs {
-            gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs)
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: gemma4_leak_static_str(format!(
-                            "fork_seq: MultiSeqHybridKvBuffers v_norms copy failed ({e})"
-                        )),
-                    }
-                })?;
+            gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs).map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHybridKvBuffers v_norms copy failed ({e})"
+                    )),
+                },
+            )?;
         }
         // Optional BF16 xlen K/V (HF2Q_DFLASH_XLEN_SDPA=1 path).  Same
         // n_seqs outermost layout per `alloc_multi_seq_hybrid_kv_for_layer:1019-1031`.
         if let Some(ref mut bk) = self.bf16_xlen_k {
-            gemma4_copy_buffer_slot_region(bk, src_idx, dst_idx, n_seqs)
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: gemma4_leak_static_str(format!(
-                            "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_k copy failed ({e})"
-                        )),
-                    }
-                })?;
+            gemma4_copy_buffer_slot_region(bk, src_idx, dst_idx, n_seqs).map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_k copy failed ({e})"
+                    )),
+                }
+            })?;
         }
         if let Some(ref mut bv) = self.bf16_xlen_v {
-            gemma4_copy_buffer_slot_region(bv, src_idx, dst_idx, n_seqs)
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: gemma4_leak_static_str(format!(
-                            "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_v copy failed ({e})"
-                        )),
-                    }
-                })?;
+            gemma4_copy_buffer_slot_region(bv, src_idx, dst_idx, n_seqs).map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_v copy failed ({e})"
+                    )),
+                }
+            })?;
         }
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
@@ -1514,12 +1498,10 @@ impl MultiSeqHybridKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // Reset the per-slot cursor.  K (F16) / V (packed | F16) / V
         // norms (F32 | dummy) / optional xlen bf16 K/V bytes are NOT
@@ -1733,12 +1715,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST (iter-1.5 cfa-finding-F5 ordering).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — MultiSeqDenseKvBuffers
         //    does not expose Paged.
@@ -1754,12 +1734,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only.
         // 3. Budget: SeparateSlots cannot SlotOom on append (buffers
@@ -1781,12 +1759,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Budget: drop is a pure release; SlotOom unreachable.
@@ -1806,20 +1782,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds — src FIRST per iter-1.5 cfa-finding-F5.
         if src.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: self.n_seqs,
+            });
         }
         if dst.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Same-slot fork is a no-op per trait spec.
@@ -1840,22 +1812,20 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqDenseKvBuffers k copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.v, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqDenseKvBuffers v copy failed ({e})"
-                    )),
-                }
-            })?;
+        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs).map_err(|e| {
+            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqDenseKvBuffers k copy failed ({e})"
+                )),
+            }
+        })?;
+        gemma4_copy_buffer_slot_region(&mut self.v, src_idx, dst_idx, n_seqs).map_err(|e| {
+            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqDenseKvBuffers v copy failed ({e})"
+                )),
+            }
+        })?;
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
         Ok(())
@@ -1907,12 +1877,10 @@ impl MultiSeqDenseKvBuffers {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // Reset the per-slot cursor.  K / V bytes are NOT zeroed
         // (cursor-masked read path — see layout proof above; matches
@@ -2178,12 +2146,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST (iter-1.5 cfa-finding-F5 ordering).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — MultiSeqMlxKvCache does not
         //    expose Paged.
@@ -2199,12 +2165,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only.
         // 3. Budget: SeparateSlots cannot SlotOom on append (buffers
@@ -2226,12 +2190,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds FIRST.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Budget: drop is a pure release; SlotOom unreachable.
@@ -2252,20 +2214,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds — src FIRST per iter-1.5 cfa-finding-F5.
         if src.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: self.n_seqs,
+            });
         }
         if dst.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Same-slot fork is a no-op per trait spec.
@@ -2288,38 +2246,34 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqMlxKvCache k_packed copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqMlxKvCache k_norms copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqMlxKvCache v_packed copy failed ({e})"
-                    )),
-                }
-            })?;
-        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs)
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: gemma4_leak_static_str(format!(
-                        "fork_seq: MultiSeqMlxKvCache v_norms copy failed ({e})"
-                    )),
-                }
-            })?;
+        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqMlxKvCache k_packed copy failed ({e})"
+                )),
+            },
+        )?;
+        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqMlxKvCache k_norms copy failed ({e})"
+                )),
+            },
+        )?;
+        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqMlxKvCache v_packed copy failed ({e})"
+                )),
+            },
+        )?;
+        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs).map_err(
+            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: gemma4_leak_static_str(format!(
+                    "fork_seq: MultiSeqMlxKvCache v_norms copy failed ({e})"
+                )),
+            },
+        )?;
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
         Ok(())
@@ -2374,12 +2328,10 @@ impl MultiSeqMlxKvCache {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // Reset the per-slot cursor.  K packed / K norms / V packed /
         // V norms bytes are NOT zeroed (cursor-masked read path — see
@@ -2456,12 +2408,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
         slot: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: 1,
+            });
         }
         // DenseKvBuffers carries no internal cursor — seq_len is
         // tracked externally by the caller (the `MlxModelWeights`
@@ -2477,12 +2427,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
         _n_tokens: u32,
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: 1,
+            });
         }
         // Single-seq clamp: external cursor.  Iter-A3b-2 SHIPPED
         // the multi-seq sibling `MultiSeqDenseKvBuffers` +
@@ -2506,12 +2454,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
         slot: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: 1,
+            });
         }
         // Single-seq clamp: cursor lives outside this struct.
         // Iter-A3b-2 SHIPPED the multi-seq sibling
@@ -2531,20 +2477,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
         dst: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         if src.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: 1,
+            });
         }
         if dst.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: 1,
+            });
         }
         // Single-seq: src==dst==0 is the only valid combination,
         // and that is a no-op per trait spec.
@@ -2567,12 +2509,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MlxKvCache {
         slot: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: 1,
+            });
         }
         // MlxKvCache carries `seq_len: usize` internally (legacy
         // single-seq cursor).  Report it via the trait surface for
@@ -2586,12 +2526,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MlxKvCache {
         _n_tokens: u32,
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: 1,
+            });
         }
         // Single-seq clamp: legacy path mutates `seq_len`/`write_pos`
         // via direct field access at production callsites (the trait
@@ -2618,12 +2556,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MlxKvCache {
         slot: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: 1,
+            });
         }
         // Single-seq clamp: cursor lives outside this struct.
         // Iter-A3b-3 SHIPPED the multi-seq sibling `MultiSeqMlxKvCache`
@@ -2643,20 +2579,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MlxKvCache {
         dst: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         if src.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: 1,
+            });
         }
         if dst.0 >= 1 {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: 1,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: 1,
+            });
         }
         // Single-seq: src==dst==0 is the only valid combo, no-op.
         Ok(())
@@ -2718,11 +2650,20 @@ mod tests {
     #[test]
     fn mlx_kv_cache_trim_linear_decrements_seq_len() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
-            k_packed: buf(), k_norms: buf(), v_packed: buf(), v_norms: buf(),
-            capacity: 16, is_sliding: false, write_pos: 8, seq_len: 8,
+            k_packed: buf(),
+            k_norms: buf(),
+            v_packed: buf(),
+            v_norms: buf(),
+            capacity: 16,
+            is_sliding: false,
+            write_pos: 8,
+            seq_len: 8,
         };
         let new_len = cache.trim(3).unwrap();
         assert_eq!(new_len, 5);
@@ -2733,11 +2674,20 @@ mod tests {
     #[test]
     fn mlx_kv_cache_trim_sliding_errors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
-            k_packed: buf(), k_norms: buf(), v_packed: buf(), v_norms: buf(),
-            capacity: 16, is_sliding: true, write_pos: 4, seq_len: 4,
+            k_packed: buf(),
+            k_norms: buf(),
+            v_packed: buf(),
+            v_norms: buf(),
+            capacity: 16,
+            is_sliding: true,
+            write_pos: 4,
+            seq_len: 4,
         };
         assert!(cache.trim(1).is_err());
     }
@@ -2745,11 +2695,20 @@ mod tests {
     #[test]
     fn mlx_kv_cache_trim_overflow_errors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
-            k_packed: buf(), k_norms: buf(), v_packed: buf(), v_norms: buf(),
-            capacity: 16, is_sliding: false, write_pos: 3, seq_len: 3,
+            k_packed: buf(),
+            k_norms: buf(),
+            v_packed: buf(),
+            v_norms: buf(),
+            capacity: 16,
+            is_sliding: false,
+            write_pos: 3,
+            seq_len: 3,
         };
         assert!(cache.trim(10).is_err());
     }
@@ -2757,11 +2716,20 @@ mod tests {
     #[test]
     fn mlx_kv_cache_visible_len_eq_seq_len() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let cache = MlxKvCache {
-            k_packed: buf(), k_norms: buf(), v_packed: buf(), v_norms: buf(),
-            capacity: 32, is_sliding: false, write_pos: 7, seq_len: 7,
+            k_packed: buf(),
+            k_norms: buf(),
+            v_packed: buf(),
+            v_norms: buf(),
+            capacity: 32,
+            is_sliding: false,
+            write_pos: 7,
+            seq_len: 7,
         };
         assert_eq!(cache.visible_len(), cache.seq_len);
     }
@@ -2784,18 +2752,34 @@ mod tests {
     #[test]
     fn hybrid_kv_buffers_byte_len_sums_fields() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let nkv = 2; let cap = 4; let hd = 256;
-        let k = dev.alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd]).unwrap();
-        let v_packed = dev.alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd]).unwrap();
-        let v_norms = dev.alloc_buffer(nkv * cap * 4, DType::F32, vec![nkv, cap]).unwrap();
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let nkv = 2;
+        let cap = 4;
+        let hd = 256;
+        let k = dev
+            .alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd])
+            .unwrap();
+        let v_packed = dev
+            .alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd])
+            .unwrap();
+        let v_norms = dev
+            .alloc_buffer(nkv * cap * 4, DType::F32, vec![nkv, cap])
+            .unwrap();
         let k_bytes = k.byte_len();
         let vp_bytes = v_packed.byte_len();
         let vn_bytes = v_norms.byte_len();
         let buf = HybridKvBuffers {
-            k, v_packed, v_norms,
-            capacity: cap, is_sliding: false, norms_per_pos: 1,
-            bf16_xlen_k: None, bf16_xlen_v: None,
+            k,
+            v_packed,
+            v_norms,
+            capacity: cap,
+            is_sliding: false,
+            norms_per_pos: 1,
+            bf16_xlen_k: None,
+            bf16_xlen_v: None,
         };
         use crate::serve::kv_persist::lcp_registry::ByteSized;
         assert_eq!(buf.byte_len(), (k_bytes + vp_bytes + vn_bytes) as u64);
@@ -2804,12 +2788,28 @@ mod tests {
     #[test]
     fn dense_kv_buffers_byte_len_sums_k_plus_v() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let nkv = 2; let cap = 8; let hd = 256;
-        let k = dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap();
-        let v = dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap();
-        let kb = k.byte_len(); let vb = v.byte_len();
-        let buf = DenseKvBuffers { k, v, capacity: cap, is_sliding: false, dtype: DType::F32 };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let nkv = 2;
+        let cap = 8;
+        let hd = 256;
+        let k = dev
+            .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+            .unwrap();
+        let v = dev
+            .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+            .unwrap();
+        let kb = k.byte_len();
+        let vb = v.byte_len();
+        let buf = DenseKvBuffers {
+            k,
+            v,
+            capacity: cap,
+            is_sliding: false,
+            dtype: DType::F32,
+        };
         use crate::serve::kv_persist::lcp_registry::ByteSized;
         assert_eq!(buf.byte_len(), (kb + vb) as u64);
     }
@@ -2817,7 +2817,10 @@ mod tests {
     #[test]
     fn alloc_hybrid_kv_for_layer_no_xlen_no_full_f16() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // Ensure env gates are off for this test.
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -2832,7 +2835,10 @@ mod tests {
     #[test]
     fn alloc_hybrid_kv_for_layer_full_f16_v_allocates_f16() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         std::env::set_var("HF2Q_FULL_F16_KV", "1");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
         let buf = alloc_hybrid_kv_for_layer(&dev, 1, 2, 256, 4, true).unwrap();
@@ -2845,7 +2851,10 @@ mod tests {
     #[test]
     fn alloc_hybrid_kv_for_layer_xlen_allocates_bf16_buffers() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::set_var("HF2Q_DFLASH_XLEN_SDPA", "1");
         let buf = alloc_hybrid_kv_for_layer(&dev, 2, 2, 256, 4, false).unwrap();
@@ -2857,7 +2866,10 @@ mod tests {
     #[test]
     fn alloc_hybrid_kv_for_layer_norms_per_pos_d256_d512() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
         // D=256: norms_per_pos == 1.
@@ -2918,9 +2930,7 @@ mod tests {
     /// Test-imports for the trait-surface pins.  Pulled into the test
     /// module rather than the parent module so production code carries
     /// no test-only imports.
-    use crate::serve::multi_seq_kv::{
-        MultiSeqError, MultiSeqKvCache as _, MultiSeqLayout, SlotId,
-    };
+    use crate::serve::multi_seq_kv::{MultiSeqError, MultiSeqKvCache as _, MultiSeqLayout, SlotId};
 
     /// Dossier §2.9 H6 falsifier — extending `HbKvBuffers` (here as the
     /// sibling [`MultiSeqHbKvBuffers`] per the brief-deviation rationale
@@ -2951,7 +2961,10 @@ mod tests {
     #[test]
     fn h6_hb_kv_buffers_n_seqs_4_byte_scale() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // Per dossier H6: shape choices identical to existing
         // alloc_hybrid_kv_for_layer test fixtures (nkv=2, hd=256,
         // cap=8) so the byte-count formula matches what production
@@ -2959,10 +2972,10 @@ mod tests {
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
-        let baseline = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1)
-            .expect("H6: alloc at n_seqs=1");
-        let lifted = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 4)
-            .expect("H6: alloc at n_seqs=4");
+        let baseline =
+            alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1).expect("H6: alloc at n_seqs=1");
+        let lifted =
+            alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 4).expect("H6: alloc at n_seqs=4");
 
         // n_seqs field propagated.
         assert_eq!(baseline.n_seqs, 1, "H6: baseline n_seqs=1");
@@ -3039,12 +3052,15 @@ mod tests {
     #[test]
     fn h7_hb_kv_sliding_per_slot_isolation() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize; // small ring for a sliding cache
-        // is_ring=true mirrors Gemma 4 LayerType::Sliding allocation
-        // (forward_prefill.rs:847-861 sliding-layer branch).
+                          // is_ring=true mirrors Gemma 4 LayerType::Sliding allocation
+                          // (forward_prefill.rs:847-861 sliding-layer branch).
         let mut cache = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, true, 2)
             .expect("H7: alloc n_seqs=2 sliding");
         assert!(cache.is_sliding, "H7: sliding flag propagated");
@@ -3086,25 +3102,15 @@ mod tests {
         }
 
         // Snapshot slot 1's bytes for later comparison.
-        let k_slot1_before: Vec<u8> = cache
-            .k_packed
-            .as_slice::<u8>()
-            .expect("k_packed u8")
+        let k_slot1_before: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("k_packed u8")
             [slot_packed..2 * slot_packed]
             .to_vec();
-        let v_slot1_before: Vec<u8> = cache
-            .v_packed
-            .as_slice::<u8>()
-            .expect("v_packed u8")
+        let v_slot1_before: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed u8")
             [slot_packed..2 * slot_packed]
             .to_vec();
         // Sanity: slot 0 region is all-zero before the cursor advance.
-        let k_slot0_before: Vec<u8> = cache
-            .k_packed
-            .as_slice::<u8>()
-            .expect("k_packed u8")
-            [0..slot_packed]
-            .to_vec();
+        let k_slot0_before: Vec<u8> =
+            cache.k_packed.as_slice::<u8>().expect("k_packed u8")[0..slot_packed].to_vec();
         assert!(
             k_slot0_before.iter().all(|&b| b == 0),
             "H7 fixture sanity: slot 0 K region zero-init"
@@ -3121,16 +3127,10 @@ mod tests {
 
         // H7 falsifier: slot 1's K/V bytes must be byte-identical to
         // the snapshot taken before the slot-0 cursor advance.
-        let k_slot1_after: Vec<u8> = cache
-            .k_packed
-            .as_slice::<u8>()
-            .expect("k_packed u8")
+        let k_slot1_after: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("k_packed u8")
             [slot_packed..2 * slot_packed]
             .to_vec();
-        let v_slot1_after: Vec<u8> = cache
-            .v_packed
-            .as_slice::<u8>()
-            .expect("v_packed u8")
+        let v_slot1_after: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed u8")
             [slot_packed..2 * slot_packed]
             .to_vec();
         assert_eq!(
@@ -3168,7 +3168,10 @@ mod tests {
     #[test]
     fn h8_alloc_hb_kv_for_layer_byte_equivalent_to_pre_refactor() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
@@ -3179,8 +3182,8 @@ mod tests {
         let expected_packed_bytes = nkv * cap * hd; // U8
         let expected_norms_bytes = nkv * cap * norms_per_pos * std::mem::size_of::<f32>();
 
-        let helper = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1)
-            .expect("H8: helper at n_seqs=1");
+        let helper =
+            alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1).expect("H8: helper at n_seqs=1");
 
         // K/V packed bytes match the inline formula.
         assert_eq!(
@@ -3240,11 +3243,12 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_n_seqs_outermost_axis() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let cache_1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1)
-            .expect("alloc n_seqs=1");
-        let cache_4 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc n_seqs=4");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let cache_1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1).expect("alloc n_seqs=1");
+        let cache_4 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc n_seqs=4");
 
         // All 4 buffers must be 4-D with n_seqs at shape[0].
         for (name, b1, b4) in [
@@ -3297,11 +3301,12 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_slot_count_matches_n_seqs() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let c1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1)
-            .expect("alloc 1");
-        let c4 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc 4");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let c1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1).expect("alloc 1");
+        let c4 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc 4");
         assert_eq!(c1.slot_count(), 1);
         assert_eq!(c4.slot_count(), 4);
     }
@@ -3312,9 +3317,11 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_layout_is_separate_slots() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
         assert_eq!(c.layout(), MultiSeqLayout::SeparateSlots);
     }
 
@@ -3326,47 +3333,69 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_slot_out_of_range_errors_named() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
 
         // seq_len OOR
         let err = c.seq_len(SlotId(4)).expect_err("slot 4 OOR for n_seqs=4");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
         );
         let err = c.seq_len(SlotId(99)).expect_err("slot 99 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         );
 
         // append_for_seq OOR
         let err = c.append_for_seq(SlotId(4), 1).expect_err("append OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
         );
 
         // drop_seq OOR
         let err = c.drop_seq(SlotId(4)).expect_err("drop OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
         );
 
         // fork_seq src OOR FIRST (deterministic per fixture-parity).
-        let err = c.fork_seq(SlotId(4), SlotId(5)).expect_err("fork: src OOR first");
+        let err = c
+            .fork_seq(SlotId(4), SlotId(5))
+            .expect_err("fork: src OOR first");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
         );
         // fork_seq src valid, dst OOR.
         let err = c.fork_seq(SlotId(0), SlotId(4)).expect_err("fork: dst OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
         );
     }
 
@@ -3378,9 +3407,11 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_append_advances_target_slot_only() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
         // All slots start at 0.
         for s in 0..4 {
             assert_eq!(c.seq_len(SlotId(s)).expect("seq_len in range"), 0);
@@ -3402,9 +3433,11 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_drop_resets_seq_len_for_target_slot_only() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
         // Seed every slot.
         c.append_for_seq(SlotId(0), 10).unwrap();
         c.append_for_seq(SlotId(1), 20).unwrap();
@@ -3437,12 +3470,14 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_drop_does_not_zero_k_packed_buffer() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 2)
-            .expect("alloc n_seqs=2");
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 2).expect("alloc n_seqs=2");
 
         // Step 1: fill slot 0's K and V packed regions with a
         // deterministic non-zero pattern via direct host write.
@@ -3471,18 +3506,10 @@ mod tests {
         // Step 2: cursor bump on slot 0 (then snapshot bytes BEFORE
         // drop_seq).
         c.append_for_seq(SlotId(0), 2).expect("append slot 0");
-        let k_before: Vec<u8> = c
-            .k_packed
-            .as_slice::<u8>()
-            .expect("k_packed u8")
-            [..slot_packed]
-            .to_vec();
-        let v_before: Vec<u8> = c
-            .v_packed
-            .as_slice::<u8>()
-            .expect("v_packed u8")
-            [..slot_packed]
-            .to_vec();
+        let k_before: Vec<u8> =
+            c.k_packed.as_slice::<u8>().expect("k_packed u8")[..slot_packed].to_vec();
+        let v_before: Vec<u8> =
+            c.v_packed.as_slice::<u8>().expect("v_packed u8")[..slot_packed].to_vec();
         // Fixture sanity: at least one byte is the deterministic
         // pattern, not zero.  Defends against a future regression
         // that breaks `as_mut_slice` for this buffer kind.
@@ -3498,18 +3525,10 @@ mod tests {
         assert_eq!(c.seq_lens[0], 0, "cursor reset");
 
         // Step 4: snapshot again.
-        let k_after: Vec<u8> = c
-            .k_packed
-            .as_slice::<u8>()
-            .expect("k_packed u8 after")
-            [..slot_packed]
-            .to_vec();
-        let v_after: Vec<u8> = c
-            .v_packed
-            .as_slice::<u8>()
-            .expect("v_packed u8 after")
-            [..slot_packed]
-            .to_vec();
+        let k_after: Vec<u8> =
+            c.k_packed.as_slice::<u8>().expect("k_packed u8 after")[..slot_packed].to_vec();
+        let v_after: Vec<u8> =
+            c.v_packed.as_slice::<u8>().expect("v_packed u8 after")[..slot_packed].to_vec();
 
         // Step 5: byte-by-byte equality.  Any mutation by drop_seq
         // — including partial zero, partial overwrite, in-place
@@ -3534,9 +3553,11 @@ mod tests {
     #[test]
     fn gemma4_hb_kv_fork_to_self_is_noop_ok() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
         c.append_for_seq(SlotId(2), 9).unwrap();
         // src == dst — no-op success.
         c.fork_seq(SlotId(2), SlotId(2)).expect("fork self ok");
@@ -3566,14 +3587,17 @@ mod tests {
     #[test]
     fn historical_gemma4_hb_kv_fork_cross_slot_closure_at_phase_a3c() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
         c.append_for_seq(SlotId(0), 7).unwrap();
         // iter-A3c closure: fork now returns Ok(()).
-        c.fork_seq(SlotId(0), SlotId(1))
-            .expect("iter-A3c closure: cross-slot fork must return Ok(()) — \
-                     was previously CapabilityUnsupported per A3a typed-clamp");
+        c.fork_seq(SlotId(0), SlotId(1)).expect(
+            "iter-A3c closure: cross-slot fork must return Ok(()) — \
+                     was previously CapabilityUnsupported per A3a typed-clamp",
+        );
         // Cursor copy invariant (sub-pin for H165).
         assert_eq!(
             c.seq_len(SlotId(1)).unwrap(),
@@ -3628,7 +3652,10 @@ mod tests {
     #[test]
     fn a3a_mixed_layer_alloc_full_sliding_byte_isolation() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         use crate::serve::config::LayerType;
         // Synthetic 4-layer mixed config: alternating Full / Sliding,
         // matching the production Gemma 4 27B-A4B pattern
@@ -3651,13 +3678,12 @@ mod tests {
             // uses. A future branch-swap of Full/Sliding in
             // `layer_type_to_alloc_params` would surface here as wrong
             // capacity OR wrong is_ring — load-bearing falsifier.
-            let (is_ring, cap) = super::layer_type_to_alloc_params(
-                *lt, sliding_window, max_seq_len,
-            );
+            let (is_ring, cap) =
+                super::layer_type_to_alloc_params(*lt, sliding_window, max_seq_len);
             let buf = alloc_hb_kv_for_layer(&dev, layer_idx, nkv, hd, cap, is_ring, n_seqs)
-                .unwrap_or_else(|e| panic!(
-                    "L{layer_idx} ({lt:?}): alloc_hb_kv_for_layer must succeed; got {e}"
-                ));
+                .unwrap_or_else(|e| {
+                    panic!("L{layer_idx} ({lt:?}): alloc_hb_kv_for_layer must succeed; got {e}")
+                });
 
             // Falsifier 2/3 — is_sliding flag matches layer type.
             assert_eq!(
@@ -3668,7 +3694,11 @@ mod tests {
             );
 
             // Falsifier 4/5 — capacity matches layer-type-specific cap.
-            let cap_label = if is_ring { "sliding_window" } else { "max_seq_len" };
+            let cap_label = if is_ring {
+                "sliding_window"
+            } else {
+                "max_seq_len"
+            };
             assert_eq!(
                 buf.capacity, cap,
                 "L{layer_idx} ({lt:?}): capacity={} does NOT match \
@@ -3677,14 +3707,21 @@ mod tests {
             );
 
             // Falsifier 6 — per-seq cursors zero-initialised.
-            assert_eq!(buf.seq_lens.len(), n_seqs as usize,
-                "L{layer_idx}: seq_lens.len() must equal n_seqs");
-            assert!(buf.seq_lens.iter().all(|&x| x == 0),
-                "L{layer_idx}: seq_lens must be zero-initialised");
+            assert_eq!(
+                buf.seq_lens.len(),
+                n_seqs as usize,
+                "L{layer_idx}: seq_lens.len() must equal n_seqs"
+            );
+            assert!(
+                buf.seq_lens.iter().all(|&x| x == 0),
+                "L{layer_idx}: seq_lens must be zero-initialised"
+            );
 
             // Falsifier 7 — n_seqs propagated.
-            assert_eq!(buf.n_seqs, n_seqs,
-                "L{layer_idx}: n_seqs must propagate from call site");
+            assert_eq!(
+                buf.n_seqs, n_seqs,
+                "L{layer_idx}: n_seqs must propagate from call site"
+            );
 
             // Byte-count cross-check: Full layers cap=32 vs Sliding cap=8
             // ⇒ Full byte count = 4× Sliding byte count for same n_seqs
@@ -3693,11 +3730,13 @@ mod tests {
             // for sanity:
             let expected_packed_bytes = (n_seqs as usize) * nkv * cap * hd;
             assert_eq!(
-                buf.k_packed.byte_len(), expected_packed_bytes,
+                buf.k_packed.byte_len(),
+                expected_packed_bytes,
                 "L{layer_idx} ({lt:?}): k_packed byte_len mismatch",
             );
             assert_eq!(
-                buf.v_packed.byte_len(), expected_packed_bytes,
+                buf.v_packed.byte_len(),
+                expected_packed_bytes,
                 "L{layer_idx} ({lt:?}): v_packed byte_len mismatch",
             );
         }
@@ -3734,27 +3773,31 @@ mod tests {
         let sliding_window: usize = 4_096;
         let max_pos: usize = 131_072;
 
-        let (is_ring_s, cap_s) = super::layer_type_to_alloc_params(
-            LayerType::Sliding, sliding_window, max_pos,
-        );
+        let (is_ring_s, cap_s) =
+            super::layer_type_to_alloc_params(LayerType::Sliding, sliding_window, max_pos);
         assert!(is_ring_s, "Sliding MUST map to is_ring=true (ring buffer)");
-        assert_eq!(cap_s, sliding_window,
-            "Sliding MUST map to capacity=sliding_window={sliding_window}");
-
-        let (is_ring_f, cap_f) = super::layer_type_to_alloc_params(
-            LayerType::Full, sliding_window, max_pos,
+        assert_eq!(
+            cap_s, sliding_window,
+            "Sliding MUST map to capacity=sliding_window={sliding_window}"
         );
+
+        let (is_ring_f, cap_f) =
+            super::layer_type_to_alloc_params(LayerType::Full, sliding_window, max_pos);
         assert!(!is_ring_f, "Full MUST map to is_ring=false (linear buffer)");
-        assert_eq!(cap_f, max_pos,
-            "Full MUST map to capacity=max_position_embeddings={max_pos}");
+        assert_eq!(
+            cap_f, max_pos,
+            "Full MUST map to capacity=max_position_embeddings={max_pos}"
+        );
 
         // Cross-arm sanity: a Full layer NEVER takes the sliding_window
         // capacity and a Sliding layer NEVER takes the max_pos capacity.
-        assert_ne!(cap_s, cap_f,
+        assert_ne!(
+            cap_s, cap_f,
             "Sliding + Full MUST yield distinct capacities in a realistic \
              production config (sliding_window != max_position_embeddings); \
              a swap of the two arms in `layer_type_to_alloc_params` would \
-             make these equal and break the assertion above");
+             make these equal and break the assertion above"
+        );
     }
 
     /// **cfa-iter-A5c MAJOR #3** — production-path cross-check: the
@@ -3778,22 +3821,24 @@ mod tests {
         // Sliding layer — production must allocate a ring buffer of
         // capacity sliding_window (per gemma4/model.rs:1253-1257
         // pre-iter-A5c logic; post-iter-A5c routes through this helper).
-        let (is_ring, cap) = super::layer_type_to_alloc_params(
-            LayerType::Sliding, sliding_window, max_pos,
-        );
-        assert!(is_ring && cap == sliding_window,
+        let (is_ring, cap) =
+            super::layer_type_to_alloc_params(LayerType::Sliding, sliding_window, max_pos);
+        assert!(
+            is_ring && cap == sliding_window,
             "production Sliding layer alloc shape: (ring=true, cap=1024); \
              got (ring={is_ring}, cap={cap}) — gemma4/model.rs:1247-1257 \
-             would allocate the wrong shape if this mapping drifts");
+             would allocate the wrong shape if this mapping drifts"
+        );
 
         // Full layer — production must allocate a linear buffer of
         // capacity max_position_embeddings.
-        let (is_ring, cap) = super::layer_type_to_alloc_params(
-            LayerType::Full, sliding_window, max_pos,
-        );
-        assert!(!is_ring && cap == max_pos,
+        let (is_ring, cap) =
+            super::layer_type_to_alloc_params(LayerType::Full, sliding_window, max_pos);
+        assert!(
+            !is_ring && cap == max_pos,
             "production Full layer alloc shape: (ring=false, cap=131072); \
-             got (ring={is_ring}, cap={cap})");
+             got (ring={is_ring}, cap={cap})"
+        );
     }
 
     /// ADR-040 Phase F `iter-F-kvcap` — falsifier for the per-slot allocator
@@ -3817,44 +3862,57 @@ mod tests {
         // Sliding is per-slot-independent: identical for any max_slots.
         for &n in &[1usize, 2, 4, 8] {
             let (is_ring, cap) = super::layer_type_to_alloc_params_per_slot(
-                LayerType::Sliding, sliding_window, max_pos, n,
+                LayerType::Sliding,
+                sliding_window,
+                max_pos,
+                n,
             );
             assert!(is_ring, "Sliding MUST stay a ring buffer (max_slots={n})");
-            assert_eq!(cap, sliding_window,
+            assert_eq!(
+                cap, sliding_window,
                 "Sliding capacity MUST stay sliding_window regardless of \
                  max_slots — dividing the ring window would corrupt its \
-                 semantics (max_slots={n})");
+                 semantics (max_slots={n})"
+            );
         }
 
         // Full splits the budget: max/N per slot (llama.cpp -c ÷ -np).
-        let (is_ring_f8, cap_f8) = super::layer_type_to_alloc_params_per_slot(
-            LayerType::Full, sliding_window, max_pos, 8,
-        );
+        let (is_ring_f8, cap_f8) =
+            super::layer_type_to_alloc_params_per_slot(LayerType::Full, sliding_window, max_pos, 8);
         assert!(!is_ring_f8, "Full MUST stay linear (is_ring=false)");
-        assert_eq!(cap_f8, max_pos / 8,
+        assert_eq!(
+            cap_f8,
+            max_pos / 8,
             "Full per-slot capacity at max_slots=8 MUST be max_position_\
-             embeddings/8 = {} (the literal '8×32k')", max_pos / 8);
+             embeddings/8 = {} (the literal '8×32k')",
+            max_pos / 8
+        );
 
         // (a) max_slots == 1 is identity with the single-seq helper.
-        let (_, cap_single) = super::layer_type_to_alloc_params(
-            LayerType::Full, sliding_window, max_pos,
-        );
-        let (_, cap_n1) = super::layer_type_to_alloc_params_per_slot(
-            LayerType::Full, sliding_window, max_pos, 1,
-        );
-        assert_eq!(cap_n1, cap_single,
+        let (_, cap_single) =
+            super::layer_type_to_alloc_params(LayerType::Full, sliding_window, max_pos);
+        let (_, cap_n1) =
+            super::layer_type_to_alloc_params_per_slot(LayerType::Full, sliding_window, max_pos, 1);
+        assert_eq!(
+            cap_n1, cap_single,
             "max_slots=1 MUST be identity with the single-seq helper \
-             (no N=1 / SerialFifo regression): got {cap_n1} vs {cap_single}");
+             (no N=1 / SerialFifo regression): got {cap_n1} vs {cap_single}"
+        );
 
         // (b) total full-attention KV is constant in max_slots (N × max/N ≈ max).
         for &n in &[1usize, 2, 4, 8] {
             let (_, per_slot) = super::layer_type_to_alloc_params_per_slot(
-                LayerType::Full, sliding_window, max_pos, n,
+                LayerType::Full,
+                sliding_window,
+                max_pos,
+                n,
             );
             let total = per_slot * n;
-            assert!(total >= max_pos && total < max_pos + n,
+            assert!(
+                total >= max_pos && total < max_pos + n,
                 "total Full KV (per_slot {per_slot} × {n} slots = {total}) MUST \
-                 stay ≈ one full context ({max_pos}), not grow linearly in N");
+                 stay ≈ one full context ({max_pos}), not grow linearly in N"
+            );
         }
     }
 
@@ -3915,7 +3973,10 @@ mod tests {
     #[test]
     fn h11_multi_seq_hybrid_kv_n_seqs_4_byte_scale() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // Mirror H6's fixture shapes for cross-test grep parity.
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -3980,12 +4041,7 @@ mod tests {
             ("v_norms", &lifted.v_norms),
         ] {
             let s = b.shape().to_vec();
-            assert_eq!(
-                s.len(),
-                4,
-                "H11 M5: {name} must be 4-D; got {:?}",
-                s
-            );
+            assert_eq!(s.len(), 4, "H11 M5: {name} must be 4-D; got {:?}", s);
             assert_eq!(
                 s[0], 4,
                 "H11 M5 FALSIFIED: {name} shape[0] must be n_seqs=4 (n_seqs landed \
@@ -4006,11 +4062,10 @@ mod tests {
         //   v_norms_bytes = n * nkv * cap * 1 * 4      = 4 * 2 * 8 * 1 * 4   = 256
         //   xlen_bytes    = 0 (None)
         //   TOTAL         = 49408 bytes
-        let expected_k_bytes = 4usize * nkv * cap * hd * 2;        // 32768
-        let expected_v_packed_bytes = 4usize * nkv * cap * hd;     // 16384
-        let expected_v_norms_bytes = 4usize * nkv * cap * 1 * 4;   // 256
-        let expected_total =
-            expected_k_bytes + expected_v_packed_bytes + expected_v_norms_bytes;
+        let expected_k_bytes = 4usize * nkv * cap * hd * 2; // 32768
+        let expected_v_packed_bytes = 4usize * nkv * cap * hd; // 16384
+        let expected_v_norms_bytes = 4usize * nkv * cap * 1 * 4; // 256
+        let expected_total = expected_k_bytes + expected_v_packed_bytes + expected_v_norms_bytes;
         assert_eq!(
             lifted.k.byte_len(),
             expected_k_bytes,
@@ -4066,7 +4121,10 @@ mod tests {
     #[test]
     fn h11r_multi_seq_hybrid_kv_realistic_sliding_shape_byte_formula() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
         // Canonical Gemma 4 27B sliding shape: 8 KV heads × 256 head_dim.
@@ -4075,21 +4133,21 @@ mod tests {
         let hd = 256usize;
         let cap = 512usize;
         let n_seqs = 4u32;
-        let lifted = alloc_multi_seq_hybrid_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, n_seqs,
-        )
-        .expect("H11r: realistic shape alloc");
+        let lifted = alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs)
+            .expect("H11r: realistic shape alloc");
         let n = n_seqs as usize;
-        let expected_k = n * nkv * cap * hd * 2;        // 4*8*512*256*2 = 8_388_608
-        let expected_v = n * nkv * cap * hd;            // 4*8*512*256   = 4_194_304
-        let expected_norms = n * nkv * cap * 1 * 4;     // 4*8*512*1*4   = 65_536
+        let expected_k = n * nkv * cap * hd * 2; // 4*8*512*256*2 = 8_388_608
+        let expected_v = n * nkv * cap * hd; // 4*8*512*256   = 4_194_304
+        let expected_norms = n * nkv * cap * 1 * 4; // 4*8*512*1*4   = 65_536
         let expected_total = expected_k + expected_v + expected_norms;
         assert_eq!(lifted.k.byte_len(), expected_k, "H11r: K F16");
         assert_eq!(lifted.v_packed.byte_len(), expected_v, "H11r: V packed U8");
-        assert_eq!(lifted.v_norms.byte_len(), expected_norms, "H11r: V norms F32");
-        let actual = lifted.k.byte_len()
-            + lifted.v_packed.byte_len()
-            + lifted.v_norms.byte_len();
+        assert_eq!(
+            lifted.v_norms.byte_len(),
+            expected_norms,
+            "H11r: V norms F32"
+        );
+        let actual = lifted.k.byte_len() + lifted.v_packed.byte_len() + lifted.v_norms.byte_len();
         assert_eq!(actual, expected_total, "H11r: composition");
         assert_eq!(
             actual, 12_648_448,
@@ -4117,7 +4175,10 @@ mod tests {
     #[test]
     fn h12_multi_seq_hybrid_kv_per_slot_byte_isolation() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
         let nkv = 2usize;
@@ -4163,13 +4224,19 @@ mod tests {
             }
         }
         {
-            let v_slice = cache.v_packed.as_mut_slice::<u8>().expect("v_packed u8 mut");
+            let v_slice = cache
+                .v_packed
+                .as_mut_slice::<u8>()
+                .expect("v_packed u8 mut");
             for (i, b) in v_slice[..slot_v_bytes].iter_mut().enumerate() {
                 *b = (((i * 11) % 253) + 1) as u8;
             }
         }
         {
-            let vn_slice = cache.v_norms.as_mut_slice::<f32>().expect("v_norms f32 mut");
+            let vn_slice = cache
+                .v_norms
+                .as_mut_slice::<f32>()
+                .expect("v_norms f32 mut");
             let slot_vn_f32 = nkv * cap * 1; // norms_per_pos=1
             for (i, f) in vn_slice[..slot_vn_f32].iter_mut().enumerate() {
                 *f = (i as f32) * 0.123_45;
@@ -4177,20 +4244,13 @@ mod tests {
         }
 
         // Snapshot slot 1's regions.
-        let k_slot1_before: Vec<u8> = cache
-            .k
-            .as_slice::<u8>()
-            .expect("k F16 as u8")[slot_k_bytes..2 * slot_k_bytes]
+        let k_slot1_before: Vec<u8> =
+            cache.k.as_slice::<u8>().expect("k F16 as u8")[slot_k_bytes..2 * slot_k_bytes].to_vec();
+        let v_slot1_before: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed u8")
+            [slot_v_bytes..2 * slot_v_bytes]
             .to_vec();
-        let v_slot1_before: Vec<u8> = cache
-            .v_packed
-            .as_slice::<u8>()
-            .expect("v_packed u8")[slot_v_bytes..2 * slot_v_bytes]
-            .to_vec();
-        let vn_slot1_before: Vec<f32> = cache
-            .v_norms
-            .as_slice::<f32>()
-            .expect("v_norms f32")[(nkv * cap * 1)..2 * (nkv * cap * 1)]
+        let vn_slot1_before: Vec<f32> = cache.v_norms.as_slice::<f32>().expect("v_norms f32")
+            [(nkv * cap * 1)..2 * (nkv * cap * 1)]
             .to_vec();
 
         // Sanity: slot 1 is zero-init.
@@ -4208,25 +4268,20 @@ mod tests {
         );
 
         // A3b iter-1 cursor advance on slot 0 (no buffer mutation).
-        cache.append_for_seq(SlotId(0), 3).expect("H12: append slot 0");
+        cache
+            .append_for_seq(SlotId(0), 3)
+            .expect("H12: append slot 0");
         assert_eq!(cache.seq_lens[0], 3);
         assert_eq!(cache.seq_lens[1], 0);
 
         // H12 falsifier: slot 1's bytes must be byte-identical.
-        let k_slot1_after: Vec<u8> = cache
-            .k
-            .as_slice::<u8>()
-            .expect("k F16 as u8")[slot_k_bytes..2 * slot_k_bytes]
+        let k_slot1_after: Vec<u8> =
+            cache.k.as_slice::<u8>().expect("k F16 as u8")[slot_k_bytes..2 * slot_k_bytes].to_vec();
+        let v_slot1_after: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed u8")
+            [slot_v_bytes..2 * slot_v_bytes]
             .to_vec();
-        let v_slot1_after: Vec<u8> = cache
-            .v_packed
-            .as_slice::<u8>()
-            .expect("v_packed u8")[slot_v_bytes..2 * slot_v_bytes]
-            .to_vec();
-        let vn_slot1_after: Vec<f32> = cache
-            .v_norms
-            .as_slice::<f32>()
-            .expect("v_norms f32")[(nkv * cap * 1)..2 * (nkv * cap * 1)]
+        let vn_slot1_after: Vec<f32> = cache.v_norms.as_slice::<f32>().expect("v_norms f32")
+            [(nkv * cap * 1)..2 * (nkv * cap * 1)]
             .to_vec();
 
         assert_eq!(
@@ -4251,11 +4306,14 @@ mod tests {
     #[test]
     fn h13_multi_seq_hybrid_kv_cursor_independence() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
-        let mut c = alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
-            .expect("alloc");
+        let mut c =
+            alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, 2, 256, 8, false, 4).expect("alloc");
         // All slots start at 0.
         for s in 0..4 {
             assert_eq!(c.seq_len(SlotId(s)).expect("seq_len in range"), 0);
@@ -4278,7 +4336,11 @@ mod tests {
         // Drop slot 0 — slots 2/1/3 cursors unchanged.
         c.drop_seq(SlotId(0)).expect("drop slot 0");
         assert_eq!(c.seq_len(SlotId(0)).unwrap(), 0, "H13: slot 0 reset");
-        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 3, "H13: slot 2 preserved through slot 0 drop");
+        assert_eq!(
+            c.seq_len(SlotId(2)).unwrap(),
+            3,
+            "H13: slot 2 preserved through slot 0 drop"
+        );
     }
 
     /// **H14** — `MultiSeqHybridKvBuffers` optional BF16 xlen K/V
@@ -4295,7 +4357,10 @@ mod tests {
     #[test]
     fn h14_multi_seq_hybrid_kv_xlen_optional_coexists_with_u8_v() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // (a) xlen ON.
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::set_var("HF2Q_DFLASH_XLEN_SDPA", "1");
@@ -4327,8 +4392,16 @@ mod tests {
             "H14 FALSIFIED: xlen V bytes wrong"
         );
         // Shape: n_seqs OUTERMOST on xlen buffers too.
-        assert_eq!(bk.shape(), &[3, 2, 4, 256], "H14: xlen K shape n_seqs outermost");
-        assert_eq!(bv.shape(), &[3, 2, 4, 256], "H14: xlen V shape n_seqs outermost");
+        assert_eq!(
+            bk.shape(),
+            &[3, 2, 4, 256],
+            "H14: xlen K shape n_seqs outermost"
+        );
+        assert_eq!(
+            bv.shape(),
+            &[3, 2, 4, 256],
+            "H14: xlen V shape n_seqs outermost"
+        );
 
         // U8 V packed + F32 v_norms coexist unchanged.
         // V packed: n * nkv * cap * hd (U8) = 3 * 2 * 4 * 256 = 6144.
@@ -4372,14 +4445,33 @@ mod tests {
     fn h15_dense_kv_buffers_typed_clamp_slot_count_one() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::MultiSeqKvCache;
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let nkv = 2; let cap = 8; let hd = 256;
-        let k = dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap();
-        let v = dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap();
-        let mut buf = DenseKvBuffers { k, v, capacity: cap, is_sliding: false, dtype: DType::F32 };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let nkv = 2;
+        let cap = 8;
+        let hd = 256;
+        let k = dev
+            .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+            .unwrap();
+        let v = dev
+            .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+            .unwrap();
+        let mut buf = DenseKvBuffers {
+            k,
+            v,
+            capacity: cap,
+            is_sliding: false,
+            dtype: DType::F32,
+        };
 
         // slot_count == 1.
-        assert_eq!(buf.slot_count(), 1, "H15 FALSIFIED: DenseKvBuffers slot_count must be 1");
+        assert_eq!(
+            buf.slot_count(),
+            1,
+            "H15 FALSIFIED: DenseKvBuffers slot_count must be 1"
+        );
         assert_eq!(buf.layout(), MultiSeqLayout::SeparateSlots);
 
         // seq_len(SlotId(0)) returns Ok(0).
@@ -4389,23 +4481,39 @@ mod tests {
         let err = buf.seq_len(SlotId(1)).expect_err("slot 1 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(1), max_slots: 1 },
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(1),
+                max_slots: 1
+            },
             "H15 FALSIFIED: SlotOutOfRange shape wrong; got {err:?}"
         );
 
         // append_for_seq(SlotId(2)) returns SlotOutOfRange (bounds first).
-        let err = buf.append_for_seq(SlotId(2), 1).expect_err("append slot 2 OOR");
+        let err = buf
+            .append_for_seq(SlotId(2), 1)
+            .expect_err("append slot 2 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(2), max_slots: 1 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(2),
+                max_slots: 1
+            }
         );
 
         // append_for_seq(SlotId(0)) returns CapabilityUnsupported naming iter-A3b-2.
-        let err = buf.append_for_seq(SlotId(0), 1).expect_err("append clamped to iter-A3b-2");
+        let err = buf
+            .append_for_seq(SlotId(0), 1)
+            .expect_err("append clamped to iter-A3b-2");
         match err {
             MultiSeqError::CapabilityUnsupported { capability } => {
-                assert!(capability.contains("DenseKvBuffers"), "label must name struct: {capability}");
-                assert!(capability.contains("A3b iter-2"), "label must name deferral: {capability}");
+                assert!(
+                    capability.contains("DenseKvBuffers"),
+                    "label must name struct: {capability}"
+                );
+                assert!(
+                    capability.contains("A3b iter-2"),
+                    "label must name deferral: {capability}"
+                );
             }
             other => panic!("H15: expected CapabilityUnsupported; got {other:?}"),
         }
@@ -4414,24 +4522,38 @@ mod tests {
         let err = buf.drop_seq(SlotId(5)).expect_err("drop slot 5 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(5), max_slots: 1 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(5),
+                max_slots: 1
+            }
         );
         let err = buf.drop_seq(SlotId(0)).expect_err("drop clamped");
         assert!(matches!(err, MultiSeqError::CapabilityUnsupported { .. }));
 
         // fork_seq(SlotId(0), SlotId(0)) is the only valid combo — Ok(()) no-op.
-        buf.fork_seq(SlotId(0), SlotId(0)).expect("self-fork ok no-op");
+        buf.fork_seq(SlotId(0), SlotId(0))
+            .expect("self-fork ok no-op");
         // fork_seq src OOR.
-        let err = buf.fork_seq(SlotId(1), SlotId(0)).expect_err("fork src OOR");
+        let err = buf
+            .fork_seq(SlotId(1), SlotId(0))
+            .expect_err("fork src OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(1), max_slots: 1 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(1),
+                max_slots: 1
+            }
         );
         // fork_seq dst OOR.
-        let err = buf.fork_seq(SlotId(0), SlotId(2)).expect_err("fork dst OOR");
+        let err = buf
+            .fork_seq(SlotId(0), SlotId(2))
+            .expect_err("fork dst OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(2), max_slots: 1 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(2),
+                max_slots: 1
+            }
         );
     }
 
@@ -4444,15 +4566,28 @@ mod tests {
     fn h16_mlx_kv_cache_typed_clamp_slot_count_one() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::MultiSeqKvCache;
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
-            k_packed: buf(), k_norms: buf(), v_packed: buf(), v_norms: buf(),
-            capacity: 16, is_sliding: false, write_pos: 5, seq_len: 5,
+            k_packed: buf(),
+            k_norms: buf(),
+            v_packed: buf(),
+            v_norms: buf(),
+            capacity: 16,
+            is_sliding: false,
+            write_pos: 5,
+            seq_len: 5,
         };
 
         // slot_count == 1.
-        assert_eq!(cache.slot_count(), 1, "H16 FALSIFIED: MlxKvCache slot_count must be 1");
+        assert_eq!(
+            cache.slot_count(),
+            1,
+            "H16 FALSIFIED: MlxKvCache slot_count must be 1"
+        );
         assert_eq!(cache.layout(), MultiSeqLayout::SeparateSlots);
 
         // seq_len(SlotId(0)) reports the legacy cursor.
@@ -4466,7 +4601,10 @@ mod tests {
         let err = cache.seq_len(SlotId(1)).expect_err("slot 1 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(1), max_slots: 1 },
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(1),
+                max_slots: 1
+            },
             "H16 FALSIFIED: SlotOutOfRange shape wrong; got {err:?}"
         );
 
@@ -4474,14 +4612,28 @@ mod tests {
         let err = cache.append_for_seq(SlotId(3), 1).expect_err("append OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(3), max_slots: 1 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(3),
+                max_slots: 1
+            }
         );
-        let err = cache.append_for_seq(SlotId(0), 1).expect_err("append clamped");
+        let err = cache
+            .append_for_seq(SlotId(0), 1)
+            .expect_err("append clamped");
         match err {
             MultiSeqError::CapabilityUnsupported { capability } => {
-                assert!(capability.contains("MlxKvCache"), "label must name struct: {capability}");
-                assert!(capability.contains("A3b iter-3"), "label must name deferral: {capability}");
-                assert!(capability.contains("legacy 4-bit"), "label must name legacy path: {capability}");
+                assert!(
+                    capability.contains("MlxKvCache"),
+                    "label must name struct: {capability}"
+                );
+                assert!(
+                    capability.contains("A3b iter-3"),
+                    "label must name deferral: {capability}"
+                );
+                assert!(
+                    capability.contains("legacy 4-bit"),
+                    "label must name legacy path: {capability}"
+                );
             }
             other => panic!("H16: expected CapabilityUnsupported; got {other:?}"),
         }
@@ -4490,13 +4642,18 @@ mod tests {
         let err = cache.drop_seq(SlotId(7)).expect_err("drop OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(7), max_slots: 1 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(7),
+                max_slots: 1
+            }
         );
         let err = cache.drop_seq(SlotId(0)).expect_err("drop clamped");
         assert!(matches!(err, MultiSeqError::CapabilityUnsupported { .. }));
 
         // fork self ok no-op.
-        cache.fork_seq(SlotId(0), SlotId(0)).expect("self-fork no-op");
+        cache
+            .fork_seq(SlotId(0), SlotId(0))
+            .expect("self-fork no-op");
     }
 
     /// **H10 verification (defence-in-depth, post-falsification pin)** —
@@ -4545,13 +4702,16 @@ mod tests {
     fn iter_b4c_kernel_iter1_multi_seq_hb_kv_reset_for_slot_per_slot_isolation_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::SlotId;
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
         let n_seqs: u32 = 4;
-        let mut cache = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs)
-            .expect("alloc n_seqs=4");
+        let mut cache =
+            alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs).expect("alloc n_seqs=4");
 
         // Seed every slot's cursor + K/V packed bytes with distinct
         // non-zero patterns.
@@ -4578,9 +4738,15 @@ mod tests {
             }
         }
         // Snapshot K/V packed for every slot before the reset.
-        let k_before: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("k_packed read")
+        let k_before: Vec<u8> = cache
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed read")
             .to_vec();
-        let v_before: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed read")
+        let v_before: Vec<u8> = cache
+            .v_packed
+            .as_slice::<u8>()
+            .expect("v_packed read")
             .to_vec();
 
         // Reset slot 1.
@@ -4591,22 +4757,39 @@ mod tests {
         // Slot 1's cursor must be 0; others untouched.
         for s in 0..(n_seqs as usize) {
             if s == 1 {
-                assert_eq!(cache.seq_lens[s], 0,
-                    "iter-B4c-kernel iter-1: slot 1 cursor must be 0 after reset_for_slot(1)");
+                assert_eq!(
+                    cache.seq_lens[s], 0,
+                    "iter-B4c-kernel iter-1: slot 1 cursor must be 0 after reset_for_slot(1)"
+                );
             } else {
-                assert_eq!(cache.seq_lens[s], (s as u32) + 11,
-                    "iter-B4c-kernel iter-1: slot {s} cursor must be untouched");
+                assert_eq!(
+                    cache.seq_lens[s],
+                    (s as u32) + 11,
+                    "iter-B4c-kernel iter-1: slot {s} cursor must be untouched"
+                );
             }
         }
         // K/V packed bytes of EVERY slot are byte-identical pre/post
         // (cursor-masked discipline — no K/V byte zeroing on reset).
-        let k_after: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("k_packed read 2").to_vec();
-        let v_after: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed read 2").to_vec();
-        assert_eq!(k_before, k_after,
+        let k_after: Vec<u8> = cache
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed read 2")
+            .to_vec();
+        let v_after: Vec<u8> = cache
+            .v_packed
+            .as_slice::<u8>()
+            .expect("v_packed read 2")
+            .to_vec();
+        assert_eq!(
+            k_before, k_after,
             "iter-B4c-kernel iter-1: reset_for_slot must NOT zero K packed bytes \
-             (cursor-masked discipline; matches drop_seq invariant)");
-        assert_eq!(v_before, v_after,
-            "iter-B4c-kernel iter-1: reset_for_slot must NOT zero V packed bytes");
+             (cursor-masked discipline; matches drop_seq invariant)"
+        );
+        assert_eq!(
+            v_before, v_after,
+            "iter-B4c-kernel iter-1: reset_for_slot must NOT zero V packed bytes"
+        );
     }
 
     /// **ADR-040 iter-B4c-kernel iter-1 — `MultiSeqHbKvBuffers::
@@ -4623,19 +4806,25 @@ mod tests {
     fn iter_b4c_kernel_iter1_multi_seq_hb_kv_reset_for_slot_bounds_typed_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
-        let dev = match skip_dev() { Some(d) => d, None => return };
-        let mut cache = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 4)
-            .expect("alloc n_seqs=4");
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut cache =
+            alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 4).expect("alloc n_seqs=4");
         let err = cache.reset_for_slot(SlotId(4)).expect_err("slot 4 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 },
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            },
             "iter-B4c-kernel iter-1: OOR must surface SlotOutOfRange"
         );
 
         // SlotId(0) on n_seqs=1 is the byte-equivalence case.
-        let mut cache1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 1)
-            .expect("alloc n_seqs=1");
+        let mut cache1 =
+            alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 1).expect("alloc n_seqs=1");
         cache1.seq_lens[0] = 7;
         cache1
             .reset_for_slot(SlotId(0))
@@ -4651,7 +4840,10 @@ mod tests {
     fn iter_b4c_kernel_iter1_multi_seq_hybrid_kv_reset_for_slot_per_slot_isolation_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::SlotId;
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // Ensure xlen + F16 are env-unset so the legacy F16-K + U8-V
         // shape is exercised; the reset_for_slot semantics are
         // env-invariant but the alloc-time bytes differ.
@@ -4662,13 +4854,13 @@ mod tests {
         for s in 0..4 {
             cache.seq_lens[s] = (s as u32) * 5 + 3;
         }
-        cache
-            .reset_for_slot(SlotId(2))
-            .expect("reset_for_slot(2)");
+        cache.reset_for_slot(SlotId(2)).expect("reset_for_slot(2)");
         assert_eq!(cache.seq_lens[0], 3);
         assert_eq!(cache.seq_lens[1], 8);
-        assert_eq!(cache.seq_lens[2], 0,
-            "iter-B4c-kernel iter-1: slot 2 cursor must be 0 after reset");
+        assert_eq!(
+            cache.seq_lens[2], 0,
+            "iter-B4c-kernel iter-1: slot 2 cursor must be 0 after reset"
+        );
         assert_eq!(cache.seq_lens[3], 18);
 
         // OOR.
@@ -4722,7 +4914,10 @@ mod tests {
     #[test]
     fn h144_multi_seq_dense_kv_buffers_sibling_struct_exists() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
@@ -4730,12 +4925,22 @@ mod tests {
 
         // F32 + linear path.
         let buf_f32_lin = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, /*is_ring=*/ false, DType::F32, n_seqs,
+            &dev,
+            0,
+            nkv,
+            hd,
+            cap,
+            /*is_ring=*/ false,
+            DType::F32,
+            n_seqs,
         )
         .expect("H144: alloc F32 linear");
         assert_eq!(buf_f32_lin.n_seqs, n_seqs, "H144: n_seqs propagation");
         assert_eq!(buf_f32_lin.dtype, DType::F32, "H144: dtype propagation F32");
-        assert!(!buf_f32_lin.is_sliding, "H144: is_sliding=false propagation");
+        assert!(
+            !buf_f32_lin.is_sliding,
+            "H144: is_sliding=false propagation"
+        );
         assert_eq!(buf_f32_lin.capacity, cap, "H144: capacity propagation");
         assert_eq!(
             buf_f32_lin.seq_lens.len(),
@@ -4760,10 +4965,21 @@ mod tests {
 
         // F16 + sliding path (HF2Q_F16_KV codepath).
         let buf_f16_ring = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 7, nkv, hd, cap, /*is_ring=*/ true, DType::F16, n_seqs,
+            &dev,
+            7,
+            nkv,
+            hd,
+            cap,
+            /*is_ring=*/ true,
+            DType::F16,
+            n_seqs,
         )
         .expect("H144: alloc F16 sliding");
-        assert_eq!(buf_f16_ring.dtype, DType::F16, "H144: dtype propagation F16");
+        assert_eq!(
+            buf_f16_ring.dtype,
+            DType::F16,
+            "H144: dtype propagation F16"
+        );
         assert!(buf_f16_ring.is_sliding, "H144: is_sliding=true propagation");
     }
 
@@ -4773,37 +4989,28 @@ mod tests {
     #[test]
     fn h145_alloc_multi_seq_dense_kv_for_layer_preflight_errors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // n_seqs = 0
         assert!(
-            alloc_multi_seq_dense_kv_for_layer(
-                &dev, 0, 2, 256, 8, false, DType::F32, 0
-            )
-            .is_err(),
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, 2, 256, 8, false, DType::F32, 0).is_err(),
             "H145 FALSIFIED: n_seqs=0 must error"
         );
         // nkv = 0
         assert!(
-            alloc_multi_seq_dense_kv_for_layer(
-                &dev, 0, 0, 256, 8, false, DType::F32, 1
-            )
-            .is_err(),
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, 0, 256, 8, false, DType::F32, 1).is_err(),
             "H145 FALSIFIED: nkv=0 must error"
         );
         // hd = 0
         assert!(
-            alloc_multi_seq_dense_kv_for_layer(
-                &dev, 0, 2, 0, 8, false, DType::F32, 1
-            )
-            .is_err(),
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, 2, 0, 8, false, DType::F32, 1).is_err(),
             "H145 FALSIFIED: hd=0 must error"
         );
         // cap = 0
         assert!(
-            alloc_multi_seq_dense_kv_for_layer(
-                &dev, 0, 2, 256, 0, false, DType::F32, 1
-            )
-            .is_err(),
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, 2, 256, 0, false, DType::F32, 1).is_err(),
             "H145 FALSIFIED: cap=0 must error"
         );
     }
@@ -4824,18 +5031,21 @@ mod tests {
     #[test]
     fn h146_multi_seq_dense_kv_n_seqs_4_byte_scale_exact_formula() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
 
         // F32 path.
-        let f32_baseline = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F32, 1
-        ).expect("H146: F32 alloc n_seqs=1");
-        let f32_lifted = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F32, 4
-        ).expect("H146: F32 alloc n_seqs=4");
+        let f32_baseline =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F32, 1)
+                .expect("H146: F32 alloc n_seqs=1");
+        let f32_lifted =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F32, 4)
+                .expect("H146: F32 alloc n_seqs=4");
         assert_eq!(f32_baseline.n_seqs, 1);
         assert_eq!(f32_lifted.n_seqs, 4);
         // 4× scaling on K + V.
@@ -4876,12 +5086,12 @@ mod tests {
         );
 
         // F16 path (HF2Q_F16_KV codepath).
-        let f16_baseline = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F16, 1
-        ).expect("H146: F16 alloc n_seqs=1");
-        let f16_lifted = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F16, 4
-        ).expect("H146: F16 alloc n_seqs=4");
+        let f16_baseline =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F16, 1)
+                .expect("H146: F16 alloc n_seqs=1");
+        let f16_lifted =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F16, 4)
+                .expect("H146: F16 alloc n_seqs=4");
         assert_eq!(
             f16_lifted.k.byte_len(),
             f16_baseline.k.byte_len() * 4,
@@ -4943,13 +5153,16 @@ mod tests {
     #[test]
     fn h147_multi_seq_dense_kv_per_slot_byte_isolation() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
-        let mut cache = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F32, 2
-        ).expect("H147: alloc n_seqs=2");
+        let mut cache =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F32, 2)
+                .expect("H147: alloc n_seqs=2");
         assert_eq!(cache.n_seqs, 2);
 
         // Per-slot region sizes (F32 = 4 bytes/elem):
@@ -4979,12 +5192,10 @@ mod tests {
         }
 
         // Snapshot slot 1's regions.
-        let k_slot1_before: Vec<u8> = cache.k.as_slice::<u8>().expect("K read")
-            [slot_k_bytes..2 * slot_k_bytes]
-            .to_vec();
-        let v_slot1_before: Vec<u8> = cache.v.as_slice::<u8>().expect("V read")
-            [slot_v_bytes..2 * slot_v_bytes]
-            .to_vec();
+        let k_slot1_before: Vec<u8> =
+            cache.k.as_slice::<u8>().expect("K read")[slot_k_bytes..2 * slot_k_bytes].to_vec();
+        let v_slot1_before: Vec<u8> =
+            cache.v.as_slice::<u8>().expect("V read")[slot_v_bytes..2 * slot_v_bytes].to_vec();
 
         // Sanity: slot 1 is zero-init.
         assert!(
@@ -4997,17 +5208,17 @@ mod tests {
         );
 
         // A3b iter-2 cursor advance on slot 0 (no buffer mutation).
-        cache.append_for_seq(SlotId(0), 3).expect("H147: append slot 0");
+        cache
+            .append_for_seq(SlotId(0), 3)
+            .expect("H147: append slot 0");
         assert_eq!(cache.seq_lens[0], 3);
         assert_eq!(cache.seq_lens[1], 0);
 
         // H147 falsifier: slot 1's bytes must be byte-identical.
-        let k_slot1_after: Vec<u8> = cache.k.as_slice::<u8>().expect("K read 2")
-            [slot_k_bytes..2 * slot_k_bytes]
-            .to_vec();
-        let v_slot1_after: Vec<u8> = cache.v.as_slice::<u8>().expect("V read 2")
-            [slot_v_bytes..2 * slot_v_bytes]
-            .to_vec();
+        let k_slot1_after: Vec<u8> =
+            cache.k.as_slice::<u8>().expect("K read 2")[slot_k_bytes..2 * slot_k_bytes].to_vec();
+        let v_slot1_after: Vec<u8> =
+            cache.v.as_slice::<u8>().expect("V read 2")[slot_v_bytes..2 * slot_v_bytes].to_vec();
 
         assert_eq!(
             k_slot1_before, k_slot1_after,
@@ -5033,15 +5244,17 @@ mod tests {
     #[test]
     fn h148_multi_seq_dense_kv_n_seqs_1_byte_equivalent_to_legacy() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
 
         for &dtype in &[DType::F32, DType::F16] {
-            let multi = alloc_multi_seq_dense_kv_for_layer(
-                &dev, 0, nkv, hd, cap, false, dtype, 1
-            ).expect("H148: alloc multi-seq n_seqs=1");
+            let multi = alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, dtype, 1)
+                .expect("H148: alloc multi-seq n_seqs=1");
 
             // Legacy per-layer formula (mirrors forward_prefill.rs:700-704):
             //   n = nkv * capacity * hd
@@ -5052,13 +5265,17 @@ mod tests {
                 multi.k.byte_len(),
                 legacy_bytes,
                 "H148 FALSIFIED ({:?}): K bytes {} != legacy {}",
-                dtype, multi.k.byte_len(), legacy_bytes
+                dtype,
+                multi.k.byte_len(),
+                legacy_bytes
             );
             assert_eq!(
                 multi.v.byte_len(),
                 legacy_bytes,
                 "H148 FALSIFIED ({:?}): V bytes {} != legacy {}",
-                dtype, multi.v.byte_len(), legacy_bytes
+                dtype,
+                multi.v.byte_len(),
+                legacy_bytes
             );
 
             // Total parity vs legacy DenseKvBuffers (K + V).
@@ -5068,7 +5285,9 @@ mod tests {
                 multi.byte_len(),
                 legacy_total as u64,
                 "H148 FALSIFIED ({:?}): total byte_len {} != legacy K+V {}",
-                dtype, multi.byte_len(), legacy_total
+                dtype,
+                multi.byte_len(),
+                legacy_total
             );
         }
     }
@@ -5082,11 +5301,14 @@ mod tests {
     #[test]
     fn h149_multi_seq_dense_kv_multi_seq_kv_cache_impl() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let n_seqs = 4u32;
-        let mut cache = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, 2, 256, 8, false, DType::F32, n_seqs
-        ).expect("H149: alloc n_seqs=4");
+        let mut cache =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, 2, 256, 8, false, DType::F32, n_seqs)
+                .expect("H149: alloc n_seqs=4");
 
         // 1. slot_count() == n_seqs (NOT the clamp's 1).
         assert_eq!(
@@ -5133,7 +5355,9 @@ mod tests {
         );
 
         // 5. Bounds-first OOR on append.
-        let err = cache.append_for_seq(SlotId(n_seqs + 1), 1).expect_err("append OOR");
+        let err = cache
+            .append_for_seq(SlotId(n_seqs + 1), 1)
+            .expect_err("append OOR");
         assert_eq!(
             err,
             MultiSeqError::SlotOutOfRange {
@@ -5155,32 +5379,50 @@ mod tests {
         let err = cache.drop_seq(SlotId(99)).expect_err("drop OOR");
         assert!(matches!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         ));
 
         // 8. fork_seq same slot is a no-op Ok.
-        cache.fork_seq(SlotId(1), SlotId(1)).expect("self-fork no-op");
+        cache
+            .fork_seq(SlotId(1), SlotId(1))
+            .expect("self-fork no-op");
 
         // 9. Bounds-first OOR on fork (src then dst).
-        let err = cache.fork_seq(SlotId(99), SlotId(0)).expect_err("fork src OOR");
+        let err = cache
+            .fork_seq(SlotId(99), SlotId(0))
+            .expect_err("fork src OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         );
-        let err = cache.fork_seq(SlotId(0), SlotId(99)).expect_err("fork dst OOR");
+        let err = cache
+            .fork_seq(SlotId(0), SlotId(99))
+            .expect_err("fork dst OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         );
 
         // 10. fork cross-slot → Ok(()) post-iter-A3c (was previously
         // CapabilityUnsupported naming A3c per A3b iter-2 typed-clamp).
         // Seed slot 0's cursor + slot 2's cursor for the post-fork copy
         // assertion (slot 2 untouched).
-        cache.append_for_seq(SlotId(0), 5).expect("re-seed slot 0 for fork");
+        cache
+            .append_for_seq(SlotId(0), 5)
+            .expect("re-seed slot 0 for fork");
         let slot0_before = cache.seq_len(SlotId(0)).unwrap();
         let slot2_before = cache.seq_len(SlotId(2)).unwrap();
-        cache.fork_seq(SlotId(0), SlotId(1))
+        cache
+            .fork_seq(SlotId(0), SlotId(1))
             .expect("iter-A3c closure: cross-slot fork must return Ok(())");
         assert_eq!(
             cache.seq_len(SlotId(1)).unwrap(),
@@ -5210,14 +5452,17 @@ mod tests {
     #[test]
     fn h150_multi_seq_dense_kv_reset_for_slot_per_slot_isolation_and_bounds() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
         let n_seqs = 4u32;
-        let mut cache = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F32, n_seqs
-        ).expect("alloc n_seqs=4");
+        let mut cache =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F32, n_seqs)
+                .expect("alloc n_seqs=4");
 
         // Seed every slot's cursor + K/V bytes with distinct patterns.
         for s in 0..(n_seqs as usize) {
@@ -5261,7 +5506,8 @@ mod tests {
                 );
             } else {
                 assert_eq!(
-                    cache.seq_lens[s], (s as u32) + 11,
+                    cache.seq_lens[s],
+                    (s as u32) + 11,
                     "H150 FALSIFIED: slot {s} cursor must be untouched"
                 );
             }
@@ -5285,14 +5531,17 @@ mod tests {
         let err = cache.reset_for_slot(SlotId(99)).expect_err("slot 99 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 },
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            },
             "H150 FALSIFIED: reset OOR shape; got {err:?}"
         );
 
         // SlotId(0) at n_seqs=1 byte-equivalence case (must succeed).
-        let mut cache1 = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, 2, 256, 4, false, DType::F32, 1
-        ).expect("alloc n_seqs=1");
+        let mut cache1 =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, 2, 256, 4, false, DType::F32, 1)
+                .expect("alloc n_seqs=1");
         cache1.seq_lens[0] = 7;
         cache1
             .reset_for_slot(SlotId(0))
@@ -5350,7 +5599,10 @@ mod tests {
     #[test]
     fn h151_multi_seq_mlx_kv_cache_sibling_struct_exists() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
@@ -5358,8 +5610,7 @@ mod tests {
 
         // norms_per_pos=1 (D=256) + linear path.
         let buf_lin = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd, cap, /*is_ring=*/ false,
-            /*norms_per_pos=*/ 1, n_seqs,
+            &dev, 0, nkv, hd, cap, /*is_ring=*/ false, /*norms_per_pos=*/ 1, n_seqs,
         )
         .expect("H151: alloc norms_per_pos=1 linear");
         assert_eq!(buf_lin.n_seqs, n_seqs, "H151: n_seqs propagation");
@@ -5400,11 +5651,13 @@ mod tests {
         // norms_per_pos=2 (D=512) + sliding path.
         let hd_big = 512usize;
         let buf_ring = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 7, nkv, hd_big, cap, /*is_ring=*/ true,
-            /*norms_per_pos=*/ 2, n_seqs,
+            &dev, 7, nkv, hd_big, cap, /*is_ring=*/ true, /*norms_per_pos=*/ 2, n_seqs,
         )
         .expect("H151: alloc norms_per_pos=2 sliding");
-        assert_eq!(buf_ring.norms_per_pos, 2, "H151: norms_per_pos=2 propagation");
+        assert_eq!(
+            buf_ring.norms_per_pos, 2,
+            "H151: norms_per_pos=2 propagation"
+        );
         assert!(buf_ring.is_sliding, "H151: is_sliding=true propagation");
         // K norms shape switches to 4-D when norms_per_pos > 1.
         assert_eq!(
@@ -5428,47 +5681,38 @@ mod tests {
     #[test]
     fn h152_alloc_multi_seq_mlx_kv_for_layer_preflight_errors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         // n_seqs = 0
         assert!(
-            alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, 2, 256, 8, false, 1, 0
-            ).is_err(),
+            alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 256, 8, false, 1, 0).is_err(),
             "H152 FALSIFIED: n_seqs=0 must error"
         );
         // nkv = 0
         assert!(
-            alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, 0, 256, 8, false, 1, 1
-            ).is_err(),
+            alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 0, 256, 8, false, 1, 1).is_err(),
             "H152 FALSIFIED: nkv=0 must error"
         );
         // hd = 0
         assert!(
-            alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, 2, 0, 8, false, 1, 1
-            ).is_err(),
+            alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 0, 8, false, 1, 1).is_err(),
             "H152 FALSIFIED: hd=0 must error"
         );
         // cap = 0
         assert!(
-            alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, 2, 256, 0, false, 1, 1
-            ).is_err(),
+            alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 256, 0, false, 1, 1).is_err(),
             "H152 FALSIFIED: cap=0 must error"
         );
         // norms_per_pos = 0
         assert!(
-            alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, 2, 256, 8, false, 0, 1
-            ).is_err(),
+            alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 256, 8, false, 0, 1).is_err(),
             "H152 FALSIFIED: norms_per_pos=0 must error"
         );
         // odd hd (4-bit packing requires hd to be even)
         assert!(
-            alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, 2, 257, 8, false, 1, 1
-            ).is_err(),
+            alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 257, 8, false, 1, 1).is_err(),
             "H152 FALSIFIED: odd hd must error (4-bit nibble-packed)"
         );
     }
@@ -5494,18 +5738,19 @@ mod tests {
     #[test]
     fn h153_multi_seq_mlx_kv_n_seqs_4_byte_scale_exact_formula() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
 
         // norms_per_pos=1 path (D=256).
-        let baseline_1 = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, 1, 1
-        ).expect("H153: alloc norms_per_pos=1 n_seqs=1");
-        let lifted_1 = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, 1, 4
-        ).expect("H153: alloc norms_per_pos=1 n_seqs=4");
+        let baseline_1 = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1, 1)
+            .expect("H153: alloc norms_per_pos=1 n_seqs=1");
+        let lifted_1 = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1, 4)
+            .expect("H153: alloc norms_per_pos=1 n_seqs=4");
         assert_eq!(baseline_1.n_seqs, 1);
         assert_eq!(lifted_1.n_seqs, 4);
 
@@ -5534,10 +5779,10 @@ mod tests {
         // EXACT formula at n_seqs=4 (norms_per_pos=1).
         let expected_k_packed = 4usize * nkv * cap * (hd / 2); // 8192
         let expected_v_packed = expected_k_packed;
-        let expected_k_norms = 4usize * nkv * cap * 1 * 4;     // 256
+        let expected_k_norms = 4usize * nkv * cap * 1 * 4; // 256
         let expected_v_norms = expected_k_norms;
-        let expected_total = expected_k_packed + expected_v_packed
-            + expected_k_norms + expected_v_norms;
+        let expected_total =
+            expected_k_packed + expected_v_packed + expected_k_norms + expected_v_norms;
         assert_eq!(
             lifted_1.k_packed.byte_len(),
             expected_k_packed,
@@ -5573,12 +5818,10 @@ mod tests {
 
         // norms_per_pos=2 path (D=512 — per AmesianX iter-15 per-block norm).
         let hd_big = 512usize;
-        let baseline_2 = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd_big, cap, false, 2, 1
-        ).expect("H153: alloc norms_per_pos=2 n_seqs=1");
-        let lifted_2 = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd_big, cap, false, 2, 4
-        ).expect("H153: alloc norms_per_pos=2 n_seqs=4");
+        let baseline_2 = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd_big, cap, false, 2, 1)
+            .expect("H153: alloc norms_per_pos=2 n_seqs=1");
+        let lifted_2 = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd_big, cap, false, 2, 4)
+            .expect("H153: alloc norms_per_pos=2 n_seqs=4");
         assert_eq!(
             lifted_2.k_packed.byte_len(),
             baseline_2.k_packed.byte_len() * 4,
@@ -5591,7 +5834,7 @@ mod tests {
         );
         // EXACT formula (norms_per_pos=2, hd=512).
         let expected_k_packed_2 = 4usize * nkv * cap * (hd_big / 2); // 16384
-        let expected_k_norms_2 = 4usize * nkv * cap * 2 * 4;          // 512
+        let expected_k_norms_2 = 4usize * nkv * cap * 2 * 4; // 512
         let expected_total_2 = 2 * expected_k_packed_2 + 2 * expected_k_norms_2;
         let actual_total_2 = lifted_2.byte_len() as usize;
         assert_eq!(
@@ -5615,8 +5858,8 @@ mod tests {
         for (name, b) in [
             ("k_packed", &lifted_1.k_packed),
             ("v_packed", &lifted_1.v_packed),
-            ("k_norms",  &lifted_1.k_norms),
-            ("v_norms",  &lifted_1.v_norms),
+            ("k_norms", &lifted_1.k_norms),
+            ("v_norms", &lifted_1.v_norms),
         ] {
             let s = b.shape().to_vec();
             assert!(s.len() >= 3, "H153: {name} must be ≥3-D; got {:?}", s);
@@ -5641,13 +5884,17 @@ mod tests {
     #[test]
     fn h154_multi_seq_mlx_kv_per_slot_byte_isolation() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
         let mut cache = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, /*norms_per_pos=*/ 1, 2
-        ).expect("H154: alloc n_seqs=2");
+            &dev, 0, nkv, hd, cap, false, /*norms_per_pos=*/ 1, 2,
+        )
+        .expect("H154: alloc n_seqs=2");
         assert_eq!(cache.n_seqs, 2);
 
         // Per-slot region sizes:
@@ -5661,10 +5908,26 @@ mod tests {
         let slot_vn_bytes = nkv * cap * 1 * 4;
 
         // Sanity: total bytes match 2 * slot_bytes for each buffer.
-        assert_eq!(cache.k_packed.byte_len(), 2 * slot_kp_bytes, "H154: k_packed total");
-        assert_eq!(cache.v_packed.byte_len(), 2 * slot_vp_bytes, "H154: v_packed total");
-        assert_eq!(cache.k_norms.byte_len(),  2 * slot_kn_bytes, "H154: k_norms total");
-        assert_eq!(cache.v_norms.byte_len(),  2 * slot_vn_bytes, "H154: v_norms total");
+        assert_eq!(
+            cache.k_packed.byte_len(),
+            2 * slot_kp_bytes,
+            "H154: k_packed total"
+        );
+        assert_eq!(
+            cache.v_packed.byte_len(),
+            2 * slot_vp_bytes,
+            "H154: v_packed total"
+        );
+        assert_eq!(
+            cache.k_norms.byte_len(),
+            2 * slot_kn_bytes,
+            "H154: k_norms total"
+        );
+        assert_eq!(
+            cache.v_norms.byte_len(),
+            2 * slot_vn_bytes,
+            "H154: v_norms total"
+        );
 
         // Write deterministic non-zero pattern into slot 0's region
         // for ALL FOUR buffers (interpret as u8 bytes for fixture
@@ -5697,42 +5960,72 @@ mod tests {
 
         // Snapshot slot 1's regions on all four buffers.
         let kp_slot1_before: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("kp r")
-            [slot_kp_bytes..2 * slot_kp_bytes].to_vec();
+            [slot_kp_bytes..2 * slot_kp_bytes]
+            .to_vec();
         let vp_slot1_before: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("vp r")
-            [slot_vp_bytes..2 * slot_vp_bytes].to_vec();
+            [slot_vp_bytes..2 * slot_vp_bytes]
+            .to_vec();
         let kn_slot1_before: Vec<u8> = cache.k_norms.as_slice::<u8>().expect("kn r")
-            [slot_kn_bytes..2 * slot_kn_bytes].to_vec();
+            [slot_kn_bytes..2 * slot_kn_bytes]
+            .to_vec();
         let vn_slot1_before: Vec<u8> = cache.v_norms.as_slice::<u8>().expect("vn r")
-            [slot_vn_bytes..2 * slot_vn_bytes].to_vec();
+            [slot_vn_bytes..2 * slot_vn_bytes]
+            .to_vec();
 
         // Sanity: slot 1 is zero-init for every buffer.
-        assert!(kp_slot1_before.iter().all(|&b| b == 0), "H154 sanity: kp slot1 zero");
-        assert!(vp_slot1_before.iter().all(|&b| b == 0), "H154 sanity: vp slot1 zero");
-        assert!(kn_slot1_before.iter().all(|&b| b == 0), "H154 sanity: kn slot1 zero");
-        assert!(vn_slot1_before.iter().all(|&b| b == 0), "H154 sanity: vn slot1 zero");
+        assert!(
+            kp_slot1_before.iter().all(|&b| b == 0),
+            "H154 sanity: kp slot1 zero"
+        );
+        assert!(
+            vp_slot1_before.iter().all(|&b| b == 0),
+            "H154 sanity: vp slot1 zero"
+        );
+        assert!(
+            kn_slot1_before.iter().all(|&b| b == 0),
+            "H154 sanity: kn slot1 zero"
+        );
+        assert!(
+            vn_slot1_before.iter().all(|&b| b == 0),
+            "H154 sanity: vn slot1 zero"
+        );
 
         // A3b iter-3 cursor advance on slot 0 (no buffer mutation).
-        cache.append_for_seq(SlotId(0), 3).expect("H154: append slot 0");
+        cache
+            .append_for_seq(SlotId(0), 3)
+            .expect("H154: append slot 0");
         assert_eq!(cache.seq_lens[0], 3);
         assert_eq!(cache.seq_lens[1], 0);
 
         // H154 falsifier: slot 1's bytes must be byte-identical on ALL FOUR buffers.
         let kp_slot1_after: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("kp r2")
-            [slot_kp_bytes..2 * slot_kp_bytes].to_vec();
+            [slot_kp_bytes..2 * slot_kp_bytes]
+            .to_vec();
         let vp_slot1_after: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("vp r2")
-            [slot_vp_bytes..2 * slot_vp_bytes].to_vec();
+            [slot_vp_bytes..2 * slot_vp_bytes]
+            .to_vec();
         let kn_slot1_after: Vec<u8> = cache.k_norms.as_slice::<u8>().expect("kn r2")
-            [slot_kn_bytes..2 * slot_kn_bytes].to_vec();
+            [slot_kn_bytes..2 * slot_kn_bytes]
+            .to_vec();
         let vn_slot1_after: Vec<u8> = cache.v_norms.as_slice::<u8>().expect("vn r2")
-            [slot_vn_bytes..2 * slot_vn_bytes].to_vec();
-        assert_eq!(kp_slot1_before, kp_slot1_after,
-            "H154 FALSIFIED: slot 1 k_packed bytes changed after slot-0 write");
-        assert_eq!(vp_slot1_before, vp_slot1_after,
-            "H154 FALSIFIED: slot 1 v_packed bytes changed after slot-0 write");
-        assert_eq!(kn_slot1_before, kn_slot1_after,
-            "H154 FALSIFIED: slot 1 k_norms bytes changed after slot-0 write");
-        assert_eq!(vn_slot1_before, vn_slot1_after,
-            "H154 FALSIFIED: slot 1 v_norms bytes changed after slot-0 write");
+            [slot_vn_bytes..2 * slot_vn_bytes]
+            .to_vec();
+        assert_eq!(
+            kp_slot1_before, kp_slot1_after,
+            "H154 FALSIFIED: slot 1 k_packed bytes changed after slot-0 write"
+        );
+        assert_eq!(
+            vp_slot1_before, vp_slot1_after,
+            "H154 FALSIFIED: slot 1 v_packed bytes changed after slot-0 write"
+        );
+        assert_eq!(
+            kn_slot1_before, kn_slot1_after,
+            "H154 FALSIFIED: slot 1 k_norms bytes changed after slot-0 write"
+        );
+        assert_eq!(
+            vn_slot1_before, vn_slot1_after,
+            "H154 FALSIFIED: slot 1 v_norms bytes changed after slot-0 write"
+        );
     }
 
     /// **H155** — n_seqs=1 byte-equivalence: allocating
@@ -5751,46 +6044,53 @@ mod tests {
     #[test]
     fn h155_multi_seq_mlx_kv_n_seqs_1_byte_equivalent_to_legacy() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let cap = 8usize;
 
         for &(hd, norms_per_pos) in &[(256usize, 1usize), (512usize, 2usize)] {
-            let multi = alloc_multi_seq_mlx_kv_for_layer(
-                &dev, 0, nkv, hd, cap, false, norms_per_pos, 1
-            ).expect("H155: alloc multi-seq n_seqs=1");
+            let multi =
+                alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd, cap, false, norms_per_pos, 1)
+                    .expect("H155: alloc multi-seq n_seqs=1");
 
             // Legacy per-layer formulas (mirror gemma4/model.rs:1272-1290).
             let legacy_packed_bytes = nkv * cap * (hd / 2);
-            let legacy_norms_bytes  = nkv * cap * norms_per_pos * 4;
+            let legacy_norms_bytes = nkv * cap * norms_per_pos * 4;
 
             assert_eq!(
                 multi.k_packed.byte_len(),
                 legacy_packed_bytes,
                 "H155 FALSIFIED (hd={hd} norms_per_pos={norms_per_pos}): \
                  k_packed bytes {} != legacy {}",
-                multi.k_packed.byte_len(), legacy_packed_bytes
+                multi.k_packed.byte_len(),
+                legacy_packed_bytes
             );
             assert_eq!(
                 multi.v_packed.byte_len(),
                 legacy_packed_bytes,
                 "H155 FALSIFIED (hd={hd} norms_per_pos={norms_per_pos}): \
                  v_packed bytes {} != legacy {}",
-                multi.v_packed.byte_len(), legacy_packed_bytes
+                multi.v_packed.byte_len(),
+                legacy_packed_bytes
             );
             assert_eq!(
                 multi.k_norms.byte_len(),
                 legacy_norms_bytes,
                 "H155 FALSIFIED (hd={hd} norms_per_pos={norms_per_pos}): \
                  k_norms bytes {} != legacy {}",
-                multi.k_norms.byte_len(), legacy_norms_bytes
+                multi.k_norms.byte_len(),
+                legacy_norms_bytes
             );
             assert_eq!(
                 multi.v_norms.byte_len(),
                 legacy_norms_bytes,
                 "H155 FALSIFIED (hd={hd} norms_per_pos={norms_per_pos}): \
                  v_norms bytes {} != legacy {}",
-                multi.v_norms.byte_len(), legacy_norms_bytes
+                multi.v_norms.byte_len(),
+                legacy_norms_bytes
             );
 
             // Total parity vs legacy MlxKvCache (K packed + K norms + V packed + V norms).
@@ -5801,7 +6101,8 @@ mod tests {
                 legacy_total as u64,
                 "H155 FALSIFIED (hd={hd} norms_per_pos={norms_per_pos}): \
                  total byte_len {} != legacy 4-buffer sum {}",
-                multi.byte_len(), legacy_total
+                multi.byte_len(),
+                legacy_total
             );
         }
     }
@@ -5815,11 +6116,13 @@ mod tests {
     #[test]
     fn h156_multi_seq_mlx_kv_multi_seq_kv_cache_impl() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let n_seqs = 4u32;
-        let mut cache = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, 2, 256, 8, false, 1, n_seqs
-        ).expect("H156: alloc n_seqs=4");
+        let mut cache = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 256, 8, false, 1, n_seqs)
+            .expect("H156: alloc n_seqs=4");
 
         // 1. slot_count() == n_seqs (NOT the clamp's 1).
         assert_eq!(
@@ -5866,7 +6169,9 @@ mod tests {
         );
 
         // 5. Bounds-first OOR on append.
-        let err = cache.append_for_seq(SlotId(n_seqs + 1), 1).expect_err("append OOR");
+        let err = cache
+            .append_for_seq(SlotId(n_seqs + 1), 1)
+            .expect_err("append OOR");
         assert_eq!(
             err,
             MultiSeqError::SlotOutOfRange {
@@ -5888,30 +6193,48 @@ mod tests {
         let err = cache.drop_seq(SlotId(99)).expect_err("drop OOR");
         assert!(matches!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         ));
 
         // 8. fork_seq same slot is a no-op Ok.
-        cache.fork_seq(SlotId(1), SlotId(1)).expect("self-fork no-op");
+        cache
+            .fork_seq(SlotId(1), SlotId(1))
+            .expect("self-fork no-op");
 
         // 9. Bounds-first OOR on fork (src then dst).
-        let err = cache.fork_seq(SlotId(99), SlotId(0)).expect_err("fork src OOR");
+        let err = cache
+            .fork_seq(SlotId(99), SlotId(0))
+            .expect_err("fork src OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         );
-        let err = cache.fork_seq(SlotId(0), SlotId(99)).expect_err("fork dst OOR");
+        let err = cache
+            .fork_seq(SlotId(0), SlotId(99))
+            .expect_err("fork dst OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
         );
 
         // 10. fork cross-slot → Ok(()) post-iter-A3c (was previously
         // CapabilityUnsupported naming A3c per A3b iter-3 typed-clamp).
-        cache.append_for_seq(SlotId(0), 5).expect("re-seed slot 0 for fork");
+        cache
+            .append_for_seq(SlotId(0), 5)
+            .expect("re-seed slot 0 for fork");
         let slot0_before = cache.seq_len(SlotId(0)).unwrap();
         let slot2_before = cache.seq_len(SlotId(2)).unwrap();
-        cache.fork_seq(SlotId(0), SlotId(1))
+        cache
+            .fork_seq(SlotId(0), SlotId(1))
             .expect("iter-A3c closure: cross-slot fork must return Ok(())");
         assert_eq!(
             cache.seq_len(SlotId(1)).unwrap(),
@@ -5940,14 +6263,16 @@ mod tests {
     #[test]
     fn h157_multi_seq_mlx_kv_reset_for_slot_per_slot_isolation_and_bounds() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
         let n_seqs = 4u32;
-        let mut cache = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, 1, n_seqs
-        ).expect("alloc n_seqs=4");
+        let mut cache = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1, n_seqs)
+            .expect("alloc n_seqs=4");
 
         // Seed every slot's cursor + buffer bytes with distinct patterns.
         for s in 0..(n_seqs as usize) {
@@ -6013,7 +6338,8 @@ mod tests {
                 );
             } else {
                 assert_eq!(
-                    cache.seq_lens[s], (s as u32) + 11,
+                    cache.seq_lens[s],
+                    (s as u32) + 11,
                     "H157 FALSIFIED: slot {s} cursor must be untouched"
                 );
             }
@@ -6025,28 +6351,38 @@ mod tests {
         let vp_after: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("vp r2").to_vec();
         let kn_after: Vec<u8> = cache.k_norms.as_slice::<u8>().expect("kn r2").to_vec();
         let vn_after: Vec<u8> = cache.v_norms.as_slice::<u8>().expect("vn r2").to_vec();
-        assert_eq!(kp_before, kp_after,
+        assert_eq!(
+            kp_before, kp_after,
             "H157 FALSIFIED: reset_for_slot must NOT zero k_packed bytes \
-             (cursor-masked discipline; matches drop_seq invariant)");
-        assert_eq!(vp_before, vp_after,
-            "H157 FALSIFIED: reset_for_slot must NOT zero v_packed bytes");
-        assert_eq!(kn_before, kn_after,
-            "H157 FALSIFIED: reset_for_slot must NOT zero k_norms bytes");
-        assert_eq!(vn_before, vn_after,
-            "H157 FALSIFIED: reset_for_slot must NOT zero v_norms bytes");
+             (cursor-masked discipline; matches drop_seq invariant)"
+        );
+        assert_eq!(
+            vp_before, vp_after,
+            "H157 FALSIFIED: reset_for_slot must NOT zero v_packed bytes"
+        );
+        assert_eq!(
+            kn_before, kn_after,
+            "H157 FALSIFIED: reset_for_slot must NOT zero k_norms bytes"
+        );
+        assert_eq!(
+            vn_before, vn_after,
+            "H157 FALSIFIED: reset_for_slot must NOT zero v_norms bytes"
+        );
 
         // Bounds-first OOR.
         let err = cache.reset_for_slot(SlotId(99)).expect_err("slot 99 OOR");
         assert_eq!(
             err,
-            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 },
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            },
             "H157 FALSIFIED: reset OOR shape; got {err:?}"
         );
 
         // SlotId(0) at n_seqs=1 byte-equivalence case (must succeed).
-        let mut cache1 = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, 2, 256, 4, false, 1, 1
-        ).expect("alloc n_seqs=1");
+        let mut cache1 = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, 2, 256, 4, false, 1, 1)
+            .expect("alloc n_seqs=1");
         cache1.seq_lens[0] = 7;
         cache1
             .reset_for_slot(SlotId(0))
@@ -6072,13 +6408,16 @@ mod tests {
     #[test]
     fn h159_multi_seq_hb_kv_fork_seq_cross_slot_copies_all_buffers() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
         let n_seqs = 4u32;
-        let mut c = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs)
-            .expect("alloc n_seqs=4");
+        let mut c =
+            alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs).expect("alloc n_seqs=4");
 
         // Per-slot byte sizes (4-D, n_seqs outermost):
         //   k_packed/v_packed: nkv * cap * hd  (U8 = 1 byte/elem)
@@ -6138,7 +6477,11 @@ mod tests {
         // Cursor copy.
         assert_eq!(c.seq_len(SlotId(2)).unwrap(), 5, "H159: cursor copied");
         // src cursor unchanged.
-        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 5, "H159: src cursor unchanged");
+        assert_eq!(
+            c.seq_len(SlotId(0)).unwrap(),
+            5,
+            "H159: src cursor unchanged"
+        );
         // src bytes unchanged.
         let src_kp_after = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
         assert_eq!(src_kp, src_kp_after, "H159 FALSIFIED: src k_packed mutated");
@@ -6151,14 +6494,16 @@ mod tests {
     #[test]
     fn h160_multi_seq_hybrid_kv_fork_seq_cross_slot_copies_all_buffers() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 8usize;
         let n_seqs = 4u32;
-        let mut c = alloc_multi_seq_hybrid_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, n_seqs
-        ).expect("alloc n_seqs=4");
+        let mut c = alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs)
+            .expect("alloc n_seqs=4");
 
         // Per-slot byte sizes (4-D, n_seqs outermost):
         //   k F16:          nkv * cap * hd * 2
@@ -6192,35 +6537,32 @@ mod tests {
         }
         c.append_for_seq(SlotId(1), 9).unwrap();
 
-        let src_k = c.k.as_slice::<u8>().unwrap()
-            [slot_k_bytes..2 * slot_k_bytes]
-            .to_vec();
-        let src_vp = c.v_packed.as_slice::<u8>().unwrap()
-            [slot_vp_bytes..2 * slot_vp_bytes]
-            .to_vec();
-        let src_vn = c.v_norms.as_slice::<u8>().unwrap()
-            [slot_vn_bytes..2 * slot_vn_bytes]
-            .to_vec();
+        let src_k = c.k.as_slice::<u8>().unwrap()[slot_k_bytes..2 * slot_k_bytes].to_vec();
+        let src_vp =
+            c.v_packed.as_slice::<u8>().unwrap()[slot_vp_bytes..2 * slot_vp_bytes].to_vec();
+        let src_vn = c.v_norms.as_slice::<u8>().unwrap()[slot_vn_bytes..2 * slot_vn_bytes].to_vec();
 
         c.fork_seq(SlotId(1), SlotId(3))
             .expect("H160: fork must succeed post-A3c");
 
         // dst (slot 3).
-        let dst_k = c.k.as_slice::<u8>().unwrap()
-            [3 * slot_k_bytes..4 * slot_k_bytes].to_vec();
-        let dst_vp = c.v_packed.as_slice::<u8>().unwrap()
-            [3 * slot_vp_bytes..4 * slot_vp_bytes].to_vec();
-        let dst_vn = c.v_norms.as_slice::<u8>().unwrap()
-            [3 * slot_vn_bytes..4 * slot_vn_bytes].to_vec();
+        let dst_k = c.k.as_slice::<u8>().unwrap()[3 * slot_k_bytes..4 * slot_k_bytes].to_vec();
+        let dst_vp =
+            c.v_packed.as_slice::<u8>().unwrap()[3 * slot_vp_bytes..4 * slot_vp_bytes].to_vec();
+        let dst_vn =
+            c.v_norms.as_slice::<u8>().unwrap()[3 * slot_vn_bytes..4 * slot_vn_bytes].to_vec();
         assert_eq!(src_k, dst_k, "H160 FALSIFIED: k dst != src");
         assert_eq!(src_vp, dst_vp, "H160 FALSIFIED: v_packed dst != src");
         assert_eq!(src_vn, dst_vn, "H160 FALSIFIED: v_norms dst != src");
 
         // Cursor + src invariance.
         assert_eq!(c.seq_len(SlotId(3)).unwrap(), 9, "H160: cursor copied");
-        assert_eq!(c.seq_len(SlotId(1)).unwrap(), 9, "H160: src cursor unchanged");
-        let src_k_after = c.k.as_slice::<u8>().unwrap()
-            [slot_k_bytes..2 * slot_k_bytes].to_vec();
+        assert_eq!(
+            c.seq_len(SlotId(1)).unwrap(),
+            9,
+            "H160: src cursor unchanged"
+        );
+        let src_k_after = c.k.as_slice::<u8>().unwrap()[slot_k_bytes..2 * slot_k_bytes].to_vec();
         assert_eq!(src_k, src_k_after, "H160 FALSIFIED: src k mutated");
     }
 
@@ -6230,14 +6572,17 @@ mod tests {
     #[test]
     fn h161_multi_seq_dense_kv_fork_seq_cross_slot_copies_all_buffers() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
         let n_seqs = 4u32;
-        let mut c = alloc_multi_seq_dense_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, DType::F32, n_seqs
-        ).expect("alloc n_seqs=4");
+        let mut c =
+            alloc_multi_seq_dense_kv_for_layer(&dev, 0, nkv, hd, cap, false, DType::F32, n_seqs)
+                .expect("alloc n_seqs=4");
 
         // Per-slot byte sizes (F32 = 4 bytes/elem):
         let slot_k_bytes = nkv * cap * hd * 4;
@@ -6260,10 +6605,8 @@ mod tests {
         }
         c.append_for_seq(SlotId(2), 3).unwrap();
 
-        let src_k = c.k.as_slice::<u8>().unwrap()
-            [2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
-        let src_v = c.v.as_slice::<u8>().unwrap()
-            [2 * slot_v_bytes..3 * slot_v_bytes].to_vec();
+        let src_k = c.k.as_slice::<u8>().unwrap()[2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
+        let src_v = c.v.as_slice::<u8>().unwrap()[2 * slot_v_bytes..3 * slot_v_bytes].to_vec();
 
         c.fork_seq(SlotId(2), SlotId(0))
             .expect("H161: fork must succeed post-A3c");
@@ -6274,9 +6617,13 @@ mod tests {
         assert_eq!(src_v, dst_v, "H161 FALSIFIED: v dst != src");
 
         assert_eq!(c.seq_len(SlotId(0)).unwrap(), 3, "H161: cursor copied");
-        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 3, "H161: src cursor unchanged");
-        let src_k_after = c.k.as_slice::<u8>().unwrap()
-            [2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
+        assert_eq!(
+            c.seq_len(SlotId(2)).unwrap(),
+            3,
+            "H161: src cursor unchanged"
+        );
+        let src_k_after =
+            c.k.as_slice::<u8>().unwrap()[2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
         assert_eq!(src_k, src_k_after, "H161 FALSIFIED: src k mutated");
     }
 
@@ -6287,14 +6634,16 @@ mod tests {
     #[test]
     fn h162_multi_seq_mlx_kv_fork_seq_cross_slot_copies_all_buffers() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let dev = match skip_dev() { Some(d) => d, None => return };
+        let dev = match skip_dev() {
+            Some(d) => d,
+            None => return,
+        };
         let nkv = 2usize;
         let hd = 256usize;
         let cap = 4usize;
         let n_seqs = 4u32;
-        let mut c = alloc_multi_seq_mlx_kv_for_layer(
-            &dev, 0, nkv, hd, cap, false, 1, n_seqs
-        ).expect("alloc n_seqs=4");
+        let mut c = alloc_multi_seq_mlx_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1, n_seqs)
+            .expect("alloc n_seqs=4");
 
         // Per-slot byte sizes (4-D, n_seqs outermost):
         //   k_packed/v_packed: nkv * cap * (hd/2)  (U8 = 1 byte/elem)
@@ -6339,21 +6688,21 @@ mod tests {
         c.fork_seq(SlotId(0), SlotId(3))
             .expect("H162: fork must succeed post-A3c");
 
-        let dst_kp = c.k_packed.as_slice::<u8>().unwrap()
-            [3 * slot_kp..4 * slot_kp].to_vec();
-        let dst_vp = c.v_packed.as_slice::<u8>().unwrap()
-            [3 * slot_vp..4 * slot_vp].to_vec();
-        let dst_kn = c.k_norms.as_slice::<u8>().unwrap()
-            [3 * slot_kn..4 * slot_kn].to_vec();
-        let dst_vn = c.v_norms.as_slice::<u8>().unwrap()
-            [3 * slot_vn..4 * slot_vn].to_vec();
+        let dst_kp = c.k_packed.as_slice::<u8>().unwrap()[3 * slot_kp..4 * slot_kp].to_vec();
+        let dst_vp = c.v_packed.as_slice::<u8>().unwrap()[3 * slot_vp..4 * slot_vp].to_vec();
+        let dst_kn = c.k_norms.as_slice::<u8>().unwrap()[3 * slot_kn..4 * slot_kn].to_vec();
+        let dst_vn = c.v_norms.as_slice::<u8>().unwrap()[3 * slot_vn..4 * slot_vn].to_vec();
         assert_eq!(src_kp, dst_kp, "H162 FALSIFIED: k_packed dst != src");
         assert_eq!(src_vp, dst_vp, "H162 FALSIFIED: v_packed dst != src");
         assert_eq!(src_kn, dst_kn, "H162 FALSIFIED: k_norms dst != src");
         assert_eq!(src_vn, dst_vn, "H162 FALSIFIED: v_norms dst != src");
 
         assert_eq!(c.seq_len(SlotId(3)).unwrap(), 4, "H162: cursor copied");
-        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 4, "H162: src cursor unchanged");
+        assert_eq!(
+            c.seq_len(SlotId(0)).unwrap(),
+            4,
+            "H162: src cursor unchanged"
+        );
         let src_kp_after = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
         assert_eq!(src_kp, src_kp_after, "H162 FALSIFIED: src k_packed mutated");
     }
@@ -6370,16 +6719,26 @@ mod tests {
         let dev = MlxDevice::new().expect("device");
         let (nkv, cap, hd) = (2usize, 8usize, 4usize);
         let dense = DenseKvBuffers {
-            k: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
-            v: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+            k: dev
+                .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+                .unwrap(),
+            v: dev
+                .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+                .unwrap(),
             capacity: cap,
             is_sliding: false,
             dtype: DType::F32,
         };
         let hybrid = HybridKvBuffers {
-            k: dev.alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd]).unwrap(),
-            v_packed: dev.alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd]).unwrap(),
-            v_norms: dev.alloc_buffer(nkv * cap * 4, DType::F32, vec![nkv, cap]).unwrap(),
+            k: dev
+                .alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd])
+                .unwrap(),
+            v_packed: dev
+                .alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd])
+                .unwrap(),
+            v_norms: dev
+                .alloc_buffer(nkv * cap * 4, DType::F32, vec![nkv, cap])
+                .unwrap(),
             capacity: cap,
             is_sliding: false,
             norms_per_pos: 1,
@@ -6389,12 +6748,23 @@ mod tests {
         use crate::serve::kv_persist::lcp_registry::ByteSized;
         let d_bytes = ByteSized::byte_len(&dense);
         let h_bytes = ByteSized::byte_len(&hybrid);
-        assert_eq!(d_bytes, (nkv * cap * hd * 4 * 2) as u64, "dense = 2 F32 buffers");
-        assert_eq!(h_bytes, (nkv * cap * hd * 2 + nkv * cap * hd + nkv * cap * 4) as u64);
+        assert_eq!(
+            d_bytes,
+            (nkv * cap * hd * 4 * 2) as u64,
+            "dense = 2 F32 buffers"
+        );
+        assert_eq!(
+            h_bytes,
+            (nkv * cap * hd * 2 + nkv * cap * hd + nkv * cap * 4) as u64
+        );
 
         let dense_only = GemmaLcpLayerKv::Dense(DenseKvBuffers {
-            k: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
-            v: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+            k: dev
+                .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+                .unwrap(),
+            v: dev
+                .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+                .unwrap(),
             capacity: cap,
             is_sliding: false,
             dtype: DType::F32,
@@ -6402,8 +6772,12 @@ mod tests {
         assert_eq!(ByteSized::byte_len(&dense_only), d_bytes);
         let both = GemmaLcpLayerKv::DenseAndHybrid(
             DenseKvBuffers {
-                k: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
-                v: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+                k: dev
+                    .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+                    .unwrap(),
+                v: dev
+                    .alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd])
+                    .unwrap(),
                 capacity: cap,
                 is_sliding: false,
                 dtype: DType::F32,

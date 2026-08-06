@@ -304,14 +304,12 @@ fn index_shard_lazy(
     }
 
     // Safetensors format: u64-LE header size, then JSON header, then data.
-    let header_size = u64::from_le_bytes(
-        mmap[..8]
-            .try_into()
-            .map_err(|_| SafetensorsError::HeaderParseError {
-                shard: shard_name.to_string(),
-                reason: "Failed to read header size".to_string(),
-            })?,
-    ) as usize;
+    let header_size = u64::from_le_bytes(mmap[..8].try_into().map_err(|_| {
+        SafetensorsError::HeaderParseError {
+            shard: shard_name.to_string(),
+            reason: "Failed to read header size".to_string(),
+        }
+    })?) as usize;
 
     if 8 + header_size > file_size {
         return Err(SafetensorsError::HeaderParseError {
@@ -347,13 +345,12 @@ fn index_shard_lazy(
             continue;
         }
 
-        let dtype_str =
-            info.get("dtype")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SafetensorsError::HeaderParseError {
-                    shard: shard_name.to_string(),
-                    reason: format!("Tensor '{}' missing dtype", name),
-                })?;
+        let dtype_str = info.get("dtype").and_then(|v| v.as_str()).ok_or_else(|| {
+            SafetensorsError::HeaderParseError {
+                shard: shard_name.to_string(),
+                reason: format!("Tensor '{}' missing dtype", name),
+            }
+        })?;
 
         let dtype = DType::from_safetensors_str(dtype_str).ok_or_else(|| {
             SafetensorsError::UnsupportedDtype {
@@ -373,13 +370,13 @@ fn index_shard_lazy(
             .filter_map(|v| v.as_u64().map(|u| u as usize))
             .collect();
 
-        let offsets =
-            info.get("data_offsets")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| SafetensorsError::HeaderParseError {
-                    shard: shard_name.to_string(),
-                    reason: format!("Tensor '{}' missing data_offsets", name),
-                })?;
+        let offsets = info
+            .get("data_offsets")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| SafetensorsError::HeaderParseError {
+                shard: shard_name.to_string(),
+                reason: format!("Tensor '{}' missing data_offsets", name),
+            })?;
 
         if offsets.len() != 2 {
             return Err(SafetensorsError::HeaderParseError {
@@ -457,9 +454,7 @@ mod tests {
 
     /// Create a minimal valid safetensors file in memory.
     /// Format: 8-byte header length (LE u64) + JSON header + tensor data
-    fn create_test_safetensors(
-        tensors: &[(&str, &[usize], &str, &[u8])],
-    ) -> Vec<u8> {
+    fn create_test_safetensors(tensors: &[(&str, &[usize], &str, &[u8])]) -> Vec<u8> {
         let mut header_map = serde_json::Map::new();
         let mut current_offset = 0usize;
 
@@ -472,7 +467,10 @@ mod tests {
             tensor_info.insert(
                 "shape".to_string(),
                 serde_json::Value::Array(
-                    shape.iter().map(|&s| serde_json::Value::Number(s.into())).collect(),
+                    shape
+                        .iter()
+                        .map(|&s| serde_json::Value::Number(s.into()))
+                        .collect(),
                 ),
             );
             let end_offset = current_offset + data.len();
@@ -512,9 +510,7 @@ mod tests {
         let model_dir = tmp.path();
 
         // Create a small test tensor: 2x3 F32
-        let tensor_data: Vec<u8> = (0..6u32)
-            .flat_map(|v| (v as f32).to_le_bytes())
-            .collect();
+        let tensor_data: Vec<u8> = (0..6u32).flat_map(|v| (v as f32).to_le_bytes()).collect();
 
         let safetensors_data =
             create_test_safetensors(&[("test_weight", &[2, 3], "F32", &tensor_data)]);
@@ -570,11 +566,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let model_dir = tmp.path();
 
-        let tensor_data: Vec<u8> = (0..6u32)
-            .flat_map(|v| (v as f32).to_le_bytes())
-            .collect();
-        let safetensors_data =
-            create_test_safetensors(&[("w", &[2, 3], "F32", &tensor_data)]);
+        let tensor_data: Vec<u8> = (0..6u32).flat_map(|v| (v as f32).to_le_bytes()).collect();
+        let safetensors_data = create_test_safetensors(&[("w", &[2, 3], "F32", &tensor_data)]);
         std::fs::write(model_dir.join("model.safetensors"), &safetensors_data).unwrap();
 
         let progress = ProgressReporter::new();
@@ -610,9 +603,7 @@ mod tests {
         // Mixed dtypes + multiple tensors, name-sorted differently from
         // insertion order so BTreeMap vs HashMap iteration won't mask
         // bugs.
-        let f32_data: Vec<u8> = (0..6u32)
-            .flat_map(|v| (v as f32).to_le_bytes())
-            .collect();
+        let f32_data: Vec<u8> = (0..6u32).flat_map(|v| (v as f32).to_le_bytes()).collect();
         let f16_data: Vec<u8> = (0..4u32)
             .flat_map(|v| half::f16::from_f32(v as f32).to_le_bytes())
             .collect();

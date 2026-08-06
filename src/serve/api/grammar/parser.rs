@@ -102,7 +102,11 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "grammar parse error at byte {}: {}", self.offset, self.message)
+        write!(
+            f,
+            "grammar parse error at byte {}: {}",
+            self.offset, self.message
+        )
     }
 }
 impl std::error::Error for ParseError {}
@@ -211,18 +215,15 @@ impl<'a> ParserState<'a> {
         let name_end = parse_name(self.bytes, src)?;
         let after_name = parse_space(self.bytes, name_end, false);
 
-        let name: String =
-            std::str::from_utf8(&self.bytes[name_start..name_end])
-                .map_err(|_| ParseError {
-                    offset: name_start,
-                    message: "rule name not valid UTF-8".into(),
-                })?
-                .to_string();
+        let name: String = std::str::from_utf8(&self.bytes[name_start..name_end])
+            .map_err(|_| ParseError {
+                offset: name_start,
+                message: "rule name not valid UTF-8".into(),
+            })?
+            .to_string();
         let rule_id = self.get_or_create_symbol(name.clone());
 
-        if after_name + 3 > self.bytes.len()
-            || &self.bytes[after_name..after_name + 3] != b"::="
-        {
+        if after_name + 3 > self.bytes.len() || &self.bytes[after_name..after_name + 3] != b"::=" {
             return Err(ParseError {
                 offset: after_name,
                 message: "expecting '::='".into(),
@@ -366,13 +367,12 @@ impl<'a> ParserState<'a> {
             } else if is_word_char(c) {
                 // Rule reference.
                 let name_end = parse_name(self.bytes, pos)?;
-                let name: String =
-                    std::str::from_utf8(&self.bytes[pos..name_end])
-                        .map_err(|_| ParseError {
-                            offset: pos,
-                            message: "rule reference not valid UTF-8".into(),
-                        })?
-                        .to_string();
+                let name: String = std::str::from_utf8(&self.bytes[pos..name_end])
+                    .map_err(|_| ParseError {
+                        offset: pos,
+                        message: "rule reference not valid UTF-8".into(),
+                    })?
+                    .to_string();
                 let ref_id = self.get_or_create_symbol(name);
                 pos = parse_space(self.bytes, name_end, is_nested);
                 last_sym_start = rule.len();
@@ -384,10 +384,8 @@ impl<'a> ParserState<'a> {
                 let n_rules_before = self.symbol_ids.len() as u32;
                 let sub_rule_id = self.generate_symbol(rule_name);
                 pos = self.parse_alternates(pos, rule_name, sub_rule_id, true)?;
-                n_prev_rules = std::cmp::max(
-                    1,
-                    self.symbol_ids.len() as u32 - n_rules_before,
-                ) as u64;
+                n_prev_rules =
+                    std::cmp::max(1, self.symbol_ids.len() as u32 - n_rules_before) as u64;
                 last_sym_start = rule.len();
                 rule.push(GretElement::new(GretType::RuleRef, sub_rule_id));
                 if pos >= self.bytes.len() || self.bytes[pos] != b')' {
@@ -546,9 +544,7 @@ impl<'a> ParserState<'a> {
         if *n_prev_rules * total_rules >= MAX_REPETITION_THRESHOLD {
             return Err(ParseError {
                 offset: pos,
-                message:
-                    "n_prev_rules * total_rules exceeds MAX_REPETITION_THRESHOLD"
-                        .into(),
+                message: "n_prev_rules * total_rules exceeds MAX_REPETITION_THRESHOLD".into(),
             });
         }
 
@@ -570,7 +566,11 @@ impl<'a> ParserState<'a> {
             if i > 0 || no_max {
                 rec_rule.push(GretElement::new(
                     GretType::RuleRef,
-                    if no_max { rec_rule_id } else { last_rec_rule_id },
+                    if no_max {
+                        rec_rule_id
+                    } else {
+                        last_rec_rule_id
+                    },
                 ));
             }
             rec_rule.push(GretElement::new(GretType::Alt, 0));
@@ -623,8 +623,7 @@ fn is_word_char(c: u8) -> bool {
 fn parse_space(bytes: &[u8], mut pos: usize, newline_ok: bool) -> usize {
     while pos < bytes.len() {
         let c = bytes[pos];
-        if c == b' ' || c == b'\t' || c == b'#' || (newline_ok && (c == b'\r' || c == b'\n'))
-        {
+        if c == b' ' || c == b'\t' || c == b'#' || (newline_ok && (c == b'\r' || c == b'\n')) {
             if c == b'#' {
                 while pos < bytes.len() && bytes[pos] != b'\r' && bytes[pos] != b'\n' {
                     pos += 1;
@@ -961,9 +960,7 @@ mod tests {
         // flag). A raw top-level sequence split across newlines is NOT
         // supported — the first newline terminates the outer parse_sequence.
         // This mirrors json.gbnf's `object ::= "{" ws ( ... ) "}" ws` shape.
-        let g = parse_ok(
-            "root ::= ( \n  \"x\"\n  \"y\"\n )\n",
-        );
+        let g = parse_ok("root ::= ( \n  \"x\"\n  \"y\"\n )\n");
         let r = &g.rules[0];
         // Outer rule references the synthesized subrule for the grouping.
         assert_eq!(r[0].ty, GretType::RuleRef);

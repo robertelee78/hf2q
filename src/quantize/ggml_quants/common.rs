@@ -423,13 +423,7 @@ pub fn make_qkx3_quants(
 /// Positive-only quant search; returns the chosen scale `d`. Used by
 /// Q2_K / Q4_K / Q5_K to quantize the per-sub-block `scales` / `mins`
 /// auxiliary buffers.
-pub fn make_qp_quants(
-    n: usize,
-    nmax: i32,
-    x: &[f32],
-    l: &mut [u8],
-    quant_weights: &[f32],
-) -> f32 {
+pub fn make_qp_quants(n: usize, nmax: i32, x: &[f32], l: &mut [u8], quant_weights: &[f32]) -> f32 {
     let mut max = 0.0f32;
     for i in 0..n {
         if x[i] > max {
@@ -628,10 +622,22 @@ mod tests {
     #[ignore]
     fn q6k_blk113_subblk14_byte_match() {
         let x: [f32; 16] = [
-            0.005950928, -0.01300049, 0.01519775, 0.02624512,
-            -0.07128906, -0.06689453, -0.05053711, 0.01965332,
-            -0.02551270, -0.03906250, 0.01275635, 0.008056641,
-            0.002319336, 0.04223633, -0.02416992, 0.001045227,
+            0.005950928,
+            -0.01300049,
+            0.01519775,
+            0.02624512,
+            -0.07128906,
+            -0.06689453,
+            -0.05053711,
+            0.01965332,
+            -0.02551270,
+            -0.03906250,
+            0.01275635,
+            0.008056641,
+            0.002319336,
+            0.04223633,
+            -0.02416992,
+            0.001045227,
         ];
         let mut l = [0i8; 16];
         let scale = make_qx_quants(16, 32, &x, &mut l, 1, &[]);
@@ -681,16 +687,35 @@ mod tests {
         let mut l_aux = vec![0u8; 32];
         let mut the_min = 0.0f32;
         let scale = super::make_qkx2_quants(
-            32, 15, &x, &weights, &mut l, &mut the_min, &mut l_aux,
-            -1.0, 0.1, 20, false,
+            32,
+            15,
+            &x,
+            &weights,
+            &mut l,
+            &mut the_min,
+            &mut l_aux,
+            -1.0,
+            0.1,
+            20,
+            false,
         );
         eprintln!("hf2q av_x  = {:.10e} (bits=0x{:08x})", av_x, av_x.to_bits());
-        eprintln!("hf2q scale = {:.10e} (bits=0x{:08x})", scale, scale.to_bits());
-        eprintln!("hf2q min   = {:.10e} (bits=0x{:08x})", the_min, the_min.to_bits());
+        eprintln!(
+            "hf2q scale = {:.10e} (bits=0x{:08x})",
+            scale,
+            scale.to_bits()
+        );
+        eprintln!(
+            "hf2q min   = {:.10e} (bits=0x{:08x})",
+            the_min,
+            the_min.to_bits()
+        );
         eprintln!("hf2q L     = {:?}", l);
         eprintln!("");
         eprintln!("canonical: scale=0x3be60a3e min=0x3d2e1b55");
-        eprintln!("           L = [3,5,5,8,11,0,8,9,5,1,9,3,9,8,7,5,4,11,14,3,0,3,8,5,7,3,10,7,4,5,5,1]");
+        eprintln!(
+            "           L = [3,5,5,8,11,0,8,9,5,1,9,3,9,8,7,5,4,11,14,3,0,3,8,5,7,3,10,7,4,5,5,1]"
+        );
     }
 
     /// Full-block diagnostic for ADR-033 Q4_K residual investigation —
@@ -736,7 +761,10 @@ mod tests {
                         4..=15 => format!("scales[{}]", i - 4),
                         _ => format!("qs[{}]", i - 16),
                     };
-                    eprintln!("  diff byte {} ({}): hf2q=0x{:02x} canon=0x{:02x}", i, field, a, e);
+                    eprintln!(
+                        "  diff byte {} ({}): hf2q=0x{:02x} canon=0x{:02x}",
+                        i, field, a, e
+                    );
                 }
             }
         }
@@ -755,7 +783,19 @@ mod tests {
         let mut l = vec![0u8; 32];
         let mut l_aux = vec![0u8; 32];
         let mut the_min = 0.0f32;
-        let d = make_qkx2_quants(32, 15, &x, &weights, &mut l, &mut the_min, &mut l_aux, -1.0, 0.1, 20, false);
+        let d = make_qkx2_quants(
+            32,
+            15,
+            &x,
+            &weights,
+            &mut l,
+            &mut the_min,
+            &mut l_aux,
+            -1.0,
+            0.1,
+            20,
+            false,
+        );
         assert_eq!(d, 0.0);
         assert!(l.iter().all(|&v| v == 0));
     }
@@ -768,8 +808,17 @@ mod tests {
         let mut l_aux = vec![0u8; 32];
         let mut the_min = 0.0f32;
         let d = make_qkx3_quants(
-            32, 15, &x, Some(&weights), &mut l, &mut the_min, &mut l_aux,
-            -0.9, 0.05, 36, false,
+            32,
+            15,
+            &x,
+            Some(&weights),
+            &mut l,
+            &mut the_min,
+            &mut l_aux,
+            -0.9,
+            0.05,
+            36,
+            false,
         );
         assert_eq!(d, 0.0);
         assert!(l.iter().all(|&v| v == 0));

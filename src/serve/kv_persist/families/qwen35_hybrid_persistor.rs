@@ -374,10 +374,7 @@ fn read_bytes<'a>(buf: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8
 /// Errors: empty full_attn AND empty mtp (degenerate cache shape;
 /// indicates the model has no full-attention layers + no MTP, which
 /// cannot happen for any in-tree qwen35 / qwen35moe variant).
-pub fn cfg_from_cache(
-    cache: &HybridKvCache,
-    codec: FullAttnCodec,
-) -> Result<Qwen35HybridConfig> {
+pub fn cfg_from_cache(cache: &HybridKvCache, codec: FullAttnCodec) -> Result<Qwen35HybridConfig> {
     let n_full_attn = cache.full_attn.len() as u32;
     let n_linear_attn = cache.linear_attn.len() as u32;
     let has_mtp = cache.mtp_slot.is_some();
@@ -478,8 +475,7 @@ pub fn cfg_from_cache(
     // linear-attn layers exist (the field is ignored at serialize
     // time when n_linear_attn == 0; sentinel keeps assert_matches
     // stable across runs).
-    let (linear_conv_shape, linear_recurrent_shape) = if let Some(slot) =
-        cache.linear_attn.first()
+    let (linear_conv_shape, linear_recurrent_shape) = if let Some(slot) = cache.linear_attn.first()
     {
         let cs = slot.conv_state.shape();
         ensure!(
@@ -654,12 +650,12 @@ pub fn serialize_hybrid_snapshot(
                     cfg.full_attn_shape
                 );
 
-                let k_bytes: &[u8] = k
-                    .as_slice::<u8>()
-                    .map_err(|e| anyhow!("QH35 serialize: full_attn[{slot_idx}].k as_slice: {e}"))?;
-                let v_bytes: &[u8] = v
-                    .as_slice::<u8>()
-                    .map_err(|e| anyhow!("QH35 serialize: full_attn[{slot_idx}].v as_slice: {e}"))?;
+                let k_bytes: &[u8] = k.as_slice::<u8>().map_err(|e| {
+                    anyhow!("QH35 serialize: full_attn[{slot_idx}].k as_slice: {e}")
+                })?;
+                let v_bytes: &[u8] = v.as_slice::<u8>().map_err(|e| {
+                    anyhow!("QH35 serialize: full_attn[{slot_idx}].v as_slice: {e}")
+                })?;
                 ensure!(
                     k_bytes.len() == k.byte_len(),
                     "QH35 serialize: full_attn[{slot_idx}].k as_slice.len() = {} != byte_len = {}",
@@ -725,12 +721,12 @@ pub fn serialize_hybrid_snapshot(
     for slot_idx in 0..cfg.n_linear_attn as usize {
         let conv = &snapshot.linear_conv[slot_idx];
         let rec = &snapshot.linear_recurrent[slot_idx];
-        let conv_bytes: &[u8] = conv.as_slice::<u8>().map_err(|e| {
-            anyhow!("QH35 serialize: linear_conv[{slot_idx}] as_slice: {e}")
-        })?;
-        let rec_bytes: &[u8] = rec.as_slice::<u8>().map_err(|e| {
-            anyhow!("QH35 serialize: linear_recurrent[{slot_idx}] as_slice: {e}")
-        })?;
+        let conv_bytes: &[u8] = conv
+            .as_slice::<u8>()
+            .map_err(|e| anyhow!("QH35 serialize: linear_conv[{slot_idx}] as_slice: {e}"))?;
+        let rec_bytes: &[u8] = rec
+            .as_slice::<u8>()
+            .map_err(|e| anyhow!("QH35 serialize: linear_recurrent[{slot_idx}] as_slice: {e}"))?;
         ensure!(
             conv_bytes.len() == expected_conv_bytes,
             "QH35 serialize: linear_conv[{slot_idx}].byte_len = {} != expected {}",
@@ -756,7 +752,10 @@ pub fn serialize_hybrid_snapshot(
     // exactly except the shape is from cfg.mtp_shape (Qwen3.6 MTP can
     // declare its own head count independent of regular full-attn).
     if cfg.has_mtp {
-        let mtp = snapshot.mtp.as_ref().expect("mtp present per cfg + assert above");
+        let mtp = snapshot
+            .mtp
+            .as_ref()
+            .expect("mtp present per cfg + assert above");
         ensure!(
             mtp.current_len.len() == cfg.n_seqs as usize,
             "QH35 serialize: mtp.current_len.len() = {} != n_seqs = {}",
@@ -965,9 +964,9 @@ fn deserialize_tq_blob(
         let mut buf = device
             .alloc_buffer(n, dtype, shape.to_vec())
             .map_err(|e| anyhow!("QH35 deserialize: alloc {family}[{slot_idx}].tq.{name}: {e}"))?;
-        let dst = buf
-            .as_mut_slice::<u8>()
-            .map_err(|e| anyhow!("QH35 deserialize: {family}[{slot_idx}].tq.{name} mut_slice: {e}"))?;
+        let dst = buf.as_mut_slice::<u8>().map_err(|e| {
+            anyhow!("QH35 deserialize: {family}[{slot_idx}].tq.{name} mut_slice: {e}")
+        })?;
         ensure!(
             dst.len() == src.len(),
             "QH35 deserialize: {family}[{slot_idx}].tq.{name} dst.len {} != src.len {}",
@@ -979,16 +978,40 @@ fn deserialize_tq_blob(
     };
 
     let k_packed = read_blob(
-        bytes, cursor, device, "k_packed", DType::U8, &packed_shape, expected_packed_bytes,
+        bytes,
+        cursor,
+        device,
+        "k_packed",
+        DType::U8,
+        &packed_shape,
+        expected_packed_bytes,
     )?;
     let k_norms = read_blob(
-        bytes, cursor, device, "k_norms", DType::F32, &norms_shape, expected_norms_bytes,
+        bytes,
+        cursor,
+        device,
+        "k_norms",
+        DType::F32,
+        &norms_shape,
+        expected_norms_bytes,
     )?;
     let v_packed = read_blob(
-        bytes, cursor, device, "v_packed", DType::U8, &packed_shape, expected_packed_bytes,
+        bytes,
+        cursor,
+        device,
+        "v_packed",
+        DType::U8,
+        &packed_shape,
+        expected_packed_bytes,
     )?;
     let v_norms = read_blob(
-        bytes, cursor, device, "v_norms", DType::F32, &norms_shape, expected_norms_bytes,
+        bytes,
+        cursor,
+        device,
+        "v_norms",
+        DType::F32,
+        &norms_shape,
+        expected_norms_bytes,
     )?;
 
     Ok(TqKvSnapshot {
@@ -1089,9 +1112,8 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
     let mut full_attn_current_len: Vec<Vec<u32>> = Vec::with_capacity(cfg.n_full_attn as usize);
     // iter-36 (sub-iter 23d-β): TQ snapshot per slot. v3 deserializes
     // from the envelope; v1/v2 leave all entries None.
-    let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = (0..cfg.n_full_attn as usize)
-        .map(|_| None)
-        .collect();
+    let mut full_attn_tq: Vec<Option<TqKvSnapshot>> =
+        (0..cfg.n_full_attn as usize).map(|_| None).collect();
 
     for expected_slot in 0..cfg.n_full_attn as usize {
         let slot_idx = read_u32_le(bytes, cursor)? as usize;
@@ -1141,7 +1163,12 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                 );
                 if tq_byte == QH35_TQ_PRESENT {
                     full_attn_tq[slot_idx] = Some(deserialize_tq_blob(
-                        bytes, cursor, device, slot_idx, "full_attn", cfg.full_attn_shape,
+                        bytes,
+                        cursor,
+                        device,
+                        slot_idx,
+                        "full_attn",
+                        cfg.full_attn_shape,
                     )?);
                 }
             }
@@ -1217,28 +1244,30 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             );
             if tq_byte == QH35_TQ_PRESENT {
                 full_attn_tq[slot_idx] = Some(deserialize_tq_blob(
-                    bytes, cursor, device, slot_idx, "full_attn", cfg.full_attn_shape,
+                    bytes,
+                    cursor,
+                    device,
+                    slot_idx,
+                    "full_attn",
+                    cfg.full_attn_shape,
                 )?);
             }
         }
     }
 
     // --- Per linear-attn slot (iter-3) ---
-    let conv_shape_usize: Vec<usize> =
-        cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
+    let conv_shape_usize: Vec<usize> = cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
     let recurrent_shape_usize: Vec<usize> = cfg
         .linear_recurrent_shape
         .iter()
         .map(|d| *d as usize)
         .collect();
-    let expected_conv_bytes = (cfg.linear_conv_shape.iter().product::<u64>() as usize)
-        * std::mem::size_of::<f32>();
+    let expected_conv_bytes =
+        (cfg.linear_conv_shape.iter().product::<u64>() as usize) * std::mem::size_of::<f32>();
     let expected_recurrent_bytes =
-        (cfg.linear_recurrent_shape.iter().product::<u64>() as usize)
-            * std::mem::size_of::<f32>();
+        (cfg.linear_recurrent_shape.iter().product::<u64>() as usize) * std::mem::size_of::<f32>();
     let mut linear_conv: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_linear_attn as usize);
-    let mut linear_recurrent: Vec<MlxBuffer> =
-        Vec::with_capacity(cfg.n_linear_attn as usize);
+    let mut linear_recurrent: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_linear_attn as usize);
     for expected_slot in 0..cfg.n_linear_attn as usize {
         let slot_idx = read_u32_le(bytes, cursor)? as usize;
         ensure!(
@@ -1267,18 +1296,14 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
         let rec_src = read_bytes(bytes, cursor, rec_byte_len)?;
         let mut conv_buf = device
             .alloc_buffer(conv_byte_len, DType::F32, conv_shape_usize.clone())
-            .map_err(|e| {
-                anyhow!("QH35 deserialize: alloc linear_conv[{slot_idx}]: {e}")
-            })?;
+            .map_err(|e| anyhow!("QH35 deserialize: alloc linear_conv[{slot_idx}]: {e}"))?;
         let mut rec_buf = device
             .alloc_buffer(rec_byte_len, DType::F32, recurrent_shape_usize.clone())
-            .map_err(|e| {
-                anyhow!("QH35 deserialize: alloc linear_recurrent[{slot_idx}]: {e}")
-            })?;
+            .map_err(|e| anyhow!("QH35 deserialize: alloc linear_recurrent[{slot_idx}]: {e}"))?;
         {
-            let conv_dst = conv_buf.as_mut_slice::<u8>().map_err(|e| {
-                anyhow!("QH35 deserialize: linear_conv[{slot_idx}] mut_slice: {e}")
-            })?;
+            let conv_dst = conv_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| anyhow!("QH35 deserialize: linear_conv[{slot_idx}] mut_slice: {e}"))?;
             conv_dst.copy_from_slice(conv_src);
         }
         {
@@ -1328,8 +1353,7 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             }
             let mk_src = read_bytes(bytes, cursor, mk_byte_len)?;
             let mv_src = read_bytes(bytes, cursor, mv_byte_len)?;
-            let mtp_shape_usize: Vec<usize> =
-                mk_shape_arr.iter().map(|d| *d as usize).collect();
+            let mtp_shape_usize: Vec<usize> = mk_shape_arr.iter().map(|d| *d as usize).collect();
             let dtype = full_attn_dtype_for_codec(header_cfg.full_attn_codec);
             let mut mk_buf = device
                 .alloc_buffer(mk_byte_len, dtype, mtp_shape_usize.clone())
@@ -1383,7 +1407,12 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             );
             if tq_byte == QH35_TQ_PRESENT {
                 Some(deserialize_tq_blob(
-                    bytes, cursor, device, 0, "mtp", cfg.mtp_shape,
+                    bytes,
+                    cursor,
+                    device,
+                    0,
+                    "mtp",
+                    cfg.mtp_shape,
                 )?)
             } else {
                 None
@@ -1493,8 +1522,7 @@ pub struct LcpSidecarMetadata {
 /// tail.
 pub fn serialize_lcp_sidecar(sidecar: &LcpSidecarMetadata) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        4 + 4 + 32 + 4 + sidecar.tenant_id.len() + 8 + 8
-            + sidecar.prompt_tokens.len() * 4 + 8 + 8,
+        4 + 4 + 32 + 4 + sidecar.tenant_id.len() + 8 + 8 + sidecar.prompt_tokens.len() * 4 + 8 + 8,
     );
     out.extend_from_slice(&QH3M_SIDECAR_MAGIC);
     write_u32_le(&mut out, QH3M_SIDECAR_VERSION);
@@ -1513,10 +1541,7 @@ pub fn serialize_lcp_sidecar(sidecar: &LcpSidecarMetadata) -> Vec<u8> {
 
 /// Deserialize a sidecar metadata block from `bytes` starting at `*cursor`.
 /// Advances `*cursor` past the consumed bytes.
-pub fn deserialize_lcp_sidecar(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<LcpSidecarMetadata> {
+pub fn deserialize_lcp_sidecar(bytes: &[u8], cursor: &mut usize) -> Result<LcpSidecarMetadata> {
     let magic = read_bytes(bytes, cursor, 4)?;
     ensure!(
         magic == QH3M_SIDECAR_MAGIC,
@@ -1618,13 +1643,11 @@ mod tests {
     ) -> HybridKvCacheSnapshot {
         let elems_per_slot: usize = cfg.full_attn_shape.iter().product::<u64>() as usize;
         let bytes_per_slot = elems_per_slot * std::mem::size_of::<f32>();
-        let shape_usize: Vec<usize> =
-            cfg.full_attn_shape.iter().map(|d| *d as usize).collect();
+        let shape_usize: Vec<usize> = cfg.full_attn_shape.iter().map(|d| *d as usize).collect();
 
         let mut full_attn_k: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
         let mut full_attn_v: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
-        let mut full_attn_current_len: Vec<Vec<u32>> =
-            Vec::with_capacity(cfg.n_full_attn as usize);
+        let mut full_attn_current_len: Vec<Vec<u32>> = Vec::with_capacity(cfg.n_full_attn as usize);
 
         for slot in 0..cfg.n_full_attn as usize {
             let mut k = device
@@ -1651,9 +1674,7 @@ mod tests {
             full_attn_k.push(Some(k));
             full_attn_v.push(Some(v));
             // current_len: per seq, deterministic.
-            let cl: Vec<u32> = (0..cfg.n_seqs)
-                .map(|s| (slot as u32) * 100 + s)
-                .collect();
+            let cl: Vec<u32> = (0..cfg.n_seqs).map(|s| (slot as u32) * 100 + s).collect();
             full_attn_current_len.push(cl);
         }
 
@@ -1720,8 +1741,7 @@ mod tests {
         let conv_bytes_len = conv_elems * std::mem::size_of::<f32>();
         let conv_shape_usize: Vec<usize> =
             cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
-        let rec_elems: usize =
-            cfg.linear_recurrent_shape.iter().product::<u64>() as usize;
+        let rec_elems: usize = cfg.linear_recurrent_shape.iter().product::<u64>() as usize;
         let rec_bytes_len = rec_elems * std::mem::size_of::<f32>();
         let rec_shape_usize: Vec<usize> = cfg
             .linear_recurrent_shape
@@ -1767,13 +1787,29 @@ mod tests {
         for i in 0..a.full_attn_k.len() {
             // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — compare
             // Some-to-Some byte-equal (None-to-None test path lands iter-23c+).
-            let ak = a.full_attn_k[i].as_ref().expect("a.k some").as_slice::<u8>().expect("ak slice");
-            let bk = b.full_attn_k[i].as_ref().expect("b.k some").as_slice::<u8>().expect("bk slice");
+            let ak = a.full_attn_k[i]
+                .as_ref()
+                .expect("a.k some")
+                .as_slice::<u8>()
+                .expect("ak slice");
+            let bk = b.full_attn_k[i]
+                .as_ref()
+                .expect("b.k some")
+                .as_slice::<u8>()
+                .expect("bk slice");
             if ak != bk {
                 return false;
             }
-            let av = a.full_attn_v[i].as_ref().expect("a.v some").as_slice::<u8>().expect("av slice");
-            let bv = b.full_attn_v[i].as_ref().expect("b.v some").as_slice::<u8>().expect("bv slice");
+            let av = a.full_attn_v[i]
+                .as_ref()
+                .expect("a.v some")
+                .as_slice::<u8>()
+                .expect("av slice");
+            let bv = b.full_attn_v[i]
+                .as_ref()
+                .expect("b.v some")
+                .as_slice::<u8>()
+                .expect("bv slice");
             if av != bv {
                 return false;
             }
@@ -1825,8 +1861,7 @@ mod tests {
         // iter-36 (sub-iter 23d-β): v3 adds tq_present:u8 per slot.
         // Per-slot overhead is now 569 (v2 body) + 1 (tq_present) = 570.
         assert_eq!(bytes.len(), 24 + 3 * 570);
-        let restored =
-            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         assert!(snapshots_byte_equal(&snap, &restored));
     }
 
@@ -1842,8 +1877,7 @@ mod tests {
         let cfg = synth_cfg(2, 2);
         let snap = synth_full_attn_only_snapshot(&device, &cfg);
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        let restored =
-            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         assert!(snapshots_byte_equal(&snap, &restored));
     }
 
@@ -1879,15 +1913,16 @@ mod tests {
             }
         };
         let cfg = synth_cfg(1, 1);
-        let mut bytes = serialize_hybrid_snapshot(
-            &synth_full_attn_only_snapshot(&device, &cfg),
-            &cfg,
-        )
-        .expect("serialize");
+        let mut bytes =
+            serialize_hybrid_snapshot(&synth_full_attn_only_snapshot(&device, &cfg), &cfg)
+                .expect("serialize");
         bytes[0] = b'X';
         let err = deserialize_hybrid_snapshot(&bytes, &cfg, &device).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("bad magic"), "expected magic error, got: {msg}");
+        assert!(
+            msg.contains("bad magic"),
+            "expected magic error, got: {msg}"
+        );
     }
 
     #[test]
@@ -1900,11 +1935,9 @@ mod tests {
             }
         };
         let cfg = synth_cfg(1, 1);
-        let mut bytes = serialize_hybrid_snapshot(
-            &synth_full_attn_only_snapshot(&device, &cfg),
-            &cfg,
-        )
-        .expect("serialize");
+        let mut bytes =
+            serialize_hybrid_snapshot(&synth_full_attn_only_snapshot(&device, &cfg), &cfg)
+                .expect("serialize");
         // codec_version is at offset 4..8 (LE u32). Bump to 99.
         bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
         let err = deserialize_hybrid_snapshot(&bytes, &cfg, &device).unwrap_err();
@@ -1928,8 +1961,7 @@ mod tests {
         let cfg = synth_cfg_with_linear(2, 3, 1);
         let snap = synth_full_plus_linear_snapshot(&device, &cfg);
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        let restored =
-            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         assert!(snapshots_byte_equal(&snap, &restored));
         // Per-linear-slot overhead = slot_idx(4) + conv_len(8) + rec_len(8) = 20.
         // Per-linear-slot body = conv(4*3*1*4) + rec(4*8*2*1*4) = 48 + 256 = 304.
@@ -1954,8 +1986,7 @@ mod tests {
         if cfg.has_mtp {
             let elems: usize = cfg.mtp_shape.iter().product::<u64>() as usize;
             let bytes_len = elems * std::mem::size_of::<f32>();
-            let shape_usize: Vec<usize> =
-                cfg.mtp_shape.iter().map(|d| *d as usize).collect();
+            let shape_usize: Vec<usize> = cfg.mtp_shape.iter().map(|d| *d as usize).collect();
             let mut k = device
                 .alloc_buffer(bytes_len, DType::F32, shape_usize.clone())
                 .expect("alloc mtp.k");
@@ -2000,8 +2031,7 @@ mod tests {
         let cfg = synth_cfg_full(2, 3, true, 1);
         let snap = synth_full_plus_linear_plus_mtp_snapshot(&device, &cfg);
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        let restored =
-            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         // Compare full + linear + MTP byte-equal.
         assert!(snapshots_byte_equal(&snap, &restored));
         assert!(restored.mtp.is_some());
@@ -2009,11 +2039,31 @@ mod tests {
         let s_mtp = snap.mtp.as_ref().unwrap();
         // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec round-trip
         // produces Some today (iter-23d adds None support).
-        let r_k = r_mtp.k.as_ref().expect("r_mtp.k some").as_slice::<u8>().expect("rk slice");
-        let s_k = s_mtp.k.as_ref().expect("s_mtp.k some").as_slice::<u8>().expect("sk slice");
+        let r_k = r_mtp
+            .k
+            .as_ref()
+            .expect("r_mtp.k some")
+            .as_slice::<u8>()
+            .expect("rk slice");
+        let s_k = s_mtp
+            .k
+            .as_ref()
+            .expect("s_mtp.k some")
+            .as_slice::<u8>()
+            .expect("sk slice");
         assert_eq!(r_k, s_k);
-        let r_v = r_mtp.v.as_ref().expect("r_mtp.v some").as_slice::<u8>().expect("rv slice");
-        let s_v = s_mtp.v.as_ref().expect("s_mtp.v some").as_slice::<u8>().expect("sv slice");
+        let r_v = r_mtp
+            .v
+            .as_ref()
+            .expect("r_mtp.v some")
+            .as_slice::<u8>()
+            .expect("rv slice");
+        let s_v = s_mtp
+            .v
+            .as_ref()
+            .expect("s_mtp.v some")
+            .as_slice::<u8>()
+            .expect("sv slice");
         assert_eq!(r_v, s_v);
         assert_eq!(r_mtp.current_len, s_mtp.current_len);
     }
@@ -2031,8 +2081,7 @@ mod tests {
         let cfg = synth_cfg_full(1, 0, true, 1);
         let snap = synth_full_plus_linear_plus_mtp_snapshot(&device, &cfg);
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        let restored =
-            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         assert!(snapshots_byte_equal(&snap, &restored));
     }
 
@@ -2105,11 +2154,7 @@ mod tests {
             full_attn_k: (0..n_full_attn).map(|_| None).collect(),
             full_attn_v: (0..n_full_attn).map(|_| None).collect(),
             full_attn_current_len: (0..n_full_attn)
-                .map(|slot| {
-                    (0..cfg.n_seqs)
-                        .map(|s| (slot as u32) * 100 + s)
-                        .collect()
-                })
+                .map(|slot| (0..cfg.n_seqs).map(|s| (slot as u32) * 100 + s).collect())
                 .collect(),
             // iter-35 (sub-iter 23d-α): test fixture, no TQ.
             full_attn_tq: (0..n_full_attn).map(|_| None).collect(),
@@ -2124,12 +2169,17 @@ mod tests {
         // 3 slots × 10 = 30. Total = 24 + 30 = 54.
         assert_eq!(bytes.len(), 24 + 3 * 10);
 
-        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device)
-            .expect("deserialize");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         // Every full-attn slot is None.
         for i in 0..n_full_attn {
-            assert!(restored.full_attn_k[i].is_none(), "slot[{i}].k expected None");
-            assert!(restored.full_attn_v[i].is_none(), "slot[{i}].v expected None");
+            assert!(
+                restored.full_attn_k[i].is_none(),
+                "slot[{i}].k expected None"
+            );
+            assert!(
+                restored.full_attn_v[i].is_none(),
+                "slot[{i}].v expected None"
+            );
         }
         // current_len bookkeeping preserved.
         assert_eq!(restored.full_attn_current_len, snap.full_attn_current_len);
@@ -2164,8 +2214,8 @@ mod tests {
         let sidecar = synth_sidecar();
         let bytes = serialize_lcp_sidecar(&sidecar);
         let mut cursor = 0usize;
-        let restored = deserialize_lcp_sidecar(&bytes, &mut cursor)
-            .expect("deserialize_lcp_sidecar");
+        let restored =
+            deserialize_lcp_sidecar(&bytes, &mut cursor).expect("deserialize_lcp_sidecar");
         assert_eq!(cursor, bytes.len(), "sidecar codec must consume all bytes");
         assert_eq!(restored, sidecar);
     }
@@ -2198,16 +2248,36 @@ mod tests {
             let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
             let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
             let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
-            for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+            for (i, b) in k_packed
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *b = ((slot * 31 + i * 7) % 251) as u8;
             }
-            for (i, b) in v_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+            for (i, b) in v_packed
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *b = ((slot * 13 + i * 11) % 251) as u8;
             }
-            for (i, f) in k_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            for (i, f) in k_norms
+                .as_mut_slice::<f32>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *f = (slot as f32) * 0.5 + (i as f32) * 0.125;
             }
-            for (i, f) in v_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            for (i, f) in v_norms
+                .as_mut_slice::<f32>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *f = (slot as f32) * 0.25 + (i as f32) * 0.0625;
             }
             full_attn_tq.push(Some(TqKvSnapshot {
@@ -2233,23 +2303,29 @@ mod tests {
 
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v3");
 
-        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device)
-            .expect("deserialize v3");
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize v3");
 
         // K/V remain None per slot (TQ-only mode).
         for i in 0..n_full_attn as usize {
-            assert!(restored.full_attn_k[i].is_none(),
-                "slot[{i}].k expected None (TQ-only)");
-            assert!(restored.full_attn_v[i].is_none(),
-                "slot[{i}].v expected None (TQ-only)");
+            assert!(
+                restored.full_attn_k[i].is_none(),
+                "slot[{i}].k expected None (TQ-only)"
+            );
+            assert!(
+                restored.full_attn_v[i].is_none(),
+                "slot[{i}].v expected None (TQ-only)"
+            );
         }
         // TQ payload byte-equal across all 4 buffers per slot.
         for i in 0..n_full_attn as usize {
             let src = snap.full_attn_tq[i].as_ref().unwrap();
-            let dst = restored.full_attn_tq[i].as_ref()
+            let dst = restored.full_attn_tq[i]
+                .as_ref()
                 .expect(&format!("restored.full_attn_tq[{i}] must be Some"));
-            assert_eq!(src.norms_per_pos, dst.norms_per_pos,
-                "slot[{i}].norms_per_pos mismatch");
+            assert_eq!(
+                src.norms_per_pos, dst.norms_per_pos,
+                "slot[{i}].norms_per_pos mismatch"
+            );
             assert_eq!(
                 src.k_packed.as_slice::<u8>().unwrap(),
                 dst.k_packed.as_slice::<u8>().unwrap(),
@@ -2295,7 +2371,9 @@ mod tests {
         let mut bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v3");
         // Header: magic(4) + codec_version(4) — write 2 in place of 3.
         bytes[4] = 2;
-        bytes[5] = 0; bytes[6] = 0; bytes[7] = 0;
+        bytes[5] = 0;
+        bytes[6] = 0;
+        bytes[7] = 0;
         // Strip the trailing tq_present:u8 from each full-attn slot.
         // v3 per-slot byte size = 570 (per the byte-count test). v2 = 569.
         // Slot 0 starts at offset 24+2 (skip 2-byte _reserved). After
@@ -2352,8 +2430,10 @@ mod tests {
             .expect("v3 deserializer must accept v2 envelope");
         assert_eq!(restored.full_attn_tq.len(), n_full_attn as usize);
         for i in 0..n_full_attn as usize {
-            assert!(restored.full_attn_tq[i].is_none(),
-                "v2 envelope must yield None TQ per slot (got Some at {i})");
+            assert!(
+                restored.full_attn_tq[i].is_none(),
+                "v2 envelope must yield None TQ per slot (got Some at {i})"
+            );
             // K/V restored as Some via v2 path.
             assert!(restored.full_attn_k[i].is_some());
             assert!(restored.full_attn_v[i].is_some());
@@ -2471,8 +2551,7 @@ mod tests {
         let cfg = synth_cfg(1, 1);
         let snap = synth_full_attn_only_snapshot(&device, &cfg);
         let sidecar = synth_sidecar();
-        let bytes = serialize_hybrid_with_sidecar(&snap, &cfg, &sidecar)
-            .expect("serialize");
+        let bytes = serialize_hybrid_with_sidecar(&snap, &cfg, &sidecar).expect("serialize");
         // Drop the sidecar tail entirely — only the snapshot remains.
         let truncated = &bytes[..bytes.len() - serialize_lcp_sidecar(&sidecar).len()];
         let err = deserialize_hybrid_with_sidecar(truncated, &cfg, &device).unwrap_err();
@@ -2511,9 +2590,7 @@ mod tests {
     /// keep the serve/persist layer's tests free of an inference-layer
     /// test-helper dependency).
     fn tiny_qwen35_cfg(mtp: bool) -> crate::inference::models::qwen35::Qwen35Config {
-        use crate::inference::models::qwen35::{
-            default_layer_types, Qwen35Config, Qwen35Variant,
-        };
+        use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
         Qwen35Config {
             variant: Qwen35Variant::Dense,
             hidden_size: 64,
@@ -2620,19 +2697,45 @@ mod tests {
                 let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
                 let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
                 let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
-                for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                for (i, b) in k_packed
+                    .as_mut_slice::<u8>()
+                    .unwrap()
+                    .iter_mut()
+                    .enumerate()
+                {
                     *b = ((slot * 41 + i * 13) % 251) as u8;
                 }
-                for (i, b) in v_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                for (i, b) in v_packed
+                    .as_mut_slice::<u8>()
+                    .unwrap()
+                    .iter_mut()
+                    .enumerate()
+                {
                     *b = ((slot * 17 + i * 23) % 251) as u8;
                 }
-                for (i, f) in k_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                for (i, f) in k_norms
+                    .as_mut_slice::<f32>()
+                    .unwrap()
+                    .iter_mut()
+                    .enumerate()
+                {
                     *f = (slot as f32) * 0.75 + (i as f32) * 0.25;
                 }
-                for (i, f) in v_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                for (i, f) in v_norms
+                    .as_mut_slice::<f32>()
+                    .unwrap()
+                    .iter_mut()
+                    .enumerate()
+                {
                     *f = (slot as f32) * 0.5 + (i as f32) * 0.125;
                 }
-                Some(TqKvSnapshot { k_packed, k_norms, v_packed, v_norms, norms_per_pos: 1 })
+                Some(TqKvSnapshot {
+                    k_packed,
+                    k_norms,
+                    v_packed,
+                    v_norms,
+                    norms_per_pos: 1,
+                })
             })
             .collect();
         // MTP in TQ-only mode too.
@@ -2641,16 +2744,36 @@ mod tests {
         let mut mk_norms = device.alloc_buffer(128, DType::F32, vec![32]).unwrap();
         let mut mv_packed = device.alloc_buffer(128, DType::U8, vec![128]).unwrap();
         let mut mv_norms = device.alloc_buffer(128, DType::F32, vec![32]).unwrap();
-        for (i, b) in mk_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+        for (i, b) in mk_packed
+            .as_mut_slice::<u8>()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
             *b = ((97 + i * 7) % 251) as u8;
         }
-        for (i, b) in mv_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+        for (i, b) in mv_packed
+            .as_mut_slice::<u8>()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
             *b = ((53 + i * 11) % 251) as u8;
         }
-        for (i, f) in mk_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+        for (i, f) in mk_norms
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
             *f = 0.5 + (i as f32) * 0.5;
         }
-        for (i, f) in mv_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+        for (i, f) in mv_norms
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
             *f = 0.25 + (i as f32) * 0.25;
         }
         snap.mtp = Some(MtpKvSnapshot {
@@ -2658,8 +2781,10 @@ mod tests {
             v: None,
             current_len: (0..cfg.n_seqs).map(|s| 7 + s).collect(),
             tq: Some(TqKvSnapshot {
-                k_packed: mk_packed, k_norms: mk_norms,
-                v_packed: mv_packed, v_norms: mv_norms,
+                k_packed: mk_packed,
+                k_norms: mk_norms,
+                v_packed: mv_packed,
+                v_norms: mv_norms,
                 norms_per_pos: 1,
             }),
         });
@@ -2680,8 +2805,8 @@ mod tests {
         let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         assert_eq!(version, 4, "serializer must emit codec v4");
 
-        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device)
-            .expect("deserialize v4 TQ-only");
+        let restored =
+            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize v4 TQ-only");
 
         // full-attn: k/v None restored; TQ blobs byte-exact.
         for slot in 0..cfg.n_full_attn as usize {
@@ -2689,22 +2814,59 @@ mod tests {
             assert!(restored.full_attn_v[slot].is_none());
             let src = snap.full_attn_tq[slot].as_ref().unwrap();
             let dst = restored.full_attn_tq[slot].as_ref().expect("tq restored");
-            assert_eq!(dst.k_packed.as_slice::<u8>().unwrap(), src.k_packed.as_slice::<u8>().unwrap(), "slot {slot} k_packed");
-            assert_eq!(dst.v_packed.as_slice::<u8>().unwrap(), src.v_packed.as_slice::<u8>().unwrap(), "slot {slot} v_packed");
-            assert_eq!(dst.k_norms.as_slice::<u8>().unwrap(), src.k_norms.as_slice::<u8>().unwrap(), "slot {slot} k_norms");
-            assert_eq!(dst.v_norms.as_slice::<u8>().unwrap(), src.v_norms.as_slice::<u8>().unwrap(), "slot {slot} v_norms");
+            assert_eq!(
+                dst.k_packed.as_slice::<u8>().unwrap(),
+                src.k_packed.as_slice::<u8>().unwrap(),
+                "slot {slot} k_packed"
+            );
+            assert_eq!(
+                dst.v_packed.as_slice::<u8>().unwrap(),
+                src.v_packed.as_slice::<u8>().unwrap(),
+                "slot {slot} v_packed"
+            );
+            assert_eq!(
+                dst.k_norms.as_slice::<u8>().unwrap(),
+                src.k_norms.as_slice::<u8>().unwrap(),
+                "slot {slot} k_norms"
+            );
+            assert_eq!(
+                dst.v_norms.as_slice::<u8>().unwrap(),
+                src.v_norms.as_slice::<u8>().unwrap(),
+                "slot {slot} v_norms"
+            );
             assert_eq!(dst.norms_per_pos, src.norms_per_pos);
-            assert_eq!(restored.full_attn_current_len[slot], snap.full_attn_current_len[slot]);
+            assert_eq!(
+                restored.full_attn_current_len[slot],
+                snap.full_attn_current_len[slot]
+            );
         }
         // MTP: k/v None restored (v4 kv_present=0); TQ blob byte-exact.
         let msrc = snap.mtp.as_ref().unwrap();
         let mdst = restored.mtp.as_ref().expect("mtp restored");
-        assert!(mdst.k.is_none() && mdst.v.is_none(), "v4 must restore MTP k/v as None in TQ-only mode");
-        let (stq, dtq) = (msrc.tq.as_ref().unwrap(), mdst.tq.as_ref().expect("mtp tq restored"));
-        assert_eq!(dtq.k_packed.as_slice::<u8>().unwrap(), stq.k_packed.as_slice::<u8>().unwrap());
-        assert_eq!(dtq.v_packed.as_slice::<u8>().unwrap(), stq.v_packed.as_slice::<u8>().unwrap());
-        assert_eq!(dtq.k_norms.as_slice::<u8>().unwrap(), stq.k_norms.as_slice::<u8>().unwrap());
-        assert_eq!(dtq.v_norms.as_slice::<u8>().unwrap(), stq.v_norms.as_slice::<u8>().unwrap());
+        assert!(
+            mdst.k.is_none() && mdst.v.is_none(),
+            "v4 must restore MTP k/v as None in TQ-only mode"
+        );
+        let (stq, dtq) = (
+            msrc.tq.as_ref().unwrap(),
+            mdst.tq.as_ref().expect("mtp tq restored"),
+        );
+        assert_eq!(
+            dtq.k_packed.as_slice::<u8>().unwrap(),
+            stq.k_packed.as_slice::<u8>().unwrap()
+        );
+        assert_eq!(
+            dtq.v_packed.as_slice::<u8>().unwrap(),
+            stq.v_packed.as_slice::<u8>().unwrap()
+        );
+        assert_eq!(
+            dtq.k_norms.as_slice::<u8>().unwrap(),
+            stq.k_norms.as_slice::<u8>().unwrap()
+        );
+        assert_eq!(
+            dtq.v_norms.as_slice::<u8>().unwrap(),
+            stq.v_norms.as_slice::<u8>().unwrap()
+        );
         assert_eq!(mdst.current_len, msrc.current_len);
     }
 
@@ -2726,7 +2888,7 @@ mod tests {
         write_u8(&mut out, FullAttnCodec::F32Dense as u8);
         write_u32_le(&mut out, cfg.n_seqs);
         write_u16_le(&mut out, 0); // reserved
-        // full-attn slot 0: kv_present=1 + shape + lens + current_len + payload
+                                   // full-attn slot 0: kv_present=1 + shape + lens + current_len + payload
         let elems: usize = cfg.full_attn_shape.iter().product::<u64>() as usize;
         let byte_len = elems * 4;
         write_u32_le(&mut out, 0); // slot_idx
@@ -2758,9 +2920,20 @@ mod tests {
 
         let restored = deserialize_hybrid_snapshot(&out, &cfg, &device)
             .expect("v3 envelope must still deserialize (implicit MTP kv_present)");
-        assert!(restored.mtp.as_ref().expect("mtp").k.is_some(), "v3 MTP restores as Some");
+        assert!(
+            restored.mtp.as_ref().expect("mtp").k.is_some(),
+            "v3 MTP restores as Some"
+        );
         assert_eq!(
-            restored.mtp.as_ref().unwrap().k.as_ref().unwrap().as_slice::<u8>().unwrap(),
+            restored
+                .mtp
+                .as_ref()
+                .unwrap()
+                .k
+                .as_ref()
+                .unwrap()
+                .as_slice::<u8>()
+                .unwrap(),
             mk_bytes.as_slice(),
             "v3 MTP k bytes must round-trip"
         );
@@ -2804,9 +2977,14 @@ mod tests {
             .expect("alloc src");
         for (i, slot) in src.full_attn.iter_mut().enumerate() {
             let tq = slot.tq.as_mut().expect("tq");
-            for (bi, buf) in [&mut tq.k_packed, &mut tq.k_norms, &mut tq.v_packed, &mut tq.v_norms]
-                .into_iter()
-                .enumerate()
+            for (bi, buf) in [
+                &mut tq.k_packed,
+                &mut tq.k_norms,
+                &mut tq.v_packed,
+                &mut tq.v_norms,
+            ]
+            .into_iter()
+            .enumerate()
             {
                 let s = buf.as_mut_slice::<u8>().unwrap();
                 for (j, b) in s.iter_mut().enumerate() {
@@ -2815,10 +2993,21 @@ mod tests {
             }
         }
         {
-            let tq = src.mtp_slot.as_mut().expect("mtp").tq.as_mut().expect("mtp tq");
-            for (bi, buf) in [&mut tq.k_packed, &mut tq.k_norms, &mut tq.v_packed, &mut tq.v_norms]
-                .into_iter()
-                .enumerate()
+            let tq = src
+                .mtp_slot
+                .as_mut()
+                .expect("mtp")
+                .tq
+                .as_mut()
+                .expect("mtp tq");
+            for (bi, buf) in [
+                &mut tq.k_packed,
+                &mut tq.k_norms,
+                &mut tq.v_packed,
+                &mut tq.v_norms,
+            ]
+            .into_iter()
+            .enumerate()
             {
                 let s = buf.as_mut_slice::<u8>().unwrap();
                 for (j, b) in s.iter_mut().enumerate() {
@@ -2832,7 +3021,8 @@ mod tests {
 
         // 2) Disk round-trip (serialize → deserialize) — the hydrate arm.
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        let restored_snap = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        let restored_snap =
+            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
 
         // 3) LCP resume into a fresh TQ-mode cache — THE 500 PATH.
         let mut dst = HybridKvCache::new_with_options(&live_cfg, &device, max_seq_len, 1, true)
@@ -2842,36 +3032,37 @@ mod tests {
 
         // 4) Pin: per-head prefix byte-exact on all four TQ buffers,
         //    every full-attn slot + the MTP slot; tail zero; cursor set.
-        let check_slot = |src_tq: &crate::inference::models::qwen35::kv_cache::TqFullAttnKvBuffers,
-                          dst_tq: &crate::inference::models::qwen35::kv_cache::TqFullAttnKvBuffers,
-                          what: &str| {
-            for (name, s, d) in [
-                ("k_packed", &src_tq.k_packed, &dst_tq.k_packed),
-                ("k_norms", &src_tq.k_norms, &dst_tq.k_norms),
-                ("v_packed", &src_tq.v_packed, &dst_tq.v_packed),
-                ("v_norms", &src_tq.v_norms, &dst_tq.v_norms),
-            ] {
-                let shape = d.shape();
-                let (n_kv, max_seq, inner) = (shape[1], shape[2], shape[3]);
-                let elem = d.dtype().size_of();
-                let head_stride = max_seq * inner * elem;
-                let (sb, db) = (s.as_slice::<u8>().unwrap(), d.as_slice::<u8>().unwrap());
-                for head in 0..n_kv {
-                    let off = head * head_stride;
-                    let n = n_tokens * inner * elem;
-                    assert_eq!(
-                        &db[off..off + n],
-                        &sb[off..off + n],
-                        "{what}.tq.{name}[head {head}] prefix diverged (23d-γ)"
-                    );
-                    let tail = &db[off + n..off + head_stride];
-                    assert!(
-                        tail.iter().all(|&b| b == 0),
-                        "{what}.tq.{name}[head {head}] tail not zero (23d-γ)"
-                    );
+        let check_slot =
+            |src_tq: &crate::inference::models::qwen35::kv_cache::TqFullAttnKvBuffers,
+             dst_tq: &crate::inference::models::qwen35::kv_cache::TqFullAttnKvBuffers,
+             what: &str| {
+                for (name, s, d) in [
+                    ("k_packed", &src_tq.k_packed, &dst_tq.k_packed),
+                    ("k_norms", &src_tq.k_norms, &dst_tq.k_norms),
+                    ("v_packed", &src_tq.v_packed, &dst_tq.v_packed),
+                    ("v_norms", &src_tq.v_norms, &dst_tq.v_norms),
+                ] {
+                    let shape = d.shape();
+                    let (n_kv, max_seq, inner) = (shape[1], shape[2], shape[3]);
+                    let elem = d.dtype().size_of();
+                    let head_stride = max_seq * inner * elem;
+                    let (sb, db) = (s.as_slice::<u8>().unwrap(), d.as_slice::<u8>().unwrap());
+                    for head in 0..n_kv {
+                        let off = head * head_stride;
+                        let n = n_tokens * inner * elem;
+                        assert_eq!(
+                            &db[off..off + n],
+                            &sb[off..off + n],
+                            "{what}.tq.{name}[head {head}] prefix diverged (23d-γ)"
+                        );
+                        let tail = &db[off + n..off + head_stride];
+                        assert!(
+                            tail.iter().all(|&b| b == 0),
+                            "{what}.tq.{name}[head {head}] tail not zero (23d-γ)"
+                        );
+                    }
                 }
-            }
-        };
+            };
         for (i, slot) in dst.full_attn.iter().enumerate() {
             check_slot(
                 src.full_attn[i].tq.as_ref().unwrap(),
@@ -2882,9 +3073,17 @@ mod tests {
         }
         check_slot(
             src.mtp_slot.as_ref().unwrap().tq.as_ref().unwrap(),
-            dst.mtp_slot.as_ref().unwrap().tq.as_ref().expect("dst mtp tq"),
+            dst.mtp_slot
+                .as_ref()
+                .unwrap()
+                .tq
+                .as_ref()
+                .expect("dst mtp tq"),
             "mtp",
         );
-        assert_eq!(dst.mtp_slot.as_ref().unwrap().current_len[0] as usize, n_tokens);
+        assert_eq!(
+            dst.mtp_slot.as_ref().unwrap().current_len[0] as usize,
+            n_tokens
+        );
     }
 }

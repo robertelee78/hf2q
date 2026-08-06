@@ -23,7 +23,7 @@
 //! runs entirely on CPU and can be exercised without a loaded model, which
 //! is why the full JSON-acceptance test suite below has no fixture cost.
 
-use super::parser::{GretElement, GretType, Grammar};
+use super::parser::{Grammar, GretElement, GretType};
 
 // ---------------------------------------------------------------------------
 // Position + Stack types
@@ -199,8 +199,7 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
     let mut todo: Vec<Stack> = Vec::new();
     todo.push(stack);
     // `seen` dedups across our BFS frontier.
-    let mut seen: std::collections::HashSet<Stack> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<Stack> = std::collections::HashSet::new();
 
     while let Some(curr_stack) = todo.pop() {
         if seen.contains(&curr_stack) {
@@ -293,12 +292,7 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
 
 /// Feeds one character to one stack, producing zero or more successor stacks.
 /// Mirrors `llama_grammar_accept_chr` at llama-grammar.cpp:1016.
-fn accept_chr_into(
-    grammar: &Grammar,
-    stack: &Stack,
-    chr: u32,
-    new_stacks: &mut Stacks,
-) {
+fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) {
     if stack.is_empty() {
         return;
     }
@@ -545,7 +539,10 @@ impl GrammarRuntime {
             while i < bytes.len() && partial.n_remain > 0 {
                 let b = bytes[i];
                 if (b & 0xC0) != 0x80 {
-                    self.partial_utf8 = PartialUtf8 { value: 0, n_remain: -1 };
+                    self.partial_utf8 = PartialUtf8 {
+                        value: 0,
+                        n_remain: -1,
+                    };
                     self.stacks.clear();
                     return false;
                 }
@@ -593,7 +590,10 @@ impl GrammarRuntime {
                 remain -= 1;
             }
             if remain > 0 {
-                self.partial_utf8 = PartialUtf8 { value: val, n_remain: remain };
+                self.partial_utf8 = PartialUtf8 {
+                    value: val,
+                    n_remain: remain,
+                };
                 return !self.stacks.is_empty();
             }
             if !self.accept_char(val) {
@@ -642,8 +642,8 @@ impl GrammarRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::parser::parse;
+    use super::*;
 
     fn runtime_from(src: &str, start: &str) -> GrammarRuntime {
         let g = parse(src).expect("parse");
@@ -715,10 +715,7 @@ mod tests {
 
     #[test]
     fn rule_reference_chain() {
-        let mut rt = runtime_from(
-            "root ::= ws \"hi\"\nws ::= \" \"\n",
-            "root",
-        );
+        let mut rt = runtime_from("root ::= ws \"hi\"\nws ::= \" \"\n", "root");
         assert!(rt.accept_char(' ' as u32));
         assert!(rt.accept_char('h' as u32));
         assert!(rt.accept_char('i' as u32));
@@ -842,11 +839,13 @@ mod tests {
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             assert!(
                 rt.accept_bytes(input.as_bytes()),
-                "json grammar (value rule) should accept {:?}", input
+                "json grammar (value rule) should accept {:?}",
+                input
             );
             assert!(
                 rt.is_accepted(),
-                "json grammar (value rule) should ACCEPT {:?}", input
+                "json grammar (value rule) should ACCEPT {:?}",
+                input
             );
         }
     }
@@ -881,10 +880,10 @@ mod tests {
         let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
             .expect("json.gbnf fixture");
         for input in [
-            "nul",        // truncated
-            "tru e",      // space in literal
-            "[1,",        // truncated array
-            "{\"k\":}",   // missing value
+            "nul",      // truncated
+            "tru e",    // space in literal
+            "[1,",      // truncated array
+            "{\"k\":}", // missing value
             "\"unterminated",
         ] {
             let g = parse(&src).expect("parse");
@@ -979,7 +978,10 @@ mod tests {
         // Now flip the gate; the original grammar should still be intact.
         rt.trigger();
         assert!(!rt.is_awaiting_trigger());
-        assert!(rt.accept_bytes(b"abc"), "post-trigger grammar accepts literal");
+        assert!(
+            rt.accept_bytes(b"abc"),
+            "post-trigger grammar accepts literal"
+        );
         assert!(rt.is_accepted(), "literal fully matched");
     }
 
@@ -1024,7 +1026,10 @@ mod tests {
         // `"a"*` is in an accepting state immediately (zero
         // occurrences satisfies the kleene star).
         let mut rt = runtime_from("root ::= \"a\"*\n", "root");
-        assert!(rt.is_accepted(), "kleene star is accepted at zero occurrences");
+        assert!(
+            rt.is_accepted(),
+            "kleene star is accepted at zero occurrences"
+        );
 
         rt.set_awaiting_trigger(true);
         assert!(

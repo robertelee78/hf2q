@@ -32,32 +32,32 @@ use std::path::PathBuf;
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
+use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
+use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
+use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
     bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
     nomic_bert, qwen35moe, qwen35moe_full, qwen3vl_text,
 };
-use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
-use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
-use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
-use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::orchestrator::PlanEntry;
+use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::receipt::{
-    clear_stale_receipt, write_success_receipt, PeakChunkBoundReceipt,
-    RemoteConversionSource, ReceiptError,
+    clear_stale_receipt, write_success_receipt, PeakChunkBoundReceipt, ReceiptError,
+    RemoteConversionSource,
 };
 use crate::convert::source_reader::SourceError;
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
     build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
 };
-use crate::quantize::ggml_quants::SourceDtype;
+use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 use crate::quantize::ggml_quants::apex::{
     detect_apex_config, load_mudler_config, ApexError, ApexPolicy, FingerprintHParams,
 };
 use crate::quantize::ggml_quants::standard_policy::HParams;
 use crate::quantize::ggml_quants::ArchName;
-use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
+use crate::quantize::ggml_quants::SourceDtype;
 
 // ============================================================================
 // Public API
@@ -512,8 +512,8 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
             (orch, *ftype)
         }
         QuantSelector::Apex(tier) => {
-            let n_layers = config_n_layers(&src.config)
-                .ok_or(ConvertError::ApexMissingLayerCount)?;
+            let n_layers =
+                config_n_layers(&src.config).ok_or(ConvertError::ApexMissingLayerCount)?;
             let n_expert = hparams.n_expert;
 
             // ADR-033 §Pi: resolve the imatrix surface. Two paths:
@@ -606,9 +606,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
             (orch, ftype)
         }
         QuantSelector::ApexCustom(path) => {
-            return Err(ConvertError::ApexCustomOutOfScope {
-                path: path.clone(),
-            });
+            return Err(ConvertError::ApexCustomOutOfScope { path: path.clone() });
         }
     };
 
@@ -681,24 +679,19 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // arches' build_metadata may also place these at the end of their
     // vec; we pull them out by exact key match so non-MoE paths still
     // emit in the same canonical-tail position.
-    const POSTLUDE_KEYS: &[&str] = &[
-        "general.quantization_version",
-        "general.file_type",
-    ];
+    const POSTLUDE_KEYS: &[&str] = &["general.quantization_version", "general.file_type"];
     // mmproj sidecars use a DIFFERENT KV order than text decoders:
     // general.file_type lives EARLY (after general.size_label, before
     // clip.*), while general.quantization_version remains last. The
     // generic postlude split (file_type → end) breaks this. For mmproj
     // we trust the build_metadata's emit order — only quantization_version
     // is pulled to postlude.
-    let postlude_keys: &[&str] = if matches!(
-        arch,
-        ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj
-    ) {
-        &["general.quantization_version"]
-    } else {
-        POSTLUDE_KEYS
-    };
+    let postlude_keys: &[&str] =
+        if matches!(arch, ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj) {
+            &["general.quantization_version"]
+        } else {
+            POSTLUDE_KEYS
+        };
     let mut prelude: Vec<(String, MetaValue)> = Vec::with_capacity(arch_metadata.len());
     let mut postlude: Vec<(String, MetaValue)> = Vec::with_capacity(postlude_keys.len());
     for (k, v) in arch_metadata {
@@ -1103,25 +1096,34 @@ fn resolve_bert_pooling_type(model_dir: &std::path::Path) -> Option<u32> {
     let modules_path = model_dir.join("modules.json");
     let modules_raw = std::fs::read_to_string(&modules_path).ok()?;
     let modules: serde_json::Value = serde_json::from_str(&modules_raw).ok()?;
-    let pooling_subdir = modules
-        .as_array()?
-        .iter()
-        .find_map(|m| {
-            let ty = m.get("type")?.as_str()?;
-            if ty.ends_with("Pooling") {
-                m.get("path")?.as_str().map(String::from)
-            } else {
-                None
-            }
-        })?;
+    let pooling_subdir = modules.as_array()?.iter().find_map(|m| {
+        let ty = m.get("type")?.as_str()?;
+        if ty.ends_with("Pooling") {
+            m.get("path")?.as_str().map(String::from)
+        } else {
+            None
+        }
+    })?;
     let pooling_config_path = model_dir.join(pooling_subdir).join("config.json");
     let pooling_raw = std::fs::read_to_string(&pooling_config_path).ok()?;
     let pooling: serde_json::Value = serde_json::from_str(&pooling_raw).ok()?;
-    if pooling.get("pooling_mode_mean_tokens").and_then(|v| v.as_bool()) == Some(true) {
+    if pooling
+        .get("pooling_mode_mean_tokens")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         Some(1) // MEAN
-    } else if pooling.get("pooling_mode_cls_token").and_then(|v| v.as_bool()) == Some(true) {
+    } else if pooling
+        .get("pooling_mode_cls_token")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         Some(2) // CLS
-    } else if pooling.get("pooling_mode_lasttoken").and_then(|v| v.as_bool()) == Some(true) {
+    } else if pooling
+        .get("pooling_mode_lasttoken")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         Some(3) // LAST
     } else if let Some(mode) = pooling.get("pooling_mode").and_then(|v| v.as_str()) {
         match mode {
@@ -1221,10 +1223,7 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
 /// staging path as on-disk tensors: the per-arch mapper must recognize
 /// the synthesized tensor's name and the orchestrator's F32-keep gate
 /// (`orchestrator::is_f32_keep_tensor`) must emit them raw.
-fn synthesized_tensors_for_arch(
-    arch: ArchName,
-    config: &serde_json::Value,
-) -> Vec<HfTensor> {
+fn synthesized_tensors_for_arch(arch: ArchName, config: &serde_json::Value) -> Vec<HfTensor> {
     let config = effective_config(config);
     match arch {
         ArchName::Gemma4 => gemma4::build_synthesized_tensors(config),
@@ -1283,7 +1282,8 @@ fn build_metadata_for_arch(
             .and_then(|tc| tc.get("hidden_size"))
             .or_else(|| config.get("hidden_size"))
             .and_then(|v| v.as_u64())
-            .expect("--mmproj Gemma4Vision requires text_config.hidden_size") as u32;
+            .expect("--mmproj Gemma4Vision requires text_config.hidden_size")
+            as u32;
         return crate::convert::arch::gemma4_vision_mmproj::build_metadata(
             vision,
             text_hidden,
@@ -1295,20 +1295,12 @@ fn build_metadata_for_arch(
     }
     let config = effective_config(config);
     match arch {
-        ArchName::Llama3 => llama3::build_metadata(
-            config,
-            ftype,
-            model_card,
-            sampling,
-            model_dir_basename,
-        ),
-        ArchName::Gemma4 => gemma4::build_metadata(
-            config,
-            ftype,
-            model_card,
-            sampling,
-            model_dir_basename,
-        ),
+        ArchName::Llama3 => {
+            llama3::build_metadata(config, ftype, model_card, sampling, model_dir_basename)
+        }
+        ArchName::Gemma4 => {
+            gemma4::build_metadata(config, ftype, model_card, sampling, model_dir_basename)
+        }
         ArchName::Gemma4Mmproj => unreachable!("handled above"),
         ArchName::Gemma4VisionMmproj => unreachable!("handled above"),
         ArchName::Bert => bert::build_metadata(
@@ -1515,10 +1507,12 @@ fn map_tensor(
 ) -> MapOutcome {
     match arch {
         ArchName::Llama3 => match llama3::map_tensor_name(hf_name) {
-            Some(gguf_name) => match llama3_ctx.and_then(|c| llama3_attach_bake(&gguf_name, hf_name, c)) {
-                Some(bake) => MapOutcome::DirectWithBake { gguf_name, bake },
-                None => MapOutcome::Direct(gguf_name),
-            },
+            Some(gguf_name) => {
+                match llama3_ctx.and_then(|c| llama3_attach_bake(&gguf_name, hf_name, c)) {
+                    Some(bake) => MapOutcome::DirectWithBake { gguf_name, bake },
+                    None => MapOutcome::Direct(gguf_name),
+                }
+            }
             None => MapOutcome::Unmapped,
         },
         ArchName::Gemma4 => lift_gemma4_mapped(gemma4::map_tensor_name(hf_name)),
@@ -1577,7 +1571,8 @@ fn map_tensor(
             Some(s) => MapOutcome::Direct(s),
             None => MapOutcome::Unmapped,
         },
-        ArchName::NomicBert => match nomic_bert::map_tensor_name(hf_name, hf_shape, nomic_bert_ctx) {
+        ArchName::NomicBert => match nomic_bert::map_tensor_name(hf_name, hf_shape, nomic_bert_ctx)
+        {
             Some(nomic_bert::MappedTensor::Direct(s)) => MapOutcome::Direct(s),
             Some(nomic_bert::MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 MapOutcome::DirectWithBake { gguf_name, bake }
@@ -1614,9 +1609,9 @@ fn map_tensor(
         },
         ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
         ArchName::Qwen35MoeFull => match qwen35moe_full_ctx {
-            Some(ctx) => lift_qwen35moe_full_mapped(qwen35moe_full::map_tensor_name(
-                hf_name, hf_shape, ctx,
-            )),
+            Some(ctx) => {
+                lift_qwen35moe_full_mapped(qwen35moe_full::map_tensor_name(hf_name, hf_shape, ctx))
+            }
             None => MapOutcome::Unmapped,
         },
         ArchName::MiniMaxM2 => lift_minimax_mapped(minimax_m2::map_tensor_name(hf_name)),
@@ -2026,11 +2021,11 @@ impl PlanStep {
                     }),
                 }
             }
-            PlanStep::Fused { gguf_name, .. } => Err(ConvertError::Source(
-                SourceError::Safetensors(format!(
+            PlanStep::Fused { gguf_name, .. } => {
+                Err(ConvertError::Source(SourceError::Safetensors(format!(
                     "fused tensor `{gguf_name}` must use bounded chunk streaming"
-                )),
-            )),
+                ))))
+            }
             PlanStep::Synthesized { synth_idx, .. } => {
                 let t = synthesized.get(*synth_idx).ok_or_else(|| {
                     ConvertError::Source(SourceError::Safetensors(format!(
@@ -2112,7 +2107,14 @@ fn build_convert_plan(
     let mut moe_accum: HashMap<(usize, ExpertKindKey), MoePlanGroup> = HashMap::new();
 
     for meta in src.tensor_metas() {
-        match map_tensor(arch, &meta.name, &meta.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref(), &nomic_bert_ctx) {
+        match map_tensor(
+            arch,
+            &meta.name,
+            &meta.shape,
+            qwen35moe_full_ctx.as_ref(),
+            llama3_ctx.as_ref(),
+            &nomic_bert_ctx,
+        ) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
@@ -2270,8 +2272,7 @@ fn build_convert_plan(
 
     // ----- Drain MoE accumulator into fused plan steps --------------------
     let expected_n_experts = n_experts.unwrap_or(0);
-    let mut groups: Vec<((usize, ExpertKindKey), MoePlanGroup)> =
-        moe_accum.into_iter().collect();
+    let mut groups: Vec<((usize, ExpertKindKey), MoePlanGroup)> = moe_accum.into_iter().collect();
     // Deterministic emission order: by (layer, kind). Two convert-v2
     // runs on the same input produce identical plan orders.
     groups.sort_by_key(|(k, _)| (k.0, k.1 as u8));
@@ -2322,8 +2323,7 @@ fn build_convert_plan(
         // each per-expert PyTorch shape `[out, in]` reversed to GGUF
         // `[in, out]`, then an outer `n_experts` slot appended →
         // fused GGUF shape `[in, out, n_experts]` (innermost-first).
-        let mut gguf_shape_fused: Vec<usize> =
-            per_expert_py_shape.iter().rev().copied().collect();
+        let mut gguf_shape_fused: Vec<usize> = per_expert_py_shape.iter().rev().copied().collect();
         gguf_shape_fused.push(expected_n_experts);
 
         let member_hf_names: Vec<String> = members.into_iter().map(|m| m.hf_name).collect();
@@ -2345,7 +2345,14 @@ fn build_convert_plan(
     // GGUF layout matches byte-for-byte.
     let mut synth_steps: Vec<PlanStep> = Vec::new();
     for (synth_idx, t) in synthesized.iter().enumerate() {
-        match map_tensor(arch, &t.name, &t.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref(), &nomic_bert_ctx) {
+        match map_tensor(
+            arch,
+            &t.name,
+            &t.shape,
+            qwen35moe_full_ctx.as_ref(),
+            llama3_ctx.as_ref(),
+            &nomic_bert_ctx,
+        ) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = t.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
@@ -2456,10 +2463,7 @@ fn build_convert_plan(
         });
     } else {
         steps.sort_by(|a, b| {
-            canonical_tensor_name_cmp(
-                a.plan_entry().name.as_str(),
-                b.plan_entry().name.as_str(),
-            )
+            canonical_tensor_name_cmp(a.plan_entry().name.as_str(), b.plan_entry().name.as_str())
         });
     }
     Ok(ConvertPlan { steps })
@@ -2954,9 +2958,7 @@ mod tests {
     /// `compute_imatrix`'s doc.)
     #[test]
     fn imatrix_corpus_drives_in_tree_and_errors_typed() {
-        let bogus_hf = std::path::PathBuf::from(
-            "/tmp/imatrix-corpus-driver-test-nonexistent",
-        );
+        let bogus_hf = std::path::PathBuf::from("/tmp/imatrix-corpus-driver-test-nonexistent");
         let err = super::resolve_imatrix_input(
             &ApexTier::IBalanced,
             None,
@@ -2967,12 +2969,11 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ConvertError::Imatrix(
-                crate::quantize::imatrix::ImatrixError::ConvertFailed { detail },
-            ) => {
+            ConvertError::Imatrix(crate::quantize::imatrix::ImatrixError::ConvertFailed {
+                detail,
+            }) => {
                 assert!(
-                    detail.contains("does not exist")
-                        || detail.contains("not a directory"),
+                    detail.contains("does not exist") || detail.contains("not a directory"),
                     "detail should describe missing hf_dir, got: {detail}"
                 );
             }
@@ -3054,9 +3055,10 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ConvertError::Imatrix(
-                crate::quantize::imatrix::ImatrixError::UnknownBakedCorpus { name, .. },
-            ) => assert_eq!(name, "wikitext-9000"),
+            ConvertError::Imatrix(crate::quantize::imatrix::ImatrixError::UnknownBakedCorpus {
+                name,
+                ..
+            }) => assert_eq!(name, "wikitext-9000"),
             other => panic!("expected UnknownBakedCorpus, got {other:?}"),
         }
     }
@@ -3128,9 +3130,7 @@ mod tests {
     /// the plumbing without a real forward pass.
     #[test]
     fn imatrix_n_ctx_non_default_plumbs_through() {
-        let bogus_hf = std::path::PathBuf::from(
-            "/tmp/imatrix-n-ctx-plumbing-test-nonexistent",
-        );
+        let bogus_hf = std::path::PathBuf::from("/tmp/imatrix-n-ctx-plumbing-test-nonexistent");
         let err = super::resolve_imatrix_input(
             &ApexTier::IBalanced,
             None,
@@ -3145,12 +3145,10 @@ mod tests {
         // The plumbing-correctness assertion is that NO panic /
         // wrong-variant fires before reaching ConvertFailed.
         match err {
-            ConvertError::Imatrix(
-                crate::quantize::imatrix::ImatrixError::ConvertFailed { .. },
-            ) => { /* OK: n_ctx=1024 reached the driver, then failed at convert step */ }
-            other => panic!(
-                "expected ConvertFailed (n_ctx=1024 plumbed through), got {other:?}"
-            ),
+            ConvertError::Imatrix(crate::quantize::imatrix::ImatrixError::ConvertFailed {
+                ..
+            }) => { /* OK: n_ctx=1024 reached the driver, then failed at convert step */ }
+            other => panic!("expected ConvertFailed (n_ctx=1024 plumbed through), got {other:?}"),
         }
     }
 
@@ -3217,22 +3215,30 @@ mod tests {
         std::fs::write(
             dir.path().join("model.safetensors"),
             safetensors::tensor::serialize(tensors, None).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("config.json"),
             serde_json::to_vec(&json!({
                 "model_type":"deepseek_v4", "n_routed_experts":2,
                 "quantization_config":{"quant_method":"fp8", "weight_block":[128,128]}
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let source = HfModelSource::open(dir.path()).unwrap();
         let err = match build_convert_plan(ArchName::Deepseek4, &source, &[]) {
             Ok(_) => panic!("one of two experts must not form a complete group"),
             Err(err) => err,
         };
-        assert!(matches!(err, ConvertError::IncompleteExpertGroup {
-            present_count: 1, n_experts_config: 2, ..
-        }));
+        assert!(matches!(
+            err,
+            ConvertError::IncompleteExpertGroup {
+                present_count: 1,
+                n_experts_config: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3243,9 +3249,19 @@ mod tests {
         let packed = vec![0x21_u8; 256 * 128];
         let scales = vec![127_u8; 256 * 8];
         let mut owned: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = vec![
-            ("embed.weight".into(), Dtype::F16, vec![32, 256], f16.clone()),
+            (
+                "embed.weight".into(),
+                Dtype::F16,
+                vec![32, 256],
+                f16.clone(),
+            ),
             ("head.weight".into(), Dtype::F16, vec![32, 256], f16),
-            ("norm.weight".into(), Dtype::F32, vec![256], vec![0; 256 * 4]),
+            (
+                "norm.weight".into(),
+                Dtype::F32,
+                vec![256],
+                vec![0; 256 * 4],
+            ),
         ];
         for expert in 0..2 {
             for proj in ["w1", "w2", "w3"] {
@@ -3266,15 +3282,21 @@ mod tests {
         let views: Vec<(String, TensorView<'_>)> = owned
             .iter()
             .map(|(name, dtype, shape, bytes)| {
-                (name.clone(), TensorView::new(*dtype, shape.clone(), bytes).unwrap())
+                (
+                    name.clone(),
+                    TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+                )
             })
             .collect();
-        let refs: Vec<(String, &TensorView<'_>)> =
-            views.iter().map(|(name, view)| (name.clone(), view)).collect();
+        let refs: Vec<(String, &TensorView<'_>)> = views
+            .iter()
+            .map(|(name, view)| (name.clone(), view))
+            .collect();
         std::fs::write(
             dir.path().join("model.safetensors"),
             safetensors::tensor::serialize(refs, None).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let cfg = json!({
             "_name_or_path":"deepseek-ai/DeepSeek-V4-Flash-0731", "model_type":"deepseek_v4",
@@ -3291,7 +3313,11 @@ mod tests {
             "hc_eps":1e-6, "num_hash_layers":0,
             "quantization_config":{"quant_method":"fp8", "weight_block":[128,128]}
         });
-        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&cfg).unwrap(),
+        )
+        .unwrap();
 
         let mut vocab = serde_json::Map::new();
         for i in 0..28 {
@@ -3307,15 +3333,19 @@ mod tests {
                     {"id":30,"content":"<pad>","special":true},
                     {"id":31,"content":"<unk>","special":true}
                 ]
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("tokenizer_config.json"),
             serde_json::to_vec(&json!({
                 "bos_token":"<bos>", "eos_token":"<eos>", "pad_token":"<pad>",
                 "unk_token":"<unk>", "add_bos_token":true, "add_eos_token":false
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let output = dir.path().join("tiny-q2-k-s.gguf");
         run_convert(ConvertArgs {
@@ -3333,14 +3363,18 @@ mod tests {
                 source_sha256: "b".repeat(64),
                 files: Vec::new(),
             }),
-        }).unwrap();
+        })
+        .unwrap();
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..4], b"GGUF");
-        assert!(bytes.windows(b"blk.0.ffn_gate_exps.weight".len())
+        assert!(bytes
+            .windows(b"blk.0.ffn_gate_exps.weight".len())
             .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
         assert!(bytes.len() > 32 * 1024);
         let producer = concat!("hf2q ", env!("CARGO_PKG_VERSION")).as_bytes();
-        assert!(bytes.windows(producer.len()).any(|window| window == producer));
+        assert!(bytes
+            .windows(producer.len())
+            .any(|window| window == producer));
         let expected_source_sha = "b".repeat(64);
         assert!(bytes
             .windows(expected_source_sha.len())

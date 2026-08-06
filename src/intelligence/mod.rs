@@ -19,9 +19,9 @@ use tracing::{info, warn};
 
 use self::auto_quant::{AutoQuantConstraints, AutoQuantPlan};
 use self::fingerprint::ModelFingerprint;
-use crate::core::hardware::HardwareProfile;
 #[allow(unused_imports)]
 use self::heuristics::HeuristicResult;
+use crate::core::hardware::HardwareProfile;
 
 /// Errors from intelligence operations.
 #[derive(Error, Debug)]
@@ -178,7 +178,10 @@ impl AutoResolver {
                     Some(OutputFormatHint::Gguf) => {
                         // GGUF supports K-quant types; prefer Apex for best quality/size
                         if plan.base_bits <= 6 && fingerprint.total_params >= 3_000_000_000 {
-                            ("apex".to_string(), " Format: GGUF (K-quant types available, Apex recommended).")
+                            (
+                                "apex".to_string(),
+                                " Format: GGUF (K-quant types available, Apex recommended).",
+                            )
                         } else {
                             (plan.quant_method.clone(), " Format: GGUF.")
                         }
@@ -279,10 +282,7 @@ pub fn display_resolved_config(config: &ResolvedConfig) {
         style(&config.hardware.chip_model).bold(),
         config.hardware.total_memory_gb(),
     );
-    println!(
-        "  Model:       {}",
-        style(&config.fingerprint).bold(),
-    );
+    println!("  Model:       {}", style(&config.fingerprint).bold(),);
     println!(
         "  Method:      {}",
         style(&config.quant_method).green().bold(),
@@ -291,14 +291,8 @@ pub fn display_resolved_config(config: &ResolvedConfig) {
         println!("  Bits:        {}", config.bits);
         println!("  Group size:  {}", config.group_size);
     }
-    println!(
-        "  Confidence:  {:.0}%",
-        config.confidence * 100.0,
-    );
-    println!(
-        "  Source:      {}",
-        config.source,
-    );
+    println!("  Confidence:  {:.0}%", config.confidence * 100.0,);
+    println!("  Source:      {}", config.source,);
     println!("  Reasoning:   {}", config.reasoning);
     println!();
 }
@@ -358,7 +352,10 @@ mod tests {
 
     #[test]
     fn test_resolved_source_display() {
-        assert_eq!(format!("{}", ResolvedSource::RuVectorExact), "stored (exact match)");
+        assert_eq!(
+            format!("{}", ResolvedSource::RuVectorExact),
+            "stored (exact match)"
+        );
         assert_eq!(format!("{}", ResolvedSource::Heuristic), "heuristic");
     }
 }

@@ -202,11 +202,7 @@ impl Qwen3VlTextWeights {
         let token_embd = gguf
             .load_tensor_f32("token_embd.weight", device)
             .map_err(|e| anyhow!("token_embd.weight load (as F32): {e}"))?;
-        validate_shape(
-            "token_embd.weight",
-            &token_embd,
-            &[vocab, hidden],
-        )?;
+        validate_shape("token_embd.weight", &token_embd, &[vocab, hidden])?;
 
         let output_norm = gguf
             .load_tensor_f32("output_norm.weight", device)
@@ -227,16 +223,8 @@ impl Qwen3VlTextWeights {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
         for il in 0..cfg.num_hidden_layers as usize {
-            let layer = load_layer(
-                gguf,
-                device,
-                il,
-                hidden,
-                kv_dim,
-                head_dim,
-                intermediate,
-            )
-            .with_context(|| format!("Qwen3-VL text LM: layer {il}"))?;
+            let layer = load_layer(gguf, device, il, hidden, kv_dim, head_dim, intermediate)
+                .with_context(|| format!("Qwen3-VL text LM: layer {il}"))?;
             layers.push(layer);
             progress.on_layer(il + 1);
         }
@@ -286,17 +274,15 @@ fn validate_shape(name: &str, buf: &MlxBuffer, expected: &[usize]) -> Result<()>
 ///   - Embedding (token_embd, output): F16 OR Q4_0 OR another quantized
 ///     type — operator may convert via different quants. Anything
 ///     gguf::load_tensor accepts is fine.
-fn validate_quantized_proj_type(
-    gguf: &mlx_native::gguf::GgufFile,
-    name: &str,
-) -> Result<()> {
+fn validate_quantized_proj_type(gguf: &mlx_native::gguf::GgufFile, name: &str) -> Result<()> {
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-    let info = gguf.tensor_info(name).ok_or_else(|| {
-        anyhow!("{name}: tensor info missing (loader can't validate ggml_type)")
-    })?;
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("{name}: tensor info missing (loader can't validate ggml_type)"))?;
     match info.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q4_K
-        | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0 => Ok(()),
+        GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0 => {
+            Ok(())
+        }
         other => Err(anyhow!(
             "{name}: ggml_type {other:?} is not a quantized projection \
              type (expected Q4_0/Q4_K/Q5_K/Q6_K/Q8_0). Loading would \
@@ -416,9 +402,8 @@ mod tests {
             eprintln!("skip: HF2Q_QWEN3VL_LM_LOAD!=1");
             return;
         }
-        let p = std::path::PathBuf::from(
-            "/opt/hf2q/.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf",
-        );
+        let p =
+            std::path::PathBuf::from("/opt/hf2q/.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf");
         if !p.exists() {
             eprintln!("skip: real GGUF fixture not present at {}", p.display());
             return;
@@ -427,9 +412,8 @@ mod tests {
         let cfg = Qwen3VlTextConfig::from_gguf(&gguf).expect("parse config");
         let device = MlxDevice::new().expect("Metal device init");
         let mut progress = LoadProgress::new(false, 0, cfg.num_hidden_layers as usize);
-        let weights =
-            Qwen3VlTextWeights::load_from_gguf(&gguf, &cfg, &device, &mut progress)
-                .expect("load weights from real Qwen3-VL-2B GGUF");
+        let weights = Qwen3VlTextWeights::load_from_gguf(&gguf, &cfg, &device, &mut progress)
+            .expect("load weights from real Qwen3-VL-2B GGUF");
 
         assert_eq!(weights.num_hidden_layers, 28);
         assert_eq!(weights.hidden_size, 2048);

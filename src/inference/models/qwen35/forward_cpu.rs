@@ -25,9 +25,7 @@
 use anyhow::{anyhow, Result};
 
 use super::delta_net::{delta_net_layer_cpu_ref, DeltaNetLayerShape};
-use super::ffn::{
-    dense_swiglu_cpu_ref, moe_ffn_cpu_ref, DenseFfnShape, MoeFfnShape,
-};
+use super::ffn::{dense_swiglu_cpu_ref, moe_ffn_cpu_ref, DenseFfnShape, MoeFfnShape};
 use super::full_attn::{gated_full_attention_cpu_ref, FullAttnShape};
 use super::io_heads::{apply_output_head, embed_tokens};
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
@@ -72,11 +70,7 @@ impl Qwen35Model {
     /// Validated end-to-end with a tiny synthetic config (2 layers, 1 full + 1
     /// linear, small dims) — verifies no shape or NaN bugs and that the
     /// composition matches per-stage references.
-    pub fn forward_cpu(
-        &self,
-        tokens: &[u32],
-        positions: &[[i32; 4]],
-    ) -> Result<Vec<f32>> {
+    pub fn forward_cpu(&self, tokens: &[u32], positions: &[[i32; 4]]) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_cpu: tokens must be non-empty"));
         }
@@ -118,11 +112,10 @@ impl Qwen35Model {
                             as usize
                     ];
                     let km1 = (self.cfg.linear_conv_kernel_dim - 1) as usize;
-                    let qkv_channels = (2 * self.cfg.linear_num_key_heads
-                        * self.cfg.linear_key_head_dim
-                        + self.cfg.linear_num_value_heads
-                            * self.cfg.linear_value_head_dim)
-                        as usize;
+                    let qkv_channels =
+                        (2 * self.cfg.linear_num_key_heads * self.cfg.linear_key_head_dim
+                            + self.cfg.linear_num_value_heads * self.cfg.linear_value_head_dim)
+                            as usize;
                     let conv_state = vec![0.0f32; km1 * qkv_channels];
                     let (out, _new_state, _new_conv) =
                         delta_net_layer_cpu_ref(&hidden, attn, shape, &state_in, &conv_state);
@@ -162,9 +155,11 @@ impl Qwen35Model {
                     dense_swiglu_cpu_ref(&ffn_input, w, shape)
                 }
                 Qwen35FfnWeights::Moe(w) => {
-                    let moe = self.cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("moe variant missing moe config")
-                    })?;
+                    let moe = self
+                        .cfg
+                        .moe
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("moe variant missing moe config"))?;
                     let shape = MoeFfnShape {
                         hidden_size: self.cfg.hidden_size,
                         num_experts: moe.num_experts,
@@ -335,7 +330,12 @@ mod tests {
         let l2 = m.forward_cpu(&tokens, &positions).expect("2");
         assert_eq!(l1.len(), l2.len());
         for i in 0..l1.len() {
-            assert_eq!(l1[i].to_bits(), l2[i].to_bits(), "non-deterministic at {}", i);
+            assert_eq!(
+                l1[i].to_bits(),
+                l2[i].to_bits(),
+                "non-deterministic at {}",
+                i
+            );
         }
     }
 

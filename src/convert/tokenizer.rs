@@ -198,11 +198,12 @@ pub fn build_tokenizer_metadata(
         }
     };
 
-    let model_section = tokenizer_json
-        .get("model")
-        .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
-            dir: model_dir.display().to_string(),
-        })?;
+    let model_section =
+        tokenizer_json
+            .get("model")
+            .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+                dir: model_dir.display().to_string(),
+            })?;
 
     // The `model.vocab` shape depends on `model.type`:
     //   - BPE / WordPiece / etc.:    Object<String, u64>   (token → id)
@@ -234,21 +235,18 @@ pub fn build_tokenizer_metadata(
         token_scores = Vec::with_capacity(base_vocab_size);
         for (idx, entry) in vocab_arr.iter().enumerate() {
             // Each entry is [token, score]
-            let arr = entry
-                .as_array()
-                .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+            let arr =
+                entry
+                    .as_array()
+                    .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+                        dir: model_dir.display().to_string(),
+                    })?;
+            let token = arr.first().and_then(|v| v.as_str()).ok_or_else(|| {
+                TokenizerError::TokenizerJsonMissingModel {
                     dir: model_dir.display().to_string(),
-                })?;
-            let token = arr
-                .first()
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
-                    dir: model_dir.display().to_string(),
-                })?;
-            let score = arr
-                .get(1)
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
+                }
+            })?;
+            let score = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             id_to_token.insert(idx as u32, token.to_string());
             token_scores.push(score);
         }
@@ -275,11 +273,10 @@ pub fn build_tokenizer_metadata(
     // ----- 2. Optional tokenizer_config.json (special tokens + flags) ---
     // Missing or malformed is non-fatal — the BOS/EOS lookup just yields
     // None and we skip those KV entries.
-    let tokenizer_config: Option<serde_json::Value> = std::fs::read_to_string(
-        model_dir.join("tokenizer_config.json"),
-    )
-    .ok()
-    .and_then(|s| serde_json::from_str(&s).ok());
+    let tokenizer_config: Option<serde_json::Value> =
+        std::fs::read_to_string(model_dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
 
     let added_tokens_arr = tokenizer_json
         .get("added_tokens")
@@ -405,10 +402,8 @@ pub fn build_tokenizer_metadata(
     }
 
     // ----- 6. Build merged vocab_entries for special-token lookup ------
-    let mut vocab_entries: Vec<(String, u32)> = id_to_token
-        .iter()
-        .map(|(id, t)| (t.clone(), *id))
-        .collect();
+    let mut vocab_entries: Vec<(String, u32)> =
+        id_to_token.iter().map(|(id, t)| (t.clone(), *id)).collect();
     vocab_entries.sort_by_key(|(_, id)| *id);
 
     // ----- 7. Token-type classification (mirrors legacy 2940-2986) ---
@@ -554,10 +549,7 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.tokens".into(),
             MetaValue::ArrayString(tokens),
         ));
-        kv.push((
-            "tokenizer.ggml.scores".into(),
-            MetaValue::ArrayF32(scores),
-        ));
+        kv.push(("tokenizer.ggml.scores".into(), MetaValue::ArrayF32(scores)));
         kv.push((
             "tokenizer.ggml.token_type".into(),
             MetaValue::ArrayI32(token_types),
@@ -588,10 +580,7 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = unk_id {
-            kv.push((
-                "tokenizer.ggml.unknown_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.unknown_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = sep_id {
             kv.push((
@@ -600,29 +589,14 @@ pub fn build_tokenizer_metadata(
             ));
         }
         if let Some(id) = pad_id {
-            kv.push((
-                "tokenizer.ggml.padding_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = mask_id {
-            kv.push((
-                "tokenizer.ggml.mask_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.mask_token_id".into(), MetaValue::U32(id)));
         }
-        kv.push((
-            "tokenizer.ggml.add_bos_token".into(),
-            MetaValue::Bool(true),
-        ));
-        kv.push((
-            "tokenizer.ggml.add_eos_token".into(),
-            MetaValue::Bool(true),
-        ));
-        kv.push((
-            "tokenizer.ggml.add_sep_token".into(),
-            MetaValue::Bool(true),
-        ));
+        kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(true)));
+        kv.push(("tokenizer.ggml.add_eos_token".into(), MetaValue::Bool(true)));
+        kv.push(("tokenizer.ggml.add_sep_token".into(), MetaValue::Bool(true)));
     } else if arch == ArchName::MiniMaxM2 {
         // MiniMax-M2 emit order — canonical `TextModel._set_vocab_gpt2`
         // at base.py:1603-1611, mirrored against the canonical Q4_K_M
@@ -665,10 +639,7 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = unk_id {
-            kv.push((
-                "tokenizer.ggml.unknown_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.unknown_token_id".into(), MetaValue::U32(id)));
         }
     } else if matches!(
         arch,
@@ -725,10 +696,7 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = pad_id {
-            kv.push((
-                "tokenizer.ggml.padding_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
         // bos_id from config.json's `bos_token_id` (NOT
         // tokenizer_config's `bos_token` which is null for Qwen3-VL).
@@ -739,10 +707,7 @@ pub fn build_tokenizer_metadata(
         }
         if let Some(cfg) = tokenizer_config.as_ref() {
             if let Some(v) = cfg.get("add_bos_token").and_then(|v| v.as_bool()) {
-                kv.push((
-                    "tokenizer.ggml.add_bos_token".into(),
-                    MetaValue::Bool(v),
-                ));
+                kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(v)));
             }
         }
     } else if arch == ArchName::Bert {
@@ -810,10 +775,7 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = unk_id {
-            kv.push((
-                "tokenizer.ggml.unknown_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.unknown_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = sep_id {
             kv.push((
@@ -822,25 +784,13 @@ pub fn build_tokenizer_metadata(
             ));
         }
         if let Some(id) = pad_id {
-            kv.push((
-                "tokenizer.ggml.padding_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = mask_id {
-            kv.push((
-                "tokenizer.ggml.mask_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.mask_token_id".into(), MetaValue::U32(id)));
         }
-        kv.push((
-            "tokenizer.ggml.add_bos_token".into(),
-            MetaValue::Bool(true),
-        ));
-        kv.push((
-            "tokenizer.ggml.add_eos_token".into(),
-            MetaValue::Bool(true),
-        ));
+        kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(true)));
+        kv.push(("tokenizer.ggml.add_eos_token".into(), MetaValue::Bool(true)));
         kv.push((
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(false),
@@ -879,10 +829,7 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = pad_id {
-            kv.push((
-                "tokenizer.ggml.padding_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
         let add_bos = tokenizer_config
             .as_ref()
@@ -948,10 +895,7 @@ pub fn build_tokenizer_metadata(
         if let Some(id) = eos_id {
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
-        kv.push((
-            "tokenizer.ggml.add_bos_token".into(),
-            MetaValue::Bool(true),
-        ));
+        kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(true)));
         kv.push((
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(false),
@@ -972,10 +916,7 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.tokens".into(),
             MetaValue::ArrayString(tokens),
         ));
-        kv.push((
-            "tokenizer.ggml.scores".into(),
-            MetaValue::ArrayF32(scores),
-        ));
+        kv.push(("tokenizer.ggml.scores".into(), MetaValue::ArrayF32(scores)));
         kv.push((
             "tokenizer.ggml.token_type".into(),
             MetaValue::ArrayI32(token_types),
@@ -993,22 +934,13 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = unk_id {
-            kv.push((
-                "tokenizer.ggml.unknown_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.unknown_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = pad_id {
-            kv.push((
-                "tokenizer.ggml.padding_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = mask_id {
-            kv.push((
-                "tokenizer.ggml.mask_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.mask_token_id".into(), MetaValue::U32(id)));
         }
         // Chat template inserted INLINE here (between mask and
         // add_space_prefix) per canonical Gemma 4 dump position 46.
@@ -1026,10 +958,7 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.add_space_prefix".into(),
             MetaValue::Bool(false),
         ));
-        kv.push((
-            "tokenizer.ggml.add_bos_token".into(),
-            MetaValue::Bool(true),
-        ));
+        kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(true)));
     } else {
         // BPE / WordPiece order — historical hf2q emit sequence,
         // preserved for byte-cmp parity on Llama 3 / BERT bge / Qwen.
@@ -1043,10 +972,7 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.tokens".into(),
             MetaValue::ArrayString(tokens),
         ));
-        kv.push((
-            "tokenizer.ggml.scores".into(),
-            MetaValue::ArrayF32(scores),
-        ));
+        kv.push(("tokenizer.ggml.scores".into(), MetaValue::ArrayF32(scores)));
         kv.push((
             "tokenizer.ggml.token_type".into(),
             MetaValue::ArrayI32(token_types),
@@ -1064,21 +990,12 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = unk_id {
-            kv.push((
-                "tokenizer.ggml.unknown_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.unknown_token_id".into(), MetaValue::U32(id)));
         }
         if let Some(id) = pad_id {
-            kv.push((
-                "tokenizer.ggml.padding_token_id".into(),
-                MetaValue::U32(id),
-            ));
+            kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
-        kv.push((
-            "tokenizer.ggml.add_bos_token".into(),
-            MetaValue::Bool(true),
-        ));
+        kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(true)));
         kv.push((
             "tokenizer.ggml.add_space_prefix".into(),
             MetaValue::Bool(false),
@@ -1104,10 +1021,7 @@ pub fn build_tokenizer_metadata(
     if arch != ArchName::Gemma4 {
         let template = resolve_gemma_chat_template(model_dir, &tokenizer_config, arch);
         if let Some(tmpl) = template {
-            kv.push((
-                "tokenizer.chat_template".into(),
-                MetaValue::String(tmpl),
-            ));
+            kv.push(("tokenizer.chat_template".into(), MetaValue::String(tmpl)));
         }
     }
 
@@ -1140,8 +1054,7 @@ fn resolve_gemma_chat_template(
     {
         return Some(s);
     }
-    crate::core::chat_templates::arch_default_chat_template(arch.name())
-        .map(|s| s.to_string())
+    crate::core::chat_templates::arch_default_chat_template(arch.name()).map(|s| s.to_string())
 }
 
 /// Read `type_vocab_size` from `config.json`. Defaults to 1 if absent
@@ -1170,7 +1083,10 @@ fn read_type_vocab_size_from_config(dir: &Path) -> Option<u32> {
     let s = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     v.get("type_vocab_size")
-        .or_else(|| v.get("text_config").and_then(|tc| tc.get("type_vocab_size")))
+        .or_else(|| {
+            v.get("text_config")
+                .and_then(|tc| tc.get("type_vocab_size"))
+        })
         .and_then(|x| x.as_u64())
         .map(|n| n as u32)
 }
@@ -1249,10 +1165,11 @@ fn resolve_special_token_id(
 ) -> Option<u32> {
     let cfg = config.as_ref()?;
     let v = cfg.get(key)?;
-    let token_str = v
-        .as_str()
-        .map(|s| s.to_string())
-        .or_else(|| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))?;
+    let token_str = v.as_str().map(|s| s.to_string()).or_else(|| {
+        v.get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+    })?;
     vocab_entries
         .iter()
         .find(|(t, _)| t == &token_str)
@@ -1264,9 +1181,11 @@ fn resolve_special_token_id(
 /// that's load-bearing for the 2026-04-30 DWQ48/46 guardrail.
 fn extract_special_token_string(config: &serde_json::Value, key: &str) -> Option<String> {
     let v = config.get(key)?;
-    v.as_str()
-        .map(|s| s.to_string())
-        .or_else(|| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
+    v.as_str().map(|s| s.to_string()).or_else(|| {
+        v.get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 /// Per-arch `tokenizer.ggml.model` dispatch — mirrors gemma.py:649 +
@@ -1655,8 +1574,7 @@ mod tests {
         // text_config.vocab_size.
         fs::write(
             tmp.path().join("config.json"),
-            serde_json::to_string_pretty(&serde_json::json!({"model_type": "llama"}))
-                .unwrap(),
+            serde_json::to_string_pretty(&serde_json::json!({"model_type": "llama"})).unwrap(),
         )
         .unwrap();
         let err = build_tokenizer_metadata(tmp.path(), ArchName::Llama3)
@@ -1697,7 +1615,10 @@ mod tests {
         .unwrap();
         let err = build_tokenizer_metadata(tmp.path(), ArchName::Llama3)
             .expect_err("must error when eos is unresolvable");
-        assert!(matches!(err, TokenizerError::SpecialTokenUnresolvable { .. }));
+        assert!(matches!(
+            err,
+            TokenizerError::SpecialTokenUnresolvable { .. }
+        ));
     }
 
     #[test]
@@ -1795,7 +1716,13 @@ mod tests {
         // forms only. Bare `<...>` tokens are USER_DEFINED, not CONTROL.
         // See commit 6693a52e for the alignment that closed Qwen3-VL
         // byte-cmp.
-        for s in &["<|im_end|>", "<|tool_call|>", "<pad>", "<mask>", "<unused0>"] {
+        for s in &[
+            "<|im_end|>",
+            "<|tool_call|>",
+            "<pad>",
+            "<mask>",
+            "<unused0>",
+        ] {
             assert!(does_token_look_special(s), "{s} should look special");
         }
         for s in &["abc", "<unk>", "<>", "<", ">", "<eos>", "<think>"] {

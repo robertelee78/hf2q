@@ -139,10 +139,7 @@ impl TensorCategory {
 /// `block_size` still doesn't divide `n_per_row` (the C source's
 /// "second misalignment" case where llama.cpp silently demotes to
 /// F16), we return `Err(QuantizeError::NotBlockAligned)` instead.
-pub fn tensor_type_fallback(
-    target: GgmlType,
-    n_per_row: usize,
-) -> Result<GgmlType, QuantizeError> {
+pub fn tensor_type_fallback(target: GgmlType, n_per_row: usize) -> Result<GgmlType, QuantizeError> {
     let target_block = target.block_size();
     if n_per_row % target_block == 0 {
         return Ok(target);
@@ -334,9 +331,7 @@ impl QsState {
 /// variant (first eighth, last eighth, plus every third layer in the middle).
 #[inline]
 const fn use_more_bits(i_layer: i32, n_layers: i32) -> bool {
-    i_layer < n_layers / 8
-        || i_layer >= 7 * n_layers / 8
-        || (i_layer - n_layers / 8) % 3 == 2
+    i_layer < n_layers / 8 || i_layer >= 7 * n_layers / 8 || (i_layer - n_layers / 8) % 3 == 2
 }
 
 /// `layer_info` — port of the lambda at `llama-quant.cpp:421-435`.
@@ -345,15 +340,18 @@ const fn use_more_bits(i_layer: i32, n_layers: i32) -> bool {
 /// trusted (it's `qs.i_ffn_down` etc.). For MoE (`n_expert > 1`), expert
 /// tensors are sprinkled non-consecutively, so the C code re-parses
 /// `blk.<N>.` out of the name. Returns `(i_layer, n_layer)`.
-fn layer_info(i_layer: i32, n_layer: i32, name: &str, n_expert: i32) -> Result<(i32, i32), QuantizeError> {
+fn layer_info(
+    i_layer: i32,
+    n_layer: i32,
+    name: &str,
+    n_expert: i32,
+) -> Result<(i32, i32), QuantizeError> {
     if n_expert > 1 {
         // C:427-432 — parse `blk.<i>.` out of the name.
-        let parsed = name
-            .strip_prefix("blk.")
-            .and_then(|rest| {
-                let dot = rest.find('.')?;
-                rest[..dot].parse::<i32>().ok()
-            });
+        let parsed = name.strip_prefix("blk.").and_then(|rest| {
+            let dot = rest.find('.')?;
+            rest[..dot].parse::<i32>().ok()
+        });
         let parsed = match parsed {
             Some(v) => v,
             None => {
@@ -459,7 +457,11 @@ impl StandardPolicy {
             // shape; `shape.len() > 2 && shape[2] > 1` mirrors C's
             // `tensor->ne[2] > 1`.
             let is_3d = tensor.shape.len() > 2 && tensor.shape[2] > 1;
-            new_type = if is_3d { GgmlType::MXFP4 } else { GgmlType::Q8_0 };
+            new_type = if is_3d {
+                GgmlType::MXFP4
+            } else {
+                GgmlType::Q8_0
+            };
         } else if category == TensorCategory::TokenEmbd {
             // C:469-486 — non-tied TOKEN_EMBD path.
             if let Some(t) = qs.params.token_embedding_type {
@@ -581,8 +583,7 @@ impl StandardPolicy {
                 new_type = GgmlType::Q5_K;
             }
             // C:537-542 — 70B attn_v bump.
-            if qs.model_type == LlmType::M70B
-                && matches!(new_type, GgmlType::Q3_K | GgmlType::Q4_K)
+            if qs.model_type == LlmType::M70B && matches!(new_type, GgmlType::Q3_K | GgmlType::Q4_K)
             {
                 new_type = GgmlType::Q5_K;
             }
@@ -614,8 +615,7 @@ impl StandardPolicy {
             }
         } else if category == TensorCategory::FfnDown {
             // C:568-612 — ffn_down branch.
-            let (i_layer, n_layer) =
-                layer_info(qs.i_ffn_down, qs.n_ffn_down, name, n_expert)?;
+            let (i_layer, n_layer) = layer_info(qs.i_ffn_down, qs.n_ffn_down, name, n_expert)?;
 
             if ftype == LlamaFtype::MostlyQ2_K {
                 // C:571
@@ -747,8 +747,7 @@ impl StandardPolicy {
             }
         } else if category == TensorCategory::FfnGate {
             // C:640-647 — ffn_gate branch.
-            let (i_layer, n_layer) =
-                layer_info(qs.i_ffn_gate, qs.n_ffn_gate, name, n_expert)?;
+            let (i_layer, n_layer) = layer_info(qs.i_ffn_gate, qs.n_ffn_gate, name, n_expert)?;
             if ftype == LlamaFtype::MostlyIQ3_XS
                 && i_layer >= n_layer / 8
                 && i_layer < 7 * n_layer / 8
@@ -758,8 +757,7 @@ impl StandardPolicy {
             qs.i_ffn_gate += 1;
         } else if category == TensorCategory::FfnUp {
             // C:648-655 — ffn_up branch.
-            let (i_layer, n_layer) =
-                layer_info(qs.i_ffn_up, qs.n_ffn_up, name, n_expert)?;
+            let (i_layer, n_layer) = layer_info(qs.i_ffn_up, qs.n_ffn_up, name, n_expert)?;
             if ftype == LlamaFtype::MostlyIQ3_XS
                 && i_layer >= n_layer / 8
                 && i_layer < 7 * n_layer / 8
@@ -870,7 +868,8 @@ mod tests {
         let t = mk_tensor("token_embd.weight", &shape, ArchName::Llama3);
         let pol = StandardPolicy::new();
         assert_eq!(
-            pol.target_for(&mut qs, &t, TensorCategory::TokenEmbd).unwrap(),
+            pol.target_for(&mut qs, &t, TensorCategory::TokenEmbd)
+                .unwrap(),
             GgmlType::Q4_K
         );
     }
@@ -884,7 +883,8 @@ mod tests {
         let t = mk_tensor("token_embd.weight", &shape, ArchName::Llama3);
         let pol = StandardPolicy::new();
         assert_eq!(
-            pol.target_for(&mut qs, &t, TensorCategory::TokenEmbd).unwrap(),
+            pol.target_for(&mut qs, &t, TensorCategory::TokenEmbd)
+                .unwrap(),
             GgmlType::Q6_K
         );
     }
@@ -904,7 +904,10 @@ mod tests {
             pol.target_for(&mut qs, &t, TensorCategory::AttnV).unwrap(),
             GgmlType::Q6_K
         );
-        assert_eq!(qs.i_attention_wv, 1, "counter must be incremented per C:548");
+        assert_eq!(
+            qs.i_attention_wv, 1,
+            "counter must be incremented per C:548"
+        );
     }
 
     #[test]
@@ -917,7 +920,8 @@ mod tests {
         let t = mk_tensor("blk.0.ffn_down.weight", &shape, ArchName::Llama3);
         let pol = StandardPolicy::new();
         assert_eq!(
-            pol.target_for(&mut qs, &t, TensorCategory::FfnDown).unwrap(),
+            pol.target_for(&mut qs, &t, TensorCategory::FfnDown)
+                .unwrap(),
             GgmlType::Q6_K
         );
         assert_eq!(qs.i_ffn_down, 1);
@@ -980,23 +984,71 @@ mod tests {
 
     #[test]
     fn category_classify_basic() {
-        assert_eq!(TensorCategory::classify("token_embd.weight"), TensorCategory::TokenEmbd);
-        assert_eq!(TensorCategory::classify("output.weight"), TensorCategory::Output);
-        assert_eq!(TensorCategory::classify("blk.0.attn_q.weight"), TensorCategory::AttnQ);
-        assert_eq!(TensorCategory::classify("blk.10.attn_v.weight"), TensorCategory::AttnV);
-        assert_eq!(TensorCategory::classify("blk.5.attn_k.weight"), TensorCategory::AttnK);
-        assert_eq!(TensorCategory::classify("blk.3.attn_output.weight"), TensorCategory::AttnOutput);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_down.weight"), TensorCategory::FfnDown);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_down_exps.weight"), TensorCategory::FfnDown);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_up.weight"), TensorCategory::FfnUp);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_up_exps.weight"), TensorCategory::FfnUp);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_gate.weight"), TensorCategory::FfnGate);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_gate_exps.weight"), TensorCategory::FfnGate);
-        assert_eq!(TensorCategory::classify("blk.7.ffn_gate_inp.weight"), TensorCategory::FfnGate);
+        assert_eq!(
+            TensorCategory::classify("token_embd.weight"),
+            TensorCategory::TokenEmbd
+        );
+        assert_eq!(
+            TensorCategory::classify("output.weight"),
+            TensorCategory::Output
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_q.weight"),
+            TensorCategory::AttnQ
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.10.attn_v.weight"),
+            TensorCategory::AttnV
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.5.attn_k.weight"),
+            TensorCategory::AttnK
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.3.attn_output.weight"),
+            TensorCategory::AttnOutput
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_down.weight"),
+            TensorCategory::FfnDown
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_down_exps.weight"),
+            TensorCategory::FfnDown
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_up.weight"),
+            TensorCategory::FfnUp
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_up_exps.weight"),
+            TensorCategory::FfnUp
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_gate.weight"),
+            TensorCategory::FfnGate
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_gate_exps.weight"),
+            TensorCategory::FfnGate
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.7.ffn_gate_inp.weight"),
+            TensorCategory::FfnGate
+        );
         // C:122-127 — fused-QKV / KV_B priority.
-        assert_eq!(TensorCategory::classify("blk.0.attn_qkv.weight"), TensorCategory::AttnQkv);
-        assert_eq!(TensorCategory::classify("blk.0.attn_kv_b.weight"), TensorCategory::AttnKvB);
-        assert_eq!(TensorCategory::classify("blk.0.attn_norm.weight"), TensorCategory::Other);
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_qkv.weight"),
+            TensorCategory::AttnQkv
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_kv_b.weight"),
+            TensorCategory::AttnKvB
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_norm.weight"),
+            TensorCategory::Other
+        );
         // C:101 — per_layer_token_embd alias.
         assert_eq!(
             TensorCategory::classify("per_layer_token_embd.weight"),
@@ -1006,30 +1058,54 @@ mod tests {
 
     #[test]
     fn fallback_passthrough_when_aligned() {
-        assert_eq!(tensor_type_fallback(GgmlType::Q5_K, 512).unwrap(), GgmlType::Q5_K);
-        assert_eq!(tensor_type_fallback(GgmlType::Q4_K, 256).unwrap(), GgmlType::Q4_K);
-        assert_eq!(tensor_type_fallback(GgmlType::Q4_0, 32).unwrap(), GgmlType::Q4_0);
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q5_K, 512).unwrap(),
+            GgmlType::Q5_K
+        );
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q4_K, 256).unwrap(),
+            GgmlType::Q4_K
+        );
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q4_0, 32).unwrap(),
+            GgmlType::Q4_0
+        );
     }
 
     #[test]
     fn fallback_q4_k_to_q5_0() {
-        assert_eq!(tensor_type_fallback(GgmlType::Q4_K, 128).unwrap(), GgmlType::Q5_0);
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q4_K, 128).unwrap(),
+            GgmlType::Q5_0
+        );
     }
 
     #[test]
     fn fallback_q5_k_to_q5_1() {
-        assert_eq!(tensor_type_fallback(GgmlType::Q5_K, 160).unwrap(), GgmlType::Q5_1);
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q5_K, 160).unwrap(),
+            GgmlType::Q5_1
+        );
     }
 
     #[test]
     fn fallback_q6_k_to_q8_0() {
-        assert_eq!(tensor_type_fallback(GgmlType::Q6_K, 96).unwrap(), GgmlType::Q8_0);
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q6_K, 96).unwrap(),
+            GgmlType::Q8_0
+        );
     }
 
     #[test]
     fn fallback_q2_q3_to_q4_0() {
-        assert_eq!(tensor_type_fallback(GgmlType::Q2_K, 128).unwrap(), GgmlType::Q4_0);
-        assert_eq!(tensor_type_fallback(GgmlType::Q3_K, 64).unwrap(), GgmlType::Q4_0);
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q2_K, 128).unwrap(),
+            GgmlType::Q4_0
+        );
+        assert_eq!(
+            tensor_type_fallback(GgmlType::Q3_K, 64).unwrap(),
+            GgmlType::Q4_0
+        );
     }
 
     #[test]

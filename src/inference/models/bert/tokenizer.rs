@@ -192,7 +192,11 @@ fn preprocess_words(text: &str) -> Vec<String> {
         // the append branch).
         let lower: String = c.to_lowercase().collect();
         if c.is_ascii_punctuation()
-            || (c.is_ascii() && (c as u32) < 0x7F && c.is_ascii_graphic() && !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace())
+            || (c.is_ascii()
+                && (c as u32) < 0x7F
+                && c.is_ascii_graphic()
+                && !c.is_ascii_alphanumeric()
+                && !c.is_ascii_whitespace())
         {
             // is_ascii_punctuation already covers ., ?, !, etc. The
             // second clause re-checks for ASCII symbols outside
@@ -254,15 +258,21 @@ impl BertSpecialTokens {
             gguf.metadata_u32(key)
                 .ok_or_else(|| anyhow!("GGUF missing u32 metadata '{}'", key))
         };
-        let cls = read("tokenizer.ggml.cls_token_id")
-            .or_else(|_| read("tokenizer.ggml.bos_token_id"))?;
+        let cls =
+            read("tokenizer.ggml.cls_token_id").or_else(|_| read("tokenizer.ggml.bos_token_id"))?;
         let sep = read("tokenizer.ggml.seperator_token_id")
             .or_else(|_| read("tokenizer.ggml.separator_token_id"))
             .or_else(|_| read("tokenizer.ggml.eos_token_id"))?;
         let pad = read("tokenizer.ggml.padding_token_id")?;
         let unk = read("tokenizer.ggml.unknown_token_id")?;
         let mask = read("tokenizer.ggml.mask_token_id").unwrap_or(unk);
-        Ok(BertSpecialTokens { cls, sep, pad, unk, mask })
+        Ok(BertSpecialTokens {
+            cls,
+            sep,
+            pad,
+            unk,
+            mask,
+        })
     }
 }
 
@@ -290,9 +300,9 @@ impl BertVocab {
         };
         let mut tokens: Vec<String> = Vec::with_capacity(arr.len());
         for (i, v) in arr.iter().enumerate() {
-            let s = v.as_str().ok_or_else(|| {
-                anyhow!("tokenizer.ggml.tokens[{}] is not a string", i)
-            })?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| anyhow!("tokenizer.ggml.tokens[{}] is not a string", i))?;
             tokens.push(s.to_string());
         }
         if tokens.is_empty() {
@@ -542,11 +552,7 @@ mod tests {
     fn wordpiece_tokenizer_handles_subword_continuation_prefix() {
         // Verify the continuing_subword_prefix "##" is configured so
         // tokens like "##ing" resolve.
-        let tokens: Vec<String> = vec![
-            "[UNK]".into(),
-            "play".into(),
-            "##ing".into(),
-        ];
+        let tokens: Vec<String> = vec!["[UNK]".into(), "play".into(), "##ing".into()];
         let vocab = BertVocab {
             tokens,
             specials: BertSpecialTokens {
@@ -570,9 +576,7 @@ mod tests {
     /// llama.cpp's BERT path; subwords might or might not have `##`.
     #[test]
     fn bge_small_vocab_format_diagnostic() {
-        let path = std::path::Path::new(
-            "/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf",
-        );
+        let path = std::path::Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
         if !path.exists() {
             eprintln!("skipping: bge GGUF not on disk");
             return;
@@ -582,11 +586,7 @@ mod tests {
         // Print key indices: [PAD], [UNK], [CLS], [SEP], "hello"=7592,
         // "world"=2088, and a few sample subword indices.
         for &idx in &[0u32, 100, 101, 102, 1000, 2088, 3000, 7592, 10000, 11108] {
-            eprintln!(
-                "vocab[{:5}] = {:?}",
-                idx,
-                vocab.tokens.get(idx as usize)
-            );
+            eprintln!("vocab[{:5}] = {:?}", idx, vocab.tokens.get(idx as usize));
         }
         // Count how many tokens start with ▁ vs how many start with ## vs
         // bare. Tells us the prefix convention at a glance.
@@ -628,9 +628,7 @@ mod tests {
     ///    2408, 6645, 102]
     #[test]
     fn bge_small_tokenizer_matches_llama_cpp_on_long_prompt() {
-        let path = std::path::Path::new(
-            "/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf",
-        );
+        let path = std::path::Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
         if !path.exists() {
             eprintln!("skipping: bge GGUF not on disk");
             return;
@@ -647,7 +645,8 @@ mod tests {
             102,
         ];
         assert_eq!(
-            ids, expected,
+            ids,
+            expected,
             "long-prompt tokenization mismatch ({} hf2q vs {} llama tokens)",
             ids.len(),
             expected.len(),
@@ -656,9 +655,7 @@ mod tests {
 
     #[test]
     fn bge_small_tokenizer_matches_llama_cpp_on_hello_world() {
-        let path = std::path::Path::new(
-            "/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf",
-        );
+        let path = std::path::Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
         if !path.exists() {
             eprintln!("skipping: bge GGUF not on disk at {}", path.display());
             return;

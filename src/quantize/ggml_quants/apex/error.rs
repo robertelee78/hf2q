@@ -39,10 +39,7 @@ pub enum ApexError {
         "Apex tier requires an MoE model (n_expert > 1); got `{arch}` with \
          n_expert={n_expert}. Use `--quant q5_k_m` or similar for dense models"
     )]
-    DenseModelNotSupported {
-        arch: &'static str,
-        n_expert: u32,
-    },
+    DenseModelNotSupported { arch: &'static str, n_expert: u32 },
 
     /// The named tier string didn't match any known `ApexTier`
     /// variant. v1 supported tiers per ADR §"Decision §6":
@@ -88,9 +85,7 @@ pub enum ApexError {
     /// `layer_index >= n_layers`. Apex's per-layer table runs from
     /// `0..n_layers`; an out-of-range layer index is a bug at the
     /// dispatcher.
-    #[error(
-        "tensor `{name}` has layer_index={layer_index} but n_layers={n_layers}"
-    )]
+    #[error("tensor `{name}` has layer_index={layer_index} but n_layers={n_layers}")]
     LayerIndexOutOfRange {
         name: String,
         layer_index: usize,
@@ -123,9 +118,7 @@ pub enum ApexError {
     /// A mudler config file failed to parse — either a malformed
     /// line (missing `=`) or an unknown `GgmlType` token. Carries the
     /// source-relative line number for easy bisection.
-    #[error(
-        "mudler config parse error at {source_path}:{line_number}: {detail}"
-    )]
+    #[error("mudler config parse error at {source_path}:{line_number}: {detail}")]
     MudlerConfigParse {
         source_path: String,
         line_number: usize,
@@ -200,8 +193,8 @@ mod p7_ac3_hint_tests {
     //! tests below `.to_string()` each variant and substring-match the
     //! hint text.
 
-    use super::*;
     use super::super::arches::SUPPORTED_APEX_ARCHES;
+    use super::*;
 
     #[test]
     fn p7_ac3_unsupported_arch_lists_supported() {
@@ -224,8 +217,14 @@ mod p7_ac3_hint_tests {
             n_expert: 1,
         }
         .to_string();
-        assert!(msg.contains("MoE"), "msg should explain MoE requirement: {msg}");
-        assert!(msg.contains("q5_k_m"), "msg should suggest dense fallback: {msg}");
+        assert!(
+            msg.contains("MoE"),
+            "msg should explain MoE requirement: {msg}"
+        );
+        assert!(
+            msg.contains("q5_k_m"),
+            "msg should suggest dense fallback: {msg}"
+        );
     }
 
     #[test]
@@ -236,7 +235,10 @@ mod p7_ac3_hint_tests {
         }
         .to_string();
         assert!(msg.contains("nano"), "msg should echo bad tier: {msg}");
-        assert!(msg.contains("balanced"), "msg should list supported tiers: {msg}");
+        assert!(
+            msg.contains("balanced"),
+            "msg should list supported tiers: {msg}"
+        );
         assert!(
             msg.contains("apex-custom"),
             "msg should mention apex-custom escape hatch: {msg}"
@@ -318,8 +320,14 @@ mod p7_ac3_hint_tests {
             detail: "missing `=` separator".to_string(),
         }
         .to_string();
-        assert!(msg.contains("foo.txt:42"), "msg should locate at file:line: {msg}");
-        assert!(msg.contains("missing `=`"), "msg should carry detail: {msg}");
+        assert!(
+            msg.contains("foo.txt:42"),
+            "msg should locate at file:line: {msg}"
+        );
+        assert!(
+            msg.contains("missing `=`"),
+            "msg should carry detail: {msg}"
+        );
     }
 
     #[test]
@@ -350,7 +358,10 @@ mod p7_ac3_hint_tests {
             supported_for_imatrix: &["qwen3moe", "qwen35moe", "gemma4"],
         }
         .to_string();
-        assert!(msg.contains("i-balanced"), "msg should echo bad tier: {msg}");
+        assert!(
+            msg.contains("i-balanced"),
+            "msg should echo bad tier: {msg}"
+        );
         assert!(msg.contains("gemma4"), "msg should echo arch: {msg}");
         assert!(
             msg.contains("--imatrix-corpus") && msg.contains("cdv3"),

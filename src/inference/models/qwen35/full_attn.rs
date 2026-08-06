@@ -364,10 +364,7 @@ mod tests {
     /// Build a tiny synthetic weight set with known deterministic values for
     /// exercising the CPU reference. Small dims keep the hand-verified
     /// arithmetic tractable.
-    fn synthetic_weights(
-        shape: FullAttnShape,
-        seed: u32,
-    ) -> FullAttnLayerWeights {
+    fn synthetic_weights(shape: FullAttnShape, seed: u32) -> FullAttnLayerWeights {
         let h = shape.hidden_size as usize;
         let nh = shape.n_head as usize;
         let nkv = shape.n_kv as usize;
@@ -380,9 +377,7 @@ mod tests {
             *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
             ((*seed as i32 as f32) / (i32::MAX as f32)) * 0.2
         };
-        let mk = |seed: &mut u32, n: usize| -> Vec<f32> {
-            (0..n).map(|_| step(seed)).collect()
-        };
+        let mk = |seed: &mut u32, n: usize| -> Vec<f32> { (0..n).map(|_| step(seed)).collect() };
         let mk_norm = |seed: &mut u32, n: usize| -> Vec<f32> {
             (0..n).map(|_| 1.0 + (step(seed) * 0.1)).collect()
         };
@@ -484,7 +479,10 @@ mod tests {
                 assert!(
                     d < 1e-5,
                     "causal violation at token {}, dim {}: base={}, pert={}",
-                    t, j, out_base[t * h + j], out_pert[t * h + j]
+                    t,
+                    j,
+                    out_base[t * h + j],
+                    out_pert[t * h + j]
                 );
             }
         }
@@ -496,7 +494,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_diff, "perturbation at token 3 had no effect on token 3 output");
+        assert!(
+            any_diff,
+            "perturbation at token 3 had no effect on token 3 output"
+        );
     }
 
     /// Sigmoid gate vs. no gate: with gate=0 (all weights set to produce
@@ -553,8 +554,7 @@ mod tests {
         for v in weights2.w_gate.iter_mut() {
             *v = 10.0; // produces large positive pre-sigmoid values
         }
-        let out_big_gate =
-            gated_full_attention_cpu_ref(&x, &positions, &weights2, shape);
+        let out_big_gate = gated_full_attention_cpu_ref(&x, &positions, &weights2, shape);
 
         // Ratio check: each output pair should be roughly 2x — not exactly
         // because the gate value depends on x_norm @ w_gate which varies
@@ -569,7 +569,10 @@ mod tests {
                 assert!(
                     ratio.abs() > 1.5 && ratio.abs() < 2.5,
                     "gate-scaling ratio at {} = {} (zero={}, big={})",
-                    i, ratio, zero, big
+                    i,
+                    ratio,
+                    zero,
+                    big
                 );
             }
         }

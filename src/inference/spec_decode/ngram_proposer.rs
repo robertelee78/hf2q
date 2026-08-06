@@ -37,7 +37,12 @@ impl NgramConfig {
     /// Default per ADR-028 iter-99 vLLM/dflash literature (K=3 optimal,
     /// n-grams 1..3 covering most natural-language repetitions).
     pub fn default_for_decode(max_model_len: usize) -> Self {
-        Self { min_ngram: 1, max_ngram: 3, k: 3, max_model_len }
+        Self {
+            min_ngram: 1,
+            max_ngram: 3,
+            k: 3,
+            max_model_len,
+        }
     }
 }
 
@@ -145,7 +150,12 @@ mod tests {
     use super::*;
 
     fn cfg(min_n: usize, max_n: usize, k: usize) -> NgramConfig {
-        NgramConfig { min_ngram: min_n, max_ngram: max_n, k, max_model_len: 4096 }
+        NgramConfig {
+            min_ngram: min_n,
+            max_ngram: max_n,
+            k,
+            max_model_len: 4096,
+        }
     }
 
     #[test]
@@ -237,7 +247,10 @@ mod tests {
     #[test]
     fn propose_zero_max_ngram_returns_empty() {
         let bad_cfg = NgramConfig {
-            min_ngram: 0, max_ngram: 0, k: 3, max_model_len: 4096,
+            min_ngram: 0,
+            max_ngram: 0,
+            k: 3,
+            max_model_len: 4096,
         };
         assert!(propose(&[1, 2, 3], &bad_cfg).is_empty());
     }
@@ -245,7 +258,10 @@ mod tests {
     #[test]
     fn propose_k_zero_returns_empty() {
         let bad_cfg = NgramConfig {
-            min_ngram: 1, max_ngram: 3, k: 0, max_model_len: 4096,
+            min_ngram: 1,
+            max_ngram: 3,
+            k: 0,
+            max_model_len: 4096,
         };
         assert!(propose(&[1, 2, 3], &bad_cfg).is_empty());
     }
@@ -262,11 +278,14 @@ mod tests {
     /// Pseudo-random token generator for the bench fixtures.
     fn rand_tokens(seed: u64, n: usize, vocab: u32) -> Vec<u32> {
         let mut state = seed;
-        (0..n).map(|_| {
-            state = state.wrapping_mul(6364136223846793005)
-                          .wrapping_add(1442695040888963407);
-            ((state >> 33) as u32) % vocab
-        }).collect()
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as u32) % vocab
+            })
+            .collect()
     }
 
     /// Microbench: confirm proposer CPU cost is sub-µs at realistic
@@ -288,14 +307,19 @@ mod tests {
         // KMP actually runs (vs early-returning when tokens.len() ==
         // max_model_len triggers k_room == 0).
         let cfg = NgramConfig {
-            min_ngram: 1, max_ngram: 3, k: 3, max_model_len: 16_384,
+            min_ngram: 1,
+            max_ngram: 3,
+            k: 3,
+            max_model_len: 16_384,
         };
         let lengths = [128usize, 512, 1024, 2048, 4096, 8192];
 
         for &n in &lengths {
             let tokens = rand_tokens(0xCAFE_BEEF, n, 256);
             // Warmup — primes branch predictor + cache.
-            for _ in 0..100 { let _ = propose(&tokens, &cfg); }
+            for _ in 0..100 {
+                let _ = propose(&tokens, &cfg);
+            }
 
             // Time 1000 iterations to get stable nanosecond p50.
             let mut samples: Vec<u128> = Vec::with_capacity(1000);
@@ -308,8 +332,10 @@ mod tests {
             let p50 = samples[500];
             let p99 = samples[990];
 
-            eprintln!("[BENCH iter-115] propose len={:5} p50={:6} ns p99={:6} ns",
-                      n, p50, p99);
+            eprintln!(
+                "[BENCH iter-115] propose len={:5} p50={:6} ns p99={:6} ns",
+                n, p50, p99
+            );
 
             // Falsifier: at any reasonable length, propose must be
             // <100 µs (= 100,000 ns). At 16 µs/dispatch, even one

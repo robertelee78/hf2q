@@ -65,11 +65,12 @@ impl MudlerConfig {
                 continue;
             }
             let (name, tyname) =
-                line.split_once('=').ok_or_else(|| ApexError::MudlerConfigParse {
-                    source_path: source_path.to_string(),
-                    line_number: lineno + 1,
-                    detail: format!("missing `=` separator in `{line}`"),
-                })?;
+                line.split_once('=')
+                    .ok_or_else(|| ApexError::MudlerConfigParse {
+                        source_path: source_path.to_string(),
+                        line_number: lineno + 1,
+                        detail: format!("missing `=` separator in `{line}`"),
+                    })?;
             let name = name.trim().to_string();
             let tyname = tyname.trim();
             let ggml = GgmlType::from_name(tyname).ok_or_else(|| ApexError::MudlerConfigParse {
@@ -91,10 +92,7 @@ impl MudlerConfig {
                 }
             }
         }
-        Ok(Self {
-            map,
-            source_path,
-        })
+        Ok(Self { map, source_path })
     }
 
     /// Look up one tensor name in the parsed map.
@@ -168,8 +166,12 @@ fn cache_slot(path: &'static str) -> &'static OnceLock<Result<MudlerConfig, Apex
     // total cardinality is small (≤21 v1 entries) and the key set is
     // closed at compile time.
     use std::sync::Mutex;
-    static SLOTS: Mutex<Vec<(&'static str, &'static OnceLock<Result<MudlerConfig, ApexError>>)>> =
-        Mutex::new(Vec::new());
+    static SLOTS: Mutex<
+        Vec<(
+            &'static str,
+            &'static OnceLock<Result<MudlerConfig, ApexError>>,
+        )>,
+    > = Mutex::new(Vec::new());
     let mut slots = SLOTS.lock().unwrap();
     if let Some((_, slot)) = slots.iter().find(|(p, _)| *p == path) {
         return slot;
@@ -205,12 +207,11 @@ pub fn load_mudler_config(entry: &ApexConfigRef) -> Result<&'static MudlerConfig
             mudler_config_path: entry.mudler_config_path.clone(),
         })?;
 
-    let content = vendor_config_content(static_path).ok_or_else(|| {
-        ApexError::FingerprintConfigMissing {
+    let content =
+        vendor_config_content(static_path).ok_or_else(|| ApexError::FingerprintConfigMissing {
             fingerprint: entry.fingerprint.clone(),
             mudler_config_path: entry.mudler_config_path.clone(),
-        }
-    })?;
+        })?;
 
     let slot = cache_slot(static_path);
     let result = slot.get_or_init(|| MudlerConfig::parse(content, static_path));
@@ -232,11 +233,10 @@ mod tests {
     /// tensor names carry `.weight`, mudler omits it.
     #[test]
     fn parse_gemma4_balanced_layer_5_routed_expert() {
-        let content =
-            super::super::fingerprint::vendor_config_content(
-                "vendor/apex-quant/configs/gemma4_26b_balanced.txt",
-            )
-            .expect("baked vendor content present");
+        let content = super::super::fingerprint::vendor_config_content(
+            "vendor/apex-quant/configs/gemma4_26b_balanced.txt",
+        )
+        .expect("baked vendor content present");
         let cfg = MudlerConfig::parse(content, "test").unwrap();
         // Bare key (exact-match path).
         assert_eq!(

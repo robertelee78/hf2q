@@ -140,7 +140,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
             Some("1")
         );
         let body = body_string(resp).await;
@@ -307,7 +309,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
-            resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
             Some("client-supplied-id-42")
         );
     }
@@ -488,8 +492,7 @@ mod tests {
         // return model_not_loaded. The grammar pre-compile kicks in only
         // after engine-gate passes; this is the documented ordering.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["error"]["code"], "model_not_loaded");
     }
 
@@ -517,8 +520,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         // Engine-gate runs first; test doesn't depend on which gate hits.
         assert!(
             v["error"]["code"] == "model_not_loaded",
@@ -543,8 +545,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["error"]["code"], "model_not_loaded");
     }
 
@@ -745,7 +746,8 @@ mod tests {
             "missing TYPE line for hf2q_pool_loaded_models; body:\n{body}"
         );
         assert!(
-            body.lines().any(|l| l.trim() == "hf2q_pool_loaded_models 0"),
+            body.lines()
+                .any(|l| l.trim() == "hf2q_pool_loaded_models 0"),
             "expected `hf2q_pool_loaded_models 0` line; body:\n{body}"
         );
 
@@ -759,7 +761,8 @@ mod tests {
             "missing TYPE line for hf2q_pool_resident_bytes; body:\n{body}"
         );
         assert!(
-            body.lines().any(|l| l.trim() == "hf2q_pool_resident_bytes 0"),
+            body.lines()
+                .any(|l| l.trim() == "hf2q_pool_resident_bytes 0"),
             "expected `hf2q_pool_resident_bytes 0` line; body:\n{body}"
         );
 
@@ -778,14 +781,14 @@ mod tests {
         let budget_line = body
             .lines()
             .find(|l| l.starts_with("hf2q_pool_memory_budget_bytes "))
-            .unwrap_or_else(|| panic!("expected hf2q_pool_memory_budget_bytes line; body:\n{body}"));
+            .unwrap_or_else(|| {
+                panic!("expected hf2q_pool_memory_budget_bytes line; body:\n{body}")
+            });
         let budget_val: u64 = budget_line
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                panic!("could not parse u64 from {budget_line:?}; body:\n{body}")
-            });
+            .unwrap_or_else(|| panic!("could not parse u64 from {budget_line:?}; body:\n{body}"));
         // The synthetic test budget is non-zero; production reads
         // `from_hardware` (80% of unified RAM).  Either way, > 0 here
         // proves the gauge wired through `pool_stats()` correctly.
@@ -975,7 +978,8 @@ mod tests {
 
         // Pool-gauge no-regression smoke (iter-210 surface stays green).
         assert!(
-            body.lines().any(|l| l.trim() == "hf2q_pool_loaded_models 0"),
+            body.lines()
+                .any(|l| l.trim() == "hf2q_pool_loaded_models 0"),
             "iter-210 hf2q_pool_loaded_models 0 line regression; body:\n{body}"
         );
     }
@@ -1034,7 +1038,8 @@ mod tests {
         let resp2 = app2.oneshot(req2).await.unwrap();
         let body2 = body_string(resp2).await;
         // EnqueuedBlocks(7) → success counter = 1, NOT 7.
-        let needle_per_call = "hf2q_pool_kv_spills_total{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"success\"} 1";
+        let needle_per_call =
+            "hf2q_pool_kv_spills_total{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"success\"} 1";
         assert!(
             body2.contains(needle_per_call),
             "per-call NOT per-block: EnqueuedBlocks(7) must increment by 1 not 7; \
@@ -1350,7 +1355,8 @@ mod tests {
         // Confirm the loaded count reflects the synthetic admission.
         // The pool gauge line `hf2q_pool_loaded_models 1` MUST appear.
         assert!(
-            body.lines().any(|l| l.trim() == "hf2q_pool_loaded_models 1"),
+            body.lines()
+                .any(|l| l.trim() == "hf2q_pool_loaded_models 1"),
             "expected `hf2q_pool_loaded_models 1` line; got body: {body}"
         );
     }

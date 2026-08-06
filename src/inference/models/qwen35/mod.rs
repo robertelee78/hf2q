@@ -26,24 +26,24 @@ use anyhow::{anyhow, bail, Result};
 use mlx_native::gguf::{GgufFile, MetadataValue};
 
 pub mod activation_capture_real;
+pub mod chunk_allocs_arena;
 pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
-pub mod dump_bisect;
-pub(super) mod encoder_stage;
-pub mod chunk_allocs_arena;
 pub mod dense_ffn_arena;
 pub mod dn_prefill_arena;
+pub mod dump_bisect;
+pub(super) mod encoder_stage;
 pub mod fa_prefill_arena;
 pub mod fa_projections_arena;
 pub mod ffn;
 pub mod forward_cpu;
-pub mod in_memory_loader;
 pub mod forward_gpu;
 pub mod full_attn;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
+pub mod in_memory_loader;
 pub use chunk_allocs_arena::ChunkAllocsArena;
 pub use dense_ffn_arena::{
     DenseFfnArena, DenseFfnOutputRingBuffer, LayerBoundaryArena, MoeFfnArena,
@@ -122,9 +122,7 @@ pub const ARCH_QWEN3VLMOE_UPSTREAM: &str = "qwen3vlmoe";
 /// existing Qwen3.5 dense + MoE paths) and for unrelated arches like
 /// `gemma4`, `bert`, `nomic-bert`, etc.
 pub fn is_qwen3_vl_arch(arch: &str) -> bool {
-    arch == ARCH_QWEN3_VL
-        || arch == ARCH_QWEN3VL_UPSTREAM
-        || arch == ARCH_QWEN3VLMOE_UPSTREAM
+    arch == ARCH_QWEN3_VL || arch == ARCH_QWEN3VL_UPSTREAM || arch == ARCH_QWEN3VLMOE_UPSTREAM
 }
 
 /// True iff a Qwen3-VL `general.architecture` string identifies the
@@ -242,7 +240,7 @@ pub struct Qwen35Config {
     // --- Misc runtime flags ---
     pub max_position_embeddings: u32,
     pub vocab_size: u32,
-    pub attn_output_gate: bool, // true for Qwen3.5
+    pub attn_output_gate: bool,     // true for Qwen3.5
     pub mtp_num_hidden_layers: u32, // 0 if MTP absent (apex GGUF case)
     /// Whether the MTP NextN block carries its own dedicated `embed_tokens` table.
     ///
@@ -267,13 +265,21 @@ pub struct Qwen35Config {
 // ---------------------------------------------------------------------
 
 fn required_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
-    gguf.metadata_u32(key)
-        .ok_or_else(|| anyhow!("qwen35 config: required key '{}' missing or wrong type", key))
+    gguf.metadata_u32(key).ok_or_else(|| {
+        anyhow!(
+            "qwen35 config: required key '{}' missing or wrong type",
+            key
+        )
+    })
 }
 
 fn required_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
-    gguf.metadata_f32(key)
-        .ok_or_else(|| anyhow!("qwen35 config: required key '{}' missing or wrong type", key))
+    gguf.metadata_f32(key).ok_or_else(|| {
+        anyhow!(
+            "qwen35 config: required key '{}' missing or wrong type",
+            key
+        )
+    })
 }
 
 fn required_i32_array_4(gguf: &GgufFile, key: &str) -> Result<[u32; 4]> {
@@ -529,8 +535,7 @@ impl Qwen35Config {
             }
             Qwen35Variant::Moe => {
                 let num_experts = required_u32(gguf, &format!("{p}.expert_count"))?;
-                let num_experts_per_tok =
-                    required_u32(gguf, &format!("{p}.expert_used_count"))?;
+                let num_experts_per_tok = required_u32(gguf, &format!("{p}.expert_used_count"))?;
                 let moe_intermediate_size =
                     required_u32(gguf, &format!("{p}.expert_feed_forward_length"))?;
                 let shared_expert_intermediate_size =
@@ -617,7 +622,10 @@ mod tests {
 
     #[test]
     fn variant_from_arch() {
-        assert_eq!(Qwen35Variant::from_arch("qwen35"), Some(Qwen35Variant::Dense));
+        assert_eq!(
+            Qwen35Variant::from_arch("qwen35"),
+            Some(Qwen35Variant::Dense)
+        );
         assert_eq!(
             Qwen35Variant::from_arch("qwen35moe"),
             Some(Qwen35Variant::Moe)
@@ -645,8 +653,14 @@ mod tests {
         assert_eq!(
             &lt[..8],
             &[
-                LinearAttention, LinearAttention, LinearAttention, FullAttention,
-                LinearAttention, LinearAttention, LinearAttention, FullAttention,
+                LinearAttention,
+                LinearAttention,
+                LinearAttention,
+                FullAttention,
+                LinearAttention,
+                LinearAttention,
+                LinearAttention,
+                FullAttention,
             ]
         );
     }
@@ -1003,7 +1017,11 @@ mod tests {
             stddev
         );
         // Typical attention-gate weights have small magnitudes; sanity bound.
-        assert!(stddev < 10.0, "Q5_K dequant stddev absurdly large: {}", stddev);
+        assert!(
+            stddev < 10.0,
+            "Q5_K dequant stddev absurdly large: {}",
+            stddev
+        );
 
         eprintln!(
             "blk.0.attn_gate.weight (Q5_K → f32): count={}, mean={:.6}, stddev={:.6}",

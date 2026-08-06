@@ -189,10 +189,7 @@ pub fn classify_moe_tensor(arch: ArchName, name: &str) -> MoeTensorRole {
 pub const fn is_apex_supported_arch(arch: ArchName) -> bool {
     matches!(
         arch,
-        ArchName::Qwen35Moe
-            | ArchName::Qwen35MoeFull
-            | ArchName::Gemma4
-            | ArchName::MiniMaxM2
+        ArchName::Qwen35Moe | ArchName::Qwen35MoeFull | ArchName::Gemma4 | ArchName::MiniMaxM2
     )
 }
 
@@ -202,7 +199,11 @@ mod tests {
 
     #[test]
     fn classify_routed_expert() {
-        for suffix in ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"] {
+        for suffix in [
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        ] {
             let name = format!("blk.5.{suffix}");
             assert_eq!(
                 classify_moe_tensor(ArchName::Qwen35Moe, &name),

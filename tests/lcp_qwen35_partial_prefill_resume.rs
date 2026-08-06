@@ -139,16 +139,14 @@ impl Drop for ServerGuard {
 
 impl ServerGuard {
     fn log_tail(&self) -> Vec<String> {
-        self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
-fn spawn_server(
-    bin: &Path,
-    model: &Path,
-    port: u16,
-    extra_envs: &[(&str, &str)],
-) -> ServerGuard {
+fn spawn_server(bin: &Path, model: &Path, port: u16, extra_envs: &[(&str, &str)]) -> ServerGuard {
     let mut cmd = Command::new(bin);
     cmd.args([
         "serve",
@@ -210,9 +208,9 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()
@@ -371,15 +369,14 @@ fn phase_b2c_lcp_resume_vs_fresh_prefill_byte_identity() {
         }
     };
     let bin = hf2q_binary_path();
-    assert!(bin.exists(), "[Phase B.2c] hf2q binary not found at {:?}", bin);
+    assert!(
+        bin.exists(),
+        "[Phase B.2c] hf2q binary not found at {:?}",
+        bin
+    );
 
     // ── Spawn both servers ──
-    let server_a = spawn_server(
-        &bin,
-        &model_path,
-        PORT_A,
-        &[("HF2Q_KV_LCP_RESUME", "1")],
-    );
+    let server_a = spawn_server(&bin, &model_path, PORT_A, &[("HF2Q_KV_LCP_RESUME", "1")]);
     wait_for_readyz(&server_a);
     let canonical_a = fetch_canonical_model_id(&server_a);
     eprintln!(
@@ -463,18 +460,12 @@ fn phase_b2c_lcp_resume_vs_fresh_prefill_byte_identity() {
     // ran fresh prefill, and B.2a chunked-vs-monolithic byte-identity
     // covers that case.
     let a_log = server_a.log_tail();
-    let resume_engaged = a_log
-        .iter()
-        .any(|l| l.contains("[hf2q qwen35 lcp resume]"));
-    let probe_partial = a_log
-        .iter()
-        .any(|l| l.contains("PARTIAL HIT"));
+    let resume_engaged = a_log.iter().any(|l| l.contains("[hf2q qwen35 lcp resume]"));
+    let probe_partial = a_log.iter().any(|l| l.contains("PARTIAL HIT"));
     let probe_ran = a_log
         .iter()
         .any(|l| l.contains("[hf2q qwen35 lcp probe] enabled"));
-    let store_fired = a_log
-        .iter()
-        .any(|l| l.contains("[hf2q qwen35 lcp store]"));
+    let store_fired = a_log.iter().any(|l| l.contains("[hf2q qwen35 lcp store]"));
     eprintln!(
         "[Phase B.2c] LCP path observability: \
          resume_engaged={resume_engaged}, partial_hit={probe_partial}, \

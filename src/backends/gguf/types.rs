@@ -159,9 +159,9 @@ pub fn write_metadata_kv<W: Write>(w: &mut W, key: &str, value: &MetaValue) -> I
             w.write_all(&GGUF_TYPE_FLOAT64.to_le_bytes())?;
             w.write_all(&v.to_le_bytes())?;
         }
-        MetaValue::ArrayU8(arr) => write_array(w, GGUF_TYPE_UINT8, arr.len(), |w| {
-            w.write_all(arr)
-        })?,
+        MetaValue::ArrayU8(arr) => {
+            write_array(w, GGUF_TYPE_UINT8, arr.len(), |w| w.write_all(arr))?
+        }
         MetaValue::ArrayI8(arr) => write_array(w, GGUF_TYPE_INT8, arr.len(), |w| {
             for &v in arr {
                 w.write_all(&v.to_le_bytes())?;
@@ -272,10 +272,7 @@ mod tests {
         let mut buf = Vec::new();
         write_gguf_string(&mut buf, "hi").unwrap();
         // u64 LE length (2) + "hi"
-        assert_eq!(
-            buf,
-            vec![2, 0, 0, 0, 0, 0, 0, 0, b'h', b'i']
-        );
+        assert_eq!(buf, vec![2, 0, 0, 0, 0, 0, 0, 0, b'h', b'i']);
     }
 
     #[test]
@@ -294,8 +291,12 @@ mod tests {
     #[test]
     fn write_kv_string() {
         let mut buf = Vec::new();
-        write_metadata_kv(&mut buf, "general.architecture", &MetaValue::String("llama".into()))
-            .unwrap();
+        write_metadata_kv(
+            &mut buf,
+            "general.architecture",
+            &MetaValue::String("llama".into()),
+        )
+        .unwrap();
         // key u64-len + key + type=8 + val u64-len + val
         let mut expected = Vec::new();
         expected.extend_from_slice(&(20u64).to_le_bytes());

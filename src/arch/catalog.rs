@@ -128,8 +128,7 @@ impl TensorCatalog {
                         names.push(e.name_template.replace("{L}", &l.to_string()));
                     }
                 }
-                LayerScope::FullAttentionLayersOnly
-                | LayerScope::LinearAttentionLayersOnly => {
+                LayerScope::FullAttentionLayersOnly | LayerScope::LinearAttentionLayersOnly => {
                     // Caller must filter by known layer kinds; expansion inserts indices
                     // for every block and downstream matchers filter by kind.
                     for l in 0..exp.num_hidden_layers {

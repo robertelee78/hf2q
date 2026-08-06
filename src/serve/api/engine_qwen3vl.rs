@@ -35,13 +35,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use tokenizers::Tokenizer;
 
+use crate::core::provenance::{self, Provenance};
 use crate::inference::models::qwen3vl_text::forward::forward_text_prefill_logits_last;
 use crate::inference::models::qwen3vl_text::Qwen3VlTextModel;
 use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, TokenizerSource,
 };
-use crate::core::provenance::{self, Provenance};
 use crate::serve::sampler_pure::{self, SamplingParams as SamplerPureParams};
 
 use super::engine::{effective_repetition_penalty, GenerationResult, LoadOptions, SamplingParams};
@@ -174,10 +174,7 @@ impl Qwen3VlTextLoadedModel {
     /// [`crate::serve::api::engine::EngineSpawnError::ModeNotYetWired`]
     /// at the API boundary BEFORE this method runs, so this is
     /// defense-in-depth.
-    pub fn provision_multi_seq_kv_for_slot_aware(
-        &mut self,
-        max_slots: u32,
-    ) -> Result<()> {
+    pub fn provision_multi_seq_kv_for_slot_aware(&mut self, max_slots: u32) -> Result<()> {
         if max_slots == 0 {
             anyhow::bail!(
                 "ADR-040 C2e: provision_multi_seq_kv_for_slot_aware called with \
@@ -319,8 +316,7 @@ impl Qwen3VlTextLoadedModel {
         // or a downstream weight-load shape error. Iter-228a's
         // synthetic-GGUF dispatch tests assert on this parser-error
         // shape.
-        let cfg_preview =
-            Qwen3VlTextModel::load_config_only(&gguf).context("config preview")?;
+        let cfg_preview = Qwen3VlTextModel::load_config_only(&gguf).context("config preview")?;
 
         // ---- Tokenizer path ----
         // Qwen3-VL ships GGUF metadata `tokenizer.ggml.pre = 'default'`
@@ -359,8 +355,12 @@ impl Qwen3VlTextLoadedModel {
         // family's `tokenizer.ggml.pre = 'default'` (qwen35-specific
         // regex; see qwen35/tokenizer.rs:118). Loading the HF
         // tokenizer.json is the simpler + safer path.
-        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer.json from {}: {e}", tokenizer_path.display()))?;
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load tokenizer.json from {}: {e}",
+                tokenizer_path.display()
+            )
+        })?;
         tokenizer
             .with_truncation(None)
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
@@ -542,11 +542,7 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 /// Sample one token from `logits` per `params`, with the standard
 /// repetition-penalty + temperature + top-p / top-k / min-p chain
 /// (`sampler_pure::sample_token`).
-fn sample_logits_qwen3vl(
-    logits: &mut [f32],
-    params: &SamplingParams,
-    generated: &[u32],
-) -> u32 {
+fn sample_logits_qwen3vl(logits: &mut [f32], params: &SamplingParams, generated: &[u32]) -> u32 {
     let sp = SamplerPureParams {
         temperature: params.temperature as f64,
         top_p: params.top_p as f64,
@@ -564,10 +560,7 @@ fn sample_logits_qwen3vl(
 /// stripped — the EOS check happens before this point so any visible
 /// special tokens are mid-stream artifacts the chat template chose to
 /// expose).
-fn decode_to_text(
-    tokenizer: &Tokenizer,
-    decoded_tokens: &[u32],
-) -> Result<String> {
+fn decode_to_text(tokenizer: &Tokenizer, decoded_tokens: &[u32]) -> Result<String> {
     tokenizer
         .decode(decoded_tokens, /* skip_special_tokens */ false)
         .map_err(|e| anyhow!("Qwen3-VL tokenizer decode: {e}"))
@@ -694,7 +687,7 @@ pub fn generate_qwen3vl_text_once(
         decode_duration,
         // iter-9b has no prompt cache wired; cached_tokens is always 0.
         cached_tokens: 0,
-            logprobs: None,
+        logprobs: None,
     })
 }
 
@@ -801,8 +794,7 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
         // Refill the prompt-side positions from positions_flat (axis-major).
         for axis in 0..4 {
             for t in 0..prompt_len {
-                current_positions[axis * total_len + t] =
-                    positions_flat[axis * prompt_len + t];
+                current_positions[axis * total_len + t] = positions_flat[axis * prompt_len + t];
             }
         }
         // Append the decoded-token positions: monotone after the last
@@ -879,6 +871,6 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
         prefill_duration,
         decode_duration,
         cached_tokens: 0,
-            logprobs: None,
+        logprobs: None,
     })
 }

@@ -136,10 +136,7 @@ fn decode_bf16_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>, Eagle3TensorsError
     Ok(out)
 }
 
-fn upload_bf16(
-    device: &MlxDevice,
-    view: &TensorView<'_>,
-) -> Result<MlxBuffer, Eagle3TensorsError> {
+fn upload_bf16(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, Eagle3TensorsError> {
     let shape: Vec<usize> = view.shape().to_vec();
     let byte_len = view.data().len();
     let mut buf = device.alloc_buffer(byte_len, DType::BF16, shape)?;
@@ -214,7 +211,10 @@ impl Eagle3DrafterTensors {
         };
         let fc = upload_bf16(device, fetch(weights, "fc.weight")?)?;
         let input_norm = if cfg.norm_before_fc {
-            Some(upload_bf16_as_f32(device, fetch(weights, "input_norm.weight")?)?)
+            Some(upload_bf16_as_f32(
+                device,
+                fetch(weights, "input_norm.weight")?,
+            )?)
         } else {
             None
         };
@@ -243,24 +243,18 @@ impl Eagle3DrafterTensors {
         };
 
         // --- Layer 0 ---
-        let input_layernorm = upload_bf16_as_f32(
-            device,
-            fetch(weights, "layers.0.input_layernorm.weight")?,
-        )?;
+        let input_layernorm =
+            upload_bf16_as_f32(device, fetch(weights, "layers.0.input_layernorm.weight")?)?;
         let hidden_norm =
             upload_bf16_as_f32(device, fetch(weights, "layers.0.hidden_norm.weight")?)?;
         let post_attention_layernorm = upload_bf16_as_f32(
             device,
             fetch(weights, "layers.0.post_attention_layernorm.weight")?,
         )?;
-        let q_proj =
-            upload_bf16(device, fetch(weights, "layers.0.self_attn.q_proj.weight")?)?;
-        let k_proj =
-            upload_bf16(device, fetch(weights, "layers.0.self_attn.k_proj.weight")?)?;
-        let v_proj =
-            upload_bf16(device, fetch(weights, "layers.0.self_attn.v_proj.weight")?)?;
-        let o_proj =
-            upload_bf16(device, fetch(weights, "layers.0.self_attn.o_proj.weight")?)?;
+        let q_proj = upload_bf16(device, fetch(weights, "layers.0.self_attn.q_proj.weight")?)?;
+        let k_proj = upload_bf16(device, fetch(weights, "layers.0.self_attn.k_proj.weight")?)?;
+        let v_proj = upload_bf16(device, fetch(weights, "layers.0.self_attn.v_proj.weight")?)?;
+        let o_proj = upload_bf16(device, fetch(weights, "layers.0.self_attn.o_proj.weight")?)?;
         let (q_norm, k_norm) = if cfg.use_qk_norm {
             (
                 Some(upload_bf16_as_f32(
@@ -302,12 +296,9 @@ impl Eagle3DrafterTensors {
         } else {
             (None, None, None, None)
         };
-        let mlp_gate =
-            upload_bf16(device, fetch(weights, "layers.0.mlp.gate_proj.weight")?)?;
-        let mlp_up =
-            upload_bf16(device, fetch(weights, "layers.0.mlp.up_proj.weight")?)?;
-        let mlp_down =
-            upload_bf16(device, fetch(weights, "layers.0.mlp.down_proj.weight")?)?;
+        let mlp_gate = upload_bf16(device, fetch(weights, "layers.0.mlp.gate_proj.weight")?)?;
+        let mlp_up = upload_bf16(device, fetch(weights, "layers.0.mlp.up_proj.weight")?)?;
+        let mlp_down = upload_bf16(device, fetch(weights, "layers.0.mlp.down_proj.weight")?)?;
 
         let tensors = Self {
             embed_tokens,
@@ -374,7 +365,12 @@ impl Eagle3DrafterTensors {
         }
         // Biases now cast to F32 at upload (matches add_bias_row_2d_f32
         // kernel input expectation).
-        for opt in [&tensors.q_bias, &tensors.k_bias, &tensors.v_bias, &tensors.o_bias] {
+        for opt in [
+            &tensors.q_bias,
+            &tensors.k_bias,
+            &tensors.v_bias,
+            &tensors.o_bias,
+        ] {
             if let Some(b) = opt {
                 debug_assert_eq!(b.dtype(), DType::F32);
             }
@@ -520,16 +516,12 @@ mod tests {
             storage.push(vec![0u8; nelem * elem_bytes]);
         }
         for (i, exp) in manifest.iter().enumerate() {
-            let view =
-                TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
-                    .expect("synthetic tensor view");
+            let view = TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
+                .expect("synthetic tensor view");
             tensors.insert(exp.name.clone(), view);
         }
-        safetensors::serialize(
-            &tensors,
-            None::<std::collections::HashMap<String, String>>,
-        )
-        .expect("serialize synthetic")
+        safetensors::serialize(&tensors, None::<std::collections::HashMap<String, String>>)
+            .expect("serialize synthetic")
     }
 
     /// Smaller config than qwen35_default so synthetic tests run fast.
@@ -569,12 +561,15 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_synthetic_safetensors(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights)
-            .expect("upload to GPU");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload to GPU");
         // Always-present tensors: fc, norm, layer norms (3), projections (4),
         // mlp (3) = 12.
         assert_eq!(tensors.fc.dtype(), DType::BF16);
-        assert_eq!(tensors.norm.dtype(), DType::F32, "norm cast to F32 on upload");
+        assert_eq!(
+            tensors.norm.dtype(),
+            DType::F32,
+            "norm cast to F32 on upload"
+        );
         assert_eq!(tensors.input_layernorm.dtype(), DType::F32);
         assert_eq!(tensors.hidden_norm.dtype(), DType::F32);
         assert_eq!(tensors.post_attention_layernorm.dtype(), DType::F32);
@@ -585,11 +580,7 @@ mod tests {
             "has_own_embed_tokens = true"
         );
         assert!(tensors.input_norm.is_none(), "norm_before_fc = false");
-        assert_eq!(
-            tensors.fc_norm.len(),
-            3,
-            "fc_norm = true, num_aux = 3"
-        );
+        assert_eq!(tensors.fc_norm.len(), 3, "fc_norm = true, num_aux = 3");
         assert!(tensors.q_norm.is_some(), "use_qk_norm = true");
         assert!(tensors.k_norm.is_some(), "use_qk_norm = true");
         assert!(tensors.q_bias.is_none(), "attention_bias = false");
@@ -618,8 +609,8 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_synthetic_safetensors(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights)
-            .expect("minimum-config upload");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("minimum-config upload");
         // All Option<MlxBuffer> fields should be None.
         assert!(tensors.embed_tokens.is_none());
         assert!(tensors.input_norm.is_none());
@@ -648,8 +639,8 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_synthetic_safetensors(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights)
-            .expect("maximum-config upload");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("maximum-config upload");
         assert!(tensors.embed_tokens.is_some());
         assert!(tensors.input_norm.is_some());
         assert_eq!(tensors.fc_norm.len(), cfg.num_aux_hidden_states);
@@ -673,10 +664,8 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_synthetic_safetensors(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let safetensors_data_bytes: usize =
-            weights.tensors.iter().map(|t| t.data().len()).sum();
-        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights)
-            .expect("upload to GPU");
+        let safetensors_data_bytes: usize = weights.tensors.iter().map(|t| t.data().len()).sum();
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload to GPU");
         // Test uses TOTAL bytes (gpu + cpu) since safetensors_data_bytes
         // counts the I64 mapping which is CPU-resident (codex /cfa
         // E4b.1 Minor 2026-05-22).

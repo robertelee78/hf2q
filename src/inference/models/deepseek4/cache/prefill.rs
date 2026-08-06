@@ -70,8 +70,7 @@ impl Deepseek4Cache {
                     compressed_write_start: compressed_before,
                     compressed_count,
                     compressed_valid_after,
-                    indexer_write_start: usize::from(layer.compress_ratio == 4)
-                        * compressed_before,
+                    indexer_write_start: usize::from(layer.compress_ratio == 4) * compressed_before,
                     indexer_count,
                     indexer_valid_after,
                 }

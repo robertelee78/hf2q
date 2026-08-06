@@ -176,11 +176,7 @@ pub struct MoeFfnShape {
 /// y_s = shared_down @ c_s
 /// output = moe_out + shared_gate_val * y_s
 /// ```
-pub fn moe_ffn_cpu_ref(
-    x: &[f32],
-    weights: &MoeFfnWeights,
-    shape: MoeFfnShape,
-) -> Vec<f32> {
+pub fn moe_ffn_cpu_ref(x: &[f32], weights: &MoeFfnWeights, shape: MoeFfnShape) -> Vec<f32> {
     let h = shape.hidden_size as usize;
     let ne = shape.num_experts as usize;
     let topk = shape.num_experts_per_tok as usize;
@@ -229,7 +225,9 @@ pub fn moe_ffn_cpu_ref(
         // Top-k selection by probability.
         let mut idx_sorted: Vec<usize> = (0..ne).collect();
         idx_sorted.sort_by(|a, b| {
-            probs[*b].partial_cmp(&probs[*a]).unwrap_or(std::cmp::Ordering::Equal)
+            probs[*b]
+                .partial_cmp(&probs[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         let topk_idx: Vec<usize> = idx_sorted[..topk].to_vec();
         let topk_probs: Vec<f32> = topk_idx.iter().map(|&i| probs[i]).collect();
@@ -416,7 +414,14 @@ mod tests {
             }
             for j in 0..4 {
                 let d = (out[t * 4 + j] - y[j]).abs();
-                assert!(d < 1e-5, "t={}, j={}: got {}, want {}", t, j, out[t * 4 + j], y[j]);
+                assert!(
+                    d < 1e-5,
+                    "t={}, j={}: got {}, want {}",
+                    t,
+                    j,
+                    out[t * 4 + j],
+                    y[j]
+                );
             }
         }
     }
@@ -530,7 +535,10 @@ mod tests {
             assert!(
                 d < 1e-3,
                 "gate linearity broken at {}: mid={}, avg_off_on={}, d={}",
-                i, out_mid[i], avg, d
+                i,
+                out_mid[i],
+                avg,
+                d
             );
         }
     }
@@ -638,7 +646,10 @@ mod tests {
             assert!(
                 d < 1e-5,
                 "at {}: got {}, expected {}, d {}",
-                i, out[i], expected[i], d
+                i,
+                out[i],
+                expected[i],
+                d
             );
         }
     }

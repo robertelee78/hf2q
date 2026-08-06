@@ -48,7 +48,8 @@ pub fn embed_tokens(
         assert!(
             tok_idx < vocab,
             "token id {} out of range (vocab_size = {})",
-            tok, vocab
+            tok,
+            vocab
         );
         let src = &token_embd[tok_idx * h..(tok_idx + 1) * h];
         out[t * h..(t + 1) * h].copy_from_slice(src);
@@ -118,16 +119,16 @@ pub fn greedy_argmax_last_token(logits: &[f32], vocab_size: u32) -> u32 {
     let v = vocab_size as usize;
     assert!(logits.len() >= v);
     let last = &logits[logits.len() - v..];
-    let (max_idx, _) = last
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best_i, best_v), (i, &v)| {
-            if v > best_v {
-                (i as u32, v)
-            } else {
-                (best_i, best_v)
-            }
-        });
+    let (max_idx, _) =
+        last.iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best_i, best_v), (i, &v)| {
+                if v > best_v {
+                    (i as u32, v)
+                } else {
+                    (best_i, best_v)
+                }
+            });
     max_idx
 }
 
@@ -207,7 +208,9 @@ mod tests {
             assert!(
                 (logits[j] - expected).abs() < 1e-5,
                 "token 0 dim {}: got {}, want {}",
-                j, logits[j], expected
+                j,
+                logits[j],
+                expected
             );
         }
         // Expected token 1: all 2.0 → normalized all = 2.0 * (1/sqrt(4 + eps)) = 2.0 * 0.5 = 1.0.
@@ -215,7 +218,8 @@ mod tests {
             assert!(
                 (logits[4 + j] - 1.0).abs() < 1e-5,
                 "token 1 dim {}: got {}",
-                j, logits[4 + j]
+                j,
+                logits[4 + j]
             );
         }
     }
@@ -238,7 +242,12 @@ mod tests {
         let l1 = apply_output_head(&hidden, &output_norm_w, &output_weight, h, v, 1e-6);
         let l2 = apply_output_head(&hidden, &output_norm_w, &output_weight, h, v, 1e-6);
         for i in 0..l1.len() {
-            assert_eq!(l1[i].to_bits(), l2[i].to_bits(), "non-deterministic at {}", i);
+            assert_eq!(
+                l1[i].to_bits(),
+                l2[i].to_bits(),
+                "non-deterministic at {}",
+                i
+            );
         }
     }
 

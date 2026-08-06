@@ -101,8 +101,8 @@ fn four_dots_png_path() -> PathBuf {
 /// Read PNG bytes → base64 → `data:image/png;base64,<...>` data URI.
 fn read_as_data_uri(path: &PathBuf, mime: &str) -> String {
     use base64::Engine;
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {path:?}: {e}"));
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|e| panic!("failed to read fixture {path:?}: {e}"));
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     format!("data:{mime};base64,{b64}")
 }
@@ -178,8 +178,21 @@ fn resolve_fixtures_or_skip(test_name: &str) -> Option<(String, String)> {
 /// these. This is the same image-aware bar Phase 2c iter-132 used for
 /// peer-precision-parity closure.
 const PEER_OVERLAP_WORDS: &[&str] = &[
-    "square", "squares", "frame", "corner", "corners", "four", "dots", "dot",
-    "black", "white", "background", "pattern", "image", "shape", "shapes",
+    "square",
+    "squares",
+    "frame",
+    "corner",
+    "corners",
+    "four",
+    "dots",
+    "dot",
+    "black",
+    "white",
+    "background",
+    "pattern",
+    "image",
+    "shape",
+    "shapes",
 ];
 
 fn assert_image_aware(label: &str, text: &str) {
@@ -210,8 +223,8 @@ fn scenario4_image_url_multi_turn() {
          + mmproj={mmproj} (base_url={})",
         base_url()
     );
-    let _server = ServerGuard::spawn_with_mmproj(&gguf, &mmproj)
-        .expect("spawn hf2q serve --mmproj");
+    let _server =
+        ServerGuard::spawn_with_mmproj(&gguf, &mmproj).expect("spawn hf2q serve --mmproj");
     wait_for_readyz();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -296,9 +309,7 @@ fn scenario4_image_url_multi_turn() {
         "turn1 vision determinism violation at temperature=0:\n  first:  {turn1_text:?}\n  \
          rerun:  {rerun_text:?}"
     );
-    eprintln!(
-        "openwebui_vision: determinism PASS — turn1 byte-identical at temperature=0"
-    );
+    eprintln!("openwebui_vision: determinism PASS — turn1 byte-identical at temperature=0");
 
     // -----------------------------------------------------------------
     // Fixture record / replay
@@ -329,8 +340,8 @@ fn image_url_jpeg_data_uri_supported() {
         return;
     };
 
-    let _server = ServerGuard::spawn_with_mmproj(&gguf, &mmproj)
-        .expect("spawn hf2q serve --mmproj");
+    let _server =
+        ServerGuard::spawn_with_mmproj(&gguf, &mmproj).expect("spawn hf2q serve --mmproj");
     wait_for_readyz();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -356,8 +367,7 @@ fn image_url_jpeg_data_uri_supported() {
         "Describe what you see in one sentence.",
         &jpeg_uri,
     )];
-    let (chunks, text) =
-        rt.block_on(streaming_chat_with_max_tokens(&model_id, &messages, 16));
+    let (chunks, text) = rt.block_on(streaming_chat_with_max_tokens(&model_id, &messages, 16));
     assert_streaming_invariants("jpeg_data_uri", &chunks);
     assert!(
         !text.trim().is_empty(),
@@ -377,8 +387,8 @@ fn image_url_webp_data_uri_rejected() {
         return;
     };
 
-    let _server = ServerGuard::spawn_with_mmproj(&gguf, &mmproj)
-        .expect("spawn hf2q serve --mmproj");
+    let _server =
+        ServerGuard::spawn_with_mmproj(&gguf, &mmproj).expect("spawn hf2q serve --mmproj");
     wait_for_readyz();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -410,7 +420,10 @@ fn image_url_webp_data_uri_rejected() {
         "temperature": 0,
     });
     let (status, json) = rt.block_on(nonstreaming_chat_status_and_body(body));
-    assert_eq!(status, 400, "WEBP data URI: expected 400, got {status}; body={json}");
+    assert_eq!(
+        status, 400,
+        "WEBP data URI: expected 400, got {status}; body={json}"
+    );
     let err_type = json["error"]["type"].as_str().unwrap_or("");
     assert_eq!(
         err_type, "invalid_request_error",
@@ -418,7 +431,8 @@ fn image_url_webp_data_uri_rejected() {
     );
     let err_msg = json["error"]["message"].as_str().unwrap_or("");
     assert!(
-        err_msg.contains("image/webp") || err_msg.contains("not supported")
+        err_msg.contains("image/webp")
+            || err_msg.contains("not supported")
             || err_msg.contains("parse failed"),
         "WEBP data URI: error.message lacks identification of the unsupported \
          mime; body={json}"
@@ -459,13 +473,12 @@ fn image_url_https_url_fetched() {
         );
         return;
     }
-    let Some((gguf, mmproj)) = resolve_fixtures_or_skip("image_url_https_url_fetched")
-    else {
+    let Some((gguf, mmproj)) = resolve_fixtures_or_skip("image_url_https_url_fetched") else {
         return;
     };
 
-    let _server = ServerGuard::spawn_with_mmproj(&gguf, &mmproj)
-        .expect("spawn hf2q serve --mmproj");
+    let _server =
+        ServerGuard::spawn_with_mmproj(&gguf, &mmproj).expect("spawn hf2q serve --mmproj");
     wait_for_readyz();
 
     let rt = tokio::runtime::Builder::new_current_thread()

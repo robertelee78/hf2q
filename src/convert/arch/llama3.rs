@@ -150,7 +150,8 @@ pub fn build_metadata(
         .expect("config.json missing required key `num_attention_heads`") as u32;
     let ctx_len = config["max_position_embeddings"]
         .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+        .expect("config.json missing required key `max_position_embeddings`")
+        as u32;
     let rms_eps = config["rms_norm_eps"]
         .as_f64()
         .expect("config.json missing required key `rms_norm_eps`") as f32;
@@ -280,9 +281,15 @@ mod tests {
                 "model.layers.7.self_attn.o_proj.weight",
                 "blk.7.attn_output.weight",
             ),
-            ("model.layers.3.mlp.gate_proj.weight", "blk.3.ffn_gate.weight"),
+            (
+                "model.layers.3.mlp.gate_proj.weight",
+                "blk.3.ffn_gate.weight",
+            ),
             ("model.layers.3.mlp.up_proj.weight", "blk.3.ffn_up.weight"),
-            ("model.layers.3.mlp.down_proj.weight", "blk.3.ffn_down.weight"),
+            (
+                "model.layers.3.mlp.down_proj.weight",
+                "blk.3.ffn_down.weight",
+            ),
         ];
 
         for &(hf, expected_gguf) in cases {
@@ -303,10 +310,7 @@ mod tests {
         // Unknown global.
         assert_eq!(map_tensor_name("model.unknown.weight"), None);
         // Wrong prefix.
-        assert_eq!(
-            map_tensor_name("transformer.layers.0.attn.weight"),
-            None
-        );
+        assert_eq!(map_tensor_name("transformer.layers.0.attn.weight"), None);
         // Llama-3 has no biases on linear projections.
         assert_eq!(
             map_tensor_name("model.layers.0.self_attn.q_proj.bias"),

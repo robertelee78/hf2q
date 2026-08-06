@@ -204,7 +204,10 @@ fn split_weight_or_bias(s: &str) -> Option<(&str, &str)> {
 ///     does not own that hparam. v1 omits it; downstream consumers must
 ///     provide it via `--text-config` or by reading the paired text-model
 ///     GGUF.
-pub fn build_metadata(vision_config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
+pub fn build_metadata(
+    vision_config: &serde_json::Value,
+    file_type: u32,
+) -> Vec<(String, MetaValue)> {
     let image_size = vision_config["image_size"]
         .as_u64()
         .expect("vision_config missing required key `image_size`") as u32;
@@ -236,14 +239,8 @@ pub fn build_metadata(vision_config: &serde_json::Value, file_type: u32) -> Vec<
             MetaValue::String("clip".into()),
         ),
         ("general.file_type".into(), MetaValue::U32(file_type)),
-        (
-            "clip.has_vision_encoder".into(),
-            MetaValue::Bool(true),
-        ),
-        (
-            "clip.has_audio_encoder".into(),
-            MetaValue::Bool(false),
-        ),
+        ("clip.has_vision_encoder".into(), MetaValue::Bool(true)),
+        ("clip.has_audio_encoder".into(), MetaValue::Bool(false)),
         (
             "clip.projector_type".into(),
             MetaValue::String("gemma3".into()),
@@ -409,30 +406,22 @@ mod tests {
         );
         // Unknown per-block sub.
         assert_eq!(
-            map_tensor_name(
-                "model.vision_tower.vision_model.encoder.layers.0.layer_norm3.weight"
-            ),
+            map_tensor_name("model.vision_tower.vision_model.encoder.layers.0.layer_norm3.weight"),
             None
         );
         // Malformed layer index (leading zero — matches llama3.rs strictness).
         assert_eq!(
-            map_tensor_name(
-                "model.vision_tower.vision_model.encoder.layers.01.layer_norm1.weight"
-            ),
+            map_tensor_name("model.vision_tower.vision_model.encoder.layers.01.layer_norm1.weight"),
             None
         );
         // Empty layer index.
         assert_eq!(
-            map_tensor_name(
-                "model.vision_tower.vision_model.encoder.layers..layer_norm1.weight"
-            ),
+            map_tensor_name("model.vision_tower.vision_model.encoder.layers..layer_norm1.weight"),
             None
         );
         // No layer prefix at all.
         assert_eq!(
-            map_tensor_name(
-                "model.vision_tower.vision_model.encoder.layers.layer_norm1.weight"
-            ),
+            map_tensor_name("model.vision_tower.vision_model.encoder.layers.layer_norm1.weight"),
             None
         );
         // Unknown projector tensor.

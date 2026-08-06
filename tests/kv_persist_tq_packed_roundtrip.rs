@@ -167,8 +167,7 @@ fn check_tq_factory_registered_advisory(server: &driver::ServerGuard) {
     let joined = log.join("\n");
     let saw_tq = joined.contains("factory=TqPackedSpillFactory")
         || joined.contains("\"TqPackedSpillFactory\"");
-    let saw_dense =
-        joined.contains("factory=Gemma4DenseSpillFactory") && !saw_tq;
+    let saw_dense = joined.contains("factory=Gemma4DenseSpillFactory") && !saw_tq;
     if saw_dense {
         // Dense factory registered when we asked for TQ — that's a
         // mis-substitute, fail loud.
@@ -189,7 +188,13 @@ fn check_tq_factory_registered_advisory(server: &driver::ServerGuard) {
              remains the load-bearing gate.\n\n\
              --- stderr_tail ({} lines, last 20) ---\n{}",
             log.len(),
-            log.iter().rev().take(20).rev().cloned().collect::<Vec<_>>().join("\n"),
+            log.iter()
+                .rev()
+                .take(20)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
     } else {
         eprintln!("[B-tq.4 E2E] factory=TqPackedSpillFactory confirmed in stderr");
@@ -344,13 +349,9 @@ fn kv_persist_tq_packed_b_tq_4_e2e() {
         canonical,
     );
 
-    let capture_a = driver::decode_full_text(
-        &server_a,
-        &canonical,
-        TQ_E2E_PROMPT,
-        TQ_E2E_MAX_TOKENS,
-    )
-    .expect("[B-tq.4 E2E] decode round 1");
+    let capture_a =
+        driver::decode_full_text(&server_a, &canonical, TQ_E2E_PROMPT, TQ_E2E_MAX_TOKENS)
+            .expect("[B-tq.4 E2E] decode round 1");
     eprintln!(
         "[B-tq.4 E2E] capture_a: {} bytes ({} tokens, ttft={:.1}ms)",
         capture_a.text.len(),
@@ -363,14 +364,10 @@ fn kv_persist_tq_packed_b_tq_4_e2e() {
     );
 
     // Drain + shutdown.
-    let _ = driver::trigger_graceful_shutdown(&server_a)
-        .expect("[B-tq.4 E2E] POST /shutdown on A");
+    let _ = driver::trigger_graceful_shutdown(&server_a).expect("[B-tq.4 E2E] POST /shutdown on A");
     let mut server_a = server_a;
-    let exit_status = driver::wait_for_graceful_exit(
-        &mut server_a,
-        Duration::from_secs(60),
-    )
-    .expect("[B-tq.4 E2E] server A graceful exit");
+    let exit_status = driver::wait_for_graceful_exit(&mut server_a, Duration::from_secs(60))
+        .expect("[B-tq.4 E2E] server A graceful exit");
     eprintln!(
         "[B-tq.4 E2E] server A exited cleanly: status={:?}",
         exit_status
@@ -422,13 +419,9 @@ fn kv_persist_tq_packed_b_tq_4_e2e() {
     );
     eprintln!("[B-tq.4 E2E] server B ready, replaying prompt");
 
-    let capture_b = driver::decode_full_text(
-        &server_b,
-        &canonical_b,
-        TQ_E2E_PROMPT,
-        TQ_E2E_MAX_TOKENS,
-    )
-    .expect("[B-tq.4 E2E] decode round 2");
+    let capture_b =
+        driver::decode_full_text(&server_b, &canonical_b, TQ_E2E_PROMPT, TQ_E2E_MAX_TOKENS)
+            .expect("[B-tq.4 E2E] decode round 2");
     eprintln!(
         "[B-tq.4 E2E] capture_b: {} bytes ({} tokens, ttft={:.1}ms)",
         capture_b.text.len(),
@@ -568,7 +561,7 @@ fn kv_persist_tq_packed_b_tq_4_long_prompt_perf() {
              Centroid tables are baked into the binary at compile \
              time; rotation is a deterministic O(d log d) operation.  \
              Per-block magnitudes are stored in F32 alongside the \
-             packed indices to enable byte-exact decode.  "
+             packed indices to enable byte-exact decode.  ",
         );
     }
     long_prompt.push_str("Please respond with a one-sentence summary.");
@@ -599,11 +592,10 @@ fn kv_persist_tq_packed_b_tq_4_long_prompt_perf() {
         extra_env,
     )
     .expect("[B-tq.4 perf] spawn A");
-    driver::wait_for_readyz(&server_a)
-        .expect("[B-tq.4 perf] server A /readyz");
+    driver::wait_for_readyz(&server_a).expect("[B-tq.4 perf] server A /readyz");
     check_tq_factory_registered_advisory(&server_a);
-    let canonical = driver::fetch_canonical_model_id(&server_a)
-        .expect("[B-tq.4 perf] fetch model id A");
+    let canonical =
+        driver::fetch_canonical_model_id(&server_a).expect("[B-tq.4 perf] fetch model id A");
     let cold = driver::decode_full_text(&server_a, &canonical, &long_prompt, 32)
         .expect("[B-tq.4 perf] decode round 1 (cold)");
     eprintln!(
@@ -636,11 +628,10 @@ fn kv_persist_tq_packed_b_tq_4_long_prompt_perf() {
         extra_env,
     )
     .expect("[B-tq.4 perf] spawn B");
-    driver::wait_for_readyz(&server_b)
-        .expect("[B-tq.4 perf] server B /readyz");
+    driver::wait_for_readyz(&server_b).expect("[B-tq.4 perf] server B /readyz");
     check_tq_factory_registered_advisory(&server_b);
-    let canonical_b = driver::fetch_canonical_model_id(&server_b)
-        .expect("[B-tq.4 perf] fetch model id B");
+    let canonical_b =
+        driver::fetch_canonical_model_id(&server_b).expect("[B-tq.4 perf] fetch model id B");
     let warm = driver::decode_full_text(&server_b, &canonical_b, &long_prompt, 32)
         .expect("[B-tq.4 perf] decode round 2 (warm)");
     eprintln!(

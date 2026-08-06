@@ -29,9 +29,7 @@
 //! linear-attention inference path. Never runs in production. The GPU
 //! builder (next iter) matches its output to ≤1e-3.
 
-use mlx_native::ops::gated_delta_net::{
-    cpu_reference_f32 as gdn_cpu_ref, GatedDeltaNetParams,
-};
+use mlx_native::ops::gated_delta_net::{cpu_reference_f32 as gdn_cpu_ref, GatedDeltaNetParams};
 
 use crate::inference::models::qwen35::Qwen35Config;
 
@@ -170,9 +168,9 @@ fn matmul_a_by_bt(lhs: &[f32], rhs: &[f32], m: usize, k: usize, n: usize) -> Vec
 ///
 /// Matches mlx-native's ssm_conv math exactly.
 fn ssm_conv_scalar(
-    x: &[f32],           // [seq, channels] row-major
-    kernel: &[f32],      // [K, channels] row-major (k inner)
-    conv_state: &[f32],  // [K-1, channels]
+    x: &[f32],          // [seq, channels] row-major
+    kernel: &[f32],     // [K, channels] row-major (k inner)
+    conv_state: &[f32], // [K-1, channels]
     seq: usize,
     channels: usize,
     k_width: usize,
@@ -291,8 +289,7 @@ pub fn delta_net_layer_cpu_ref(
     let mut v_buf = vec![0.0f32; seq * v_span];
     for t in 0..seq {
         let base = t * qkv_channels;
-        q_buf[t * q_span..(t + 1) * q_span]
-            .copy_from_slice(&qkv_conv[base..base + q_span]);
+        q_buf[t * q_span..(t + 1) * q_span].copy_from_slice(&qkv_conv[base..base + q_span]);
         k_buf[t * k_span..(t + 1) * k_span]
             .copy_from_slice(&qkv_conv[base + q_span..base + q_span + k_span]);
         v_buf[t * v_span..(t + 1) * v_span]
@@ -640,18 +637,16 @@ mod tests {
         let x_full: Vec<f32> = (0..2 * h).map(|i| 0.1 + 0.01 * i as f32).collect();
 
         // Monolithic run.
-        let (out_mono, _, _) = delta_net_layer_cpu_ref(
-            &x_full, &weights, shape, &state_zeros, &conv_zeros,
-        );
+        let (out_mono, _, _) =
+            delta_net_layer_cpu_ref(&x_full, &weights, shape, &state_zeros, &conv_zeros);
 
         // Chunked: token 0, then token 1 using intermediate state.
         let x_t0 = x_full[0..h].to_vec();
         let x_t1 = x_full[h..2 * h].to_vec();
         let (out_t0, state_after_t0, conv_after_t0) =
             delta_net_layer_cpu_ref(&x_t0, &weights, shape, &state_zeros, &conv_zeros);
-        let (out_t1, _, _) = delta_net_layer_cpu_ref(
-            &x_t1, &weights, shape, &state_after_t0, &conv_after_t0,
-        );
+        let (out_t1, _, _) =
+            delta_net_layer_cpu_ref(&x_t1, &weights, shape, &state_after_t0, &conv_after_t0);
 
         // Chunked outputs concatenated should match monolithic.
         for i in 0..h {
@@ -659,7 +654,9 @@ mod tests {
             assert!(
                 d < 1e-5,
                 "chunked-vs-mono t0 mismatch at {}: mono={}, chunk={}",
-                i, out_mono[i], out_t0[i]
+                i,
+                out_mono[i],
+                out_t0[i]
             );
         }
         for i in 0..h {
@@ -667,7 +664,9 @@ mod tests {
             assert!(
                 d < 1e-5,
                 "chunked-vs-mono t1 mismatch at {}: mono={}, chunk={}",
-                i, out_mono[h + i], out_t1[i]
+                i,
+                out_mono[h + i],
+                out_t1[i]
             );
         }
     }

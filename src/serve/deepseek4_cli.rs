@@ -159,6 +159,42 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
     );
     print_stage_profile("prefill", prefill_gpu_started);
     print_pipeline_profile("prefill");
+    // Match the existing Qwen diagnostic contract: capture the exact
+    // post-prefill state and first-token logits, then exit before sampling.
+    // Keeping this path read-only lets matrix and sequential prefill runs be
+    // compared without generation policy becoming a confounder.
+    if std::env::var("HF2Q_DUMP_LOGITS").as_deref() == Ok("1") {
+        let prompt_last_state = model
+            .last_token_state(&final_state)
+            .context("view DeepSeek-V4 diagnostic final prompt state")?;
+        let logits = model
+            .forward_logits(&prompt_last_state)
+            .context("execute DeepSeek-V4 diagnostic output head")?;
+        write_f32_dump(
+            "/tmp/hf2q_deepseek_state_t0.bin",
+            prompt_last_state.as_logical_slice::<f32>()?,
+        )?;
+        let logit_values = logits.as_slice::<f32>()?;
+        write_f32_dump("/tmp/hf2q_logits_t0.bin", logit_values)?;
+        let mut indexed = logit_values
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
+        indexed.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!(
+            "HF2Q_DUMP_LOGITS: wrote {} state and {} logit f32 values",
+            prompt_last_state.shape().iter().product::<usize>(),
+            logit_values.len()
+        );
+        eprintln!("  top-3: {:?}", &indexed[..3.min(indexed.len())]);
+        return Ok(());
+    }
     if args.max_tokens == 0 {
         return Ok(());
     }
@@ -227,6 +263,16 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
     print_stage_profile("decode", decode_gpu_started);
     print_pipeline_profile("decode");
     Ok(())
+}
+
+fn write_f32_dump(path: &str, values: &[f32]) -> Result<()> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            values.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(values),
+        )
+    };
+    std::fs::write(path, bytes).with_context(|| format!("write diagnostic dump {path}"))
 }
 
 fn run_benchmark(

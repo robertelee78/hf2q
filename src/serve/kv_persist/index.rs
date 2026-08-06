@@ -122,7 +122,10 @@ impl BlockIndex {
     /// definition a content-equal block (chain-hash identity) and the
     /// freshest mtime/path wins.
     pub fn insert(&self, meta: BlockMeta) {
-        let mut guard = self.inner.write().expect("BlockIndex inner RwLock poisoned");
+        let mut guard = self
+            .inner
+            .write()
+            .expect("BlockIndex inner RwLock poisoned");
         guard.insert(meta.hash, meta);
     }
 
@@ -137,7 +140,10 @@ impl BlockIndex {
 
     /// Remove a block by hash. Returns the prior meta if present.
     pub fn remove(&self, hash: &BlockHash) -> Option<BlockMeta> {
-        let mut guard = self.inner.write().expect("BlockIndex inner RwLock poisoned");
+        let mut guard = self
+            .inner
+            .write()
+            .expect("BlockIndex inner RwLock poisoned");
         guard.remove(hash)
     }
 
@@ -276,9 +282,9 @@ fn quarantine(slug_path: &Path, blk_path: &Path) -> std::io::Result<()> {
     if !q_dir.exists() {
         std::fs::create_dir_all(&q_dir)?;
     }
-    let name = blk_path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other(format!("blk path has no name: {}", blk_path.display())))?;
+    let name = blk_path.file_name().ok_or_else(|| {
+        std::io::Error::other(format!("blk path has no name: {}", blk_path.display()))
+    })?;
     let dest = q_dir.join(name);
     // Try rename first (cheap, intra-fs). If that fails (e.g. cross-fs
     // edge case), fall back to copy + remove. We don't expect the
@@ -367,11 +373,7 @@ mod tests {
             .join(format!("{hex}.safetensors"))
     }
 
-    fn synthetic_meta(
-        fp: ModelFingerprint,
-        seed: u32,
-        bytes: u64,
-    ) -> (BlockHash, BlockMeta) {
+    fn synthetic_meta(fp: ModelFingerprint, seed: u32, bytes: u64) -> (BlockHash, BlockMeta) {
         // Synthesize a unique BlockHash from the seed (without going to disk).
         let mut h = Sha256::new();
         h.update(seed.to_le_bytes());
@@ -522,7 +524,10 @@ mod tests {
         }
 
         // No quarantine dir was created (clean state).
-        let q = dir.join("models").join(fp.short_hex()).join("kv-quarantine");
+        let q = dir
+            .join("models")
+            .join(fp.short_hex())
+            .join("kv-quarantine");
         assert!(!q.exists(), "no quarantine on clean rebuild");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -584,7 +589,10 @@ mod tests {
         assert_eq!(idx.block_count(), 3, "3 indexed; 2 quarantined");
 
         // Quarantine dir exists with both moved files.
-        let q = dir.join("models").join(fp.short_hex()).join("kv-quarantine");
+        let q = dir
+            .join("models")
+            .join(fp.short_hex())
+            .join("kv-quarantine");
         assert!(q.exists(), "quarantine dir created");
         let q_files: Vec<_> = std::fs::read_dir(&q)
             .expect("read q")
@@ -623,11 +631,7 @@ mod tests {
             .join(fp.short_hex())
             .join("kv")
             .join(&hashes[0].to_string()[..1]);
-        let orphan = fanout_dir.join(format!(
-            "{}.safetensors.tmp.{}",
-            hashes[0],
-            process::id()
-        ));
+        let orphan = fanout_dir.join(format!("{}.safetensors.tmp.{}", hashes[0], process::id()));
         std::fs::write(&orphan, b"this would be a partial atomic-rename leftover")
             .expect("write orphan");
         assert!(orphan.exists());
@@ -638,7 +642,10 @@ mod tests {
 
         // The orphan was NOT quarantined (quarantine is for parse errors,
         // not for atomic-rename leftovers).
-        let q = dir.join("models").join(fp.short_hex()).join("kv-quarantine");
+        let q = dir
+            .join("models")
+            .join(fp.short_hex())
+            .join("kv-quarantine");
         if q.exists() {
             let q_count = std::fs::read_dir(&q)
                 .expect("read q")

@@ -77,7 +77,8 @@ mod tests {
         submit_to_global_worker(move || {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             tx.send(()).ok();
-        }).expect("submit");
+        })
+        .expect("submit");
 
         rx.recv().expect("worker did not signal");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -98,7 +99,8 @@ mod tests {
                 let id = std::thread::current().id();
                 ids_clone.lock().expect("lock").push(id);
                 tx.send(()).ok();
-            }).expect("submit");
+            })
+            .expect("submit");
         }
 
         for rx in signals {

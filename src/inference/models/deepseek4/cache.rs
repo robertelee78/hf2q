@@ -724,13 +724,14 @@ fn copy_buffer(
             kind,
             source,
         })?;
-    let destination = destination
-        .as_mut_slice::<u8>()
-        .map_err(|source| CacheError::SnapshotCopy {
-            layer,
-            kind,
-            source,
-        })?;
+    let destination =
+        destination
+            .as_mut_slice::<u8>()
+            .map_err(|source| CacheError::SnapshotCopy {
+                layer,
+                kind,
+                source,
+            })?;
     if source.len() != destination.len() {
         return Err(CacheError::SnapshotBufferMismatch { layer, kind });
     }

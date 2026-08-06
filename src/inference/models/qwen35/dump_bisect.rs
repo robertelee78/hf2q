@@ -470,19 +470,17 @@ mod tests {
             filter: LayerFilter::All,
             dir: tmp_dir.clone(),
         };
-        dump_inner(&cfg, 0, Some(0), "synthetic", &buf, &[4])
-            .expect("dump_inner round-trip");
+        dump_inner(&cfg, 0, Some(0), "synthetic", &buf, &[4]).expect("dump_inner round-trip");
 
         // Read back and verify.
         let path = tmp_dir.join("step0000_layer000_synthetic.f32");
         let bytes = std::fs::read(&path).expect("read dump");
         assert_eq!(bytes.len(), 16);
-        let read: &[f32] =
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, 4) };
+        let read: &[f32] = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, 4) };
         assert_eq!(read, &[1.0, 2.0, 3.0, 4.0]);
 
-        let manifest = std::fs::read_to_string(tmp_dir.join("manifest.txt"))
-            .expect("read manifest");
+        let manifest =
+            std::fs::read_to_string(tmp_dir.join("manifest.txt")).expect("read manifest");
         assert!(manifest.contains("step=0"));
         assert!(manifest.contains("layer=0"));
         assert!(manifest.contains("op=synthetic"));

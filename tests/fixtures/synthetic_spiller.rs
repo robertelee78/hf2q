@@ -489,13 +489,13 @@ impl BlockStore {
             f.write_all(&header_bytes)
                 .map_err(|e| SpillError::Io(e.to_string()))?;
             for chunk in &payload_chunks {
-                f.write_all(chunk).map_err(|e| SpillError::Io(e.to_string()))?;
+                f.write_all(chunk)
+                    .map_err(|e| SpillError::Io(e.to_string()))?;
             }
             f.sync_all().map_err(|e| SpillError::Io(e.to_string()))?;
         }
 
-        std::fs::rename(&tmp_path, &final_path)
-            .map_err(|e| SpillError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| SpillError::Io(e.to_string()))?;
 
         let total = 8 + header_bytes.len() as u64 + offset;
         self.seen
@@ -545,9 +545,8 @@ impl BlockStore {
             .rposition(|b| *b != b' ' && *b != 0)
             .map(|p| p + 1)
             .unwrap_or(0);
-        let header: serde_json::Value =
-            serde_json::from_slice(&header_bytes[..trim_end])
-                .map_err(|e| RestoreError::Io(format!("malformed header json: {e}")))?;
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes[..trim_end])
+            .map_err(|e| RestoreError::Io(format!("malformed header json: {e}")))?;
         let header = header
             .as_object()
             .ok_or_else(|| RestoreError::Io("header not object".into()))?;
@@ -593,9 +592,7 @@ impl BlockStore {
                 .and_then(|s| s.as_array())
                 .ok_or_else(|| RestoreError::Io(format!("tensor {k} missing data_offsets")))?;
             if off.len() != 2 {
-                return Err(RestoreError::Io(format!(
-                    "tensor {k} bad data_offsets len"
-                )));
+                return Err(RestoreError::Io(format!("tensor {k} bad data_offsets len")));
             }
             let start = off[0]
                 .as_u64()
@@ -644,8 +641,7 @@ impl BlockStore {
             .get("block_hash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| RestoreError::Io("missing block_hash".into()))?;
-        let bh_bytes =
-            hex::decode(block_hash_hex).map_err(|e| RestoreError::Io(e.to_string()))?;
+        let bh_bytes = hex::decode(block_hash_hex).map_err(|e| RestoreError::Io(e.to_string()))?;
         if bh_bytes.len() != 32 {
             return Err(RestoreError::Io("block_hash length".into()));
         }
@@ -717,10 +713,7 @@ impl BlockStore {
         }
         for fp_ent in std::fs::read_dir(&models_root)? {
             let fp_ent = fp_ent?;
-            let fp_short = fp_ent
-                .file_name()
-                .to_string_lossy()
-                .to_string();
+            let fp_short = fp_ent.file_name().to_string_lossy().to_string();
             let kv_root = fp_ent.path().join("kv");
             if !kv_root.exists() {
                 continue;
@@ -792,13 +785,7 @@ impl BlockStore {
         for i in 0..n_blocks {
             let toks: Vec<u32> = (i * 16..i * 16 + 16).collect();
             let h = BlockHash::next(&prev, fingerprint, &toks);
-            let p = make_test_payload(
-                fingerprint,
-                &h,
-                BLOCK_TOKENS,
-                (i % 251) as u8,
-                block_bytes,
-            );
+            let p = make_test_payload(fingerprint, &h, BLOCK_TOKENS, (i % 251) as u8, block_bytes);
             self.write_block(&p)
                 .map_err(|e| std::io::Error::other(format!("write_block: {e:?}")))?;
             hashes.push(h.clone());
@@ -1097,13 +1084,16 @@ mod synthetic_spiller {
         let final_path = store.block_path(&fp, &h);
         std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
 
-        let stem = final_path.file_stem().unwrap().to_string_lossy().to_string();
+        let stem = final_path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let tmp_path = final_path
             .parent()
             .unwrap()
             .join(format!("{stem}_tmp.safetensors"));
-        std::fs::write(&tmp_path, b"PARTIAL_WRITE_NEVER_FINISHED")
-            .expect("write partial tmp");
+        std::fs::write(&tmp_path, b"PARTIAL_WRITE_NEVER_FINISHED").expect("write partial tmp");
 
         let visible = store.scan_visible_blocks().expect("scan");
         assert!(
@@ -1125,7 +1115,9 @@ mod synthetic_spiller {
         let f = OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(4).unwrap();
 
-        let err = store.read_block(&fp, &h).expect_err("must reject truncated");
+        let err = store
+            .read_block(&fp, &h)
+            .expect_err("must reject truncated");
         assert!(
             matches!(err, RestoreError::HeaderTruncated),
             "expected HeaderTruncated; got {err:?}"
@@ -1192,7 +1184,13 @@ mod synthetic_spiller {
             .read_block(&fp, &h)
             .expect_err("must reject version mismatch");
         assert!(
-            matches!(err, RestoreError::VersionMismatch { found: 999, expected: 1 }),
+            matches!(
+                err,
+                RestoreError::VersionMismatch {
+                    found: 999,
+                    expected: 1
+                }
+            ),
             "expected VersionMismatch{{999, 1}}; got {err:?}"
         );
     }
@@ -1271,7 +1269,11 @@ mod synthetic_spiller {
         let pretend_h = BlockHash::next(&prev, &fp, &[42; 16]);
         let final_path = store.block_path(&fp, &pretend_h);
         std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
-        let stem = final_path.file_stem().unwrap().to_string_lossy().to_string();
+        let stem = final_path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let partial = final_path
             .parent()
             .unwrap()
@@ -1358,10 +1360,7 @@ mod synthetic_spiller {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let total = store.total_bytes().unwrap();
-        assert!(
-            total <= 1500,
-            "total {total} > budget 1500 after eviction"
-        );
+        assert!(total <= 1500, "total {total} > budget 1500 after eviction");
         // Newest two files survive; oldest two evicted.
         assert!(paths[3].exists(), "newest survived");
         assert!(paths[2].exists(), "second-newest survived");
@@ -1410,10 +1409,7 @@ mod synthetic_spiller {
         toks2[BLOCK_TOKENS as usize + 5] ^= 0xDEAD;
         let chain_c = chain_hash_blocks(&fp, &toks2);
         assert_eq!(chain_a[0], chain_c[0], "first block unchanged");
-        assert_ne!(
-            chain_a[1], chain_c[1],
-            "block containing edit must differ"
-        );
+        assert_ne!(chain_a[1], chain_c[1], "block containing edit must differ");
         assert_ne!(
             chain_a[2], chain_c[2],
             "downstream block must differ via chain"
@@ -1458,16 +1454,15 @@ mod synthetic_spiller {
             fingerprint: fp.clone(),
         };
         let engine = Arc::new(MockEngine);
-        let outcome = <SyntheticSpiller as MockKvSpiller<MockEngine>>::pre_evict(
-            &spiller, &handle, &engine,
-        );
+        let outcome =
+            <SyntheticSpiller as MockKvSpiller<MockEngine>>::pre_evict(&spiller, &handle, &engine);
         assert_eq!(outcome, SpillOutcome::EnqueuedBlocks(3));
 
-        spiller
-            .restore_token_chain
-            .lock()
-            .unwrap()
-            .push(("repo/trait".to_string(), fp.clone(), hashes));
+        spiller.restore_token_chain.lock().unwrap().push((
+            "repo/trait".to_string(),
+            fp.clone(),
+            hashes,
+        ));
         let restore = <SyntheticSpiller as MockKvSpiller<MockEngine>>::post_admit(
             &spiller,
             "repo/trait",

@@ -166,9 +166,9 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()
@@ -363,25 +363,13 @@ fn phase_b_hybrid_qwen35_lcp_probe_runs() {
 
     // Send Q (first-time prompt, PromptCache miss) — probe should run.
     let q_decoded = chat_decode(&server, &canonical, PROMPT_Q, MAX_TOKENS);
-    assert!(
-        !q_decoded.is_empty(),
-        "[Phase B-hybrid.1] Q decoded empty"
-    );
-    eprintln!(
-        "[Phase B-hybrid.1] Q decoded {} bytes",
-        q_decoded.len()
-    );
+    assert!(!q_decoded.is_empty(), "[Phase B-hybrid.1] Q decoded empty");
+    eprintln!("[Phase B-hybrid.1] Q decoded {} bytes", q_decoded.len());
 
     // Send P (different from Q, PromptCache miss again) — probe runs.
     let p_decoded = chat_decode(&server, &canonical, PROMPT_P, MAX_TOKENS);
-    assert!(
-        !p_decoded.is_empty(),
-        "[Phase B-hybrid.1] P decoded empty"
-    );
-    eprintln!(
-        "[Phase B-hybrid.1] P decoded {} bytes",
-        p_decoded.len()
-    );
+    assert!(!p_decoded.is_empty(), "[Phase B-hybrid.1] P decoded empty");
+    eprintln!("[Phase B-hybrid.1] P decoded {} bytes", p_decoded.len());
 
     // Assert: probe ran on at least one of the two requests.
     let metrics_post = fetch_metrics(&server);

@@ -202,12 +202,7 @@ impl FaProjectionsArena {
         head_dim: u32,
         rms_norm_eps: f32,
     ) -> Result<Self> {
-        if seq_capacity == 0
-            || hidden_size == 0
-            || n_head == 0
-            || n_kv == 0
-            || head_dim == 0
-        {
+        if seq_capacity == 0 || hidden_size == 0 || n_head == 0 || n_kv == 0 || head_dim == 0 {
             return Err(anyhow!(
                 "FaProjectionsArena::new: zero dim \
                  seq_capacity={} hidden_size={} n_head={} n_kv={} head_dim={}",
@@ -451,7 +446,11 @@ mod tests {
             .sigmoid_params_buf
             .as_slice::<u32>()
             .expect("sigmoid_params_buf as_slice");
-        assert_eq!(sg[0], seq * nh * d, "sigmoid_params[0] = seq*n_head*head_dim");
+        assert_eq!(
+            sg[0],
+            seq * nh * d,
+            "sigmoid_params[0] = seq*n_head*head_dim"
+        );
     }
 
     /// Smaller shape sanity-check.
@@ -465,8 +464,8 @@ mod tests {
                 return;
             }
         };
-        let arena = FaProjectionsArena::new(&device, 64, 128, 4, 2, 32, 1e-5)
-            .expect("fa proj arena small");
+        let arena =
+            FaProjectionsArena::new(&device, 64, 128, 4, 2, 32, 1e-5).expect("fa proj arena small");
         assert_eq!(arena.seq_capacity, 64);
     }
 
@@ -515,8 +514,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaProjectionsArena::new(&device, 128, 256, 4, 2, 32, 1e-5).expect("arena");
+        let arena = FaProjectionsArena::new(&device, 128, 256, 4, 2, 32, 1e-5).expect("arena");
         assert!(arena.validate_fits(128, 256, 4, 2, 32).is_ok());
         assert!(arena.validate_fits(64, 256, 4, 2, 32).is_ok());
     }
@@ -532,8 +530,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaProjectionsArena::new(&device, 128, 256, 4, 2, 32, 1e-5).expect("arena");
+        let arena = FaProjectionsArena::new(&device, 128, 256, 4, 2, 32, 1e-5).expect("arena");
         assert!(arena.validate_fits(256, 256, 4, 2, 32).is_err());
     }
 
@@ -544,14 +541,11 @@ mod tests {
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "test_fa_proj_validate_fits_shape_mismatch: skipping — no Metal device"
-                );
+                eprintln!("test_fa_proj_validate_fits_shape_mismatch: skipping — no Metal device");
                 return;
             }
         };
-        let arena =
-            FaProjectionsArena::new(&device, 128, 256, 4, 2, 32, 1e-5).expect("arena");
+        let arena = FaProjectionsArena::new(&device, 128, 256, 4, 2, 32, 1e-5).expect("arena");
         assert!(arena.validate_fits(128, 128, 4, 2, 32).is_err()); // h
         assert!(arena.validate_fits(128, 256, 8, 2, 32).is_err()); // nh
         assert!(arena.validate_fits(128, 256, 4, 1, 32).is_err()); // nkv
@@ -571,8 +565,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaProjectionsArena::new(&device, 64, 128, 4, 2, 32, 1e-5).expect("arena");
+        let arena = FaProjectionsArena::new(&device, 64, 128, 4, 2, 32, 1e-5).expect("arena");
 
         let f32_outs: [(&MlxBuffer, &str); 10] = [
             (&arena.x_norm_buf, "x_norm_buf"),

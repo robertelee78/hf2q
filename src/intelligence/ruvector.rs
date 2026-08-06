@@ -14,8 +14,8 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use super::fingerprint::ModelFingerprint;
-use crate::core::hardware::HardwareProfile;
 use super::{ResolvedConfig, ResolvedSource};
+use crate::core::hardware::HardwareProfile;
 
 /// Errors from RuVector operations.
 #[derive(Error, Debug)]
@@ -176,7 +176,10 @@ impl RuVectorDb {
             message: if self.records.is_empty() {
                 "Operational but empty. Will populate after first conversion.".to_string()
             } else {
-                format!("Operational with {} stored conversions.", self.records.len())
+                format!(
+                    "Operational with {} stored conversions.",
+                    self.records.len()
+                )
             },
             feature_enabled: cfg!(feature = "ruvector"),
         }
@@ -210,10 +213,7 @@ impl RuVectorDb {
             .collect();
 
         if !exact_matches.is_empty() {
-            debug!(
-                count = exact_matches.len(),
-                "Found exact RuVector matches"
-            );
+            debug!(count = exact_matches.len(), "Found exact RuVector matches");
             let best = select_best_record(&exact_matches);
             return Ok(Some(record_to_resolved(
                 best,
@@ -266,12 +266,8 @@ impl RuVectorDb {
                 "Using flagged (needs revalidation) RuVector records with reduced confidence"
             );
             let best = select_best_record(&flagged_matches);
-            let mut resolved = record_to_resolved(
-                best,
-                hardware,
-                fingerprint,
-                ResolvedSource::RuVectorSimilar,
-            );
+            let mut resolved =
+                record_to_resolved(best, hardware, fingerprint, ResolvedSource::RuVectorSimilar);
             // Reduce confidence further for flagged records
             resolved.confidence = (resolved.confidence * 0.7).clamp(0.2, 0.7);
             resolved.reasoning = format!(
@@ -306,8 +302,7 @@ impl RuVectorDb {
             .filter_map(|r| {
                 let param_ratio = if fingerprint.total_params > 0 && r.fingerprint.total_params > 0
                 {
-                    let ratio = r.fingerprint.total_params as f64
-                        / fingerprint.total_params as f64;
+                    let ratio = r.fingerprint.total_params as f64 / fingerprint.total_params as f64;
                     if !(0.5..=2.0).contains(&ratio) {
                         return None; // Outside 2x range
                     }
@@ -634,9 +629,7 @@ fn extract_chip_family(chip_model: &str) -> String {
     // For Apple Silicon: "apple" + "mN"
     if tokens.len() >= 2 && tokens[0] == "apple" {
         if let Some(gen) = tokens.iter().find(|t| {
-            t.starts_with('m')
-                && t.len() <= 3
-                && t[1..].chars().all(|c| c.is_ascii_digit())
+            t.starts_with('m') && t.len() <= 3 && t[1..].chars().all(|c| c.is_ascii_digit())
         }) {
             return format!("apple {}", gen);
         }
@@ -1035,23 +1028,33 @@ mod tests {
 
         // Lower KL but no cosine sim
         db.store_conversion(
-            &hw, &fp, "q4", 4, 64,
+            &hw,
+            &fp,
+            "q4",
+            4,
+            64,
             QualityMetrics {
                 kl_divergence: Some(0.01),
                 perplexity_delta: Some(0.1),
                 cosine_similarity: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Higher KL but excellent cosine sim -> higher quality score
         db.store_conversion(
-            &hw, &fp, "q8", 8, 64,
+            &hw,
+            &fp,
+            "q8",
+            8,
+            64,
             QualityMetrics {
                 kl_divergence: Some(0.02),
                 perplexity_delta: Some(0.05),
                 cosine_similarity: Some(0.999),
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = db.query_best_config(&hw, &fp).unwrap().unwrap();
         assert_eq!(result.quant_method, "q8");
@@ -1122,13 +1125,18 @@ mod tests {
             vocab_size: 32000,
         };
         db.store_conversion(
-            &hw, &fp_7b, "q4", 4, 64,
+            &hw,
+            &fp_7b,
+            "q4",
+            4,
+            64,
             QualityMetrics {
                 kl_divergence: Some(0.02),
                 perplexity_delta: Some(0.1),
                 cosine_similarity: Some(0.998),
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Query for an 8B Llama model (similar but not exact)
         let fp_8b = make_fingerprint(); // 8B params, same architecture
@@ -1149,9 +1157,8 @@ mod tests {
         // Store a result for a Llama model
         let hw = make_hardware();
         let fp_llama = make_fingerprint();
-        db.store_conversion(
-            &hw, &fp_llama, "q4", 4, 64, QualityMetrics::default(),
-        ).unwrap();
+        db.store_conversion(&hw, &fp_llama, "q4", 4, 64, QualityMetrics::default())
+            .unwrap();
 
         // Query for a different architecture (Mistral) with different params
         let fp_mistral = ModelFingerprint {

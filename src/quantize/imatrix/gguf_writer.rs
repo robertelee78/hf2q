@@ -92,10 +92,8 @@ pub fn write_imatrix<W: Write + Seek>(
     // iterates `to_store` only). For Phase A we follow the more
     // conservative rule of skipping completely-empty tensors so that
     // a partial Phase B run produces a valid file.
-    let storable: Vec<(&str, &Accumulator)> = registry
-        .iter()
-        .filter(|(_, acc)| acc.has_data())
-        .collect();
+    let storable: Vec<(&str, &Accumulator)> =
+        registry.iter().filter(|(_, acc)| acc.has_data()).collect();
     let tensor_count = storable.len() as u64 * 2; // each pair contributes 2 tensors
     let kv_count: u64 = 4;
     w.write_header(tensor_count, kv_count)?;
@@ -104,10 +102,7 @@ pub fn write_imatrix<W: Write + Seek>(
     w.write_metadata_kv(KV_KEY_TYPE, &MetaValue::String(KV_VALUE_TYPE.to_string()))?;
 
     // imatrix.datasets = [<corpora>]  (array of strings)
-    w.write_metadata_kv(
-        KV_KEY_DATASETS,
-        &MetaValue::ArrayString(datasets.to_vec()),
-    )?;
+    w.write_metadata_kv(KV_KEY_DATASETS, &MetaValue::ArrayString(datasets.to_vec()))?;
 
     // imatrix.chunk_count = <u32>
     w.write_metadata_kv(KV_KEY_CHUNK_COUNT, &MetaValue::U32(chunk_count))?;
@@ -139,11 +134,8 @@ pub fn write_imatrix<W: Write + Seek>(
             GgmlType::F32,
         )?;
         // counts: shape [1, n_mat], F32
-        let counts_idx = w.reserve_tensor_info(
-            &counts_name,
-            &[1u64, acc.n_mat as u64],
-            GgmlType::F32,
-        )?;
+        let counts_idx =
+            w.reserve_tensor_info(&counts_name, &[1u64, acc.n_mat as u64], GgmlType::F32)?;
         payload_idx.push((in_sum2_idx, counts_idx));
     }
 

@@ -156,7 +156,9 @@ pub fn build_metadata(
             // prefix should be like "26B" and suffix like "-a4B"
             if prefix.ends_with('B')
                 && prefix.len() >= 2
-                && prefix[..prefix.len() - 1].chars().all(|c| c.is_ascii_digit())
+                && prefix[..prefix.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
                 && suffix.starts_with("-a")
             {
                 // Reclassify prefix → finetune (lowercased `b` per canonical).
@@ -192,10 +194,12 @@ pub fn build_metadata(
     //   layer_norm_eps = 1e-6
     let embedding_length = vision_config["hidden_size"]
         .as_u64()
-        .expect("vision_config missing required key `hidden_size`") as u32;
+        .expect("vision_config missing required key `hidden_size`")
+        as u32;
     let feed_forward_length = vision_config["intermediate_size"]
         .as_u64()
-        .expect("vision_config missing required key `intermediate_size`") as u32;
+        .expect("vision_config missing required key `intermediate_size`")
+        as u32;
     // Block count: HF config uses `num_hidden_layers`, canonical
     // gemma.py reads via find_hparam(["num_hidden_layers", "depth"]).
     let block_count = vision_config
@@ -206,7 +210,8 @@ pub fn build_metadata(
         as u32;
     let head_count = vision_config["num_attention_heads"]
         .as_u64()
-        .expect("vision_config missing required key `num_attention_heads`") as u32;
+        .expect("vision_config missing required key `num_attention_heads`")
+        as u32;
     let layer_norm_eps = vision_config
         .get("layer_norm_eps")
         .and_then(|v| v.as_f64())
@@ -258,22 +263,13 @@ pub fn build_metadata(
         kv.push(("general.size_label".into(), MetaValue::String(sl.clone())));
     }
     kv.push(("general.file_type".into(), MetaValue::U32(file_type)));
-    kv.push((
-        "clip.has_vision_encoder".into(),
-        MetaValue::Bool(true),
-    ));
+    kv.push(("clip.has_vision_encoder".into(), MetaValue::Bool(true)));
     kv.push((
         "clip.vision.projection_dim".into(),
         MetaValue::U32(text_hidden_size),
     ));
-    kv.push((
-        "clip.vision.image_size".into(),
-        MetaValue::U32(image_size),
-    ));
-    kv.push((
-        "clip.vision.patch_size".into(),
-        MetaValue::U32(patch_size),
-    ));
+    kv.push(("clip.vision.image_size".into(), MetaValue::U32(image_size)));
+    kv.push(("clip.vision.patch_size".into(), MetaValue::U32(patch_size)));
     kv.push((
         "clip.vision.embedding_length".into(),
         MetaValue::U32(embedding_length),
@@ -309,10 +305,7 @@ pub fn build_metadata(
         "clip.vision.attention.layer_norm_epsilon".into(),
         MetaValue::F32(layer_norm_eps),
     ));
-    kv.push((
-        "general.quantization_version".into(),
-        MetaValue::U32(2),
-    ));
+    kv.push(("general.quantization_version".into(), MetaValue::U32(2)));
 
     kv
 }
@@ -420,9 +413,7 @@ mod tests {
     fn map_unknown_returns_none() {
         // Wrong prefix (Gemma 3 SigLIP convention should not match here).
         assert_eq!(
-            map_tensor_name(
-                "model.vision_tower.vision_model.embeddings.patch_embedding.weight"
-            ),
+            map_tensor_name("model.vision_tower.vision_model.embeddings.patch_embedding.weight"),
             None
         );
         // Wrong suffix.

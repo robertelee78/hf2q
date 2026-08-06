@@ -136,18 +136,14 @@ fn hotswap_two_cached_ggufs_e2e() {
     let model_a = match std::env::var(ENV_MODEL_A) {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
-            eprintln!(
-                "[skip] hotswap_two_cached_ggufs_e2e — {ENV_MODEL_A} not set"
-            );
+            eprintln!("[skip] hotswap_two_cached_ggufs_e2e — {ENV_MODEL_A} not set");
             return;
         }
     };
     let model_b = match std::env::var(ENV_MODEL_B) {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
-            eprintln!(
-                "[skip] hotswap_two_cached_ggufs_e2e — {ENV_MODEL_B} not set"
-            );
+            eprintln!("[skip] hotswap_two_cached_ggufs_e2e — {ENV_MODEL_B} not set");
             return;
         }
     };

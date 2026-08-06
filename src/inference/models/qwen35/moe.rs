@@ -79,11 +79,7 @@
 //   # MoE FFN tensors: same as linear layers (8 more, see above).
 
 /// Global (non-per-layer) tensor names.
-pub const GLOBAL_TENSORS: &[&str] = &[
-    "token_embd.weight",
-    "output.weight",
-    "output_norm.weight",
-];
+pub const GLOBAL_TENSORS: &[&str] = &["token_embd.weight", "output.weight", "output_norm.weight"];
 
 /// Per-linear-attention-layer tensor suffixes (append to `blk.{i}.`).
 ///
@@ -138,10 +134,7 @@ pub const FULL_LAYER_TENSOR_SUFFIXES: &[&str] = &[
 ];
 
 /// Build the full per-layer tensor name list for a given layer index + kind.
-pub fn tensor_names_for_layer(
-    layer_idx: u32,
-    kind: super::Qwen35LayerKind,
-) -> Vec<String> {
+pub fn tensor_names_for_layer(layer_idx: u32, kind: super::Qwen35LayerKind) -> Vec<String> {
     let suffixes = match kind {
         super::Qwen35LayerKind::LinearAttention => LINEAR_LAYER_TENSOR_SUFFIXES,
         super::Qwen35LayerKind::FullAttention => FULL_LAYER_TENSOR_SUFFIXES,

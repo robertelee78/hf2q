@@ -41,7 +41,6 @@ pub const QK_K: usize = 256;
 pub const K_SCALE_SIZE: usize = 12;
 pub const BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 2; // 144
 
-
 /// Quantize an F32 buffer to Q4_K bytes.
 ///
 /// Mirrors dispatcher `quantize_q4_K` at `ggml-quants.c:1564`. When
@@ -79,16 +78,18 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
     // par_chunks_exact_mut into a pre-allocated output. Byte output is
     // unchanged — the §P1 byte-cmp regression gate validates.
     let mut out = vec![0u8; n_rows * row_bytes];
-    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
-        let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
-        let mut tmp = Vec::with_capacity(row_bytes);
-        match imatrix {
-            None => quantize_row_ref(row_x, &mut tmp),
-            Some(qw) => quantize_row_impl(row_x, qw, &mut tmp),
-        }
-        debug_assert_eq!(tmp.len(), row_bytes);
-        dst.copy_from_slice(&tmp);
-    });
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, dst)| {
+            let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
+            let mut tmp = Vec::with_capacity(row_bytes);
+            match imatrix {
+                None => quantize_row_ref(row_x, &mut tmp),
+                Some(qw) => quantize_row_impl(row_x, qw, &mut tmp),
+            }
+            debug_assert_eq!(tmp.len(), row_bytes);
+            dst.copy_from_slice(&tmp);
+        });
 
     out
 }
@@ -357,12 +358,30 @@ mod tests {
     fn gemma_blk3083_sub6_hf2q_trace() {
         let f32_bytes = std::fs::read("/tmp/c_quant_repro/gemma_blk3083_sub6_f32.bin").unwrap();
         let w_bytes = std::fs::read("/tmp/c_quant_repro/gemma_blk3083_sub6_weights.bin").unwrap();
-        let x: Vec<f32> = f32_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let x: Vec<f32> = f32_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let w: Vec<f32> = w_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         let mut l = [0u8; 32];
         let mut l_aux = [0u8; 32];
         let mut the_min = 0.0f32;
-        let scale = make_qkx2_quants_instrumented(32, 15, &x, &w, &mut l, &mut the_min, &mut l_aux, -1.0, 0.1, 20, false);
+        let scale = make_qkx2_quants_instrumented(
+            32,
+            15,
+            &x,
+            &w,
+            &mut l,
+            &mut the_min,
+            &mut l_aux,
+            -1.0,
+            0.1,
+            20,
+            false,
+        );
         println!("FINAL hf2q scale={:.10} the_min={:.10}", scale, the_min);
     }
 
@@ -375,14 +394,14 @@ mod tests {
         use super::super::common::make_qkx2_quants;
         // Canonical-recovered scales (from canon_qkx2_sub*.c standalone runs)
         let canon_scales: [f32; 8] = [
-            0.0069445884,  // sub 0
-            0.0069021727,  // sub 1
-            0.0085167065,  // sub 2
-            0.0089343758,  // sub 3
-            0.0099748811,  // sub 4
-            0.0061270911,  // sub 5
-            0.0100716567,  // sub 6 — MAX
-            0.0056068259,  // sub 7
+            0.0069445884, // sub 0
+            0.0069021727, // sub 1
+            0.0085167065, // sub 2
+            0.0089343758, // sub 3
+            0.0099748811, // sub 4
+            0.0061270911, // sub 5
+            0.0100716567, // sub 6 — MAX
+            0.0056068259, // sub 7
         ];
         let mut hf2q_scales = [0.0f32; 8];
         for j in 0..8 {
@@ -390,12 +409,30 @@ mod tests {
             let w_path = format!("/tmp/c_quant_repro/gemma_blk3083_sub{}_weights.bin", j);
             let f32_bytes = std::fs::read(&f32_path).unwrap();
             let w_bytes = std::fs::read(&w_path).unwrap();
-            let x: Vec<f32> = f32_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let x: Vec<f32> = f32_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let w: Vec<f32> = w_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             let mut l = [0u8; 32];
             let mut l_aux = [0u8; 32];
             let mut the_min = 0.0f32;
-            let scale = make_qkx2_quants(32, 15, &x, &w, &mut l, &mut the_min, &mut l_aux, -1.0, 0.1, 20, false);
+            let scale = make_qkx2_quants(
+                32,
+                15,
+                &x,
+                &w,
+                &mut l,
+                &mut the_min,
+                &mut l_aux,
+                -1.0,
+                0.1,
+                20,
+                false,
+            );
             hf2q_scales[j] = scale;
         }
         let mut max_scale_canon = 0.0f32;
@@ -404,21 +441,53 @@ mod tests {
         for j in 0..8 {
             let c = canon_scales[j];
             let h = hf2q_scales[j];
-            if c > max_scale_canon { max_scale_canon = c; }
-            if h > max_scale_hf2q { max_scale_hf2q = h; }
+            if c > max_scale_canon {
+                max_scale_canon = c;
+            }
+            if h > max_scale_hf2q {
+                max_scale_hf2q = h;
+            }
             let delta = h - c;
-            let marker = if delta.abs() > 1e-8 { " ← DIVERGES" } else { "" };
-            println!("{:3} | {:.10} 0x{:08x}     | {:.10} 0x{:08x} | {:+.3e}{}",
-                j, c, c.to_bits(), h, h.to_bits(), delta, marker);
+            let marker = if delta.abs() > 1e-8 {
+                " ← DIVERGES"
+            } else {
+                ""
+            };
+            println!(
+                "{:3} | {:.10} 0x{:08x}     | {:.10} 0x{:08x} | {:+.3e}{}",
+                j,
+                c,
+                c.to_bits(),
+                h,
+                h.to_bits(),
+                delta,
+                marker
+            );
         }
         let d_canon = max_scale_canon / 63.0;
         let d_hf2q = max_scale_hf2q / 63.0;
         let d_canon_f16 = half::f16::from_f32(d_canon);
         let d_hf2q_f16 = half::f16::from_f32(d_hf2q);
-        println!("\nmax_scale canon = {:.10} (bits 0x{:08x})", max_scale_canon, max_scale_canon.to_bits());
-        println!("max_scale hf2q  = {:.10} (bits 0x{:08x})", max_scale_hf2q, max_scale_hf2q.to_bits());
-        println!("d (F16) canon = 0x{:04x} = {:?}", d_canon_f16.to_bits(), d_canon_f16.to_le_bytes());
-        println!("d (F16) hf2q  = 0x{:04x} = {:?}", d_hf2q_f16.to_bits(), d_hf2q_f16.to_le_bytes());
+        println!(
+            "\nmax_scale canon = {:.10} (bits 0x{:08x})",
+            max_scale_canon,
+            max_scale_canon.to_bits()
+        );
+        println!(
+            "max_scale hf2q  = {:.10} (bits 0x{:08x})",
+            max_scale_hf2q,
+            max_scale_hf2q.to_bits()
+        );
+        println!(
+            "d (F16) canon = 0x{:04x} = {:?}",
+            d_canon_f16.to_bits(),
+            d_canon_f16.to_le_bytes()
+        );
+        println!(
+            "d (F16) hf2q  = 0x{:04x} = {:?}",
+            d_hf2q_f16.to_bits(),
+            d_hf2q_f16.to_le_bytes()
+        );
     }
 
     /// 2026-05-20 — Instrumented copy of make_qkx2_quants that prints which iteration
@@ -445,15 +514,23 @@ mod tests {
         let mut sum_w = weights[0];
         let mut sum_x = sum_w * x[0];
         for i in 1..n {
-            if x[i] < min { min = x[i]; }
-            if x[i] > max { max = x[i]; }
+            if x[i] < min {
+                min = x[i];
+            }
+            if x[i] > max {
+                max = x[i];
+            }
             let w = weights[i];
             sum_w += w;
             sum_x = w.mul_add(x[i], sum_x);
         }
-        if min > 0.0 { min = 0.0; }
+        if min > 0.0 {
+            min = 0.0;
+        }
         if max == min {
-            for li in l.iter_mut().take(n) { *li = 0; }
+            for li in l.iter_mut().take(n) {
+                *li = 0;
+            }
             *the_min = -min;
             return 0.0;
         }
@@ -467,9 +544,12 @@ mod tests {
             l[i] = li_c;
             let mut diff = scale * li_c as f32 + min - x[i];
             diff = if use_mad { diff.abs() } else { diff * diff };
-            best_error = weights[i].mul_add(diff, best_error);  // fma re-added
+            best_error = weights[i].mul_add(diff, best_error); // fma re-added
         }
-        println!("  INIT: scale={:.10} min={:.10} best_error_FMA={:.10e}", scale, min, best_error);
+        println!(
+            "  INIT: scale={:.10} min={:.10} best_error_FMA={:.10e}",
+            scale, min, best_error
+        );
         let mut accepted_is: i32 = -1;
         for is in 0..=nstep {
             iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
@@ -500,14 +580,22 @@ mod tests {
                 for i in 0..n {
                     let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
                     diff = if use_mad { diff.abs() } else { diff * diff };
-                    cur_error = weights[i].mul_add(diff, cur_error);  // fma re-added
+                    cur_error = weights[i].mul_add(diff, cur_error); // fma re-added
                 }
                 let accepted = cur_error < best_error;
-                println!("  is={:2}: this_scale={:.10} this_min={:.10} cur_error={:.10e} fb={} {}",
-                    is, this_scale, this_min, cur_error, used_fallback,
-                    if accepted {"<-ACCEPTED"} else {""});
+                println!(
+                    "  is={:2}: this_scale={:.10} this_min={:.10} cur_error={:.10e} fb={} {}",
+                    is,
+                    this_scale,
+                    this_min,
+                    cur_error,
+                    used_fallback,
+                    if accepted { "<-ACCEPTED" } else { "" }
+                );
                 if accepted {
-                    for i in 0..n { l[i] = l_aux[i]; }
+                    for i in 0..n {
+                        l[i] = l_aux[i];
+                    }
                     best_error = cur_error;
                     scale = this_scale;
                     min = this_min;
@@ -517,7 +605,10 @@ mod tests {
                 println!("  is={:2}: d_det<=0, skipped", is);
             }
         }
-        println!("  FINAL: scale={:.10} min={:.10} accepted_is={}", scale, min, accepted_is);
+        println!(
+            "  FINAL: scale={:.10} min={:.10} accepted_is={}",
+            scale, min, accepted_is
+        );
         *the_min = -min;
         scale
     }
@@ -530,9 +621,12 @@ mod tests {
     #[test]
     #[ignore]
     fn qwen35_ssm_out_row100_blk13_subblk1_makeqkx2_dump() {
-        let f32_bytes = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_f32.bin").unwrap();
-        let canonical = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_q4k.bin").unwrap();
-        let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+        let f32_bytes =
+            std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_f32.bin").unwrap();
+        let canonical =
+            std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_q4k.bin").unwrap();
+        let f32: Vec<f32> = f32_bytes
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let blk13_offset = 13 * 256;
@@ -547,19 +641,34 @@ mod tests {
         let mut l = [0u8; 32];
         let mut l_aux = [0u8; 32];
         let mut the_min = 0.0f32;
-        let scale = make_qkx2_quants_instrumented(32, 15, sub, &weights, &mut l, &mut the_min, &mut l_aux,
-            -1.0, 0.1, 20, false);
-        let _min_alias = -the_min;  // make_qkx2 writes -min into the_min
-        // Actually the function writes `*the_min = -min`. So our recovered min:
-        // *the_min holds -min. Since min is the F32 returned to caller as mins[j],
-        // mins[1] = *the_min = -min. Let me name it more carefully:
-        let mins_1_hf2q = the_min;  // == -min from make_qkx2's perspective
+        let scale = make_qkx2_quants_instrumented(
+            32,
+            15,
+            sub,
+            &weights,
+            &mut l,
+            &mut the_min,
+            &mut l_aux,
+            -1.0,
+            0.1,
+            20,
+            false,
+        );
+        let _min_alias = -the_min; // make_qkx2 writes -min into the_min
+                                   // Actually the function writes `*the_min = -min`. So our recovered min:
+                                   // *the_min holds -min. Since min is the F32 returned to caller as mins[j],
+                                   // mins[1] = *the_min = -min. Let me name it more carefully:
+        let mins_1_hf2q = the_min; // == -min from make_qkx2's perspective
         println!("hf2q sub-block 1 of block 13 (row 100):");
         println!("  scale = {:.30} (bits 0x{:08x})", scale, scale.to_bits());
-        println!("  mins[1] = {:.30} (bits 0x{:08x})", mins_1_hf2q, mins_1_hf2q.to_bits());
+        println!(
+            "  mins[1] = {:.30} (bits 0x{:08x})",
+            mins_1_hf2q,
+            mins_1_hf2q.to_bits()
+        );
 
         // Read canonical's block 13: extract dmin F16, lm[1]=25, mins/scales pack
-        let canon_blk13 = &canonical[13*144..14*144];
+        let canon_blk13 = &canonical[13 * 144..14 * 144];
         let canon_dmin_u16 = u16::from_le_bytes([canon_blk13[2], canon_blk13[3]]);
         // half F16 → F32
         let canon_dmin = half::f16::from_bits(canon_dmin_u16).to_f32();
@@ -572,22 +681,40 @@ mod tests {
         let canon_mins_1_approx_low = 24.5 / canon_inv_min;
         let canon_mins_1_approx_high = 25.5 / canon_inv_min;
         println!("\ncanonical recovered:");
-        println!("  dmin F16 bytes: {:02x} {:02x}", canon_blk13[2], canon_blk13[3]);
+        println!(
+            "  dmin F16 bytes: {:02x} {:02x}",
+            canon_blk13[2], canon_blk13[3]
+        );
         println!("  dmin F32 = {:.30}", canon_dmin);
         println!("  max_min = {:.30} (= dmin*63)", canon_max_min);
         println!("  inv_min = {:.30} (= 63/max_min)", canon_inv_min);
-        println!("  mins[1] in range [{:.10}, {:.10}) for lm[1]=25", canon_mins_1_approx_low, canon_mins_1_approx_high);
+        println!(
+            "  mins[1] in range [{:.10}, {:.10}) for lm[1]=25",
+            canon_mins_1_approx_low, canon_mins_1_approx_high
+        );
 
         // Now compute hf2q's inv_min*mins[1] product and verify the round
         // For hf2q we need max_min which requires running make_qkx2 for ALL 8 sub-blocks.
         // Skipping that — use canonical's inv_min (since 7 of 8 lm[i] match, they must be ≈ equal).
         let hf2q_product_approx = canon_inv_min * mins_1_hf2q;
-        println!("\nhf2q mins[1] * canon inv_min = {:.10}", hf2q_product_approx);
-        println!("  → nearest_int = {}", (hf2q_product_approx + 0.5).floor() as i32);
+        println!(
+            "\nhf2q mins[1] * canon inv_min = {:.10}",
+            hf2q_product_approx
+        );
+        println!(
+            "  → nearest_int = {}",
+            (hf2q_product_approx + 0.5).floor() as i32
+        );
         let canon_product_low = 24.5;
         let canon_product_high = 25.5;
-        println!("\nCANON product range for lm[1]=25: [{}, {})", canon_product_low, canon_product_high);
-        println!("Δ (hf2q - canon_mid_25.0): {:.10}", hf2q_product_approx - 25.0);
+        println!(
+            "\nCANON product range for lm[1]=25: [{}, {})",
+            canon_product_low, canon_product_high
+        );
+        println!(
+            "Δ (hf2q - canon_mid_25.0): {:.10}",
+            hf2q_product_approx - 25.0
+        );
     }
 
     /// 2026-05-20 — diff localization for the invariant 11-byte ssm_out row 100
@@ -600,9 +727,12 @@ mod tests {
     #[test]
     #[ignore]
     fn qwen35_ssm_out_row100_q4k_diff_breakdown() {
-        let f32_bytes = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_f32.bin").unwrap();
-        let canonical = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_q4k.bin").unwrap();
-        let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+        let f32_bytes =
+            std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_f32.bin").unwrap();
+        let canonical =
+            std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_q4k.bin").unwrap();
+        let f32: Vec<f32> = f32_bytes
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let n_per_row = f32.len();
@@ -611,31 +741,57 @@ mod tests {
         let mut total_diff = 0usize;
         for blk in 0..n_blocks {
             let s = blk * 144;
-            let mine = &q4k[s..s+144];
-            let canon = &canonical[s..s+144];
+            let mine = &q4k[s..s + 144];
+            let canon = &canonical[s..s + 144];
             let d_diff = mine[0..2] != canon[0..2];
             let dmin_diff = mine[2..4] != canon[2..4];
-            let scales_diff: usize = mine[4..16].iter().zip(canon[4..16].iter()).filter(|(a,b)| a != b).count();
-            let qs_diff: usize = mine[16..144].iter().zip(canon[16..144].iter()).filter(|(a,b)| a != b).count();
-            let blk_diff = (if d_diff {2} else {0}) + (if dmin_diff {2} else {0}) + scales_diff + qs_diff;
+            let scales_diff: usize = mine[4..16]
+                .iter()
+                .zip(canon[4..16].iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            let qs_diff: usize = mine[16..144]
+                .iter()
+                .zip(canon[16..144].iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            let blk_diff = (if d_diff { 2 } else { 0 })
+                + (if dmin_diff { 2 } else { 0 })
+                + scales_diff
+                + qs_diff;
             total_diff += blk_diff;
             if blk_diff > 0 {
-                println!("blk {}: d_diff={} dmin_diff={} scales_diff={} qs_diff={} (total {})",
-                    blk, d_diff, dmin_diff, scales_diff, qs_diff, blk_diff);
+                println!(
+                    "blk {}: d_diff={} dmin_diff={} scales_diff={} qs_diff={} (total {})",
+                    blk, d_diff, dmin_diff, scales_diff, qs_diff, blk_diff
+                );
                 if d_diff {
                     println!("  hf2q  d (f16 LE bytes): {:02x} {:02x}", mine[0], mine[1]);
-                    println!("  canon d (f16 LE bytes): {:02x} {:02x}", canon[0], canon[1]);
+                    println!(
+                        "  canon d (f16 LE bytes): {:02x} {:02x}",
+                        canon[0], canon[1]
+                    );
                 }
                 if dmin_diff {
-                    println!("  hf2q  dmin (f16 LE bytes): {:02x} {:02x}", mine[2], mine[3]);
-                    println!("  canon dmin (f16 LE bytes): {:02x} {:02x}", canon[2], canon[3]);
+                    println!(
+                        "  hf2q  dmin (f16 LE bytes): {:02x} {:02x}",
+                        mine[2], mine[3]
+                    );
+                    println!(
+                        "  canon dmin (f16 LE bytes): {:02x} {:02x}",
+                        canon[2], canon[3]
+                    );
                 }
                 if scales_diff > 0 {
                     print!("  hf2q  scales[12]:  ");
-                    for b in &mine[4..16] { print!("{:02x} ", b); }
+                    for b in &mine[4..16] {
+                        print!("{:02x} ", b);
+                    }
                     println!();
                     print!("  canon scales[12]: ");
-                    for b in &canon[4..16] { print!("{:02x} ", b); }
+                    for b in &canon[4..16] {
+                        print!("{:02x} ", b);
+                    }
                     println!();
                 }
             }
@@ -666,14 +822,23 @@ mod tests {
             for &row_idx in *rows {
                 let f32_path = format!("/tmp/c_quant_repro/gemma_{}_row{}_f32.bin", name, row_idx);
                 let q4k_path = format!("/tmp/c_quant_repro/gemma_{}_row{}_q4k.bin", name, row_idx);
-                let f32_bytes = std::fs::read(&f32_path).unwrap_or_else(|_| panic!("{} must exist", f32_path));
-                let canonical = std::fs::read(&q4k_path).unwrap_or_else(|_| panic!("{} must exist", q4k_path));
+                let f32_bytes =
+                    std::fs::read(&f32_path).unwrap_or_else(|_| panic!("{} must exist", f32_path));
+                let canonical =
+                    std::fs::read(&q4k_path).unwrap_or_else(|_| panic!("{} must exist", q4k_path));
                 let n_blocks = n_per_row / 256;
                 assert_eq!(f32_bytes.len(), n_per_row * 4);
                 assert_eq!(canonical.len(), n_blocks * 144);
-                let f32: Vec<f32> = f32_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let f32: Vec<f32> = f32_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
                 let q4k = quantize(&f32, *n_per_row, None);
-                let diff: usize = q4k.iter().zip(canonical.iter()).filter(|(a, b)| a != b).count();
+                let diff: usize = q4k
+                    .iter()
+                    .zip(canonical.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
                 if diff > 0 {
                     println!("{} row {}: {} bytes differ", name, row_idx, diff);
                 }
@@ -681,8 +846,12 @@ mod tests {
                 grand_total += q4k.len();
             }
         }
-        println!("\nGEMMA Q4_K BROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
-            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+        println!(
+            "\nGEMMA Q4_K BROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
+            grand_total_diff,
+            grand_total,
+            100.0 * grand_total_diff as f64 / grand_total as f64
+        );
     }
 
     /// 2026-05-20 Qwen 3.5 Q4_K BROAD diagnostic — sample 16 rows across 5
@@ -705,19 +874,23 @@ mod tests {
             for &row_idx in *rows {
                 let f32_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_f32.bin", name, row_idx);
                 let q4k_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_q4k.bin", name, row_idx);
-                let f32_bytes = std::fs::read(&f32_path)
-                    .unwrap_or_else(|_| panic!("{} must exist", f32_path));
-                let canonical = std::fs::read(&q4k_path)
-                    .unwrap_or_else(|_| panic!("{} must exist", q4k_path));
+                let f32_bytes =
+                    std::fs::read(&f32_path).unwrap_or_else(|_| panic!("{} must exist", f32_path));
+                let canonical =
+                    std::fs::read(&q4k_path).unwrap_or_else(|_| panic!("{} must exist", q4k_path));
                 let n_blocks = n_per_row / 256;
                 assert_eq!(f32_bytes.len(), n_per_row * 4);
                 assert_eq!(canonical.len(), n_blocks * 144);
-                let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+                let f32: Vec<f32> = f32_bytes
+                    .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 let q4k = quantize(&f32, *n_per_row, None);
-                let diff: usize = q4k.iter().zip(canonical.iter())
-                    .filter(|(a, b)| a != b).count();
+                let diff: usize = q4k
+                    .iter()
+                    .zip(canonical.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
                 if diff > 0 {
                     println!("{} row {}: {} bytes differ", name, row_idx, diff);
                 }
@@ -725,8 +898,12 @@ mod tests {
                 grand_total += q4k.len();
             }
         }
-        println!("\nBROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
-            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+        println!(
+            "\nBROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
+            grand_total_diff,
+            grand_total,
+            100.0 * grand_total_diff as f64 / grand_total as f64
+        );
     }
 
     /// 2026-05-20 Qwen 3.5 Q4_K multi-tensor diagnostic — sample 3 tensors
@@ -748,26 +925,39 @@ mod tests {
         for (name, n_per_row, n_blocks) in cases {
             let f32_path = format!("/tmp/c_quant_repro/qwen35_{}_row0_f32.bin", name);
             let q4k_path = format!("/tmp/c_quant_repro/qwen35_{}_row0_q4k.bin", name);
-            let f32_bytes = std::fs::read(&f32_path)
-                .unwrap_or_else(|_| panic!("{} must exist", f32_path));
-            let canonical = std::fs::read(&q4k_path)
-                .unwrap_or_else(|_| panic!("{} must exist", q4k_path));
+            let f32_bytes =
+                std::fs::read(&f32_path).unwrap_or_else(|_| panic!("{} must exist", f32_path));
+            let canonical =
+                std::fs::read(&q4k_path).unwrap_or_else(|_| panic!("{} must exist", q4k_path));
             assert_eq!(f32_bytes.len(), n_per_row * 4);
             assert_eq!(canonical.len(), n_blocks * 144);
-            let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+            let f32: Vec<f32> = f32_bytes
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let q4k = quantize(&f32, *n_per_row, None);
             assert_eq!(q4k.len(), canonical.len());
-            let diff: usize = q4k.iter().zip(canonical.iter())
-                .filter(|(a, b)| a != b).count();
-            println!("{}: {}/{} bytes differ ({:.4}%)",
-                name, diff, q4k.len(), 100.0 * diff as f64 / q4k.len() as f64);
+            let diff: usize = q4k
+                .iter()
+                .zip(canonical.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            println!(
+                "{}: {}/{} bytes differ ({:.4}%)",
+                name,
+                diff,
+                q4k.len(),
+                100.0 * diff as f64 / q4k.len() as f64
+            );
             grand_total_diff += diff;
             grand_total += q4k.len();
         }
-        println!("\nGRAND TOTAL: {}/{} bytes differ ({:.4}%)",
-            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+        println!(
+            "\nGRAND TOTAL: {}/{} bytes differ ({:.4}%)",
+            grand_total_diff,
+            grand_total,
+            100.0 * grand_total_diff as f64 / grand_total as f64
+        );
     }
 
     /// 2026-05-20 diagnostic: read canonical Qwen 3.5 blk.0.attn_gate.weight
@@ -781,7 +971,8 @@ mod tests {
         let f32_bytes = std::fs::read("/tmp/c_quant_repro/qwen35_blk0_attn_gate_row0_f32.bin")
             .expect("/tmp/c_quant_repro/qwen35_blk0_attn_gate_row0_f32.bin must exist");
         assert_eq!(f32_bytes.len(), 8192, "expected 2048 F32 = 8192 bytes");
-        let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+        let f32: Vec<f32> = f32_bytes
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -798,24 +989,37 @@ mod tests {
             let blk_end = blk_start + 144;
             let hf2q_blk = &q4k[blk_start..blk_end];
             let canon_blk = &canonical[blk_start..blk_end];
-            let blk_diff: usize = hf2q_blk.iter().zip(canon_blk.iter())
-                .filter(|(a, b)| a != b).count();
+            let blk_diff: usize = hf2q_blk
+                .iter()
+                .zip(canon_blk.iter())
+                .filter(|(a, b)| a != b)
+                .count();
             total_diff_bytes += blk_diff;
             if blk_diff > 0 {
                 println!("Block {}: {} bytes differ", blk_idx, blk_diff);
-                let hex_h = hf2q_blk[..16].iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                let hex_c = canon_blk[..16].iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                let hex_h = hf2q_blk[..16]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
+                let hex_c = canon_blk[..16]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
                 println!("  hf2q  d/dmin/scales12: {}", hex_h);
                 println!("  canon d/dmin/scales12: {}", hex_c);
             }
         }
-        println!("\nTotal: {}/{} bytes differ ({:.4}%)",
-            total_diff_bytes, 8 * 144, 100.0 * total_diff_bytes as f64 / (8.0 * 144.0));
+        println!(
+            "\nTotal: {}/{} bytes differ ({:.4}%)",
+            total_diff_bytes,
+            8 * 144,
+            100.0 * total_diff_bytes as f64 / (8.0 * 144.0)
+        );
     }
 
     fn fixture_path(name: &str) -> PathBuf {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set by cargo test");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo test");
         PathBuf::from(manifest)
             .join("tests/fixtures/ggml_quants")
             .join(name)
@@ -890,8 +1094,7 @@ mod tests {
     fn real_model_byte_cmp_blk0_attn_k() {
         let f32_path = "/tmp/blk0_attn_k_f32.bin";
         let expected_path = "/tmp/blk0_attn_k_q4k_expected.bin";
-        if !std::path::Path::new(f32_path).exists()
-            || !std::path::Path::new(expected_path).exists()
+        if !std::path::Path::new(f32_path).exists() || !std::path::Path::new(expected_path).exists()
         {
             eprintln!(
                 "[skip] real_model_byte_cmp_blk0_attn_k: fixture files missing. \
@@ -967,12 +1170,18 @@ mod tests {
                 *field_diffs.entry(field).or_insert(0) += 1;
             }
         }
-        eprintln!("  blocks differing: {} of 22528 ({:.2}%)", blocks_diff.len(), 100.0 * blocks_diff.len() as f64 / 22528.0);
-        eprintln!("  diffs per field: d={}, dmin={}, scales={}, qs={}",
+        eprintln!(
+            "  blocks differing: {} of 22528 ({:.2}%)",
+            blocks_diff.len(),
+            100.0 * blocks_diff.len() as f64 / 22528.0
+        );
+        eprintln!(
+            "  diffs per field: d={}, dmin={}, scales={}, qs={}",
             field_diffs.get("d").unwrap_or(&0),
             field_diffs.get("dmin").unwrap_or(&0),
             field_diffs.get("scales").unwrap_or(&0),
-            field_diffs.get("qs").unwrap_or(&0));
+            field_diffs.get("qs").unwrap_or(&0)
+        );
         // 2026-05-20 (post-stale-fixture-fix): fixture regenerated against
         // current /opt/llama.cpp HEAD `e15384a5c` and hf2q kernel reverted
         // to plain `+=` at sum_l/sum_l2/sum_xl (matches canonical's effective

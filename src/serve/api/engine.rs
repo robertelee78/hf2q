@@ -40,18 +40,15 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::serve::config::Gemma4Config;
 use crate::inference::models::gemma4::{MlxModelWeights, ProfileAccumulator};
+use crate::serve::config::Gemma4Config;
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
 use crate::serve::header;
 use crate::serve::load_info::{
-    self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
-    TokenizerSource,
+    self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
 };
-use crate::serve::sampler_pure::{
-    self, SamplingParams as SamplerParams,
-};
+use crate::serve::sampler_pure::{self, SamplingParams as SamplerParams};
 // ADR-040 Phase C iter-2a (C2b) — Scheduler wiring per Shape A
 // (dossier `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.1).
 // `FifoSchedulerAdapter` is the only concrete scheduler instantiated under
@@ -61,11 +58,11 @@ use crate::serve::sampler_pure::{
 // trait carries the public `stats(&self) -> SchedulerStats` signature
 // even though `advance_after_*` deliberately lives on the concrete type
 // per dossier §2.9).
+use crate::serve::multi_seq_kv::SlotId;
 use crate::serve::scheduler::{
     AdmitError, AdmitRequest, FifoSchedulerAdapter, InflightBatchedScheduler, Scheduler,
     SchedulerPolicy, SchedulerStats, SchedulerStep, SlotHandle, StepError,
 };
-use crate::serve::multi_seq_kv::SlotId;
 // ADR-040 iter-2-decode-C-stream-tool-call (§6.1.48) — `MultiSeqError`
 // import is now ONLY used inside `#[cfg(test)]` modules (the slot-aware
 // streaming fn's last typed-error `CapabilityUnsupported` constructor
@@ -171,7 +168,6 @@ pub enum ToolCallPolicy {
     Constrained,
 }
 
-
 impl ToolCallPolicy {
     /// `true` when the policy carries an active grammar that physically
     /// constrains the tool-call body (Constrained from byte 0, or
@@ -182,7 +178,10 @@ impl ToolCallPolicy {
     /// (`emit_streaming_tool_call_close`) and non-streaming
     /// (`extract_tool_calls_from_text`) paths.
     pub fn enforces_body_grammar(&self) -> bool {
-        matches!(self, ToolCallPolicy::Constrained | ToolCallPolicy::AutoLazyGrammar)
+        matches!(
+            self,
+            ToolCallPolicy::Constrained | ToolCallPolicy::AutoLazyGrammar
+        )
     }
 }
 
@@ -916,8 +915,7 @@ pub const ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS: u32 = 8;
 /// for the [`EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold`]
 /// error variant.  Operator log greps land directly on the path so
 /// triage routes to the research source not a code line.
-pub const ADR040_A4_DOSSIER_CITE: &str =
-    "ADR-040 §6.1.53 + §6.1.54 A4 dossier — \
+pub const ADR040_A4_DOSSIER_CITE: &str = "ADR-040 §6.1.53 + §6.1.54 A4 dossier — \
      docs/research/adr040-a4-drafter-multi-seq-dossier-2026-05-30.md";
 
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — read
@@ -1168,61 +1166,60 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
                         range,
                         reply,
                     } => {
-                        let result: Result<Option<KvSnapshotBytes>> = if layer_rank
-                            >= nkv_clone.len()
-                        {
-                            Err(anyhow::anyhow!("layer OOB"))
-                        } else {
-                            let nkv_l = nkv_clone[layer_rank];
-                            let cap_l = capacity_clone[layer_rank];
-                            let hd_l = head_dim_clone[layer_rank];
-                            let is_sliding_l = is_sliding_clone[layer_rank];
-                            let chunk = hd_l * kv_dtype_bytes;
-                            // If layer was never seeded AND no
-                            // restore wrote into it, return None
-                            // (mirroring "no prefill yet").
-                            let layer_populated =
-                                cells.iter().any(|((l, _, _), _)| *l == layer_rank);
-                            if !layer_populated {
-                                Ok(None)
+                        let result: Result<Option<KvSnapshotBytes>> =
+                            if layer_rank >= nkv_clone.len() {
+                                Err(anyhow::anyhow!("layer OOB"))
                             } else {
-                                let n_tokens = (range.end - range.start) as usize;
-                                let mut k_out = Vec::with_capacity(nkv_l * n_tokens * chunk);
-                                let mut v_out = Vec::with_capacity(nkv_l * n_tokens * chunk);
-                                for h in 0..nkv_l {
-                                    for tok in range.start..range.end {
-                                        let slot = if is_sliding_l {
-                                            (tok as usize) % cap_l
-                                        } else {
-                                            tok as usize
-                                        };
-                                        match cells.get(&(layer_rank, h, slot)) {
-                                            Some((k, v)) => {
-                                                k_out.extend_from_slice(k);
-                                                v_out.extend_from_slice(v);
-                                            }
-                                            None => {
-                                                k_out.extend_from_slice(&vec![0u8; chunk]);
-                                                v_out.extend_from_slice(&vec![0u8; chunk]);
+                                let nkv_l = nkv_clone[layer_rank];
+                                let cap_l = capacity_clone[layer_rank];
+                                let hd_l = head_dim_clone[layer_rank];
+                                let is_sliding_l = is_sliding_clone[layer_rank];
+                                let chunk = hd_l * kv_dtype_bytes;
+                                // If layer was never seeded AND no
+                                // restore wrote into it, return None
+                                // (mirroring "no prefill yet").
+                                let layer_populated =
+                                    cells.iter().any(|((l, _, _), _)| *l == layer_rank);
+                                if !layer_populated {
+                                    Ok(None)
+                                } else {
+                                    let n_tokens = (range.end - range.start) as usize;
+                                    let mut k_out = Vec::with_capacity(nkv_l * n_tokens * chunk);
+                                    let mut v_out = Vec::with_capacity(nkv_l * n_tokens * chunk);
+                                    for h in 0..nkv_l {
+                                        for tok in range.start..range.end {
+                                            let slot = if is_sliding_l {
+                                                (tok as usize) % cap_l
+                                            } else {
+                                                tok as usize
+                                            };
+                                            match cells.get(&(layer_rank, h, slot)) {
+                                                Some((k, v)) => {
+                                                    k_out.extend_from_slice(k);
+                                                    v_out.extend_from_slice(v);
+                                                }
+                                                None => {
+                                                    k_out.extend_from_slice(&vec![0u8; chunk]);
+                                                    v_out.extend_from_slice(&vec![0u8; chunk]);
+                                                }
                                             }
                                         }
                                     }
+                                    Ok(Some(KvSnapshotBytes {
+                                        k: k_out,
+                                        v: v_out,
+                                        nkv_heads: nkv_l as u16,
+                                        head_dim: hd_l as u16,
+                                        capacity: cap_l as u32,
+                                        is_sliding: is_sliding_l,
+                                        write_pos: if is_sliding_l {
+                                            write_pos[layer_rank]
+                                        } else {
+                                            u32::MAX
+                                        },
+                                    }))
                                 }
-                                Ok(Some(KvSnapshotBytes {
-                                    k: k_out,
-                                    v: v_out,
-                                    nkv_heads: nkv_l as u16,
-                                    head_dim: hd_l as u16,
-                                    capacity: cap_l as u32,
-                                    is_sliding: is_sliding_l,
-                                    write_pos: if is_sliding_l {
-                                        write_pos[layer_rank]
-                                    } else {
-                                        u32::MAX
-                                    },
-                                }))
-                            }
-                        };
+                            };
                         let _ = reply.send(result);
                     }
                     Request::KvRestore {
@@ -2049,9 +2046,7 @@ pub struct GemmaLoadedModel {
     /// HB variant only (matches default operator config); the hybrid
     /// variant scaffold is iter-C2c-cont per the same gating as the
     /// kernel slot routing.
-    pub multi_seq_kv: Option<
-        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
-    >,
+    pub multi_seq_kv: Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>>,
 
     /// **ADR-040 Phase C iter-C2c-cont (2026-05-30)** — sibling multi-
     /// seq KV scaffold for the PRODUCTION-DEFAULT hybrid F16-K + TQ-HB-V
@@ -2094,9 +2089,8 @@ pub struct GemmaLoadedModel {
     /// THIS field via `MlxBuffer::slice_view` at the F16-K
     /// `slot_id.0 * nkv * cap * hd * 2`-byte offset (mirror of the
     /// HB-encoded iter-2A-cont scheme).
-    pub multi_seq_kv_hybrid: Option<
-        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
-    >,
+    pub multi_seq_kv_hybrid:
+        Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>>,
     /// ADR-040 iter-C2c-cont-cont (2026-05-30) — multi-seq dense F32 KV
     /// scaffold sibling.  Provisioned IFF `INVESTIGATION_ENV.use_dense`
     /// is true at SlotAware spawn time (HF2Q_USE_DENSE=1 opt-in
@@ -2109,9 +2103,8 @@ pub struct GemmaLoadedModel {
     /// branch surfaces typed `iter-C2c-cont-cont-invariant-violated`
     /// defense-in-depth at this case (operator who flipped the env
     /// post-LazyLock-cache would land here).  See ADR-040 §6.1.46.
-    pub multi_seq_kv_dense: Option<
-        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
-    >,
+    pub multi_seq_kv_dense:
+        Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>>,
     /// ADR-040 iter-C2c-cont-cont (2026-05-30) — multi-seq legacy 4-bit
     /// nibble-packed KV scaffold sibling.  Provisioned IFF the
     /// HF2Q_TQ_CODEBOOK_BITS=4 env gate is engaged at SlotAware spawn
@@ -2126,9 +2119,8 @@ pub struct GemmaLoadedModel {
     /// dispatch-fork branch surfaces typed
     /// `iter-C2c-cont-cont-invariant-violated` defense-in-depth at this
     /// case.  See ADR-040 §6.1.46.
-    pub multi_seq_kv_mlx: Option<
-        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
-    >,
+    pub multi_seq_kv_mlx:
+        Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>>,
 }
 
 impl LoadedModel {
@@ -2448,10 +2440,11 @@ impl<'a> EventSink<'a> {
     /// (replay does not capture; it re-emits already-captured fragments) and
     /// by tests / qwen35 callsites that don't participate in the Gemma
     /// streaming-origin store path.
-    pub(super) fn new(
-        sender: &'a tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
-    ) -> Self {
-        Self { sender, capture: None }
+    pub(super) fn new(sender: &'a tokio::sync::mpsc::Sender<super::sse::GenerationEvent>) -> Self {
+        Self {
+            sender,
+            capture: None,
+        }
     }
 
     /// Capture sink — every `Delta` / `ToolCallDelta` is mirrored into
@@ -2461,7 +2454,10 @@ impl<'a> EventSink<'a> {
         sender: &'a tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
         capture: &'a std::cell::RefCell<Vec<CachedFragment>>,
     ) -> Self {
-        Self { sender, capture: Some(capture) }
+        Self {
+            sender,
+            capture: Some(capture),
+        }
     }
 
     /// Forward an event to the underlying channel, mirroring into the
@@ -2482,7 +2478,9 @@ impl<'a> EventSink<'a> {
                 super::sse::GenerationEvent::Delta {
                     kind: super::sse::DeltaKind::Reasoning,
                     text,
-                } => cap.borrow_mut().push(CachedFragment::Reasoning(text.clone())),
+                } => cap
+                    .borrow_mut()
+                    .push(CachedFragment::Reasoning(text.clone())),
                 super::sse::GenerationEvent::ToolCallDelta {
                     index,
                     id,
@@ -2640,7 +2638,11 @@ impl PromptCache {
     /// `grammar_kind`, `frequency_penalty`, `presence_penalty`,
     /// `min_p`, `tool_call_policy`, `logprobs`, `top_logprobs`,
     /// `parallel_tool_calls`.  See `PromptCacheKey` doc for rationale.
-    pub fn lookup(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Option<GenerationResult> {
+    pub fn lookup(
+        &self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+    ) -> Option<GenerationResult> {
         self.lookup_with_fragments(prompt_tokens, params)
             .map(|(result, _frags)| result)
     }
@@ -2917,23 +2919,27 @@ impl GemmaLoadedModel {
         // by `tests/adr_022_phase1_p11_gemma4_tokenizer_parity.rs` (5/5
         // cases byte-identical to the on-disk tokenizer.json on the
         // abliterated Gemma4-A4B file).
-        let tokenizer_path_opt = resolve_tokenizer_path_optional(
-            model_path,
-            opts.tokenizer_path.as_deref(),
-        );
+        let tokenizer_path_opt =
+            resolve_tokenizer_path_optional(model_path, opts.tokenizer_path.as_deref());
 
         // Open GGUF (header + metadata only).
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         if load_timing {
-            tracing::info!("[LOAD_TIMING] gguf_open={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] gguf_open={:.0}ms",
+                t_phase.elapsed().as_secs_f64() * 1000.0
+            );
             t_phase = Instant::now();
         }
 
         let config = Gemma4Config::from_gguf(&gguf)
             .context("Failed to derive Gemma4Config from GGUF metadata")?;
         if load_timing {
-            tracing::info!("[LOAD_TIMING] config_parse={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] config_parse={:.0}ms",
+                t_phase.elapsed().as_secs_f64() * 1000.0
+            );
             t_phase = Instant::now();
         }
 
@@ -3013,13 +3019,19 @@ impl GemmaLoadedModel {
         //   - Test contexts that capture stderr: stderr is rarely a
         //     TTY → reporter silent.
         if load_timing {
-            tracing::info!("[LOAD_TIMING] meta_misc(provenance+quant+template)={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] meta_misc(provenance+quant+template)={:.0}ms",
+                t_phase.elapsed().as_secs_f64() * 1000.0
+            );
             t_phase = Instant::now();
         }
-        let mut ctx = GpuContext::new()
-            .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+        let mut ctx =
+            GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
         if load_timing {
-            tracing::info!("[LOAD_TIMING] gpu_ctx_new={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] gpu_ctx_new={:.0}ms",
+                t_phase.elapsed().as_secs_f64() * 1000.0
+            );
             t_phase = Instant::now();
         }
 
@@ -3031,14 +3043,13 @@ impl GemmaLoadedModel {
             0
         };
         let mut load_progress = header::LoadProgress::new(stderr_is_tty, verbosity, n_layers);
-        let mut weights = MlxModelWeights::load_from_gguf(
-            &gguf,
-            &config,
-            &mut ctx,
-            &mut load_progress,
-        )?;
+        let mut weights =
+            MlxModelWeights::load_from_gguf(&gguf, &config, &mut ctx, &mut load_progress)?;
         if load_timing {
-            tracing::info!("[LOAD_TIMING] mlx_weights_load={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] mlx_weights_load={:.0}ms",
+                t_phase.elapsed().as_secs_f64() * 1000.0
+            );
             t_phase = Instant::now();
         }
 
@@ -3049,12 +3060,7 @@ impl GemmaLoadedModel {
         if let Some(overlay_path) = opts.dwq_overlay_path.as_ref() {
             let overridden = weights
                 .apply_dwq_overlay(ctx.device(), overlay_path)
-                .with_context(|| {
-                    format!(
-                        "DWQ overlay from {} failed",
-                        overlay_path.display()
-                    )
-                })?;
+                .with_context(|| format!("DWQ overlay from {} failed", overlay_path.display()))?;
             tracing::info!(
                 count = overridden,
                 path = %overlay_path.display(),
@@ -3091,14 +3097,20 @@ impl GemmaLoadedModel {
                 .context("Failed to build Gemma4 tokenizer from GGUF metadata (HF2Q_TOKENIZER_GGUF_EMBEDDED=1)")?
         } else {
             match tokenizer_path_opt.as_ref() {
-                Some(p) => Tokenizer::from_file(p)
-                    .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", p.display()))?,
-                None => crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
-                    .context("Failed to build Gemma4 tokenizer from GGUF metadata")?,
+                Some(p) => Tokenizer::from_file(p).map_err(|e| {
+                    anyhow::anyhow!("Failed to load tokenizer from {}: {e}", p.display())
+                })?,
+                None => {
+                    crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
+                        .context("Failed to build Gemma4 tokenizer from GGUF metadata")?
+                }
             }
         };
         if load_timing {
-            tracing::info!("[LOAD_TIMING] tokenizer_init={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] tokenizer_init={:.0}ms",
+                t_phase.elapsed().as_secs_f64() * 1000.0
+            );
         }
         let _ = t_phase; // last phase consumes the timer; suppress unused warning
         let tokenizer_path = tokenizer_path_opt.unwrap_or_else(|| {
@@ -3164,7 +3176,7 @@ impl GemmaLoadedModel {
             // bare integers ≥ 4096 = raw byte count; suffix b/k/m/g =
             // bytes with multiplier.
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
-                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget(),
             ),
             // ADR-017 Phase E.a iter-2: metrics sink wired by
             // `serve::load_engine` AFTER this constructor returns
@@ -3252,10 +3264,7 @@ impl GemmaLoadedModel {
     /// `max_slots == 0` is caught at the allocator's pre-flight
     /// (`n_seqs == 0` → typed error per A3a/A3b's invariants) AND at
     /// this fn's entry (defense-in-depth diagnostic).
-    pub fn provision_multi_seq_kv_for_slot_aware(
-        &mut self,
-        max_slots: u32,
-    ) -> Result<()> {
+    pub fn provision_multi_seq_kv_for_slot_aware(&mut self, max_slots: u32) -> Result<()> {
         use crate::inference::models::gemma4::kv_cache::{
             alloc_hb_kv_for_layer, alloc_multi_seq_dense_kv_for_layer,
             alloc_multi_seq_hybrid_kv_for_layer, alloc_multi_seq_mlx_kv_for_layer,
@@ -3286,7 +3295,11 @@ impl GemmaLoadedModel {
             let hd = self.config.head_dim_for_layer(i);
             let nkv = self.config.num_kv_heads_for_layer(i);
             let is_full = self.config.is_full_attention(i);
-            let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
+            let layer_type = if is_full {
+                LayerType::Full
+            } else {
+                LayerType::Sliding
+            };
             let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                 layer_type,
                 self.config.sliding_window,
@@ -3322,8 +3335,11 @@ impl GemmaLoadedModel {
                 let hd = self.config.head_dim_for_layer(i);
                 let nkv = self.config.num_kv_heads_for_layer(i);
                 let is_full = self.config.is_full_attention(i);
-                let layer_type =
-                    if is_full { LayerType::Full } else { LayerType::Sliding };
+                let layer_type = if is_full {
+                    LayerType::Full
+                } else {
+                    LayerType::Sliding
+                };
                 let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
@@ -3376,8 +3392,11 @@ impl GemmaLoadedModel {
                 let hd = self.config.head_dim_for_layer(i);
                 let nkv = self.config.num_kv_heads_for_layer(i);
                 let is_full = self.config.is_full_attention(i);
-                let layer_type =
-                    if is_full { LayerType::Full } else { LayerType::Sliding };
+                let layer_type = if is_full {
+                    LayerType::Full
+                } else {
+                    LayerType::Sliding
+                };
                 let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
@@ -3423,8 +3442,11 @@ impl GemmaLoadedModel {
                 let hd = self.config.head_dim_for_layer(i);
                 let nkv = self.config.num_kv_heads_for_layer(i);
                 let is_full = self.config.is_full_attention(i);
-                let layer_type =
-                    if is_full { LayerType::Full } else { LayerType::Sliding };
+                let layer_type = if is_full {
+                    LayerType::Full
+                } else {
+                    LayerType::Sliding
+                };
                 let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
@@ -3433,7 +3455,14 @@ impl GemmaLoadedModel {
                 );
                 let norms_per_pos = (hd / 256).max(1);
                 let buf = alloc_multi_seq_mlx_kv_for_layer(
-                    dev, i, nkv, hd, capacity, is_ring, norms_per_pos, max_slots,
+                    dev,
+                    i,
+                    nkv,
+                    hd,
+                    capacity,
+                    is_ring,
+                    norms_per_pos,
+                    max_slots,
                 )
                 .with_context(|| {
                     format!(
@@ -3524,7 +3553,9 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             // banner text in `load_info::emit_text`.
             tq_kv_active: !crate::debug::investigation_env::INVESTIGATION_ENV.use_dense
                 && !matches!(
-                    crate::debug::investigation_env::INVESTIGATION_ENV.layer_policy.as_deref(),
+                    crate::debug::investigation_env::INVESTIGATION_ENV
+                        .layer_policy
+                        .as_deref(),
                     Some("dense_all")
                 ),
             // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Gemma 4
@@ -3547,9 +3578,9 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             // the per-token multiplier that lives in
             // `kv_bytes_for_request`, the SHAPE is what differs per
             // layer and must be summed here).
-            kv_bytes_per_token_override: Some(
-                load_info::gemma4_exact_kv_bytes_per_token(&self.config),
-            ),
+            kv_bytes_per_token_override: Some(load_info::gemma4_exact_kv_bytes_per_token(
+                &self.config,
+            )),
         }
     }
 }
@@ -3563,18 +3594,30 @@ impl LoadInfoBuilder for LoadedModel {
         kv_spill_active: bool,
     ) -> LoadInfo {
         match self {
-            LoadedModel::Gemma(g) => {
-                g.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
-            }
-            LoadedModel::Qwen35(q) => {
-                q.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
-            }
-            LoadedModel::Qwen3VlText(v) => {
-                v.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
-            }
-            LoadedModel::Deepseek4(d) => {
-                d.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
-            }
+            LoadedModel::Gemma(g) => g.build_load_info(
+                gguf,
+                load_wall_clock,
+                kv_cache_budget_bytes,
+                kv_spill_active,
+            ),
+            LoadedModel::Qwen35(q) => q.build_load_info(
+                gguf,
+                load_wall_clock,
+                kv_cache_budget_bytes,
+                kv_spill_active,
+            ),
+            LoadedModel::Qwen3VlText(v) => v.build_load_info(
+                gguf,
+                load_wall_clock,
+                kv_cache_budget_bytes,
+                kv_spill_active,
+            ),
+            LoadedModel::Deepseek4(d) => d.build_load_info(
+                gguf,
+                load_wall_clock,
+                kv_cache_budget_bytes,
+                kv_spill_active,
+            ),
         }
     }
 }
@@ -3661,12 +3704,14 @@ impl Engine {
                             super::kv_spill_descriptor::KvSpillProvenance::default()
                         }
                     };
-                    Some(super::kv_spill_descriptor::KvSpillDescriptor::from_gemma_loaded_model(
-                        &g.weights,
-                        max_decode_tokens,
-                        kv_dtype,
-                        provenance,
-                    ))
+                    Some(
+                        super::kv_spill_descriptor::KvSpillDescriptor::from_gemma_loaded_model(
+                            &g.weights,
+                            max_decode_tokens,
+                            kv_dtype,
+                            provenance,
+                        ),
+                    )
                 }
                 LoadedModel::Qwen35(_) => None,
                 // iter-228a: Qwen3-VL text LM doesn't yet wire a
@@ -3929,12 +3974,9 @@ impl Engine {
                 // the SAME typed error at the SAME `max_slots`
                 // threshold, regardless of which per-arch provisioner
                 // would have run.
-                let threshold = read_continuous_batching_max_slots(|name| {
-                    std::env::var(name).ok()
-                });
-                let allow_oversized = read_spec_decode_allow_oversized(|name| {
-                    std::env::var(name).ok()
-                });
+                let threshold = read_continuous_batching_max_slots(|name| std::env::var(name).ok());
+                let allow_oversized =
+                    read_spec_decode_allow_oversized(|name| std::env::var(name).ok());
                 if max_slots > threshold && !allow_oversized {
                     return Err(EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold {
                         max_slots,
@@ -4230,12 +4272,14 @@ impl Engine {
                             super::kv_spill_descriptor::KvSpillProvenance::default()
                         }
                     };
-                    Some(super::kv_spill_descriptor::KvSpillDescriptor::from_gemma_loaded_model(
-                        &g.weights,
-                        max_decode_tokens,
-                        kv_dtype,
-                        provenance,
-                    ))
+                    Some(
+                        super::kv_spill_descriptor::KvSpillDescriptor::from_gemma_loaded_model(
+                            &g.weights,
+                            max_decode_tokens,
+                            kv_dtype,
+                            provenance,
+                        ),
+                    )
                 }
                 LoadedModel::Qwen35(_) => None,
                 LoadedModel::Qwen3VlText(_) => None,
@@ -4580,9 +4624,7 @@ impl Engine {
     /// thread. Used by
     /// `Gemma4DenseSpillFactory::try_from_engine_arc` to construct a
     /// real (non-stub) hook from the live shape.
-    pub fn kv_spill_descriptor(
-        &self,
-    ) -> Option<&super::kv_spill_descriptor::KvSpillDescriptor> {
+    pub fn kv_spill_descriptor(&self) -> Option<&super::kv_spill_descriptor::KvSpillDescriptor> {
         self.inner.kv_spill_descriptor.as_ref()
     }
 
@@ -4999,14 +5041,8 @@ impl Engine {
         soft_tokens: Vec<SoftTokenData>,
         params: SamplingParams,
     ) -> Result<GenerationResult> {
-        self.generate_with_soft_tokens_and_deepstack(
-            prompt_tokens,
-            soft_tokens,
-            params,
-            None,
-            None,
-        )
-        .await
+        self.generate_with_soft_tokens_and_deepstack(prompt_tokens, soft_tokens, params, None, None)
+            .await
     }
 
     /// Wedge-4d entry point for Qwen3-VL chat: same as
@@ -5079,10 +5115,7 @@ impl Engine {
                 .await
                 .context("spawn_blocking for worker join")?
                 .map_err(|panic| {
-                    anyhow::anyhow!(
-                        "engine worker thread panicked on shutdown: {:?}",
-                        panic
-                    )
+                    anyhow::anyhow!("engine worker thread panicked on shutdown: {:?}", panic)
                 })?;
         }
 
@@ -5171,7 +5204,10 @@ enum WorkerScheduler {
 }
 
 impl WorkerScheduler {
-    fn admit(&mut self, req: AdmitRequest) -> Result<crate::serve::scheduler::RequestSlot, AdmitError> {
+    fn admit(
+        &mut self,
+        req: AdmitRequest,
+    ) -> Result<crate::serve::scheduler::RequestSlot, AdmitError> {
         match self {
             Self::Fifo(s) => s.admit(req),
             Self::Inflight(s) => s.admit(req),
@@ -5362,9 +5398,7 @@ impl Gemma4DecodeState {
         params: &SamplingParams,
         registration: Option<&super::registry::ModelRegistration>,
         slot_id: SlotId,
-        multi_seq_kv: &mut Vec<
-            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-        >,
+        multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
         mut multi_seq_kv_hybrid: Option<
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
         >,
@@ -5405,19 +5439,17 @@ impl Gemma4DecodeState {
         }
 
         let prefill_started = Instant::now();
-        let first_decode_token = loaded
-            .weights
-            .forward_prefill_with_soft_tokens_slot_aware(
-                prompt_tokens,
-                soft_tokens,
-                max_decode_tokens,
-                &mut loaded.ctx,
-                slot_id,
-                multi_seq_kv,
-                multi_seq_kv_hybrid.as_deref_mut(),
-                multi_seq_kv_dense.as_deref_mut(),
-                multi_seq_kv_mlx.as_deref_mut(),
-            )?;
+        let first_decode_token = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+            prompt_tokens,
+            soft_tokens,
+            max_decode_tokens,
+            &mut loaded.ctx,
+            slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
+        )?;
         let prefill_duration = prefill_started.elapsed();
         if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
             eprintln!(
@@ -5432,8 +5464,13 @@ impl Gemma4DecodeState {
         // State construction extracted to `from_first_token` (shared with the
         // iter-G(a) batched admit path, which supplies the multi-seq first token).
         Self::from_first_token(
-            loaded, prompt_tokens, params, registration, slot_id,
-            first_decode_token, prefill_duration,
+            loaded,
+            prompt_tokens,
+            params,
+            registration,
+            slot_id,
+            first_decode_token,
+            prefill_duration,
         )
     }
 
@@ -5501,8 +5538,7 @@ impl Gemma4DecodeState {
         };
 
         // First decode token — mirror of serial ref engine.rs:9074-9108.
-        let token_bytes_ref: Option<&[Vec<u8>]> =
-            token_bytes.as_deref().map(|v| &v[..]);
+        let token_bytes_ref: Option<&[Vec<u8>]> = token_bytes.as_deref().map(|v| &v[..]);
         let mut next_token = if sample_logits {
             let sp = sampler_params.as_ref().expect("sample_logits gate");
             let mut logits: Vec<f32> = loaded.weights.logits_view()?.to_vec();
@@ -5538,9 +5574,9 @@ impl Gemma4DecodeState {
             first_decode_token
         };
 
-        let mut reasoning_splitter = registration
-            .filter(|r| r.has_reasoning())
-            .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
+        let mut reasoning_splitter = registration.filter(|r| r.has_reasoning()).and_then(|r| {
+            super::registry::make_reasoning_splitter(r, params.reasoning_forced_open)
+        });
         let reasoning_enabled = reasoning_splitter.is_some();
         let reasoning_forced_open = params.reasoning_forced_open;
         let mut reasoning_token_count: usize = 0;
@@ -5629,9 +5665,7 @@ impl Gemma4DecodeState {
     fn decode_tick(
         &mut self,
         loaded: &mut GemmaLoadedModel,
-        multi_seq_kv: &mut Vec<
-            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-        >,
+        multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
         mut multi_seq_kv_hybrid: Option<
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
         >,
@@ -5680,8 +5714,7 @@ impl Gemma4DecodeState {
         greedy_token: u32,
         logits_row: &[f32],
     ) -> Result<TickOutcome> {
-        let token_bytes_ref: Option<&[Vec<u8>]> =
-            self.token_bytes.as_deref().map(|v| &v[..]);
+        let token_bytes_ref: Option<&[Vec<u8>]> = self.token_bytes.as_deref().map(|v| &v[..]);
         self.next_token = if let Some(sp) = self.sampler_params.as_ref() {
             let mut logits: Vec<f32> = logits_row.to_vec();
             if !self.logit_bias.is_empty() {
@@ -5726,7 +5759,11 @@ impl Gemma4DecodeState {
         // EOS before push/decode (serial ref 9228-9231): suppress the token.
         if loaded.eos_token_ids.contains(&self.next_token) {
             self.finish_reason = "stop";
-            return Ok(TickOutcome { fragment: String::new(), is_reasoning: false, finished: true });
+            return Ok(TickOutcome {
+                fragment: String::new(),
+                is_reasoning: false,
+                finished: true,
+            });
         }
         self.generated_tokens.push(self.next_token);
         let fragment = loaded
@@ -5759,7 +5796,11 @@ impl Gemma4DecodeState {
         if hit_stop_string(&self.decoded_text, &self.stop_strings) {
             self.finish_reason = "stop";
             strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
-            return Ok(TickOutcome { fragment, is_reasoning, finished: true });
+            return Ok(TickOutcome {
+                fragment,
+                is_reasoning,
+                finished: true,
+            });
         }
         // grammar-dead (serial ref 9262-9270): pop the offending token + re-
         // decode the surviving prefix. The popped token was already emitted
@@ -5773,7 +5814,11 @@ impl Gemma4DecodeState {
                 .tokenizer
                 .decode(&self.generated_tokens, false)
                 .unwrap_or_default();
-            return Ok(TickOutcome { fragment, is_reasoning, finished: true });
+            return Ok(TickOutcome {
+                fragment,
+                is_reasoning,
+                finished: true,
+            });
         }
         // max_tokens: the scheduler auto-releases at max_tokens, but the
         // generate loop bound is `1..max_decode_tokens` (serial ref 9158).
@@ -5781,7 +5826,11 @@ impl Gemma4DecodeState {
         // `generated_tokens.len()` tokens total. Finish when we reach the
         // bound so finish_reason stays "length".
         let finished = self.generated_tokens.len() >= self.max_decode_tokens;
-        Ok(TickOutcome { fragment, is_reasoning, finished })
+        Ok(TickOutcome {
+            fragment,
+            is_reasoning,
+            finished,
+        })
     }
 
     /// ADR-040 S1c-2 — body-capture half of [`Self::decode_tick`]: runs the
@@ -5794,9 +5843,7 @@ impl Gemma4DecodeState {
     fn decode_tick_capture(
         &mut self,
         loaded: &mut GemmaLoadedModel,
-        multi_seq_kv: &mut Vec<
-            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-        >,
+        multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
         mut multi_seq_kv_hybrid: Option<
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
         >,
@@ -5837,13 +5884,11 @@ impl Gemma4DecodeState {
     /// ref engine.rs:9277-9299.
     fn finish(self, registration: Option<&super::registry::ModelRegistration>) -> GenerationResult {
         let (content, reasoning_text) = match registration {
-            Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output_forced(
-                    reg,
-                    &self.decoded_text,
-                    self.reasoning_forced_open,
-                )
-            }
+            Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
+                reg,
+                &self.decoded_text,
+                self.reasoning_forced_open,
+            ),
             _ => (self.decoded_text, None),
         };
         let decode_duration = self.decode_started.elapsed();
@@ -5945,7 +5990,10 @@ fn slot_emit_token(reply: &SlotReply, tick: &TickOutcome) -> bool {
                 super::sse::DeltaKind::Content
             };
             if events
-                .blocking_send(super::sse::GenerationEvent::Delta { kind, text: tick.fragment.clone() })
+                .blocking_send(super::sse::GenerationEvent::Delta {
+                    kind,
+                    text: tick.fragment.clone(),
+                })
                 .is_err()
             {
                 tracing::info!("SSE stream dropped by client; evicting slot mid-decode");
@@ -5981,8 +6029,8 @@ fn slot_fire_done(reply: SlotReply, gr: Result<GenerationResult>, client_dropped
                     });
                 }
                 Err(e) => {
-                    let _ = events
-                        .blocking_send(super::sse::GenerationEvent::Error(format!("{e:#}")));
+                    let _ =
+                        events.blocking_send(super::sse::GenerationEvent::Error(format!("{e:#}")));
                 }
             }
         }
@@ -6065,7 +6113,13 @@ impl<'a> Gemma4KvGuard<'a> {
         let hybrid = model.multi_seq_kv_hybrid.take();
         let dense = model.multi_seq_kv_dense.take();
         let mlx = model.multi_seq_kv_mlx.take();
-        Ok(Self { model, kv, hybrid, dense, mlx })
+        Ok(Self {
+            model,
+            kv,
+            hybrid,
+            dense,
+            mlx,
+        })
     }
 }
 
@@ -6157,7 +6211,9 @@ fn run_slot_aware_gemma4(
             // single path, exactly as the default loop does.
             loop {
                 let n_free = slots.iter().filter(|s| s.is_none()).count();
-                if n_free == 0 { break; }
+                if n_free == 0 {
+                    break;
+                }
                 let mut reqs: Vec<Request> = Vec::with_capacity(n_free);
                 while reqs.len() < n_free {
                     let req = match pending.take() {
@@ -6170,47 +6226,154 @@ fn run_slot_aware_gemma4(
                     };
                     reqs.push(req);
                 }
-                if reqs.is_empty() { break; }
+                if reqs.is_empty() {
+                    break;
+                }
                 let mut batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
                 for req in reqs {
                     match req {
-                        Request::Generate { prompt_tokens, params, reply }
-                            if params_is_greedy(&params) && params.max_tokens > 0 =>
-                        {
+                        Request::Generate {
+                            prompt_tokens,
+                            params,
+                            reply,
+                        } if params_is_greedy(&params) && params.max_tokens > 0 => {
                             batch.push((prompt_tokens, params, SlotReply::Unary(reply)));
                         }
-                        Request::GenerateStream { prompt_tokens, params, events, cancellation_counter, .. }
-                            if params_is_greedy(&params) && params.max_tokens > 0 =>
-                        {
-                            batch.push((prompt_tokens, params, SlotReply::Stream { events, cancel: cancellation_counter }));
+                        Request::GenerateStream {
+                            prompt_tokens,
+                            params,
+                            events,
+                            cancellation_counter,
+                            ..
+                        } if params_is_greedy(&params) && params.max_tokens > 0 => {
+                            batch.push((
+                                prompt_tokens,
+                                params,
+                                SlotReply::Stream {
+                                    events,
+                                    cancel: cancellation_counter,
+                                },
+                            ));
                         }
-                        Request::Generate { prompt_tokens, params, reply } => {
-                            admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, SlotReply::Unary(reply));
+                        Request::Generate {
+                            prompt_tokens,
+                            params,
+                            reply,
+                        } => {
+                            admit_gemma4_slot(
+                                &mut guard,
+                                &mut scheduler,
+                                &mut slots,
+                                registration.as_ref(),
+                                &scheduler_stats_snapshot,
+                                per_slot_kv_budget_bytes,
+                                kv_bytes_per_token,
+                                prompt_tokens,
+                                Vec::new(),
+                                params,
+                                SlotReply::Unary(reply),
+                            );
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
-                        Request::GenerateStream { prompt_tokens, params, events, cancellation_counter, .. } => {
-                            admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, SlotReply::Stream { events, cancel: cancellation_counter });
+                        Request::GenerateStream {
+                            prompt_tokens,
+                            params,
+                            events,
+                            cancellation_counter,
+                            ..
+                        } => {
+                            admit_gemma4_slot(
+                                &mut guard,
+                                &mut scheduler,
+                                &mut slots,
+                                registration.as_ref(),
+                                &scheduler_stats_snapshot,
+                                per_slot_kv_budget_bytes,
+                                kv_bytes_per_token,
+                                prompt_tokens,
+                                Vec::new(),
+                                params,
+                                SlotReply::Stream {
+                                    events,
+                                    cancel: cancellation_counter,
+                                },
+                            );
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
-                        Request::GenerateWithSoftTokens { prompt_tokens, soft_tokens, params, reply, .. } => {
-                            admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, soft_tokens, params, SlotReply::Unary(reply));
+                        Request::GenerateWithSoftTokens {
+                            prompt_tokens,
+                            soft_tokens,
+                            params,
+                            reply,
+                            ..
+                        } => {
+                            admit_gemma4_slot(
+                                &mut guard,
+                                &mut scheduler,
+                                &mut slots,
+                                registration.as_ref(),
+                                &scheduler_stats_snapshot,
+                                per_slot_kv_budget_bytes,
+                                kv_bytes_per_token,
+                                prompt_tokens,
+                                soft_tokens,
+                                params,
+                                SlotReply::Unary(reply),
+                            );
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
-                        Request::Warmup { reply } => { let _ = reply.send(warmup_once(&mut guard.model)); }
-                        Request::Shutdown => { tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting"); break 'worker; }
-                        Request::Embed { prompt_tokens, reply } => {
-                            embed_gemma4_inline(&mut guard, &mut scheduler, &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, reply);
+                        Request::Warmup { reply } => {
+                            let _ = reply.send(warmup_once(&mut guard.model));
+                        }
+                        Request::Shutdown => {
+                            tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting");
+                            break 'worker;
+                        }
+                        Request::Embed {
+                            prompt_tokens,
+                            reply,
+                        } => {
+                            embed_gemma4_inline(
+                                &mut guard,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                per_slot_kv_budget_bytes,
+                                kv_bytes_per_token,
+                                prompt_tokens,
+                                reply,
+                            );
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
                         _ => {}
                     }
                 }
                 if batch.len() >= 2 {
-                    admit_gemma4_slots_batched(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, batch);
+                    admit_gemma4_slots_batched(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        batch,
+                    );
                     publish(&scheduler, &scheduler_stats_snapshot);
                 } else {
                     for (prompt_tokens, params, reply) in batch {
-                        admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, reply);
+                        admit_gemma4_slot(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            per_slot_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            Vec::new(),
+                            params,
+                            reply,
+                        );
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
                 }
@@ -6229,7 +6392,11 @@ fn run_slot_aware_gemma4(
                     },
                 };
                 match req {
-                    Request::Generate { prompt_tokens, params, reply } => {
+                    Request::Generate {
+                        prompt_tokens,
+                        params,
+                        reply,
+                    } => {
                         admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
@@ -6263,7 +6430,10 @@ fn run_slot_aware_gemma4(
                             prompt_tokens,
                             Vec::new(),
                             params,
-                            SlotReply::Stream { events, cancel: cancellation_counter },
+                            SlotReply::Stream {
+                                events,
+                                cancel: cancellation_counter,
+                            },
                         );
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
@@ -6311,7 +6481,10 @@ fn run_slot_aware_gemma4(
                     // a one-shot (no decode loop) → run it inline in the admit
                     // path (like Warmup): reserve a slot, run the slot-aware
                     // embed, release.
-                    Request::Embed { prompt_tokens, reply } => {
+                    Request::Embed {
+                        prompt_tokens,
+                        reply,
+                    } => {
                         embed_gemma4_inline(
                             &mut guard,
                             &mut scheduler,
@@ -6516,7 +6689,10 @@ fn admit_gemma4_slot(
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
-        Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+        Err(AdmitError::SlotBudgetExceeded {
+            needed_bytes,
+            budget_bytes,
+        }) => {
             let gr = Err(anyhow::anyhow!(
                 "slot_budget_exceeded: ADR-040 Phase F M1 — per-slot KV budget exceeded \
                  (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}). Reduce \
@@ -6697,7 +6873,9 @@ fn admit_gemma4_slots_batched(
             },
             Err(e) => slot_fire_done(
                 reply,
-                Err(anyhow::anyhow!("ADR-040 iter-G(a) batched admit failed: {e:?}")),
+                Err(anyhow::anyhow!(
+                    "ADR-040 iter-G(a) batched admit failed: {e:?}"
+                )),
                 false,
             ),
         }
@@ -6713,8 +6891,17 @@ fn admit_gemma4_slots_batched(
         for (handle, prompt_tokens, params, reply) in admitted {
             scheduler.release(handle);
             admit_gemma4_slot(
-                guard, scheduler, slots, registration, scheduler_stats_snapshot,
-                per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, reply,
+                guard,
+                scheduler,
+                slots,
+                registration,
+                scheduler_stats_snapshot,
+                per_slot_kv_budget_bytes,
+                kv_bytes_per_token,
+                prompt_tokens,
+                Vec::new(),
+                params,
+                reply,
             );
         }
         return;
@@ -6730,8 +6917,10 @@ fn admit_gemma4_slots_batched(
     ITER_GA_BATCHED_ADMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // 3. ONE multi-seq forward → N first tokens (writes each slot's KV scatter).
-    let seqs: Vec<(Vec<u32>, SlotId)> =
-        admitted.iter().map(|(h, p, _, _)| (p.clone(), h.slot_id)).collect();
+    let seqs: Vec<(Vec<u32>, SlotId)> = admitted
+        .iter()
+        .map(|(h, p, _, _)| (p.clone(), h.slot_id))
+        .collect();
     let max_decode = admitted
         .iter()
         .map(|(_, _, params, _)| params.max_tokens.max(1))
@@ -6743,7 +6932,10 @@ fn admit_gemma4_slots_batched(
         .as_deref()
         .expect("iter-G(a): hybrid scaffold present (capability-gated by caller)");
     let forward = guard.model.weights.forward_prefill_batched_multi_seq(
-        &seqs, scaffold, max_decode, &mut guard.model.ctx,
+        &seqs,
+        scaffold,
+        max_decode,
+        &mut guard.model.ctx,
     );
     let prefill_duration = prefill_started.elapsed();
     clear_gemma4_self_mounts(guard.model);
@@ -6777,8 +6969,13 @@ fn admit_gemma4_slots_batched(
         admitted.into_iter().zip(tokens.into_iter())
     {
         let state = match Gemma4DecodeState::from_first_token(
-            guard.model, &prompt_tokens, &params, registration, handle.slot_id,
-            first_token, prefill_duration,
+            guard.model,
+            &prompt_tokens,
+            &params,
+            registration,
+            handle.slot_id,
+            first_token,
+            prefill_duration,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -6835,7 +7032,7 @@ fn embed_gemma4_inline(
     let admit_req = AdmitRequest {
         prompt_tokens: prompt_tokens.len() as u32,
         max_tokens: 1, // ≥1 so the scheduler allocates a physical slot
-                       // (max_tokens==0 → CompletedAtAdmit/no handle).
+        // (max_tokens==0 → CompletedAtAdmit/no handle).
         kv_bytes_needed: needed_bytes,
     };
     let admitted = match scheduler.admit(admit_req) {
@@ -7007,8 +7204,12 @@ fn decode_batch_gemma4(
             return;
         }
         if trace {
-            let comp: Vec<String> = sids.iter().zip(positions.iter()).zip(tokens.iter())
-                .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t)).collect();
+            let comp: Vec<String> = sids
+                .iter()
+                .zip(positions.iter())
+                .zip(tokens.iter())
+                .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t))
+                .collect();
             eprintln!("[DECTRACE] BATCHED N={} [{}]", sids.len(), comp.join(" "));
         }
         crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -7051,14 +7252,19 @@ fn decode_batch_gemma4(
                 )),
             }
         } else {
-            let mut regime = crate::inference::models::gemma4::batched_body::BatchedKvRegime::FullTq(
-                guard.kv.as_mut_slice(),
-            );
+            let mut regime =
+                crate::inference::models::gemma4::batched_body::BatchedKvRegime::FullTq(
+                    guard.kv.as_mut_slice(),
+                );
             let lm = &mut *guard.model;
-            lm.weights
-                .forward_decode_body_batched(
-                    &tokens, &sids, &positions, &mut regime, &mut fused_head_out, &mut lm.ctx,
-                )
+            lm.weights.forward_decode_body_batched(
+                &tokens,
+                &sids,
+                &positions,
+                &mut regime,
+                &mut fused_head_out,
+                &mut lm.ctx,
+            )
         };
         DECODE_BODY_GPU_NS.fetch_add(
             _catsplit_g0.elapsed().as_nanos() as u64,
@@ -7164,19 +7370,27 @@ fn decode_batch_gemma4(
         // rerank still runs on host. BYTE-IDENTICAL: GPU candidate set == host
         // threshold scan, both feed the same rerank tail. Host fallback on
         // overflow (rare) or HF2Q_GPU_SAMPLE off.
-        let gpu_s = head.gpu_sample.as_ref().filter(|gs| {
-            gs.overflow[i] == 0 && (gs.cand_count[i] as usize) <= gs.cap
-        });
+        let gpu_s = head
+            .gpu_sample
+            .as_ref()
+            .filter(|gs| gs.overflow[i] == 0 && (gs.cand_count[i] as usize) <= gs.cap);
         let top1_val: f32;
         let greedy_result = if let Some(gs) = gpu_s {
             top1_val = gs.top1_val[i];
             let cnt = (gs.cand_count[i] as usize).min(gs.cap);
             let cands = &gs.cand_ids[i * gs.cap..i * gs.cap + cnt];
-            guard.model.weights.finalize_token_from_gpu_candidates(cands, normed_row, gs.top1_idx[i])
+            guard.model.weights.finalize_token_from_gpu_candidates(
+                cands,
+                normed_row,
+                gs.top1_idx[i],
+            )
         } else {
             let (ti, tv) = argmax_f32(logits_row);
             top1_val = tv;
-            guard.model.weights.finalize_token_from_logits(logits_row, normed_row, ti, tv)
+            guard
+                .model
+                .weights
+                .finalize_token_from_logits(logits_row, normed_row, ti, tv)
         };
         let greedy_token = match greedy_result {
             Ok(t) => t,
@@ -7192,8 +7406,10 @@ fn decode_batch_gemma4(
             _hp_am.elapsed().as_nanos() as u64,
         );
         if trace {
-            eprintln!("[DECTRACE]   out s{} top1_val={:.4} -> tok{}",
-                handle.slot_id.0, top1_val, greedy_token);
+            eprintln!(
+                "[DECTRACE]   out s{} top1_val={:.4} -> tok{}",
+                handle.slot_id.0, top1_val, greedy_token
+            );
         }
         let _hp_dt = std::time::Instant::now();
         let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
@@ -7344,7 +7560,10 @@ impl<'a> Qwen35KvGuard<'a> {
                  for Qwen35 SlotAware loop entry. C2d spawn-arm invariant violated."
             )
         })?;
-        Ok(Self { model, kv: Some(kv) })
+        Ok(Self {
+            model,
+            kv: Some(kv),
+        })
     }
 }
 
@@ -7354,7 +7573,11 @@ impl Drop for Qwen35KvGuard<'_> {
     }
 }
 
-type Qwen35Slot = (super::engine_qwen35::Qwen35DecodeState, SlotReply, SlotHandle);
+type Qwen35Slot = (
+    super::engine_qwen35::Qwen35DecodeState,
+    SlotReply,
+    SlotHandle,
+);
 
 /// ADR-040 Phase F M1 (F1) — Qwen35 SlotAware admit-while-decoding loop.
 /// Same shape as `run_slot_aware_gemma4`; single shared `HybridKvCache`.
@@ -7389,7 +7612,9 @@ fn run_slot_aware_qwen35(
     'worker: loop {
         // ── ADMIT ────────────────────────────────────────────────────
         loop {
-            let Some(_free) = slots.iter().position(|s| s.is_none()) else { break };
+            let Some(_free) = slots.iter().position(|s| s.is_none()) else {
+                break;
+            };
             let req = match pending.take() {
                 Some(r) => r,
                 None => match rx.try_recv() {
@@ -7399,7 +7624,11 @@ fn run_slot_aware_qwen35(
                 },
             };
             match req {
-                Request::Generate { prompt_tokens, params, reply } => {
+                Request::Generate {
+                    prompt_tokens,
+                    params,
+                    reply,
+                } => {
                     admit_qwen35_slot(
                         &mut guard,
                         &mut scheduler,
@@ -7431,7 +7660,10 @@ fn run_slot_aware_qwen35(
                         kv_bytes_per_token,
                         prompt_tokens,
                         params,
-                        SlotReply::Stream { events, cancel: cancellation_counter },
+                        SlotReply::Stream {
+                            events,
+                            cancel: cancellation_counter,
+                        },
                     );
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
@@ -7446,7 +7678,10 @@ fn run_slot_aware_qwen35(
                 // Embed IS served at SlotId>0 by the legacy inflight arm
                 // today (embed_qwen35_slot_aware, engine_qwen35.rs:5288) →
                 // 501 would regress. One-shot, run inline in admit.
-                Request::Embed { prompt_tokens, reply } => {
+                Request::Embed {
+                    prompt_tokens,
+                    reply,
+                } => {
                     embed_qwen35_inline(
                         &mut guard,
                         &mut scheduler,
@@ -7513,7 +7748,13 @@ fn run_slot_aware_qwen35(
             },
             SchedulerStep::Prefill { .. } => {}
             SchedulerStep::Decode { handles } => {
-                decode_batch_qwen35(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &handles);
+                decode_batch_qwen35(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    registration.as_ref(),
+                    &handles,
+                );
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
                 crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -7522,7 +7763,13 @@ fn run_slot_aware_qwen35(
                 );
             }
             SchedulerStep::Mixed { decode_handles, .. } => {
-                decode_batch_qwen35(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &decode_handles);
+                decode_batch_qwen35(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    registration.as_ref(),
+                    &decode_handles,
+                );
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
                 crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -7564,7 +7811,10 @@ fn admit_qwen35_slot(
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
-        Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+        Err(AdmitError::SlotBudgetExceeded {
+            needed_bytes,
+            budget_bytes,
+        }) => {
             slot_fire_done(
                 reply,
                 Err(anyhow::anyhow!(
@@ -7576,7 +7826,11 @@ fn admit_qwen35_slot(
             return;
         }
         Err(e) => {
-            slot_fire_done(reply, Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e:?}")), false);
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e:?}")),
+                false,
+            );
             return;
         }
     };
@@ -7604,7 +7858,11 @@ fn admit_qwen35_slot(
     let state = match seed {
         Ok(s) => s,
         Err(e) => {
-            let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+            let _ = guard
+                .kv
+                .as_mut()
+                .expect("kv Some during loop")
+                .reset_for_slot(handle.slot_id);
             scheduler.release(handle);
             if let Ok(mut g) = scheduler_stats_snapshot.lock() {
                 *g = scheduler.stats();
@@ -7625,7 +7883,11 @@ fn admit_qwen35_slot(
         };
         let dropped = slot_emit_token(&reply, &tick);
         scheduler.advance_after_decode(handle);
-        let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+        let _ = guard
+            .kv
+            .as_mut()
+            .expect("kv Some during loop")
+            .reset_for_slot(handle.slot_id);
         scheduler.release(handle);
         let gr = Ok(state.finish(guard.model, registration));
         slot_fire_done(reply, gr, dropped);
@@ -7746,8 +8008,9 @@ fn generate_qwen35_soft_tokens_inline(
             embeddings: &d.embeddings,
         })
         .collect();
-    let ds_borrow: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> =
-        deepstack.as_ref().map(|d| crate::serve::forward_prefill::DeepstackInjection {
+    let ds_borrow: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> = deepstack
+        .as_ref()
+        .map(|d| crate::serve::forward_prefill::DeepstackInjection {
             image_token_positions: d.image_token_positions.clone(),
             chunks: d.chunks.iter().collect(),
         });
@@ -7836,18 +8099,20 @@ fn decode_batch_qwen35(
             continue;
         }
 
-        let qtick = match state.decode_tick(
-            guard.model,
-            guard.kv.as_mut().expect("kv Some during loop"),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
-                continue;
-            }
-        };
+        let qtick =
+            match state.decode_tick(guard.model, guard.kv.as_mut().expect("kv Some during loop")) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = guard
+                        .kv
+                        .as_mut()
+                        .expect("kv Some during loop")
+                        .reset_for_slot(handle.slot_id);
+                    scheduler.release(handle);
+                    slot_fire_done(reply, Err(e), false);
+                    continue;
+                }
+            };
         let tick = TickOutcome {
             fragment: qtick.fragment,
             is_reasoning: qtick.is_reasoning,
@@ -7858,7 +8123,11 @@ fn decode_batch_qwen35(
         scheduler.advance_after_decode(handle);
 
         if tick.finished || client_dropped {
-            let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+            let _ = guard
+                .kv
+                .as_mut()
+                .expect("kv Some during loop")
+                .reset_for_slot(handle.slot_id);
             scheduler.release(handle);
             let gr = Ok(state.finish(guard.model, registration));
             slot_fire_done(reply, gr, client_dropped);
@@ -7956,19 +8225,17 @@ fn worker_run(
     // (byte-equivalence H23 pin); the only addition is the
     // `WorkerScheduler::Inflight` arm for SlotAware.
     let mut scheduler: WorkerScheduler = match mode {
-        EngineMode::SerialFifo => WorkerScheduler::Fifo(
-            FifoSchedulerAdapter::new_with_kv_budget(
-                queue_capacity,
-                per_slot_kv_budget_bytes,
-            ),
-        ),
-        EngineMode::SlotAware { max_slots } => WorkerScheduler::Inflight(
-            InflightBatchedScheduler::new_with_kv_budget(
+        EngineMode::SerialFifo => WorkerScheduler::Fifo(FifoSchedulerAdapter::new_with_kv_budget(
+            queue_capacity,
+            per_slot_kv_budget_bytes,
+        )),
+        EngineMode::SlotAware { max_slots } => {
+            WorkerScheduler::Inflight(InflightBatchedScheduler::new_with_kv_budget(
                 queue_capacity,
                 max_slots,
                 per_slot_kv_budget_bytes,
-            ),
-        ),
+            ))
+        }
     };
 
     // Helper closure: push the current SchedulerStats snapshot to the
@@ -7981,8 +8248,7 @@ fn worker_run(
     // Iter-C2c (C2c): generalised to take `&WorkerScheduler` so the
     // InflightBatchedScheduler stats also flow through to /metrics
     // identically.
-    let publish_stats = |sched: &WorkerScheduler,
-                         snap: &Arc<Mutex<SchedulerStats>>| {
+    let publish_stats = |sched: &WorkerScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut guard) = snap.lock() {
             *guard = sched.stats();
         }
@@ -8067,12 +8333,16 @@ fn worker_run(
                     // this admit site so the production path actually
                     // exercises this arm under operator pressure (was
                     // dead code under iter-A5's `kv_bytes_needed: 0`).
-                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                    Err(AdmitError::SlotBudgetExceeded {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "slot_budget_exceeded: ADR-040 §3.5 A5b — per-slot \
                              KV budget exceeded (needed_bytes={}, budget_bytes={}). \
                              Reduce max_tokens or use a shorter prompt.",
-                            needed_bytes, budget_bytes
+                            needed_bytes,
+                            budget_bytes
                         )));
                         continue;
                     }
@@ -8358,7 +8628,8 @@ fn worker_run(
                     // The worker-arm lift onto the persistent multi-
                     // seq cache lands at **iter-C2e-cont** (post
                     // iter-228a) per ADR-040 §6.1.52.
-                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)
+                    {
                         let slot_id = handle.slot_id;
                         // `iter-C2e-cont per ADR-040 §6.1.52` (original
                         // C2e spawn-arm forward-pointer; preserved for
@@ -8378,17 +8649,18 @@ fn worker_run(
                         // Qwen35 + Gemma 4 worker arms already use;
                         // sentinel propagation preserved verbatim
                         // (H239 + H240).
-                        let result: Result<GenerationResult> = if let LoadedModel::Qwen3VlText(v) = &mut loaded {
-                            v.handle_qwen3vl_slot_aware_n_gt_0_sentinel(
-                                slot_id,
-                                "qwen3vl-generate-slot-N",
-                            )
-                        } else {
-                            unreachable!(
-                                "ADR-040 §6.1.55 iter-C2e-cont: matches!(loaded, \
+                        let result: Result<GenerationResult> =
+                            if let LoadedModel::Qwen3VlText(v) = &mut loaded {
+                                v.handle_qwen3vl_slot_aware_n_gt_0_sentinel(
+                                    slot_id,
+                                    "qwen3vl-generate-slot-N",
+                                )
+                            } else {
+                                unreachable!(
+                                    "ADR-040 §6.1.55 iter-C2e-cont: matches!(loaded, \
                                  LoadedModel::Qwen3VlText(_)) preconditioned above"
-                            )
-                        };
+                                )
+                            };
                         let _ = reply.send(result);
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
@@ -8411,14 +8683,12 @@ fn worker_run(
                     }
                     // Wedge-3 / iter-216 Phase D: real chat completion via
                     // Qwen35Model::forward_gpu_last_logits + forward_gpu_greedy.
-                    LoadedModel::Qwen35(q) => {
-                        super::engine_qwen35::generate_qwen35_once(
-                            q,
-                            &prompt_tokens,
-                            &params,
-                            registration.as_ref(),
-                        )
-                    }
+                    LoadedModel::Qwen35(q) => super::engine_qwen35::generate_qwen35_once(
+                        q,
+                        &prompt_tokens,
+                        &params,
+                        registration.as_ref(),
+                    ),
                     // iter-9b: live dense transformer forward via the
                     // naive O(N²) re-prefill loop in
                     // `engine_qwen3vl::generate_qwen3vl_text_once`.
@@ -8431,14 +8701,12 @@ fn worker_run(
                             registration.as_ref(),
                         )
                     }
-                    LoadedModel::Deepseek4(d) => {
-                        super::engine_deepseek4::generate_once(
-                            d,
-                            &prompt_tokens,
-                            &params,
-                            registration.as_ref(),
-                        )
-                    }
+                    LoadedModel::Deepseek4(d) => super::engine_deepseek4::generate_once(
+                        d,
+                        &prompt_tokens,
+                        &params,
+                        registration.as_ref(),
+                    ),
                 };
 
                 if let Some(handle) = admitted.handle {
@@ -8515,14 +8783,12 @@ fn worker_run(
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
                     Err(AdmitError::QueueFull { .. }) => {
-                        let _ = events.blocking_send(
-                            super::sse::GenerationEvent::Error(
-                                "ADR-040 C2b: scheduler admit returned \
+                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(
+                            "ADR-040 C2b: scheduler admit returned \
                                  QueueFull for GenerateStream (mpsc \
                                  backpressure should have rejected upstream)."
-                                    .to_string(),
-                            ),
-                        );
+                                .to_string(),
+                        ));
                         continue;
                     }
                     // ADR-040 §3.5 iter-A5b — surfaces a typed-prefix error
@@ -8530,26 +8796,25 @@ fn worker_run(
                     // termination. Reachable only if the pre-stream
                     // `Engine::try_admit_budget` check was bypassed — the
                     // handler call sites all run it first now.
-                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
-                        let _ = events.blocking_send(
-                            super::sse::GenerationEvent::Error(format!(
-                                "slot_budget_exceeded: ADR-040 §3.5 A5b — \
+                    Err(AdmitError::SlotBudgetExceeded {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
+                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!(
+                            "slot_budget_exceeded: ADR-040 §3.5 A5b — \
                                  per-slot KV budget exceeded for GenerateStream \
                                  (needed_bytes={}, budget_bytes={}). Reduce \
                                  max_tokens or use a shorter prompt.",
-                                needed_bytes, budget_bytes
-                            )),
-                        );
+                            needed_bytes, budget_bytes
+                        )));
                         continue;
                     }
                     Err(e) => {
-                        let _ = events.blocking_send(
-                            super::sse::GenerationEvent::Error(format!(
-                                "ADR-040 C2b: scheduler admit failed for \
+                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!(
+                            "ADR-040 C2b: scheduler admit failed for \
                                  GenerateStream: {:?}",
-                                e
-                            )),
-                        );
+                            e
+                        )));
                         continue;
                     }
                 };
@@ -8637,8 +8902,8 @@ fn worker_run(
                         let mut multi_seq = match g.multi_seq_kv.take() {
                             Some(buf) => buf,
                             None => {
-                                let _ = events.blocking_send(
-                                    super::sse::GenerationEvent::Error(format!(
+                                let _ = events.blocking_send(super::sse::GenerationEvent::Error(
+                                    format!(
                                         "capability_unsupported: ADR-040 \
                                          iter-B4c-kernel iter-3 — \
                                          multi_seq_kv is None at SlotId({}) \
@@ -8650,8 +8915,8 @@ fn worker_run(
                                          spawn_with_mode wiring in \
                                          src/serve/api/engine.rs.",
                                         slot_id.0,
-                                    )),
-                                );
+                                    ),
+                                ));
                                 scheduler.release(handle);
                                 publish_stats(&scheduler, &scheduler_stats_snapshot);
                                 continue;
@@ -8784,8 +9049,8 @@ fn worker_run(
                         let mut persistent = match q.persistent_kv_cache.take() {
                             Some(cache) => cache,
                             None => {
-                                let _ = events.blocking_send(
-                                    super::sse::GenerationEvent::Error(format!(
+                                let _ = events.blocking_send(super::sse::GenerationEvent::Error(
+                                    format!(
                                         "capability_unsupported: ADR-040 \
                                          iter-C2d-cont-kernel iter-2 — \
                                          persistent_kv_cache is None at SlotId({}) \
@@ -8797,8 +9062,8 @@ fn worker_run(
                                          spawn_with_mode wiring in \
                                          src/serve/api/engine.rs.",
                                         slot_id.0,
-                                    )),
-                                );
+                                    ),
+                                ));
                                 scheduler.release(handle);
                                 publish_stats(&scheduler, &scheduler_stats_snapshot);
                                 continue;
@@ -8862,7 +9127,8 @@ fn worker_run(
                     // clean stream termination with a 501-style error
                     // body). See Generate-arm clamp for the full
                     // rationale + iter-228a upstream blocker cite.
-                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)
+                    {
                         let slot_id = handle.slot_id;
                         // `iter-C2e-cont per ADR-040 §6.1.52` (preserved
                         // for H220 operator-grep compat) — UPGRADED to
@@ -8893,9 +9159,7 @@ fn worker_run(
                                  LoadedModel::Qwen3VlText(_)) preconditioned above"
                             )
                         };
-                        let _ = events.blocking_send(
-                            super::sse::GenerationEvent::Error(err_msg),
-                        );
+                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(err_msg));
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
@@ -8942,12 +9206,13 @@ fn worker_run(
                         embeddings: &d.embeddings,
                     })
                     .collect();
-                let ds_borrow_stream: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> =
-                    deepstack.as_ref().map(|d| {
-                        crate::serve::forward_prefill::DeepstackInjection {
-                            image_token_positions: d.image_token_positions.clone(),
-                            chunks: d.chunks.iter().collect(),
-                        }
+                let ds_borrow_stream: Option<
+                    crate::serve::forward_prefill::DeepstackInjection<'_>,
+                > = deepstack
+                    .as_ref()
+                    .map(|d| crate::serve::forward_prefill::DeepstackInjection {
+                        image_token_positions: d.image_token_positions.clone(),
+                        chunks: d.chunks.iter().collect(),
                     });
                 match &mut loaded {
                     LoadedModel::Gemma(g) => {
@@ -9002,9 +9267,9 @@ fn worker_run(
                         let pending: Result<()> =
                             crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err();
                         if let Err(e) = pending {
-                            let _ = events.blocking_send(
-                                super::sse::GenerationEvent::Error(format!("{e:#}")),
-                            );
+                            let _ = events.blocking_send(super::sse::GenerationEvent::Error(
+                                format!("{e:#}"),
+                            ));
                         }
                     }
                     LoadedModel::Deepseek4(d) => {
@@ -9012,13 +9277,11 @@ fn worker_run(
                             || ds_borrow_stream.is_some()
                             || positions_flat.is_some()
                         {
-                            let _ = events.blocking_send(
-                                super::sse::GenerationEvent::Error(
-                                    "DeepSeek-V4 does not support multimodal soft-token or \
+                            let _ = events.blocking_send(super::sse::GenerationEvent::Error(
+                                "DeepSeek-V4 does not support multimodal soft-token or \
                                      DeepStack injections"
-                                        .to_string(),
-                                ),
-                            );
+                                    .to_string(),
+                            ));
                         } else {
                             super::engine_deepseek4::generate_stream(
                                 d,
@@ -9078,8 +9341,7 @@ fn worker_run(
                     if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
                         0
                     } else {
-                        u64::from(prompt_tokens.len() as u32)
-                            .saturating_mul(kv_bytes_per_token)
+                        u64::from(prompt_tokens.len() as u32).saturating_mul(kv_bytes_per_token)
                     };
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
@@ -9100,12 +9362,16 @@ fn worker_run(
                     // a typed-prefix error that the embeddings handler
                     // string-matches to route to ApiError::slot_budget_exceeded
                     // (HTTP 429 + Retry-After: 1) parallel to queue_full.
-                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                    Err(AdmitError::SlotBudgetExceeded {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "slot_budget_exceeded: ADR-040 §3.5 A5b — Embed \
                              prompt exceeds per-slot KV budget (needed_bytes={}, \
                              budget_bytes={}). Reduce prompt length.",
-                            needed_bytes, budget_bytes
+                            needed_bytes,
+                            budget_bytes
                         )));
                         continue;
                     }
@@ -9349,7 +9615,8 @@ fn worker_run(
                     // Embed shape. See Generate-arm clamp for the
                     // full rationale + iter-228a upstream blocker
                     // cite.
-                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)
+                    {
                         let slot_id = handle.slot_id;
                         // `iter-C2e-cont per ADR-040 §6.1.52` (preserved
                         // for H220 operator-grep compat) — UPGRADED to
@@ -9357,17 +9624,18 @@ fn worker_run(
                         // worker hot path lift via the sentinel-aware
                         // helper.  See Generate arm for the full
                         // rationale.
-                        let result: Result<Vec<f32>> = if let LoadedModel::Qwen3VlText(v) = &mut loaded {
-                            v.handle_qwen3vl_slot_aware_n_gt_0_sentinel(
-                                slot_id,
-                                "qwen3vl-embed-slot-N",
-                            )
-                        } else {
-                            unreachable!(
-                                "ADR-040 §6.1.55 iter-C2e-cont: matches!(loaded, \
+                        let result: Result<Vec<f32>> =
+                            if let LoadedModel::Qwen3VlText(v) = &mut loaded {
+                                v.handle_qwen3vl_slot_aware_n_gt_0_sentinel(
+                                    slot_id,
+                                    "qwen3vl-embed-slot-N",
+                                )
+                            } else {
+                                unreachable!(
+                                    "ADR-040 §6.1.55 iter-C2e-cont: matches!(loaded, \
                                  LoadedModel::Qwen3VlText(_)) preconditioned above"
-                            )
-                        };
+                                )
+                            };
                         let _ = reply.send(result);
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
@@ -9456,13 +9724,17 @@ fn worker_run(
                     // ADR-040 §3.5 iter-A5b — typed-prefix error for
                     // the handler-side 429 mapping (same shape as the
                     // text-only Generate arm).
-                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                    Err(AdmitError::SlotBudgetExceeded {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "slot_budget_exceeded: ADR-040 §3.5 A5b — scheduler rejected \
                              GenerateWithSoftTokens — per-slot KV budget \
                              exceeded (needed_bytes={}, budget_bytes={}). \
                              Reduce max_tokens or use a shorter prompt.",
-                            needed_bytes, budget_bytes
+                            needed_bytes,
+                            budget_bytes
                         )));
                         continue;
                     }
@@ -9806,7 +10078,8 @@ fn worker_run(
                     // §6.1.21 SoftTokens + C2d-cont §6.1.24 SoftTokens
                     // shape. See Generate-arm clamp for the full
                     // rationale + iter-228a upstream blocker cite.
-                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)
+                    {
                         let slot_id = handle.slot_id;
                         // `iter-C2e-cont per ADR-040 §6.1.52` (preserved
                         // for H220 operator-grep compat) — UPGRADED to
@@ -9814,17 +10087,18 @@ fn worker_run(
                         // worker hot path lift via the sentinel-aware
                         // helper.  See Generate arm for the full
                         // rationale.
-                        let result: Result<GenerationResult> = if let LoadedModel::Qwen3VlText(v) = &mut loaded {
-                            v.handle_qwen3vl_slot_aware_n_gt_0_sentinel(
-                                slot_id,
-                                "qwen3vl-generate-with-soft-tokens-slot-N",
-                            )
-                        } else {
-                            unreachable!(
-                                "ADR-040 §6.1.55 iter-C2e-cont: matches!(loaded, \
+                        let result: Result<GenerationResult> =
+                            if let LoadedModel::Qwen3VlText(v) = &mut loaded {
+                                v.handle_qwen3vl_slot_aware_n_gt_0_sentinel(
+                                    slot_id,
+                                    "qwen3vl-generate-with-soft-tokens-slot-N",
+                                )
+                            } else {
+                                unreachable!(
+                                    "ADR-040 §6.1.55 iter-C2e-cont: matches!(loaded, \
                                  LoadedModel::Qwen3VlText(_)) preconditioned above"
-                            )
-                        };
+                                )
+                            };
                         let _ = reply.send(result);
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
@@ -9854,12 +10128,12 @@ fn worker_run(
                     })
                     .collect();
                 let ds_borrow: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> =
-                    deepstack.as_ref().map(|d| {
-                        crate::serve::forward_prefill::DeepstackInjection {
+                    deepstack
+                        .as_ref()
+                        .map(|d| crate::serve::forward_prefill::DeepstackInjection {
                             image_token_positions: d.image_token_positions.clone(),
                             chunks: d.chunks.iter().collect(),
-                        }
-                    });
+                        });
                 let result = match &mut loaded {
                     LoadedModel::Gemma(g) => {
                         // Gemma path doesn't consume deepstack / 3D
@@ -9947,9 +10221,7 @@ fn worker_run(
                         )
                     }
                     LoadedModel::Deepseek4(d) => {
-                        if !injections.is_empty()
-                            || ds_borrow.is_some()
-                            || positions_flat.is_some()
+                        if !injections.is_empty() || ds_borrow.is_some() || positions_flat.is_some()
                         {
                             Err(anyhow::anyhow!(
                                 "DeepSeek-V4 does not support multimodal soft-token or \
@@ -10001,9 +10273,7 @@ fn worker_run(
                 // point (we only see KvSnapshot after the previous
                 // request's reply was sent).
                 let result: Result<Option<KvSnapshotBytes>> = match &mut loaded {
-                    LoadedModel::Gemma(g) => {
-                        kv_snapshot_gemma(g, layer_rank, range)
-                    }
+                    LoadedModel::Gemma(g) => kv_snapshot_gemma(g, layer_rank, range),
                     // Qwen35 has no dense_kvs surface; KV-persist for
                     // hybrid models lands under B-hybrid.1.
                     LoadedModel::Qwen35(_) => Ok(None),
@@ -10026,14 +10296,9 @@ fn worker_run(
                 reply,
             } => {
                 let result = match &mut loaded {
-                    LoadedModel::Gemma(g) => kv_restore_gemma(
-                        g,
-                        layer_rank,
-                        range,
-                        &k_payload,
-                        &v_payload,
-                        write_pos,
-                    ),
+                    LoadedModel::Gemma(g) => {
+                        kv_restore_gemma(g, layer_rank, range, &k_payload, &v_payload, write_pos)
+                    }
                     LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
                         "kv_restore: not supported on Qwen35 variant (hybrid \
                          KV state — see B-hybrid.1)"
@@ -10067,16 +10332,8 @@ fn worker_run(
                 let result: Result<(Vec<u8>, Vec<u8>)> = match &loaded {
                     LoadedModel::Gemma(g) => g
                         .weights
-                        .tq_v2_snapshot_block(
-                            layer_rank,
-                            range,
-                            bits_per_coord,
-                            flags,
-                            scale,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("tq_v2_snapshot_block failed: {:?}", e)
-                        }),
+                        .tq_v2_snapshot_block(layer_rank, range, bits_per_coord, flags, scale)
+                        .map_err(|e| anyhow::anyhow!("tq_v2_snapshot_block failed: {:?}", e)),
                     LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
                         "tq_packed_kv_snapshot: not supported on Qwen35 variant \
                          (TQ-active path is Gemma 4 only at this iter — see B-tq.4)"
@@ -10109,9 +10366,7 @@ fn worker_run(
                             &k_payload,
                             &v_payload,
                         )
-                        .map_err(|e| {
-                            anyhow::anyhow!("tq_v2_restore_block failed: {:?}", e)
-                        }),
+                        .map_err(|e| anyhow::anyhow!("tq_v2_restore_block failed: {:?}", e)),
                     LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
                         "tq_packed_kv_restore: not supported on Qwen35 variant"
                     )),
@@ -10219,8 +10474,7 @@ fn kv_snapshot_gemma(
     let layer_spec = &weights.layers[layer_rank];
     let nkv = layer_spec.num_kv_heads;
     let hd = layer_spec.head_dim;
-    let is_sliding =
-        layer_spec.layer_type == crate::serve::config::LayerType::Sliding;
+    let is_sliding = layer_spec.layer_type == crate::serve::config::LayerType::Sliding;
 
     let kvs = match weights.dense_kvs.as_ref() {
         Some(v) => v,
@@ -10296,11 +10550,7 @@ fn kv_snapshot_gemma(
             for tok in range.start..range.end {
                 let slot = tok as usize;
                 if slot >= capacity {
-                    anyhow::bail!(
-                        "kv_snapshot: linear slot {} >= capacity {}",
-                        slot,
-                        capacity,
-                    );
+                    anyhow::bail!("kv_snapshot: linear slot {} >= capacity {}", slot, capacity,);
                 }
                 let off = head_base + slot * tok_chunk_bytes;
                 let end = off + tok_chunk_bytes;
@@ -10363,8 +10613,7 @@ fn kv_restore_gemma(
     let layer_spec = &weights.layers[layer_rank];
     let nkv = layer_spec.num_kv_heads;
     let hd = layer_spec.head_dim;
-    let is_sliding =
-        layer_spec.layer_type == crate::serve::config::LayerType::Sliding;
+    let is_sliding = layer_spec.layer_type == crate::serve::config::LayerType::Sliding;
     let sliding_window = weights.sliding_window;
 
     if range.end <= range.start {
@@ -10384,8 +10633,8 @@ fn kv_restore_gemma(
         for li in 0..num_layers {
             let s_nkv = weights.layers[li].num_kv_heads;
             let s_hd = weights.layers[li].head_dim;
-            let s_is_sliding = weights.layers[li].layer_type
-                == crate::serve::config::LayerType::Sliding;
+            let s_is_sliding =
+                weights.layers[li].layer_type == crate::serve::config::LayerType::Sliding;
             let s_cap = if s_is_sliding {
                 sliding_window
             } else {
@@ -10439,14 +10688,10 @@ fn kv_restore_gemma(
             let nbytes = s_nkv * s_cap * s_hd * elem;
             let k = dev
                 .alloc_buffer(nbytes, kv_dtype, vec![s_nkv, s_cap, s_hd])
-                .map_err(|e| {
-                    anyhow::anyhow!("kv_restore: alloc K layer {li} failed: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("kv_restore: alloc K layer {li} failed: {e}"))?;
             let v = dev
                 .alloc_buffer(nbytes, kv_dtype, vec![s_nkv, s_cap, s_hd])
-                .map_err(|e| {
-                    anyhow::anyhow!("kv_restore: alloc V layer {li} failed: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("kv_restore: alloc V layer {li} failed: {e}"))?;
             all.push(crate::inference::models::gemma4::DenseKvBuffers {
                 k,
                 v,
@@ -10511,9 +10756,7 @@ fn kv_restore_gemma(
     let head_stride_bytes = capacity * hd * elem_bytes;
     let tok_chunk_bytes = hd * elem_bytes;
     let expected_payload_bytes = nkv * n_tokens * tok_chunk_bytes;
-    if k_payload.len() != expected_payload_bytes
-        || v_payload.len() != expected_payload_bytes
-    {
+    if k_payload.len() != expected_payload_bytes || v_payload.len() != expected_payload_bytes {
         anyhow::bail!(
             "kv_restore: payload size mismatch (k={}, v={}, expected={})",
             k_payload.len(),
@@ -10545,9 +10788,8 @@ fn kv_restore_gemma(
                 if end > k_dst.len() {
                     anyhow::bail!("kv_restore: K slot OOB sliding");
                 }
-                k_dst[off..end].copy_from_slice(
-                    &k_payload[payload_off..payload_off + tok_chunk_bytes],
-                );
+                k_dst[off..end]
+                    .copy_from_slice(&k_payload[payload_off..payload_off + tok_chunk_bytes]);
                 payload_off += tok_chunk_bytes;
             }
         }
@@ -10558,20 +10800,15 @@ fn kv_restore_gemma(
             for tok in range.start..range.end {
                 let slot = tok as usize;
                 if slot >= capacity {
-                    anyhow::bail!(
-                        "kv_restore: linear slot {} >= capacity {}",
-                        slot,
-                        capacity,
-                    );
+                    anyhow::bail!("kv_restore: linear slot {} >= capacity {}", slot, capacity,);
                 }
                 let off = head_base + slot * tok_chunk_bytes;
                 let end = off + tok_chunk_bytes;
                 if end > k_dst.len() {
                     anyhow::bail!("kv_restore: K slot OOB linear");
                 }
-                k_dst[off..end].copy_from_slice(
-                    &k_payload[payload_off..payload_off + tok_chunk_bytes],
-                );
+                k_dst[off..end]
+                    .copy_from_slice(&k_payload[payload_off..payload_off + tok_chunk_bytes]);
                 payload_off += tok_chunk_bytes;
             }
         }
@@ -10597,9 +10834,8 @@ fn kv_restore_gemma(
                 let slot = (tok as usize) % capacity;
                 let off = head_base + slot * tok_chunk_bytes;
                 let end = off + tok_chunk_bytes;
-                v_dst[off..end].copy_from_slice(
-                    &v_payload[payload_off..payload_off + tok_chunk_bytes],
-                );
+                v_dst[off..end]
+                    .copy_from_slice(&v_payload[payload_off..payload_off + tok_chunk_bytes]);
                 payload_off += tok_chunk_bytes;
             }
         }
@@ -10611,9 +10847,8 @@ fn kv_restore_gemma(
                 let slot = tok as usize;
                 let off = head_base + slot * tok_chunk_bytes;
                 let end = off + tok_chunk_bytes;
-                v_dst[off..end].copy_from_slice(
-                    &v_payload[payload_off..payload_off + tok_chunk_bytes],
-                );
+                v_dst[off..end]
+                    .copy_from_slice(&v_payload[payload_off..payload_off + tok_chunk_bytes]);
                 payload_off += tok_chunk_bytes;
             }
         }
@@ -10653,9 +10888,10 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
         .forward_prefill(&prompt, max_tokens, &mut loaded.ctx)?;
     // One decode step to exercise the decode kernel set.
     let mut profiler = None;
-    let _ = loaded
-        .weights
-        .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)?;
+    let _ =
+        loaded
+            .weights
+            .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)?;
     // Discard the warmup's per-prefill cache state.  warmup runs with
     // `prompt_len=1, max_tokens=1` → `linear_capacity = 2` allocated for
     // every per-layer KV buffer.  The `is_none()` re-alloc guards at
@@ -10754,8 +10990,7 @@ pub(crate) fn effective_kv_lcp_resume(parsed: bool, resumable_substrate: bool) -
         return true;
     }
     // Substrate unproven. Check if user explicitly set the var to "1".
-    let explicitly_one =
-        crate::debug::investigation_env::is_kv_lcp_resume_explicitly_one();
+    let explicitly_one = crate::debug::investigation_env::is_kv_lcp_resume_explicitly_one();
     if explicitly_one {
         // Operator intentionally set HF2Q_KV_LCP_RESUME=1 even on an
         // unproven substrate. Honour their intent; the existing
@@ -10806,9 +11041,7 @@ pub(crate) fn effective_kv_lcp_resume(parsed: bool, resumable_substrate: bool) -
 /// the pre-sub-iter store behavior.
 fn build_gemma_lcp_payload(
     dense_snapshot: Vec<std::sync::Arc<crate::inference::models::gemma4::DenseKvBuffers>>,
-    hybrid_snapshot: Option<
-        Vec<std::sync::Arc<crate::inference::models::gemma4::HybridKvBuffers>>,
-    >,
+    hybrid_snapshot: Option<Vec<std::sync::Arc<crate::inference::models::gemma4::HybridKvBuffers>>>,
 ) -> Option<Vec<std::sync::Arc<crate::inference::models::gemma4::GemmaLcpLayerKv>>> {
     use crate::inference::models::gemma4::GemmaLcpLayerKv;
     match hybrid_snapshot {
@@ -10823,7 +11056,10 @@ fn build_gemma_lcp_payload(
                 return None;
             }
             let mut out = Vec::with_capacity(dense_snapshot.len());
-            for (idx, (d, h)) in dense_snapshot.into_iter().zip(hsnap.into_iter()).enumerate()
+            for (idx, (d, h)) in dense_snapshot
+                .into_iter()
+                .zip(hsnap.into_iter())
+                .enumerate()
             {
                 let d = std::sync::Arc::try_unwrap(d)
                     .map_err(|arc| {
@@ -10885,9 +11121,7 @@ fn build_lcp_key_for_request(
     // collisions across re-quants of the same model).
     let chat_template_hash = match &loaded.provenance {
         crate::core::provenance::Provenance::Hf2q { .. } => {
-            super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
-                &loaded.chat_template,
-            )
+            super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(&loaded.chat_template)
         }
         crate::core::provenance::Provenance::External => String::new(),
     };
@@ -11088,7 +11322,11 @@ fn generate_once_with_soft_tokens(
                                         crate::serve::config::LayerType::Sliding
                                     );
                                     let required_cap = if layer_is_ring {
-                                        if lr_long { model_sw.max(new_linear) } else { model_sw }
+                                        if lr_long {
+                                            model_sw.max(new_linear)
+                                        } else {
+                                            model_sw
+                                        }
                                     } else {
                                         new_linear
                                     };
@@ -11198,22 +11436,22 @@ fn generate_once_with_soft_tokens(
                                     drop(hybrid_owned);
                                     None
                                 } else {
-                                let has_hybrid = !hybrid_owned.is_empty();
-                                // Install the per-layer Arcs into the
-                                // model. After this assignment, the
-                                // engine holds the only Arcs (registry
-                                // dropped its set in `take_prefix`,
-                                // strong_count == 1 per layer).
-                                loaded.weights.dense_kvs = Some(dense_arcs);
-                                if has_hybrid {
-                                    loaded.weights.hybrid_kv = Some(hybrid_owned);
-                                }
-                                tracing::debug!(
-                                    "lcp_resume: ENGAGED — K={} of N={} (per-layer cap ok)",
-                                    k,
-                                    prompt_tokens.len(),
-                                );
-                                Some(k)
+                                    let has_hybrid = !hybrid_owned.is_empty();
+                                    // Install the per-layer Arcs into the
+                                    // model. After this assignment, the
+                                    // engine holds the only Arcs (registry
+                                    // dropped its set in `take_prefix`,
+                                    // strong_count == 1 per layer).
+                                    loaded.weights.dense_kvs = Some(dense_arcs);
+                                    if has_hybrid {
+                                        loaded.weights.hybrid_kv = Some(hybrid_owned);
+                                    }
+                                    tracing::debug!(
+                                        "lcp_resume: ENGAGED — K={} of N={} (per-layer cap ok)",
+                                        k,
+                                        prompt_tokens.len(),
+                                    );
+                                    Some(k)
                                 }
                             }
                         }
@@ -11291,7 +11529,8 @@ fn generate_once_with_soft_tokens(
     // below).  For `GrammarKind::ResponseFormat` the runtime starts
     // EAGER — enforcement from token 0, byte-identical to pre-A1
     // behavior.  This is the wave-2.5 audit divergence A1 fix.
-    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
+    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref()
+    {
         Some(g) => {
             let start_rule_id = g
                 .rule_id("root")
@@ -11347,38 +11586,36 @@ fn generate_once_with_soft_tokens(
     // post-bias / post-grammar-mask logits (so the logprob reflects
     // the distribution the sampler actually ran against).
     let want_logprobs = params.logprobs;
-    let sample_from_live_logits =
-        |weights: &mut MlxModelWeights,
-         generated: &[u32],
-         runtime: Option<&super::grammar::GrammarRuntime>|
-         -> Result<(u32, Option<f32>)> {
-            let sp = sampler_params.as_ref().expect("sample_logits gate");
-            let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
-            // Tier 4 logit_bias FIRST: additive per OpenAI convention.
-            if !params.logit_bias.is_empty() {
-                let v = logits.len();
-                for (&id, &bias) in &params.logit_bias {
-                    let idx = id as usize;
-                    if idx < v {
-                        logits[idx] += bias;
-                    }
+    let sample_from_live_logits = |weights: &mut MlxModelWeights,
+                                   generated: &[u32],
+                                   runtime: Option<&super::grammar::GrammarRuntime>|
+     -> Result<(u32, Option<f32>)> {
+        let sp = sampler_params.as_ref().expect("sample_logits gate");
+        let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
+        // Tier 4 logit_bias FIRST: additive per OpenAI convention.
+        if !params.logit_bias.is_empty() {
+            let v = logits.len();
+            for (&id, &bias) in &params.logit_bias {
+                let idx = id as usize;
+                if idx < v {
+                    logits[idx] += bias;
                 }
             }
-            // Grammar mask: zero out tokens that would drive the runtime
-            // dead.  Self-gates on `runtime.is_awaiting_trigger()` —
-            // suspended runtimes mask zero tokens (preamble freedom for
-            // ToolCallBody-kind grammars before the open marker fires).
-            if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-            }
-            if want_logprobs {
-                let (tok, lp) =
-                    sampler_pure::sample_token_with_logprob(&mut logits, sp, generated);
-                Ok((tok, Some(lp)))
-            } else {
-                Ok((sampler_pure::sample_token(&mut logits, sp, generated), None))
-            }
-        };
+        }
+        // Grammar mask: zero out tokens that would drive the runtime
+        // dead.  Self-gates on `runtime.is_awaiting_trigger()` —
+        // suspended runtimes mask zero tokens (preamble freedom for
+        // ToolCallBody-kind grammars before the open marker fires).
+        if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
+            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+        }
+        if want_logprobs {
+            let (tok, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, generated);
+            Ok((tok, Some(lp)))
+        } else {
+            Ok((sampler_pure::sample_token(&mut logits, sp, generated), None))
+        }
+    };
     // ADR-020 AC#7 — per-completion-token logprob accumulator.
     // Length tracks `completion_tokens` and is moved into
     // `GenerationResult.logprobs` at end-of-decode.  Stays `None` when
@@ -11418,11 +11655,10 @@ fn generate_once_with_soft_tokens(
     let batched_allowed = match serve_batched_env.as_deref() {
         Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
         None => {
-            let viable =
-                crate::serve::forward_prefill_batched::serve_batched_route_viable(
-                    prompt_tokens.len(),
-                    loaded.weights.num_attention_heads,
-                );
+            let viable = crate::serve::forward_prefill_batched::serve_batched_route_viable(
+                prompt_tokens.len(),
+                loaded.weights.num_attention_heads,
+            );
             if !viable {
                 eprintln!(
                     "[hf2q batched prefill] auto-fallback to linear route: \
@@ -11434,24 +11670,20 @@ fn generate_once_with_soft_tokens(
             viable
         }
     };
-    let use_batched_serve = soft_tokens.is_empty()
-        && resume_lcp.is_none()
-        && batched_allowed;
+    let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
     let prefill_argmax = if use_batched_serve {
         loaded
             .weights
             .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)?
     } else {
-        loaded
-            .weights
-            .forward_prefill_with_soft_tokens_resume(
-                prompt_tokens,
-                soft_tokens,
-                max_tokens,
-                &mut loaded.ctx,
-                resume_lcp,
-                false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
-            )?
+        loaded.weights.forward_prefill_with_soft_tokens_resume(
+            prompt_tokens,
+            soft_tokens,
+            max_tokens,
+            &mut loaded.ctx,
+            resume_lcp,
+            false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
+        )?
     };
     let prefill_duration = prefill_start.elapsed();
 
@@ -11472,7 +11704,8 @@ fn generate_once_with_soft_tokens(
     // (response_format fixes audit divergence A1; Required eagerly
     // constrains the model to emit a tool call from byte 0).
     let mut next_token = if sample_logits {
-        let (tok, lp) = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
+        let (tok, lp) =
+            sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
         if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp) {
             acc.push(lp_val);
         }
@@ -11545,7 +11778,10 @@ fn generate_once_with_soft_tokens(
     if let Some(tcs) = tc_splitter_ns.as_mut() {
         let events = tcs.feed(&first_fragment);
         if let Some(rt) = grammar_runtime.as_mut() {
-            if events.iter().any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen)) {
+            if events
+                .iter()
+                .any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen))
+            {
                 rt.trigger();
             }
         }
@@ -11567,9 +11803,10 @@ fn generate_once_with_soft_tokens(
             // side-effect of its lm_head + softcap dispatch chain; the
             // returned u32 is the on-GPU greedy argmax (only used on the
             // greedy fast-path).
-            let greedy_token = loaded
-                .weights
-                .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)?;
+            let greedy_token =
+                loaded
+                    .weights
+                    .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)?;
             // ADR-017 Phase E.a iter-3 — count physical KV write.
             // `forward_decode` always writes exactly one position; this
             // increments BEFORE any later EOS / stop_string / grammar-
@@ -11646,7 +11883,10 @@ fn generate_once_with_soft_tokens(
             if let Some(tcs) = tc_splitter_ns.as_mut() {
                 let events = tcs.feed(&fragment);
                 if let Some(rt) = grammar_runtime.as_mut() {
-                    if events.iter().any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen)) {
+                    if events
+                        .iter()
+                        .any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen))
+                    {
                         rt.trigger();
                     }
                 }
@@ -11703,7 +11943,11 @@ fn generate_once_with_soft_tokens(
     // markers registered. If not, the full decoded text goes into
     // `content` and `reasoning_text` is `None`.
     let (content, reasoning_text) = match registration {
-        Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open),
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
+            reg,
+            &decoded_text,
+            params.reasoning_forced_open,
+        ),
         _ => (decoded_text, None),
     };
 
@@ -11839,9 +12083,11 @@ fn generate_once_with_soft_tokens(
             // the store below is skipped (clean future miss, never fatal).
             let payload = build_gemma_lcp_payload(snapshot, hybrid_snapshot);
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let has_sliding_layer = loaded.weights.layers.iter().any(|l| {
-                matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
-            });
+            let has_sliding_layer = loaded
+                .weights
+                .layers
+                .iter()
+                .any(|l| matches!(l.layer_type, crate::serve::config::LayerType::Sliding));
             // iter-3.5c prefill-wrap guard — distinct from iter-3 v1's
             // decode-wrap guard (which iter-3.5b removed).
             //
@@ -11866,29 +12112,26 @@ fn generate_once_with_soft_tokens(
             let _ = physical_decode_writes;
             if prefill_safe {
                 if let Some(payload) = payload {
-                let lcp_key = build_lcp_key_for_request(loaded, params);
-                // ADR-017 Phase E.a iter-3.5d — multi-turn chat
-                // headroom. Snapshot global-layer buffers were
-                // allocated with capacity = sliding_window (not
-                // prompt_len + max_decode_tokens). Report the
-                // larger value here so the probe-side capacity check
-                // admits future turns whose prompts grow toward sw.
-                let linear_capacity = sliding_window.max(prompt_len + params.max_tokens.max(1));
-                match loaded.lcp_registry.store(
-                    lcp_key,
-                    prompt_tokens.to_vec(),
-                    payload,
-                    sliding_window,
-                    linear_capacity,
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "lcp_registry.store rejected (unexpected): {:?}",
-                            e
-                        );
+                    let lcp_key = build_lcp_key_for_request(loaded, params);
+                    // ADR-017 Phase E.a iter-3.5d — multi-turn chat
+                    // headroom. Snapshot global-layer buffers were
+                    // allocated with capacity = sliding_window (not
+                    // prompt_len + max_decode_tokens). Report the
+                    // larger value here so the probe-side capacity check
+                    // admits future turns whose prompts grow toward sw.
+                    let linear_capacity = sliding_window.max(prompt_len + params.max_tokens.max(1));
+                    match loaded.lcp_registry.store(
+                        lcp_key,
+                        prompt_tokens.to_vec(),
+                        payload,
+                        sliding_window,
+                        linear_capacity,
+                    ) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::debug!("lcp_registry.store rejected (unexpected): {:?}", e);
+                        }
                     }
-                }
                 } // if let Some(payload)
             } else {
                 tracing::debug!(
@@ -12027,9 +12270,7 @@ fn generate_gemma4_once_slot_aware(
     // reasoning-mode + tool-call requests at SlotId(N>0) route correctly;
     // both helpers take an `Option<&ModelRegistration>`.
     registration: Option<&super::registry::ModelRegistration>,
-    multi_seq_kv: &mut Vec<
-        crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-    >,
+    multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
     // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — production-default
     // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
     // iter-C2c-cont provisions this field IFF `INVESTIGATION_ENV.hybrid_kv
@@ -12096,10 +12337,12 @@ fn generate_gemma4_once_slot_aware(
     // Mirror of Qwen35 iter-C2d-cont-kernel iter-1 entry-reset
     // discipline per §6.1.27.
     for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
-        buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
-            "generate_gemma4_once_slot_aware: reset_for_slot at entry L{layer_idx}: {e} \
+        buf.reset_for_slot(slot_id).map_err(|e| {
+            anyhow::anyhow!(
+                "generate_gemma4_once_slot_aware: reset_for_slot at entry L{layer_idx}: {e} \
              (ADR-040 iter-B4c-kernel iter-1)"
-        ))?;
+            )
+        })?;
     }
     // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — entry reset on the
     // hybrid scaffold sibling.  Mirrors the HB scaffold entry-reset
@@ -12109,10 +12352,12 @@ fn generate_gemma4_once_slot_aware(
     // ends with this for-loop scope).
     if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
         for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
-            buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
-                "generate_gemma4_once_slot_aware: reset_for_slot at entry (hybrid) \
+            buf.reset_for_slot(slot_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "generate_gemma4_once_slot_aware: reset_for_slot at entry (hybrid) \
                  L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-2B)"
-            ))?;
+                )
+            })?;
         }
     }
 
@@ -12166,24 +12411,22 @@ fn generate_gemma4_once_slot_aware(
     // from `loaded.weights.logits_view()`.
     let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
         let prefill_started = Instant::now();
-        let first_decode_token = loaded
-            .weights
-            .forward_prefill_with_soft_tokens_slot_aware(
-                prompt_tokens,
-                &[], // Generate-arm: no soft-token overrides; vision-aware
-                     // path is iter-B4c-kernel-iter-5 (SoftTokens arm).
-                max_decode_tokens,
-                &mut loaded.ctx,
-                slot_id,
-                multi_seq_kv,
-                multi_seq_kv_hybrid.as_deref_mut(),
-                // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
-                // 4-bit scaffold siblings.  Threaded as Option<&mut> per
-                // the iter-2B precedent — None when the respective env
-                // gate is off (the model fn defense-in-depth-fails).
-                multi_seq_kv_dense.as_deref_mut(),
-                multi_seq_kv_mlx.as_deref_mut(),
-            )?;
+        let first_decode_token = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+            prompt_tokens,
+            &[], // Generate-arm: no soft-token overrides; vision-aware
+            // path is iter-B4c-kernel-iter-5 (SoftTokens arm).
+            max_decode_tokens,
+            &mut loaded.ctx,
+            slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+            // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
+            // 4-bit scaffold siblings.  Threaded as Option<&mut> per
+            // the iter-2B precedent — None when the respective env
+            // gate is off (the model fn defense-in-depth-fails).
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
+        )?;
         let prefill_duration = prefill_started.elapsed();
 
         // ── Sampler / grammar / logprobs config ────────────────────────
@@ -12231,8 +12474,7 @@ fn generate_gemma4_once_slot_aware(
                 }
                 None => None,
             };
-        let token_bytes_ref: Option<&[Vec<u8>]> =
-            params.token_bytes.as_deref().map(|v| &v[..]);
+        let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
         // Tool-call splitter for trigger detection.  Mirror of
         // engine.rs:7523-7524.  We use it for the lazy-grammar trigger;
@@ -12270,8 +12512,7 @@ fn generate_gemma4_once_slot_aware(
                 super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
             }
             let (tok, lp_opt) = if want_logprobs {
-                let (t, lp) =
-                    sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
+                let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
                 (t, Some(lp))
             } else {
                 (sampler_pure::sample_token(&mut logits, sp, &[]), None)
@@ -12293,9 +12534,9 @@ fn generate_gemma4_once_slot_aware(
         // Reasoning splitter — classifies the running text; counter is
         // accumulated and exposed via GenerationResult.reasoning_tokens.
         // Mirror of generate_once at engine.rs:7671-7675.
-        let mut splitter = registration
-            .filter(|r| r.has_reasoning())
-            .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
+        let mut splitter = registration.filter(|r| r.has_reasoning()).and_then(|r| {
+            super::registry::make_reasoning_splitter(r, params.reasoning_forced_open)
+        });
         let reasoning_enabled = splitter.is_some();
         let mut reasoning_token_count: usize = 0;
 
@@ -12340,9 +12581,7 @@ fn generate_gemma4_once_slot_aware(
             generated_tokens.push(next_token);
             for _ in 1..max_decode_tokens {
                 let pos = prompt_tokens.len() + generated_tokens.len() - 1;
-                let mut p: Option<
-                    crate::inference::models::gemma4::profile::TokenProfile,
-                > = None;
+                let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
                 let greedy_token = loaded.weights.forward_decode_slot_aware(
                     next_token,
                     pos,
@@ -12369,9 +12608,7 @@ fn generate_gemma4_once_slot_aware(
                             }
                         }
                     }
-                    if let (Some(rt), Some(tb)) =
-                        (grammar_runtime.as_ref(), token_bytes_ref)
-                    {
+                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
                         super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
                     }
                     let (tok, lp_opt) = if want_logprobs {
@@ -12383,22 +12620,15 @@ fn generate_gemma4_once_slot_aware(
                         (t, Some(lp))
                     } else {
                         (
-                            sampler_pure::sample_token(
-                                &mut logits,
-                                sp,
-                                &generated_tokens,
-                            ),
+                            sampler_pure::sample_token(&mut logits, sp, &generated_tokens),
                             None,
                         )
                     };
                     if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                         acc.push(lp_val);
                     }
-                    if let (Some(rt), Some(tb)) =
-                        (grammar_runtime.as_mut(), token_bytes_ref)
-                    {
-                        let bytes =
-                            tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                        let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
                         if !bytes.is_empty() {
                             rt.accept_bytes(bytes);
                         }
@@ -12427,9 +12657,10 @@ fn generate_gemma4_once_slot_aware(
                 if let Some(tcs) = tc_splitter_ns.as_mut() {
                     let events = tcs.feed(&fragment);
                     if let Some(rt) = grammar_runtime.as_mut() {
-                        if events.iter().any(|e| {
-                            matches!(e, super::registry::ToolCallEvent::ToolCallOpen)
-                        }) {
+                        if events
+                            .iter()
+                            .any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen))
+                        {
                             rt.trigger();
                         }
                     }
@@ -12458,9 +12689,11 @@ fn generate_gemma4_once_slot_aware(
         // Reasoning-text split at end-of-decode.  Mirror of generate_once
         // at engine.rs:7876-7879.
         let (content, reasoning_text) = match registration {
-            Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
-            }
+            Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
+                reg,
+                &decoded_text,
+                params.reasoning_forced_open,
+            ),
             _ => (decoded_text, None),
         };
 
@@ -12501,7 +12734,9 @@ fn generate_gemma4_once_slot_aware(
                 "generate_gemma4_once_slot_aware: reset_for_slot at exit L{} \
                  failed (slot_id={}): {} — slot WILL be reset before next \
                  admission via the entry reset of the next call",
-                layer_idx, slot_id.0, e
+                layer_idx,
+                slot_id.0,
+                e
             );
         }
     }
@@ -12517,7 +12752,9 @@ fn generate_gemma4_once_slot_aware(
                     "generate_gemma4_once_slot_aware: reset_for_slot (hybrid) at exit L{} \
                      failed (slot_id={}): {} — slot WILL be reset before next \
                      admission via the entry reset of the next call",
-                    layer_idx, slot_id.0, e
+                    layer_idx,
+                    slot_id.0,
+                    e
                 );
             }
         }
@@ -12646,9 +12883,7 @@ fn generate_stream_gemma4_once_slot_aware(
     // stateful incremental JSON parsing — out of scope for iter-2-decode-C).
     registration: Option<&super::registry::ModelRegistration>,
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
-    multi_seq_kv: &mut Vec<
-        crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-    >,
+    multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
     // ADR-040 iter-B4c-kernel iter-3 (2026-05-30) — production-default
     // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
     // iter-C2c-cont provisions this field IFF the hybrid env-gate is
@@ -12673,9 +12908,7 @@ fn generate_stream_gemma4_once_slot_aware(
     macro_rules! send {
         ($ev:expr) => {
             if events.blocking_send($ev).is_err() {
-                tracing::info!(
-                    "SSE stream dropped by client; aborting gemma4 slot-aware decode"
-                );
+                tracing::info!("SSE stream dropped by client; aborting gemma4 slot-aware decode");
                 if let Some(c) = cancellation_counter {
                     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -12786,24 +13019,22 @@ fn generate_stream_gemma4_once_slot_aware(
     // streaming branch's abort above).  Mirror of Qwen35 iter-4 §6.1.30
     // streaming has_extension lift.
     let max_decode_tokens = params.max_tokens.max(1);
-    let prefill_result: Result<u32> = loaded
-        .weights
-        .forward_prefill_with_soft_tokens_slot_aware(
-            prompt_tokens,
-            soft_tokens, // GenerateStream-arm: iter-5 (§6.1.37) lifts
-                         // the vision-augmented streaming branch —
-                         // soft-token overrides are threaded through
-                         // to the slot-aware prefill kernel verbatim.
-            max_decode_tokens,
-            &mut loaded.ctx,
-            slot_id,
-            multi_seq_kv,
-            multi_seq_kv_hybrid.as_deref_mut(),
-            // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
-            // 4-bit scaffold siblings (None when env-gate is off).
-            multi_seq_kv_dense.as_deref_mut(),
-            multi_seq_kv_mlx.as_deref_mut(),
-        );
+    let prefill_result: Result<u32> = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+        prompt_tokens,
+        soft_tokens, // GenerateStream-arm: iter-5 (§6.1.37) lifts
+        // the vision-augmented streaming branch —
+        // soft-token overrides are threaded through
+        // to the slot-aware prefill kernel verbatim.
+        max_decode_tokens,
+        &mut loaded.ctx,
+        slot_id,
+        multi_seq_kv,
+        multi_seq_kv_hybrid.as_deref_mut(),
+        // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
+        // 4-bit scaffold siblings (None when env-gate is off).
+        multi_seq_kv_dense.as_deref_mut(),
+        multi_seq_kv_mlx.as_deref_mut(),
+    );
 
     // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) — GenerateStream-arm
     // decode-loop body landed (greedy fast-path).
@@ -12853,44 +13084,42 @@ fn generate_stream_gemma4_once_slot_aware(
             // at this branch entry is REMOVED; the unified body below
             // runs the real Wave 3 W-B3 `ToolCallStreamEmitter` path.
 
-                // ── Sampler / grammar / logprobs config (mirror of
-                // generate_stream_once at engine.rs:11453+).
-                let sample_logits = params.temperature > 0.0
-                    || params.top_k > 0
-                    || params.top_p < 1.0
-                    || params.repetition_penalty != 1.0
-                    || !params.logit_bias.is_empty()
-                    || params.grammar.is_some()
-                    || params.logprobs;
-                let sampler_params = if sample_logits {
-                    Some(SamplerParams {
-                        temperature: params.temperature as f64,
-                        top_p: params.top_p as f64,
-                        top_k: params.top_k,
-                        min_p: 0.0,
-                        repetition_penalty: effective_repetition_penalty(params),
-                        max_tokens: params.max_tokens,
-                    })
-                } else {
-                    None
-                };
+            // ── Sampler / grammar / logprobs config (mirror of
+            // generate_stream_once at engine.rs:11453+).
+            let sample_logits = params.temperature > 0.0
+                || params.top_k > 0
+                || params.top_p < 1.0
+                || params.repetition_penalty != 1.0
+                || !params.logit_bias.is_empty()
+                || params.grammar.is_some()
+                || params.logprobs;
+            let sampler_params = if sample_logits {
+                Some(SamplerParams {
+                    temperature: params.temperature as f64,
+                    top_p: params.top_p as f64,
+                    top_k: params.top_k,
+                    min_p: 0.0,
+                    repetition_penalty: effective_repetition_penalty(params),
+                    max_tokens: params.max_tokens,
+                })
+            } else {
+                None
+            };
 
-                let mut grammar_runtime: Option<super::grammar::GrammarRuntime> =
-                    match params.grammar.as_ref() {
-                        Some(g) => {
-                            let start_rule_id = match g.rule_id("root") {
-                                Some(id) => id,
-                                None => {
-                                    send!(super::sse::GenerationEvent::Error(
-                                        "grammar has no root rule".into()
-                                    ));
-                                    return;
-                                }
-                            };
-                            let mut rt = match super::grammar::GrammarRuntime::new(
-                                g.clone(),
-                                start_rule_id,
-                            ) {
+            let mut grammar_runtime: Option<super::grammar::GrammarRuntime> =
+                match params.grammar.as_ref() {
+                    Some(g) => {
+                        let start_rule_id = match g.rule_id("root") {
+                            Some(id) => id,
+                            None => {
+                                send!(super::sse::GenerationEvent::Error(
+                                    "grammar has no root rule".into()
+                                ));
+                                return;
+                            }
+                        };
+                        let mut rt =
+                            match super::grammar::GrammarRuntime::new(g.clone(), start_rule_id) {
                                 Some(r) => r,
                                 None => {
                                     send!(super::sse::GenerationEvent::Error(
@@ -12899,484 +13128,457 @@ fn generate_stream_gemma4_once_slot_aware(
                                     return;
                                 }
                             };
-                            if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                                rt.set_awaiting_trigger(true);
-                            }
-                            Some(rt)
+                        if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
+                            rt.set_awaiting_trigger(true);
                         }
-                        None => None,
-                    };
-                let token_bytes_ref: Option<&[Vec<u8>]> =
-                    params.token_bytes.as_deref().map(|v| &v[..]);
+                        Some(rt)
+                    }
+                    None => None,
+                };
+            let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
-                // Reasoning splitter classifies each fragment into
-                // Content vs Reasoning DeltaKind.  When `None` (model
-                // has no reasoning markers registered), every fragment
-                // routes to Content.
-                let mut reason_splitter = registration
-                    .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
+            // Reasoning splitter classifies each fragment into
+            // Content vs Reasoning DeltaKind.  When `None` (model
+            // has no reasoning markers registered), every fragment
+            // routes to Content.
+            let mut reason_splitter = registration.and_then(|r| {
+                super::registry::make_reasoning_splitter(r, params.reasoning_forced_open)
+            });
 
-                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
-                // tool-call splitter classifies the post-reasoning
-                // Content stream into in/out-of-tool-call spans
-                // (mirror of generate_stream_once at engine.rs:12140-
-                // 12152).  Composition: reasoning splitter first; any
-                // Content-classified fragment then flows into the
-                // tool-call splitter via `route_content`.  When the
-                // model has no tool-call markers registered, the
-                // splitter is `None` and every fragment routes
-                // verbatim through `Delta { kind: Content, .. }`
-                // (byte-equivalent to the pre-iter-2-decode-C-stream-
-                // tool-call shape).
-                let mut tool_splitter = registration
-                    .and_then(super::registry::ToolCallSplitter::from_registration);
-                let mut tool_call_body: String = String::new();
-                let mut tool_call_index: usize = 0;
-                let mut saw_tool_call: bool = false;
-                let mut tool_call_emitter: Option<ToolCallStreamEmitter> = None;
-                let tool_call_policy = params.tool_call_policy;
+            // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
+            // tool-call splitter classifies the post-reasoning
+            // Content stream into in/out-of-tool-call spans
+            // (mirror of generate_stream_once at engine.rs:12140-
+            // 12152).  Composition: reasoning splitter first; any
+            // Content-classified fragment then flows into the
+            // tool-call splitter via `route_content`.  When the
+            // model has no tool-call markers registered, the
+            // splitter is `None` and every fragment routes
+            // verbatim through `Delta { kind: Content, .. }`
+            // (byte-equivalent to the pre-iter-2-decode-C-stream-
+            // tool-call shape).
+            let mut tool_splitter =
+                registration.and_then(super::registry::ToolCallSplitter::from_registration);
+            let mut tool_call_body: String = String::new();
+            let mut tool_call_index: usize = 0;
+            let mut saw_tool_call: bool = false;
+            let mut tool_call_emitter: Option<ToolCallStreamEmitter> = None;
+            let tool_call_policy = params.tool_call_policy;
 
-                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
-                // EventSink wrapper for ToolCallStreamEmitter::{advance,
-                // finalize}, which take `&EventSink<'_>` instead of the
-                // raw `&Sender`.  The slot-aware fn has no streaming-
-                // origin capture (no PromptCache store on slot-aware
-                // path — that's iter-LCP scope per §6.1.39), so we use
-                // the passive `EventSink::new` constructor.  The
-                // wrapper forwards every blocking_send call verbatim
-                // to the underlying sender.
-                let event_sink = EventSink::new(events);
+            // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
+            // EventSink wrapper for ToolCallStreamEmitter::{advance,
+            // finalize}, which take `&EventSink<'_>` instead of the
+            // raw `&Sender`.  The slot-aware fn has no streaming-
+            // origin capture (no PromptCache store on slot-aware
+            // path — that's iter-LCP scope per §6.1.39), so we use
+            // the passive `EventSink::new` constructor.  The
+            // wrapper forwards every blocking_send call verbatim
+            // to the underlying sender.
+            let event_sink = EventSink::new(events);
 
-                let want_logprobs = params.logprobs;
-                let want_log_per_token = want_logprobs;
+            let want_logprobs = params.logprobs;
+            let want_log_per_token = want_logprobs;
 
-                // Closure: classify a fragment + emit Delta events
-                // through the reasoning splitter → tool-call splitter
-                // pipeline.  Returns Err if SSE send failed (signals
-                // stream cancellation).
-                //
-                // We can't return early from a closure to the outer fn,
-                // so the closure produces `Result<(), ()>` and the
-                // caller checks + breaks the loop.
-                //
-                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
-                // — closure signature widened from the iter-2-decode-C
-                // shape `(events, splitter, fragment)` to
-                // `(events_sink, splitter, tool_splitter, body,
-                // tc_index, saw_tc, emitter, grammar_runtime,
-                // fragment, reg)` to thread the per-call tool-call
-                // streaming state through.  Mirror of
-                // `generate_stream_once::emit_fragment` at engine.rs:
-                // 12323-12382 + `route_content` at 12210-12317.
-                let emit_fragment =
-                    |event_sink: &EventSink<'_>,
-                     splitter: &mut Option<super::registry::ReasoningSplitter>,
-                     tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
+            // Closure: classify a fragment + emit Delta events
+            // through the reasoning splitter → tool-call splitter
+            // pipeline.  Returns Err if SSE send failed (signals
+            // stream cancellation).
+            //
+            // We can't return early from a closure to the outer fn,
+            // so the closure produces `Result<(), ()>` and the
+            // caller checks + breaks the loop.
+            //
+            // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
+            // — closure signature widened from the iter-2-decode-C
+            // shape `(events, splitter, fragment)` to
+            // `(events_sink, splitter, tool_splitter, body,
+            // tc_index, saw_tc, emitter, grammar_runtime,
+            // fragment, reg)` to thread the per-call tool-call
+            // streaming state through.  Mirror of
+            // `generate_stream_once::emit_fragment` at engine.rs:
+            // 12323-12382 + `route_content` at 12210-12317.
+            let emit_fragment = |event_sink: &EventSink<'_>,
+                                 splitter: &mut Option<super::registry::ReasoningSplitter>,
+                                 tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
+                                 body: &mut String,
+                                 tc_index: &mut usize,
+                                 saw_tc: &mut bool,
+                                 emitter: &mut Option<ToolCallStreamEmitter>,
+                                 grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
+                                 fragment: &str,
+                                 reg: Option<&super::registry::ModelRegistration>|
+             -> Result<(), ()> {
+                // Inner helper: route a Content-classified text
+                // run through the ToolCallSplitter (when
+                // present) or emit as a Content Delta event
+                // verbatim.  Mirror of
+                // generate_stream_once::route_content shape.
+                let route_content =
+                    |tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
                      body: &mut String,
                      tc_index: &mut usize,
                      saw_tc: &mut bool,
                      emitter: &mut Option<ToolCallStreamEmitter>,
                      grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
-                     fragment: &str,
+                     text: &str,
                      reg: Option<&super::registry::ModelRegistration>|
                      -> Result<(), ()> {
-                        // Inner helper: route a Content-classified text
-                        // run through the ToolCallSplitter (when
-                        // present) or emit as a Content Delta event
-                        // verbatim.  Mirror of
-                        // generate_stream_once::route_content shape.
-                        let route_content =
-                            |tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
-                             body: &mut String,
-                             tc_index: &mut usize,
-                             saw_tc: &mut bool,
-                             emitter: &mut Option<ToolCallStreamEmitter>,
-                             grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
-                             text: &str,
-                             reg: Option<&super::registry::ModelRegistration>|
-                             -> Result<(), ()> {
-                                if text.is_empty() {
-                                    return Ok(());
-                                }
-                                let Some(tcs) = tool_splitter.as_mut() else {
-                                    // No tool markers registered — original behavior.
-                                    if event_sink
-                                        .blocking_send(super::sse::GenerationEvent::Delta {
-                                            kind: super::sse::DeltaKind::Content,
-                                            text: text.to_string(),
-                                        })
-                                        .is_err()
+                        if text.is_empty() {
+                            return Ok(());
+                        }
+                        let Some(tcs) = tool_splitter.as_mut() else {
+                            // No tool markers registered — original behavior.
+                            if event_sink
+                                .blocking_send(super::sse::GenerationEvent::Delta {
+                                    kind: super::sse::DeltaKind::Content,
+                                    text: text.to_string(),
+                                })
+                                .is_err()
+                            {
+                                return Err(());
+                            }
+                            return Ok(());
+                        };
+                        for ev in tcs.feed(text) {
+                            match ev {
+                                super::registry::ToolCallEvent::Content(t) => {
+                                    if !t.is_empty()
+                                        && event_sink
+                                            .blocking_send(super::sse::GenerationEvent::Delta {
+                                                kind: super::sse::DeltaKind::Content,
+                                                text: t,
+                                            })
+                                            .is_err()
                                     {
                                         return Err(());
                                     }
-                                    return Ok(());
-                                };
-                                for ev in tcs.feed(text) {
-                                    match ev {
-                                        super::registry::ToolCallEvent::Content(t) => {
-                                            if !t.is_empty()
-                                                && event_sink
-                                                    .blocking_send(super::sse::GenerationEvent::Delta {
-                                                        kind: super::sse::DeltaKind::Content,
-                                                        text: t,
-                                                    })
-                                                    .is_err()
-                                            {
-                                                return Err(());
-                                            }
-                                        }
-                                        super::registry::ToolCallEvent::ToolCallOpen => {
-                                            body.clear();
-                                            // Wave 3 W-B3 incremental:
-                                            // fresh emitter for THIS call.
-                                            *emitter = Some(ToolCallStreamEmitter::new(
-                                                reg.map(|r| r.family),
-                                                *tc_index,
-                                            ));
-                                            // Wave 2.6 W-α5 Q2: arm grammar trigger.
-                                            if let Some(rt) = grammar_runtime.as_mut() {
-                                                rt.trigger();
-                                            }
-                                        }
-                                        super::registry::ToolCallEvent::ToolCallText(t) => {
-                                            body.push_str(&t);
-                                            if let Some(em) = emitter.as_mut() {
-                                                em.advance(body, event_sink)?;
-                                            }
-                                        }
-                                        super::registry::ToolCallEvent::ToolCallClose => {
-                                            let body_dump = std::mem::take(body);
-                                            let mut em = emitter.take().unwrap_or_else(|| {
-                                                ToolCallStreamEmitter::new(
-                                                    reg.map(|r| r.family),
-                                                    *tc_index,
-                                                )
-                                            });
-                                            em.finalize(
-                                                body_dump,
-                                                reg,
-                                                tool_call_policy,
-                                                tc_index,
-                                                saw_tc,
-                                                event_sink,
-                                            )?;
-                                        }
+                                }
+                                super::registry::ToolCallEvent::ToolCallOpen => {
+                                    body.clear();
+                                    // Wave 3 W-B3 incremental:
+                                    // fresh emitter for THIS call.
+                                    *emitter = Some(ToolCallStreamEmitter::new(
+                                        reg.map(|r| r.family),
+                                        *tc_index,
+                                    ));
+                                    // Wave 2.6 W-α5 Q2: arm grammar trigger.
+                                    if let Some(rt) = grammar_runtime.as_mut() {
+                                        rt.trigger();
                                     }
                                 }
-                                Ok(())
-                            };
-
-                        if fragment.is_empty() {
-                            return Ok(());
-                        }
-                        if let Some(sp) = splitter.as_mut() {
-                            for (slot, frag) in sp.feed(fragment) {
-                                match slot {
-                                    super::registry::SplitSlot::Reasoning => {
-                                        if !frag.is_empty()
-                                            && event_sink
-                                                .blocking_send(super::sse::GenerationEvent::Delta {
-                                                    kind: super::sse::DeltaKind::Reasoning,
-                                                    text: frag,
-                                                })
-                                                .is_err()
-                                        {
-                                            return Err(());
-                                        }
+                                super::registry::ToolCallEvent::ToolCallText(t) => {
+                                    body.push_str(&t);
+                                    if let Some(em) = emitter.as_mut() {
+                                        em.advance(body, event_sink)?;
                                     }
-                                    super::registry::SplitSlot::Content => {
-                                        route_content(
-                                            tool_splitter,
-                                            body,
-                                            tc_index,
-                                            saw_tc,
-                                            emitter,
-                                            grammar_runtime,
-                                            &frag,
-                                            reg,
-                                        )?;
-                                    }
+                                }
+                                super::registry::ToolCallEvent::ToolCallClose => {
+                                    let body_dump = std::mem::take(body);
+                                    let mut em = emitter.take().unwrap_or_else(|| {
+                                        ToolCallStreamEmitter::new(reg.map(|r| r.family), *tc_index)
+                                    });
+                                    em.finalize(
+                                        body_dump,
+                                        reg,
+                                        tool_call_policy,
+                                        tc_index,
+                                        saw_tc,
+                                        event_sink,
+                                    )?;
                                 }
                             }
-                        } else {
-                            // No reasoning splitter — route everything as Content.
-                            route_content(
-                                tool_splitter,
-                                body,
-                                tc_index,
-                                saw_tc,
-                                emitter,
-                                grammar_runtime,
-                                fragment,
-                                reg,
-                            )?;
                         }
                         Ok(())
                     };
 
-                // First decode token (sampler path re-derives from live
-                // logits; greedy path reuses prefill argmax).
-                let mut next_token = if sample_logits {
-                    let sp = sampler_params.as_ref().expect("sample_logits gate");
-                    let mut logits: Vec<f32> = match loaded.weights.logits_view() {
-                        Ok(s) => s.to_vec(),
-                        Err(e) => {
-                            send!(super::sse::GenerationEvent::Error(format!(
-                                "gemma4 stream slot-aware logits_view failed: {e:#}",
-                            )));
-                            return;
-                        }
-                    };
-                    if !params.logit_bias.is_empty() {
-                        let v = logits.len();
-                        for (&id, &bias) in &params.logit_bias {
-                            let idx = id as usize;
-                            if idx < v {
-                                logits[idx] += bias;
+                if fragment.is_empty() {
+                    return Ok(());
+                }
+                if let Some(sp) = splitter.as_mut() {
+                    for (slot, frag) in sp.feed(fragment) {
+                        match slot {
+                            super::registry::SplitSlot::Reasoning => {
+                                if !frag.is_empty()
+                                    && event_sink
+                                        .blocking_send(super::sse::GenerationEvent::Delta {
+                                            kind: super::sse::DeltaKind::Reasoning,
+                                            text: frag,
+                                        })
+                                        .is_err()
+                                {
+                                    return Err(());
+                                }
+                            }
+                            super::registry::SplitSlot::Content => {
+                                route_content(
+                                    tool_splitter,
+                                    body,
+                                    tc_index,
+                                    saw_tc,
+                                    emitter,
+                                    grammar_runtime,
+                                    &frag,
+                                    reg,
+                                )?;
                             }
                         }
                     }
-                    if let (Some(rt), Some(tb)) =
-                        (grammar_runtime.as_ref(), token_bytes_ref)
-                    {
-                        super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                } else {
+                    // No reasoning splitter — route everything as Content.
+                    route_content(
+                        tool_splitter,
+                        body,
+                        tc_index,
+                        saw_tc,
+                        emitter,
+                        grammar_runtime,
+                        fragment,
+                        reg,
+                    )?;
+                }
+                Ok(())
+            };
+
+            // First decode token (sampler path re-derives from live
+            // logits; greedy path reuses prefill argmax).
+            let mut next_token = if sample_logits {
+                let sp = sampler_params.as_ref().expect("sample_logits gate");
+                let mut logits: Vec<f32> = match loaded.weights.logits_view() {
+                    Ok(s) => s.to_vec(),
+                    Err(e) => {
+                        send!(super::sse::GenerationEvent::Error(format!(
+                            "gemma4 stream slot-aware logits_view failed: {e:#}",
+                        )));
+                        return;
                     }
-                    let (tok, lp_opt) = if want_logprobs {
-                        let (t, lp) = sampler_pure::sample_token_with_logprob(
-                            &mut logits, sp, &[],
-                        );
-                        (t, Some(lp))
-                    } else {
-                        (sampler_pure::sample_token(&mut logits, sp, &[]), None)
-                    };
-                    if let (Some(_lp), true) = (lp_opt, want_log_per_token) {
-                        // Per-token logprob streaming uses the
-                        // streaming Logprobs event; for the iter-2-
-                        // decode-C scope we emit a minimal
-                        // single-entry chunk.  The SSE encoder at
-                        // sse.rs:303 handles the rest.
-                        // Implementation: we emit the raw chosen-token
-                        // logprob as a degenerate ChoiceLogprobs
-                        // (single entry) — fuller top-K shape is
-                        // iter-LCP/iter-G scope, not iter-2-decode-C.
-                        // For now we skip the per-token Logprobs event
-                        // and let the final Done event carry the
-                        // aggregate; full per-token streaming is the
-                        // generate_stream_once shape which uses
-                        // ToolCallSplitter — that's iter-2-decode-C-
-                        // stream-tool-call scope.
-                        // NOTE: this is intentionally a degraded surface
-                        // — the request still completes correctly; the
-                        // per-token logprob granularity for streaming
-                        // is the documented sub-deferral.
-                    }
-                    if let (Some(rt), Some(tb)) =
-                        (grammar_runtime.as_mut(), token_bytes_ref)
-                    {
-                        let bytes =
-                            tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                        if !bytes.is_empty() {
-                            rt.accept_bytes(bytes);
+                };
+                if !params.logit_bias.is_empty() {
+                    let v = logits.len();
+                    for (&id, &bias) in &params.logit_bias {
+                        let idx = id as usize;
+                        if idx < v {
+                            logits[idx] += bias;
                         }
                     }
-                    tok
-                } else {
-                    first_decode_token
-                };
-
-                let mut generated_tokens: Vec<u32> =
-                    Vec::with_capacity(max_decode_tokens);
-                let mut completion_token_count: usize = 0;
-                let mut finish_reason: &'static str = "length";
-                let mut decoded_running = String::new();
-
-                let first_fragment = loaded
-                    .tokenizer
-                    .decode(&[next_token], false)
-                    .unwrap_or_default();
-                decoded_running.push_str(&first_fragment);
-                if emit_fragment(
-                    &event_sink,
-                    &mut reason_splitter,
-                    &mut tool_splitter,
-                    &mut tool_call_body,
-                    &mut tool_call_index,
-                    &mut saw_tool_call,
-                    &mut tool_call_emitter,
-                    &mut grammar_runtime,
-                    &first_fragment,
-                    registration,
-                )
-                .is_err()
-                {
-                    tracing::info!("SSE stream dropped by client; aborting gemma4 slot-aware decode");
-                    if let Some(c) = cancellation_counter {
-                        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    return;
                 }
-                completion_token_count += 1;
-
-                let mut decode_err: Option<anyhow::Error> = None;
-                if loaded.eos_token_ids.contains(&next_token) {
-                    finish_reason = "stop";
-                } else if hit_stop_string(&decoded_running, &params.stop_strings) {
-                    finish_reason = "stop";
+                if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                }
+                let (tok, lp_opt) = if want_logprobs {
+                    let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
+                    (t, Some(lp))
                 } else {
-                    generated_tokens.push(next_token);
-                    for _ in 1..max_decode_tokens {
-                        let pos = prompt_tokens.len() + generated_tokens.len() - 1;
-                        let mut p: Option<
-                            crate::inference::models::gemma4::profile::TokenProfile,
-                        > = None;
-                        let r = loaded.weights.forward_decode_slot_aware(
-                            next_token,
-                            pos,
-                            &mut loaded.ctx,
-                            &mut p,
-                            slot_id,
-                            multi_seq_kv,
-                            multi_seq_kv_hybrid.as_deref_mut(),
-                            // ADR-040 iter-2-decode-D (§6.1.46).
-                            multi_seq_kv_dense.as_deref_mut(),
-                            multi_seq_kv_mlx.as_deref_mut(),
-                        );
-                        let greedy_token = match r {
-                            Ok(t) => t,
+                    (sampler_pure::sample_token(&mut logits, sp, &[]), None)
+                };
+                if let (Some(_lp), true) = (lp_opt, want_log_per_token) {
+                    // Per-token logprob streaming uses the
+                    // streaming Logprobs event; for the iter-2-
+                    // decode-C scope we emit a minimal
+                    // single-entry chunk.  The SSE encoder at
+                    // sse.rs:303 handles the rest.
+                    // Implementation: we emit the raw chosen-token
+                    // logprob as a degenerate ChoiceLogprobs
+                    // (single entry) — fuller top-K shape is
+                    // iter-LCP/iter-G scope, not iter-2-decode-C.
+                    // For now we skip the per-token Logprobs event
+                    // and let the final Done event carry the
+                    // aggregate; full per-token streaming is the
+                    // generate_stream_once shape which uses
+                    // ToolCallSplitter — that's iter-2-decode-C-
+                    // stream-tool-call scope.
+                    // NOTE: this is intentionally a degraded surface
+                    // — the request still completes correctly; the
+                    // per-token logprob granularity for streaming
+                    // is the documented sub-deferral.
+                }
+                if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                    let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if !bytes.is_empty() {
+                        rt.accept_bytes(bytes);
+                    }
+                }
+                tok
+            } else {
+                first_decode_token
+            };
+
+            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
+            let mut completion_token_count: usize = 0;
+            let mut finish_reason: &'static str = "length";
+            let mut decoded_running = String::new();
+
+            let first_fragment = loaded
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            decoded_running.push_str(&first_fragment);
+            if emit_fragment(
+                &event_sink,
+                &mut reason_splitter,
+                &mut tool_splitter,
+                &mut tool_call_body,
+                &mut tool_call_index,
+                &mut saw_tool_call,
+                &mut tool_call_emitter,
+                &mut grammar_runtime,
+                &first_fragment,
+                registration,
+            )
+            .is_err()
+            {
+                tracing::info!("SSE stream dropped by client; aborting gemma4 slot-aware decode");
+                if let Some(c) = cancellation_counter {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
+            }
+            completion_token_count += 1;
+
+            let mut decode_err: Option<anyhow::Error> = None;
+            if loaded.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+            } else if hit_stop_string(&decoded_running, &params.stop_strings) {
+                finish_reason = "stop";
+            } else {
+                generated_tokens.push(next_token);
+                for _ in 1..max_decode_tokens {
+                    let pos = prompt_tokens.len() + generated_tokens.len() - 1;
+                    let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> =
+                        None;
+                    let r = loaded.weights.forward_decode_slot_aware(
+                        next_token,
+                        pos,
+                        &mut loaded.ctx,
+                        &mut p,
+                        slot_id,
+                        multi_seq_kv,
+                        multi_seq_kv_hybrid.as_deref_mut(),
+                        // ADR-040 iter-2-decode-D (§6.1.46).
+                        multi_seq_kv_dense.as_deref_mut(),
+                        multi_seq_kv_mlx.as_deref_mut(),
+                    );
+                    let greedy_token = match r {
+                        Ok(t) => t,
+                        Err(e) => {
+                            decode_err = Some(e);
+                            break;
+                        }
+                    };
+
+                    next_token = if sample_logits {
+                        let sp = sampler_params.as_ref().expect("sample_logits gate");
+                        let mut logits: Vec<f32> = match loaded.weights.logits_view() {
+                            Ok(s) => s.to_vec(),
                             Err(e) => {
                                 decode_err = Some(e);
                                 break;
                             }
                         };
-
-                        next_token = if sample_logits {
-                            let sp = sampler_params.as_ref().expect("sample_logits gate");
-                            let mut logits: Vec<f32> = match loaded.weights.logits_view() {
-                                Ok(s) => s.to_vec(),
-                                Err(e) => {
-                                    decode_err = Some(e);
-                                    break;
-                                }
-                            };
-                            if !params.logit_bias.is_empty() {
-                                let v = logits.len();
-                                for (&id, &bias) in &params.logit_bias {
-                                    let idx = id as usize;
-                                    if idx < v {
-                                        logits[idx] += bias;
-                                    }
+                        if !params.logit_bias.is_empty() {
+                            let v = logits.len();
+                            for (&id, &bias) in &params.logit_bias {
+                                let idx = id as usize;
+                                if idx < v {
+                                    logits[idx] += bias;
                                 }
                             }
-                            if let (Some(rt), Some(tb)) =
-                                (grammar_runtime.as_ref(), token_bytes_ref)
-                            {
-                                super::grammar::mask::mask_invalid_tokens(
-                                    rt, tb, &mut logits,
-                                );
-                            }
-                            let (tok, _lp_opt) = if want_logprobs {
-                                let (t, lp) = sampler_pure::sample_token_with_logprob(
-                                    &mut logits,
-                                    sp,
-                                    &generated_tokens,
-                                );
-                                (t, Some(lp))
-                            } else {
-                                (
-                                    sampler_pure::sample_token(
-                                        &mut logits,
-                                        sp,
-                                        &generated_tokens,
-                                    ),
-                                    None,
-                                )
-                            };
-                            if let (Some(rt), Some(tb)) =
-                                (grammar_runtime.as_mut(), token_bytes_ref)
-                            {
-                                let bytes = tb
-                                    .get(tok as usize)
-                                    .map(|v| v.as_slice())
-                                    .unwrap_or(&[]);
-                                if !bytes.is_empty() {
-                                    rt.accept_bytes(bytes);
-                                }
-                            }
-                            tok
+                        }
+                        if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                        }
+                        let (tok, _lp_opt) = if want_logprobs {
+                            let (t, lp) = sampler_pure::sample_token_with_logprob(
+                                &mut logits,
+                                sp,
+                                &generated_tokens,
+                            );
+                            (t, Some(lp))
                         } else {
-                            greedy_token
+                            (
+                                sampler_pure::sample_token(&mut logits, sp, &generated_tokens),
+                                None,
+                            )
                         };
-
-                        if loaded.eos_token_ids.contains(&next_token) {
-                            finish_reason = "stop";
-                            break;
-                        }
-                        generated_tokens.push(next_token);
-                        let fragment = loaded
-                            .tokenizer
-                            .decode(&[next_token], false)
-                            .unwrap_or_default();
-                        decoded_running.push_str(&fragment);
-                        if emit_fragment(
-                            &event_sink,
-                            &mut reason_splitter,
-                            &mut tool_splitter,
-                            &mut tool_call_body,
-                            &mut tool_call_index,
-                            &mut saw_tool_call,
-                            &mut tool_call_emitter,
-                            &mut grammar_runtime,
-                            &fragment,
-                            registration,
-                        )
-                        .is_err()
-                        {
-                            tracing::info!("SSE stream dropped by client; aborting gemma4 slot-aware decode");
-                            if let Some(c) = cancellation_counter {
-                                c.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                        if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                            let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                            if !bytes.is_empty() {
+                                rt.accept_bytes(bytes);
                             }
-                            return;
                         }
-                        completion_token_count += 1;
+                        tok
+                    } else {
+                        greedy_token
+                    };
 
-                        if hit_stop_string(&decoded_running, &params.stop_strings) {
-                            finish_reason = "stop";
-                            break;
+                    if loaded.eos_token_ids.contains(&next_token) {
+                        finish_reason = "stop";
+                        break;
+                    }
+                    generated_tokens.push(next_token);
+                    let fragment = loaded
+                        .tokenizer
+                        .decode(&[next_token], false)
+                        .unwrap_or_default();
+                    decoded_running.push_str(&fragment);
+                    if emit_fragment(
+                        &event_sink,
+                        &mut reason_splitter,
+                        &mut tool_splitter,
+                        &mut tool_call_body,
+                        &mut tool_call_index,
+                        &mut saw_tool_call,
+                        &mut tool_call_emitter,
+                        &mut grammar_runtime,
+                        &fragment,
+                        registration,
+                    )
+                    .is_err()
+                    {
+                        tracing::info!(
+                            "SSE stream dropped by client; aborting gemma4 slot-aware decode"
+                        );
+                        if let Some(c) = cancellation_counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
-                            finish_reason = "stop";
-                            break;
-                        }
+                        return;
+                    }
+                    completion_token_count += 1;
+
+                    if hit_stop_string(&decoded_running, &params.stop_strings) {
+                        finish_reason = "stop";
+                        break;
+                    }
+                    if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
+                        finish_reason = "stop";
+                        break;
                     }
                 }
-                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
-                // — finish_reason override: per OpenAI tool-calls spec,
-                // when ANY tool-call closed during the stream
-                // (`saw_tool_call` latched true by ToolCallStreamEmitter
-                // ::finalize / emit_streaming_tool_call_close), the
-                // terminal finish_reason is `"tool_calls"` regardless
-                // of whether the grammar exhausted (which would
-                // otherwise read as `"stop"`) or the decode loop hit
-                // max_tokens (`"length"`).  Mirror of
-                // generate_stream_once at engine.rs:12754+ shape.
-                if saw_tool_call {
-                    finish_reason = "tool_calls";
-                }
-                if let Some(e) = decode_err {
-                    send!(super::sse::GenerationEvent::Error(format!(
-                        "gemma4 stream slot-aware decode failed: {e:#}",
-                    )));
-                } else {
-                    send!(super::sse::GenerationEvent::Done {
-                        finish_reason,
-                        prompt_tokens: prompt_tokens.len(),
-                        completion_tokens: completion_token_count,
-                        stats: super::sse::StreamStats::default(),
-                    });
-                }
+            }
+            // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
+            // — finish_reason override: per OpenAI tool-calls spec,
+            // when ANY tool-call closed during the stream
+            // (`saw_tool_call` latched true by ToolCallStreamEmitter
+            // ::finalize / emit_streaming_tool_call_close), the
+            // terminal finish_reason is `"tool_calls"` regardless
+            // of whether the grammar exhausted (which would
+            // otherwise read as `"stop"`) or the decode loop hit
+            // max_tokens (`"length"`).  Mirror of
+            // generate_stream_once at engine.rs:12754+ shape.
+            if saw_tool_call {
+                finish_reason = "tool_calls";
+            }
+            if let Some(e) = decode_err {
+                send!(super::sse::GenerationEvent::Error(format!(
+                    "gemma4 stream slot-aware decode failed: {e:#}",
+                )));
+            } else {
+                send!(super::sse::GenerationEvent::Done {
+                    finish_reason,
+                    prompt_tokens: prompt_tokens.len(),
+                    completion_tokens: completion_token_count,
+                    stats: super::sse::StreamStats::default(),
+                });
+            }
         }
         Err(e) => {
             send!(super::sse::GenerationEvent::Error(format!(
@@ -13397,7 +13599,9 @@ fn generate_stream_gemma4_once_slot_aware(
                 "generate_stream_gemma4_once_slot_aware: reset_for_slot at \
                  exit L{} failed (slot_id={}): {} — slot WILL be reset \
                  before next admission via the entry reset of the next call",
-                layer_idx, slot_id.0, e
+                layer_idx,
+                slot_id.0,
+                e
             );
         }
     }
@@ -13412,7 +13616,9 @@ fn generate_stream_gemma4_once_slot_aware(
                      (hybrid) at exit L{} failed (slot_id={}): {} — slot \
                      WILL be reset before next admission via the entry \
                      reset of the next call",
-                    layer_idx, slot_id.0, e
+                    layer_idx,
+                    slot_id.0,
+                    e
                 );
             }
         }
@@ -13520,9 +13726,7 @@ fn generate_stream_gemma4_once_slot_aware(
 fn embed_gemma4_slot_aware(
     loaded: &mut GemmaLoadedModel,
     prompt_tokens: &[u32],
-    multi_seq_kv: &mut Vec<
-        crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-    >,
+    multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
     // ADR-040 iter-B4c-kernel iter-4 (2026-05-30) — production-default
     // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
     // iter-C2c-cont provisions this field IFF the hybrid env-gate is
@@ -13582,10 +13786,12 @@ fn embed_gemma4_slot_aware(
     // Mirror of iter-1 Generate-arm + iter-3 GenerateStream-arm entry-
     // reset discipline.
     for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
-        buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
-            "embed_gemma4_slot_aware: reset_for_slot at entry L{layer_idx}: {e} \
+        buf.reset_for_slot(slot_id).map_err(|e| {
+            anyhow::anyhow!(
+                "embed_gemma4_slot_aware: reset_for_slot at entry L{layer_idx}: {e} \
              (ADR-040 iter-B4c-kernel iter-4)"
-        ))?;
+            )
+        })?;
     }
     // ADR-040 iter-B4c-kernel iter-4 — entry reset on the hybrid
     // scaffold sibling.  Mirrors the HB scaffold entry-reset discipline
@@ -13595,10 +13801,12 @@ fn embed_gemma4_slot_aware(
     // scope).
     if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
         for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
-            buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
-                "embed_gemma4_slot_aware: reset_for_slot at entry (hybrid) \
+            buf.reset_for_slot(slot_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "embed_gemma4_slot_aware: reset_for_slot at entry (hybrid) \
                  L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-4)"
-            ))?;
+                )
+            })?;
         }
     }
 
@@ -13620,27 +13828,25 @@ fn embed_gemma4_slot_aware(
     // Multi-token decode-loop body wrapping (iter-B4c-kernel-iter-2-decode
     // scope on the Generate / GenerateStream surfaces) is STRUCTURALLY
     // N/A here: embed has no decode loop.
-    let prefill_result = loaded
-        .weights
-        .forward_prefill_with_soft_tokens_slot_aware(
-            prompt_tokens,
-            &[], // Embed-arm: no soft-token overrides; the Embed Request
-                 // variant does NOT carry soft_tokens / deepstack /
-                 // positions_flat surfaces.
-            0,   // max_decode_tokens=0 — embed has no decode budget;
-                 // matches forward_embed_last's call shape at
-                 // forward_prefill.rs:2303 (the `0` triggers
-                 // `linear_capacity = prompt_len + 0`).
-            &mut loaded.ctx,
-            slot_id,
-            multi_seq_kv,
-            multi_seq_kv_hybrid.as_deref_mut(),
-            // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
-            // 4-bit scaffold siblings.  Embed has no decode loop, so
-            // these are consumed only by the prefill branches.
-            multi_seq_kv_dense.as_deref_mut(),
-            multi_seq_kv_mlx.as_deref_mut(),
-        );
+    let prefill_result = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+        prompt_tokens,
+        &[], // Embed-arm: no soft-token overrides; the Embed Request
+        // variant does NOT carry soft_tokens / deepstack /
+        // positions_flat surfaces.
+        0, // max_decode_tokens=0 — embed has no decode budget;
+        // matches forward_embed_last's call shape at
+        // forward_prefill.rs:2303 (the `0` triggers
+        // `linear_capacity = prompt_len + 0`).
+        &mut loaded.ctx,
+        slot_id,
+        multi_seq_kv,
+        multi_seq_kv_hybrid.as_deref_mut(),
+        // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
+        // 4-bit scaffold siblings.  Embed has no decode loop, so
+        // these are consumed only by the prefill branches.
+        multi_seq_kv_dense.as_deref_mut(),
+        multi_seq_kv_mlx.as_deref_mut(),
+    );
 
     // Read the L2-normalized hidden vector from norm_out — byte-
     // equivalent to the tail of `MlxModelWeights::forward_embed_last`
@@ -13654,15 +13860,12 @@ fn embed_gemma4_slot_aware(
             // sized [1 row * hidden_size] — the per-token reuse of the
             // buffer means it always holds exactly one row's worth of
             // data (the last token's RMS-normed hidden state).
-            let view_result = loaded
-                .weights
-                .activations
-                .norm_out
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!(
+            let view_result = loaded.weights.activations.norm_out.as_slice().map_err(|e| {
+                anyhow::anyhow!(
                     "embed_gemma4_slot_aware read norm_out: {e} \
                      (ADR-040 iter-B4c-kernel iter-4)"
-                ));
+                )
+            });
             match view_result {
                 Ok(view) => {
                     let hs = loaded.weights.hidden_size;
@@ -13680,8 +13883,7 @@ fn embed_gemma4_slot_aware(
                         // similarity by dot product. 1e-12 floor matches
                         // the BERT-lane bert_l2_normalize_gpu epsilon
                         // (mirrors forward_embed_last:2326-2330 verbatim).
-                        let norm: f32 =
-                            out.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        let norm: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
                         let denom = if norm < 1e-12 { 1e-12 } else { norm };
                         for v in out.iter_mut() {
                             *v /= denom;
@@ -13711,7 +13913,9 @@ fn embed_gemma4_slot_aware(
                 "embed_gemma4_slot_aware: reset_for_slot at exit L{} \
                  failed (slot_id={}): {} — slot WILL be reset before next \
                  admission via the entry reset of the next call",
-                layer_idx, slot_id.0, e
+                layer_idx,
+                slot_id.0,
+                e
             );
         }
     }
@@ -13727,7 +13931,9 @@ fn embed_gemma4_slot_aware(
                     "embed_gemma4_slot_aware: reset_for_slot (hybrid) at exit L{} \
                      failed (slot_id={}): {} — slot WILL be reset before next \
                      admission via the entry reset of the next call",
-                    layer_idx, slot_id.0, e
+                    layer_idx,
+                    slot_id.0,
+                    e
                 );
             }
         }
@@ -13826,9 +14032,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     soft_tokens: &[SoftTokenInjection<'_>],
     params: &SamplingParams,
     registration: Option<&super::registry::ModelRegistration>,
-    multi_seq_kv: &mut Vec<
-        crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-    >,
+    multi_seq_kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
     // ADR-040 iter-B4c-kernel iter-5 (2026-05-30) — production-default
     // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
     // iter-C2c-cont provisions this field IFF the hybrid env-gate is
@@ -13913,20 +14117,24 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     // Mirror of iter-1 Generate-arm + iter-3 GenerateStream-arm +
     // iter-4 Embed-arm entry-reset discipline.
     for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
-        buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
-            "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot at \
+        buf.reset_for_slot(slot_id).map_err(|e| {
+            anyhow::anyhow!(
+                "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot at \
              entry L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-5)"
-        ))?;
+            )
+        })?;
     }
     // ADR-040 iter-B4c-kernel iter-5 — entry reset on the hybrid
     // scaffold sibling.  Mirrors the HB scaffold entry-reset discipline
     // above for the production-default regime.
     if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
         for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
-            buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
-                "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
+            buf.reset_for_slot(slot_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
                  at entry (hybrid) L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-5)"
-            ))?;
+                )
+            })?;
         }
     }
 
@@ -13954,23 +14162,21 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     // logprobs / stop-strings / reasoning shape is identical.
     let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
         let prefill_started = Instant::now();
-        let first_decode_token = loaded
-            .weights
-            .forward_prefill_with_soft_tokens_slot_aware(
-                prompt_tokens,
-                soft_tokens, // SoftTokens-arm: vision-aware soft-token
-                             // overrides threaded through — this is the
-                             // load-bearing difference from iter-1+2A+2B
-                             // (Generate-arm passes `&[]`).
-                max_decode_tokens,
-                &mut loaded.ctx,
-                slot_id,
-                multi_seq_kv,
-                multi_seq_kv_hybrid.as_deref_mut(),
-                // ADR-040 iter-2D + iter-2C (§6.1.46).
-                multi_seq_kv_dense.as_deref_mut(),
-                multi_seq_kv_mlx.as_deref_mut(),
-            )?;
+        let first_decode_token = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+            prompt_tokens,
+            soft_tokens, // SoftTokens-arm: vision-aware soft-token
+            // overrides threaded through — this is the
+            // load-bearing difference from iter-1+2A+2B
+            // (Generate-arm passes `&[]`).
+            max_decode_tokens,
+            &mut loaded.ctx,
+            slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+            // ADR-040 iter-2D + iter-2C (§6.1.46).
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
+        )?;
         let prefill_duration = prefill_started.elapsed();
 
         // ── Sampler / grammar / logprobs config (mirror of Generate-arm).
@@ -14009,8 +14215,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 }
                 None => None,
             };
-        let token_bytes_ref: Option<&[Vec<u8>]> =
-            params.token_bytes.as_deref().map(|v| &v[..]);
+        let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
         let mut tc_splitter_ns: Option<super::registry::ToolCallSplitter> =
             registration.and_then(super::registry::ToolCallSplitter::from_registration);
 
@@ -14037,8 +14242,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
             }
             let (tok, lp_opt) = if want_logprobs {
-                let (t, lp) =
-                    sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
+                let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
                 (t, Some(lp))
             } else {
                 (sampler_pure::sample_token(&mut logits, sp, &[]), None)
@@ -14057,9 +14261,9 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
             first_decode_token
         };
 
-        let mut splitter = registration
-            .filter(|r| r.has_reasoning())
-            .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
+        let mut splitter = registration.filter(|r| r.has_reasoning()).and_then(|r| {
+            super::registry::make_reasoning_splitter(r, params.reasoning_forced_open)
+        });
         let reasoning_enabled = splitter.is_some();
         let mut reasoning_token_count: usize = 0;
 
@@ -14101,9 +14305,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
             generated_tokens.push(next_token);
             for _ in 1..max_decode_tokens {
                 let pos = prompt_tokens.len() + generated_tokens.len() - 1;
-                let mut p: Option<
-                    crate::inference::models::gemma4::profile::TokenProfile,
-                > = None;
+                let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
                 let greedy_token = loaded.weights.forward_decode_slot_aware(
                     next_token,
                     pos,
@@ -14130,9 +14332,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                             }
                         }
                     }
-                    if let (Some(rt), Some(tb)) =
-                        (grammar_runtime.as_ref(), token_bytes_ref)
-                    {
+                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
                         super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
                     }
                     let (tok, lp_opt) = if want_logprobs {
@@ -14144,22 +14344,15 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                         (t, Some(lp))
                     } else {
                         (
-                            sampler_pure::sample_token(
-                                &mut logits,
-                                sp,
-                                &generated_tokens,
-                            ),
+                            sampler_pure::sample_token(&mut logits, sp, &generated_tokens),
                             None,
                         )
                     };
                     if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                         acc.push(lp_val);
                     }
-                    if let (Some(rt), Some(tb)) =
-                        (grammar_runtime.as_mut(), token_bytes_ref)
-                    {
-                        let bytes =
-                            tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                        let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
                         if !bytes.is_empty() {
                             rt.accept_bytes(bytes);
                         }
@@ -14188,9 +14381,10 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 if let Some(tcs) = tc_splitter_ns.as_mut() {
                     let events = tcs.feed(&fragment);
                     if let Some(rt) = grammar_runtime.as_mut() {
-                        if events.iter().any(|e| {
-                            matches!(e, super::registry::ToolCallEvent::ToolCallOpen)
-                        }) {
+                        if events
+                            .iter()
+                            .any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen))
+                        {
                             rt.trigger();
                         }
                     }
@@ -14214,9 +14408,11 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
         let decode_duration = decode_started.elapsed();
 
         let (content, reasoning_text) = match registration {
-            Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
-            }
+            Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
+                reg,
+                &decoded_text,
+                params.reasoning_forced_open,
+            ),
             _ => (decoded_text, None),
         };
 
@@ -14250,7 +14446,9 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
                  at exit L{} failed (slot_id={}): {} — slot WILL be reset before \
                  next admission via the entry reset of the next call",
-                layer_idx, slot_id.0, e
+                layer_idx,
+                slot_id.0,
+                e
             );
         }
     }
@@ -14264,7 +14462,9 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                     "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
                      (hybrid) at exit L{} failed (slot_id={}): {} — slot WILL be \
                      reset before next admission via the entry reset of the next call",
-                    layer_idx, slot_id.0, e
+                    layer_idx,
+                    slot_id.0,
+                    e
                 );
             }
         }
@@ -14382,9 +14582,7 @@ fn finalize_streaming_tool_state(
                         // Fires for Constrained AND AutoLazyGrammar.
                         let policy_label = match policy {
                             ToolCallPolicy::Constrained => "required/function",
-                            ToolCallPolicy::AutoLazyGrammar => {
-                                "auto (lazy grammar active)"
-                            }
+                            ToolCallPolicy::AutoLazyGrammar => "auto (lazy grammar active)",
                             ToolCallPolicy::Auto => {
                                 unreachable!("body_grammar_active gate")
                             }
@@ -14572,11 +14770,7 @@ impl ToolCallStreamEmitter {
     /// fragment has been appended. Emits any newly-extractable name / kv
     /// fragments. Idempotent on repeated calls with the same body — safe to
     /// invoke even when no new bytes arrived.
-    fn advance(
-        &mut self,
-        body: &str,
-        events: &EventSink<'_>,
-    ) -> Result<(), ()> {
+    fn advance(&mut self, body: &str, events: &EventSink<'_>) -> Result<(), ()> {
         use super::sse::GenerationEvent;
 
         // Step 1: emit the name + opening chunk if not yet done.
@@ -14638,11 +14832,7 @@ impl ToolCallStreamEmitter {
     /// non-final kvs, `}` for the final one. We emit only on `,` boundaries
     /// during streaming; the trailing `}` is finalize's job (the last kv
     /// before `}` may not yet be in the body, so we can't speculate).
-    fn scan_emit_gemma4_kvs(
-        &mut self,
-        body: &str,
-        events: &EventSink<'_>,
-    ) -> Result<(), ()> {
+    fn scan_emit_gemma4_kvs(&mut self, body: &str, events: &EventSink<'_>) -> Result<(), ()> {
         use super::sse::GenerationEvent;
         // Walk from scan_cursor, tracking `<|"|>` string state. On a top-level
         // `,` after `scan_cursor`, parse the kv span [scan_cursor..comma] and
@@ -14702,19 +14892,19 @@ impl ToolCallStreamEmitter {
     /// Scan-and-emit closed Qwen 3.5/3.6 `<parameter=KEY>VAL</parameter>`
     /// blocks from `body[scan_cursor..]`. A block is "closed" when we observe
     /// `</parameter>` after its opening tag. Emits one delta per closed block.
-    fn scan_emit_qwen35_kvs(
-        &mut self,
-        body: &str,
-        events: &EventSink<'_>,
-    ) -> Result<(), ()> {
+    fn scan_emit_qwen35_kvs(&mut self, body: &str, events: &EventSink<'_>) -> Result<(), ()> {
         use super::sse::GenerationEvent;
         loop {
             // Locate the next `<parameter=` in body[scan_cursor..].
             let rest = &body[self.scan_cursor..];
-            let Some(rel_open) = rest.find("<parameter=") else { break };
+            let Some(rel_open) = rest.find("<parameter=") else {
+                break;
+            };
             let p_open = self.scan_cursor + rel_open;
             let key_start = p_open + "<parameter=".len();
-            let Some(rel_gt) = body[key_start..].find('>') else { break };
+            let Some(rel_gt) = body[key_start..].find('>') else {
+                break;
+            };
             let key_end = key_start + rel_gt;
             let val_start = key_end + 1;
             let Some(rel_close) = body[val_start..].find("</parameter>") else {
@@ -14735,8 +14925,7 @@ impl ToolCallStreamEmitter {
                 Err(_) => serde_json::Value::String(val_raw.to_string()),
             };
             let key_json = serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
-            let val_json = serde_json::to_string(&json_val)
-                .unwrap_or_else(|_| "null".to_string());
+            let val_json = serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string());
             let prefix = if self.kvs_emitted == 0 { "" } else { "," };
             let frag = format!("{prefix}{key_json}:{val_json}");
             if events
@@ -14803,19 +14992,15 @@ impl ToolCallStreamEmitter {
             // Fallback: streaming path never fired. Use the legacy close-
             // buffered emit so policy-enforced loud-error branches and the
             // single-chunk shape both stay intact.
-            let parsed = registration
-                .and_then(|r| super::registry::parse_tool_call_body(r, &body));
-            return emit_streaming_tool_call_close(
-                parsed, body, policy, tc_index, saw_tc, events,
-            );
+            let parsed = registration.and_then(|r| super::registry::parse_tool_call_body(r, &body));
+            return emit_streaming_tool_call_close(parsed, body, policy, tc_index, saw_tc, events);
         }
 
         // Streaming path was active. Re-parse the now-complete body and emit
         // the tail (last kv we couldn't stream because we couldn't
         // distinguish "final kv" from "next kv arriving later") + the
         // closing `}`.
-        let parsed = registration
-            .and_then(|r| super::registry::parse_tool_call_body(r, &body));
+        let parsed = registration.and_then(|r| super::registry::parse_tool_call_body(r, &body));
         let Some(pc) = parsed else {
             // Body failed parse despite streaming having extracted the name.
             // Under policy.enforces_body_grammar(), this means the grammar
@@ -15491,10 +15676,10 @@ fn replay_cached_streaming_response_with_fragments(
     // CACHED GenerationResult whose text was already split at capture
     // time (the original request's seed applied then); the cached
     // content field starts OUTSIDE any reasoning span.
-    let mut reasoning_splitter = registration
-        .and_then(|r| super::registry::make_reasoning_splitter(r, false));
-    let mut tool_splitter = registration
-        .and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
+    let mut reasoning_splitter =
+        registration.and_then(|r| super::registry::make_reasoning_splitter(r, false));
+    let mut tool_splitter =
+        registration.and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
 
     let mut tool_call_body: String = String::new();
     let mut tool_call_index: usize = 0;
@@ -15509,67 +15694,66 @@ fn replay_cached_streaming_response_with_fragments(
     // is the same pattern as `emit_streaming_tool_call_close` (extracted
     // for the close-branch) and `finalize_streaming_tool_state` (extracted
     // for the end-of-stream drain).
-    let route_replay_fragment =
-        |tcs: &mut Option<super::registry::ToolCallSplitter>,
-         body: &mut String,
-         tc_index: &mut usize,
-         saw_tc: &mut bool,
-         events: &EventSink<'_>,
-         text: &str|
-         -> Result<(), ()> {
-            if text.is_empty() {
-                return Ok(());
+    let route_replay_fragment = |tcs: &mut Option<super::registry::ToolCallSplitter>,
+                                 body: &mut String,
+                                 tc_index: &mut usize,
+                                 saw_tc: &mut bool,
+                                 events: &EventSink<'_>,
+                                 text: &str|
+     -> Result<(), ()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some(tcs) = tcs.as_mut() else {
+            if events
+                .blocking_send(GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: text.to_string(),
+                })
+                .is_err()
+            {
+                return Err(());
             }
-            let Some(tcs) = tcs.as_mut() else {
-                if events
-                    .blocking_send(GenerationEvent::Delta {
-                        kind: DeltaKind::Content,
-                        text: text.to_string(),
-                    })
-                    .is_err()
-                {
-                    return Err(());
-                }
-                return Ok(());
-            };
-            for ev in tcs.feed(text) {
-                match ev {
-                    super::registry::ToolCallEvent::Content(t) => {
-                        if !t.is_empty()
-                            && events
-                                .blocking_send(GenerationEvent::Delta {
-                                    kind: DeltaKind::Content,
-                                    text: t,
-                                })
-                                .is_err()
-                        {
-                            return Err(());
-                        }
-                    }
-                    super::registry::ToolCallEvent::ToolCallOpen => {
-                        body.clear();
-                        // Replay: no grammar_runtime to trigger.
-                    }
-                    super::registry::ToolCallEvent::ToolCallText(t) => {
-                        body.push_str(&t);
-                    }
-                    super::registry::ToolCallEvent::ToolCallClose => {
-                        let parsed = registration
-                            .and_then(|r| super::registry::parse_tool_call_body(r, body));
-                        let body_dump = std::mem::take(body);
-                        emit_streaming_tool_call_close(
-                            parsed,
-                            body_dump,
-                            tool_call_policy,
-                            tc_index,
-                            saw_tc,
-                            events,
-                        )?;
-                    }
-                }
-            }
-            Ok(())
+            return Ok(());
         };
+        for ev in tcs.feed(text) {
+            match ev {
+                super::registry::ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallOpen => {
+                    body.clear();
+                    // Replay: no grammar_runtime to trigger.
+                }
+                super::registry::ToolCallEvent::ToolCallText(t) => {
+                    body.push_str(&t);
+                }
+                super::registry::ToolCallEvent::ToolCallClose => {
+                    let parsed =
+                        registration.and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    let body_dump = std::mem::take(body);
+                    emit_streaming_tool_call_close(
+                        parsed,
+                        body_dump,
+                        tool_call_policy,
+                        tc_index,
+                        saw_tc,
+                        events,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    };
 
     // Feed the cached text through the reasoning splitter first, then
     // route Content-classified spans through the tool-call splitter.
@@ -15742,7 +15926,11 @@ fn replay_cached_streaming_response_with_fragments(
             // Tool-call replays must override finish_reason so clients see
             // `tool_calls` (OpenAI spec). The splitter sets `saw_tool_call`
             // when a ToolCallClose fires.
-            finish_reason: if saw_tool_call { "tool_calls" } else { cached.finish_reason },
+            finish_reason: if saw_tool_call {
+                "tool_calls"
+            } else {
+                cached.finish_reason
+            },
             prompt_tokens: cached.prompt_tokens,
             completion_tokens: cached.completion_tokens,
             stats,
@@ -15841,8 +16029,9 @@ fn generate_stream_once(
     //     boundaries.  This branch fires when the cache entry came
     //     from `generate_once_with_soft_tokens` (no per-token trace
     //     exists at non-streaming origin).
-    if let Some((cached, cached_frags)) =
-        loaded.prompt_cache.lookup_with_fragments(prompt_tokens, params)
+    if let Some((cached, cached_frags)) = loaded
+        .prompt_cache
+        .lookup_with_fragments(prompt_tokens, params)
     {
         tracing::debug!(
             "prompt_cache: STREAMING HIT — {} tokens served from cache, \
@@ -15955,7 +16144,11 @@ fn generate_stream_once(
                                         crate::serve::config::LayerType::Sliding
                                     );
                                     let required_cap = if layer_is_ring {
-                                        if lr_long { model_sw.max(new_linear) } else { model_sw }
+                                        if lr_long {
+                                            model_sw.max(new_linear)
+                                        } else {
+                                            model_sw
+                                        }
                                     } else {
                                         new_linear
                                     };
@@ -16044,17 +16237,17 @@ fn generate_stream_once(
                                     drop(hybrid_owned);
                                     None
                                 } else {
-                                let has_hybrid = !hybrid_owned.is_empty();
-                                loaded.weights.dense_kvs = Some(dense_arcs);
-                                if has_hybrid {
-                                    loaded.weights.hybrid_kv = Some(hybrid_owned);
-                                }
-                                tracing::debug!(
-                                    "lcp_resume (streaming): ENGAGED — K={} of N={}",
-                                    k,
-                                    prompt_tokens.len(),
-                                );
-                                Some(k)
+                                    let has_hybrid = !hybrid_owned.is_empty();
+                                    loaded.weights.dense_kvs = Some(dense_arcs);
+                                    if has_hybrid {
+                                        loaded.weights.hybrid_kv = Some(hybrid_owned);
+                                    }
+                                    tracing::debug!(
+                                        "lcp_resume (streaming): ENGAGED — K={} of N={}",
+                                        k,
+                                        prompt_tokens.len(),
+                                    );
+                                    Some(k)
                                 }
                             }
                         }
@@ -16083,8 +16276,8 @@ fn generate_stream_once(
     // never appears inside a tool call — neither chat template emits a
     // reasoning-open marker (Gemma 4 `<|channel>` or Qwen 3.5/3.6 `<think>`)
     // between tool-call markers — so this layering is safe.
-    let mut tool_splitter = registration
-        .and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
+    let mut tool_splitter =
+        registration.and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
     // Per-call body accumulator + per-stream tool-call index. Body is
     // bounded by max_tokens so unbounded growth is impossible. Index is
     // incremented every time a tool-call closes and emits a delta — used
@@ -16200,10 +16393,7 @@ fn generate_stream_once(
                     // unregistered family yields an emitter that declines
                     // (its `advance` is a no-op and `finalize` falls back
                     // to `emit_streaming_tool_call_close`).
-                    *emitter = Some(ToolCallStreamEmitter::new(
-                        reg.map(|r| r.family),
-                        *tc_index,
-                    ));
+                    *emitter = Some(ToolCallStreamEmitter::new(reg.map(|r| r.family), *tc_index));
                     // Wave 2.6 W-α5 Q2: entering a tool-call body — flip
                     // the grammar runtime's trigger so subsequent decode
                     // steps enforce the body grammar.  No-op when the
@@ -16360,7 +16550,8 @@ fn generate_stream_once(
     // response_format regression for ResponseFormat, and forces tool-call
     // emission for Required/Function (mirrors llama.cpp grammar_lazy=false
     // in common/chat.cpp:898-913, 1177-1200, 1399-1416).
-    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
+    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref()
+    {
         Some(g) => {
             let start_rule_id = match g.rule_id("root") {
                 Some(id) => id,
@@ -16419,11 +16610,10 @@ fn generate_stream_once(
     let batched_allowed = match serve_batched_env.as_deref() {
         Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
         None => {
-            let viable =
-                crate::serve::forward_prefill_batched::serve_batched_route_viable(
-                    prompt_tokens.len(),
-                    loaded.weights.num_attention_heads,
-                );
+            let viable = crate::serve::forward_prefill_batched::serve_batched_route_viable(
+                prompt_tokens.len(),
+                loaded.weights.num_attention_heads,
+            );
             if !viable {
                 eprintln!(
                     "[hf2q batched prefill] auto-fallback to linear route: \
@@ -16435,24 +16625,20 @@ fn generate_stream_once(
             viable
         }
     };
-    let use_batched_serve = soft_tokens.is_empty()
-        && resume_lcp.is_none()
-        && batched_allowed;
+    let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
     let next_token_result = if use_batched_serve {
         loaded
             .weights
             .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)
     } else {
-        loaded
-            .weights
-            .forward_prefill_with_soft_tokens_resume(
-                prompt_tokens,
-                soft_tokens,
-                max_tokens,
-                &mut loaded.ctx,
-                resume_lcp,
-                false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
-            )
+        loaded.weights.forward_prefill_with_soft_tokens_resume(
+            prompt_tokens,
+            soft_tokens,
+            max_tokens,
+            &mut loaded.ctx,
+            resume_lcp,
+            false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
+        )
     };
     let prefill_duration = prefill_start.elapsed();
     let prefill_argmax = match next_token_result {
@@ -16470,7 +16656,9 @@ fn generate_stream_once(
         let logits_view = match loaded.weights.logits_view() {
             Ok(v) => v.to_vec(),
             Err(e) => {
-                send!(GenerationEvent::Error(format!("first-token logits read: {e}")));
+                send!(GenerationEvent::Error(format!(
+                    "first-token logits read: {e}"
+                )));
                 return;
             }
         };
@@ -16674,7 +16862,10 @@ fn generate_stream_once(
             if let Some(rt) = grammar_runtime.as_ref() {
                 if rt.is_accepted() {
                     if let Some(tb) = token_bytes_ref {
-                        let bytes = tb.get(next_token as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                        let bytes = tb
+                            .get(next_token as usize)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
                         if bytes.is_empty() {
                             finish_reason = "stop";
                             break;
@@ -16767,9 +16958,7 @@ fn generate_stream_once(
     let stats = StreamStats {
         prefill_time_secs: Some(prefill_duration.as_secs_f64()),
         decode_time_secs: Some(decode_duration.as_secs_f64()),
-        total_time_secs: Some(
-            (prefill_duration + decode_duration).as_secs_f64(),
-        ),
+        total_time_secs: Some((prefill_duration + decode_duration).as_secs_f64()),
         time_to_first_token_ms: Some(prefill_duration.as_secs_f64() * 1000.0),
         prefill_tokens_per_sec: Some(if prefill_duration.as_secs_f64() > 0.0 {
             prompt_len as f64 / prefill_duration.as_secs_f64()
@@ -16782,9 +16971,7 @@ fn generate_stream_once(
             0.0
         }),
         gpu_sync_count: Some(mlx_native::sync_count().saturating_sub(pre_syncs)),
-        gpu_dispatch_count: Some(
-            mlx_native::dispatch_count().saturating_sub(pre_dispatches),
-        ),
+        gpu_dispatch_count: Some(mlx_native::dispatch_count().saturating_sub(pre_dispatches)),
         cached_prompt_tokens: None,
         reasoning_tokens: if reasoning_token_count > 0 {
             Some(reasoning_token_count)
@@ -16833,7 +17020,7 @@ fn generate_stream_once(
         prefill_duration,
         decode_duration,
         cached_tokens: 0,
-            logprobs: None,
+        logprobs: None,
     };
 
     // ADR-005 iter-224 W-A2.2: streaming-origin fragment capture.
@@ -16859,12 +17046,9 @@ fn generate_stream_once(
     let _ = events; // release the `&sink` alias (was a reference; clippy: `drop` of reference)
     drop(sink);
     let fragments = captured_fragments.into_inner();
-    loaded.prompt_cache.store_with_fragments(
-        prompt_tokens,
-        params,
-        &cache_result,
-        Some(fragments),
-    );
+    loaded
+        .prompt_cache
+        .store_with_fragments(prompt_tokens, params, &cache_result, Some(fragments));
 
     // ADR-017 Phase E.a iter-3.5b (streaming origin): mirror the
     // non-streaming snapshot-store site. Take the end-of-prefill
@@ -16889,9 +17073,11 @@ fn generate_stream_once(
             // the store below is skipped (clean future miss, never fatal).
             let payload = build_gemma_lcp_payload(snapshot, hybrid_snapshot);
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let has_sliding_layer = loaded.weights.layers.iter().any(|l| {
-                matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
-            });
+            let has_sliding_layer = loaded
+                .weights
+                .layers
+                .iter()
+                .any(|l| matches!(l.layer_type, crate::serve::config::LayerType::Sliding));
             // iter-3.5c prefill-wrap guard (mirrors non-streaming).
             // ADR-017 Phase E.a iter-3.6: lift when LONG_RESUME=1 (mirrors
             // engine.rs:4516 non-streaming site).
@@ -16901,9 +17087,8 @@ fn generate_stream_once(
                 && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
                 && (crate::debug::INVESTIGATION_ENV.use_dense
                     || crate::debug::INVESTIGATION_ENV.hybrid_kv);
-            let prefill_safe = !has_sliding_layer
-                || prompt_tokens.len() <= sliding_window
-                || kv_lcp_long_resume;
+            let prefill_safe =
+                !has_sliding_layer || prompt_tokens.len() <= sliding_window || kv_lcp_long_resume;
             if prefill_safe {
                 let lcp_key = build_lcp_key_for_request(loaded, params);
                 // iter-3.5d headroom (mirrors non-streaming site).
@@ -16915,18 +17100,18 @@ fn generate_stream_once(
                 // "gemma-hybrid-lcp": store gated on the payload build
                 // (None = fail-safe skip).
                 if let Some(payload) = payload {
-                if let Err(e) = loaded.lcp_registry.store(
-                    lcp_key,
-                    prompt_tokens.to_vec(),
-                    payload,
-                    sliding_window,
-                    linear_capacity,
-                ) {
-                    tracing::warn!(
-                        error = ?e,
-                        "gemma streaming lcp_registry store failed"
-                    );
-                }
+                    if let Err(e) = loaded.lcp_registry.store(
+                        lcp_key,
+                        prompt_tokens.to_vec(),
+                        payload,
+                        sliding_window,
+                        linear_capacity,
+                    ) {
+                        tracing::warn!(
+                            error = ?e,
+                            "gemma streaming lcp_registry store failed"
+                        );
+                    }
                 }
             } else {
                 tracing::debug!(
@@ -16944,7 +17129,9 @@ fn hit_stop_string(text: &str, stops: &[String]) -> bool {
     if stops.is_empty() {
         return false;
     }
-    stops.iter().any(|s| !s.is_empty() && text.ends_with(s.as_str()))
+    stops
+        .iter()
+        .any(|s| !s.is_empty() && text.ends_with(s.as_str()))
 }
 
 fn strip_trailing_stop(text: &mut String, stops: &[String]) {
@@ -17055,12 +17242,7 @@ pub fn render_chat_prompt_with_tools(
     // instead of attempting to approximate those transitions through
     // minijinja. The GGUF still carries the Jinja form for external readers.
     if template_str == crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731 {
-        return render_deepseek_v4_prompt(
-            messages,
-            tools,
-            enable_thinking,
-            chat_template_kwargs,
-        );
+        return render_deepseek_v4_prompt(messages, tools, enable_thinking, chat_template_kwargs);
     }
 
     let remap_assistant_to_model = template_str.contains("<|turn>model");
@@ -17123,12 +17305,11 @@ pub fn render_chat_prompt_with_tools(
                     if msg.role == "assistant" {
                         id_to_name.insert(tc.id.clone(), tc.function.name.clone());
                     }
-                    let arguments = match serde_json::from_str::<serde_json::Value>(
-                        &tc.function.arguments,
-                    ) {
-                        Ok(v @ serde_json::Value::Object(_)) => v,
-                        _ => serde_json::Value::String(tc.function.arguments.clone()),
-                    };
+                    let arguments =
+                        match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+                            Ok(v @ serde_json::Value::Object(_)) => v,
+                            _ => serde_json::Value::String(tc.function.arguments.clone()),
+                        };
                     serde_json::json!({
                         "id": tc.id,
                         "type": tc.call_type,
@@ -17213,9 +17394,18 @@ pub fn render_chat_prompt_with_tools(
         "enable_thinking".into(),
         serde_json::Value::Bool(enable_thinking),
     );
-    ctx.insert("add_generation_prompt".into(), serde_json::Value::Bool(true));
-    ctx.insert("bos_token".into(), serde_json::Value::String("<bos>".into()));
-    ctx.insert("eos_token".into(), serde_json::Value::String("<eos>".into()));
+    ctx.insert(
+        "add_generation_prompt".into(),
+        serde_json::Value::Bool(true),
+    );
+    ctx.insert(
+        "bos_token".into(),
+        serde_json::Value::String("<bos>".into()),
+    );
+    ctx.insert(
+        "eos_token".into(),
+        serde_json::Value::String("<eos>".into()),
+    );
     if let Some(kwargs) = chat_template_kwargs {
         for (k, v) in kwargs {
             ctx.insert(k.clone(), v.clone());
@@ -17259,7 +17449,9 @@ fn render_deepseek_v4_prompt(
         "low" => ReasoningEffort::Low,
         "high" => ReasoningEffort::High,
         "max" => ReasoningEffort::Max,
-        other => anyhow::bail!("DeepSeek-V4 reasoning_effort must be low, high, or max; got {other:?}"),
+        other => {
+            anyhow::bail!("DeepSeek-V4 reasoning_effort must be low, high, or max; got {other:?}")
+        }
     };
 
     let mut values = serde_json::to_value(messages)
@@ -17310,10 +17502,7 @@ fn render_deepseek_v4_prompt(
 /// `--tokenizer <path>`, or (b) `tokenizer.json` next to the .gguf.
 /// Returns `None` otherwise — the caller falls back to
 /// `gemma4::tokenizer::build_tokenizer_from_gguf`.
-fn resolve_tokenizer_path_optional(
-    model_path: &Path,
-    explicit: Option<&Path>,
-) -> Option<PathBuf> {
+fn resolve_tokenizer_path_optional(model_path: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
@@ -17386,11 +17575,8 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
             }
         }
     }
-    anyhow::bail!(
-        "Cannot find config.json. Use --config to specify the path explicitly."
-    )
+    anyhow::bail!("Cannot find config.json. Use --config to specify the path explicitly.")
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -17398,8 +17584,8 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::schema::{ChatMessage, ContentPart, ImageUrl, MessageContent};
+    use super::*;
 
     #[test]
     fn sampling_params_default_is_greedy_t0() {
@@ -17468,7 +17654,10 @@ mod tests {
         let payload = build_gemma_lcp_payload(dense, None).expect("payload");
         assert_eq!(payload.len(), 2);
         for arc in &payload {
-            assert!(arc.hybrid().is_none(), "dense-only regime must not carry hybrid legs");
+            assert!(
+                arc.hybrid().is_none(),
+                "dense-only regime must not carry hybrid legs"
+            );
             assert_eq!(arc.dense().capacity, 8);
         }
     }
@@ -17480,24 +17669,34 @@ mod tests {
         let mut d = lcp_test_dense_arc(&dev, 8);
         // Plant a canary in the dense K buffer.
         {
-            let mut owned = std::sync::Arc::try_unwrap(d)
-                .unwrap_or_else(|_| panic!("exclusive arc"));
+            let mut owned =
+                std::sync::Arc::try_unwrap(d).unwrap_or_else(|_| panic!("exclusive arc"));
             owned.k.as_mut_slice::<u8>().unwrap()[0] = 0xAB;
             d = std::sync::Arc::new(owned);
         }
         let mut h = lcp_test_hybrid_arc(&dev, 8);
         {
-            let mut owned = std::sync::Arc::try_unwrap(h)
-                .unwrap_or_else(|_| panic!("exclusive arc"));
+            let mut owned =
+                std::sync::Arc::try_unwrap(h).unwrap_or_else(|_| panic!("exclusive arc"));
             owned.v_packed.as_mut_slice::<u8>().unwrap()[0] = 0xCD;
             h = std::sync::Arc::new(owned);
         }
         let payload = build_gemma_lcp_payload(vec![d], Some(vec![h])).expect("payload");
         assert_eq!(payload.len(), 1);
         let layer = &payload[0];
-        let h_leg = layer.hybrid().expect("hybrid leg present under hybrid regime");
-        assert_eq!(layer.dense().k.as_slice::<u8>().unwrap()[0], 0xAB, "dense leg contents must ride through");
-        assert_eq!(h_leg.v_packed.as_slice::<u8>().unwrap()[0], 0xCD, "hybrid leg contents must ride through");
+        let h_leg = layer
+            .hybrid()
+            .expect("hybrid leg present under hybrid regime");
+        assert_eq!(
+            layer.dense().k.as_slice::<u8>().unwrap()[0],
+            0xAB,
+            "dense leg contents must ride through"
+        );
+        assert_eq!(
+            h_leg.v_packed.as_slice::<u8>().unwrap()[0],
+            0xCD,
+            "hybrid leg contents must ride through"
+        );
     }
 
     #[test]
@@ -17609,10 +17808,12 @@ assistant:
         // an operator inspecting curl bytes.
         use crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
         assert!(
-            FALLBACK_GEMMA4_API_CHAT_TEMPLATE.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+            FALLBACK_GEMMA4_API_CHAT_TEMPLATE
+                .ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
             "FALLBACK_GEMMA4_API_CHAT_TEMPLATE must end with the empty channel block; \
              got tail: {:?}",
-            &FALLBACK_GEMMA4_API_CHAT_TEMPLATE[FALLBACK_GEMMA4_API_CHAT_TEMPLATE.len().saturating_sub(50)..]
+            &FALLBACK_GEMMA4_API_CHAT_TEMPLATE
+                [FALLBACK_GEMMA4_API_CHAT_TEMPLATE.len().saturating_sub(50)..]
         );
     }
 
@@ -17639,7 +17840,9 @@ assistant:
             &out[out.len().saturating_sub(50)..]
         );
         // Sanity: the empty block lives after `<|turn>model\n`, not before.
-        let model_turn_idx = out.find("<|turn>model\n").expect("`<|turn>model` marker present");
+        let model_turn_idx = out
+            .find("<|turn>model\n")
+            .expect("`<|turn>model` marker present");
         let channel_open_idx = out.find("<|channel>").expect("`<|channel>` open present");
         assert!(
             channel_open_idx > model_turn_idx,
@@ -17876,9 +18079,7 @@ assistant:
             },
             ChatMessage {
                 role: "tool".into(),
-                content: Some(MessageContent::Text(
-                    "{\"temperature\": 18}".into(),
-                )),
+                content: Some(MessageContent::Text("{\"temperature\": 18}".into())),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: Some("call_abc".into()),
@@ -17906,14 +18107,18 @@ assistant:
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "what is ".into() },
+                ContentPart::Text {
+                    text: "what is ".into(),
+                },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,XXX".into(),
                         detail: None,
                     },
                 },
-                ContentPart::Text { text: "this?".into() },
+                ContentPart::Text {
+                    text: "this?".into(),
+                },
             ])),
             reasoning_content: None,
             tool_calls: None,
@@ -18014,7 +18219,10 @@ assistant:
         )
         .unwrap();
         assert!(out.contains("<function=read_file>"), "out={out}");
-        assert!(out.contains("<parameter=path>\nfoo.rs\n</parameter>"), "out={out}");
+        assert!(
+            out.contains("<parameter=path>\nfoo.rs\n</parameter>"),
+            "out={out}"
+        );
     }
 
     #[test]
@@ -18024,14 +18232,9 @@ assistant:
         // separately below).
         let tmpl = "{{ messages[2].tool_calls[0].function.arguments is string }}";
         for raw in ["[1,2]", "42", "true", "null", "\"foo\"", "location=Paris"] {
-            let out = render_chat_prompt_with_tools(
-                tmpl,
-                &i229_tail_transcript(raw),
-                None,
-                false,
-                None,
-            )
-            .unwrap();
+            let out =
+                render_chat_prompt_with_tools(tmpl, &i229_tail_transcript(raw), None, false, None)
+                    .unwrap();
             assert_eq!(out, "true", "arguments {raw:?} must stay a raw string");
         }
         // Control: a valid object DOES become a mapping.
@@ -18125,9 +18328,14 @@ assistant:
             "<bos><|turn>system\n<|think|>You are an agent.<turn|>\n<|turn>user\nFix the bug in foo.rs<turn|>\n<|turn>model\nDone, fixed the panic.<turn|>\n<|turn>user\nNow add a test for it<turn|>\n<|turn>model\n"
         );
         let empty = serde_json::Map::new();
-        let out_empty =
-            render_chat_prompt_with_tools(GEMMA4_EMBEDDED_TEMPLATE, &msgs, None, true, Some(&empty))
-                .unwrap();
+        let out_empty = render_chat_prompt_with_tools(
+            GEMMA4_EMBEDDED_TEMPLATE,
+            &msgs,
+            None,
+            true,
+            Some(&empty),
+        )
+        .unwrap();
         assert_eq!(out, out_empty);
     }
 
@@ -18187,7 +18395,8 @@ assistant:
 
     #[test]
     fn iter229_ac3c_reasoning_only_inserted_on_assistant_messages() {
-        let tmpl = "{% for m in messages %}{{ m.role }}:{{ m.reasoning_content is defined }};{% endfor %}";
+        let tmpl =
+            "{% for m in messages %}{{ m.role }}:{{ m.reasoning_content is defined }};{% endfor %}";
         let mut msgs = vec![
             i229_msg("system", "s"),
             i229_msg("user", "u"),
@@ -18403,7 +18612,10 @@ assistant:
             None,
         )
         .unwrap();
-        assert!(out.contains("<tool_response>\nbare result\n</tool_response>"), "out={out}");
+        assert!(
+            out.contains("<tool_response>\nbare result\n</tool_response>"),
+            "out={out}"
+        );
     }
 
     #[test]
@@ -18432,7 +18644,10 @@ assistant:
         for (msgs, expect) in cases {
             let err = render_chat_prompt_with_tools(tmpl, &msgs, None, false, None).unwrap_err();
             let text = format!("{err:#}");
-            assert!(text.contains(expect), "expected {expect:?} in err chain: {text}");
+            assert!(
+                text.contains(expect),
+                "expected {expect:?} in err chain: {text}"
+            );
         }
     }
 
@@ -18507,7 +18722,7 @@ assistant:
                 registration: None,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: None,
-            tq_packed_descriptor: None,
+                tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
                 // ADR-040 C2b scaffold for test-only engines.
                 max_slots: 1,
@@ -18534,7 +18749,10 @@ assistant:
         assert_eq!(info.backend, "mlx-native");
         assert_eq!(info.tokenizer_source, TokenizerSource::GgufEmbedded);
         assert_eq!(info.chat_template_source, ChatTemplateSource::None);
-        assert_eq!(info.provenance, crate::core::provenance::Provenance::External);
+        assert_eq!(
+            info.provenance,
+            crate::core::provenance::Provenance::External
+        );
         assert_eq!(info.load_wall_clock, Duration::ZERO);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -18567,11 +18785,16 @@ assistant:
         // Both fields 0 ⇒ enforcement disabled ⇒ Ok regardless of
         // prompt + max_tokens.
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 0, 0, drain_until_shutdown,
+            LoadedArch::Gemma,
+            0,
+            0,
+            drain_until_shutdown,
         );
         assert!(engine.try_admit_budget(0, 0).is_ok());
-        assert!(engine.try_admit_budget(u32::MAX, u32::MAX).is_ok(),
-            "u64::MAX-saturating needed_bytes still admits under zero budget");
+        assert!(
+            engine.try_admit_budget(u32::MAX, u32::MAX).is_ok(),
+            "u64::MAX-saturating needed_bytes still admits under zero budget"
+        );
     }
 
     #[test]
@@ -18580,7 +18803,10 @@ assistant:
         // Ok (cannot compute cost; treat as do-not-enforce per
         // scheduler.rs `kv_bytes_needed: 0` opt-out).
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 1024 * 1024, 0, drain_until_shutdown,
+            LoadedArch::Gemma,
+            1024 * 1024,
+            0,
+            drain_until_shutdown,
         );
         assert!(engine.try_admit_budget(1000, 1000).is_ok());
     }
@@ -18590,7 +18816,10 @@ assistant:
         // Per-token set but budget = 0 ⇒ Ok (operator didn't pass
         // --kv-cache-budget-bytes; preserves pre-A5 byte-equivalence).
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 0, 4096, drain_until_shutdown,
+            LoadedArch::Gemma,
+            0,
+            4096,
+            drain_until_shutdown,
         );
         assert!(engine.try_admit_budget(1000, 1000).is_ok());
     }
@@ -18600,7 +18829,10 @@ assistant:
         // 1 MiB budget, 256 bytes/token, 100 + 100 = 200 tokens ⇒
         // 200 × 256 = 51_200 bytes ≤ 1_048_576 ⇒ Ok.
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 1024 * 1024, 256, drain_until_shutdown,
+            LoadedArch::Gemma,
+            1024 * 1024,
+            256,
+            drain_until_shutdown,
         );
         assert!(engine.try_admit_budget(100, 100).is_ok());
     }
@@ -18610,14 +18842,26 @@ assistant:
         // 1 MiB budget, 1024 bytes/token, 1000 + 1000 = 2000 tokens ⇒
         // 2000 × 1024 = 2_048_000 > 1_048_576 ⇒ SlotBudgetExceeded.
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+            LoadedArch::Gemma,
+            1024 * 1024,
+            1024,
+            drain_until_shutdown,
         );
         match engine.try_admit_budget(1000, 1000) {
-            Err(EngineAdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
-                assert_eq!(needed_bytes, 2000 * 1024,
-                    "needed_bytes = (prompt + max) × per_token");
-                assert_eq!(budget_bytes, 1024 * 1024,
-                    "budget_bytes echoes the configured per-slot budget");
+            Err(EngineAdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => {
+                assert_eq!(
+                    needed_bytes,
+                    2000 * 1024,
+                    "needed_bytes = (prompt + max) × per_token"
+                );
+                assert_eq!(
+                    budget_bytes,
+                    1024 * 1024,
+                    "budget_bytes echoes the configured per-slot budget"
+                );
             }
             Ok(()) => panic!("over-budget admit MUST surface SlotBudgetExceeded, got Ok"),
         }
@@ -18627,11 +18871,16 @@ assistant:
     fn a5b_try_admit_budget_at_budget_exactly_returns_ok() {
         // Boundary: needed == budget is Ok (strict `>` in the check).
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+            LoadedArch::Gemma,
+            1024 * 1024,
+            1024,
+            drain_until_shutdown,
         );
         // 1024 × 1024 = 1 MiB exactly.
-        assert!(engine.try_admit_budget(512, 512).is_ok(),
-            "at-budget admit (needed == budget) must succeed");
+        assert!(
+            engine.try_admit_budget(512, 512).is_ok(),
+            "at-budget admit (needed == budget) must succeed"
+        );
     }
 
     #[test]
@@ -18640,14 +18889,23 @@ assistant:
         // exposition + future per-slot operator views; pin that it
         // simply echoes EngineInner.per_slot_kv_budget_bytes.
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 4 * 1024 * 1024, 256, drain_until_shutdown,
+            LoadedArch::Gemma,
+            4 * 1024 * 1024,
+            256,
+            drain_until_shutdown,
         );
         assert_eq!(engine.per_slot_kv_budget_bytes(), 4 * 1024 * 1024);
         let engine0 = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 0, 0, drain_until_shutdown,
+            LoadedArch::Gemma,
+            0,
+            0,
+            drain_until_shutdown,
         );
-        assert_eq!(engine0.per_slot_kv_budget_bytes(), 0,
-            "0 means enforcement disabled");
+        assert_eq!(
+            engine0.per_slot_kv_budget_bytes(),
+            0,
+            "0 means enforcement disabled"
+        );
     }
 
     #[test]
@@ -18660,14 +18918,22 @@ assistant:
             budget_bytes: 4_096_000,
         };
         let display = format!("{err}");
-        assert!(display.contains("12345678"),
-            "Display names needed_bytes verbatim: {display}");
-        assert!(display.contains("4096000"),
-            "Display names budget_bytes verbatim: {display}");
-        assert!(display.contains("ADR-040"),
-            "Display cites ADR-040: {display}");
-        assert!(display.contains("max_tokens") || display.contains("prompt"),
-            "Display names the actionable remediation: {display}");
+        assert!(
+            display.contains("12345678"),
+            "Display names needed_bytes verbatim: {display}"
+        );
+        assert!(
+            display.contains("4096000"),
+            "Display names budget_bytes verbatim: {display}"
+        );
+        assert!(
+            display.contains("ADR-040"),
+            "Display cites ADR-040: {display}"
+        );
+        assert!(
+            display.contains("max_tokens") || display.contains("prompt"),
+            "Display names the actionable remediation: {display}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -18720,17 +18986,20 @@ assistant:
     /// 5. The body JSON does not contain `"code":"slot_budget_exceeded"`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a5d_seam_only_try_admit_budget_to_api_error_429_wire_shape() {
+        use super::super::schema::ApiError;
         use axum::body::to_bytes;
         use axum::http::header;
         use axum::response::IntoResponse;
-        use super::super::schema::ApiError;
 
         // Synthetic Engine mirroring the production `Engine::spawn`
         // shape: per_slot_kv_budget_bytes = 1 MiB; kv_bytes_per_token =
         // 1 KiB. A request asking for (prompt=1000 + max_tokens=1000)
         // tokens needs 2000 × 1024 = 2 MiB > 1 MiB budget.
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+            LoadedArch::Gemma,
+            1024 * 1024,
+            1024,
+            drain_until_shutdown,
         );
 
         // EXACTLY mirrors the non-streaming handler path at
@@ -18739,9 +19008,10 @@ assistant:
         // The streaming path (CRITICAL #2's load-bearing case) uses
         // `try_admit_budget` directly.
         let response = match engine.try_admit_budget(1000, 1000) {
-            Err(EngineAdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
-                ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response()
-            }
+            Err(EngineAdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response(),
             Ok(()) => panic!(
                 "Synthetic over-budget admit MUST surface SlotBudgetExceeded — \
                  indicates `try_admit_budget` is broken"
@@ -18762,23 +19032,35 @@ assistant:
             "non-streaming over-budget MUST set Retry-After: 1"
         );
         // (3/5) JSON body shape — Content-Type + code field.
-        let ct = response.headers().get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()).unwrap_or("");
-        assert!(ct.contains("application/json"),
-            "body Content-Type MUST be application/json; got {ct:?}");
-        let body_bytes = to_bytes(response.into_body(), 1 << 20).await
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
+            "body Content-Type MUST be application/json; got {ct:?}"
+        );
+        let body_bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
             .expect("collect body bytes");
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
         // (4/5) Body contains `slot_budget_exceeded` code.
-        assert!(body_str.contains("slot_budget_exceeded"),
-            "body MUST contain `slot_budget_exceeded` code; got: {body_str}");
+        assert!(
+            body_str.contains("slot_budget_exceeded"),
+            "body MUST contain `slot_budget_exceeded` code; got: {body_str}"
+        );
         // (5/5) Body contains the actual byte numbers (operator-facing
         // remediation diagnostic — parse_slot_budget_exceeded contract
         // depends on these being verbatim in the message).
-        assert!(body_str.contains("2048000"),
-            "body MUST embed needed_bytes=2048000 verbatim; got: {body_str}");
-        assert!(body_str.contains("1048576"),
-            "body MUST embed budget_bytes=1048576 verbatim; got: {body_str}");
+        assert!(
+            body_str.contains("2048000"),
+            "body MUST embed needed_bytes=2048000 verbatim; got: {body_str}"
+        );
+        assert!(
+            body_str.contains("1048576"),
+            "body MUST embed budget_bytes=1048576 verbatim; got: {body_str}"
+        );
 
         engine.shutdown().await.expect("shutdown");
     }
@@ -18796,12 +19078,15 @@ assistant:
     /// `handlers.rs::a5d_handler_429_tests::a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a5d_seam_only_streaming_response_is_json_not_sse_when_over_budget() {
+        use super::super::schema::ApiError;
         use axum::http::header;
         use axum::response::IntoResponse;
-        use super::super::schema::ApiError;
 
         let engine = make_test_engine_with_worker_arch_and_budget(
-            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+            LoadedArch::Gemma,
+            1024 * 1024,
+            1024,
+            drain_until_shutdown,
         );
 
         // EXACTLY mirrors the streaming handler path at
@@ -18811,9 +19096,10 @@ assistant:
         // `ApiError::slot_budget_exceeded(...)` is `application/json`,
         // not `text/event-stream`.
         let response = match engine.try_admit_budget(1000, 1000) {
-            Err(EngineAdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
-                ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response()
-            }
+            Err(EngineAdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response(),
             Ok(()) => panic!(
                 "Synthetic over-budget admit MUST surface SlotBudgetExceeded \
                  — streaming pre-admit seam is broken"
@@ -18832,16 +19118,23 @@ assistant:
         // Load-bearing assertion #2: Content-Type is JSON, NOT
         // text/event-stream. If the SSE body had been constructed, the
         // response would carry `text/event-stream`.
-        let ct = response.headers().get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()).unwrap_or("");
-        assert!(ct.contains("application/json"),
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
             "streaming pre-admit 429 MUST be a JSON body (NOT \
              text/event-stream); got Content-Type: {ct:?} — this assertion \
              is the wire-level proof that the response is NOT an SSE \
-             body");
-        assert!(!ct.contains("text/event-stream"),
+             body"
+        );
+        assert!(
+            !ct.contains("text/event-stream"),
             "streaming pre-admit 429 MUST NOT carry text/event-stream; \
-             got: {ct:?}");
+             got: {ct:?}"
+        );
         // Retry-After: 1 — matches queue_full convention.
         let retry_after = response.headers().get(header::RETRY_AFTER);
         assert_eq!(
@@ -18885,13 +19178,11 @@ assistant:
         let upper = (fn_start + 200_000).min(handlers_src.len());
         let slice = &handlers_src[fn_start..upper];
 
-        let admit_pos = slice
-            .find("engine.try_admit_budget(")
-            .expect(
-                "`engine.try_admit_budget(` call MUST exist in \
+        let admit_pos = slice.find("engine.try_admit_budget(").expect(
+            "`engine.try_admit_budget(` call MUST exist in \
                  chat_completions_stream — pre-stream admit seam (codex \
                  CRITICAL #2 fix at iter-A5b)",
-            );
+        );
         let stream_pos = slice
             .find("engine\n        .generate_stream_with_deepstack")
             .or_else(|| slice.find(".generate_stream_with_deepstack("))
@@ -18961,11 +19252,7 @@ assistant:
 
     /// Helper: build a stored PromptCache that looks like a previous greedy
     /// request completed with `result_text`.
-    fn make_cached(
-        tokens: &[u32],
-        params: &SamplingParams,
-        result_text: &str,
-    ) -> PromptCache {
+    fn make_cached(tokens: &[u32], params: &SamplingParams, result_text: &str) -> PromptCache {
         let mut cache = PromptCache::new();
         let result = GenerationResult {
             text: result_text.to_string(),
@@ -19030,7 +19317,7 @@ assistant:
 
     #[test]
     fn prompt_cache_miss_on_different_response_format_grammar() {
-        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use super::super::grammar::parser::{Grammar, GretElement, GretType};
         use std::collections::HashMap;
 
         let tokens: Vec<u32> = vec![1, 2, 3];
@@ -19082,7 +19369,7 @@ assistant:
     /// exercises at the end of `prepare_chat_completion_common`.
     #[test]
     fn prompt_cache_miss_on_different_tool_choice_grammar() {
-        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use super::super::grammar::parser::{Grammar, GretElement, GretType};
         use std::collections::HashMap;
 
         let tokens: Vec<u32> = vec![1, 2, 3];
@@ -19165,7 +19452,7 @@ assistant:
     #[test]
     fn prompt_cache_miss_on_different_grammar_kind() {
         let tokens: Vec<u32> = vec![1, 2, 3];
-        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use super::super::grammar::parser::{Grammar, GretElement, GretType};
         use std::collections::HashMap;
 
         // Build a trivial grammar used by both base and req.
@@ -19174,7 +19461,11 @@ assistant:
                 GretElement::new(GretType::Char, b'x' as u32),
                 GretElement::new(GretType::End, 0),
             ]],
-            symbol_ids: { let mut m = HashMap::new(); m.insert("root".to_string(), 0u32); m },
+            symbol_ids: {
+                let mut m = HashMap::new();
+                m.insert("root".to_string(), 0u32);
+                m
+            },
         };
 
         let mut base = SamplingParams::default();
@@ -19307,7 +19598,7 @@ assistant:
     /// including the wave-2.6 W-ε additions.
     #[test]
     fn prompt_cache_hit_full_inventory_equal() {
-        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use super::super::grammar::parser::{Grammar, GretElement, GretType};
         use std::collections::HashMap;
 
         let tokens: Vec<u32> = vec![10, 20, 30];
@@ -19317,7 +19608,11 @@ assistant:
                 GretElement::new(GretType::Char, b'z' as u32),
                 GretElement::new(GretType::End, 0),
             ]],
-            symbol_ids: { let mut m = HashMap::new(); m.insert("root".to_string(), 0u32); m },
+            symbol_ids: {
+                let mut m = HashMap::new();
+                m.insert("root".to_string(), 0u32);
+                m
+            },
         };
 
         let mut params = SamplingParams::default();
@@ -19551,8 +19846,7 @@ assistant:
         use super::super::sse::{DeltaKind, GenerationEvent};
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<GenerationEvent>(64);
-        let capture: std::cell::RefCell<Vec<CachedFragment>> =
-            std::cell::RefCell::new(Vec::new());
+        let capture: std::cell::RefCell<Vec<CachedFragment>> = std::cell::RefCell::new(Vec::new());
         let sink = EventSink::with_capture(&tx, &capture);
 
         // Drive a representative sequence: Reasoning + Content + ToolCall
@@ -19709,8 +20003,7 @@ assistant:
     #[test]
     fn loaded_model_enum_accessor_methods_dispatch_correctly() {
         use crate::inference::models::qwen35::{
-            default_layer_types, model::Qwen35Model, Qwen35Config,
-            Qwen35MoeConfig, Qwen35Variant,
+            default_layer_types, model::Qwen35Model, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
         };
 
         // ---- Build a synthetic Qwen35 variant -----------------------
@@ -19762,8 +20055,7 @@ assistant:
             load_duration: Duration::from_millis(7),
             provenance: crate::core::provenance::Provenance::External,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
-            lcp_registry:
-                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
@@ -19824,7 +20116,11 @@ assistant:
         // plain literal.
         assert!(
             src.contains(&format!("push({expected_default})"))
-                || src.contains(&format!("push({}_{})", expected_default / 1000, expected_default % 1000))
+                || src.contains(&format!(
+                    "push({}_{})",
+                    expected_default / 1000,
+                    expected_default % 1000
+                ))
                 || src.contains(&format!("push(151_645)")),
             "Qwen35LoadedModel::load must default EOS to {expected_default} \
              (HF Qwen3.5 default per cmd_generate_qwen35) when the GGUF metadata \
@@ -19957,17 +20253,14 @@ assistant:
                             range,
                             reply,
                         } => {
-                            let result = if layer_rank
-                                >= cache.nkv_per_layer.len()
-                            {
+                            let result = if layer_rank >= cache.nkv_per_layer.len() {
                                 Err(anyhow::anyhow!("test: layer OOB"))
                             } else {
                                 let nkv = cache.nkv_per_layer[layer_rank];
                                 let cap = cache.capacity_per_layer[layer_rank];
                                 let hd = cache.head_dim_per_layer[layer_rank];
                                 let is_sliding = cache.is_sliding_per_layer[layer_rank];
-                                let n_tokens =
-                                    (range.end - range.start) as usize;
+                                let n_tokens = (range.end - range.start) as usize;
                                 let mut k_out = Vec::with_capacity(nkv * n_tokens * hd);
                                 let mut v_out = Vec::with_capacity(nkv * n_tokens * hd);
                                 let mut ok = true;
@@ -20022,24 +20315,17 @@ assistant:
                             write_pos,
                             reply,
                         } => {
-                            let result = if layer_rank
-                                >= cache.nkv_per_layer.len()
-                            {
+                            let result = if layer_rank >= cache.nkv_per_layer.len() {
                                 Err(anyhow::anyhow!("test: layer OOB"))
                             } else {
                                 let nkv = cache.nkv_per_layer[layer_rank];
                                 let cap = cache.capacity_per_layer[layer_rank];
                                 let hd = cache.head_dim_per_layer[layer_rank];
                                 let is_sliding = cache.is_sliding_per_layer[layer_rank];
-                                let n_tokens =
-                                    (range.end - range.start) as usize;
+                                let n_tokens = (range.end - range.start) as usize;
                                 let expected = nkv * n_tokens * hd;
-                                if k_payload.len() != expected
-                                    || v_payload.len() != expected
-                                {
-                                    Err(anyhow::anyhow!(
-                                        "test: payload size mismatch"
-                                    ))
+                                if k_payload.len() != expected || v_payload.len() != expected {
+                                    Err(anyhow::anyhow!("test: payload size mismatch"))
                                 } else {
                                     let mut off = 0usize;
                                     for h in 0..nkv {
@@ -20052,18 +20338,15 @@ assistant:
                                             cache.cells.insert(
                                                 (layer_rank, h, slot),
                                                 (
-                                                    k_payload[off..off + hd]
-                                                        .to_vec(),
-                                                    v_payload[off..off + hd]
-                                                        .to_vec(),
+                                                    k_payload[off..off + hd].to_vec(),
+                                                    v_payload[off..off + hd].to_vec(),
                                                 ),
                                             );
                                             off += hd;
                                         }
                                     }
                                     if is_sliding && write_pos != u32::MAX {
-                                        cache.write_pos_per_layer[layer_rank] =
-                                            write_pos;
+                                        cache.write_pos_per_layer[layer_rank] = write_pos;
                                     }
                                     Ok(())
                                 }
@@ -20129,8 +20412,7 @@ assistant:
             nkv_heads: vec![2, 1],
             head_dim: vec![8, 16],
             kv_dtype: KvDType::F32,
-            provenance:
-                super::super::kv_spill_descriptor::KvSpillProvenance::default(),
+            provenance: super::super::kv_spill_descriptor::KvSpillProvenance::default(),
         };
         let engine = make_synthetic_kv_engine(
             vec![2, 1],
@@ -20154,14 +20436,7 @@ assistant:
     /// across architectures.
     #[test]
     fn request_kv_descriptor_returns_none_when_not_set() {
-        let engine = make_synthetic_kv_engine(
-            vec![1],
-            vec![4],
-            vec![8],
-            vec![true],
-            None,
-            vec![],
-        );
+        let engine = make_synthetic_kv_engine(vec![1], vec![4], vec![8], vec![true], None, vec![]);
         assert!(engine.kv_spill_descriptor().is_none());
     }
 
@@ -20220,14 +20495,7 @@ assistant:
         // n_tokens=0). Use range collapse to cover Ok(None) at the
         // descriptor level instead: descriptor.num_layers > engine
         // layer count = layer OOB error.
-        let engine = make_synthetic_kv_engine(
-            vec![1],
-            vec![4],
-            vec![8],
-            vec![true],
-            None,
-            vec![],
-        );
+        let engine = make_synthetic_kv_engine(vec![1], vec![4], vec![8], vec![true], None, vec![]);
         // Layer 99 doesn't exist — synthetic worker returns Err.
         let err = engine.request_kv_snapshot(99, 0..4);
         assert!(err.is_err(), "out-of-range layer ⇒ Err from worker");
@@ -20238,14 +20506,7 @@ assistant:
     /// Falsifier: any byte mismatch.
     #[test]
     fn request_kv_restore_then_snapshot_round_trip_byte_exact() {
-        let engine = make_synthetic_kv_engine(
-            vec![1],
-            vec![4],
-            vec![8],
-            vec![true],
-            None,
-            vec![],
-        );
+        let engine = make_synthetic_kv_engine(vec![1], vec![4], vec![8], vec![true], None, vec![]);
         // Build deterministic payload: 1 head * 4 tokens * 4 head_dim
         // = 16 bytes per K and V.
         let k_payload: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(7) ^ 0xC3).collect();
@@ -20267,19 +20528,11 @@ assistant:
     /// mismatch. Falsifier: silently truncates.
     #[test]
     fn request_kv_restore_shape_mismatch_returns_err() {
-        let engine = make_synthetic_kv_engine(
-            vec![1],
-            vec![4],
-            vec![8],
-            vec![true],
-            None,
-            vec![],
-        );
+        let engine = make_synthetic_kv_engine(vec![1], vec![4], vec![8], vec![true], None, vec![]);
         // Range expects 4 tokens * 1 head * 4 head_dim = 16 bytes.
         // Pass only 4 bytes — must fail.
         let bad = vec![0u8; 4];
-        let result = engine
-            .request_kv_restore(0, 0..4, bad.clone(), bad, u32::MAX);
+        let result = engine.request_kv_restore(0, 0..4, bad.clone(), bad, u32::MAX);
         assert!(
             result.is_err(),
             "payload shape mismatch must surface as Err"
@@ -20547,18 +20800,32 @@ assistant:
 
     /// Compare two `GenerationResult`s field-by-field (excluding wall-clock
     /// timing). `ctx` names the comparison for the failure surface.
-    fn assert_genresult_byte_equal(
-        a: &GenerationResult,
-        b: &GenerationResult,
-        ctx: &str,
-    ) {
+    fn assert_genresult_byte_equal(a: &GenerationResult, b: &GenerationResult, ctx: &str) {
         assert_eq!(a.text, b.text, "{ctx}: `text` diverged");
-        assert_eq!(a.reasoning_text, b.reasoning_text, "{ctx}: `reasoning_text` diverged");
-        assert_eq!(a.prompt_tokens, b.prompt_tokens, "{ctx}: `prompt_tokens` diverged");
-        assert_eq!(a.completion_tokens, b.completion_tokens, "{ctx}: `completion_tokens` diverged");
-        assert_eq!(a.reasoning_tokens, b.reasoning_tokens, "{ctx}: `reasoning_tokens` diverged");
-        assert_eq!(a.cached_tokens, b.cached_tokens, "{ctx}: `cached_tokens` diverged");
-        assert_eq!(a.finish_reason, b.finish_reason, "{ctx}: `finish_reason` diverged");
+        assert_eq!(
+            a.reasoning_text, b.reasoning_text,
+            "{ctx}: `reasoning_text` diverged"
+        );
+        assert_eq!(
+            a.prompt_tokens, b.prompt_tokens,
+            "{ctx}: `prompt_tokens` diverged"
+        );
+        assert_eq!(
+            a.completion_tokens, b.completion_tokens,
+            "{ctx}: `completion_tokens` diverged"
+        );
+        assert_eq!(
+            a.reasoning_tokens, b.reasoning_tokens,
+            "{ctx}: `reasoning_tokens` diverged"
+        );
+        assert_eq!(
+            a.cached_tokens, b.cached_tokens,
+            "{ctx}: `cached_tokens` diverged"
+        );
+        assert_eq!(
+            a.finish_reason, b.finish_reason,
+            "{ctx}: `finish_reason` diverged"
+        );
         assert_eq!(a.logprobs, b.logprobs, "{ctx}: `logprobs` diverged");
     }
 
@@ -20664,7 +20931,11 @@ assistant:
             vec![8u32, 9],
             vec![2u32, 4, 6, 8],
         ];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
         let mut golden: Vec<String> = Vec::new();
         for p in &prompts {
             let r = gemma4_serial_slot_aware_ref(&load_opts, p, &params);
@@ -20713,7 +20984,11 @@ assistant:
             kv_persist_dir: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 12, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 12,
+            ..Default::default()
+        };
 
         let r_ref = gemma4_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
         for k in [0u32, 1, 3] {
@@ -20760,7 +21035,9 @@ assistant:
         // Atomic per-slot reference token streams (no interleave).
         let atomic_stream = |prompt: &[u32]| -> Vec<u32> {
             let mut m = LoadedModel::load(&load_opts).expect("load atomic");
-            let LoadedModel::Gemma(g) = &mut m else { panic!("Gemma") };
+            let LoadedModel::Gemma(g) = &mut m else {
+                panic!("Gemma")
+            };
             g.provision_multi_seq_kv_for_slot_aware(1).expect("prov");
             let mut kv = g.multi_seq_kv.take().unwrap();
             let mut hyb = g.multi_seq_kv_hybrid.take();
@@ -20770,8 +21047,15 @@ assistant:
             let first = g
                 .weights
                 .forward_prefill_with_soft_tokens_slot_aware(
-                    prompt, &[], n_dec, &mut g.ctx, SlotId(0),
-                    &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+                    prompt,
+                    &[],
+                    n_dec,
+                    &mut g.ctx,
+                    SlotId(0),
+                    &mut kv,
+                    hyb.as_mut(),
+                    den.as_mut(),
+                    mlx.as_mut(),
                 )
                 .expect("atomic prefill");
             toks.push(first);
@@ -20782,8 +21066,15 @@ assistant:
                 let t = g
                     .weights
                     .forward_decode_slot_aware(
-                        feed, pos, &mut g.ctx, &mut pr, SlotId(0),
-                        &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+                        feed,
+                        pos,
+                        &mut g.ctx,
+                        &mut pr,
+                        SlotId(0),
+                        &mut kv,
+                        hyb.as_mut(),
+                        den.as_mut(),
+                        mlx.as_mut(),
                     )
                     .expect("atomic decode");
                 toks.push(t);
@@ -20797,7 +21088,9 @@ assistant:
 
         // Interleaved run on ONE model, n_seqs=2, slot0=p0 slot1=p1.
         let mut m = LoadedModel::load(&load_opts).expect("load interleave");
-        let LoadedModel::Gemma(g) = &mut m else { panic!("Gemma") };
+        let LoadedModel::Gemma(g) = &mut m else {
+            panic!("Gemma")
+        };
         g.provision_multi_seq_kv_for_slot_aware(2).expect("prov2");
         let mut kv = g.multi_seq_kv.take().unwrap();
         let mut hyb = g.multi_seq_kv_hybrid.take();
@@ -20810,33 +21103,73 @@ assistant:
             g.weights.leg_hb_encoded = None;
         };
         clear(g);
-        let f0 = g.weights.forward_prefill_with_soft_tokens_slot_aware(
-            &p0, &[], n_dec, &mut g.ctx, SlotId(0),
-            &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
-        ).expect("il prefill0");
+        let f0 = g
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                &p0,
+                &[],
+                n_dec,
+                &mut g.ctx,
+                SlotId(0),
+                &mut kv,
+                hyb.as_mut(),
+                den.as_mut(),
+                mlx.as_mut(),
+            )
+            .expect("il prefill0");
         clear(g);
-        let f1 = g.weights.forward_prefill_with_soft_tokens_slot_aware(
-            &p1, &[], n_dec, &mut g.ctx, SlotId(1),
-            &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
-        ).expect("il prefill1");
+        let f1 = g
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                &p1,
+                &[],
+                n_dec,
+                &mut g.ctx,
+                SlotId(1),
+                &mut kv,
+                hyb.as_mut(),
+                den.as_mut(),
+                mlx.as_mut(),
+            )
+            .expect("il prefill1");
         let mut s0 = vec![f0];
         let mut s1 = vec![f1];
         let (mut feed0, mut feed1) = (f0, f1);
         for step in 1..n_dec {
             let pos0 = p0.len() + step - 1;
             let mut pr0: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
-            let t0 = g.weights.forward_decode_slot_aware(
-                feed0, pos0, &mut g.ctx, &mut pr0, SlotId(0),
-                &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
-            ).expect("il decode0");
+            let t0 = g
+                .weights
+                .forward_decode_slot_aware(
+                    feed0,
+                    pos0,
+                    &mut g.ctx,
+                    &mut pr0,
+                    SlotId(0),
+                    &mut kv,
+                    hyb.as_mut(),
+                    den.as_mut(),
+                    mlx.as_mut(),
+                )
+                .expect("il decode0");
             s0.push(t0);
             feed0 = t0;
             let pos1 = p1.len() + step - 1;
             let mut pr1: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
-            let t1 = g.weights.forward_decode_slot_aware(
-                feed1, pos1, &mut g.ctx, &mut pr1, SlotId(1),
-                &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
-            ).expect("il decode1");
+            let t1 = g
+                .weights
+                .forward_decode_slot_aware(
+                    feed1,
+                    pos1,
+                    &mut g.ctx,
+                    &mut pr1,
+                    SlotId(1),
+                    &mut kv,
+                    hyb.as_mut(),
+                    den.as_mut(),
+                    mlx.as_mut(),
+                )
+                .expect("il decode1");
             s1.push(t1);
             feed1 = t1;
         }
@@ -20850,14 +21183,24 @@ assistant:
         };
         eprintln!(
             "[B2-interleave] slot0 interleaved-vs-atomic first_diff={:?} (atomic={:?} il={:?})",
-            first_diff(&s0, &ref0), ref0, s0
+            first_diff(&s0, &ref0),
+            ref0,
+            s0
         );
         eprintln!(
             "[B2-interleave] slot1 interleaved-vs-atomic first_diff={:?} (atomic={:?} il={:?})",
-            first_diff(&s1, &ref1), ref1, s1
+            first_diff(&s1, &ref1),
+            ref1,
+            s1
         );
-        assert_eq!(s0, ref0, "ADR-040 B2 — slot0 interleaved stream diverged from atomic");
-        assert_eq!(s1, ref1, "ADR-040 B2 — slot1 interleaved stream diverged from atomic");
+        assert_eq!(
+            s0, ref0,
+            "ADR-040 B2 — slot0 interleaved stream diverged from atomic"
+        );
+        assert_eq!(
+            s1, ref1,
+            "ADR-040 B2 — slot1 interleaved stream diverged from atomic"
+        );
     }
 
     /// F1 AC4 (ADR-040 §0.12, ruling (b) 2026-06-24) — SlotAware at N=1 is
@@ -20897,20 +21240,20 @@ assistant:
             kv_persist_dir: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
 
         // Reference: the serial slot-aware fn inline (same forward path).
         let r_ref = gemma4_serial_slot_aware_ref(&load_opts, &prompt_tokens, &params);
 
         // F1 loop at N=1.
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
-        let engine_slot = Engine::spawn_with_mode(
-            loaded_slot,
-            4,
-            None,
-            EngineMode::SlotAware { max_slots: 1 },
-        )
-        .expect("spawn SlotAware{max_slots:1}");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 })
+                .expect("spawn SlotAware{max_slots:1}");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -20956,14 +21299,21 @@ assistant:
             kv_persist_dir: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
 
         // (1) My F1 loop via SlotAware{1}.
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
             Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 })
                 .expect("spawn SlotAware{1}");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
         let r_loop = rt
             .block_on(engine_slot.generate(prompt_tokens.clone(), params.clone()))
             .expect("loop generate");
@@ -20972,7 +21322,9 @@ assistant:
         // (2) The existing serial slot-aware ref, run inline at SlotId(0) on
         // a freshly-provisioned multi-seq KV.
         let mut loaded_ref = LoadedModel::load(&load_opts).expect("load ref");
-        let LoadedModel::Gemma(g) = &mut loaded_ref else { panic!("expected Gemma GGUF") };
+        let LoadedModel::Gemma(g) = &mut loaded_ref else {
+            panic!("expected Gemma GGUF")
+        };
         // Provision the slot-aware multi-seq KV the way SlotAware spawn does.
         g.provision_multi_seq_kv_for_slot_aware(1)
             .expect("provision multi-seq KV n_seqs=1");
@@ -21081,9 +21433,16 @@ assistant:
             .weights
             .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut g.ctx)
             .expect("legacy forward_prefill_batched");
-        let l0 = g.weights.logits_view().expect("legacy prefill logits").to_vec();
+        let l0 = g
+            .weights
+            .logits_view()
+            .expect("legacy prefill logits")
+            .to_vec();
         let (am0, _, _) = argmax_and_top2_gap(&l0);
-        assert_eq!(am0, prefill_argmax, "legacy: logits argmax != kernel prefill argmax");
+        assert_eq!(
+            am0, prefill_argmax,
+            "legacy: logits argmax != kernel prefill argmax"
+        );
         logits_per_pos.push(l0);
         greedy_stream.push(prefill_argmax);
 
@@ -21097,7 +21456,11 @@ assistant:
                 .weights
                 .forward_decode(next_token, pos, &mut g.ctx, &mut p)
                 .expect("legacy forward_decode");
-            let lk = g.weights.logits_view().expect("legacy decode logits").to_vec();
+            let lk = g
+                .weights
+                .logits_view()
+                .expect("legacy decode logits")
+                .to_vec();
             let (amk, _, _) = argmax_and_top2_gap(&lk);
             assert_eq!(amk, greedy, "legacy: decode logits argmax != kernel greedy");
             logits_per_pos.push(lk);
@@ -21122,8 +21485,12 @@ assistant:
         max_tokens: usize,
         driver_tokens: Option<&[u32]>,
         kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
-        mut hybrid: Option<&mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>>,
-        mut dense: Option<&mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>>,
+        mut hybrid: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+        >,
+        mut dense: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+        >,
         mut mlx: Option<&mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>>,
     ) -> (Vec<u32>, Vec<Vec<f32>>) {
         let slot = SlotId(0);
@@ -21133,7 +21500,8 @@ assistant:
         }
         if let Some(ref mut h) = hybrid {
             for buf in h.iter_mut() {
-                buf.reset_for_slot(slot).expect("slot-aware entry reset hybrid");
+                buf.reset_for_slot(slot)
+                    .expect("slot-aware entry reset hybrid");
             }
         }
 
@@ -21154,9 +21522,16 @@ assistant:
                 mlx.as_deref_mut(),
             )
             .expect("slot-aware prefill");
-        let l0 = g.weights.logits_view().expect("slot-aware prefill logits").to_vec();
+        let l0 = g
+            .weights
+            .logits_view()
+            .expect("slot-aware prefill logits")
+            .to_vec();
         let (am0, _, _) = argmax_and_top2_gap(&l0);
-        assert_eq!(am0, prefill_argmax, "slot-aware: logits argmax != kernel prefill argmax");
+        assert_eq!(
+            am0, prefill_argmax,
+            "slot-aware: logits argmax != kernel prefill argmax"
+        );
         logits_per_pos.push(l0);
         greedy_stream.push(prefill_argmax);
 
@@ -21178,9 +21553,16 @@ assistant:
                     mlx.as_deref_mut(),
                 )
                 .expect("slot-aware forward_decode");
-            let lk = g.weights.logits_view().expect("slot-aware decode logits").to_vec();
+            let lk = g
+                .weights
+                .logits_view()
+                .expect("slot-aware decode logits")
+                .to_vec();
             let (amk, _, _) = argmax_and_top2_gap(&lk);
-            assert_eq!(amk, greedy, "slot-aware: decode logits argmax != kernel greedy");
+            assert_eq!(
+                amk, greedy,
+                "slot-aware: decode logits argmax != kernel greedy"
+            );
             logits_per_pos.push(lk);
             greedy_stream.push(greedy);
             next_token = match driver_tokens {
@@ -21193,9 +21575,7 @@ assistant:
 
     #[test]
     fn adr040_f_m1_legacy_vs_slot_aware_logit_characterization() {
-        if byte_equiv_skip_unless_gated(
-            "adr040_f_m1_legacy_vs_slot_aware_logit_characterization",
-        ) {
+        if byte_equiv_skip_unless_gated("adr040_f_m1_legacy_vs_slot_aware_logit_characterization") {
             return;
         }
         let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
@@ -21223,20 +21603,31 @@ assistant:
         // ── PASS 1: each path drives its OWN greedy argmax (real generation) ──
         let (legacy_stream, legacy_logits) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load legacy");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma GGUF")
+            };
             capture_legacy_logits(g, &prompt_tokens, max_tokens, None)
         };
         let (slot_stream, slot_logits) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load slot");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
-            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision multi-seq KV");
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma GGUF")
+            };
+            g.provision_multi_seq_kv_for_slot_aware(1)
+                .expect("provision multi-seq KV");
             let mut kv = g.multi_seq_kv.take().expect("kv");
             let mut hybrid = g.multi_seq_kv_hybrid.take();
             let mut dense = g.multi_seq_kv_dense.take();
             let mut mlx = g.multi_seq_kv_mlx.take();
             let r = capture_slot_aware_logits(
-                g, &prompt_tokens, max_tokens, None,
-                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+                g,
+                &prompt_tokens,
+                max_tokens,
+                None,
+                &mut kv,
+                hybrid.as_mut(),
+                dense.as_mut(),
+                mlx.as_mut(),
             );
             g.multi_seq_kv = Some(kv);
             g.multi_seq_kv_hybrid = hybrid;
@@ -21246,7 +21637,11 @@ assistant:
         };
 
         let vocab = legacy_logits[0].len();
-        assert_eq!(vocab, slot_logits[0].len(), "vocab size mismatch between paths");
+        assert_eq!(
+            vocab,
+            slot_logits[0].len(),
+            "vocab size mismatch between paths"
+        );
         assert!(vocab > 0, "empty logits");
         assert_eq!(legacy_logits.len(), max_tokens);
         assert_eq!(slot_logits.len(), max_tokens);
@@ -21261,7 +21656,10 @@ assistant:
                 break;
             }
         }
-        eprintln!("first greedy-stream divergence position: {:?}", first_stream_div);
+        eprintln!(
+            "first greedy-stream divergence position: {:?}",
+            first_stream_div
+        );
 
         // ── PASS 2: TEACHER-FORCED on the legacy token stream so a
         // position-N logit delta is NOT confounded by an earlier token
@@ -21271,20 +21669,31 @@ assistant:
         // is the load-bearing measurement for root-cause. ──
         let (_, legacy_tf) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load legacy tf");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma GGUF")
+            };
             capture_legacy_logits(g, &prompt_tokens, max_tokens, Some(&legacy_stream))
         };
         let (_, slot_tf) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load slot tf");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
-            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision multi-seq KV tf");
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma GGUF")
+            };
+            g.provision_multi_seq_kv_for_slot_aware(1)
+                .expect("provision multi-seq KV tf");
             let mut kv = g.multi_seq_kv.take().expect("kv tf");
             let mut hybrid = g.multi_seq_kv_hybrid.take();
             let mut dense = g.multi_seq_kv_dense.take();
             let mut mlx = g.multi_seq_kv_mlx.take();
             let r = capture_slot_aware_logits(
-                g, &prompt_tokens, max_tokens, Some(&legacy_stream),
-                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+                g,
+                &prompt_tokens,
+                max_tokens,
+                Some(&legacy_stream),
+                &mut kv,
+                hybrid.as_mut(),
+                dense.as_mut(),
+                mlx.as_mut(),
             );
             g.multi_seq_kv = Some(kv);
             g.multi_seq_kv_hybrid = hybrid;
@@ -21331,7 +21740,14 @@ assistant:
             }
             eprintln!(
                 "{:3} | {:12.6} | {:13.8} | {:6}({:8.5}) | {:6}({:8.5}) | {}",
-                pos, max_abs, mean_abs, la, lgap, sa, sgap, if flip { "FLIP" } else { "" }
+                pos,
+                max_abs,
+                mean_abs,
+                la,
+                lgap,
+                sa,
+                sgap,
+                if flip { "FLIP" } else { "" }
             );
         }
         let mean_mean = sum_mean_over_pos / max_tokens as f64;
@@ -21340,14 +21756,19 @@ assistant:
             global_max_diff, global_max_diff_pos, mean_mean
         );
         eprintln!("first teacher-forced argmax flip: {:?}", first_argmax_flip);
-        eprintln!("all flips (pos, legacy_top2_gap, slot_top2_gap): {:?}", flip_details);
+        eprintln!(
+            "all flips (pos, legacy_top2_gap, slot_top2_gap): {:?}",
+            flip_details
+        );
 
         // Characterize: are flips on near-ties (benign) or confident (bug)?
         for (pos, lgap, sgap) in &flip_details {
             let near_tie = *lgap < global_max_diff.max(1e-3) || *sgap < global_max_diff.max(1e-3);
             eprintln!(
                 "  flip @pos {}: legacy_gap={:.6} slot_gap={:.6} -> {}",
-                pos, lgap, sgap,
+                pos,
+                lgap,
+                sgap,
                 if near_tie {
                     "NEAR-TIE (gap <= logit-noise => benign finite-precision flip)"
                 } else {
@@ -21372,7 +21793,10 @@ assistant:
         // NOT assert a tight bound here — this is a measurement test whose
         // job is to MEASURE the delta. The companion disambiguation test
         // pins the root-cause axis.
-        assert!(global_max_diff.is_finite(), "ADR-040 F M1: non-finite logit delta");
+        assert!(
+            global_max_diff.is_finite(),
+            "ADR-040 F M1: non-finite logit delta"
+        );
     }
 
     /// ADR-040 Phase F M1 — PREFILL-ONLY disambiguation. The
@@ -21415,25 +21839,42 @@ assistant:
         // (A) legacy batched prefill.
         let (a_argmax, a_logits) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load A");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
-            let am = g.weights.forward_prefill_batched(&prompt, max_tokens, 0, &mut g.ctx)
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("Gemma")
+            };
+            let am = g
+                .weights
+                .forward_prefill_batched(&prompt, max_tokens, 0, &mut g.ctx)
                 .expect("A prefill_batched");
             (am, g.weights.logits_view().expect("A logits").to_vec())
         };
         // (B) legacy non-batched resume prefill.
         let (b_argmax, b_logits) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load B");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
-            let am = g.weights.forward_prefill_with_soft_tokens_resume(
-                &prompt, &[], max_tokens, &mut g.ctx, None, false,
-            ).expect("B prefill_resume");
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("Gemma")
+            };
+            let am = g
+                .weights
+                .forward_prefill_with_soft_tokens_resume(
+                    &prompt,
+                    &[],
+                    max_tokens,
+                    &mut g.ctx,
+                    None,
+                    false,
+                )
+                .expect("B prefill_resume");
             (am, g.weights.logits_view().expect("B logits").to_vec())
         };
         // (C) slot-aware prefill.
         let (c_argmax, c_logits) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load C");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
-            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision");
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("Gemma")
+            };
+            g.provision_multi_seq_kv_for_slot_aware(1)
+                .expect("provision");
             let mut kv = g.multi_seq_kv.take().expect("kv");
             let mut hybrid = g.multi_seq_kv_hybrid.take();
             let mut dense = g.multi_seq_kv_dense.take();
@@ -21446,10 +21887,20 @@ assistant:
                     buf.reset_for_slot(SlotId(0)).expect("reset hybrid");
                 }
             }
-            let am = g.weights.forward_prefill_with_soft_tokens_slot_aware(
-                &prompt, &[], max_tokens, &mut g.ctx, SlotId(0),
-                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
-            ).expect("C prefill_slot_aware");
+            let am = g
+                .weights
+                .forward_prefill_with_soft_tokens_slot_aware(
+                    &prompt,
+                    &[],
+                    max_tokens,
+                    &mut g.ctx,
+                    SlotId(0),
+                    &mut kv,
+                    hybrid.as_mut(),
+                    dense.as_mut(),
+                    mlx.as_mut(),
+                )
+                .expect("C prefill_slot_aware");
             let lg = g.weights.logits_view().expect("C logits").to_vec();
             g.multi_seq_kv = Some(kv);
             g.multi_seq_kv_hybrid = hybrid;
@@ -21462,25 +21913,19 @@ assistant:
         assert_eq!(vocab, b_logits.len());
         assert_eq!(vocab, c_logits.len());
         let max_abs = |x: &[f32], y: &[f32]| -> f32 {
-            x.iter().zip(y.iter()).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max)
+            x.iter()
+                .zip(y.iter())
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
         };
         let ab = max_abs(&a_logits, &b_logits);
         let bc = max_abs(&b_logits, &c_logits);
         let ac = max_abs(&a_logits, &c_logits);
         eprintln!("\n==== ADR-040 F M1 PREFILL disambiguation ====");
         eprintln!("prompt={:?} vocab={}", prompt, vocab);
-        eprintln!(
-            "(A) legacy batched      prefill argmax = {}",
-            a_argmax
-        );
-        eprintln!(
-            "(B) legacy non-batched  prefill argmax = {}",
-            b_argmax
-        );
-        eprintln!(
-            "(C) slot-aware          prefill argmax = {}",
-            c_argmax
-        );
+        eprintln!("(A) legacy batched      prefill argmax = {}", a_argmax);
+        eprintln!("(B) legacy non-batched  prefill argmax = {}", b_argmax);
+        eprintln!("(C) slot-aware          prefill argmax = {}", c_argmax);
         eprintln!("max|A-B| (batched vs non-batched)        = {:.6}", ab);
         eprintln!("max|B-C| (non-batched vs slot-aware MOUNT)= {:.6}", bc);
         eprintln!("max|A-C| (legacy-default vs slot-aware)   = {:.6}", ac);
@@ -21502,18 +21947,30 @@ assistant:
         // DEFAULT is the batched-vs-non-batched prefill axis pinned above. ──
         let (b_stream, _) = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load Bstream");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("Gemma")
+            };
             // Drive legacy NON-BATCHED greedy: prefill_resume then forward_decode.
             let mut stream = Vec::with_capacity(max_tokens);
-            let am = g.weights.forward_prefill_with_soft_tokens_resume(
-                &prompt, &[], max_tokens, &mut g.ctx, None, false,
-            ).expect("Bstream prefill");
+            let am = g
+                .weights
+                .forward_prefill_with_soft_tokens_resume(
+                    &prompt,
+                    &[],
+                    max_tokens,
+                    &mut g.ctx,
+                    None,
+                    false,
+                )
+                .expect("Bstream prefill");
             stream.push(am);
             let mut nt = am;
             for step in 1..max_tokens {
                 let pos = prompt.len() + step - 1;
                 let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
-                let g_tok = g.weights.forward_decode(nt, pos, &mut g.ctx, &mut p)
+                let g_tok = g
+                    .weights
+                    .forward_decode(nt, pos, &mut g.ctx, &mut p)
                     .expect("Bstream decode");
                 stream.push(g_tok);
                 nt = g_tok;
@@ -21523,21 +21980,32 @@ assistant:
         // B-path teacher-forced logits.
         let b_tf = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load Btf");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("Gemma")
+            };
             capture_legacy_logits_nonbatched(g, &prompt, max_tokens, &b_stream)
         };
         // C-path (slot-aware) teacher-forced logits.
         let c_tf = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load Ctf");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
-            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision Ctf");
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("Gemma")
+            };
+            g.provision_multi_seq_kv_for_slot_aware(1)
+                .expect("provision Ctf");
             let mut kv = g.multi_seq_kv.take().expect("kv");
             let mut hybrid = g.multi_seq_kv_hybrid.take();
             let mut dense = g.multi_seq_kv_dense.take();
             let mut mlx = g.multi_seq_kv_mlx.take();
             let (_, lg) = capture_slot_aware_logits(
-                g, &prompt, max_tokens, Some(&b_stream),
-                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+                g,
+                &prompt,
+                max_tokens,
+                Some(&b_stream),
+                &mut kv,
+                hybrid.as_mut(),
+                dense.as_mut(),
+                mlx.as_mut(),
             );
             g.multi_seq_kv = Some(kv);
             g.multi_seq_kv_hybrid = hybrid;
@@ -21579,15 +22047,25 @@ assistant:
         driver_tokens: &[u32],
     ) -> Vec<Vec<f32>> {
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(max_tokens);
-        let _am = g.weights.forward_prefill_with_soft_tokens_resume(
-            prompt_tokens, &[], max_tokens, &mut g.ctx, None, false,
-        ).expect("nb prefill");
+        let _am = g
+            .weights
+            .forward_prefill_with_soft_tokens_resume(
+                prompt_tokens,
+                &[],
+                max_tokens,
+                &mut g.ctx,
+                None,
+                false,
+            )
+            .expect("nb prefill");
         out.push(g.weights.logits_view().expect("nb prefill logits").to_vec());
         let mut nt = driver_tokens[0];
         for step in 1..max_tokens {
             let pos = prompt_tokens.len() + step - 1;
             let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
-            let _g = g.weights.forward_decode(nt, pos, &mut g.ctx, &mut p)
+            let _g = g
+                .weights
+                .forward_decode(nt, pos, &mut g.ctx, &mut p)
                 .expect("nb decode");
             out.push(g.weights.logits_view().expect("nb decode logits").to_vec());
             nt = driver_tokens[step];
@@ -21621,9 +22099,17 @@ assistant:
         };
 
         // Four distinct greedy prompts.
-        let prompts: Vec<Vec<u32>> =
-            vec![vec![1, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14]];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1, 2, 3],
+            vec![4, 5, 6, 7],
+            vec![8, 9],
+            vec![10, 11, 12, 13, 14],
+        ];
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 24,
+            ..Default::default()
+        };
 
         // Serial slot-aware references (SAME forward path as the SlotAware
         // loop) — the AC4-correct bar, decoupled from the legacy-forward
@@ -21722,8 +22208,11 @@ assistant:
         // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
         // every slot's greedy output is a prefix of it.
         let prompt: Vec<u32> = vec![2, 4, 6, 8];
-        let ref_params =
-            SamplingParams { temperature: 0.0, max_tokens: 40, ..Default::default() };
+        let ref_params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 40,
+            ..Default::default()
+        };
         let serial = gemma4_serial_slot_aware_ref(&load_opts, &prompt, &ref_params);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -21751,13 +22240,21 @@ assistant:
         // differentiator left vs the (passing) simultaneous/staggered runs above.
         let evict = std::env::var("HF2Q_FALSIFIER_EVICT").as_deref() == Ok("1");
         let long = 40usize;
-        let budgets: Vec<usize> = if evict { vec![4, long, long, long] } else { vec![24; 4] };
+        let budgets: Vec<usize> = if evict {
+            vec![4, long, long, long]
+        } else {
+            vec![24; 4]
+        };
         let slot_results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
             for (slot_i, &b) in budgets.iter().enumerate() {
                 let eng = engine_slot.clone();
                 let p = prompt.clone();
-                let pr = SamplingParams { temperature: 0.0, max_tokens: b, ..Default::default() };
+                let pr = SamplingParams {
+                    temperature: 0.0,
+                    max_tokens: b,
+                    ..Default::default()
+                };
                 let si = slot_i as u64;
                 handles.push(tokio::spawn(async move {
                     if stagger_ms > 0 {
@@ -21770,7 +22267,11 @@ assistant:
             if evict {
                 let eng = engine_slot.clone();
                 let p = prompt.clone();
-                let pr = SamplingParams { temperature: 0.0, max_tokens: long, ..Default::default() };
+                let pr = SamplingParams {
+                    temperature: 0.0,
+                    max_tokens: long,
+                    ..Default::default()
+                };
                 handles.push(tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                     eng.generate(p, pr).await.expect("slot5 generate")
@@ -21835,7 +22336,11 @@ assistant:
             vec![21, 22, 23],
             vec![24, 25, 26, 27, 28],
         ];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 24,
+            ..Default::default()
+        };
 
         // Serial slot-aware references (AC4-correct bar; one model per prompt).
         let serial_refs: Vec<GenerationResult> = prompts
@@ -21948,7 +22453,11 @@ assistant:
             kv_persist_dir: None,
         };
         let prompt = vec![1u32, 2, 3];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 24,
+            ..Default::default()
+        };
         let r_full = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
         let r_split = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 8, SlotId(0));
         eprintln!("[CAPPIN] n_seqs=1 text={:?}", r_full.text);
@@ -21981,7 +22490,11 @@ assistant:
             kv_persist_dir: None,
         };
         let prompt = vec![1u32, 2, 3];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 24,
+            ..Default::default()
+        };
         let serial = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
         let loaded = LoadedModel::load(&load_opts).expect("load qwen35 n1");
         let engine =
@@ -22040,7 +22553,11 @@ assistant:
         // the supported multi-slot configuration this gate proves.
         std::env::set_var("HF2Q_TQ_KV", "0");
         let gguf_path = PathBuf::from(gguf);
-        assert!(gguf_path.exists(), "qwen35 GGUF missing: {}", gguf_path.display());
+        assert!(
+            gguf_path.exists(),
+            "qwen35 GGUF missing: {}",
+            gguf_path.display()
+        );
         let load_opts = LoadOptions {
             model_path: gguf_path,
             tokenizer_path: None,
@@ -22060,7 +22577,11 @@ assistant:
             vec![21, 22, 23],
             vec![24, 25, 26, 27, 28],
         ];
-        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 24,
+            ..Default::default()
+        };
 
         // Slot-equivalence pin: same prompt, serial, SlotId(0) vs SlotId(7)
         // on an n_seqs=8 provisioning — pins per-slot KV region indexing.
@@ -22121,7 +22642,8 @@ assistant:
                 &format!("ADR-040 M-QWEN — qwen35 SlotAware N=8 slot {i} vs its serial ref"),
             );
         }
-        rt.block_on(engine_slot.shutdown()).expect("shutdown qwen35 slot");
+        rt.block_on(engine_slot.shutdown())
+            .expect("shutdown qwen35 slot");
     }
 
     /// ADR-040 §0.19 — HIGH-RATE long-prompt determinism REPRO. Runs the
@@ -22252,7 +22774,10 @@ assistant:
             std::env::var("HF2Q_HYBRID_NWG").unwrap_or_else(|_| "default".into())
         );
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
-        assert_eq!(flakes, 0, "§0.19 non-determinism: {flakes}/{total} mismatches");
+        assert_eq!(
+            flakes, 0,
+            "§0.19 non-determinism: {flakes}/{total} mismatches"
+        );
     }
 
     /// ADR-040 iter-G(a) — cross-slot batched-prefill FORWARD isolation gate.
@@ -22304,7 +22829,11 @@ assistant:
             // 64-token prompts → each seq starts at a 64-multiple offset =
             // D512 chunk(C=64)-aligned, so post-blk-fix F16 FA isolates byte-exact.
             (0..8u32)
-                .map(|i| (0..64u32).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect())
+                .map(|i| {
+                    (0..64u32)
+                        .map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000))
+                        .collect()
+                })
                 .collect()
         } else {
             vec![(0..70u32).map(|j| 1 + (j.wrapping_mul(7) % 4000)).collect()]
@@ -22329,11 +22858,13 @@ assistant:
             }
         }
         // Vacuous-test guard: the refs must not all collapse to one token.
-        if n > 1 { assert!(
-            ref_tokens.iter().any(|&t| t != ref_tokens[0]),
-            "vacuous: all single-seq first tokens identical ({:?})",
-            ref_tokens
-        ); }
+        if n > 1 {
+            assert!(
+                ref_tokens.iter().any(|&t| t != ref_tokens[0]),
+                "vacuous: all single-seq first tokens identical ({:?})",
+                ref_tokens
+            );
+        }
 
         // Multi-seq cross-slot prefill — all N prompts in ONE forward.
         let mut loaded = LoadedModel::load(&load_opts).expect("load multi-seq model");
@@ -22361,10 +22892,14 @@ assistant:
         let mut mismatches = 0usize;
         for i in 0..n {
             let ok = ms_tokens[i] == ref_tokens[i];
-            if !ok { mismatches += 1; }
+            if !ok {
+                mismatches += 1;
+            }
             eprintln!(
                 "[iter-G(a) seq {i}] cross-slot={} single-seq={} {}",
-                ms_tokens[i], ref_tokens[i], if ok { "OK" } else { "MISMATCH" },
+                ms_tokens[i],
+                ref_tokens[i],
+                if ok { "OK" } else { "MISMATCH" },
             );
         }
         assert_eq!(
@@ -22405,23 +22940,34 @@ assistant:
         };
         let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
         let mk = |i: u32, l: u32| -> Vec<u32> {
-            (0..l).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect()
+            (0..l)
+                .map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000))
+                .collect()
         };
         let prompts: Vec<Vec<u32>> = (0..8u32).map(|i| mk(i, lens[i as usize])).collect();
         let n = prompts.len();
         let max_decode = 24usize;
-        let k_runs: usize = std::env::var("HF2Q_ITERGA_KRUNS").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(20);
+        let k_runs: usize = std::env::var("HF2Q_ITERGA_KRUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
 
         let mut loaded = LoadedModel::load(&load_opts).expect("load");
-        let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
-        g.provision_multi_seq_kv_for_slot_aware(n as u32).expect("provision multi-seq KV");
+        let LoadedModel::Gemma(g) = &mut loaded else {
+            panic!("expected Gemma GGUF")
+        };
+        g.provision_multi_seq_kv_for_slot_aware(n as u32)
+            .expect("provision multi-seq KV");
 
         let run_batch = |g: &mut GemmaLoadedModel, batch: &[Vec<u32>]| -> Vec<u32> {
-            let seqs: Vec<(Vec<u32>, SlotId)> = batch.iter().enumerate()
-                .map(|(i, p)| (p.clone(), SlotId(i as u32))).collect();
+            let seqs: Vec<(Vec<u32>, SlotId)> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.clone(), SlotId(i as u32)))
+                .collect();
             let scaffold = g.multi_seq_kv_hybrid.take().expect("hybrid scaffold");
-            let toks = g.weights
+            let toks = g
+                .weights
                 .forward_prefill_batched_multi_seq(&seqs, &scaffold, max_decode, &mut g.ctx)
                 .expect("multi-seq prefill");
             g.multi_seq_kv_hybrid = Some(scaffold);
@@ -22430,7 +22976,9 @@ assistant:
 
         // 1. DETERMINISM — k_runs repeated identical batches.
         let mut runs: Vec<Vec<u32>> = Vec::with_capacity(k_runs);
-        for _ in 0..k_runs { runs.push(run_batch(g, &prompts)); }
+        for _ in 0..k_runs {
+            runs.push(run_batch(g, &prompts));
+        }
         for k in 1..k_runs {
             assert_eq!(
                 runs[k], runs[0],
@@ -22438,7 +22986,10 @@ assistant:
                 runs[0], runs[k]
             );
         }
-        eprintln!("[iter-G(a) BF16] DETERMINISM {k_runs}/{k_runs} byte-identical: {:?}", runs[0]);
+        eprintln!(
+            "[iter-G(a) BF16] DETERMINISM {k_runs}/{k_runs} byte-identical: {:?}",
+            runs[0]
+        );
 
         // 2. NO CONTENT LEAKAGE (the correct isolation bar — NOT byte-identity
         //    to the single-seq path, which is the accepted-benign batched-vs-
@@ -22471,7 +23022,11 @@ assistant:
         //    NOT an assertion: batched != serial by a benign near-tie margin.
         let mut refs: Vec<u32> = Vec::with_capacity(n);
         for p in &prompts {
-            refs.push(g.weights.forward_prefill_batched(p, max_decode, 0, &mut g.ctx).expect("ref"));
+            refs.push(
+                g.weights
+                    .forward_prefill_batched(p, max_decode, 0, &mut g.ctx)
+                    .expect("ref"),
+            );
         }
         let benign = (0..n).filter(|&i| runs[0][i] != refs[i]).count();
         eprintln!(
@@ -22493,17 +23048,28 @@ assistant:
             return;
         }
         let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
-            .map(PathBuf::from).expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
         assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
         let load_opts = LoadOptions {
-            model_path: gguf_path, tokenizer_path: None, config_path: None,
-            dwq_overlay_path: None, kv_persist_dir: None,
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
         };
         let prompts: Vec<Vec<u32>> = (0..8u32)
-            .map(|i| (0..(20 + i * 3)).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect())
+            .map(|i| {
+                (0..(20 + i * 3))
+                    .map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000))
+                    .collect()
+            })
             .collect();
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(8).enable_all().build().expect("rt");
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("rt");
 
         // multi-seq forces BF16 regardless; set it so single-seq peers match.
         std::env::set_var("HF2Q_FA_F16", "0");
@@ -22511,23 +23077,35 @@ assistant:
         // ── E2E: batched admit ON, 8 concurrent greedy generates ──────────
         std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "1");
         ITER_GA_BATCHED_ADMIT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 24,
+            ..Default::default()
+        };
         let loaded = LoadedModel::load(&load_opts).expect("load e2e");
-        let engine = Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
-            .expect("spawn SlotAware");
+        let engine =
+            Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn SlotAware");
         let results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
             for p in prompts.iter().cloned() {
                 let eng = engine.clone();
                 let pr = params.clone();
-                handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("generate") }));
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("generate")
+                }));
             }
             let mut out = Vec::new();
-            for h in handles { out.push(h.await.expect("join")); }
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
             out
         });
         for (i, r) in results.iter().enumerate() {
-            assert!(!r.text.is_empty(), "iter-G(a) E2E: seq {i} produced empty output");
+            assert!(
+                !r.text.is_empty(),
+                "iter-G(a) E2E: seq {i} produced empty output"
+            );
             assert!(r.completion_tokens > 0, "iter-G(a) E2E: seq {i} no tokens");
         }
         let batched = ITER_GA_BATCHED_ADMIT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
@@ -22536,25 +23114,41 @@ assistant:
         rt.block_on(engine.shutdown()).expect("shutdown e2e");
 
         // ── TTFT A/B: 8 concurrent max_tokens=1, batched ON vs OFF ────────
-        let ttft_params = SamplingParams { temperature: 0.0, max_tokens: 1, ..Default::default() };
+        let ttft_params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 1,
+            ..Default::default()
+        };
         let measure = |on: bool| -> f64 {
-            if on { std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "1"); }
-            else { std::env::remove_var("HF2Q_CROSS_SLOT_ADMIT"); }
+            if on {
+                std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "1");
+            } else {
+                std::env::remove_var("HF2Q_CROSS_SLOT_ADMIT");
+            }
             let loaded = LoadedModel::load(&load_opts).expect("load ttft");
-            let engine = Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
-                .expect("spawn ttft");
+            let engine =
+                Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
+                    .expect("spawn ttft");
             // warm-up (pipeline bake) — not timed.
-            let _ = rt.block_on(engine.clone().generate(prompts[0].clone(), ttft_params.clone()));
+            let _ = rt.block_on(
+                engine
+                    .clone()
+                    .generate(prompts[0].clone(), ttft_params.clone()),
+            );
             let t0 = std::time::Instant::now();
             let _: Vec<GenerationResult> = rt.block_on(async {
                 let mut handles = Vec::new();
                 for p in prompts.iter().cloned() {
                     let eng = engine.clone();
                     let pr = ttft_params.clone();
-                    handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("gen") }));
+                    handles.push(tokio::spawn(async move {
+                        eng.generate(p, pr).await.expect("gen")
+                    }));
                 }
                 let mut out = Vec::new();
-                for h in handles { out.push(h.await.expect("join")); }
+                for h in handles {
+                    out.push(h.await.expect("join"));
+                }
                 out
             });
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
@@ -22593,20 +23187,35 @@ assistant:
         };
         // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
         // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
-        let alen: usize = std::env::var("HF2Q_BISECT_ALEN").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-        let blen: usize = std::env::var("HF2Q_BISECT_BLEN").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let alen: usize = std::env::var("HF2Q_BISECT_ALEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let blen: usize = std::env::var("HF2Q_BISECT_BLEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
         // HF2Q_BISECT_ASEED varies A's CONTENT at fixed length — the decisive
         // leakage-vs-benign-FP discriminator: if B's token is invariant to A's
         // content (B depends only on A's presence/length), there is NO leakage.
-        let aseed: u32 = std::env::var("HF2Q_BISECT_ASEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let prompt_a: Vec<u32> = (0..alen as u32).map(|j| 100 + j + aseed.wrapping_mul(311) % 30000).collect();
-        let prompt_b: Vec<u32> = (0..blen as u32).map(|j| 1 + j.wrapping_mul(7) % 4000).collect();
+        let aseed: u32 = std::env::var("HF2Q_BISECT_ASEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let prompt_a: Vec<u32> = (0..alen as u32)
+            .map(|j| 100 + j + aseed.wrapping_mul(311) % 30000)
+            .collect();
+        let prompt_b: Vec<u32> = (0..blen as u32)
+            .map(|j| 1 + j.wrapping_mul(7) % 4000)
+            .collect();
         let max_decode = 24usize;
 
         eprintln!("[BISECT] ===SINGLEA=== single-seq forward of prompt A (offset 0, len {alen})");
         let single_a_tok = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load singleA");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma")
+            };
             g.weights
                 .forward_prefill_batched(&prompt_a, max_decode, 0, &mut g.ctx)
                 .expect("singleA forward")
@@ -22616,7 +23225,9 @@ assistant:
         eprintln!("[BISECT] ===SINGLEB=== single-seq forward of prompt B (offset 0, len {blen})");
         let single_tok = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load single");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma")
+            };
             g.weights
                 .forward_prefill_batched(&prompt_b, max_decode, 0, &mut g.ctx)
                 .expect("single forward")
@@ -22626,8 +23237,11 @@ assistant:
         eprintln!("[BISECT] === multi-seq forward of [A(len {alen}), B(len {blen})] — B at offset {alen} ===");
         let multi_toks = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load multi");
-            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
-            g.provision_multi_seq_kv_for_slot_aware(2).expect("provision");
+            let LoadedModel::Gemma(g) = &mut loaded else {
+                panic!("expected Gemma")
+            };
+            g.provision_multi_seq_kv_for_slot_aware(2)
+                .expect("provision");
             let scaffold = g.multi_seq_kv_hybrid.take().expect("scaffold");
             let seqs: Vec<(Vec<u32>, SlotId)> =
                 vec![(prompt_a.clone(), SlotId(0)), (prompt_b.clone(), SlotId(1))];
@@ -22641,8 +23255,16 @@ assistant:
         eprintln!(
             "[BISECT] multi tokens={multi_toks:?}; singleA={single_a_tok} seq0(A) {}; \
              singleB={single_tok} seq1(B) {}",
-            if multi_toks.first() == Some(&single_a_tok) { "==" } else { "!=" },
-            if multi_toks.get(1) == Some(&single_tok) { "==" } else { "!=" },
+            if multi_toks.first() == Some(&single_a_tok) {
+                "=="
+            } else {
+                "!="
+            },
+            if multi_toks.get(1) == Some(&single_tok) {
+                "=="
+            } else {
+                "!="
+            },
         );
     }
 
@@ -22670,23 +23292,26 @@ assistant:
         for len in [0usize, 1, 2, 7, 256, 1024, 262144] {
             let mut row = Vec::with_capacity(len);
             for _ in 0..len {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 row.push(((s >> 33) as f32) / (u32::MAX as f32) - 0.5);
             }
             cases.push(row);
         }
         // Tie cases: first-max must win.
         cases.push(vec![1.0, 2.0, 2.0, 2.0, 1.0]); // max 2.0 first at idx 1
-        cases.push(vec![5.0, 5.0, 5.0]);           // all equal -> idx 0
-        cases.push(vec![f32::NEG_INFINITY; 4]);    // all -inf -> (0, -inf)
+        cases.push(vec![5.0, 5.0, 5.0]); // all equal -> idx 0
+        cases.push(vec![f32::NEG_INFINITY; 4]); // all -inf -> (0, -inf)
         cases.push(vec![-1.0, f32::NAN, -2.0, -0.5]); // NaN skipped -> idx 3 (-0.5)
-        cases.push(vec![f32::NAN, f32::NAN]);      // all NaN -> (0, -inf)
-        cases.push(vec![0.0, -0.0, 0.0]);          // +0/-0: 0.0 not > 0.0 -> idx 0
+        cases.push(vec![f32::NAN, f32::NAN]); // all NaN -> (0, -inf)
+        cases.push(vec![0.0, -0.0, 0.0]); // +0/-0: 0.0 not > 0.0 -> idx 0
         for (ci, c) in cases.iter().enumerate() {
             let r = scalar_ref(c);
             let g = argmax_f32_first_max(c);
             assert_eq!(
-                r, g,
+                r,
+                g,
                 "argmax mismatch case {ci} (len {}): scalar {r:?} vs fast {g:?}",
                 c.len()
             );
@@ -22718,7 +23343,9 @@ assistant:
         };
         // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
         let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
         // HF2Q_BENCH_N = number of concurrent streams (default 4, max 8) — lets
         // us measure single-stream (N=1) vs batched scaling. For N>4 set
         // HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS=N to clear the A4 threshold gate.
@@ -22727,21 +23354,35 @@ assistant:
             .and_then(|v| v.parse().ok())
             .unwrap_or(4)
             .clamp(1, 8);
-        let base = [vec![1u32, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14],
-                    vec![15, 16, 17], vec![18, 19, 20, 21], vec![22, 23], vec![24, 25, 26, 27, 28]];
+        let base = [
+            vec![1u32, 2, 3],
+            vec![4, 5, 6, 7],
+            vec![8, 9],
+            vec![10, 11, 12, 13, 14],
+            vec![15, 16, 17],
+            vec![18, 19, 20, 21],
+            vec![22, 23],
+            vec![24, 25, 26, 27, 28],
+        ];
         // HF2Q_BENCH_PROMPT_LEN: pad each stream's prompt to N tokens (long-context
         // throughput at realistic 8k/32k-per-slot). Distinct per-stream token band
         // (well within gemma's 262k vocab) so prompts stay non-degenerate.
         let bench_prompt_len: usize = std::env::var("HF2Q_BENCH_PROMPT_LEN")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let prompts: Vec<Vec<u32>> = (0..n_streams).map(|i| {
-            if bench_prompt_len > 0 {
-                let band = 1000u32 + (i as u32) * 30000u32;
-                (0..bench_prompt_len).map(|t| band + (t as u32 % 25000)).collect()
-            } else {
-                base[i].clone()
-            }
-        }).collect();
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let prompts: Vec<Vec<u32>> = (0..n_streams)
+            .map(|i| {
+                if bench_prompt_len > 0 {
+                    let band = 1000u32 + (i as u32) * 30000u32;
+                    (0..bench_prompt_len)
+                        .map(|t| band + (t as u32 % 25000))
+                        .collect()
+                } else {
+                    base[i].clone()
+                }
+            })
+            .collect();
         let params = SamplingParams {
             temperature: 0.0,
             max_tokens: bench_tokens,
@@ -22750,8 +23391,12 @@ assistant:
         let batched_on = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1");
         let loaded = LoadedModel::load(&load_opts).expect("load");
         let engine = Engine::spawn_with_mode(
-            loaded, 16, None,
-            EngineMode::SlotAware { max_slots: n_streams as u32 },
+            loaded,
+            16,
+            None,
+            EngineMode::SlotAware {
+                max_slots: n_streams as u32,
+            },
         )
         .expect("spawn SlotAware");
         // ADR-040 iter-I contention probe: vary the probe's tokio worker count
@@ -22759,7 +23404,10 @@ assistant:
         // worker-loop time is core-contention between the model worker thread and
         // the async runtime.
         let tokio_threads: usize = std::env::var("HF2Q_BENCH_TOKIO_THREADS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+            .max(1);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(tokio_threads)
             .enable_all()
@@ -22768,7 +23416,11 @@ assistant:
         // Warm-up generate (model load / pipeline bake) — not timed.
         let _ = rt.block_on(engine.clone().generate(
             prompts[0].clone(),
-            SamplingParams { temperature: 0.0, max_tokens: 8, ..Default::default() },
+            SamplingParams {
+                temperature: 0.0,
+                max_tokens: 8,
+                ..Default::default()
+            },
         ));
         // ADR-040 §7.S019 determinism-ladder instrument (documented protocol).
         // HF2Q_BENCH_REPEAT=R → run R back-to-back single-process rounds,
@@ -22784,7 +23436,9 @@ assistant:
         if let Ok(rv) = std::env::var("HF2Q_BENCH_REPEAT") {
             let repeat: usize = rv.parse().unwrap_or(1);
             let settle_ms: u64 = std::env::var("HF2Q_BENCH_SETTLE_MS")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let concurrent = std::env::var("HF2Q_BENCH_CONC").as_deref() == Ok("1");
             let fnv1a64 = |text: &str| -> u64 {
                 let mut h: u64 = 0xcbf29ce484222325;
@@ -22819,7 +23473,8 @@ assistant:
                     }
                 } else {
                     for (si, p) in prompts.iter().cloned().enumerate() {
-                        let r = rt.block_on(engine.clone().generate(p, params.clone()))
+                        let r = rt
+                            .block_on(engine.clone().generate(p, params.clone()))
                             .expect("generate");
                         eprintln!(
                             "[REPEAT_FPRINT] run={run} stream={si} conc=0 comp_tokens={} text_bytes={} fnv1a64={:016x} text={:?}",
@@ -22878,7 +23533,9 @@ assistant:
                 }
                 eprintln!(
                     "[FPRINT] stream={i} comp_tokens={} text_bytes={} fnv1a64={:016x}",
-                    r.completion_tokens, r.text.len(), h,
+                    r.completion_tokens,
+                    r.text.len(),
+                    h,
                 );
             }
         }
@@ -22916,7 +23573,10 @@ assistant:
                 "[CATSPLIT] N={n_streams} per-category GPU-busy + DISPATCH COUNT, ranked by dispatches/step, over {} emitted tokens; total {:.1} disp/step:",
                 total_tokens, sum_disp as f64 / cs_steps as f64,
             );
-            eprintln!("[CATSPLIT]   {:<40} {:>10} {:>8} {:>10} {:>10}", "category", "ms/token", "% step", "disp/step", "cbs/token");
+            eprintln!(
+                "[CATSPLIT]   {:<40} {:>10} {:>8} {:>10} {:>10}",
+                "category", "ms/token", "% step", "disp/step", "cbs/token"
+            );
             for (name, ns, cbs, disp) in &rows {
                 eprintln!(
                     "[CATSPLIT]   {:<40} {:>10.4} {:>7.1}% {:>10.1} {:>10.1}",
@@ -22988,12 +23648,17 @@ assistant:
                     let tag = if i >= leaf { " [ref]" } else { "" };
                     eprintln!(
                         "[HOST_PHASES]   {:<32} {:6.3} ms/step ({:4.1}%){}",
-                        name, *ns as f64 / 1e6 / steps as f64,
-                        100.0 * *ns as f64 / total.max(1) as f64, tag,
+                        name,
+                        *ns as f64 / 1e6 / steps as f64,
+                        100.0 * *ns as f64 / total.max(1) as f64,
+                        tag,
                     );
                 }
-                eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (sum of leaf phases)",
-                    "TOTAL", total as f64 / 1e6 / steps as f64);
+                eprintln!(
+                    "[HOST_PHASES]   {:<32} {:6.3} ms/step (sum of leaf phases)",
+                    "TOTAL",
+                    total as f64 / 1e6 / steps as f64
+                );
                 // §25: how much of the serial encode is barrier conflict-tracking.
                 let bns = mlx_native::barrier_ns();
                 if bns > 0 {
@@ -23045,7 +23710,11 @@ assistant:
         let serial_refs: Vec<GenerationResult> = budgets
             .iter()
             .map(|&mt| {
-                let pr = SamplingParams { temperature: 0.0, max_tokens: mt, ..Default::default() };
+                let pr = SamplingParams {
+                    temperature: 0.0,
+                    max_tokens: mt,
+                    ..Default::default()
+                };
                 gemma4_serial_slot_aware_ref(&load_opts, &prompt, &pr)
             })
             .collect();
@@ -23064,16 +23733,28 @@ assistant:
             for &mt in budgets.iter() {
                 let eng = engine_slot.clone();
                 let p = prompt.clone();
-                let pr = SamplingParams { temperature: 0.0, max_tokens: mt, ..Default::default() };
-                handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("slot") }));
+                let pr = SamplingParams {
+                    temperature: 0.0,
+                    max_tokens: mt,
+                    ..Default::default()
+                };
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("slot")
+                }));
             }
             // A 5th request that should reuse the slot freed by the
             // max_tokens=5 completion.
             {
                 let eng = engine_slot.clone();
                 let p = prompt.clone();
-                let pr = SamplingParams { temperature: 0.0, max_tokens: 10, ..Default::default() };
-                handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("slot5") }));
+                let pr = SamplingParams {
+                    temperature: 0.0,
+                    max_tokens: 10,
+                    ..Default::default()
+                };
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("slot5")
+                }));
             }
             let mut out = Vec::new();
             for h in handles {
@@ -23124,7 +23805,9 @@ assistant:
 
         // LEGACY prefill logits.
         let mut legacy = LoadedModel::load(&load_opts).expect("load legacy");
-        let LoadedModel::Gemma(lg) = &mut legacy else { panic!("expected Gemma") };
+        let LoadedModel::Gemma(lg) = &mut legacy else {
+            panic!("expected Gemma")
+        };
         let _legacy_tok = lg
             .weights
             .forward_prefill(&prompt, max_decode, &mut lg.ctx)
@@ -23133,8 +23816,11 @@ assistant:
 
         // SLOT-AWARE prefill logits (production-default hybrid regime).
         let mut slot = LoadedModel::load(&load_opts).expect("load slot");
-        let LoadedModel::Gemma(sg) = &mut slot else { panic!("expected Gemma") };
-        sg.provision_multi_seq_kv_for_slot_aware(1).expect("provision n_seqs=1");
+        let LoadedModel::Gemma(sg) = &mut slot else {
+            panic!("expected Gemma")
+        };
+        sg.provision_multi_seq_kv_for_slot_aware(1)
+            .expect("provision n_seqs=1");
         let mut kv = sg.multi_seq_kv.take().expect("multi_seq_kv");
         let mut hybrid = sg.multi_seq_kv_hybrid.take();
         let mut dense = sg.multi_seq_kv_dense.take();
@@ -23204,10 +23890,20 @@ assistant:
             slot_arg,
             flipped,
             legacy_gap,
-            if legacy_gap > 0.0 { max_abs / legacy_gap } else { f32::INFINITY },
+            if legacy_gap > 0.0 {
+                max_abs / legacy_gap
+            } else {
+                f32::INFINITY
+            },
         );
-        assert!(legacy_logits.iter().all(|x| x.is_finite()), "legacy logits non-finite");
-        assert!(slot_logits.iter().all(|x| x.is_finite()), "slot logits non-finite");
+        assert!(
+            legacy_logits.iter().all(|x| x.is_finite()),
+            "legacy logits non-finite"
+        );
+        assert!(
+            slot_logits.iter().all(|x| x.is_finite()),
+            "slot logits non-finite"
+        );
 
         // ── DECODE-STEP comparison ───────────────────────────────────────
         // The prefill logits matched exactly above ⇒ any divergence emerges
@@ -23218,44 +23914,74 @@ assistant:
         // position: max abs logit diff, whether argmax agrees, and the
         // legacy top1-top2 gap (to judge near-tie).
         let mut legacy_re = LoadedModel::load(&load_opts).expect("reload legacy");
-        let LoadedModel::Gemma(lg2) = &mut legacy_re else { panic!("expected Gemma") };
+        let LoadedModel::Gemma(lg2) = &mut legacy_re else {
+            panic!("expected Gemma")
+        };
         let mut slot_re = LoadedModel::load(&load_opts).expect("reload slot");
-        let LoadedModel::Gemma(sg2) = &mut slot_re else { panic!("expected Gemma") };
-        sg2.provision_multi_seq_kv_for_slot_aware(1).expect("provision n_seqs=1");
+        let LoadedModel::Gemma(sg2) = &mut slot_re else {
+            panic!("expected Gemma")
+        };
+        sg2.provision_multi_seq_kv_for_slot_aware(1)
+            .expect("provision n_seqs=1");
         let mut kv2 = sg2.multi_seq_kv.take().expect("kv2");
         let mut hyb2 = sg2.multi_seq_kv_hybrid.take();
         let mut den2 = sg2.multi_seq_kv_dense.take();
         let mut mlx2 = sg2.multi_seq_kv_mlx.take();
         let n_decode = 12usize;
-        let l_first = lg2.weights.forward_prefill(&prompt, n_decode, &mut lg2.ctx).expect("lp");
+        let l_first = lg2
+            .weights
+            .forward_prefill(&prompt, n_decode, &mut lg2.ctx)
+            .expect("lp");
         let s_first = sg2
             .weights
             .forward_prefill_with_soft_tokens_slot_aware(
-                &prompt, &[], n_decode, &mut sg2.ctx, SlotId(0),
-                &mut kv2, hyb2.as_mut(), den2.as_mut(), mlx2.as_mut(),
+                &prompt,
+                &[],
+                n_decode,
+                &mut sg2.ctx,
+                SlotId(0),
+                &mut kv2,
+                hyb2.as_mut(),
+                den2.as_mut(),
+                mlx2.as_mut(),
             )
             .expect("sp");
-        assert_eq!(l_first, s_first, "first token already differs (contradicts prefill match)");
+        assert_eq!(
+            l_first, s_first,
+            "first token already differs (contradicts prefill match)"
+        );
         let mut feed = l_first;
         let mut first_argmax_flip: Option<usize> = None;
         for step in 1..n_decode {
             let pos = prompt.len() + step - 1;
             let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
-            let l_tok = lg2.weights.forward_decode(feed, pos, &mut lg2.ctx, &mut p).expect("ld");
+            let l_tok = lg2
+                .weights
+                .forward_decode(feed, pos, &mut lg2.ctx, &mut p)
+                .expect("ld");
             let l_log: Vec<f32> = lg2.weights.logits_view().expect("ll").to_vec();
             let mut p2: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
             let s_tok = sg2
                 .weights
                 .forward_decode_slot_aware(
-                    feed, pos, &mut sg2.ctx, &mut p2, SlotId(0),
-                    &mut kv2, hyb2.as_mut(), den2.as_mut(), mlx2.as_mut(),
+                    feed,
+                    pos,
+                    &mut sg2.ctx,
+                    &mut p2,
+                    SlotId(0),
+                    &mut kv2,
+                    hyb2.as_mut(),
+                    den2.as_mut(),
+                    mlx2.as_mut(),
                 )
                 .expect("sd");
             let s_log: Vec<f32> = sg2.weights.logits_view().expect("sl").to_vec();
             let mut mx = 0.0f32;
             for (a, b) in l_log.iter().zip(s_log.iter()) {
                 let d = (a - b).abs();
-                if d > mx { mx = d; }
+                if d > mx {
+                    mx = d;
+                }
             }
             let mut t2 = l_log.clone();
             t2.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -23302,9 +24028,15 @@ assistant:
         // full fn) differs from the slot-aware full fn, the divergence is in
         // the GENERATE-LOOP WRAPPER (greedy fast-path token capture, prompt-
         // cache, sampling, first-token handling), NOT the forward.
-        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
         let mut legacy_gen = LoadedModel::load(&load_opts).expect("load legacy gen");
-        let LoadedModel::Gemma(lg3) = &mut legacy_gen else { panic!("expected Gemma") };
+        let LoadedModel::Gemma(lg3) = &mut legacy_gen else {
+            panic!("expected Gemma")
+        };
         let r_legacy = generate_once(lg3, &prompt, &params, None).expect("generate_once");
         let r_slot_ref = gemma4_serial_slot_aware_ref(&load_opts, &prompt, &params);
         eprintln!(
@@ -23380,9 +24112,8 @@ assistant:
     // ---------------------------------------------------------------------------
     #[test]
     fn engine_serial_fifo_two_sequential_requests_no_state_leak() {
-        if byte_equiv_skip_unless_gated(
-            "engine_serial_fifo_two_sequential_requests_no_state_leak",
-        ) {
+        if byte_equiv_skip_unless_gated("engine_serial_fifo_two_sequential_requests_no_state_leak")
+        {
             return;
         }
 
@@ -23596,12 +24327,14 @@ assistant:
         let stats_a = engine_a.scheduler_stats();
         let stats_b = engine_b.scheduler_stats();
         assert_eq!(
-            stats_a.policy, SchedulerPolicy::FifoSerial,
+            stats_a.policy,
+            SchedulerPolicy::FifoSerial,
             "ADR-040 C2b H2 M3: engine_a scheduler_stats policy must report \
              FifoSerial (3-arg spawn defaults to SerialFifo)."
         );
         assert_eq!(
-            stats_b.policy, SchedulerPolicy::FifoSerial,
+            stats_b.policy,
+            SchedulerPolicy::FifoSerial,
             "ADR-040 C2b H2 M3: engine_b scheduler_stats policy must report \
              FifoSerial under explicit SerialFifo mode."
         );
@@ -23688,7 +24421,8 @@ assistant:
         let stats_b = engine_b.scheduler_stats();
 
         assert_eq!(
-            stats_a.policy, SchedulerPolicy::FifoSerial,
+            stats_a.policy,
+            SchedulerPolicy::FifoSerial,
             "cfa-iter-C2.5 M2 C: synthetic engine_a scheduler_stats policy \
              must be FifoSerial (matches `make_synthetic_engine_for_test` \
              default mode at engine.rs:892)."
@@ -23753,12 +24487,14 @@ assistant:
         // max_slots is the SchedulerPolicy::FifoSerial cap (always 1
         // per engine.rs:847 / 895), independent of queue_capacity.
         assert_eq!(
-            engine_a.max_slots(), 1,
+            engine_a.max_slots(),
+            1,
             "cfa-iter-C2.5 M2 C: synthetic engine_a.max_slots() must be 1 \
              under FifoSerial."
         );
         assert_eq!(
-            engine_b.max_slots(), 1,
+            engine_b.max_slots(),
+            1,
             "cfa-iter-C2.5 M2 C: synthetic engine_b.max_slots() must be 1."
         );
     }
@@ -23775,8 +24511,8 @@ assistant:
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod streaming_prompt_cache_replay_tests {
-    use super::*;
     use super::super::sse::{DeltaKind, GenerationEvent};
+    use super::*;
 
     /// Build a `GenerationResult` that looks like a non-streaming-origin
     /// cache entry (post-reasoning-split text + explicit reasoning_text).
@@ -23827,7 +24563,10 @@ mod streaming_prompt_cache_replay_tests {
         // Expected: 1 Delta(Content) + 1 Done.
         assert_eq!(events.len(), 2, "got events: {events:?}");
         match &events[0] {
-            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text,
+            } => {
                 assert_eq!(text, "Hello, world!");
             }
             other => panic!("expected Delta(Content); got {other:?}"),
@@ -23871,13 +24610,19 @@ mod streaming_prompt_cache_replay_tests {
         // Expected: Reasoning, Content, Done.
         assert_eq!(events.len(), 3, "got events: {events:?}");
         match &events[0] {
-            GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+            GenerationEvent::Delta {
+                kind: DeltaKind::Reasoning,
+                text,
+            } => {
                 assert_eq!(text, "let me think...");
             }
             other => panic!("expected Delta(Reasoning); got {other:?}"),
         }
         match &events[1] {
-            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text,
+            } => {
                 assert_eq!(text, "the answer");
             }
             other => panic!("expected Delta(Content); got {other:?}"),
@@ -23919,9 +24664,8 @@ mod streaming_prompt_cache_replay_tests {
         // on whether parse succeeds.  Both Some(parsed) → ToolCallDelta×2
         // and None (under Auto) → Content fallback are valid replay
         // shapes per `emit_streaming_tool_call_close`'s policy matrix.
-        let cached_text = format!(
-            "preamble {open}{{\"name\":\"foo\",\"arguments\":{{}}}}{close} postscript"
-        );
+        let cached_text =
+            format!("preamble {open}{{\"name\":\"foo\",\"arguments\":{{}}}}{close} postscript");
         let cached = GenerationResult {
             text: cached_text,
             reasoning_text: None,
@@ -23953,12 +24697,19 @@ mod streaming_prompt_cache_replay_tests {
             )),
             "preamble must be emitted as Content delta; got {events:?}"
         );
-        let done_idx = events.iter().position(|e| matches!(e, GenerationEvent::Done { .. }))
+        let done_idx = events
+            .iter()
+            .position(|e| matches!(e, GenerationEvent::Done { .. }))
             .expect("Done event missing");
         assert_eq!(done_idx, events.len() - 1, "Done must be last event");
 
         // Extract the Done and assert cached_tokens surfaces.
-        if let GenerationEvent::Done { stats, finish_reason, .. } = &events[done_idx] {
+        if let GenerationEvent::Done {
+            stats,
+            finish_reason,
+            ..
+        } = &events[done_idx]
+        {
             assert_eq!(stats.cached_prompt_tokens, Some(4));
             // finish_reason: if the splitter drove ToolCallOpen+Close to
             // completion AND parser succeeded, we expect "tool_calls"; if
@@ -24027,7 +24778,7 @@ mod streaming_prompt_cache_replay_tests {
     #[test]
     fn replay_returns_err_when_receiver_dropped() {
         let (tx, rx) = mpsc::channel(1); // tiny buffer
-        // Drop receiver so all sends fail.
+                                         // Drop receiver so all sends fail.
         drop(rx);
 
         let cached = cached_non_streaming("anything", None);
@@ -24114,7 +24865,10 @@ mod streaming_prompt_cache_replay_tests {
         let content_text: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.as_str()),
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -24168,9 +24922,7 @@ mod streaming_prompt_cache_replay_tests {
         // 5-byte postscript "after" sits entirely in the splitter's
         // tail_buf after feed() returns and is only recoverable via
         // finish()).
-        let cached_text = format!(
-            "{open}call:foo{{x:1}}{close}after"
-        );
+        let cached_text = format!("{open}call:foo{{x:1}}{close}after");
         let cached = GenerationResult {
             text: cached_text,
             reasoning_text: None,
@@ -24201,7 +24953,10 @@ mod streaming_prompt_cache_replay_tests {
         let content_concat: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -24276,8 +25031,7 @@ mod streaming_prompt_cache_replay_tests {
             })
             .expect("Done event must be present");
         assert_eq!(
-            done_finish_reason,
-            "tool_calls",
+            done_finish_reason, "tool_calls",
             "Wave 3.6 W-4: finish_reason MUST be 'tool_calls' (not '{}') when \
              a tool call was extracted from the cached text during replay. \
              The replay overrides cached.finish_reason (='stop') with \
@@ -24388,13 +25142,19 @@ mod streaming_prompt_cache_replay_tests {
         let mut first_content_idx: Option<usize> = None;
         for (i, ev) in events.iter().enumerate() {
             match ev {
-                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Reasoning,
+                    text,
+                } => {
                     if first_reasoning_idx.is_none() {
                         first_reasoning_idx = Some(i);
                     }
                     reasoning_concat.push_str(text);
                 }
-                GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => {
                     if first_content_idx.is_none() {
                         first_content_idx = Some(i);
                     }
@@ -24484,16 +25244,20 @@ mod streaming_prompt_cache_replay_tests {
         let reasoning_concat: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
-                    Some(text.clone())
-                }
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Reasoning,
+                    text,
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
         let content_concat: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -24572,18 +25336,27 @@ mod streaming_prompt_cache_replay_tests {
         let events = drain(&mut rx);
 
         // Find the index of the FIRST event of each kind.
-        let first_reasoning_idx = events.iter().position(|e| matches!(
-            e,
-            GenerationEvent::Delta { kind: DeltaKind::Reasoning, .. }
-        ));
-        let first_content_idx = events.iter().position(|e| matches!(
-            e,
-            GenerationEvent::Delta { kind: DeltaKind::Content, .. }
-        ));
-        let first_tool_call_idx = events.iter().position(|e| matches!(
-            e,
-            GenerationEvent::ToolCallDelta { .. }
-        ));
+        let first_reasoning_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Reasoning,
+                    ..
+                }
+            )
+        });
+        let first_content_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    ..
+                }
+            )
+        });
+        let first_tool_call_idx = events
+            .iter()
+            .position(|e| matches!(e, GenerationEvent::ToolCallDelta { .. }));
 
         // Reasoning MUST appear; it's unconditional in this fixture.
         let r_idx = first_reasoning_idx.unwrap_or_else(|| {
@@ -24634,9 +25407,15 @@ mod streaming_prompt_cache_replay_tests {
         // distinct variants, both encode through `sse.rs:166-247` into
         // separate JSON chunks. Lock in by asserting NO ToolCallDelta
         // appears at an index ≤ the last Reasoning delta index.
-        let last_reasoning_idx = events
-            .iter()
-            .rposition(|e| matches!(e, GenerationEvent::Delta { kind: DeltaKind::Reasoning, .. }));
+        let last_reasoning_idx = events.iter().rposition(|e| {
+            matches!(
+                e,
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Reasoning,
+                    ..
+                }
+            )
+        });
         if let (Some(lr), Some(t)) = (last_reasoning_idx, first_tool_call_idx) {
             assert!(
                 lr < t,
@@ -24702,14 +25481,20 @@ mod streaming_prompt_cache_replay_tests {
         let reasoning_concat: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => Some(text.clone()),
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Reasoning,
+                    text,
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
         let content_concat: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -24767,7 +25552,10 @@ mod streaming_prompt_cache_replay_tests {
         let content_concat: String = events
             .iter()
             .filter_map(|e| match e {
-                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -25059,9 +25847,8 @@ mod test_a1_conditional_grammar_wire {
                 return;
             }
         };
-        let mut splitter =
-            crate::serve::api::registry::ToolCallSplitter::from_registration(&reg)
-                .expect("ToolCallSplitter::from_registration must return Some for gemma4");
+        let mut splitter = crate::serve::api::registry::ToolCallSplitter::from_registration(&reg)
+            .expect("ToolCallSplitter::from_registration must return Some for gemma4");
 
         // Initial state: not inside a tool-call body.
         // Grammar mask should NOT be active.
@@ -25075,10 +25862,9 @@ mod test_a1_conditional_grammar_wire {
         // Grammar mask SHOULD now be active.
         let events_open = splitter.feed(open);
         assert!(
-            events_open.iter().any(|e| matches!(
-                e,
-                crate::serve::api::registry::ToolCallEvent::ToolCallOpen
-            )),
+            events_open
+                .iter()
+                .any(|e| matches!(e, crate::serve::api::registry::ToolCallEvent::ToolCallOpen)),
             "A1: feeding the open marker must emit ToolCallOpen"
         );
         assert!(
@@ -25091,10 +25877,9 @@ mod test_a1_conditional_grammar_wire {
         // Grammar mask should NOT be active.
         let events_close = splitter.feed(close);
         assert!(
-            events_close.iter().any(|e| matches!(
-                e,
-                crate::serve::api::registry::ToolCallEvent::ToolCallClose
-            )),
+            events_close
+                .iter()
+                .any(|e| matches!(e, crate::serve::api::registry::ToolCallEvent::ToolCallClose)),
             "A1: feeding the close marker must emit ToolCallClose"
         );
         assert!(
@@ -25119,8 +25904,8 @@ mod test_a1_conditional_grammar_wire {
     /// `route_content` uses.
     #[test]
     fn tool_call_open_triggers_grammar_runtime() {
-        use crate::serve::api::grammar::GrammarRuntime;
         use crate::serve::api::grammar::parser::parse;
+        use crate::serve::api::grammar::GrammarRuntime;
 
         // Real Gemma4 registration with real open/close markers.
         let reg = crate::serve::api::registry::find_for("gemma4-27b-it")
@@ -25132,9 +25917,8 @@ mod test_a1_conditional_grammar_wire {
                 return;
             }
         };
-        let mut splitter =
-            crate::serve::api::registry::ToolCallSplitter::from_registration(&reg)
-                .expect("ToolCallSplitter::from_registration must return Some for gemma4");
+        let mut splitter = crate::serve::api::registry::ToolCallSplitter::from_registration(&reg)
+            .expect("ToolCallSplitter::from_registration must return Some for gemma4");
 
         // Build a real GrammarRuntime in the lazy state, the way
         // generate_stream_once does for `GrammarKind::ToolCallBodyAuto`.
@@ -25160,10 +25944,10 @@ mod test_a1_conditional_grammar_wire {
         // Production trigger pattern (mirrors route_content's
         // ToolCallOpen branch in generate_stream_once):
         let events_open = splitter.feed(open);
-        if events_open.iter().any(|e| matches!(
-            e,
-            crate::serve::api::registry::ToolCallEvent::ToolCallOpen
-        )) {
+        if events_open
+            .iter()
+            .any(|e| matches!(e, crate::serve::api::registry::ToolCallEvent::ToolCallOpen))
+        {
             runtime.trigger();
         }
         assert!(
@@ -25476,7 +26260,10 @@ mod finalize_streaming_tool_state_tests {
                      matchers continue to work unchanged"
                 );
             }
-            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text,
+            } => {
                 panic!(
                     "REGRESSION: AutoLazyGrammar mid-call truncation emitted \
                      Content fallback (text={text:?}); the wave-3 W-B2 T2.4 \
@@ -25674,16 +26461,16 @@ mod emit_streaming_tool_call_close_tests {
                      code would indicate a regression to wave-2.5 A4 vocabulary"
                 );
             }
-            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text,
+            } => {
                 panic!(
                     "REGRESSION: Constrained parse failure emitted Content fallback \
                      (text={text:?}); this is the T2.4 silent-fallback that W-A3 removes"
                 );
             }
-            other => panic!(
-                "expected GenerationEvent::Error, got: {:?}",
-                other
-            ),
+            other => panic!("expected GenerationEvent::Error, got: {:?}", other),
         }
     }
 
@@ -25750,17 +26537,17 @@ mod emit_streaming_tool_call_close_tests {
                      (the unified loud-error vocabulary)"
                 );
             }
-            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text,
+            } => {
                 panic!(
                     "REGRESSION: AutoLazyGrammar parse failure emitted Content fallback \
                      (text={text:?}); the wave-3 W-B2 T2.4 final closure MUST promote \
                      this branch to Error identically to Constrained"
                 );
             }
-            other => panic!(
-                "expected GenerationEvent::Error, got: {:?}",
-                other
-            ),
+            other => panic!("expected GenerationEvent::Error, got: {:?}", other),
         }
     }
 
@@ -25802,7 +26589,10 @@ mod emit_streaming_tool_call_close_tests {
             "Auto + parse failure MUST return Ok(()) \
              (content fallback is the defined Auto behaviour, not an error)"
         );
-        assert_eq!(tc_index, 0, "tc_index must not be incremented on parse failure");
+        assert_eq!(
+            tc_index, 0,
+            "tc_index must not be incremented on parse failure"
+        );
         assert!(!saw_tc, "saw_tc must remain false on parse failure");
 
         drop(tx);
@@ -25880,7 +26670,10 @@ mod tool_call_stream_emitter_tests {
         let mut args = String::new();
         for ev in events {
             if let GenerationEvent::ToolCallDelta {
-                index, name: n, arguments, ..
+                index,
+                name: n,
+                arguments,
+                ..
             } = ev
             {
                 if *index != expect_index {
@@ -25908,7 +26701,9 @@ mod tool_call_stream_emitter_tests {
         // a started kv. The first `advance` call MUST emit chunk 1
         // (id+type+name) and chunk 2 (the args opening `{`).
         let body = "call:get_weather{location:<|\"|>San Fra".to_string();
-        emitter.advance(&body, &EventSink::new(&tx)).expect("advance ok");
+        emitter
+            .advance(&body, &EventSink::new(&tx))
+            .expect("advance ok");
         drop(tx);
         let events = drain(&mut rx);
         // Chunk 1: name+id+type, no args.
@@ -25934,13 +26729,13 @@ mod tool_call_stream_emitter_tests {
         // Chunk 2: args opening `{`, no name.
         match &events[1] {
             GenerationEvent::ToolCallDelta {
-                name, arguments, id, ..
+                name,
+                arguments,
+                id,
+                ..
             } => {
                 assert!(id.is_none(), "subsequent chunks MUST NOT retransmit id");
-                assert!(
-                    name.is_none(),
-                    "subsequent chunks MUST NOT retransmit name"
-                );
+                assert!(name.is_none(), "subsequent chunks MUST NOT retransmit name");
                 assert_eq!(
                     arguments.as_deref(),
                     Some("{"),
@@ -26028,7 +26823,9 @@ mod tool_call_stream_emitter_tests {
         ];
         for c in &chunks {
             body.push_str(c);
-            emitter.advance(&body, &EventSink::new(&tx)).expect("advance");
+            emitter
+                .advance(&body, &EventSink::new(&tx))
+                .expect("advance");
         }
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
@@ -26049,11 +26846,9 @@ mod tool_call_stream_emitter_tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&args).expect("args MUST be valid JSON");
         // Canonical args from the existing parser:
-        let canonical = super::super::registry::parse_tool_call_body(
-            &super::super::registry::GEMMA4,
-            &body,
-        )
-        .expect("canonical parse");
+        let canonical =
+            super::super::registry::parse_tool_call_body(&super::super::registry::GEMMA4, &body)
+                .expect("canonical parse");
         let canonical_json: serde_json::Value =
             serde_json::from_str(&canonical.arguments_json).expect("canonical json");
         assert_eq!(
@@ -26074,7 +26869,9 @@ mod tool_call_stream_emitter_tests {
         let (tx, mut rx) = mpsc::channel::<GenerationEvent>(16);
         let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
         let body = "call:f{x:1}".to_string();
-        emitter.advance(&body, &EventSink::new(&tx)).expect("advance");
+        emitter
+            .advance(&body, &EventSink::new(&tx))
+            .expect("advance");
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
         emitter
@@ -26230,7 +27027,9 @@ mod tool_call_stream_emitter_tests {
         //   chunk 2: arguments=`{`
         // Then finalize emits the residual tail.
         let body = "call:f{x:1}".to_string();
-        emitter.advance(&body, &EventSink::new(&tx)).expect("advance");
+        emitter
+            .advance(&body, &EventSink::new(&tx))
+            .expect("advance");
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
         emitter
@@ -26250,7 +27049,9 @@ mod tool_call_stream_emitter_tests {
         // events MUST be ToolCallDelta with the canonical incremental
         // shape — NOT the legacy two-chunk close-buffered shape.
         assert!(
-            events.iter().all(|e| matches!(e, GenerationEvent::ToolCallDelta { .. })),
+            events
+                .iter()
+                .all(|e| matches!(e, GenerationEvent::ToolCallDelta { .. })),
             "all events MUST be ToolCallDelta (no Content fallback for \
              well-formed Gemma 4 body); got {events:?}"
         );
@@ -26260,12 +27061,23 @@ mod tool_call_stream_emitter_tests {
         let chunk1 = events.first().expect("at least one event");
         match chunk1 {
             GenerationEvent::ToolCallDelta {
-                index, id, call_type, name, arguments,
+                index,
+                id,
+                call_type,
+                name,
+                arguments,
             } => {
                 assert_eq!(*index, 0, "chunk 1 index MUST be 0");
-                assert!(id.is_some(), "chunk 1 MUST carry id (canonical OpenAI shape)");
+                assert!(
+                    id.is_some(),
+                    "chunk 1 MUST carry id (canonical OpenAI shape)"
+                );
                 assert_eq!(call_type.as_deref(), Some("function"));
-                assert_eq!(name.as_deref(), Some("f"), "chunk 1 MUST carry function name");
+                assert_eq!(
+                    name.as_deref(),
+                    Some("f"),
+                    "chunk 1 MUST carry function name"
+                );
                 assert!(arguments.is_none(), "chunk 1 MUST NOT carry arguments");
             }
             other => panic!("chunk 1 must be ToolCallDelta with id+name; got {other:?}"),
@@ -26276,7 +27088,11 @@ mod tool_call_stream_emitter_tests {
         let chunk2 = events.get(1).expect("at least two events");
         match chunk2 {
             GenerationEvent::ToolCallDelta {
-                index, id, call_type, name, arguments,
+                index,
+                id,
+                call_type,
+                name,
+                arguments,
             } => {
                 assert_eq!(*index, 0);
                 assert!(id.is_none(), "chunk 2 MUST NOT retransmit id");
@@ -26349,11 +27165,9 @@ mod tool_call_stream_emitter_tests {
         assert_eq!(name.as_deref(), Some("lookup"));
         let v: serde_json::Value =
             serde_json::from_str(&args).expect("args concatenate to valid JSON");
-        let canonical = super::super::registry::parse_tool_call_body(
-            &super::super::registry::QWEN35,
-            &body,
-        )
-        .expect("canonical");
+        let canonical =
+            super::super::registry::parse_tool_call_body(&super::super::registry::QWEN35, &body)
+                .expect("canonical");
         let cv: serde_json::Value = serde_json::from_str(&canonical.arguments_json).unwrap();
         assert_eq!(
             v, cv,
@@ -26391,7 +27205,10 @@ mod tool_call_stream_emitter_tests {
             &mut saw_tc,
             &EventSink::new(&tx),
         );
-        assert!(result.is_ok(), "Auto + unparseable MUST be Ok (content fallback)");
+        assert!(
+            result.is_ok(),
+            "Auto + unparseable MUST be Ok (content fallback)"
+        );
         drop(tx);
         let events = drain(&mut rx);
         assert_eq!(events.len(), 1, "exactly one Content delta expected");
@@ -26435,9 +27252,7 @@ mod tool_call_stream_emitter_tests {
     ///   - `Auto`: parse failure emits `Content(raw_body)` so the malformed
     ///     bytes still reach the client. Use this for iter-219b which
     ///     covers special-token-pollution recovery.
-    fn drive_splitter_emitter_pipeline(
-        fragments: &[&str],
-    ) -> (String, Vec<GenerationEvent>) {
+    fn drive_splitter_emitter_pipeline(fragments: &[&str]) -> (String, Vec<GenerationEvent>) {
         drive_splitter_emitter_pipeline_with_policy(fragments, ToolCallPolicy::Constrained)
     }
 
@@ -26447,9 +27262,8 @@ mod tool_call_stream_emitter_tests {
     ) -> (String, Vec<GenerationEvent>) {
         let (tx, mut rx) = mpsc::channel::<GenerationEvent>(256);
         let reg = &super::super::registry::GEMMA4;
-        let mut splitter =
-            super::super::registry::ToolCallSplitter::from_registration(reg)
-                .expect("gemma4 has tool markers");
+        let mut splitter = super::super::registry::ToolCallSplitter::from_registration(reg)
+            .expect("gemma4 has tool markers");
         let mut body = String::new();
         let mut emitter: Option<ToolCallStreamEmitter> = None;
         let mut tc_index: usize = 0;
@@ -26491,14 +27305,7 @@ mod tool_call_stream_emitter_tests {
                         // Constrained / AutoLazyGrammar: parse failure → loud
                         // Err(()). Allow either path here so test scenarios
                         // can exercise both contracts.
-                        let _ = em.finalize(
-                            body_dump,
-                            Some(reg),
-                            policy,
-                            tc_index,
-                            saw_tc,
-                            sink,
-                        );
+                        let _ = em.finalize(body_dump, Some(reg), policy, tc_index, saw_tc, sink);
                     }
                 }
             }
@@ -26507,10 +27314,24 @@ mod tool_call_stream_emitter_tests {
         let sink = EventSink::new(&tx);
         for frag in fragments {
             let events = splitter.feed(frag);
-            drive_events(events, &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &sink);
+            drive_events(
+                events,
+                &mut body,
+                &mut emitter,
+                &mut tc_index,
+                &mut saw_tc,
+                &sink,
+            );
         }
         if let Some(tail) = splitter.finish() {
-            drive_events(vec![tail], &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &sink);
+            drive_events(
+                vec![tail],
+                &mut body,
+                &mut emitter,
+                &mut tc_index,
+                &mut saw_tc,
+                &sink,
+            );
         }
         drop(sink);
         drop(tx);
@@ -26565,13 +27386,23 @@ mod tool_call_stream_emitter_tests {
     fn iter219_reproducer_token_boundary_yields_clean_name() {
         let fragments: &[&str] = &[
             "<|tool_response>",
-            "get", "_", "current",
+            "get",
+            "_",
+            "current",
             "<|tool_call>",
-            "call", ":",
-            "get", "_", "current", "_", "weather",
+            "call",
+            ":",
+            "get",
+            "_",
+            "current",
+            "_",
+            "weather",
             "{",
-            "location", ":",
-            "<|\"|>", "Paris", "<|\"|>",
+            "location",
+            ":",
+            "<|\"|>",
+            "Paris",
+            "<|\"|>",
             "}",
             "<tool_call|>",
         ];
@@ -26605,13 +27436,23 @@ mod tool_call_stream_emitter_tests {
     #[test]
     fn iter219_reproducer_leading_get_current_content_isolated() {
         let fragments: &[&str] = &[
-            "get", "_", "current",
+            "get",
+            "_",
+            "current",
             "<|tool_call>",
-            "call", ":",
-            "get", "_", "current", "_", "weather",
+            "call",
+            ":",
+            "get",
+            "_",
+            "current",
+            "_",
+            "weather",
             "{",
-            "location", ":",
-            "<|\"|>", "Paris", "<|\"|>",
+            "location",
+            ":",
+            "<|\"|>",
+            "Paris",
+            "<|\"|>",
             "}",
             "<tool_call|>",
         ];
@@ -26652,12 +27493,25 @@ mod tool_call_stream_emitter_tests {
     fn iter219b_reproducer_tool_response_inside_call() {
         let fragments: &[&str] = &[
             "<|tool_call>",
-            "call", ":", "get", "_", "current",
-            "<|tool_response>",                  // stray special token MID-CALL
-            "call", ":", "get", "_", "current", "_", "weather",
+            "call",
+            ":",
+            "get",
+            "_",
+            "current",
+            "<|tool_response>", // stray special token MID-CALL
+            "call",
+            ":",
+            "get",
+            "_",
+            "current",
+            "_",
+            "weather",
             "{",
-            "location", ":",
-            "<|\"|>", "Paris", "<|\"|>",
+            "location",
+            ":",
+            "<|\"|>",
+            "Paris",
+            "<|\"|>",
             "}",
             "<tool_call|>",
         ];
@@ -26719,11 +27573,25 @@ mod tool_call_stream_emitter_tests {
     fn iter219b_content_fallback_does_not_leak_special_tokens() {
         let fragments: &[&str] = &[
             "<|tool_call>",
-            "call", ":", "get", "_", "current",
+            "call",
+            ":",
+            "get",
+            "_",
+            "current",
             "<|tool_response>",
-            "call", ":", "get", "_", "current", "_", "weather",
-            "{", "location", ":",
-            "<|\"|>", "Paris", "<|\"|>",
+            "call",
+            ":",
+            "get",
+            "_",
+            "current",
+            "_",
+            "weather",
+            "{",
+            "location",
+            ":",
+            "<|\"|>",
+            "Paris",
+            "<|\"|>",
             "}",
             "<tool_call|>",
         ];
@@ -26734,10 +27602,14 @@ mod tool_call_stream_emitter_tests {
         // markers. Listed against the Gemma 4 BUILTIN_REGISTRATIONS family
         // (mirrors `tests/openwebui_multiturn.rs::assert_no_leaked_special_tokens`):
         for marker in &[
-            "<|channel>", "<channel|>",
-            "<|tool_call>", "<tool_call|>",
-            "<|tool_response>", "<tool_response|>",
-            "<|turn>", "<turn|>",
+            "<|channel>",
+            "<channel|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|turn>",
+            "<turn|>",
         ] {
             assert!(
                 !content.contains(marker),
@@ -27022,15 +27894,16 @@ mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
         assert_eq!(read_continuous_batching_max_slots(|_| None), 8);
         // Primary env wins.
         assert_eq!(
-            read_continuous_batching_max_slots(|n| (n == "HF2Q_MAX_BATCHED_SLOTS")
-                .then(|| "6".to_string())),
+            read_continuous_batching_max_slots(
+                |n| (n == "HF2Q_MAX_BATCHED_SLOTS").then(|| "6".to_string())
+            ),
             6
         );
         // Legacy env honoured as fallback when primary unset (back-compat).
         assert_eq!(
-            read_continuous_batching_max_slots(|n| (n
-                == "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS")
-                .then(|| "5".to_string())),
+            read_continuous_batching_max_slots(
+                |n| (n == "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS").then(|| "5".to_string())
+            ),
             5
         );
         // Primary takes precedence over legacy when BOTH set.
@@ -27044,8 +27917,9 @@ mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
         );
         // Zero/malformed trap to default.
         assert_eq!(
-            read_continuous_batching_max_slots(|n| (n == "HF2Q_MAX_BATCHED_SLOTS")
-                .then(|| "0".to_string())),
+            read_continuous_batching_max_slots(
+                |n| (n == "HF2Q_MAX_BATCHED_SLOTS").then(|| "0".to_string())
+            ),
             8
         );
     }
@@ -27230,8 +28104,7 @@ mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
     #[test]
     fn h229_dossier_cite_pin() {
         assert!(
-            ADR040_A4_DOSSIER_CITE
-                .contains("adr040-a4-drafter-multi-seq-dossier-2026-05-30.md"),
+            ADR040_A4_DOSSIER_CITE.contains("adr040-a4-drafter-multi-seq-dossier-2026-05-30.md"),
             "H229: ADR040_A4_DOSSIER_CITE MUST name the dossier file \
              (operator-runbook + error-Display anchor). Got: {ADR040_A4_DOSSIER_CITE}"
         );
@@ -27333,9 +28206,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
     /// shape that `Engine::spawn_with_mode(SlotAware)` would set up.
     #[test]
     fn h24_worker_scheduler_inflight_arm_reports_inflight_batched_policy() {
-        let mut sched = WorkerScheduler::Inflight(
-            InflightBatchedScheduler::new_with_kv_budget(8, 4, 0),
-        );
+        let mut sched =
+            WorkerScheduler::Inflight(InflightBatchedScheduler::new_with_kv_budget(8, 4, 0));
         let stats = sched.stats();
         assert_eq!(
             stats.policy,
@@ -27370,7 +28242,9 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             max_tokens: 8,
             kv_bytes_needed: 0,
         };
-        let admitted = sched.admit(req).expect("H24: admit must succeed on fresh InflightBatched");
+        let admitted = sched
+            .admit(req)
+            .expect("H24: admit must succeed on fresh InflightBatched");
         let handle = admitted
             .handle
             .expect("H24: max_tokens > 0 admit returns Some(handle)");
@@ -27397,9 +28271,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
     /// engine's SlotAware spawn arm provides the correct primitive.
     #[test]
     fn h24_cont_inflight_scheduler_hands_out_distinct_slot_ids_under_stacked_admits() {
-        let mut sched = WorkerScheduler::Inflight(
-            InflightBatchedScheduler::new_with_kv_budget(8, 4, 0),
-        );
+        let mut sched =
+            WorkerScheduler::Inflight(InflightBatchedScheduler::new_with_kv_budget(8, 4, 0));
         let mut handles = Vec::new();
         for i in 0..4 {
             let req = AdmitRequest {
@@ -27410,7 +28283,11 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             let admitted = sched
                 .admit(req)
                 .unwrap_or_else(|e| panic!("H24-cont: admit #{i} must succeed: {:?}", e));
-            handles.push(admitted.handle.expect("H24-cont: admit returns Some(handle)"));
+            handles.push(
+                admitted
+                    .handle
+                    .expect("H24-cont: admit returns Some(handle)"),
+            );
         }
         // Distinct slot IDs spanning [0, max_slots).
         let mut slot_ids: Vec<u32> = handles.iter().map(|h| h.slot_id.0).collect();
@@ -27546,12 +28423,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             matches!(loaded, LoadedModel::Gemma(_)),
             "H21 fixture: GGUF must load as LoadedModel::Gemma"
         );
-        let engine = Engine::spawn_with_mode(
-            loaded,
-            8,
-            None,
-            EngineMode::SlotAware { max_slots: 4 },
-        );
+        let engine =
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 });
         let engine = engine.unwrap_or_else(|e| {
             panic!(
                 "H21 FALSIFIED: spawn_with_mode(SlotAware) must return \
@@ -27733,7 +28606,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
     /// assertion for clarity.
     #[test]
     fn h24_engine_spawn_with_slot_aware_reports_inflight_batched_policy() {
-        if c2c_skip_unless_gated("h24_engine_spawn_with_slot_aware_reports_inflight_batched_policy") {
+        if c2c_skip_unless_gated("h24_engine_spawn_with_slot_aware_reports_inflight_batched_policy")
+        {
             return;
         }
         let gguf_path: std::path::PathBuf = std::env::var(C2C_E2E_GGUF_ENV)
@@ -27747,13 +28621,9 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_dir: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
-        let engine = Engine::spawn_with_mode(
-            loaded,
-            8,
-            None,
-            EngineMode::SlotAware { max_slots: 4 },
-        )
-        .expect("H24: spawn_with_mode(SlotAware) returns Ok for Gemma 4 at C2c");
+        let engine =
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+                .expect("H24: spawn_with_mode(SlotAware) returns Ok for Gemma 4 at C2c");
         let stats = engine.scheduler_stats();
         assert_eq!(
             stats.policy,
@@ -28011,8 +28881,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
     fn h22_gemma4_spawn_fail_variant_carries_max_slots_and_cause() {
         let err = EngineSpawnError::Gemma4SlotAwareProvisionFailed {
             max_slots: 16,
-            cause: "alloc_hb_kv_for_layer L0: synthetic device OOM (test fixture)"
-                .to_string(),
+            cause: "alloc_hb_kv_for_layer L0: synthetic device OOM (test fixture)".to_string(),
         };
         let msg = format!("{}", err);
         assert!(
@@ -28027,10 +28896,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
              without it the operator can't distinguish OOM from \
              malformed Gemma4Config. Got: {msg}"
         );
-        assert!(
-            msg.contains("C2c"),
-            "H22-fail sanity: iter cite present"
-        );
+        assert!(msg.contains("C2c"), "H22-fail sanity: iter cite present");
     }
 }
 
@@ -28261,7 +29127,8 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
     /// non-spec-decode generate path), NOT `rollback_la_to` (which
     /// requires `ensure_la_capture` only allocated in spec-decode).
     #[test]
-    fn h38_typed_deferral_label_present_in_all_four_worker_arms_and_rollback_la_to_not_yet_called() {
+    fn h38_typed_deferral_label_present_in_all_four_worker_arms_and_rollback_la_to_not_yet_called()
+    {
         let src = include_str!("engine.rs");
         let body_start = src
             .find("fn worker_run(")
@@ -28431,7 +29298,9 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
         // mirroring the spawn_with_mode dispatch order
         // (Gemma → Qwen35 → Qwen3VlText).
         assert!(
-            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
             "H40 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
              clamp is MISSING from worker_run. iter-C2e SHIPPED 2026-05-30 \
              flipping the Qwen3VL SlotAware spawn arm to `Ok(Engine)` AND \
@@ -28560,7 +29429,9 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
         // here may indicate the predicate accidentally extended to
         // SlotId(0) too.
         assert!(
-            body.contains("matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0)"),
+            body.contains(
+                "matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0)"
+            ),
             "H51 FALSIFIED: the iter-1 lift predicate at the Generate \
              arm is no longer `slot_id != SlotId(0)`. Drift here means \
              the lift may fire at SlotId(0) too, breaking byte-equivalence."
@@ -28718,8 +29589,8 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
              typed error (NOT panic) at this site."
         );
         assert!(
-            body.contains("capability_unsupported:") &&
-            body.contains("iter-C2d-cont-kernel iter-1"),
+            body.contains("capability_unsupported:")
+                && body.contains("iter-C2d-cont-kernel iter-1"),
             "H55 FALSIFIED: the None-branch typed error does not \
              carry both `capability_unsupported:` (handler 501 \
              string-prefix per ADR-040 C3 wiring at schema.rs:344) \
@@ -28776,7 +29647,9 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
         // C2e). Sibling discipline pin: Qwen35 iter-1 must not REMOVE
         // the C2e Qwen3VL clamp.
         assert!(
-            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
             "H56 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
              clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
              adds the Qwen3VL clamp at the four worker arms; iter-1 must \
@@ -28855,7 +29728,11 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
         // §6.1.27's deferrals matrix (historical body, unchanged by
         // iter-2 + iter-3) must still enumerate iter-2/3/4 sub-deferrals
         // so the operator runbook traces the full sequencing chain.
-        for iter_label in ["iter-C2d-cont-kernel-iter-2", "iter-C2d-cont-kernel-iter-3", "iter-C2d-cont-kernel-iter-4"] {
+        for iter_label in [
+            "iter-C2d-cont-kernel-iter-2",
+            "iter-C2d-cont-kernel-iter-3",
+            "iter-C2d-cont-kernel-iter-4",
+        ] {
             assert!(
                 block.contains(iter_label),
                 "H57 FALSIFIED: §6.1.27 closure block does not name \
@@ -29016,9 +29893,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
         // fn. Source-grep pin: the worker_run body MUST call
         // `super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(`.
         assert!(
-            body.contains(
-                "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("
-            ),
+            body.contains("super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("),
             "H59 FALSIFIED: iter-2 lift fn \
              `generate_stream_qwen35_once_extended_slot_aware` is NOT \
              called from the worker_run body. The GenerateStream-arm \
@@ -29031,9 +29906,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
         // admit'd handle), NOT a hard-coded SlotId(0). Pin the
         // threading via substring search inside the lift call block.
         let lift_block_start = body
-            .find(
-                "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(",
-            )
+            .find("super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(")
             .expect("H59: lift call site not found");
         let lift_block_end = body[lift_block_start..]
             .find(");")
@@ -29132,9 +30005,9 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
 
         let engine_q = include_str!("engine_qwen35.rs");
         let fn_marker = "pub fn generate_stream_qwen35_once_extended_slot_aware(";
-        let fn_start = engine_q.find(fn_marker).expect(
-            "H61: generate_stream_qwen35_once_extended_slot_aware not defined",
-        );
+        let fn_start = engine_q
+            .find(fn_marker)
+            .expect("H61: generate_stream_qwen35_once_extended_slot_aware not defined");
         // Locate the fn body — bound by next `pub fn` or end-of-file.
         let body_after = &engine_q[fn_start..];
         let body_end_off = body_after[fn_marker.len()..]
@@ -29244,9 +30117,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
         // iter-2 GenerateStream-arm lift fn must still be called
         // (iter-3 must not regress iter-2's GenerateStream lift).
         assert!(
-            body.contains(
-                "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("
-            ),
+            body.contains("super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("),
             "H62 FALSIFIED: iter-2 lift fn \
              `generate_stream_qwen35_once_extended_slot_aware` is NOT \
              called from worker_run. iter-3 must NOT regress iter-2's \
@@ -29289,9 +30160,9 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
     fn h63_slot_aware_stream_fn_preserves_sse_event_ordering() {
         let engine_q = include_str!("engine_qwen35.rs");
         let fn_marker = "pub fn generate_stream_qwen35_once_extended_slot_aware(";
-        let fn_start = engine_q.find(fn_marker).expect(
-            "H63: generate_stream_qwen35_once_extended_slot_aware not defined",
-        );
+        let fn_start = engine_q
+            .find(fn_marker)
+            .expect("H63: generate_stream_qwen35_once_extended_slot_aware not defined");
         let body_after = &engine_q[fn_start..];
         let body_end_off = body_after[fn_marker.len()..]
             .find("\npub fn ")
@@ -29730,9 +30601,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter3_qwen35_tests {
         // iter-2 GenerateStream-arm lift fn must still be called
         // (iter-4 must not regress iter-2's GenerateStream lift).
         assert!(
-            body.contains(
-                "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("
-            ),
+            body.contains("super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("),
             "H68 FALSIFIED: iter-2 lift fn \
              `generate_stream_qwen35_once_extended_slot_aware` is NOT \
              called from worker_run. iter-4 must NOT regress iter-2's \
@@ -30261,8 +31130,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
         // (b) The streaming fn body now calls the soft-tokens-and-
         // deepstack forward (the lifted vision-augmented prefill).
         assert!(
-            fn_body
-                .contains("forward_gpu_last_logits_with_soft_tokens_and_deepstack("),
+            fn_body.contains("forward_gpu_last_logits_with_soft_tokens_and_deepstack("),
             "H74 FALSIFIED: \
              `generate_stream_qwen35_once_extended_slot_aware` body \
              does not call \
@@ -30356,9 +31224,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
 
         // iter-2 GenerateStream-arm lift fn must still be called.
         assert!(
-            body.contains(
-                "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("
-            ),
+            body.contains("super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("),
             "H75 FALSIFIED: iter-2 lift fn \
              `generate_stream_qwen35_once_extended_slot_aware` is NOT \
              called from worker_run. iter-4 must NOT regress iter-2's \
@@ -30428,7 +31294,13 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
             // family `"qwen35-` followed by anything followed by
             // `(iter-C2d-cont-kernel-iter-N` must NOT appear in the
             // body. This is the exact pre-iter-{1,2,3,4} clamp shape.
-            let clamp_shape = format!("(iter-C2d-cont-kernel-iter-{}", iter_label.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-').len().to_string());
+            let clamp_shape = format!(
+                "(iter-C2d-cont-kernel-iter-{}",
+                iter_label
+                    .trim_end_matches(|c: char| c.is_ascii_digit() || c == '-')
+                    .len()
+                    .to_string()
+            );
             // Simpler & more reliable: the four pre-iter clamp shapes
             // all had a `qwen35-...-slot-N (iter-C2d-cont-kernel-iter-N`
             // structure. Pin the conservative "no `qwen35-...-slot-N`
@@ -30436,8 +31308,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
             // iter-N`" pattern by checking the worker_run body
             // explicitly.
             let _ = clamp_shape;
-            let pre_iter_clamp_substr =
-                format!("-slot-N ({iter_label}");
+            let pre_iter_clamp_substr = format!("-slot-N ({iter_label}");
             assert!(
                 !body.contains(&pre_iter_clamp_substr),
                 "H76 FALSIFIED: the worker_run body still contains the \
@@ -30753,7 +31624,8 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
     /// (operator-facing) + the source-grep structural pin (reviewer-
     /// facing) move in lockstep. Mirrors C2d-cont H38.
     #[test]
-    fn h43_typed_deferral_label_present_in_all_four_worker_arms_and_forward_prefill_slot_id_not_yet_threaded() {
+    fn h43_typed_deferral_label_present_in_all_four_worker_arms_and_forward_prefill_slot_id_not_yet_threaded(
+    ) {
         let src = include_str!("engine.rs");
         // Count Gemma 4 B4c clamp occurrences. Each of the 4 worker
         // arms (Generate / GenerateStream / Embed /
@@ -30958,7 +31830,9 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
         // C2e). Sibling discipline pin: B4c must not REMOVE the C2e
         // Qwen3VL clamp.
         assert!(
-            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
             "H45 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
              clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
              flipping the Qwen3VL SlotAware spawn arm to `Ok(Engine)` AND \
@@ -31019,11 +31893,26 @@ mod adr040_phase_e1_closure_tests {
     fn iter230_a1_historical_markers_exactly_once() {
         let history = adr040_history_doc();
         for marker in [
-            "### 6.1.26", "### 6.1.27", "### 6.1.30", "### 6.1.31",
-            "### 6.1.32", "### 6.1.33", "### 6.1.34", "### 6.1.35",
-            "### 6.1.36", "### 6.1.37", "### 6.1.38", "### 6.1.39",
-            "### 6.1.40", "### 6.1.41", "### 6.1.42", "### 6.1.43",
-            "### 6.1.44", "### 6.1.45", "### 6.1.52", "### 6.1.55",
+            "### 6.1.26",
+            "### 6.1.27",
+            "### 6.1.30",
+            "### 6.1.31",
+            "### 6.1.32",
+            "### 6.1.33",
+            "### 6.1.34",
+            "### 6.1.35",
+            "### 6.1.36",
+            "### 6.1.37",
+            "### 6.1.38",
+            "### 6.1.39",
+            "### 6.1.40",
+            "### 6.1.41",
+            "### 6.1.42",
+            "### 6.1.43",
+            "### 6.1.44",
+            "### 6.1.45",
+            "### 6.1.52",
+            "### 6.1.55",
         ] {
             let n = history.matches(marker).count();
             assert_eq!(
@@ -31155,10 +32044,10 @@ mod adr040_phase_e1_closure_tests {
     fn h48_e1_closure_enumerates_at_least_7_typed_deferrals() {
         let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         let closure_marker = "### 6.1.26";
-        let closure_start = adr
-            .find(closure_marker)
-            .expect("H48: ADR §6.1.26 closure block not found — E1 \
-                     closure ceremony has not landed");
+        let closure_start = adr.find(closure_marker).expect(
+            "H48: ADR §6.1.26 closure block not found — E1 \
+                     closure ceremony has not landed",
+        );
         let closure_end_off = adr[closure_start..]
             .find("\n---\n")
             .or_else(|| adr[closure_start..].find("\n## "))
@@ -31293,8 +32182,7 @@ mod adr040_phase_e1_closure_tests {
         );
 
         // Trigger conditions named — customer ask OR ≥8 concurrent.
-        let customer_named = closure_body.contains("customer")
-            || closure_body.contains("Customer");
+        let customer_named = closure_body.contains("customer") || closure_body.contains("Customer");
         assert!(
             customer_named,
             "H50 FALSIFIED: §6.1.26 closure block does not name \
@@ -31605,9 +32493,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
         // The `reset_for_slot` primitive is defined in
         // `gemma4/kv_cache.rs` — verify via cross-file source-grep
         // that the production callsite knows the name.
-        let kv_src = include_str!(
-            "../../../src/inference/models/gemma4/kv_cache.rs"
-        );
+        let kv_src = include_str!("../../../src/inference/models/gemma4/kv_cache.rs");
         assert!(
             kv_src.contains("pub fn reset_for_slot("),
             "H80 FALSIFIED: `reset_for_slot` is NOT defined in \
@@ -31756,7 +32642,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
         // predates C2e). Sibling discipline pin: Gemma 4 iter-1 must
         // not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
             "H82 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
              clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
              flipping the Qwen3VL SlotAware spawn arm to `Ok(Engine)` AND \
@@ -32219,9 +33107,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
         let bounds_pos = body_window
             .find("slot_id.0 >= n_seqs")
             .expect("H88: bounds check present (asserted above)");
-        let dispatch_pos = body_window.find("INVESTIGATION_ENV.hybrid_kv").expect(
-            "H88: dispatch fork present (must be lexically AFTER bounds check)",
-        );
+        let dispatch_pos = body_window
+            .find("INVESTIGATION_ENV.hybrid_kv")
+            .expect("H88: dispatch fork present (must be lexically AFTER bounds check)");
         assert!(
             bounds_pos < dispatch_pos,
             "H88 FALSIFIED: bounds-first ordering violated — the \
@@ -32571,18 +33459,9 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
         };
         // Variant destructures with the expected field shape.
         match &err {
-            EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed {
-                max_slots,
-                cause,
-            } => {
-                assert_eq!(
-                    *max_slots, 4u32,
-                    "H93 sanity: max_slots round-trips"
-                );
-                assert!(
-                    cause.contains("OOM"),
-                    "H93 sanity: cause round-trips"
-                );
+            EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed { max_slots, cause } => {
+                assert_eq!(*max_slots, 4u32, "H93 sanity: max_slots round-trips");
+                assert!(cause.contains("OOM"), "H93 sanity: cause round-trips");
             }
             other => panic!(
                 "H93 FALSIFIED: Gemma4HybridSlotAwareProvisionFailed \
@@ -32726,9 +33605,9 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
         // SerialFifo's spawn path runs `load` (no per-arch dispatch),
         // never touches the field.
         let load_marker = "fn load(opts: &LoadOptions)";
-        let load_idx = src.find(load_marker).expect(
-            "H95: GemmaLoadedModel::load fn not found (engine.rs structure changed)",
-        );
+        let load_idx = src
+            .find(load_marker)
+            .expect("H95: GemmaLoadedModel::load fn not found (engine.rs structure changed)");
         let load_window = &src[load_idx..(load_idx + 30_000).min(src.len())];
         assert!(
             load_window.contains("multi_seq_kv_hybrid: None,"),
@@ -32794,8 +33673,7 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
         // Specifically: NOT in the spawn_with_mode Qwen35 arm.
         let qwen35_arm_marker = "LoadedModel::Qwen35(mut q) => {";
         if let Some(qwen_arm_idx) = src.find(qwen35_arm_marker) {
-            let qwen_arm_window =
-                &src[qwen_arm_idx..(qwen_arm_idx + 6000).min(src.len())];
+            let qwen_arm_window = &src[qwen_arm_idx..(qwen_arm_idx + 6000).min(src.len())];
             assert!(
                 !qwen_arm_window.contains("alloc_multi_seq_hybrid_kv_for_layer"),
                 "H96 FALSIFIED: Qwen35 spawn-arm body calls \
@@ -32851,8 +33729,7 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
             .or_else(|| adr[closure_start..].find("\n---\n"))
             .or_else(|| adr[closure_start..].find("\n## "))
             .unwrap_or_else(|| adr[closure_start..].len().min(40_000));
-        let closure_body =
-            &adr[closure_start..closure_start + closure_end_off];
+        let closure_body = &adr[closure_start..closure_start + closure_end_off];
         for required in [
             "iter-C2c-cont",
             "MultiSeqHybridKvBuffers",
@@ -32973,7 +33850,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
         // The iter-2A hybrid-branch typed-error label is the literal
         // `"gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per"`
         // (the iter-2A pin). iter-2B REMOVES it (real routing).
-        let iter2a_hybrid_label = "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per";
+        let iter2a_hybrid_label =
+            "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per";
         assert!(
             !fn_window.contains(iter2a_hybrid_label),
             "H97 FALSIFIED: new fn body still contains iter-2A hybrid \
@@ -33092,9 +33970,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
     fn h100_slot_view_byte_offset_uses_f16_2_byte_multiplier() {
         let src = include_str!("../forward_prefill.rs");
         let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
-        let fn_idx = src
-            .find(fn_marker)
-            .expect("H100: new fn marker present");
+        let fn_idx = src.find(fn_marker).expect("H100: new fn marker present");
         // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
         // 30_000 to 80_000 to cover both the hybrid + HB-encoded
         // branches now that the dense F32 + legacy 4-bit branches
@@ -33105,8 +33981,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
         // dtype-aware `DType::F16.size_of()` lookup.  We accept either
         // form — the load-bearing invariant is the F16 byte-size
         // multiplier appears in the slot-view byte-offset arithmetic.
-        let has_explicit_2 = fn_window.contains("* 2)") || fn_window.contains("* 2 ")
-            || fn_window.contains("(2u64)") || fn_window.contains("size_of::<u16>()");
+        let has_explicit_2 = fn_window.contains("* 2)")
+            || fn_window.contains("* 2 ")
+            || fn_window.contains("(2u64)")
+            || fn_window.contains("size_of::<u16>()");
         let has_dtype_lookup = fn_window.contains("DType::F16.size_of()");
         assert!(
             has_explicit_2 || has_dtype_lookup,
@@ -33140,9 +34018,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
     fn h101_slot_view_preserves_legacy_hybrid_kv_buffers_3d_shape() {
         let src = include_str!("../forward_prefill.rs");
         let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
-        let fn_idx = src
-            .find(fn_marker)
-            .expect("H101: new fn marker present");
+        let fn_idx = src.find(fn_marker).expect("H101: new fn marker present");
         // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
         // 30_000 to 80_000 to cover both the hybrid + HB-encoded
         // branches now that the dense F32 + legacy 4-bit branches
@@ -33216,8 +34092,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
             .expect("H102: alloc-site eprintln marker not found");
         // Pull a 200-char window BEFORE the eprintln (covers the
         // `if INVESTIGATION_ENV.hybrid_kv ...` predicate line).
-        let pre_alloc_window =
-            &pf_src[alloc_idx.saturating_sub(400)..alloc_idx];
+        let pre_alloc_window = &pf_src[alloc_idx.saturating_sub(400)..alloc_idx];
         assert!(
             pre_alloc_window.contains("self.hybrid_kv.is_none()"),
             "H102 FALSIFIED: prefill alloc gate at line ~842 does NOT \
@@ -33238,9 +34113,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
     fn h103_hb_encoded_branch_iter2a_cont_typed_deferral_preserved() {
         let src = include_str!("../forward_prefill.rs");
         let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
-        let fn_idx = src
-            .find(fn_marker)
-            .expect("H103: new fn marker present");
+        let fn_idx = src.find(fn_marker).expect("H103: new fn marker present");
         // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
         // 30_000 to 80_000 to cover both the hybrid + HB-encoded
         // branches now that the dense F32 + legacy 4-bit branches
@@ -33549,7 +34422,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
              route to slot 0's region."
         );
         // Hybrid scaffold restore pattern.
-        let hyb_restore_count = body.matches("g.multi_seq_kv_hybrid = multi_seq_hybrid").count();
+        let hyb_restore_count = body
+            .matches("g.multi_seq_kv_hybrid = multi_seq_hybrid")
+            .count();
         assert!(
             hyb_restore_count >= 2,
             "H106 FALSIFIED: the iter-3 lift call site does not put \
@@ -33575,9 +34450,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
     #[test]
     fn h107_slot_aware_stream_fn_calls_reset_for_slot_at_entry_and_exit() {
         // reset_for_slot primitives (iter-1's load-bearing add).
-        let kv_src = include_str!(
-            "../../../src/inference/models/gemma4/kv_cache.rs"
-        );
+        let kv_src = include_str!("../../../src/inference/models/gemma4/kv_cache.rs");
         assert!(
             kv_src.contains("pub fn reset_for_slot("),
             "H107 FALSIFIED: `reset_for_slot` is not defined in \
@@ -33589,9 +34462,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
         let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
         let fn_idx = src
             .find(fn_marker)
-            .expect(
-                "H107: generate_stream_gemma4_once_slot_aware not defined",
-            );
+            .expect("H107: generate_stream_gemma4_once_slot_aware not defined");
         // Window covering the fn body — bound by next top-level fn
         // marker or end-of-file.
         let body_after = &src[fn_idx..];
@@ -33751,9 +34622,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
         let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
         let fn_idx = src
             .find(fn_marker)
-            .expect(
-                "H109: generate_stream_gemma4_once_slot_aware not defined",
-            );
+            .expect("H109: generate_stream_gemma4_once_slot_aware not defined");
         let body_after = &src[fn_idx..];
         let body_end_off = body_after[fn_marker.len()..]
             .find("\nfn ")
@@ -33843,8 +34712,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
         // entry-reset (defense against a refactor that emits Error
         // BEFORE resetting the slot).
         let _ = first_error_idx; // referenced for clarity; the
-                                  // iter-2-decode cite-based pin
-                                  // above is the load-bearing one.
+                                 // iter-2-decode cite-based pin
+                                 // above is the load-bearing one.
 
         // The ADR-040 §6.1.35 closure block exists in the ADR.
         let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
@@ -34121,7 +34990,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
              iter-2A hybrid typed error or route to slot 0's region."
         );
         // Hybrid scaffold restore pattern.
-        let hyb_restore_count = body.matches("g.multi_seq_kv_hybrid = multi_seq_hybrid").count();
+        let hyb_restore_count = body
+            .matches("g.multi_seq_kv_hybrid = multi_seq_hybrid")
+            .count();
         assert!(
             hyb_restore_count >= 3,
             "H112 FALSIFIED: the iter-4 lift call site does not put \
@@ -34147,9 +35018,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
     #[test]
     fn h113_slot_aware_embed_fn_calls_reset_for_slot_at_entry_and_exit() {
         // reset_for_slot primitives (iter-1's load-bearing add).
-        let kv_src = include_str!(
-            "../../../src/inference/models/gemma4/kv_cache.rs"
-        );
+        let kv_src = include_str!("../../../src/inference/models/gemma4/kv_cache.rs");
         assert!(
             kv_src.contains("pub fn reset_for_slot("),
             "H113 FALSIFIED: `reset_for_slot` is not defined in \
@@ -34161,9 +35030,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
         let fn_marker = "fn embed_gemma4_slot_aware(";
         let fn_idx = src
             .find(fn_marker)
-            .expect(
-                "H113: embed_gemma4_slot_aware not defined",
-            );
+            .expect("H113: embed_gemma4_slot_aware not defined");
         // Window covering the fn body — bound by next top-level fn
         // marker or end-of-file.
         let body_after = &src[fn_idx..];
@@ -34469,7 +35336,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
     /// equivalence chain extended to the Gemma 4 vision-aware soft-token
     /// surface.  Direct mirror of Qwen35 iter-C2d-cont-kernel iter-4 H70.
     #[test]
-    fn h116_slot_id_0_gemma4_soft_tokens_routes_through_generate_once_with_soft_tokens_byte_equivalent() {
+    fn h116_slot_id_0_gemma4_soft_tokens_routes_through_generate_once_with_soft_tokens_byte_equivalent(
+    ) {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
@@ -34638,7 +35506,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
              iter-2A hybrid typed error or route to slot 0's region."
         );
         // Hybrid scaffold restore pattern.
-        let hyb_restore_count = body.matches("g.multi_seq_kv_hybrid = multi_seq_hybrid").count();
+        let hyb_restore_count = body
+            .matches("g.multi_seq_kv_hybrid = multi_seq_hybrid")
+            .count();
         assert!(
             hyb_restore_count >= 4,
             "H118 FALSIFIED: the iter-5 lift call site does not put \
@@ -34664,9 +35534,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
     #[test]
     fn h119_slot_aware_soft_tokens_fn_calls_reset_for_slot_at_entry_and_exit() {
         // reset_for_slot primitives (iter-1's load-bearing add).
-        let kv_src = include_str!(
-            "../../../src/inference/models/gemma4/kv_cache.rs"
-        );
+        let kv_src = include_str!("../../../src/inference/models/gemma4/kv_cache.rs");
         assert!(
             kv_src.contains("pub fn reset_for_slot("),
             "H119 FALSIFIED: `reset_for_slot` is not defined in \
@@ -34678,9 +35546,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
         let fn_marker = "fn generate_gemma4_once_with_soft_tokens_slot_aware(";
         let fn_idx = src
             .find(fn_marker)
-            .expect(
-                "H119: generate_gemma4_once_with_soft_tokens_slot_aware not defined",
-            );
+            .expect("H119: generate_gemma4_once_with_soft_tokens_slot_aware not defined");
         // Window covering the fn body — bound by next top-level fn
         // marker or end-of-file.
         let body_after = &src[fn_idx..];
@@ -34935,9 +35801,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
              before merging."
         );
         // The §6.1.37 block names `iter-B4c-kernel iter-5`.
-        let block_start = adr
-            .find("### 6.1.37")
-            .expect("H122: §6.1.37 block missing");
+        let block_start = adr.find("### 6.1.37").expect("H122: §6.1.37 block missing");
         let block_end_off = adr[block_start..]
             .find("\n### ")
             .map(|off| block_start + off)
@@ -35181,9 +36045,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
              is missing — orchestrator cannot emit content tokens."
         );
         // (c) slot_id threaded through (not a hardcoded SlotId(0)).
-        let call_idx = fn_window.find(".forward_decode_slot_aware(").expect(
-            "H125: call marker present (asserted above)",
-        );
+        let call_idx = fn_window
+            .find(".forward_decode_slot_aware(")
+            .expect("H125: call marker present (asserted above)");
         let call_window = &fn_window[call_idx..(call_idx + 800).min(fn_window.len())];
         assert!(
             call_window.contains("slot_id"),
@@ -35282,9 +36146,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
              content tokens at SlotId(N>0)."
         );
         // (c) slot_id threaded through.
-        let call_idx = fn_window.find(".forward_decode_slot_aware(").expect(
-            "H127: call marker present (asserted above)",
-        );
+        let call_idx = fn_window
+            .find(".forward_decode_slot_aware(")
+            .expect("H127: call marker present (asserted above)");
         let call_window = &fn_window[call_idx..(call_idx + 800).min(fn_window.len())];
         assert!(
             call_window.contains("slot_id"),
@@ -35303,9 +36167,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
     /// is the load-bearing invariant.
     #[test]
     fn h128_serial_fifo_sibling_forward_decode_signature_unchanged() {
-        let src = include_str!(
-            "../../inference/models/gemma4/forward_gpu.rs"
-        );
+        let src = include_str!("../../inference/models/gemma4/forward_gpu.rs");
         let sibling_marker = "pub fn forward_decode(";
         let sib_idx = src
             .find(sibling_marker)
@@ -35381,7 +36243,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         // NOT call forward_decode_slot_aware (decode loop would corrupt
         // the L2-normalized embedding vector by overwriting norm_out).
         let embed_marker = "fn embed_gemma4_slot_aware(";
-        let embed_idx = src.find(embed_marker).expect("H129: embed_gemma4_slot_aware not found");
+        let embed_idx = src
+            .find(embed_marker)
+            .expect("H129: embed_gemma4_slot_aware not found");
         let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
         assert!(
             !embed_window.contains(".forward_decode_slot_aware("),
@@ -35735,9 +36599,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
     /// the byte-equivalence pin for SerialFifo + SlotId(0).
     #[test]
     fn h135_serial_fifo_sibling_forward_decode_signature_unchanged() {
-        let src = include_str!(
-            "../../inference/models/gemma4/forward_gpu.rs"
-        );
+        let src = include_str!("../../inference/models/gemma4/forward_gpu.rs");
         let sibling_marker = "pub fn forward_decode(";
         let sib_idx = src
             .find(sibling_marker)
@@ -35814,7 +36676,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         }
         // Embed-arm has NO decode loop (iter-4 §6.1.36 closure).
         let embed_marker = "fn embed_gemma4_slot_aware(";
-        let embed_idx = src.find(embed_marker).expect("H136: embed_gemma4_slot_aware not found");
+        let embed_idx = src
+            .find(embed_marker)
+            .expect("H136: embed_gemma4_slot_aware not found");
         let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
         assert!(
             !embed_window.contains(".forward_decode_slot_aware("),
@@ -36563,9 +37427,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
     fn h182_iter2d_dense_f32_branch_typed_error_replaced_with_slot_routing() {
         let src = include_str!("../forward_prefill.rs");
         let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
-        let fn_idx = src
-            .find(fn_marker)
-            .expect("H182: new fn marker present");
+        let fn_idx = src.find(fn_marker).expect("H182: new fn marker present");
         let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         let iter2d_typed_error =
             "gemma4-forward-prefill-slot-N-dense-F32 (iter-B4c-kernel-iter-2D per";
@@ -36727,10 +37589,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         // alloc site at line ~705 also constructs DenseKvBuffers, so
         // the expected count is ≥3 (1 legacy + 1 iter-2D prefill +
         // 1 iter-2D decode).
-        for required in [
-            "k: k_view,",
-            "v: v_view,",
-        ] {
+        for required in ["k: k_view,", "v: v_view,"] {
             let count = src.matches(required).count();
             assert!(
                 count >= 2,
@@ -36779,7 +37638,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         // HB norms layout (mirror of iter-2A-cont's norms_byte_offset
         // discipline).
         assert!(
-            src.matches("checked_mul(4u64) // F32 = 4 bytes/elem").count() >= 2,
+            src.matches("checked_mul(4u64) // F32 = 4 bytes/elem")
+                .count()
+                >= 2,
             "H186 FALSIFIED: forward_prefill.rs F32 4-byte/elem norms \
              multiplier marker appears <2 times — expected ≥2 (prefill + \
              decode MLX norms slot-view arithmetic)."
@@ -36818,11 +37679,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         // (a) Sibling fn forward_prefill_with_soft_tokens_resume's
         // signature is unchanged (no slot_id / multi_seq_kv params).
         let sibling_marker = "pub fn forward_prefill_with_soft_tokens_resume(";
-        let sibling_idx = src.find(sibling_marker).expect(
-            "H187: sibling fn forward_prefill_with_soft_tokens_resume present",
-        );
-        let sibling_sig =
-            &src[sibling_idx..(sibling_idx + 2_000).min(src.len())];
+        let sibling_idx = src
+            .find(sibling_marker)
+            .expect("H187: sibling fn forward_prefill_with_soft_tokens_resume present");
+        let sibling_sig = &src[sibling_idx..(sibling_idx + 2_000).min(src.len())];
         assert!(
             !sibling_sig.contains("slot_id:"),
             "H187 FALSIFIED: sibling `forward_prefill_with_soft_tokens_resume` \
@@ -36836,13 +37696,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         );
         // (b) Sibling fn forward_decode's signature is unchanged.
         let decode_sibling_marker = "pub fn forward_decode(";
-        let decode_idx = src
-            .find(decode_sibling_marker)
-            .or_else(|| {
-                // forward_decode may live in gemma4/forward_gpu.rs;
-                // check there if not in forward_prefill.rs.
-                None
-            });
+        let decode_idx = src.find(decode_sibling_marker).or_else(|| {
+            // forward_decode may live in gemma4/forward_gpu.rs;
+            // check there if not in forward_prefill.rs.
+            None
+        });
         // Either forward_decode is in forward_prefill.rs (skip-mode pin
         // would scan its sig here) or it's in gemma4/forward_gpu.rs
         // (skip the in-file check).
@@ -36931,11 +37789,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         // (g) Embed-arm must NOT call forward_decode_slot_aware (mirror
         // of H180).
         let fn_marker = "fn embed_gemma4_slot_aware(";
-        let embed_idx = src.find(fn_marker).expect(
-            "H188: embed_gemma4_slot_aware not found"
-        );
-        let embed_window =
-            &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        let embed_idx = src
+            .find(fn_marker)
+            .expect("H188: embed_gemma4_slot_aware not found");
+        let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
         assert!(
             !embed_window.contains(".forward_decode_slot_aware("),
             "H188 FALSIFIED: Embed-arm fn body calls \
@@ -37324,9 +38181,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
             .expect("H192: prefill slot-aware fn marker present");
         let prefill_window = &src[prefill_idx..(prefill_idx + 80_000).min(src.len())];
         assert!(
-            prefill_window.contains(
-                "let xlen_byte_offset: u64 = (slot_id.0 as u64)",
-            ),
+            prefill_window.contains("let xlen_byte_offset: u64 = (slot_id.0 as u64)",),
             "H192 FALSIFIED: prefill fn body does NOT contain the \
              `let xlen_byte_offset: u64 = (slot_id.0 as u64)` binding \
              — per-slot byte isolation at risk; SlotId(N>0) xlen \
@@ -37347,9 +38202,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
             .expect("H192: decode slot-aware fn marker present");
         let decode_window = &src[decode_idx..(decode_idx + 80_000).min(src.len())];
         assert!(
-            decode_window.contains(
-                "let xlen_byte_offset: u64 = (slot_id.0 as u64)",
-            ),
+            decode_window.contains("let xlen_byte_offset: u64 = (slot_id.0 as u64)",),
             "H192 FALSIFIED: decode fn body does NOT contain the \
              `let xlen_byte_offset: u64 = (slot_id.0 as u64)` binding \
              — decode-side per-slot byte isolation at risk."
@@ -37416,9 +38269,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
         // at slot-routing time (which would diverge from the alloc-
         // time decision per the LazyLock-cache discipline).
         assert!(
-            prefill_window.contains(
-                ".any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some())",
-            ),
+            prefill_window
+                .contains(".any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some())",),
             "H193 FALSIFIED: prefill fn body does NOT derive \
              `xlen_engaged` from buffer-field presence — risk of \
              slot-routing-time env-var read diverging from alloc-time \
@@ -37453,11 +38305,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
         // signature UNCHANGED (no slot_id / multi_seq_kv / xlen params
         // — H86 transitivity to xlen).
         let sibling_marker = "pub fn forward_prefill_with_soft_tokens_resume(";
-        let sibling_idx = src.find(sibling_marker).expect(
-            "H194: sibling fn forward_prefill_with_soft_tokens_resume present",
-        );
-        let sibling_sig =
-            &src[sibling_idx..(sibling_idx + 4_000).min(src.len())];
+        let sibling_idx = src
+            .find(sibling_marker)
+            .expect("H194: sibling fn forward_prefill_with_soft_tokens_resume present");
+        let sibling_sig = &src[sibling_idx..(sibling_idx + 4_000).min(src.len())];
         assert!(
             !sibling_sig.contains("slot_id:"),
             "H194 FALSIFIED: sibling `forward_prefill_with_soft_tokens_resume` \
@@ -37545,7 +38396,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
         // (e) iter-2C 4-bit (Vec-swap) mount STILL present
         // (H181 + H183 transitivity).
         assert!(
-            pf_src.matches("std::mem::replace(&mut self.kv_caches,").count() >= 2,
+            pf_src
+                .matches("std::mem::replace(&mut self.kv_caches,")
+                .count()
+                >= 2,
             "H195 FALSIFIED: 4-bit `std::mem::replace(&mut self.kv_caches,` \
              mount count < 2 (expected ≥2: prefill + decode) — \
              iter-2C (H181) or iter-2-decode-D-4bit (H183) regression."
@@ -37576,11 +38430,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
         // (h) Embed-arm fn body does NOT call forward_decode_slot_aware
         // (mirror of H180 / H188).
         let fn_marker = "fn embed_gemma4_slot_aware(";
-        let embed_idx = src.find(fn_marker).expect(
-            "H195: embed_gemma4_slot_aware not found"
-        );
-        let embed_window =
-            &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        let embed_idx = src
+            .find(fn_marker)
+            .expect("H195: embed_gemma4_slot_aware not found");
+        let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
         assert!(
             !embed_window.contains(".forward_decode_slot_aware("),
             "H195 FALSIFIED: Embed-arm fn body calls \
@@ -37833,9 +38686,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
     fn h198_serial_fifo_sibling_forward_decode_signature_unchanged() {
         // (a) Sibling forward_decode signature unchanged (mirror of
         // H135).
-        let src = include_str!(
-            "../../inference/models/gemma4/forward_gpu.rs"
-        );
+        let src = include_str!("../../inference/models/gemma4/forward_gpu.rs");
         let sibling_marker = "pub fn forward_decode(";
         let sib_idx = src
             .find(sibling_marker)
@@ -37899,8 +38750,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // `iter-2-decode-C-stream-tool-call` MUST NOT appear in the
         // Qwen35 architecture source (iter-2-decode-C-stream-tool-
         // call is a Gemma-only label).
-        let qwen35_src =
-            include_str!("../../inference/models/qwen35/gpu_delta_net.rs");
+        let qwen35_src = include_str!("../../inference/models/qwen35/gpu_delta_net.rs");
         assert!(
             !qwen35_src.contains("iter-2-decode-C-stream-tool-call"),
             "H199 FALSIFIED: Qwen35 gpu_delta_net.rs mentions \
@@ -37945,9 +38795,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // surface — its presence in a `send!(...Error(...))` call
         // would mean the typed-error abort was reinstated.
         assert!(
-            !fn_window.contains(
-                "streaming tool-call body at SlotId(N>0) requested"
-            ),
+            !fn_window.contains("streaming tool-call body at SlotId(N>0) requested"),
             "H200 FALSIFIED: slot-aware streaming fn body still \
              contains the iter-2-decode-C surviving sub-deferral SSE \
              Error event phrase `streaming tool-call body at \
@@ -37958,8 +38806,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // (c) finish_reason override present (H197 (d) transitivity).
         assert!(
             fn_window.contains("if saw_tool_call {")
-                && fn_window
-                    .contains("finish_reason = \"tool_calls\""),
+                && fn_window.contains("finish_reason = \"tool_calls\""),
             "H200 FALSIFIED: slot-aware streaming fn body lacks the \
              `if saw_tool_call {{ finish_reason = \"tool_calls\"; }}` \
              override — OpenAI tool-calls finish_reason contract \
@@ -37981,11 +38828,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // (a) Embed-arm body still does NOT call forward_decode_slot_
         // aware (mirror of H180 / H188 / H195).
         let embed_marker = "fn embed_gemma4_slot_aware(";
-        let embed_idx = src.find(embed_marker).expect(
-            "H201: embed_gemma4_slot_aware not found"
-        );
-        let embed_window =
-            &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        let embed_idx = src
+            .find(embed_marker)
+            .expect("H201: embed_gemma4_slot_aware not found");
+        let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
         assert!(
             !embed_window.contains(".forward_decode_slot_aware("),
             "H201 FALSIFIED: Embed-arm fn body calls \
@@ -38242,8 +39088,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
              iter-2-batched closure cite `{closure_cite}`.  H87 discipline \
              violated."
         );
-        let short_label =
-            "iter-B4c-kernel-iter-2-batched per ADR-040 §6.1.49";
+        let short_label = "iter-B4c-kernel-iter-2-batched per ADR-040 §6.1.49";
         assert!(
             src.contains(short_label),
             "H203 FALSIFIED: forward_prefill_batched.rs is missing the \
@@ -38317,7 +39162,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
                     }
                     i += 1;
                 }
-                if depth == 0 { i } else { (orch_idx + 75_000).min(src.len()) }
+                if depth == 0 {
+                    i
+                } else {
+                    (orch_idx + 75_000).min(src.len())
+                }
             };
             let orch_window = &src[orch_idx..body_end.min(src.len())];
 
@@ -38436,8 +39285,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
         // (a) Qwen35 architecture sources do NOT mention iter-2-embed /
         // iter-2-batched (these are Gemma 4 only labels on the
         // iter-B4c-kernel arc — iter-C2d-cont-kernel is the Qwen35 arc).
-        let qwen35_forward_gpu =
-            include_str!("../../inference/models/qwen35/forward_gpu.rs");
+        let qwen35_forward_gpu = include_str!("../../inference/models/qwen35/forward_gpu.rs");
         assert!(
             !qwen35_forward_gpu.contains("iter-2-embed per ADR-040"),
             "H206 FALSIFIED: Qwen35 forward_gpu.rs mentions \
@@ -38501,8 +39349,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
         let section_end_rel = adr[section_idx + 10..]
             .find("\n### ")
             .unwrap_or(adr.len() - section_idx - 10);
-        let section_window =
-            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        let section_window = &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
         assert!(
             section_window.contains("iter-2-embed"),
             "H206 FALSIFIED: §6.1.49 closure block does NOT name \
@@ -38709,7 +39556,9 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
         // logits dispatch for minimal LOC delta" is REMOVED.  That
         // exact phrasing was the pre-§6.1.50 marker.
         assert!(
-            !src.contains("keeps the simpler forward_gpu_last_logits dispatch for minimal LOC delta"),
+            !src.contains(
+                "keeps the simpler forward_gpu_last_logits dispatch for minimal LOC delta"
+            ),
             "H208 FALSIFIED: the pre-iter-G marker comment \
              `keeps the simpler forward_gpu_last_logits dispatch for \
              minimal LOC delta` is STILL present in engine_qwen35.rs. \
@@ -38788,7 +39637,8 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
         let src = include_str!("engine_qwen35.rs");
 
         // (a) SerialFifo pre-existing decode call site unchanged.
-        let serial_marker = ".forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))";
+        let serial_marker =
+            ".forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))";
         assert!(
             src.contains(serial_marker),
             "H210 FALSIFIED: the pre-iter-G `forward_gpu_greedy(.., \
@@ -38867,9 +39717,8 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
     ///     Gemma 4 in this iter).
     #[test]
     fn h211_qwen35_qwen3vl_surfaces_unchanged_by_iter_lcp_g_and_iter_2d_lcp() {
-        let src_qwen35_forward = include_str!(
-            "../../../src/inference/models/qwen35/forward_gpu.rs"
-        );
+        let src_qwen35_forward =
+            include_str!("../../../src/inference/models/qwen35/forward_gpu.rs");
 
         // (a) `forward_gpu_greedy` signature still accepts `slot_id:
         // SlotId` — B4d §6.1.44 H167 transitivity.
@@ -38881,8 +39730,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
             .find(") -> Result<u32>")
             .map(|off| fn_idx + off + ") -> Result<u32>".len())
             .unwrap_or(fn_idx + 1000);
-        let sig_window =
-            &src_qwen35_forward[fn_idx..sig_end.min(src_qwen35_forward.len())];
+        let sig_window = &src_qwen35_forward[fn_idx..sig_end.min(src_qwen35_forward.len())];
         assert!(
             sig_window.contains("slot_id: SlotId"),
             "H211 FALSIFIED: `forward_gpu_greedy` signature in qwen35/\
@@ -38979,8 +39827,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
         let section_end_rel = adr[section_idx + 10..]
             .find("\n### ")
             .unwrap_or(adr.len() - section_idx - 10);
-        let section_window =
-            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        let section_window = &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
         for required_label in [
             "iter-C2d-cont-kernel-iter-LCP",
             "iter-C2d-cont-kernel-iter-G",
@@ -39388,14 +40235,8 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         let section_end_rel = adr[section_idx + 10..]
             .find("\n### ")
             .unwrap_or(adr.len() - section_idx - 10);
-        let section_window =
-            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
-        for required_label in [
-            "iter-C2e",
-            "Qwen3-VL",
-            "iter-C2e-cont",
-            "iter-228a",
-        ] {
+        let section_window = &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        for required_label in ["iter-C2e", "Qwen3-VL", "iter-C2e-cont", "iter-228a"] {
             assert!(
                 section_window.contains(required_label),
                 "H223-cont FALSIFIED: §6.1.52 closure block does NOT \
@@ -39424,8 +40265,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
     /// `HF2Q_A4_MOE_AB_VALIDATION_E2E=1` + `HF2Q_CB_THROUGHPUT_MODEL`.
     #[test]
     fn h236_iter_a4_cont_moe_validation_env_gated_harness_exists() {
-        let bench_src =
-            include_str!("../../../tests/continuous_batching_throughput.rs");
+        let bench_src = include_str!("../../../tests/continuous_batching_throughput.rs");
         assert!(
             bench_src.contains("HF2Q_A4_MOE_AB_VALIDATION_E2E"),
             "H236 FALSIFIED: iter-A4-cont-moe-validation harness MUST \
@@ -39486,7 +40326,9 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         );
         // The iter-C2e-cont cite is named at each of the 4 worker arms
         // for forward-pointer to §6.1.55.
-        let n_cont_cites = engine_src.matches("iter-C2e-cont per ADR-040 §6.1.55").count();
+        let n_cont_cites = engine_src
+            .matches("iter-C2e-cont per ADR-040 §6.1.55")
+            .count();
         assert!(
             n_cont_cites >= 4,
             "H237 FALSIFIED: `iter-C2e-cont per ADR-040 §6.1.55` cite \
@@ -39546,8 +40388,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         let section_end_rel = adr[section_idx + 10..]
             .find("\n### ")
             .unwrap_or(adr.len() - section_idx - 10);
-        let section_window =
-            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        let section_window = &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
         // Names the 5 surviving deferrals.
         for required_label in [
             "iter-A4-cont-acceptance-telemetry",

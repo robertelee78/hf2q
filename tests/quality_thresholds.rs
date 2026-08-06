@@ -22,8 +22,8 @@
 fn dwq46_ppl_ratio_is_1_10_per_adr012_party_mode_2026_04_24() {
     // ADR-012 Decision 17 party-mode-confirmed (2026-04-24):
     //   "DWQ46 perplexity ≤ 1.10× F16 reference PPL"
-    let registry_src = std::fs::read_to_string("src/arch/registry.rs")
-        .expect("src/arch/registry.rs present");
+    let registry_src =
+        std::fs::read_to_string("src/arch/registry.rs").expect("src/arch/registry.rs present");
     assert!(
         registry_src.contains("ppl_ratio_dwq46: 1.10"),
         "ADR-012 Decision 17 requires DWQ46 PPL ratio = 1.10; src/arch/registry.rs must carry that literal. \
@@ -35,8 +35,8 @@ fn dwq46_ppl_ratio_is_1_10_per_adr012_party_mode_2026_04_24() {
 fn dwq48_ppl_ratio_is_1_05_per_adr012_party_mode_2026_04_24() {
     // ADR-012 Decision 17:
     //   "DWQ48 perplexity ≤ 1.05× F16 reference PPL"
-    let registry_src = std::fs::read_to_string("src/arch/registry.rs")
-        .expect("src/arch/registry.rs present");
+    let registry_src =
+        std::fs::read_to_string("src/arch/registry.rs").expect("src/arch/registry.rs present");
     assert!(
         registry_src.contains("ppl_ratio_dwq48: 1.05"),
         "ADR-012 Decision 17 requires DWQ48 PPL ratio = 1.05."
@@ -47,8 +47,8 @@ fn dwq48_ppl_ratio_is_1_05_per_adr012_party_mode_2026_04_24() {
 fn median_kl_is_0_02_nats_per_adr012_party_mode_2026_04_24() {
     // ADR-012 Decision 17:
     //   "Median KL-divergence per token < 0.02 nats"
-    let registry_src = std::fs::read_to_string("src/arch/registry.rs")
-        .expect("src/arch/registry.rs present");
+    let registry_src =
+        std::fs::read_to_string("src/arch/registry.rs").expect("src/arch/registry.rs present");
     assert!(
         registry_src.contains("max_median_kl: 0.02"),
         "ADR-012 Decision 17 requires median KL < 0.02 nats."
@@ -60,8 +60,8 @@ fn thresholds_appear_as_literal_constants_not_tbd() {
     // Decision 17 rejects "TBD" / "reasonable" values. The test
     // catches accidental refactors that migrate the constants to a
     // config file or environment lookup.
-    let registry_src = std::fs::read_to_string("src/arch/registry.rs")
-        .expect("src/arch/registry.rs present");
+    let registry_src =
+        std::fs::read_to_string("src/arch/registry.rs").expect("src/arch/registry.rs present");
     assert!(
         registry_src.contains("pub const ADR_012_DEFAULT: QualityThresholds"),
         "ADR_012_DEFAULT must be a `const`, not a runtime lookup."

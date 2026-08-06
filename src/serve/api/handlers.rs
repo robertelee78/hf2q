@@ -67,12 +67,8 @@ use crate::serve::quant_select::QuantType;
 /// | `<\|begin_of_text\|>` | Llama 3 / 3.1 / 3.2 |
 /// | `<s>` | Llama 1 / 2, Mistral |
 /// | `<\|im_start\|>` | Qwen 2 / 2.5 / 3 (start-of-turn used as BOS by `llama-embedding`) |
-pub(crate) const BOS_PROBE_FRAGMENTS: &[&str] = &[
-    "<bos>",
-    "<|begin_of_text|>",
-    "<s>",
-    "<|im_start|>",
-];
+pub(crate) const BOS_PROBE_FRAGMENTS: &[&str] =
+    &["<bos>", "<|begin_of_text|>", "<s>", "<|im_start|>"];
 
 /// Probe `tokenizer` for the first `BOS_PROBE_FRAGMENTS` entry it recognizes.
 /// Returns the corresponding token id, or `None` if no fragment matches
@@ -243,9 +239,9 @@ async fn resolve_engine_for_request(
         Result<Arc<LoadedEngine<Engine>>, HotSwapError>,
         tokio::task::JoinError,
     > = tokio::task::spawn_blocking(move || {
-        let mut w = pool_arc
-            .write()
-            .map_err(|e| HotSwapError::LoaderFailed(anyhow::anyhow!("pool rwlock poisoned: {e}")))?;
+        let mut w = pool_arc.write().map_err(|e| {
+            HotSwapError::LoaderFailed(anyhow::anyhow!("pool rwlock poisoned: {e}"))
+        })?;
         w.load_or_get(&pool_repo_blocking, pool_quant, &gguf_path, &engine_config)
     })
     .await;
@@ -279,11 +275,9 @@ fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
                     "model {repo_id} exceeds pool memory budget; \
                      try a smaller quant or raise the budget"
                 ),
-                PoolError::ZeroCapacity => {
-                    "multi-model pool has capacity_models = 0; \
+                PoolError::ZeroCapacity => "multi-model pool has capacity_models = 0; \
                      operator must raise capacity"
-                        .to_string()
-                }
+                    .to_string(),
             };
             ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -301,7 +295,10 @@ fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
             tracing::error!(error = %inner, "hot-swap loader failed");
             ApiError::generation_error(format!("model load failed: {inner}")).into_response()
         }
-        HotSwapError::FileSize { ref path, ref source } => {
+        HotSwapError::FileSize {
+            ref path,
+            ref source,
+        } => {
             tracing::error!(
                 path = %path.display(), error = %source,
                 "hot-swap file size read failed"
@@ -350,11 +347,17 @@ pub async fn chat_completions(
     let prepared = match prepare_chat_generation(&state, &req).await {
         Ok(p) => p,
         Err(resp) => {
-            state.metrics.requests_rejected_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .requests_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
             return resp;
         }
     };
-    state.metrics.chat_completions_started.fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .chat_completions_started
+        .fetch_add(1, Ordering::Relaxed);
 
     // ── ADR-005 Phase 4 reopen iter-216 Wedge-3 — Qwen3.5/3.6 chat live ──
     //
@@ -467,7 +470,10 @@ async fn chat_completions_with_prepared(
             let msg = format!("{e:#}");
             // Distinguish queue_full (→ 429) from other engine errors (→ 500).
             if msg.contains("queue_full") {
-                state.metrics.chat_completions_queue_full.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .chat_completions_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
                 return queue_full_with_rate_limit_headers(&state);
             }
             // ADR-040 §3.5 iter-A5b — typed-prefix routing for the
@@ -519,9 +525,18 @@ async fn chat_completions_with_prepared(
         }
     };
     let total_time = gen_started.elapsed();
-    state.metrics.chat_completions_completed.fetch_add(1, Ordering::Relaxed);
-    state.metrics.prompt_tokens_total.fetch_add(result.prompt_tokens as u64, Ordering::Relaxed);
-    state.metrics.decode_tokens_total.fetch_add(result.completion_tokens as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .chat_completions_completed
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .prompt_tokens_total
+        .fetch_add(result.prompt_tokens as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .decode_tokens_total
+        .fetch_add(result.completion_tokens as u64, Ordering::Relaxed);
 
     // --- Wrap in OpenAI response envelope ---
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -567,11 +582,7 @@ async fn chat_completions_with_prepared(
     // logic.  A4 passes the tool_call_policy so Constrained parse failures
     // surface as 500 errors instead of silently falling back to Content.
     let registration = engine.registration();
-    let extracted = extract_tool_calls_from_text(
-        &result.text,
-        registration,
-        tool_call_policy,
-    );
+    let extracted = extract_tool_calls_from_text(&result.text, registration, tool_call_policy);
 
     // A4: promote Constrained parse failure to 500.
     if let Some(failed_body) = extracted.constrained_parse_failure {
@@ -579,8 +590,7 @@ async fn chat_completions_with_prepared(
             body = %failed_body,
             "tool_call_parse_failure: Constrained tool_choice but model emitted unparseable body"
         );
-        return ApiError::generation_error("tool_call_parse_failure".to_string())
-            .into_response();
+        return ApiError::generation_error("tool_call_parse_failure".to_string()).into_response();
     }
 
     // Wave 2.7 W-η defensive 500 (extracted into
@@ -616,7 +626,11 @@ async fn chat_completions_with_prepared(
             };
             // OpenAI spec: finish_reason == "tool_calls" whenever at least one
             // structured tool call was emitted.
-            (content, Some(extracted.tool_calls), "tool_calls".to_string())
+            (
+                content,
+                Some(extracted.tool_calls),
+                "tool_calls".to_string(),
+            )
         };
 
     let resp = ChatCompletionResponse {
@@ -667,13 +681,20 @@ async fn chat_completions_with_prepared(
             prompt_tokens_details: Some(PromptTokensDetails {
                 cached_tokens: result.cached_tokens,
             }),
-            completion_tokens_details: reasoning_tokens
-                .map(|reasoning_tokens| super::schema::CompletionTokensDetails { reasoning_tokens }),
+            completion_tokens_details: reasoning_tokens.map(|reasoning_tokens| {
+                super::schema::CompletionTokensDetails { reasoning_tokens }
+            }),
         },
         x_hf2q_timing: Some(timing),
     };
     let mut response = (StatusCode::OK, Json(resp)).into_response();
-    apply_transparency_headers(&state, &req, &mut response, summarized_messages, summary_tokens);
+    apply_transparency_headers(
+        &state,
+        &req,
+        &mut response,
+        summarized_messages,
+        summary_tokens,
+    );
     apply_vit_transparency_headers(
         &mut response,
         vit_forward_ms,
@@ -734,10 +755,18 @@ fn extract_tool_calls_from_text(
     // If there's no model registration or the registration has no tool markers,
     // there can't be any tool calls — return the text unchanged.
     let Some(reg) = registration else {
-        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new(), constrained_parse_failure: None };
+        return ExtractedToolCalls {
+            content: text.to_string(),
+            tool_calls: Vec::new(),
+            constrained_parse_failure: None,
+        };
     };
     let Some(mut tool_splitter) = registry::ToolCallSplitter::from_registration(reg) else {
-        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new(), constrained_parse_failure: None };
+        return ExtractedToolCalls {
+            content: text.to_string(),
+            tool_calls: Vec::new(),
+            constrained_parse_failure: None,
+        };
     };
 
     let mut content = String::new();
@@ -772,8 +801,7 @@ fn extract_tool_calls_from_text(
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_nanos() as u64)
                                         .unwrap_or(0)
-                                        ^ (tc_index as u64)
-                                            .wrapping_mul(0x9e3779b97f4a7c15)
+                                        ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
                                 );
                                 tool_calls.push(super::schema::ToolCall {
                                     id,
@@ -859,7 +887,11 @@ fn extract_tool_calls_from_text(
         }
     }
 
-    ExtractedToolCalls { content, tool_calls, constrained_parse_failure: parse_failure }
+    ExtractedToolCalls {
+        content,
+        tool_calls,
+        constrained_parse_failure: parse_failure,
+    }
 }
 
 /// Apply Decision #23 transparency headers on a chat-completion response.
@@ -881,8 +913,8 @@ fn apply_transparency_headers(
     summarized_messages: Option<usize>,
     summary_tokens: Option<usize>,
 ) {
-    use axum::http::{header::HeaderName, HeaderValue};
     use super::schema::OverflowPolicy;
+    use axum::http::{header::HeaderName, HeaderValue};
     let policy = req
         .hf2q_overflow_policy
         .unwrap_or(state.config.default_overflow_policy);
@@ -914,9 +946,8 @@ fn apply_transparency_headers(
 /// Used by the injectable seam added for ADR-005 wave-1.5 Codex fix T1.1.
 type ResolverBoxFuture<'s> = std::pin::Pin<
     Box<
-        dyn std::future::Future<
-                Output = std::result::Result<Arc<LoadedEngine<Engine>>, Response>,
-            > + Send
+        dyn std::future::Future<Output = std::result::Result<Arc<LoadedEngine<Engine>>, Response>>
+            + Send
             + 's,
     >,
 >;
@@ -1057,11 +1088,11 @@ where
     // → N image tokens + MlxBuffer alloc + range computation) runs
     // after the standard render/tokenize/overflow pipeline so its
     // inputs are exactly the prompt tokens the engine sees.
-    let preprocessed_inputs =
-        match process_multimodal_content(&req.messages, state.mmproj.as_ref()) {
-            Ok(imgs) => imgs,
-            Err(resp) => return Err(resp),
-        };
+    let preprocessed_inputs = match process_multimodal_content(&req.messages, state.mmproj.as_ref())
+    {
+        Ok(imgs) => imgs,
+        Err(resp) => return Err(resp),
+    };
     let (
         messages_for_render,
         vision_embeddings,
@@ -1093,20 +1124,19 @@ where
         // (extracted iter-2 of mmproj-on-generate so SERVE + CLI share
         // one path); request-shape-specific concerns (chat-message
         // rewriting) stay here at the call site.
-        let pipeline_out =
-            match crate::inference::vision::pipeline::run_vit_forward(
-                &preprocessed_inputs,
-                mmproj,
-                engine.hidden_size(),
-            ) {
-                Ok(out) => out,
-                Err(e) => {
-                    return Err(ApiError::generation_error(format!(
-                        "ViT forward failed: {e:#}"
-                    ))
-                    .into_response());
-                }
-            };
+        let pipeline_out = match crate::inference::vision::pipeline::run_vit_forward(
+            &preprocessed_inputs,
+            mmproj,
+            engine.hidden_size(),
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                return Err(
+                    ApiError::generation_error(format!("ViT forward failed: {e:#}"))
+                        .into_response(),
+                );
+            }
+        };
         let n_images = pipeline_out.embeddings.len();
         let rewritten =
             rewrite_messages_for_vision_placeholders_family(&req.messages, pipeline_out.family);
@@ -1285,11 +1315,7 @@ where
         .max_completion_tokens
         .or(req.max_tokens)
         .unwrap_or(SamplingParams::default().max_tokens);
-    let stop_strings = req
-        .stop
-        .clone()
-        .map(|s| s.into_vec())
-        .unwrap_or_default();
+    let stop_strings = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
     // Translate request logit_bias (HashMap<String, f32>) → HashMap<u32, f32>.
     // OpenAI keys are stringified token ids; we accept any string that parses
     // as an unsigned int. Malformed keys are silently dropped + warned.
@@ -1335,8 +1361,12 @@ where
         super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_) => {
             engine::ToolCallPolicy::Constrained
         }
-        super::schema::ToolChoiceValue::Auto if effective_grammar.is_some()
-            && matches!(effective_grammar_kind, engine::GrammarKind::ToolCallBodyAuto) =>
+        super::schema::ToolChoiceValue::Auto
+            if effective_grammar.is_some()
+                && matches!(
+                    effective_grammar_kind,
+                    engine::GrammarKind::ToolCallBodyAuto
+                ) =>
         {
             // Wave 3 W-B2: Auto with a compiled lazy grammar.  The
             // `effective_grammar_kind == ToolCallBodyAuto` guard ensures
@@ -1388,7 +1418,11 @@ where
         Vec<engine::SoftTokenData>,
         Vec<Vec<u32>>,
     ) = if vision_embeddings.is_empty() {
-        (prompt_tokens, Vec::<engine::SoftTokenData>::new(), Vec::new())
+        (
+            prompt_tokens,
+            Vec::<engine::SoftTokenData>::new(),
+            Vec::new(),
+        )
     } else {
         match expand_image_placeholders_family(
             engine,
@@ -1545,8 +1579,7 @@ fn dispatch_qwen3vl_seam_split(
 
     // Per-image n_image_tokens derived from augmented-embed length.
     // Phase-2: per-image counts may differ; we collect them into a Vec.
-    let mut per_image_n_image_tokens: Vec<usize> =
-        Vec::with_capacity(vision_embeddings.len());
+    let mut per_image_n_image_tokens: Vec<usize> = Vec::with_capacity(vision_embeddings.len());
     for (i, e) in vision_embeddings.iter().enumerate() {
         if e.len() % per_row_floats != 0 {
             return Err(ApiError::generation_error(format!(
@@ -1583,13 +1616,10 @@ fn dispatch_qwen3vl_seam_split(
         // the expanded prompt — image regions get the standard
         // `[t,t,t,t]` text broadcast since no Wedge-4d hooks consume
         // them at decode time anyway).
-        let flat = build_qwen3vl_positions(final_prompt_tokens.len(), &[])
-            .map_err(|e| {
-                ApiError::generation_error(format!(
-                    "build_qwen3vl_positions (no images): {e}"
-                ))
+        let flat = build_qwen3vl_positions(final_prompt_tokens.len(), &[]).map_err(|e| {
+            ApiError::generation_error(format!("build_qwen3vl_positions (no images): {e}"))
                 .into_response()
-            })?;
+        })?;
         return Ok((
             engine::DeepstackData {
                 image_token_positions: Vec::new(),
@@ -1603,10 +1633,8 @@ fn dispatch_qwen3vl_seam_split(
     // deepstack chunk slot. Phase-2: total_n_image_tokens is the SUM
     // of per-image counts (differing across images).
     let mlx_dev = mlx_native::MlxDevice::new().map_err(|e| {
-        ApiError::generation_error(format!(
-            "dispatch_qwen3vl_seam_split: MlxDevice::new: {e}"
-        ))
-        .into_response()
+        ApiError::generation_error(format!("dispatch_qwen3vl_seam_split: MlxDevice::new: {e}"))
+            .into_response()
     })?;
     let chunk_byte_len = total_n_image_tokens * hidden * std::mem::size_of::<f32>();
     let mut chunks: Vec<mlx_native::MlxBuffer> = Vec::with_capacity(n_deepstack);
@@ -1642,8 +1670,7 @@ fn dispatch_qwen3vl_seam_split(
             for r in 0..n_img_i {
                 let src_base = r * per_row_floats + (j + 1) * hidden;
                 let dst_base = (row_offset + r) * hidden;
-                dst[dst_base..dst_base + hidden]
-                    .copy_from_slice(&src[src_base..src_base + hidden]);
+                dst[dst_base..dst_base + hidden].copy_from_slice(&src[src_base..src_base + hidden]);
             }
             row_offset += n_img_i;
         }
@@ -1665,9 +1692,7 @@ fn dispatch_qwen3vl_seam_split(
     // `n_x * n_y` matches the augmented-embed row count
     // `per_image_n_image_tokens[i]` so a producer/consumer mismatch
     // fails LOUD here rather than silently mis-routing positions.
-    if !qwen3vl_image_grids.is_empty()
-        && qwen3vl_image_grids.len() != vision_embeddings.len()
-    {
+    if !qwen3vl_image_grids.is_empty() && qwen3vl_image_grids.len() != vision_embeddings.len() {
         return Err(ApiError::generation_error(format!(
             "dispatch_qwen3vl_seam_split: qwen3vl_image_grids.len()={} != \
              vision_embeddings.len()={} — one (n_x, n_y) entry required \
@@ -1810,8 +1835,7 @@ async fn chat_completions_stream(
     // Worker bumps this counter if it aborts because the SSE receiver was
     // dropped (client disconnect per Decision #18). Shared atomic lives on
     // ServerMetrics so /metrics surfaces it.
-    let cancellation_counter =
-        Some(state.metrics.sse_cancellations_counter_arc());
+    let cancellation_counter = Some(state.metrics.sse_cancellations_counter_arc());
     // ADR-040 §3.5 iter-A5b — PRE-STREAM per-slot KV budget check.
     // Per codex review CRITICAL #2 (handlers.rs:1739-1748 originally
     // string-matched `queue_full` only AND streaming-arm admit
@@ -1836,8 +1860,7 @@ async fn chat_completions_stream(
                     budget_bytes,
                     "chat_completions_stream: ADR-040 §3.5 A5b pre-stream slot_budget_exceeded"
                 );
-                return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes)
-                    .into_response();
+                return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response();
             }
         }
     }
@@ -1890,10 +1913,15 @@ async fn chat_completions_stream(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono_seconds();
-    let sse =
-        generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts);
+    let sse = generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts);
     let mut response = sse.into_response();
-    apply_transparency_headers(&state, &req, &mut response, summarized_messages, summary_tokens);
+    apply_transparency_headers(
+        &state,
+        &req,
+        &mut response,
+        summarized_messages,
+        summary_tokens,
+    );
     response
 }
 
@@ -2040,9 +2068,7 @@ pub(crate) struct SummarySplit {
 /// in `summary_window` becomes a single line `"<ROLE>: <content>"`.
 /// Non-text content parts are silently dropped (image_url etc. — the
 /// summarizer can't see images anyway).
-pub(crate) fn build_summary_user_text(
-    summary_window: &[super::schema::ChatMessage],
-) -> String {
+pub(crate) fn build_summary_user_text(summary_window: &[super::schema::ChatMessage]) -> String {
     use super::schema::MessageContent;
     let mut buf = String::with_capacity(summary_window.len() * 80);
     buf.push_str(
@@ -2077,9 +2103,7 @@ pub(crate) fn build_summary_user_text(
 /// the rewritten message list. Wraps the model's summary in a marker
 /// prefix so downstream consumers can recognize and (if they want)
 /// re-expand from cached history.
-pub(crate) fn build_synthetic_summary_message(
-    summary_text: &str,
-) -> super::schema::ChatMessage {
+pub(crate) fn build_synthetic_summary_message(summary_text: &str) -> super::schema::ChatMessage {
     super::schema::ChatMessage {
         role: "system".to_string(),
         content: Some(super::schema::MessageContent::Text(format!(
@@ -2126,8 +2150,13 @@ async fn apply_overflow_policy(
 ) -> std::result::Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     use super::schema::OverflowPolicy;
 
-    let (tokens, n) =
-        render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking, template_kwargs)?;
+    let (tokens, n) = render_and_tokenize_for_overflow(
+        engine,
+        messages,
+        tools,
+        enable_thinking,
+        template_kwargs,
+    )?;
     let ctx_len = match engine.context_length() {
         Some(c) => c,
         None => return Ok((tokens, n, None, None)), // no advertised ctx → trust the caller
@@ -2155,8 +2184,15 @@ async fn apply_overflow_policy(
             Ok((t, n, None, None))
         }
         OverflowPolicy::Summarize => {
-            apply_summarize(engine, messages, ctx_len, tools, enable_thinking, template_kwargs)
-                .await
+            apply_summarize(
+                engine,
+                messages,
+                ctx_len,
+                tools,
+                enable_thinking,
+                template_kwargs,
+            )
+            .await
         }
     }
 }
@@ -2240,9 +2276,13 @@ fn apply_truncate_left(
     });
     match outcome {
         TruncateOutcome::Fits(_, _) => Ok((initial_tokens, initial_n)),
-        TruncateOutcome::Truncated(shrunk, _, _) => {
-            render_and_tokenize_for_overflow(engine, &shrunk, tools, enable_thinking, template_kwargs)
-        }
+        TruncateOutcome::Truncated(shrunk, _, _) => render_and_tokenize_for_overflow(
+            engine,
+            &shrunk,
+            tools,
+            enable_thinking,
+            template_kwargs,
+        ),
         TruncateOutcome::CannotShrink { ctx_len, actual } => {
             Err(ApiError::context_length_exceeded(ctx_len, actual).into_response())
         }
@@ -2273,8 +2313,13 @@ async fn apply_summarize(
     if split.summary_window.is_empty() {
         // Nothing to summarize — fall through to truncate_left without
         // populating the summarize-specific transparency counters.
-        let (initial_tokens, initial_n) =
-            render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking, template_kwargs)?;
+        let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(
+            engine,
+            messages,
+            tools,
+            enable_thinking,
+            template_kwargs,
+        )?;
         let (t, n) = apply_truncate_left(
             engine,
             messages,
@@ -2332,8 +2377,13 @@ async fn apply_summarize(
     // (e.g. a single 50k-token user dump) — fall back to truncate_left
     // on the original message list.
     if summary_prompt_n + SUMMARIZE_MAX_TOKENS >= ctx_len {
-        let (initial_tokens, initial_n) =
-            render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking, template_kwargs)?;
+        let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(
+            engine,
+            messages,
+            tools,
+            enable_thinking,
+            template_kwargs,
+        )?;
         let (t, n) = apply_truncate_left(
             engine,
             messages,
@@ -2385,10 +2435,10 @@ async fn apply_summarize(
             // could not deliver. Don't silently fall through, that hides
             // overload from the operator.
             tracing::warn!(error = %e, "summarize engine.generate failed");
-            return Err(ApiError::generation_error(format!(
-                "summarize forward pass failed: {e}"
-            ))
-            .into_response());
+            return Err(
+                ApiError::generation_error(format!("summarize forward pass failed: {e}"))
+                    .into_response(),
+            );
         }
     };
     let (summary_text, summary_completion_tokens) = summary_text;
@@ -2402,8 +2452,13 @@ async fn apply_summarize(
 
     let summarized_count = split.summary_window.len();
 
-    let (new_tokens, new_n) =
-        render_and_tokenize_for_overflow(engine, &new_messages, tools, enable_thinking, template_kwargs)?;
+    let (new_tokens, new_n) = render_and_tokenize_for_overflow(
+        engine,
+        &new_messages,
+        tools,
+        enable_thinking,
+        template_kwargs,
+    )?;
     if new_n < ctx_len {
         return Ok((
             new_tokens,
@@ -2457,8 +2512,8 @@ async fn apply_summarize(
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::*;
     use super::super::schema::{ChatMessage, MessageContent};
+    use super::*;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -2511,7 +2566,10 @@ mod truncate_tests {
                 assert_eq!(retained[0].role, "system");
                 assert_eq!(retained[1].role, "user");
                 // Last user should be the ORIGINAL last-user (the "final" msg).
-                assert_eq!(retained[1].content.as_ref().map(|c| c.text()).unwrap(), "final");
+                assert_eq!(
+                    retained[1].content.as_ref().map(|c| c.text()).unwrap(),
+                    "final"
+                );
                 assert_eq!(n, 20);
                 assert_eq!(iters, 4); // dropped u1, a1, u2, a2
             }
@@ -2546,7 +2604,10 @@ mod truncate_tests {
             TruncateOutcome::Truncated(retained, n, _) => {
                 assert_eq!(retained.len(), 1);
                 assert_eq!(retained[0].role, "user");
-                assert_eq!(retained[0].content.as_ref().map(|c| c.text()).unwrap(), "final");
+                assert_eq!(
+                    retained[0].content.as_ref().map(|c| c.text()).unwrap(),
+                    "final"
+                );
                 assert_eq!(n, 10);
             }
             other => panic!("expected Truncated, got {:?}", other),
@@ -2618,11 +2679,7 @@ mod truncate_tests {
     #[test]
     fn split_for_summarize_keep_count_exceeds_tail_means_no_summary() {
         // 1 system + 2 non-system, keep_recent=4 → all non-system in recent.
-        let msgs = vec![
-            msg("system", "s"),
-            msg("user", "u"),
-            msg("assistant", "a"),
-        ];
+        let msgs = vec![msg("system", "s"), msg("user", "u"), msg("assistant", "a")];
         let s = split_for_summarize(&msgs, 4);
         assert_eq!(s.system_prefix.len(), 1);
         assert!(s.summary_window.is_empty());
@@ -2644,27 +2701,31 @@ mod truncate_tests {
         // Tail = 5 (u1 a1 u2 a2 u3). keep_recent=2 → recent = [a2, u3], summary = [u1, a1, u2].
         assert_eq!(s.system_prefix.len(), 1);
         assert_eq!(s.summary_window.len(), 3);
-        assert_eq!(s.summary_window[0].content,
-            Some(MessageContent::Text("u1".into())));
-        assert_eq!(s.summary_window[2].content,
-            Some(MessageContent::Text("u2".into())));
+        assert_eq!(
+            s.summary_window[0].content,
+            Some(MessageContent::Text("u1".into()))
+        );
+        assert_eq!(
+            s.summary_window[2].content,
+            Some(MessageContent::Text("u2".into()))
+        );
         assert_eq!(s.recent_window.len(), 2);
-        assert_eq!(s.recent_window[1].content,
-            Some(MessageContent::Text("u3".into())));
+        assert_eq!(
+            s.recent_window[1].content,
+            Some(MessageContent::Text("u3".into()))
+        );
     }
 
     #[test]
     fn split_for_summarize_no_system_prefix() {
-        let msgs = vec![
-            msg("user", "u1"),
-            msg("assistant", "a1"),
-            msg("user", "u2"),
-        ];
+        let msgs = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
         let s = split_for_summarize(&msgs, 2);
         assert!(s.system_prefix.is_empty());
         assert_eq!(s.summary_window.len(), 1);
-        assert_eq!(s.summary_window[0].content,
-            Some(MessageContent::Text("u1".into())));
+        assert_eq!(
+            s.summary_window[0].content,
+            Some(MessageContent::Text("u1".into()))
+        );
         assert_eq!(s.recent_window.len(), 2);
     }
 
@@ -2698,11 +2759,18 @@ mod truncate_tests {
         let m = ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "see this:".into() },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl { url: "data:img...".into(), detail: None },
+                ContentPart::Text {
+                    text: "see this:".into(),
                 },
-                ContentPart::Text { text: "and this".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:img...".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text {
+                    text: "and this".into(),
+                },
             ])),
             reasoning_content: None,
             tool_calls: None,
@@ -2824,17 +2892,16 @@ fn process_multimodal_content(
     let mut out: Vec<VisionInput> = Vec::with_capacity(image_refs.len());
     for (mi, pi, image_url) in image_refs {
         // Parse the URL (data URI / file:// / bare path / http).
-        let parsed = crate::inference::vision::parse_image_url(&image_url.url)
-            .map_err(|e| {
-                ApiError::invalid_request(
-                    format!(
-                        "messages[{}].content[{}].image_url parse failed: {}",
-                        mi, pi, e
-                    ),
-                    Some(format!("messages[{}].content[{}]", mi, pi)),
-                )
-                .into_response()
-            })?;
+        let parsed = crate::inference::vision::parse_image_url(&image_url.url).map_err(|e| {
+            ApiError::invalid_request(
+                format!(
+                    "messages[{}].content[{}].image_url parse failed: {}",
+                    mi, pi, e
+                ),
+                Some(format!("messages[{}].content[{}]", mi, pi)),
+            )
+            .into_response()
+        })?;
         // Compute a source_label before consuming `parsed` into the loader.
         let source_label = match &parsed {
             crate::inference::vision::ImageInput::DataUri { mime_type, .. } => mime_type.clone(),
@@ -2862,8 +2929,8 @@ fn process_multimodal_content(
                 // SigLIP-49 / classic-CLIP: square fixed-size pixels.
                 let preprocess_cfg = mmproj.config.preprocess_config();
                 let pixel_values =
-                    crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
-                        .map_err(|e| {
+                    crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg).map_err(
+                        |e| {
                             ApiError::invalid_request(
                                 format!(
                                     "messages[{}].content[{}].image_url preprocess failed: {}",
@@ -2872,7 +2939,8 @@ fn process_multimodal_content(
                                 Some(format!("messages[{}].content[{}]", mi, pi)),
                             )
                             .into_response()
-                        })?;
+                        },
+                    )?;
                 out.push(VisionInput::Siglip49(
                     crate::inference::vision::PreprocessedImage {
                         pixel_values,
@@ -2886,18 +2954,19 @@ fn process_multimodal_content(
             ArchProfile::Gemma4Siglip => {
                 // Variable-resolution patches + per-patch 2D pos arrays.
                 let cfg = &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT;
-                let preprocessed =
-                    crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, cfg)
-                        .map_err(|e| {
-                            ApiError::invalid_request(
-                                format!(
-                                    "messages[{}].content[{}].image_url gemma4v preprocess failed: {}",
-                                    mi, pi, e
-                                ),
-                                Some(format!("messages[{}].content[{}]", mi, pi)),
-                            )
-                            .into_response()
-                        })?;
+                let preprocessed = crate::inference::vision::preprocess::preprocess_gemma4v(
+                    &bytes, cfg,
+                )
+                .map_err(|e| {
+                    ApiError::invalid_request(
+                        format!(
+                            "messages[{}].content[{}].image_url gemma4v preprocess failed: {}",
+                            mi, pi, e
+                        ),
+                        Some(format!("messages[{}].content[{}]", mi, pi)),
+                    )
+                    .into_response()
+                })?;
                 out.push(VisionInput::Gemma4v(Gemma4vPreprocessedImage {
                     patches: preprocessed.patches,
                     pos_x: preprocessed.pos_x,
@@ -2928,23 +2997,22 @@ fn process_multimodal_content(
                         ))
                         .into_response()
                     })?;
-                let preprocessed =
-                    crate::inference::vision::preprocess::preprocess_qwen3vl(
-                        &bytes,
-                        &qcfg,
-                        mmproj.config.image_size,
-                    )
-                    .map_err(|e| {
-                        ApiError::invalid_request(
-                            format!(
-                                "messages[{}].content[{}].image_url qwen3vl preprocess \
+                let preprocessed = crate::inference::vision::preprocess::preprocess_qwen3vl(
+                    &bytes,
+                    &qcfg,
+                    mmproj.config.image_size,
+                )
+                .map_err(|e| {
+                    ApiError::invalid_request(
+                        format!(
+                            "messages[{}].content[{}].image_url qwen3vl preprocess \
                                  failed: {e}",
-                                mi, pi
-                            ),
-                            Some(format!("messages[{}].content[{}]", mi, pi)),
-                        )
-                        .into_response()
-                    })?;
+                            mi, pi
+                        ),
+                        Some(format!("messages[{}].content[{}]", mi, pi)),
+                    )
+                    .into_response()
+                })?;
                 // Phase-2: per-image rectangular pixel grid is carried
                 // through `pixel_w` / `pixel_h`; downstream
                 // `compute_vision_embeddings_gpu_qwen3vl` derives
@@ -3071,9 +3139,7 @@ fn rewrite_messages_for_vision_placeholders_family(
 
     let placeholder_marker: String = match family {
         VisionFamily::Gemma => "<|image|>".to_string(),
-        VisionFamily::Qwen3Vl => {
-            "<|vision_start|><|image_pad|><|vision_end|>".to_string()
-        }
+        VisionFamily::Qwen3Vl => "<|vision_start|><|image_pad|><|vision_end|>".to_string(),
         // Unknown shouldn't reach here (gate at `process_multimodal_content`),
         // but produce a deterministic empty marker so the caller's
         // tokenization is well-defined; the request is already rejected.
@@ -3242,10 +3308,7 @@ fn expand_image_placeholders_family(
     embeddings: &[Vec<f32>],
     family: crate::inference::vision::mmproj::VisionFamily,
     per_row_floats: usize,
-) -> std::result::Result<
-    (Vec<u32>, Vec<engine::SoftTokenData>, Vec<Vec<u32>>),
-    Response,
-> {
+) -> std::result::Result<(Vec<u32>, Vec<engine::SoftTokenData>, Vec<Vec<u32>>), Response> {
     // Thin handler-side wrapper around the shared
     // `inference::vision::pipeline::expand_image_placeholders` so SERVE
     // and the CLI `--image` path use one implementation. The wrapper
@@ -3319,8 +3382,7 @@ ws ::= | " " | "\n" [ \t]{0,20}
     };
     match grammar::parser::parse(&gbnf) {
         Ok(g) => Ok(Some(g)),
-        Err(e) => Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e))
-            .into_response()),
+        Err(e) => Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e)).into_response()),
     }
 }
 
@@ -3388,9 +3450,7 @@ fn select_effective_grammar(
 /// over `ToolChoiceValue`: `None` returns the `Default`
 /// (`ResponseFormat`) which is never read because no tool grammar is
 /// produced under `tool_choice=none`.
-fn tool_grammar_kind_for(
-    tool_choice: &super::schema::ToolChoiceValue,
-) -> engine::GrammarKind {
+fn tool_grammar_kind_for(tool_choice: &super::schema::ToolChoiceValue) -> engine::GrammarKind {
     use super::schema::ToolChoiceValue;
     match tool_choice {
         // Auto with a compiled grammar = lazy (awaiting_trigger=true).
@@ -3550,8 +3610,10 @@ fn compile_tool_grammar(
     // also matters for precondition strictness:
     //   * Required/Function: missing tools[] OR unknown family ⇒ Err(400)
     //   * Auto              : missing tools[] OR unknown family ⇒ Ok(None)
-    let constrain =
-        matches!(tool_choice, ToolChoiceValue::Required | ToolChoiceValue::Function(_));
+    let constrain = matches!(
+        tool_choice,
+        ToolChoiceValue::Required | ToolChoiceValue::Function(_)
+    );
 
     // Wave 2.8 W-θ MED — hard-error when tool_choice=required/function but
     // the request has no tools[] declared. Silently returning Ok(None)
@@ -3654,7 +3716,10 @@ fn compile_tool_grammar(
             let found: Vec<_> = tools.iter().filter(|t| t.function.name == *name).collect();
             if found.is_empty() {
                 return Err(ApiError::invalid_request(
-                    format!("tool_choice.function.name '{}' not found in tools list", name),
+                    format!(
+                        "tool_choice.function.name '{}' not found in tools list",
+                        name
+                    ),
                     Some("tool_choice".into()),
                 )
                 .into_response());
@@ -3789,11 +3854,9 @@ fn compile_tool_grammar(
 
     match grammar::parser::parse(&combined_gbnf) {
         Ok(g) => Ok(Some(g)),
-        Err(e) => Err(ApiError::grammar_error(format!(
-            "tool call GBNF parse failed: {}",
-            e
-        ))
-        .into_response()),
+        Err(e) => Err(
+            ApiError::grammar_error(format!("tool call GBNF parse failed: {}", e)).into_response(),
+        ),
     }
 }
 
@@ -3808,10 +3871,10 @@ fn compile_tool_grammar(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod compile_tool_grammar_precondition_tests {
-    use super::*;
     use super::super::schema::{
         ChatCompletionRequest, ChatMessage, MessageContent, Tool, ToolChoiceValue, ToolFunction,
     };
+    use super::*;
 
     /// Build a minimal `ChatCompletionRequest` with overridable model + tools.
     fn req_with(model: &str, tools: Option<Vec<Tool>>) -> ChatCompletionRequest {
@@ -3898,10 +3961,7 @@ mod compile_tool_grammar_precondition_tests {
     #[test]
     fn compile_tool_grammar_function_with_no_tools_returns_error() {
         let req = req_with("gemma4-27b-it", None);
-        let res = compile_tool_grammar(
-            &req,
-            &ToolChoiceValue::Function("get_weather".to_string()),
-        );
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Function("get_weather".to_string()));
         let resp = res.expect_err("Function + no tools MUST hard-error (400)");
         assert_eq!(
             resp.status(),
@@ -3918,10 +3978,7 @@ mod compile_tool_grammar_precondition_tests {
     #[test]
     fn compile_tool_grammar_function_with_empty_tools_returns_error() {
         let req = req_with("gemma4-27b-it", Some(Vec::new()));
-        let res = compile_tool_grammar(
-            &req,
-            &ToolChoiceValue::Function("get_weather".to_string()),
-        );
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Function("get_weather".to_string()));
         let resp = res.expect_err("Function + empty tools[] MUST hard-error (400)");
         assert_eq!(
             resp.status(),
@@ -3941,11 +3998,11 @@ mod compile_tool_grammar_precondition_tests {
             "test fixture must use an unregistered model id; \
              update if registry adds a 'unknown-fake-model-zzzz' family"
         );
-        let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("get_weather")));
-        let res = compile_tool_grammar(
-            &req,
-            &ToolChoiceValue::Function("get_weather".to_string()),
+        let req = req_with(
+            "unknown-fake-model-zzzz",
+            Some(one_scalar_tool("get_weather")),
         );
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Function("get_weather".to_string()));
         let resp = res.expect_err("Function + unknown model MUST hard-error (400)");
         assert_eq!(
             resp.status(),
@@ -4286,8 +4343,7 @@ mod compile_tool_grammar_precondition_tests {
         // Feed preamble that the eager (Required) runtime would REJECT —
         // arbitrary content that doesn't begin with the gemma4 open
         // marker `<|tool_call>`.  A bunch of natural-language bytes:
-        let preamble: &[u8] =
-            b"Sure! Let me think about whether this needs a tool call. ";
+        let preamble: &[u8] = b"Sure! Let me think about whether this needs a tool call. ";
         let alive = rt.accept_bytes(preamble);
         assert!(
             alive,
@@ -4536,10 +4592,7 @@ mod compile_tool_grammar_precondition_tests {
              the engine's is_accepted check at engine.rs:3678 then drives \
              early termination"
         );
-        assert!(
-            !rt.is_dead(),
-            "an accepted runtime MUST NOT also be dead"
-        );
+        assert!(!rt.is_dead(), "an accepted runtime MUST NOT also be dead");
     }
 
     /// Wave 3.6 W-2 — Qwen35 production-order regression test.
@@ -4624,8 +4677,7 @@ mod compile_tool_grammar_precondition_tests {
         // the runtime dead immediately.
         // Post-Wave-3.5 (OneOrMoreCallsBodyOnly grammar): root starts with
         // `<function=get_weather>` and accepts this byte stream.
-        let body: &[u8] =
-            b"<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
+        let body: &[u8] = b"<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
         let body_alive = rt.accept_bytes(body);
         assert!(
             body_alive,
@@ -4726,14 +4778,19 @@ mod compile_tool_grammar_precondition_tests {
                 .expect("Auto compile must succeed for gemma4 parallel")
                 .expect("Auto must return Some(grammar)");
 
-            let root_id = g.rule_id("root").expect("gemma4 parallel Auto grammar has root");
-            let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
-                .expect("GrammarRuntime::new");
+            let root_id = g
+                .rule_id("root")
+                .expect("gemma4 parallel Auto grammar has root");
+            let mut rt =
+                grammar::sampler::GrammarRuntime::new(g, root_id).expect("GrammarRuntime::new");
             rt.set_awaiting_trigger(true);
 
             // Pre-trigger: first open marker — no-op.
             let pre = rt.accept_bytes(open.as_bytes());
-            assert!(pre, "gemma4 parallel: pre-trigger open marker MUST be no-op");
+            assert!(
+                pre,
+                "gemma4 parallel: pre-trigger open marker MUST be no-op"
+            );
             assert!(rt.is_awaiting_trigger());
 
             // Trigger.
@@ -4816,14 +4873,19 @@ mod compile_tool_grammar_precondition_tests {
                 .expect("Auto compile must succeed for qwen35 parallel")
                 .expect("Auto must return Some(grammar)");
 
-            let root_id = g.rule_id("root").expect("qwen35 parallel Auto grammar has root");
-            let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
-                .expect("GrammarRuntime::new");
+            let root_id = g
+                .rule_id("root")
+                .expect("qwen35 parallel Auto grammar has root");
+            let mut rt =
+                grammar::sampler::GrammarRuntime::new(g, root_id).expect("GrammarRuntime::new");
             rt.set_awaiting_trigger(true);
 
             // Pre-trigger: first open marker `<tool_call>` — no-op.
             let pre = rt.accept_bytes(open.as_bytes());
-            assert!(pre, "qwen35 parallel: pre-trigger open marker MUST be no-op");
+            assert!(
+                pre,
+                "qwen35 parallel: pre-trigger open marker MUST be no-op"
+            );
             assert!(rt.is_awaiting_trigger());
 
             // Trigger.
@@ -4864,8 +4926,7 @@ mod compile_tool_grammar_precondition_tests {
             assert!(!rt.is_dead());
 
             // Body 2 — no leading `<tool_call>` (it was in the inter-call rule).
-            let body2 =
-                b"<function=get_weather>\n<parameter=q>\nNYC\n</parameter>\n</function>";
+            let body2 = b"<function=get_weather>\n<parameter=q>\nNYC\n</parameter>\n</function>";
             let alive2 = rt.accept_bytes(body2);
             assert!(
                 alive2,
@@ -4974,7 +5035,9 @@ mod compile_tool_grammar_precondition_tests {
         );
 
         // Build GrammarRuntime from the serialized GBNF.
-        let root_id = g.rule_id("root").expect("combined grammar must have root rule");
+        let root_id = g
+            .rule_id("root")
+            .expect("combined grammar must have root rule");
         let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
             .expect("GrammarRuntime::new must succeed for valid combined grammar");
 
@@ -5036,17 +5099,13 @@ mod compile_tool_grammar_precondition_tests {
                 })),
             },
         };
-        let req = req_with_parallel(
-            "DeepSeek-V4-Flash-0731",
-            Some(vec![search, read]),
-            true,
-        );
+        let req = req_with_parallel("DeepSeek-V4-Flash-0731", Some(vec![search, read]), true);
         let grammar = compile_tool_grammar(&req, &ToolChoiceValue::Required)
             .expect("compile DeepSeek multi-tool grammar")
             .expect("required tools must produce grammar");
         let root = grammar.rule_id("root").expect("root rule");
-        let mut runtime = grammar::sampler::GrammarRuntime::new(grammar, root)
-            .expect("DeepSeek grammar runtime");
+        let mut runtime =
+            grammar::sampler::GrammarRuntime::new(grammar, root).expect("DeepSeek grammar runtime");
         let payload = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">kv cache</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
         assert!(runtime.accept_bytes(payload.as_bytes()));
         assert!(runtime.is_accepted());
@@ -5260,9 +5319,7 @@ fn combine_deepseek4_function_grammars(
         combined.push_str(&serialize(&renamed));
     }
     if let Err(error) = parse(&combined) {
-        panic!(
-            "combine_deepseek4_function_grammars produced invalid grammar: {error}\n{combined}"
-        );
+        panic!("combine_deepseek4_function_grammars produced invalid grammar: {error}\n{combined}");
     }
     combined
 }
@@ -5286,9 +5343,9 @@ fn combine_deepseek4_function_grammars(
 
 #[cfg(test)]
 mod combine_function_grammars_tests {
-    use super::*;
     use super::grammar::parser::parse;
     use super::grammar::sampler::GrammarRuntime;
+    use super::*;
 
     /// Build a runtime from a GBNF string.  Helper that centralizes the
     /// parse + GrammarRuntime::new pattern.
@@ -5336,11 +5393,8 @@ mod combine_function_grammars_tests {
     fn multi_tool_shared_param_name_different_types() {
         // Wave 2.7 W-η Q-B: legacy multi-tool combine test exercises the
         // wave-2.6 single-call alternation behaviour (parallel=false).
-        let combined = combine_function_grammars(
-            vec![gbnf_for_tool_a(), gbnf_for_tool_b()],
-            false,
-            "",
-        );
+        let combined =
+            combine_function_grammars(vec![gbnf_for_tool_a(), gbnf_for_tool_b()], false, "");
 
         // 1. Round-trip through the parser must succeed (the combiner already
         //    asserts this, but we duplicate the check at the test boundary).
@@ -5359,14 +5413,26 @@ mod combine_function_grammars_tests {
         // 3. Runtime semantics: string-shape tool_a call accepted.
         let mut rt_a = runtime_from_gbnf(&combined);
         let alive = rt_a.accept_bytes(b"call:tool_a{\"q\":\"hi\"}");
-        assert!(alive, "tool_a string call rejected by combined grammar: {combined}");
-        assert!(rt_a.is_accepted(), "tool_a string call not in accepting state");
+        assert!(
+            alive,
+            "tool_a string call rejected by combined grammar: {combined}"
+        );
+        assert!(
+            rt_a.is_accepted(),
+            "tool_a string call not in accepting state"
+        );
 
         // 4. Runtime semantics: integer-shape tool_b call accepted.
         let mut rt_b = runtime_from_gbnf(&combined);
         let alive = rt_b.accept_bytes(b"call:tool_b{\"q\":42}");
-        assert!(alive, "tool_b integer call rejected by combined grammar: {combined}");
-        assert!(rt_b.is_accepted(), "tool_b integer call not in accepting state");
+        assert!(
+            alive,
+            "tool_b integer call rejected by combined grammar: {combined}"
+        );
+        assert!(
+            rt_b.is_accepted(),
+            "tool_b integer call not in accepting state"
+        );
     }
 
     /// Single-tool combine: combine_function_grammars with one function
@@ -5385,8 +5451,14 @@ mod combine_function_grammars_tests {
         // Runtime accepts a valid tool_a call.
         let mut rt = runtime_from_gbnf(&combined);
         let alive = rt.accept_bytes(b"call:tool_a{\"q\":\"hi\"}");
-        assert!(alive, "single-tool combine rejected valid tool_a call: {combined}");
-        assert!(rt.is_accepted(), "single-tool combine not accepting valid call");
+        assert!(
+            alive,
+            "single-tool combine rejected valid tool_a call: {combined}"
+        );
+        assert!(
+            rt.is_accepted(),
+            "single-tool combine not accepting valid call"
+        );
     }
 
     /// T1.8 wiring: response_format AND tool_choice both set.
@@ -5511,7 +5583,10 @@ mod combine_function_grammars_tests {
         let mut rt = runtime_from_gbnf(&combined);
         let alive = rt.accept_bytes(b"Bworld");
         assert!(alive, "valid string `Bworld` rejected (fn-1): {combined}");
-        assert!(rt.is_accepted(), "valid string `Bworld` not in accepting state (fn-1): {combined}");
+        assert!(
+            rt.is_accepted(),
+            "valid string `Bworld` not in accepting state (fn-1): {combined}"
+        );
     }
 
     /// Two Qwen-shape grammars combine into a working alternation.  Each
@@ -5543,24 +5618,34 @@ mod combine_function_grammars_tests {
         let g = parse(&combined).expect("combined re-parses");
 
         // Sanity: namespaced root names exist.
-        assert!(g.rule_id("fn-0-root").is_some(), "fn-0-root missing: {combined}");
-        assert!(g.rule_id("fn-1-root").is_some(), "fn-1-root missing: {combined}");
+        assert!(
+            g.rule_id("fn-0-root").is_some(),
+            "fn-0-root missing: {combined}"
+        );
+        assert!(
+            g.rule_id("fn-1-root").is_some(),
+            "fn-1-root missing: {combined}"
+        );
 
         // Runtime: canonical Qwen tool-call output for fa accepted.
         let mut rt = runtime_from_gbnf(&combined);
-        let alive = rt.accept_bytes(
-            b"<function=fa>\n<parameter=q>\nhello\n</parameter>\n</function>",
-        );
+        let alive =
+            rt.accept_bytes(b"<function=fa>\n<parameter=q>\nhello\n</parameter>\n</function>");
         assert!(alive, "canonical Qwen call (fa) rejected: {combined}");
-        assert!(rt.is_accepted(), "canonical Qwen call (fa) not accepting: {combined}");
+        assert!(
+            rt.is_accepted(),
+            "canonical Qwen call (fa) not accepting: {combined}"
+        );
 
         // Runtime: canonical Qwen tool-call output for fb accepted.
         let mut rt = runtime_from_gbnf(&combined);
-        let alive = rt.accept_bytes(
-            b"<function=fb>\n<parameter=q>\nworld\n</parameter>\n</function>",
-        );
+        let alive =
+            rt.accept_bytes(b"<function=fb>\n<parameter=q>\nworld\n</parameter>\n</function>");
         assert!(alive, "canonical Qwen call (fb) rejected: {combined}");
-        assert!(rt.is_accepted(), "canonical Qwen call (fb) not accepting: {combined}");
+        assert!(
+            rt.is_accepted(),
+            "canonical Qwen call (fb) not accepting: {combined}"
+        );
     }
 
     /// Audit HIGH-6 case: two functions both have a parameter named `q`
@@ -5582,11 +5667,7 @@ mod combine_function_grammars_tests {
         )
         .to_string();
         // fn-1: q is a number (must be digits).
-        let gbnf_b = concat!(
-            "root ::= \"B\" qval\n",
-            "qval ::= [0-9]+\n",
-        )
-        .to_string();
+        let gbnf_b = concat!("root ::= \"B\" qval\n", "qval ::= [0-9]+\n",).to_string();
 
         let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "");
         parse(&combined).expect("combined re-parses");
@@ -5595,13 +5676,19 @@ mod combine_function_grammars_tests {
         let mut rt = runtime_from_gbnf(&combined);
         let alive = rt.accept_bytes(b"A\"hello\"");
         assert!(alive, "fn-0 string call rejected: {combined}");
-        assert!(rt.is_accepted(), "fn-0 string call not accepting: {combined}");
+        assert!(
+            rt.is_accepted(),
+            "fn-0 string call not accepting: {combined}"
+        );
 
         // fn-1 number-shape ACCEPTED.
         let mut rt = runtime_from_gbnf(&combined);
         let alive = rt.accept_bytes(b"B42");
         assert!(alive, "fn-1 number call rejected: {combined}");
-        assert!(rt.is_accepted(), "fn-1 number call not accepting: {combined}");
+        assert!(
+            rt.is_accepted(),
+            "fn-1 number call not accepting: {combined}"
+        );
 
         // Cross: fn-0 with a number — MUST be rejected (namespace isolated).
         let mut rt = runtime_from_gbnf(&combined);
@@ -5650,8 +5737,14 @@ mod combine_function_grammars_tests {
         // Runtime equivalence: accept the source grammar's canonical output.
         let mut rt = runtime_from_gbnf(&combined);
         let alive = rt.accept_bytes(b"Xhello");
-        assert!(alive, "single-function combine rejected `Xhello`: {combined}");
-        assert!(rt.is_accepted(), "single-function combine not accepting `Xhello`: {combined}");
+        assert!(
+            alive,
+            "single-function combine rejected `Xhello`: {combined}"
+        );
+        assert!(
+            rt.is_accepted(),
+            "single-function combine not accepting `Xhello`: {combined}"
+        );
 
         // And the source grammar's runtime accepts the same input.
         let mut src_rt = runtime_from_gbnf(&src);
@@ -5718,7 +5811,10 @@ mod combine_function_grammars_tests {
         // Single call also accepted (1 ≤ count, the `+` quantifier).
         let mut rt_single = runtime_from_gbnf(&combined);
         let alive = rt_single.accept_bytes(b"call:tool_b{\"q\":7}");
-        assert!(alive, "Gemma-shape parallel runtime rejected single tool_b call");
+        assert!(
+            alive,
+            "Gemma-shape parallel runtime rejected single tool_b call"
+        );
         assert!(rt_single.is_accepted());
 
         // Empty input rejected (min=1 — there must be at least one call).
@@ -5840,9 +5936,9 @@ mod grammar_kind_selection_tests {
         // mod, while letting us also emit the GrammarKind discriminant.
         fn select(tool: Option<u32>, resp: Option<u32>) -> (Option<u32>, GrammarKind) {
             match (tool, resp) {
-                (Some(g), _)       => (Some(g), GrammarKind::ToolCallBodyRequired),
-                (None,    Some(g)) => (Some(g), GrammarKind::ResponseFormat),
-                (None,    None)    => (None,    GrammarKind::default()),
+                (Some(g), _) => (Some(g), GrammarKind::ToolCallBodyRequired),
+                (None, Some(g)) => (Some(g), GrammarKind::ResponseFormat),
+                (None, None) => (None, GrammarKind::default()),
             }
         }
 
@@ -5876,7 +5972,11 @@ mod grammar_kind_selection_tests {
         // effective_grammar is None.
         let (g, k) = select(None, None);
         assert!(g.is_none(), "no grammar means no constraint");
-        assert_eq!(k, GrammarKind::default(), "kind defaults when grammar is None");
+        assert_eq!(
+            k,
+            GrammarKind::default(),
+            "kind defaults when grammar is None"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -5961,8 +6061,7 @@ mod grammar_kind_selection_tests {
         // identity (the chosen output IS the tool grammar, not the
         // response-format grammar).
         let rf_resp = ResponseFormat::JsonObject;
-        let resp_grammar =
-            super::compile_response_format(&rf_resp).expect("compile json_object");
+        let resp_grammar = super::compile_response_format(&rf_resp).expect("compile json_object");
         assert!(resp_grammar.is_some());
 
         let rf_tool = ResponseFormat::JsonSchema {
@@ -5981,8 +6080,7 @@ mod grammar_kind_selection_tests {
         // second grammar; the helper does not care about the source —
         // it just sees `Option<Grammar>` and matches the wave-2.6 Q1
         // selection rule.
-        let tool_grammar =
-            super::compile_response_format(&rf_tool).expect("compile schema");
+        let tool_grammar = super::compile_response_format(&rf_tool).expect("compile schema");
         assert!(tool_grammar.is_some());
 
         // Serialize both grammars to stable GBNF text BEFORE passing them
@@ -6009,7 +6107,10 @@ mod grammar_kind_selection_tests {
             GrammarKind::ToolCallBodyRequired,
             resp_grammar,
         );
-        assert!(effective.is_some(), "helper must propagate the tool grammar");
+        assert!(
+            effective.is_some(),
+            "helper must propagate the tool grammar"
+        );
         assert_eq!(
             kind,
             GrammarKind::ToolCallBodyRequired,
@@ -6045,11 +6146,8 @@ mod grammar_kind_selection_tests {
         // tool_grammar_kind is unused when tool_grammar is None; pass
         // ToolCallBodyAuto deliberately to assert the helper does NOT
         // smuggle the caller-provided kind through the empty branch.
-        let (effective, kind) = super::select_effective_grammar(
-            None,
-            GrammarKind::ToolCallBodyAuto,
-            None,
-        );
+        let (effective, kind) =
+            super::select_effective_grammar(None, GrammarKind::ToolCallBodyAuto, None);
         assert!(effective.is_none(), "no grammar means no constraint");
         assert_eq!(
             kind,
@@ -6157,12 +6255,19 @@ fn parse_slot_budget_exceeded(msg: &str) -> (u64, u64) {
     fn extract_u64(msg: &str, key: &str) -> u64 {
         // Find `key=` then parse contiguous digits.
         let needle = format!("{key}=");
-        let Some(start) = msg.find(&needle) else { return 0 };
+        let Some(start) = msg.find(&needle) else {
+            return 0;
+        };
         let after = &msg[start + needle.len()..];
-        let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
         after[..end].parse::<u64>().unwrap_or(0)
     }
-    (extract_u64(msg, "needed_bytes"), extract_u64(msg, "budget_bytes"))
+    (
+        extract_u64(msg, "needed_bytes"),
+        extract_u64(msg, "budget_bytes"),
+    )
 }
 
 fn queue_full_with_rate_limit_headers(state: &AppState) -> Response {
@@ -6356,9 +6461,7 @@ pub async fn embeddings(
         // /v1/embeddings request reaches this handler — populated by
         // `cmd_serve` immediately after weight load.
         let registry_arc = shared_registry.ok_or_else(|| {
-            anyhow::anyhow!(
-                "embedding registry not pre-warmed (server boot did not initialize it)"
-            )
+            anyhow::anyhow!("embedding registry not pre-warmed (server boot did not initialize it)")
         })?;
 
         let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
@@ -6391,11 +6494,7 @@ pub async fn embeddings(
             // SAFETY: executor outlives this closure scope.
             let device: &MlxDevice = unsafe { &*device_ref };
             let ids_buf = device
-                .alloc_buffer(
-                    ids.len() * 4,
-                    mlx_native::DType::U32,
-                    vec![ids.len()],
-                )
+                .alloc_buffer(ids.len() * 4, mlx_native::DType::U32, vec![ids.len()])
                 .map_err(|e| anyhow::anyhow!("alloc ids buf: {e}"))?;
             // SAFETY: just-allocated u32 buffer; exclusive access.
             let s: &mut [u32] = unsafe {
@@ -6409,9 +6508,9 @@ pub async fn embeddings(
             let mut session = executor
                 .begin()
                 .map_err(|e| anyhow::anyhow!("begin session: {e}"))?;
-            let mut registry_guard = registry_arc.lock().map_err(|e| {
-                anyhow::anyhow!("embedding registry mutex poisoned: {e}")
-            })?;
+            let mut registry_guard = registry_arc
+                .lock()
+                .map_err(|e| anyhow::anyhow!("embedding registry mutex poisoned: {e}"))?;
             // valid_token_count = the count BEFORE [PAD] padding. The
             // forward pass uses this to build the attention mask so
             // padded positions don't contaminate the embedding.
@@ -6519,10 +6618,7 @@ pub async fn embeddings(
 /// Inputs run sequentially through the engine's FIFO worker queue —
 /// concurrent embedding requests get the same 429 + Retry-After
 /// behaviour as concurrent chat completions when the queue fills.
-async fn chat_model_embeddings(
-    engine: super::engine::Engine,
-    req: EmbeddingRequest,
-) -> Response {
+async fn chat_model_embeddings(engine: super::engine::Engine, req: EmbeddingRequest) -> Response {
     let want_base64 = match req.encoding_format.as_deref() {
         None | Some("float") => false,
         Some("base64") => true,
@@ -6661,8 +6757,7 @@ async fn chat_model_embeddings(
                 // bypassed (configuration error).
                 if msg.contains("slot_budget_exceeded") {
                     let (needed, budget) = parse_slot_budget_exceeded(&msg);
-                    return ApiError::slot_budget_exceeded(needed, budget)
-                        .into_response();
+                    return ApiError::slot_budget_exceeded(needed, budget).into_response();
                 }
                 // Iter-215 Wedge-2: Qwen3.5/3.6 embed sentinel → 501.
                 if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
@@ -7085,13 +7180,19 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     if state.is_ready_for_gen() {
         (
             StatusCode::OK,
-            Json(ReadyzResponse { ready: true, detail: "ready" }),
+            Json(ReadyzResponse {
+                ready: true,
+                detail: "ready",
+            }),
         )
             .into_response()
     } else {
         let mut resp = (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadyzResponse { ready: false, detail: "warming up" }),
+            Json(ReadyzResponse {
+                ready: false,
+                detail: "warming up",
+            }),
         )
             .into_response();
         // Retry-After: 1 second suggestion; warmup typically completes in
@@ -7581,7 +7682,9 @@ fn infer_quant_type(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
 
     let mut histogram: HashMap<&'static str, usize> = HashMap::new();
     for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
+        let Some(info) = gguf.tensor_info(name) else {
+            continue;
+        };
         let label = ggml_type_label(info.ggml_type);
         // Skip fp types — we want the dominant quantization, not the norm/embed dtype.
         if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
@@ -7589,7 +7692,10 @@ fn infer_quant_type(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
         }
         *histogram.entry(label).or_insert(0) += 1;
     }
-    histogram.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k.to_string())
+    histogram
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(k, _)| k.to_string())
 }
 
 /// Map a ggml type enum into a short, well-known label.
@@ -7713,10 +7819,10 @@ mod tests {
     /// `None` here so the corresponding `ModelObject` field also stays
     /// `None`; the Gemma fixture below covers the `Some` arm.
     fn populated_qwen35_load_info() -> crate::serve::load_info::LoadInfo {
+        use crate::core::provenance::Provenance;
         use crate::serve::load_info::{
             ArchFamily, ChatTemplateSource, LoadInfo, MoeShape, TokenizerSource,
         };
-        use crate::core::provenance::Provenance;
         use std::path::PathBuf;
         use std::time::Duration;
 
@@ -7767,10 +7873,8 @@ mod tests {
     /// Qwen35 fixture above to cover both `Some(_)` and `None` arms of
     /// every C5 field.
     fn populated_gemma4_load_info() -> crate::serve::load_info::LoadInfo {
-        use crate::serve::load_info::{
-            ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
-        };
         use crate::core::provenance::Provenance;
+        use crate::serve::load_info::{ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource};
         use std::path::PathBuf;
         use std::time::Duration;
 
@@ -7850,7 +7954,9 @@ mod tests {
         assert_eq!(m.sliding_window, None);
         assert_eq!(m.kv_spill_active, Some(false));
         assert!(
-            m.quant_bpw.map(|v| (v - 4.55).abs() < 1e-3).unwrap_or(false),
+            m.quant_bpw
+                .map(|v| (v - 4.55).abs() < 1e-3)
+                .unwrap_or(false),
             "expected quant_bpw ≈ 4.55, got {:?}",
             m.quant_bpw
         );
@@ -7874,7 +7980,9 @@ mod tests {
         assert_eq!(m.kv_spill_active, Some(true));
         // BPW present.
         assert!(
-            m.quant_bpw.map(|v| (v - 4.83).abs() < 1e-3).unwrap_or(false),
+            m.quant_bpw
+                .map(|v| (v - 4.83).abs() < 1e-3)
+                .unwrap_or(false),
             "expected quant_bpw ≈ 4.83, got {:?}",
             m.quant_bpw
         );
@@ -7968,7 +8076,10 @@ mod tests {
         assert_eq!(v["arch"], "gemma4");
         assert_eq!(v["max_context_length"], 131_072);
         assert_eq!(v["provenance"], "external");
-        assert!(v.get("moe_experts").is_none(), "dense → moe_experts skipped");
+        assert!(
+            v.get("moe_experts").is_none(),
+            "dense → moe_experts skipped"
+        );
         assert!(
             v.get("moe_experts_per_tok").is_none(),
             "dense → moe_experts_per_tok skipped"
@@ -8093,7 +8204,8 @@ mod multimodal_tests {
     fn images_without_mmproj_return_400_no_mmproj_loaded() {
         let uri = synthetic_png_data_uri();
         let msgs = vec![user_with_image("describe this", &uri)];
-        let resp = process_multimodal_content(&msgs, None).expect_err("image without mmproj should 400");
+        let resp =
+            process_multimodal_content(&msgs, None).expect_err("image without mmproj should 400");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -8156,8 +8268,8 @@ mod multimodal_tests {
     fn malformed_url_returns_400_with_location() {
         let msgs = vec![user_with_image("x", "not-a-url")];
         let mmproj = synthetic_mmproj();
-        let resp = process_multimodal_content(&msgs, Some(&mmproj))
-            .expect_err("bad URL should 400");
+        let resp =
+            process_multimodal_content(&msgs, Some(&mmproj)).expect_err("bad URL should 400");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -8255,8 +8367,7 @@ mod multimodal_tests {
         // GIF is deliberately rejected by parse_image_url.
         let msgs = vec![user_with_image("x", "data:image/gif;base64,R0lGODlh")];
         let mmproj = synthetic_mmproj();
-        let resp = process_multimodal_content(&msgs, Some(&mmproj))
-            .expect_err("gif should 400");
+        let resp = process_multimodal_content(&msgs, Some(&mmproj)).expect_err("gif should 400");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -8297,8 +8408,12 @@ mod multimodal_tests {
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "hello".into() },
-                ContentPart::Text { text: " world".into() },
+                ContentPart::Text {
+                    text: "hello".into(),
+                },
+                ContentPart::Text {
+                    text: " world".into(),
+                },
             ])),
             reasoning_content: None,
             tool_calls: None,
@@ -8317,7 +8432,9 @@ mod multimodal_tests {
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "see this:".into() },
+                ContentPart::Text {
+                    text: "see this:".into(),
+                },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,XXX".into(),
@@ -8369,7 +8486,10 @@ mod multimodal_tests {
         match out[0].content.as_ref().expect("content") {
             MessageContent::Text(t) => {
                 let n_marks = t.matches("<|image|>").count();
-                assert_eq!(n_marks, 2, "expected 2 placeholders, got {n_marks} in {t:?}");
+                assert_eq!(
+                    n_marks, 2,
+                    "expected 2 placeholders, got {n_marks} in {t:?}"
+                );
                 assert!(t.starts_with("a:"));
             }
             other => panic!("expected Text, got {:?}", other),
@@ -8551,7 +8671,9 @@ mod multimodal_tests {
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "describe:".into() },
+                ContentPart::Text {
+                    text: "describe:".into(),
+                },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,XXX".into(),
@@ -8662,7 +8784,9 @@ mod multimodal_tests {
     ) -> Vec<Vec<f32>> {
         let per_row_floats = hidden * (1 + n_deepstack);
         let total = per_image_n_image_tokens * vision_embeddings.len();
-        let mut chunks: Vec<Vec<f32>> = (0..n_deepstack).map(|_| vec![0f32; total * hidden]).collect();
+        let mut chunks: Vec<Vec<f32>> = (0..n_deepstack)
+            .map(|_| vec![0f32; total * hidden])
+            .collect();
         for j in 0..n_deepstack {
             let mut row_offset = 0usize;
             for src in vision_embeddings {
@@ -8701,12 +8825,8 @@ mod multimodal_tests {
         }
 
         let vision_embeddings = vec![augmented.clone()];
-        let chunks = cpu_split_qwen3vl_augmented(
-            &vision_embeddings,
-            n_image_tokens,
-            hidden,
-            n_deepstack,
-        );
+        let chunks =
+            cpu_split_qwen3vl_augmented(&vision_embeddings, n_image_tokens, hidden, n_deepstack);
         assert_eq!(chunks.len(), n_deepstack);
 
         // Now reconstruct: for each row, concat the BASE chunk (per-row
@@ -8715,21 +8835,14 @@ mod multimodal_tests {
         for r in 0..n_image_tokens {
             let mut reconstructed = Vec::with_capacity(per_row_floats);
             // Base chunk = first `hidden` floats of original row.
-            reconstructed.extend_from_slice(
-                &augmented[r * per_row_floats..r * per_row_floats + hidden],
-            );
+            reconstructed
+                .extend_from_slice(&augmented[r * per_row_floats..r * per_row_floats + hidden]);
             // Deepstack chunks j=1..=N.
             for j in 0..n_deepstack {
-                reconstructed.extend_from_slice(
-                    &chunks[j][r * hidden..(r + 1) * hidden],
-                );
+                reconstructed.extend_from_slice(&chunks[j][r * hidden..(r + 1) * hidden]);
             }
-            let original_row =
-                &augmented[r * per_row_floats..(r + 1) * per_row_floats];
-            assert_eq!(
-                reconstructed, original_row,
-                "row {r} round-trip mismatch"
-            );
+            let original_row = &augmented[r * per_row_floats..(r + 1) * per_row_floats];
+            assert_eq!(reconstructed, original_row, "row {r} round-trip mismatch");
         }
     }
 
@@ -8777,8 +8890,9 @@ mod multimodal_tests {
         let total_n = n_img0 + n_img1;
         let per_image_n_image_tokens = vec![n_img0, n_img1];
         let vision_embeddings = vec![img0, img1];
-        let mut chunks: Vec<Vec<f32>> =
-            (0..n_deepstack).map(|_| vec![0f32; total_n * hidden]).collect();
+        let mut chunks: Vec<Vec<f32>> = (0..n_deepstack)
+            .map(|_| vec![0f32; total_n * hidden])
+            .collect();
         for j in 0..n_deepstack {
             let mut row_offset = 0usize;
             for (i, src) in vision_embeddings.iter().enumerate() {
@@ -8830,12 +8944,8 @@ mod multimodal_tests {
             }
         }
         let vision_embeddings = vec![img0, img1];
-        let chunks = cpu_split_qwen3vl_augmented(
-            &vision_embeddings,
-            n_image_tokens,
-            hidden,
-            n_deepstack,
-        );
+        let chunks =
+            cpu_split_qwen3vl_augmented(&vision_embeddings, n_image_tokens, hidden, n_deepstack);
         // chunks[0] is concatenated [img0_rows; img1_rows].
         // Row 0 of chunks[0] = img0 row 0's slot 1 = 0.
         // Row 3 of chunks[0] = img1 row 0's slot 1 = 100.
@@ -8856,8 +8966,8 @@ mod multimodal_tests {
 
 #[cfg(test)]
 mod readiness_guard_tests {
-    use super::*;
     use super::super::state::{AppState, ServerConfig};
+    use super::*;
     use axum::http::header::RETRY_AFTER;
 
     /// Verify that `ApiError::not_ready()` (the error emitted by the early-503
@@ -8868,7 +8978,10 @@ mod readiness_guard_tests {
     fn not_ready_error_is_503_with_retry_after_1() {
         let resp = ApiError::not_ready().into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let ra = resp.headers().get(RETRY_AFTER).expect("Retry-After must be set on not_ready");
+        let ra = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After must be set on not_ready");
         assert_eq!(ra, "1");
     }
 
@@ -9006,7 +9119,10 @@ mod pool_error_tests {
         });
         let resp = map_hotswap_error_to_response(err);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let ra = resp.headers().get(RETRY_AFTER).expect("Retry-After header must be set");
+        let ra = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After header must be set");
         assert_eq!(ra, "5", "Retry-After should be 5 seconds for pool refusal");
     }
 
@@ -9016,7 +9132,10 @@ mod pool_error_tests {
         let err = HotSwapError::PoolRefused(PoolError::ZeroCapacity);
         let resp = map_hotswap_error_to_response(err);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let ra = resp.headers().get(RETRY_AFTER).expect("Retry-After header must be set");
+        let ra = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After header must be set");
         assert_eq!(ra, "5");
     }
 
@@ -9143,14 +9262,14 @@ mod pool_error_tests {
 #[cfg(test)]
 mod iter215_qwen35_chat_501_tests {
     use super::*;
-    use axum::http::StatusCode;
     use axum::body::to_bytes;
+    use axum::http::StatusCode;
     use std::sync::Arc;
     use std::time::SystemTime;
 
     use super::super::engine;
-    use super::super::state::{AppState, ServerConfig};
     use super::super::schema::{ChatCompletionRequest, ChatMessage, MessageContent};
+    use super::super::state::{AppState, ServerConfig};
 
     fn empty_request_for_model(model: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -9251,10 +9370,8 @@ mod iter215_qwen35_chat_501_tests {
         // 501 response from the ApiError builder using the engine
         // constants.  This is the literal sequence handlers.rs:296
         // executes.
-        let resp = ApiError::not_implemented(
-            engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
-        )
-        .into_response();
+        let resp = ApiError::not_implemented(engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string())
+            .into_response();
         assert_eq!(
             resp.status(),
             StatusCode::NOT_IMPLEMENTED,
@@ -9282,7 +9399,7 @@ mod iter215_qwen35_chat_501_tests {
 
 #[cfg(test)]
 mod test_a3_tool_call_extraction {
-    use super::{extract_tool_calls_from_text, registry, engine};
+    use super::{engine, extract_tool_calls_from_text, registry};
 
     /// Build a minimal ModelRegistration with Gemma4 tool markers so tests
     /// can exercise the splitter without a live model.
@@ -9296,11 +9413,8 @@ mod test_a3_tool_call_extraction {
     #[test]
     fn extract_no_tool_calls_returns_text_unchanged() {
         let reg = gemma4_reg();
-        let result = extract_tool_calls_from_text(
-            "Hello, world!",
-            Some(&reg),
-            engine::ToolCallPolicy::Auto,
-        );
+        let result =
+            extract_tool_calls_from_text("Hello, world!", Some(&reg), engine::ToolCallPolicy::Auto);
         assert!(result.tool_calls.is_empty(), "no tool calls in plain text");
         assert_eq!(result.content, "Hello, world!", "content must be preserved");
         assert!(result.constrained_parse_failure.is_none());
@@ -9323,13 +9437,11 @@ mod test_a3_tool_call_extraction {
         // Build a synthetic tool-call body in Gemma4 format: call:NAME{k:v}
         let body = "call:get_weather{location:<|\"|>Paris<|\"|>}";
         let full_text = format!("Here is the weather: {open}{body}{close}");
-        let result = extract_tool_calls_from_text(
-            &full_text,
-            Some(&reg),
-            engine::ToolCallPolicy::Auto,
-        );
+        let result =
+            extract_tool_calls_from_text(&full_text, Some(&reg), engine::ToolCallPolicy::Auto);
         assert_eq!(
-            result.tool_calls.len(), 1,
+            result.tool_calls.len(),
+            1,
             "exactly one tool call must be extracted"
         );
         assert_eq!(result.tool_calls[0].function.name, "get_weather");
@@ -9348,11 +9460,7 @@ mod test_a3_tool_call_extraction {
 
     #[test]
     fn extract_no_registration_returns_text_unchanged() {
-        let result = extract_tool_calls_from_text(
-            "plain text",
-            None,
-            engine::ToolCallPolicy::Auto,
-        );
+        let result = extract_tool_calls_from_text("plain text", None, engine::ToolCallPolicy::Auto);
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.content, "plain text");
     }
@@ -9461,11 +9569,8 @@ mod test_a3_tool_call_extraction {
         let bad_body = "totally malformed body bytes — not a call";
         let full_text = format!("{open}{bad_body}{close}");
 
-        let result = extract_tool_calls_from_text(
-            &full_text,
-            Some(&reg),
-            engine::ToolCallPolicy::Auto,
-        );
+        let result =
+            extract_tool_calls_from_text(&full_text, Some(&reg), engine::ToolCallPolicy::Auto);
 
         assert!(
             result.tool_calls.is_empty(),
@@ -9511,14 +9616,12 @@ mod test_a3_tool_call_extraction {
         // (the candidate name contains special-token bytes), so the
         // Auto-policy content-fallback branch fires — that's the path we
         // want to verify scrubs the body before emit.
-        let bad_body = "call:get_current<|tool_response>call:get_current_weather{location:<|\"|>Paris<|\"|>}";
+        let bad_body =
+            "call:get_current<|tool_response>call:get_current_weather{location:<|\"|>Paris<|\"|>}";
         let full_text = format!("{open}{bad_body}{close}");
 
-        let result = extract_tool_calls_from_text(
-            &full_text,
-            Some(&reg),
-            engine::ToolCallPolicy::Auto,
-        );
+        let result =
+            extract_tool_calls_from_text(&full_text, Some(&reg), engine::ToolCallPolicy::Auto);
 
         assert!(
             result.tool_calls.is_empty(),
@@ -9527,10 +9630,14 @@ mod test_a3_tool_call_extraction {
         // Registered Gemma 4 leak markers MUST NOT appear in content
         // (mirrors `tests/openwebui_multiturn.rs` LEAK_MARKERS gate).
         for marker in &[
-            "<|channel>", "<channel|>",
-            "<|tool_call>", "<tool_call|>",
-            "<|tool_response>", "<tool_response|>",
-            "<|turn>", "<turn|>",
+            "<|channel>",
+            "<channel|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|turn>",
+            "<turn|>",
         ] {
             assert!(
                 !result.content.contains(marker),
@@ -9595,16 +9702,12 @@ mod defensive_500_wire_shape_tests {
         //    "type": "server_error", "code": "generation_error", ...}}
         //    with "tool_call_no_call_under_constrained" embedded in the
         //    message so log/metrics matchers can grep on it.
-        let bytes = to_bytes(resp.into_body(), 1 << 16)
-            .await
-            .expect("body");
+        let bytes = to_bytes(resp.into_body(), 1 << 16).await.expect("body");
         let body_str = String::from_utf8_lossy(&bytes);
         let parsed: serde_json::Value =
             serde_json::from_str(&body_str).expect("body must be valid JSON");
 
-        let err = parsed
-            .get("error")
-            .expect("envelope must have `error` key");
+        let err = parsed.get("error").expect("envelope must have `error` key");
         assert_eq!(
             err.get("type").and_then(|v| v.as_str()),
             Some("server_error"),
@@ -9684,7 +9787,7 @@ mod defensive_500_wire_shape_tests {
 
 #[cfg(test)]
 mod test_a4_tool_call_policy {
-    use super::{extract_tool_calls_from_text, registry, engine};
+    use super::{engine, extract_tool_calls_from_text, registry};
 
     fn gemma4_reg() -> registry::ModelRegistration {
         registry::find_for("gemma4-27b-it").expect("gemma4 registration must exist")
@@ -9702,11 +9805,8 @@ mod test_a4_tool_call_policy {
         // Deliberately malformed body (no `call:` prefix).
         let bad_body = "garbage{}";
         let full_text = format!("{open}{bad_body}{close}");
-        let result = extract_tool_calls_from_text(
-            &full_text,
-            Some(&reg),
-            engine::ToolCallPolicy::Auto,
-        );
+        let result =
+            extract_tool_calls_from_text(&full_text, Some(&reg), engine::ToolCallPolicy::Auto);
         assert!(
             result.constrained_parse_failure.is_none(),
             "Auto mode must NOT set constrained_parse_failure"
@@ -9718,7 +9818,8 @@ mod test_a4_tool_call_policy {
         // The raw body should be emitted as content.
         assert!(
             result.content.contains(bad_body),
-            "Auto mode must re-emit bad body as content, got: {:?}", result.content
+            "Auto mode must re-emit bad body as content, got: {:?}",
+            result.content
         );
     }
 
@@ -9747,7 +9848,6 @@ mod test_a4_tool_call_policy {
         );
     }
 }
-
 
 // ============================================================================
 // BOS-probe family matrix tests (2026-05-02)
@@ -9789,7 +9889,10 @@ mod bos_probe_tests {
         // Gemma 1/2/3/4 vocabularies register `<bos>` as the BOS marker.
         let tok = tokenizer_with_specials(&["<bos>"]);
         let expected_id = tok.token_to_id("<bos>");
-        assert!(expected_id.is_some(), "fixture invariant: <bos> must register");
+        assert!(
+            expected_id.is_some(),
+            "fixture invariant: <bos> must register"
+        );
         assert_eq!(probe_bos_token_id(&tok), expected_id);
     }
 
@@ -9798,7 +9901,10 @@ mod bos_probe_tests {
         // Llama 3 / 3.1 / 3.2 vocabularies register `<|begin_of_text|>`.
         let tok = tokenizer_with_specials(&["<|begin_of_text|>"]);
         let expected_id = tok.token_to_id("<|begin_of_text|>");
-        assert!(expected_id.is_some(), "fixture invariant: <|begin_of_text|> must register");
+        assert!(
+            expected_id.is_some(),
+            "fixture invariant: <|begin_of_text|> must register"
+        );
         assert_eq!(probe_bos_token_id(&tok), expected_id);
     }
 
@@ -9807,7 +9913,10 @@ mod bos_probe_tests {
         // Llama 1/2, Mistral SentencePiece vocabularies register `<s>`.
         let tok = tokenizer_with_specials(&["<s>"]);
         let expected_id = tok.token_to_id("<s>");
-        assert!(expected_id.is_some(), "fixture invariant: <s> must register");
+        assert!(
+            expected_id.is_some(),
+            "fixture invariant: <s> must register"
+        );
         assert_eq!(probe_bos_token_id(&tok), expected_id);
     }
 
@@ -9817,7 +9926,10 @@ mod bos_probe_tests {
         // treated as BOS by `llama-embedding`'s wire format.
         let tok = tokenizer_with_specials(&["<|im_start|>"]);
         let expected_id = tok.token_to_id("<|im_start|>");
-        assert!(expected_id.is_some(), "fixture invariant: <|im_start|> must register");
+        assert!(
+            expected_id.is_some(),
+            "fixture invariant: <|im_start|> must register"
+        );
         assert_eq!(probe_bos_token_id(&tok), expected_id);
     }
 
@@ -9860,10 +9972,10 @@ mod bos_probe_tests {
         // the dual-format-checkpoint case (caught by the test above) is
         // ALSO caught here at the data layer with a clearer failure message.
         assert_eq!(BOS_PROBE_FRAGMENTS.len(), 4);
-        assert_eq!(BOS_PROBE_FRAGMENTS[0], "<bos>",            "Gemma slot");
+        assert_eq!(BOS_PROBE_FRAGMENTS[0], "<bos>", "Gemma slot");
         assert_eq!(BOS_PROBE_FRAGMENTS[1], "<|begin_of_text|>", "Llama 3 slot");
-        assert_eq!(BOS_PROBE_FRAGMENTS[2], "<s>",              "Llama 1/2 + Mistral slot");
-        assert_eq!(BOS_PROBE_FRAGMENTS[3], "<|im_start|>",     "Qwen slot");
+        assert_eq!(BOS_PROBE_FRAGMENTS[2], "<s>", "Llama 1/2 + Mistral slot");
+        assert_eq!(BOS_PROBE_FRAGMENTS[3], "<|im_start|>", "Qwen slot");
     }
 
     #[test]
@@ -9896,7 +10008,10 @@ mod bos_probe_tests {
         let msg = "slot_budget_exceeded: ADR-040 §3.5 A5b — per-slot KV \
                    budget exceeded (needed_bytes=12345678, budget_bytes=4096000). \
                    Reduce max_tokens or use a shorter prompt.";
-        assert_eq!(super::parse_slot_budget_exceeded(msg), (12_345_678, 4_096_000));
+        assert_eq!(
+            super::parse_slot_budget_exceeded(msg),
+            (12_345_678, 4_096_000)
+        );
     }
 
     #[test]
@@ -9924,7 +10039,10 @@ mod bos_probe_tests {
         // u64 values without panicking.
         let big = u64::MAX.to_string();
         let msg = format!("slot_budget_exceeded: needed_bytes={big}, budget_bytes={big}");
-        assert_eq!(super::parse_slot_budget_exceeded(&msg), (u64::MAX, u64::MAX));
+        assert_eq!(
+            super::parse_slot_budget_exceeded(&msg),
+            (u64::MAX, u64::MAX)
+        );
     }
 
     #[test]
@@ -9992,12 +10110,12 @@ mod bos_probe_tests {
 
 #[cfg(test)]
 mod a5d_handler_429_tests {
-    use super::*;
     use super::super::engine::{
-        make_synthetic_engine_over_budget,
-        make_synthetic_engine_with_slot_budget_exceeded_worker, LoadedArch,
+        make_synthetic_engine_over_budget, make_synthetic_engine_with_slot_budget_exceeded_worker,
+        LoadedArch,
     };
     use super::super::state::{AppState, ServerConfig};
+    use super::*;
     use crate::serve::multi_model::LoadedEngine;
     use crate::serve::quant_select::QuantType;
     use axum::body::to_bytes;
@@ -10111,8 +10229,8 @@ mod a5d_handler_429_tests {
     /// response is NOT an SSE body, i.e. the handler short-circuited
     /// BEFORE constructing the SSE response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded()
-    {
+    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded(
+    ) {
         // Per-slot budget = 1 MiB; per-token cost = 1 KiB. Request asks
         // for (prompt_len=1000 + max_tokens=1000) × 1024 = 2 MiB > 1 MiB.
         let per_slot_kv_budget_bytes: u64 = 1024 * 1024;
@@ -10230,8 +10348,8 @@ mod a5d_handler_429_tests {
     /// "POST through the handler path" — this test covers the
     /// non-streaming half.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded()
-    {
+    async fn a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded(
+    ) {
         // Worker will respond to Request::Generate with
         // "slot_budget_exceeded: ... needed_bytes=2048000, budget_bytes=1048576".
         let needed_bytes: u64 = 2_048_000;
@@ -10322,8 +10440,8 @@ mod a5d_handler_429_tests {
 /// wire envelope without needing a loaded model.
 #[cfg(test)]
 mod iter229_ac5_http_tests {
-    use super::render_chat_prompt_or_400;
     use super::super::schema::{ChatMessage, MessageContent};
+    use super::render_chat_prompt_or_400;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
 
@@ -10401,7 +10519,8 @@ mod iter229_ac5_http_tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(
-            body_str.contains("reserved chat_template_kwargs key") && body_str.contains("bos_token"),
+            body_str.contains("reserved chat_template_kwargs key")
+                && body_str.contains("bos_token"),
             "got: {body_str}"
         );
     }
@@ -10455,8 +10574,7 @@ mod iter230_b_probe_tests {
             msg("assistant", "Done."),
             msg("user", "Now add a test"),
         ];
-        let gemma_tmpl =
-            include_str!("test_fixtures/gemma4-apex-embedded-chat-template.jinja");
+        let gemma_tmpl = include_str!("test_fixtures/gemma4-apex-embedded-chat-template.jinja");
         for (tmpl, tmpl_name) in [
             (crate::core::chat_templates::QWEN3_CHATML, "qwen3-chatml"),
             (gemma_tmpl, "gemma4-apex-embedded"),

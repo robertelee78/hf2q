@@ -6,6 +6,5 @@
 //! ADR-012: Qwen3.5-family conversion module (P2).
 //! ADR-013: inference-side models live in src/inference/models/ — do NOT mix.
 
-
 /// ADR-012 P10: pure-Rust mmproj vision-tower emitter.
 pub mod vit;

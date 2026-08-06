@@ -62,7 +62,8 @@ pub fn should_drop_source_tensor(model_type: &str, hf_name: &str) -> bool {
             ) {
                 return true;
             }
-            if stripped.starts_with("cls.predictions") || stripped.starts_with("cls.seq_relationship")
+            if stripped.starts_with("cls.predictions")
+                || stripped.starts_with("cls.seq_relationship")
             {
                 return true;
             }
@@ -80,7 +81,8 @@ pub fn should_drop_source_tensor(model_type: &str, hf_name: &str) -> bool {
             ) {
                 return true;
             }
-            if stripped.starts_with("cls.predictions") || stripped.starts_with("cls.seq_relationship")
+            if stripped.starts_with("cls.predictions")
+                || stripped.starts_with("cls.seq_relationship")
             {
                 return true;
             }

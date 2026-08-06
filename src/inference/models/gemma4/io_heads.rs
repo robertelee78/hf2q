@@ -59,7 +59,10 @@ impl MlxModelWeights {
         if hidden.len() != expected {
             anyhow::bail!(
                 "per_position_argmax_from_hidden: hidden len {} != seq_len({}) * hs({}) = {}",
-                hidden.len(), seq_len, hs, expected
+                hidden.len(),
+                seq_len,
+                hs,
+                expected
             );
         }
         // ADR-030 iter-70: HF2Q_DFLASH_BATCH_ARGMAX=1 (opt-in) routes to
@@ -71,7 +74,10 @@ impl MlxModelWeights {
         // target_argmax = 51 ms/round → expected ~10 ms/round after batching.
         if std::env::var("HF2Q_DFLASH_BATCH_ARGMAX").as_deref() == Ok("1") {
             return self.per_position_argmax_from_hidden_batched_impl(
-                hidden, seq_len, apply_final_norm, gpu,
+                hidden,
+                seq_len,
+                apply_final_norm,
+                gpu,
             );
         }
         let mut argmaxes = Vec::with_capacity(seq_len as usize);
@@ -118,10 +124,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("per_pos final_norm: {e}"))?;
             } else {
                 // Copy hidden → norm_out (already pre-normed by drafter)
-                s.barrier_between(
-                    &[&self.activations.hidden],
-                    &[&self.activations.norm_out],
-                );
+                s.barrier_between(&[&self.activations.hidden], &[&self.activations.norm_out]);
                 mlx_native::ops::copy::dispatch_copy_f32(
                     s.encoder_mut(),
                     reg,
@@ -191,10 +194,7 @@ impl MlxModelWeights {
             }
 
             if let Some(cap) = self.final_logit_softcapping {
-                s.barrier_between(
-                    &[&self.activations.logits],
-                    &[&self.activations.logits],
-                );
+                s.barrier_between(&[&self.activations.logits], &[&self.activations.logits]);
                 mlx_native::ops::softcap::dispatch_softcap(
                     s.encoder_mut(),
                     reg,
@@ -209,7 +209,10 @@ impl MlxModelWeights {
 
             s.barrier_between(
                 &[&self.activations.logits],
-                &[&self.activations.argmax_index, &self.activations.argmax_value],
+                &[
+                    &self.activations.argmax_index,
+                    &self.activations.argmax_value,
+                ],
             );
             mlx_native::ops::argmax::dispatch_argmax_f32(
                 s.encoder_mut(),
@@ -271,7 +274,10 @@ impl MlxModelWeights {
         if hidden.len() != expected {
             anyhow::bail!(
                 "per_position_argmax_batched: hidden len {} != seq_len({}) * hs({}) = {}",
-                hidden.len(), seq_len, hs, expected
+                hidden.len(),
+                seq_len,
+                hs,
+                expected
             );
         }
         let (exec, reg) = gpu.split();
@@ -316,10 +322,7 @@ impl MlxModelWeights {
 
         // (a) ONE rms_norm or copy with rows=n
         if apply_final_norm {
-            s.barrier_between(
-                &[&gpu_hidden_all, &self.final_norm],
-                &[&norm_out_batched],
-            );
+            s.barrier_between(&[&gpu_hidden_all, &self.final_norm], &[&norm_out_batched]);
             s.rms_norm(
                 reg,
                 metal_dev,
@@ -332,10 +335,7 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched arg rms_norm: {e}"))?;
         } else {
-            s.barrier_between(
-                &[&gpu_hidden_all],
-                &[&norm_out_batched],
-            );
+            s.barrier_between(&[&gpu_hidden_all], &[&norm_out_batched]);
             mlx_native::ops::copy::dispatch_copy_f32(
                 s.encoder_mut(),
                 reg,
@@ -353,10 +353,7 @@ impl MlxModelWeights {
         //     m<=8 through mat-vec (multiple matvecs per dispatch) and
         //     m>8 through mat-mat (simdgroup MMA, tile kernel).
         if let Some(ref q6k) = self.lm_head_q6k {
-            s.barrier_between(
-                &[&norm_out_batched, &q6k.buffer],
-                &[&logits_batched],
-            );
+            s.barrier_between(&[&norm_out_batched, &q6k.buffer], &[&logits_batched]);
             crate::serve::forward_mlx_shared::dispatch_qmatmul(
                 &mut s,
                 reg,
@@ -369,10 +366,7 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched arg lm_head Q6_K: {e}"))?;
         } else if let Some(ref q8) = self.lm_head_q8 {
-            s.barrier_between(
-                &[&norm_out_batched, &q8.buffer],
-                &[&logits_batched],
-            );
+            s.barrier_between(&[&norm_out_batched, &q8.buffer], &[&logits_batched]);
             crate::serve::forward_mlx_shared::dispatch_qmatmul(
                 &mut s,
                 reg,
@@ -385,10 +379,7 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched arg lm_head Q8: {e}"))?;
         } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-            s.barrier_between(
-                &[&norm_out_batched, lm_head_f16],
-                &[&logits_batched],
-            );
+            s.barrier_between(&[&norm_out_batched, lm_head_f16], &[&logits_batched]);
             mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
                 s.encoder_mut(),
                 reg,
@@ -404,9 +395,7 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched arg lm_head F16: {e}"))?;
         } else {
-            anyhow::bail!(
-                "per_position_argmax_batched requires lm_head_q6k / q8 / f16"
-            );
+            anyhow::bail!("per_position_argmax_batched requires lm_head_q6k / q8 / f16");
         }
 
         // (c) ONE softcap on the full n*vocab logits (element-wise).
@@ -430,10 +419,7 @@ impl MlxModelWeights {
                 p[0] = cap;
                 p[1] = f32::from_bits(total as u32);
             }
-            s.barrier_between(
-                &[&logits_batched],
-                &[&logits_batched],
-            );
+            s.barrier_between(&[&logits_batched], &[&logits_batched]);
             mlx_native::ops::softcap::dispatch_softcap(
                 s.encoder_mut(),
                 reg,
@@ -450,14 +436,13 @@ impl MlxModelWeights {
         //     stage is cheap compared to lm_head).  We dispatch within
         //     the same session — n small dispatches, one finish().
         for pos in 0..n {
-            let logits_row = logits_batched
-                .slice_view((pos * (vocab_size as usize) * 4) as u64, vocab_size as usize);
+            let logits_row = logits_batched.slice_view(
+                (pos * (vocab_size as usize) * 4) as u64,
+                vocab_size as usize,
+            );
             let argmax_idx_view = argmax_index_all.slice_view((pos * 4) as u64, 1);
             let argmax_val_view = argmax_value_all.slice_view((pos * 4) as u64, 1);
-            s.barrier_between(
-                &[&logits_batched],
-                &[&argmax_idx_view, &argmax_val_view],
-            );
+            s.barrier_between(&[&logits_batched], &[&argmax_idx_view, &argmax_val_view]);
             mlx_native::ops::argmax::dispatch_argmax_f32(
                 s.encoder_mut(),
                 reg,
@@ -511,13 +496,17 @@ impl MlxModelWeights {
     /// is in an unreadable state (typically: never written by any
     /// preceding forward call).
     pub fn logits_view(&self) -> Result<&[f32]> {
-        let slice: &[f32] = self.activations.logits.as_slice()
+        let slice: &[f32] = self
+            .activations
+            .logits
+            .as_slice()
             .map_err(|e| anyhow::anyhow!("logits_view read: {e}"))?;
         let v = self.vocab_size;
         anyhow::ensure!(
             slice.len() >= v,
             "logits_view: buffer length {} < vocab_size {}",
-            slice.len(), v
+            slice.len(),
+            v
         );
         Ok(&slice[..v])
     }
@@ -535,7 +524,10 @@ impl MlxModelWeights {
     /// Public surface for downstream eval/scoring crates; no internal caller.
     #[allow(dead_code)]
     pub fn token_nll_from_logits(&self, token_id: u32) -> Result<f32> {
-        let logits: &[f32] = self.activations.logits.as_slice()
+        let logits: &[f32] = self
+            .activations
+            .logits
+            .as_slice()
             .map_err(|e| anyhow::anyhow!("token_nll logits read: {e}"))?;
         let v = self.vocab_size;
         anyhow::ensure!(
@@ -545,12 +537,9 @@ impl MlxModelWeights {
         let slice = &logits[..v];
         // Log-sum-exp with max subtraction for numerical stability.
         let max_logit = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let sum_exp: f64 = slice.iter()
-            .map(|&l| ((l - max_logit) as f64).exp())
-            .sum();
+        let sum_exp: f64 = slice.iter().map(|&l| ((l - max_logit) as f64).exp()).sum();
         let log_sum_exp = max_logit as f64 + sum_exp.ln();
         let log_prob = (logits[token_id as usize] as f64) - log_sum_exp;
         Ok(-log_prob as f32)
     }
-
 }

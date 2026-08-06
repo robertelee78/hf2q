@@ -139,12 +139,11 @@ impl CorpusBytes {
                 // specific error pointing at the workaround.
                 Err(ImatrixError::CorpusRead {
                     path: "<baked:mudler>".to_string(),
-                    detail:
-                        "mudler corpus is not bundled in Phase A. \
+                    detail: "mudler corpus is not bundled in Phase A. \
                          Either use `cdv3` (default) or supply your own via \
                          `user-file:<path>`. See ADR-033 §Pi for the mudler-style \
                          sampling recipe."
-                            .to_string(),
+                        .to_string(),
                 })
             }
             CorpusSource::UserFile(path) => load_user_file(path),
@@ -238,8 +237,14 @@ mod tests {
     /// CLI parsing accepts the baked names and the `user-file:` prefix.
     #[test]
     fn from_cli_parses_baked_and_user_file() {
-        assert!(matches!(CorpusSource::from_cli("cdv3"), Ok(CorpusSource::Cdv3)));
-        assert!(matches!(CorpusSource::from_cli("mudler"), Ok(CorpusSource::Mudler)));
+        assert!(matches!(
+            CorpusSource::from_cli("cdv3"),
+            Ok(CorpusSource::Cdv3)
+        ));
+        assert!(matches!(
+            CorpusSource::from_cli("mudler"),
+            Ok(CorpusSource::Mudler)
+        ));
         let uf = CorpusSource::from_cli("user-file:/tmp/x.txt").unwrap();
         match uf {
             CorpusSource::UserFile(p) => assert_eq!(p.to_str(), Some("/tmp/x.txt")),

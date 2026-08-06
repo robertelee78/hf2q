@@ -143,10 +143,8 @@ fn wait_for_readyz() {
             )?;
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
             s.write_all(
-                format!(
-                    "GET /readyz HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nConnection: close\r\n\r\n"
-                )
-                .as_bytes(),
+                format!("GET /readyz HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
             )?;
             let mut head = [0u8; 64];
             let n = s.read(&mut head)?;
@@ -269,9 +267,7 @@ async fn fetch_model_id(client: &reqwest::Client) -> String {
         .expect("GET /v1/models");
     assert_eq!(resp.status().as_u16(), 200, "/v1/models returned non-200");
     let v: serde_json::Value = resp.json().await.expect("parse /v1/models JSON");
-    let data = v["data"]
-        .as_array()
-        .expect("/v1/models missing data array");
+    let data = v["data"].as_array().expect("/v1/models missing data array");
     // Prefer models with a context_length (chat-eligible).
     data.iter()
         .find(|m| !m["context_length"].is_null())
@@ -419,13 +415,10 @@ fn tool_call_grammar_constrained_stream() {
         return;
     }
 
-    let gguf = std::env::var(ENV_GEMMA_GGUF)
-        .unwrap_or_else(|_| DEFAULT_GEMMA_GGUF.to_string());
+    let gguf = std::env::var(ENV_GEMMA_GGUF).unwrap_or_else(|_| DEFAULT_GEMMA_GGUF.to_string());
 
     if !PathBuf::from(&gguf).exists() {
-        eprintln!(
-            "[SKIP] Gemma GGUF not found at {gguf}; set {ENV_GEMMA_GGUF}=<path>"
-        );
+        eprintln!("[SKIP] Gemma GGUF not found at {gguf}; set {ENV_GEMMA_GGUF}=<path>");
         return;
     }
 
@@ -433,8 +426,8 @@ fn tool_call_grammar_constrained_stream() {
         "tool_call_grammar_constrained [stream]: spawning hf2q at {HOST}:{PORT} model={gguf}"
     );
 
-    let _guard = ServerGuard::spawn(&gguf)
-        .unwrap_or_else(|e| panic!("failed to spawn hf2q serve: {e}"));
+    let _guard =
+        ServerGuard::spawn(&gguf).unwrap_or_else(|e| panic!("failed to spawn hf2q serve: {e}"));
     wait_for_readyz();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -524,8 +517,8 @@ fn tool_call_grammar_constrained_stream() {
              decode must produce at least {{}} for the required 'location' key."
         );
 
-        let args_val: serde_json::Value = serde_json::from_str(&slot0.arguments)
-            .unwrap_or_else(|e| {
+        let args_val: serde_json::Value =
+            serde_json::from_str(&slot0.arguments).unwrap_or_else(|e| {
                 panic!(
                     "FAIL: concatenated delta.tool_calls[0].function.arguments is \
                      not valid JSON ({e}).\n\
@@ -547,8 +540,7 @@ fn tool_call_grammar_constrained_stream() {
 
         eprintln!(
             "tool_call_grammar_constrained [stream]: arguments={} location={:?}",
-            slot0.arguments,
-            args_val["location"]
+            slot0.arguments, args_val["location"]
         );
 
         // --- Assert 5: finish_reason == "tool_calls" ---
@@ -614,13 +606,10 @@ fn tool_call_grammar_constrained_nonstream() {
         return;
     }
 
-    let gguf = std::env::var(ENV_GEMMA_GGUF)
-        .unwrap_or_else(|_| DEFAULT_GEMMA_GGUF.to_string());
+    let gguf = std::env::var(ENV_GEMMA_GGUF).unwrap_or_else(|_| DEFAULT_GEMMA_GGUF.to_string());
 
     if !PathBuf::from(&gguf).exists() {
-        eprintln!(
-            "[SKIP] Gemma GGUF not found at {gguf}; set {ENV_GEMMA_GGUF}=<path>"
-        );
+        eprintln!("[SKIP] Gemma GGUF not found at {gguf}; set {ENV_GEMMA_GGUF}=<path>");
         return;
     }
 
@@ -628,8 +617,8 @@ fn tool_call_grammar_constrained_nonstream() {
         "tool_call_grammar_constrained [non-stream]: spawning hf2q at {HOST}:{PORT} model={gguf}"
     );
 
-    let _guard = ServerGuard::spawn(&gguf)
-        .unwrap_or_else(|e| panic!("failed to spawn hf2q serve: {e}"));
+    let _guard =
+        ServerGuard::spawn(&gguf).unwrap_or_else(|e| panic!("failed to spawn hf2q serve: {e}"));
     wait_for_readyz();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -644,9 +633,7 @@ fn tool_call_grammar_constrained_nonstream() {
             .expect("build reqwest client");
 
         let model_id = fetch_model_id(&client).await;
-        eprintln!(
-            "tool_call_grammar_constrained [non-stream]: model_id={model_id}"
-        );
+        eprintln!("tool_call_grammar_constrained [non-stream]: model_id={model_id}");
 
         let body = weather_tool_request(false, &model_id);
         let resp = nonstream_chat_completions(&client, &body).await;
@@ -723,12 +710,9 @@ fn tool_call_grammar_constrained_nonstream() {
             "tool_calls[0].function.arguments must not be empty"
         );
 
-        let args_val: serde_json::Value = serde_json::from_str(fn_args_str)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "tool_calls[0].function.arguments is not valid JSON ({e}): {fn_args_str:?}"
-                )
-            });
+        let args_val: serde_json::Value = serde_json::from_str(fn_args_str).unwrap_or_else(|e| {
+            panic!("tool_calls[0].function.arguments is not valid JSON ({e}): {fn_args_str:?}")
+        });
 
         assert!(
             !args_val["location"].is_null(),

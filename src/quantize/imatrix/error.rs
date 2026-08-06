@@ -121,9 +121,7 @@ pub enum ImatrixError {
     /// `chunk_index` is 0-based, `chunk_count` is the total number of
     /// chunks the driver planned to walk. Wraps the upstream
     /// `anyhow::Error`.
-    #[error(
-        "imatrix driver: forward pass failed on chunk {chunk_index}/{chunk_count}: {detail}"
-    )]
+    #[error("imatrix driver: forward pass failed on chunk {chunk_index}/{chunk_count}: {detail}")]
     ForwardPassFailed {
         chunk_index: usize,
         chunk_count: usize,
@@ -183,8 +181,14 @@ mod p7_ac3_hint_tests {
         }
         .to_string();
         assert!(msg.contains("/tmp/foo.gguf"), "msg should echo path: {msg}");
-        assert!(msg.contains("imatrix"), "msg should reference imatrix: {msg}");
-        assert!(msg.contains("llama"), "msg should report actual general.type: {msg}");
+        assert!(
+            msg.contains("imatrix"),
+            "msg should reference imatrix: {msg}"
+        );
+        assert!(
+            msg.contains("llama"),
+            "msg should report actual general.type: {msg}"
+        );
     }
 
     #[test]
@@ -194,7 +198,10 @@ mod p7_ac3_hint_tests {
             key: "imatrix.chunk_count",
         }
         .to_string();
-        assert!(msg.contains("imatrix.chunk_count"), "msg should name the key: {msg}");
+        assert!(
+            msg.contains("imatrix.chunk_count"),
+            "msg should name the key: {msg}"
+        );
         assert!(msg.contains("/tmp/x.gguf"), "msg should echo path: {msg}");
     }
 
@@ -205,8 +212,14 @@ mod p7_ac3_hint_tests {
             supported: &["cdv3", "mudler", "user-file"],
         }
         .to_string();
-        assert!(msg.contains("wikitext-9000"), "msg should echo bad name: {msg}");
-        assert!(msg.contains("cdv3"), "msg should list a supported value: {msg}");
+        assert!(
+            msg.contains("wikitext-9000"),
+            "msg should echo bad name: {msg}"
+        );
+        assert!(
+            msg.contains("cdv3"),
+            "msg should list a supported value: {msg}"
+        );
         assert!(
             msg.contains("user-file"),
             "msg should mention the operator-supplied option: {msg}"
@@ -223,7 +236,10 @@ mod p7_ac3_hint_tests {
             expected: 8,
         }
         .to_string();
-        assert!(msg.contains("blk.0.attn_q.weight"), "msg should name tensor: {msg}");
+        assert!(
+            msg.contains("blk.0.attn_q.weight"),
+            "msg should name tensor: {msg}"
+        );
         assert!(msg.contains("2"), "msg should carry m: {msg}");
         assert!(msg.contains("4"), "msg should carry n_per_row: {msg}");
         assert!(msg.contains("5"), "msg should carry got: {msg}");
@@ -240,7 +256,10 @@ mod p7_ac3_hint_tests {
             msg.contains("convert to F16 GGUF failed"),
             "msg should name the failed step: {msg}"
         );
-        assert!(msg.contains("/tmp/bogus"), "msg should carry upstream detail: {msg}");
+        assert!(
+            msg.contains("/tmp/bogus"),
+            "msg should carry upstream detail: {msg}"
+        );
     }
 
     #[test]
@@ -249,8 +268,14 @@ mod p7_ac3_hint_tests {
             detail: "GGUF magic mismatch".to_string(),
         }
         .to_string();
-        assert!(msg.contains("model load failed"), "msg should name the step: {msg}");
-        assert!(msg.contains("GGUF magic mismatch"), "msg should carry detail: {msg}");
+        assert!(
+            msg.contains("model load failed"),
+            "msg should name the step: {msg}"
+        );
+        assert!(
+            msg.contains("GGUF magic mismatch"),
+            "msg should carry detail: {msg}"
+        );
     }
 
     #[test]
@@ -263,9 +288,18 @@ mod p7_ac3_hint_tests {
             supported: &["gemma4", "qwen35moe"],
         }
         .to_string();
-        assert!(msg.contains("minimax-m2"), "msg should echo bad arch: {msg}");
-        assert!(msg.contains("gemma4"), "msg should list supported arches: {msg}");
-        assert!(msg.contains("qwen35moe"), "msg should list qwen35moe (Stage 3b.4): {msg}");
+        assert!(
+            msg.contains("minimax-m2"),
+            "msg should echo bad arch: {msg}"
+        );
+        assert!(
+            msg.contains("gemma4"),
+            "msg should list supported arches: {msg}"
+        );
+        assert!(
+            msg.contains("qwen35moe"),
+            "msg should list qwen35moe (Stage 3b.4): {msg}"
+        );
         assert!(
             msg.contains("not yet wired") || msg.contains("supported"),
             "msg should explain the gap: {msg}"
@@ -279,7 +313,10 @@ mod p7_ac3_hint_tests {
         }
         .to_string();
         assert!(msg.contains("tokenizer"), "msg should name the step: {msg}");
-        assert!(msg.contains("byte 42"), "msg should carry upstream detail: {msg}");
+        assert!(
+            msg.contains("byte 42"),
+            "msg should carry upstream detail: {msg}"
+        );
     }
 
     #[test]
@@ -294,7 +331,10 @@ mod p7_ac3_hint_tests {
             msg.contains("7") && msg.contains("100"),
             "msg should locate chunk_index/chunk_count: {msg}"
         );
-        assert!(msg.contains("GPU OOM"), "msg should carry upstream detail: {msg}");
+        assert!(
+            msg.contains("GPU OOM"),
+            "msg should carry upstream detail: {msg}"
+        );
     }
 
     #[test]
@@ -305,7 +345,10 @@ mod p7_ac3_hint_tests {
             n_ctx: 512,
         }
         .to_string();
-        assert!(msg.contains("user-file:tiny.txt"), "msg should echo label: {msg}");
+        assert!(
+            msg.contains("user-file:tiny.txt"),
+            "msg should echo label: {msg}"
+        );
         assert!(msg.contains("32"), "msg should carry token_count: {msg}");
         assert!(msg.contains("512"), "msg should carry n_ctx: {msg}");
     }

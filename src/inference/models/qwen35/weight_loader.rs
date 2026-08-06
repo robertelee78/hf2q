@@ -26,10 +26,10 @@
 //! tensors (norms, biases) are 1-D and drop in directly.
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::BTreeMap;
 use mlx_native::gguf::GgufFile;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType as MlxDType, MlxBuffer, MlxDevice};
+use std::collections::BTreeMap;
 
 use crate::ir::lazy::{LazyTensor, LazyTensorMap};
 use crate::ir::{DType as IrDType, TensorRef};
@@ -119,11 +119,7 @@ pub struct DenseFfnWeightsQ {
 
 /// Load a tensor from the GGUF, dequantize to f32, and download into
 /// a `Vec<f32>`.
-pub fn load_f32_tensor(
-    gguf: &GgufFile,
-    name: &str,
-    device: &MlxDevice,
-) -> Result<Vec<f32>> {
+pub fn load_f32_tensor(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Result<Vec<f32>> {
     let buf = gguf
         .load_tensor_f32(name, device)
         .map_err(|e| anyhow!("load_tensor_f32({name}): {e}"))?;
@@ -165,12 +161,11 @@ pub fn load_global_tensors(
     device: &MlxDevice,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let _ = cfg; // reserved for future shape validation
-    let token_embd = load_f32_tensor(gguf, "token_embd.weight", device)
-        .context("token_embd.weight")?;
-    let output_weight = load_f32_tensor(gguf, "output.weight", device)
-        .context("output.weight")?;
-    let output_norm = load_f32_tensor(gguf, "output_norm.weight", device)
-        .context("output_norm.weight")?;
+    let token_embd =
+        load_f32_tensor(gguf, "token_embd.weight", device).context("token_embd.weight")?;
+    let output_weight = load_f32_tensor(gguf, "output.weight", device).context("output.weight")?;
+    let output_norm =
+        load_f32_tensor(gguf, "output_norm.weight", device).context("output_norm.weight")?;
     Ok((token_embd, output_weight, output_norm))
 }
 
@@ -333,8 +328,11 @@ fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Confi
     let head_dim = lookup
         .maybe(&format!("blk.{full_layer_idx}.attn_q_norm.weight"))
         .and_then(|t| t.shape().first().copied())
-        .or_else(|| lookup.maybe(&format!("blk.{full_layer_idx}.attn_k_norm.weight"))
-            .and_then(|t| t.shape().first().copied()))
+        .or_else(|| {
+            lookup
+                .maybe(&format!("blk.{full_layer_idx}.attn_k_norm.weight"))
+                .and_then(|t| t.shape().first().copied())
+        })
         .unwrap_or(32) as u32;
     let attn_q_rows = lookup
         .maybe(&format!("blk.{full_layer_idx}.attn_q.weight"))
@@ -368,8 +366,10 @@ fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Confi
     let attn_qkv_rows = lookup
         .maybe(&format!("blk.{linear_layer_idx}.attn_qkv.weight"))
         .and_then(|t| t.shape().first().copied())
-        .unwrap_or((2 * num_key_value_heads * linear_key_head_dim
-            + linear_num_value_heads * linear_value_head_dim) as usize) as u32;
+        .unwrap_or(
+            (2 * num_key_value_heads * linear_key_head_dim
+                + linear_num_value_heads * linear_value_head_dim) as usize,
+        ) as u32;
     let v_rows = linear_num_value_heads * linear_value_head_dim;
     let linear_num_key_heads = if attn_qkv_rows > v_rows && linear_key_head_dim > 0 {
         ((attn_qkv_rows - v_rows) / (2 * linear_key_head_dim)).max(1)
@@ -393,7 +393,8 @@ fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Confi
                 .shape()
                 .first()
                 .copied()
-                .ok_or_else(|| anyhow!("blk.0.ffn_gate.weight has empty shape"))? as u32;
+                .ok_or_else(|| anyhow!("blk.0.ffn_gate.weight has empty shape"))?
+                as u32;
             (Some(m), None)
         }
         Qwen35Variant::Moe => {
@@ -647,10 +648,7 @@ fn load_lazy_delta_net_layer(
     })
 }
 
-fn load_lazy_dense_ffn(
-    lookup: &LazyQwen35Lookup<'_>,
-    layer_idx: u32,
-) -> Result<DenseFfnWeights> {
+fn load_lazy_dense_ffn(lookup: &LazyQwen35Lookup<'_>, layer_idx: u32) -> Result<DenseFfnWeights> {
     let p = format!("blk.{}", layer_idx);
     Ok(DenseFfnWeights {
         gate: load_lazy_f32(lookup, &format!("{p}.ffn_gate.weight"))?,
@@ -693,8 +691,8 @@ impl Qwen35Model {
     pub fn load_from_lazy_tensor_map(model: &LazyTensorMap) -> Result<Self> {
         let lookup = LazyQwen35Lookup::new(model);
         let mut cfg = infer_lazy_qwen35_config(&lookup)?;
-        let device = MlxDevice::new()
-            .map_err(|e| anyhow!("MlxDevice::new for lazy qwen35 loading: {e}"))?;
+        let device =
+            MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for lazy qwen35 loading: {e}"))?;
 
         let mut token_embd = load_lazy_f32(&lookup, "token_embd.weight")?;
         let output_weight = load_lazy_f32(&lookup, "output.weight")?;
@@ -711,9 +709,7 @@ impl Qwen35Model {
         if h > 0 {
             const QWEN35_FULL_VOCAB: u32 = 248_320;
             let current_vocab = cfg.vocab_size;
-            if current_vocab < QWEN35_FULL_VOCAB
-                && (QWEN35_FULL_VOCAB - current_vocab) < 2048
-            {
+            if current_vocab < QWEN35_FULL_VOCAB && (QWEN35_FULL_VOCAB - current_vocab) < 2048 {
                 token_embd.resize(QWEN35_FULL_VOCAB as usize * h, 0.0f32);
             }
         }
@@ -808,7 +804,11 @@ pub fn load_full_attn_layer(
     assert_eq!(attn_q_norm.len(), d, "attn_q_norm layer {layer_idx} shape");
     assert_eq!(attn_k_norm.len(), d, "attn_k_norm layer {layer_idx} shape");
     assert_eq!(wo.len(), h * q_total, "attn_output layer {layer_idx} shape");
-    assert_eq!(post_attn_norm.len(), h, "post_attn_norm layer {layer_idx} shape");
+    assert_eq!(
+        post_attn_norm.len(),
+        h,
+        "post_attn_norm layer {layer_idx} shape"
+    );
 
     // De-interleave fused q_fused into wq and w_gate.
     // llama.cpp layout (confirmed from build_layer_attn): Q and gate are INTERLEAVED
@@ -884,11 +884,11 @@ pub fn load_delta_net_layer(
     let p = format!("blk.{}", layer_idx);
 
     // Key dimensions.
-    let nk     = cfg.linear_num_key_heads as usize;
-    let nv     = cfg.linear_num_value_heads as usize;
-    let dk     = cfg.linear_key_head_dim as usize;
-    let dv     = cfg.linear_value_head_dim as usize;
-    let h      = cfg.hidden_size as usize;
+    let nk = cfg.linear_num_key_heads as usize;
+    let nv = cfg.linear_num_value_heads as usize;
+    let dk = cfg.linear_key_head_dim as usize;
+    let dv = cfg.linear_value_head_dim as usize;
+    let h = cfg.hidden_size as usize;
     let k_width = cfg.linear_conv_kernel_dim as usize;
     let qkv_channels = 2 * nk * dk + nv * dv;
 
@@ -903,7 +903,7 @@ pub fn load_delta_net_layer(
     // n_k_heads` internally, so this layout is consumed directly — no reorder.
     let attn_qkv = load_f32_tensor(gguf, &format!("{p}.attn_qkv.weight"), device)?;
     let qk_rows = 2 * nk * dk;
-    let v_rows  = nv * dv;
+    let v_rows = nv * dv;
     assert_eq!(attn_qkv.len(), (qk_rows + v_rows) * h, "attn_qkv shape");
 
     // ---- attn_gate ----
@@ -919,7 +919,11 @@ pub fn load_delta_net_layer(
     // is opaque to the kernel — we just transpose from [channels, K] to
     // [K, channels] (the order the CPU reference's `ssm_conv_scalar` reads).
     let ssm_conv1d_gguf = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
-    assert_eq!(ssm_conv1d_gguf.len(), qkv_channels * k_width, "ssm_conv1d shape");
+    assert_eq!(
+        ssm_conv1d_gguf.len(),
+        qkv_channels * k_width,
+        "ssm_conv1d shape"
+    );
     let ssm_conv1d = {
         // Transpose [channels, K] → [K, channels].
         let mut out = vec![0.0f32; k_width * qkv_channels];
@@ -982,11 +986,7 @@ pub fn load_delta_net_layer(
 }
 
 /// Load an MoE FFN layer's weights.
-pub fn load_moe_ffn(
-    gguf: &GgufFile,
-    layer_idx: u32,
-    device: &MlxDevice,
-) -> Result<MoeFfnWeights> {
+pub fn load_moe_ffn(gguf: &GgufFile, layer_idx: u32, device: &MlxDevice) -> Result<MoeFfnWeights> {
     let p = format!("blk.{}", layer_idx);
     let router = load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp.weight"), device)?;
     let expert_gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate_exps.weight"), device)?;
@@ -1031,24 +1031,24 @@ pub fn load_moe_ffn_quantized(
     let shared_gate_logit =
         load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), device)?;
     let shared_gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate_shexp.weight"), device)?;
-    let shared_up   = load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?;
+    let shared_up = load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?;
     let shared_down = load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?;
 
     // Expert weights: load raw GGML blocks, preserving quantization.
     // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
-    let expert_gate_q = load_tensor_with_residency(
-        gguf, &format!("{p}.ffn_gate_exps.weight"), device,
-    ).with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
-    let expert_up_q = load_tensor_with_residency(
-        gguf, &format!("{p}.ffn_up_exps.weight"), device,
-    ).with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
-    let expert_down_q = load_tensor_with_residency(
-        gguf, &format!("{p}.ffn_down_exps.weight"), device,
-    ).with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
+    let expert_gate_q =
+        load_tensor_with_residency(gguf, &format!("{p}.ffn_gate_exps.weight"), device)
+            .with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
+    let expert_up_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_up_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
+    let expert_down_q =
+        load_tensor_with_residency(gguf, &format!("{p}.ffn_down_exps.weight"), device)
+            .with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
 
     // Gate and up may have a different quant type than down (e.g. Q5_K vs Q6_K
     // in the apex GGUF).  Read each separately.
-    let gate_info = gguf.tensor_info(&format!("{p}.ffn_gate_exps.weight"))
+    let gate_info = gguf
+        .tensor_info(&format!("{p}.ffn_gate_exps.weight"))
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate_exps not found in GGUF"))?;
     let ggml_type_gate_up = gate_info.ggml_type;
 
@@ -1068,12 +1068,15 @@ pub fn load_moe_ffn_quantized(
         ggml_type_gate_up,
     );
 
-    let down_info = gguf.tensor_info(&format!("{p}.ffn_down_exps.weight"))
+    let down_info = gguf
+        .tensor_info(&format!("{p}.ffn_down_exps.weight"))
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down_exps not found in GGUF"))?;
     let ggml_type_down = down_info.ggml_type;
 
-    let supported = |t: GgmlType| matches!(t,
-        GgmlType::Q4_0
+    let supported = |t: GgmlType| {
+        matches!(
+            t,
+            GgmlType::Q4_0
             | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::Q4_K
@@ -1085,7 +1088,8 @@ pub fn load_moe_ffn_quantized(
             // apex-i-quality MoE GGUFs (mudler's canonical mid-layer
             // expert quant).
             | GgmlType::IQ4_XS
-    );
+        )
+    };
 
     // Validate that the types are supported by quantized_matmul_id_ggml.
     // Per `mlx-native/src/ops/quantized_matmul_id_ggml.rs`:
@@ -1160,19 +1164,18 @@ pub fn load_dense_ffn_quantized(
 
     // Read quantization types from GGUF tensor metadata BEFORE loading buffers,
     // so we can reject unsupported types cheaply without touching the tensor data.
-    let gate_info = gguf.tensor_info(&format!("{p}.ffn_gate.weight"))
+    let gate_info = gguf
+        .tensor_info(&format!("{p}.ffn_gate.weight"))
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate.weight not found in GGUF"))?;
     let ggml_type_gate_up = gate_info.ggml_type;
 
-    let down_info = gguf.tensor_info(&format!("{p}.ffn_down.weight"))
+    let down_info = gguf
+        .tensor_info(&format!("{p}.ffn_down.weight"))
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down.weight not found in GGUF"))?;
     let ggml_type_down = down_info.ggml_type;
 
     // Reject float types — callers must use `load_dense_ffn` for those.
-    let supported = |t: GgmlType| matches!(
-        t,
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K
-    );
+    let supported = |t: GgmlType| matches!(t, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K);
     if !supported(ggml_type_gate_up) {
         return Err(anyhow!(
             "layer {layer_idx}: gate/up dense weights have unsupported quant type {:?} \
@@ -1192,20 +1195,18 @@ pub fn load_dense_ffn_quantized(
 
     // Load raw GGML blocks — DType::U8 on Metal, no F32 expansion.
     // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
-    let gate_q = load_tensor_with_residency(
-        gguf, &format!("{p}.ffn_gate.weight"), device,
-    ).with_context(|| format!("layer {layer_idx} ffn_gate.weight (quantized)"))?;
-    let up_q = load_tensor_with_residency(
-        gguf, &format!("{p}.ffn_up.weight"), device,
-    ).with_context(|| format!("layer {layer_idx} ffn_up.weight (quantized)"))?;
-    let down_q = load_tensor_with_residency(
-        gguf, &format!("{p}.ffn_down.weight"), device,
-    ).with_context(|| format!("layer {layer_idx} ffn_down.weight (quantized)"))?;
+    let gate_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_gate.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_gate.weight (quantized)"))?;
+    let up_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_up.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_up.weight (quantized)"))?;
+    let down_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_down.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_down.weight (quantized)"))?;
 
     // Use config values as authoritative (already validated against GGUF metadata
     // by Qwen35Config::from_gguf).
     let hidden_size = cfg.hidden_size;
-    let intermediate_size = cfg.intermediate_size
+    let intermediate_size = cfg
+        .intermediate_size
         .ok_or_else(|| anyhow!("layer {layer_idx}: dense FFN but cfg.intermediate_size is None"))?;
 
     Ok(DenseFfnWeightsQ {
@@ -1275,9 +1276,9 @@ pub fn load_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::models::qwen35::model::Qwen35Model;
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
     use crate::ir::DType;
-    use crate::inference::models::qwen35::model::Qwen35Model;
 
     fn f32_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
         values.flat_map(|v| v.to_le_bytes()).collect()
@@ -1311,7 +1312,11 @@ mod tests {
         for layer in 0..4 {
             let p = format!("blk.{layer}");
             insert_zeros(&mut map, &format!("{p}.attn_norm.weight"), vec![h]);
-            insert_zeros(&mut map, &format!("{p}.post_attention_norm.weight"), vec![h]);
+            insert_zeros(
+                &mut map,
+                &format!("{p}.post_attention_norm.weight"),
+                vec![h],
+            );
             if layer == 3 {
                 insert_f32(
                     &mut map,
@@ -1319,22 +1324,54 @@ mod tests {
                     vec![2 * q_heads * d, h],
                     1_000.0,
                 );
-                insert_zeros(&mut map, &format!("{p}.attn_k.weight"), vec![kv_heads * d, h]);
-                insert_zeros(&mut map, &format!("{p}.attn_v.weight"), vec![kv_heads * d, h]);
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.attn_k.weight"),
+                    vec![kv_heads * d, h],
+                );
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.attn_v.weight"),
+                    vec![kv_heads * d, h],
+                );
                 insert_zeros(&mut map, &format!("{p}.attn_q_norm.weight"), vec![d]);
                 insert_zeros(&mut map, &format!("{p}.attn_k_norm.weight"), vec![d]);
-                insert_zeros(&mut map, &format!("{p}.attn_output.weight"), vec![h, q_heads * d]);
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.attn_output.weight"),
+                    vec![h, q_heads * d],
+                );
             } else {
                 let qkv_rows = 2 * lin_k_heads * d + lin_v_heads * d;
                 insert_zeros(&mut map, &format!("{p}.attn_qkv.weight"), vec![qkv_rows, h]);
-                insert_zeros(&mut map, &format!("{p}.attn_gate.weight"), vec![lin_v_heads * d, h]);
-                insert_zeros(&mut map, &format!("{p}.ssm_conv1d.weight"), vec![qkv_rows, 4]);
-                insert_zeros(&mut map, &format!("{p}.ssm_alpha.weight"), vec![lin_v_heads, h]);
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.attn_gate.weight"),
+                    vec![lin_v_heads * d, h],
+                );
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.ssm_conv1d.weight"),
+                    vec![qkv_rows, 4],
+                );
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.ssm_alpha.weight"),
+                    vec![lin_v_heads, h],
+                );
                 insert_zeros(&mut map, &format!("{p}.ssm_dt.bias"), vec![lin_v_heads]);
-                insert_zeros(&mut map, &format!("{p}.ssm_beta.weight"), vec![lin_v_heads, h]);
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.ssm_beta.weight"),
+                    vec![lin_v_heads, h],
+                );
                 insert_zeros(&mut map, &format!("{p}.ssm_a"), vec![lin_v_heads]);
                 insert_zeros(&mut map, &format!("{p}.ssm_norm.weight"), vec![d]);
-                insert_zeros(&mut map, &format!("{p}.ssm_out.weight"), vec![h, lin_v_heads * d]);
+                insert_zeros(
+                    &mut map,
+                    &format!("{p}.ssm_out.weight"),
+                    vec![h, lin_v_heads * d],
+                );
             }
             insert_zeros(&mut map, &format!("{p}.ffn_gate.weight"), vec![inter, h]);
             insert_zeros(&mut map, &format!("{p}.ffn_up.weight"), vec![inter, h]);
@@ -1352,13 +1389,40 @@ mod tests {
             map.remove(&format!("{p}.ffn_up.weight"));
             map.remove(&format!("{p}.ffn_down.weight"));
             insert_zeros(&mut map, &format!("{p}.ffn_gate_inp.weight"), vec![2, 32]);
-            insert_f32(&mut map, &format!("{p}.ffn_gate_exps.weight"), vec![2, 16, 32], 10.0);
-            insert_f32(&mut map, &format!("{p}.ffn_up_exps.weight"), vec![2, 16, 32], 20.0);
-            insert_f32(&mut map, &format!("{p}.ffn_down_exps.weight"), vec![2, 32, 16], 30.0);
-            insert_zeros(&mut map, &format!("{p}.ffn_gate_inp_shexp.weight"), vec![32]);
-            insert_zeros(&mut map, &format!("{p}.ffn_gate_shexp.weight"), vec![16, 32]);
+            insert_f32(
+                &mut map,
+                &format!("{p}.ffn_gate_exps.weight"),
+                vec![2, 16, 32],
+                10.0,
+            );
+            insert_f32(
+                &mut map,
+                &format!("{p}.ffn_up_exps.weight"),
+                vec![2, 16, 32],
+                20.0,
+            );
+            insert_f32(
+                &mut map,
+                &format!("{p}.ffn_down_exps.weight"),
+                vec![2, 32, 16],
+                30.0,
+            );
+            insert_zeros(
+                &mut map,
+                &format!("{p}.ffn_gate_inp_shexp.weight"),
+                vec![32],
+            );
+            insert_zeros(
+                &mut map,
+                &format!("{p}.ffn_gate_shexp.weight"),
+                vec![16, 32],
+            );
             insert_zeros(&mut map, &format!("{p}.ffn_up_shexp.weight"), vec![16, 32]);
-            insert_zeros(&mut map, &format!("{p}.ffn_down_shexp.weight"), vec![32, 16]);
+            insert_zeros(
+                &mut map,
+                &format!("{p}.ffn_down_shexp.weight"),
+                vec![32, 16],
+            );
         }
         map
     }
@@ -1505,7 +1569,10 @@ mod tests {
             ("ssm_out", &attn.ssm_out),
         ] {
             let n_nan = data.iter().filter(|v| v.is_nan()).count();
-            let n_inf = data.iter().filter(|v| !v.is_finite() && !v.is_nan()).count();
+            let n_inf = data
+                .iter()
+                .filter(|v| !v.is_finite() && !v.is_nan())
+                .count();
             assert_eq!(n_nan, 0, "{}: NaN values present", name);
             assert_eq!(n_inf, 0, "{}: Inf values present", name);
 
@@ -1670,8 +1737,7 @@ mod tests {
             }
         };
 
-        let (embd, out_w, out_norm) =
-            load_global_tensors(&gguf, &cfg, &device).expect("globals");
+        let (embd, out_w, out_norm) = load_global_tensors(&gguf, &cfg, &device).expect("globals");
         let vocab = cfg.vocab_size as usize;
         let h = cfg.hidden_size as usize;
         assert_eq!(embd.len(), vocab * h, "token_embd shape");
@@ -1686,7 +1752,11 @@ mod tests {
             let mean = sum / n;
             ((sum_sq / n - mean * mean).max(0.0)).sqrt()
         };
-        eprintln!("  token_embd: {} values, stddev = {:.6}", embd.len(), embd_stddev);
+        eprintln!(
+            "  token_embd: {} values, stddev = {:.6}",
+            embd.len(),
+            embd_stddev
+        );
         assert!(embd_stddev > 1e-6, "token_embd degenerate");
     }
 }

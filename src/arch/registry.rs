@@ -157,10 +157,7 @@ impl ArchRegistry {
     }
 
     /// Lookup by HF `architectures[0]` string (for config-driven dispatch).
-    pub fn get_by_hf_architecture(
-        &self,
-        hf_arch: &str,
-    ) -> Result<&'static ArchEntry, ArchError> {
+    pub fn get_by_hf_architecture(&self, hf_arch: &str) -> Result<&'static ArchEntry, ArchError> {
         for entry in self.entries {
             if entry.hf_architectures.contains(&hf_arch) {
                 return Ok(entry);
@@ -355,28 +352,24 @@ mod tests {
                             has_l,
                             "{}: per-layer entry {:?} MUST contain {{L}} \
                              (else expand_names emits N duplicates)",
-                            entry.arch,
-                            cat_entry.name_template
+                            entry.arch, cat_entry.name_template
                         );
                         assert!(
                             !has_x,
                             "{}: non-expert entry {:?} must not contain {{X}}",
-                            entry.arch,
-                            cat_entry.name_template
+                            entry.arch, cat_entry.name_template
                         );
                     }
                     LayerScope::MoeExpertsPerLayer => {
                         assert!(
                             has_l,
                             "{}: MoeExpertsPerLayer {:?} MUST contain {{L}}",
-                            entry.arch,
-                            cat_entry.name_template
+                            entry.arch, cat_entry.name_template
                         );
                         assert!(
                             has_x,
                             "{}: MoeExpertsPerLayer {:?} MUST contain {{X}}",
-                            entry.arch,
-                            cat_entry.name_template
+                            entry.arch, cat_entry.name_template
                         );
                     }
                 }

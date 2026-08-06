@@ -466,9 +466,7 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
                 return Err(BakeError {
                     op: op.clone(),
                     buffer_len: data.len(),
-                    reason: format!(
-                        "axis_size {axis_size} not divisible by 2 for SplitAxisHalf"
-                    ),
+                    reason: format!("axis_size {axis_size} not divisible by 2 for SplitAxisHalf"),
                 });
             }
             let expected_len = outer_count * axis_size * inner_count;
@@ -955,9 +953,7 @@ mod tests {
         ];
         let expert1: Vec<f32> = vec![
             100.0, 104.0, 108.0, // h=0
-            101.0, 105.0, 109.0,
-            102.0, 106.0, 110.0,
-            103.0, 107.0, 111.0,
+            101.0, 105.0, 109.0, 102.0, 106.0, 110.0, 103.0, 107.0, 111.0,
         ];
         let mut expected = expert0;
         expected.extend(expert1);
@@ -1180,7 +1176,10 @@ mod tests {
         // Per expert: take rows 0 and 1, drop rows 2 and 3.
         // expert 0: 0..6
         // expert 1: 12..18
-        let expect_first: Vec<f32> = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0].to_vec();
+        let expect_first: Vec<f32> = [
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0,
+        ]
+        .to_vec();
         assert_eq!(first, expect_first);
     }
 
@@ -1197,7 +1196,10 @@ mod tests {
             },
         )
         .unwrap();
-        let expect_second: Vec<f32> = [6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0].to_vec();
+        let expect_second: Vec<f32> = [
+            6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0,
+        ]
+        .to_vec();
         assert_eq!(second, expect_second);
     }
 
@@ -1293,7 +1295,9 @@ mod tests {
         )
         .unwrap();
         let row0_expect = [0.0, 1.0, 6.0, 7.0, 2.0, 3.0, 8.0, 9.0, 4.0, 5.0, 10.0, 11.0];
-        let row1_expect = [12.0, 13.0, 18.0, 19.0, 14.0, 15.0, 20.0, 21.0, 16.0, 17.0, 22.0, 23.0];
+        let row1_expect = [
+            12.0, 13.0, 18.0, 19.0, 14.0, 15.0, 20.0, 21.0, 16.0, 17.0, 22.0, 23.0,
+        ];
         assert_eq!(out[0..12], row0_expect);
         assert_eq!(out[12..24], row1_expect);
     }

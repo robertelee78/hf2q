@@ -51,8 +51,8 @@
 //! Target forward integration + KV rollback wiring land in subsequent
 //! commits.
 
-use anyhow::Context;
 use crate::inference::spec_decode::verifier::accept_prefix_argmax;
+use anyhow::Context;
 
 /// Output of one spec-decode round.
 #[derive(Debug, Clone, PartialEq)]
@@ -261,9 +261,7 @@ pub fn dispatch_dflash_one_round(
     gpu: &mut crate::serve::gpu::GpuContext,
 ) -> anyhow::Result<RoundResult> {
     if block_size < 2 {
-        anyhow::bail!(
-            "dispatch_dflash_one_round: block_size must be >= 2; got {block_size}"
-        );
+        anyhow::bail!("dispatch_dflash_one_round: block_size must be >= 2; got {block_size}");
     }
 
     // -------- Step 1: build the draft block --------
@@ -388,7 +386,8 @@ pub fn dispatch_dflash_generate_one_round_with_initial_capture(
         if i >= num_target_layers {
             anyhow::bail!(
                 "generate_one_round: target_layer_id {} >= num_target_layers {}",
-                i, num_target_layers
+                i,
+                num_target_layers
             );
         }
     }
@@ -406,9 +405,9 @@ pub fn dispatch_dflash_generate_one_round_with_initial_capture(
         .forward_prefill_batched(prompt_tokens, 0, 0, gpu)
         .map_err(|e| anyhow::anyhow!("generate: initial prompt forward: {e}"))?;
 
-    let captured = target
-        .take_dflash_capture()
-        .ok_or_else(|| anyhow::anyhow!("generate: capture session vanished after prompt forward"))?;
+    let captured = target.take_dflash_capture().ok_or_else(|| {
+        anyhow::anyhow!("generate: capture session vanished after prompt forward")
+    })?;
 
     // -------- Step 3: permute capture to target_hidden_concat --------
     let concat_vec: Vec<f32> = {
@@ -573,12 +572,8 @@ pub fn dispatch_dflash_generate(
     let xlen_sdpa = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
 
     // -------- Initial prompt forward with capture --------
-    let session = DFlashCaptureSession::new(
-        combined_capture_ids.clone(),
-        prompt_tokens.len(),
-        hs,
-        false,
-    );
+    let session =
+        DFlashCaptureSession::new(combined_capture_ids.clone(), prompt_tokens.len(), hs, false);
     target.install_dflash_capture(session);
     // Size full-attention KV cache via max_decode_tokens.  The
     // worst-case write extent across all verify rounds is at the LAST
@@ -648,18 +643,21 @@ pub fn dispatch_dflash_generate(
     // — its work is bounded but the K/V cache lifetime is per-round.
     while output.len() - prompt_tokens.len() < max_new_tokens {
         rounds_count += 1;
-        let t0_embed = if profile_on { Some(std::time::Instant::now()) } else { None };
+        let t0_embed = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 1. Build the drafter's input block: [last_token, mask × K]
         let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
         block.push(last_token);
-        block.extend(
-            std::iter::repeat(drafter_cfg.mask_token_id)
-                .take((block_size - 1) as usize),
-        );
+        block.extend(std::iter::repeat(drafter_cfg.mask_token_id).take((block_size - 1) as usize));
         let h = target
             .embed_tokens(&block, gpu)
             .map_err(|e| anyhow::anyhow!("generate: embed_tokens: {e}"))?;
-        if let Some(t) = t0_embed { t_embed_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        if let Some(t) = t0_embed {
+            t_embed_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 2. Drafter's context = prior_captured (= prompt capture in
         //    round 1, OR trimmed verify capture from prior round).
@@ -667,9 +665,11 @@ pub fn dispatch_dflash_generate(
         //    EXCEPT last_token, which is drafter's block[0] query).
         let prior_ctx_len = prior_captured.seq_len;
         debug_assert_eq!(
-            prior_ctx_len, output.len() - 1,
+            prior_ctx_len,
+            output.len() - 1,
             "prior_captured stale: seq_len={} but output.len()-1={}",
-            prior_ctx_len, output.len() - 1,
+            prior_ctx_len,
+            output.len() - 1,
         );
 
         // 3. Extract NEW drafter_concat rows from the prior capture and
@@ -683,12 +683,17 @@ pub fn dispatch_dflash_generate(
         // advance correctly across rounds (see
         // forward.rs:798-849).  At 0% acceptance rate, new_rows=1 per
         // round vs the previous ~P+r rows → ~5-10× faster drafter_fwd.
-        let t0_extract = if profile_on { Some(std::time::Instant::now()) } else { None };
+        let t0_extract = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let drafter_cached_seq_len = drafter_cache.layers[0].seq_len as usize;
         debug_assert!(
             prior_ctx_len >= drafter_cached_seq_len,
             "drafter cache state regressed: cached={} prior_ctx_len={}",
-            drafter_cached_seq_len, prior_ctx_len,
+            drafter_cached_seq_len,
+            prior_ctx_len,
         );
         let drafter_new_rows = prior_ctx_len - drafter_cached_seq_len;
         let n_target_layers = drafter_cfg.target_layer_ids.len();
@@ -727,10 +732,16 @@ pub fn dispatch_dflash_generate(
             }
             buf
         };
-        if let Some(t) = t0_extract { t_extract_concat_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        if let Some(t) = t0_extract {
+            t_extract_concat_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 4. Drafter forward → h_final shape [block_size, hidden]
-        let t0_drafter = if profile_on { Some(std::time::Instant::now()) } else { None };
+        let t0_drafter = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let h_final = {
             let (exec, reg) = gpu.split();
             let device = exec.device();
@@ -747,7 +758,9 @@ pub fn dispatch_dflash_generate(
             )
             .context("generate: drafter forward")?
         };
-        if let Some(t) = t0_drafter { t_drafter_fwd_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        if let Some(t) = t0_drafter {
+            t_drafter_fwd_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 5. lm_head per position on drafter's h_final → K drafts
         //    (index 0 is for last_token's position which we already
@@ -760,7 +773,11 @@ pub fn dispatch_dflash_generate(
         //    self-consistency, which is what the gate actually
         //    measures — NOT byte-identity to base autoregressive,
         //    which is empirically falsified per ADR-034 G3 row).
-        let t0_drafter_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
+        let t0_drafter_argmax = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let drafts: Vec<u32> = {
             let h_final_slice: &[f32] = h_final
                 .as_slice::<f32>()
@@ -779,7 +796,9 @@ pub fn dispatch_dflash_generate(
                 for i in 1..bs {
                     let row_i = &host_copy[i * hs..(i + 1) * hs];
                     let row_im1 = &host_copy[(i - 1) * hs..i * hs];
-                    let diff = row_i.iter().zip(row_im1.iter())
+                    let diff = row_i
+                        .iter()
+                        .zip(row_im1.iter())
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0f32, f32::max);
                     max_pairwise_diff = max_pairwise_diff.max(diff);
@@ -795,7 +814,9 @@ pub fn dispatch_dflash_generate(
                 let mut row_max_abs = Vec::with_capacity(bs);
                 for i in 0..bs {
                     let row = &host_copy[i * hs..(i + 1) * hs];
-                    let m = row.iter().filter(|x| x.is_finite())
+                    let m = row
+                        .iter()
+                        .filter(|x| x.is_finite())
                         .map(|x| x.abs())
                         .fold(0.0f32, f32::max);
                     row_max_abs.push(m);
@@ -808,13 +829,17 @@ pub fn dispatch_dflash_generate(
                      max_adj_pairwise_abs_diff(rows 1..{}) = {:.6e}\n  \
                      nan_count = {} inf_count = {}\n  \
                      per_row_max_abs = {:?}",
-                    rounds_count, bs, hs,
+                    rounds_count,
+                    bs,
+                    hs,
                     &host_copy[0..8.min(hs)],
                     &host_copy[hs..hs + 8.min(hs)],
-                    bs - 1, &host_copy[(bs - 1) * hs..(bs - 1) * hs + 8.min(hs)],
+                    bs - 1,
+                    &host_copy[(bs - 1) * hs..(bs - 1) * hs + 8.min(hs)],
                     bs,
                     max_pairwise_diff,
-                    nan_count, inf_count,
+                    nan_count,
+                    inf_count,
                     row_max_abs,
                 );
             }
@@ -823,7 +848,9 @@ pub fn dispatch_dflash_generate(
                 .map_err(|e| anyhow::anyhow!("generate: drafter argmax: {e}"))?;
             all_argmaxes[1..].to_vec()
         };
-        if let Some(t) = t0_drafter_argmax { t_drafter_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        if let Some(t) = t0_drafter_argmax {
+            t_drafter_argmax_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 6. Verify forward — two paths gated on HF2Q_DFLASH_XLEN_SDPA.
         //
@@ -848,14 +875,14 @@ pub fn dispatch_dflash_generate(
                 .collect();
             let verify_seq_len = verify_input.len(); // = block_size = K+1
             let start_pos = output.len() - 1;
-            let verify_session = DFlashCaptureSession::new(
-                combined_capture_ids.clone(),
-                verify_seq_len,
-                hs,
-                false,
-            );
+            let verify_session =
+                DFlashCaptureSession::new(combined_capture_ids.clone(), verify_seq_len, hs, false);
             target.install_dflash_capture(verify_session);
-            let t0_verify = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let t0_verify = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // dense_kvs_vec is fresh-allocated per forward_prefill_batched call
             // with `linear_capacity = seq_len + max_decode_tokens`.  For the
             // xlen verify call, K/V writes go to positions
@@ -869,14 +896,20 @@ pub fn dispatch_dflash_generate(
             let captured = target
                 .take_dflash_capture()
                 .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished (xlen)"))?;
-            if let Some(t) = t0_verify { t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0; }
+            if let Some(t) = t0_verify {
+                t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
 
             // target_argmaxes: ALL K+1 positions of the verify capture
             // (verify_input[0] = last_token, so argmax at position 0 =
             // pred-after-last_token; argmax at position i = pred-after-
             // verify_input[i] = compare to draft[i+1] or accept as
             // free-continuation when accept_count == K).
-            let t0_target_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let t0_target_argmax = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let final_slab = extract_final_layer_slab(
                 &captured.hidden_output,
                 &combined_capture_ids,
@@ -892,7 +925,9 @@ pub fn dispatch_dflash_generate(
                     gpu,
                 )
                 .map_err(|e| anyhow::anyhow!("generate: target argmax (xlen): {e}"))?;
-            if let Some(t) = t0_target_argmax { t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
+            if let Some(t) = t0_target_argmax {
+                t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
 
             (captured, argmaxes, verify_seq_len)
         } else {
@@ -907,16 +942,26 @@ pub fn dispatch_dflash_generate(
                 false,
             );
             target.install_dflash_capture(verify_session);
-            let t0_verify = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let t0_verify = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let _verify_last_argmax = target
                 .forward_prefill_batched(&verify_prefix, max_decode_for_alloc, 0, gpu)
                 .map_err(|e| anyhow::anyhow!("generate: verify forward: {e}"))?;
             let captured = target
                 .take_dflash_capture()
                 .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished"))?;
-            if let Some(t) = t0_verify { t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0; }
+            if let Some(t) = t0_verify {
+                t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
 
-            let t0_target_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let t0_target_argmax = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let final_slab = extract_final_layer_slab(
                 &captured.hidden_output,
                 &combined_capture_ids,
@@ -936,7 +981,9 @@ pub fn dispatch_dflash_generate(
                     gpu,
                 )
                 .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
-            if let Some(t) = t0_target_argmax { t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
+            if let Some(t) = t0_target_argmax {
+                t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
 
             (captured, argmaxes, verify_prefix_len)
         };
@@ -950,7 +997,9 @@ pub fn dispatch_dflash_generate(
                 "[HF2Q_DFLASH_ACCEPT] round={rounds_count} accept_count={}/{} \
                  drafts={drafts:?} target_argmaxes={target_argmaxes:?} \
                  committed={:?}",
-                round.accept_count, drafts.len(), round.committed_tokens,
+                round.accept_count,
+                drafts.len(),
+                round.committed_tokens,
             );
         }
 
@@ -966,16 +1015,18 @@ pub fn dispatch_dflash_generate(
                 .expect("final layer in combined capture set");
             let path = if xlen_sdpa { "OptA" } else { "OptC" };
             let logical_pos = output.len() - 1; // = start_pos in Option A
-            // Position-in-capture for the target_argmax[0] row:
-            // - OptA: row 0 of verify_captured (= first verify position)
-            // - OptC: row (output.len() - 1) of verify_captured (= position of last_token in re-prefilled prefix)
+                                                // Position-in-capture for the target_argmax[0] row:
+                                                // - OptA: row 0 of verify_captured (= first verify position)
+                                                // - OptC: row (output.len() - 1) of verify_captured (= position of last_token in re-prefilled prefix)
             let capture_row = if xlen_sdpa { 0 } else { logical_pos };
             let capture_seq_len = verify_captured.seq_len;
             let layer_base = final_combined_idx * capture_seq_len * hs;
             let row_base = layer_base + capture_row * hs;
             let row_slice = &verify_captured.hidden_output[row_base..row_base + 8.min(hs)];
-            let max_abs = verify_captured.hidden_output[layer_base..layer_base + capture_seq_len * hs]
-                .iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let max_abs = verify_captured.hidden_output
+                [layer_base..layer_base + capture_seq_len * hs]
+                .iter()
+                .fold(0.0f32, |a, &b| a.max(b.abs()));
             eprintln!(
                 "[HIDDEN_DEBUG path={} round={} logical_pos={} capture_row={} \
                  hidden_final_layer[d=0..8]={:?} max_abs={:.4e}",
@@ -1005,7 +1056,11 @@ pub fn dispatch_dflash_generate(
         }
 
         // 11. Update prior_captured for next round.
-        let t0_trim = if profile_on { Some(std::time::Instant::now()) } else { None };
+        let t0_trim = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         if xlen_sdpa {
             // Option A: persistent_captured grows by n_committed
             // positions per round (the accepted positions from this
@@ -1025,12 +1080,18 @@ pub fn dispatch_dflash_generate(
             // drafts at higher positions).
             let mut next_captured = verify_captured;
             let next_prior_ctx_len = output.len() - 1;
-            debug_assert!(next_prior_ctx_len <= next_captured.seq_len,
-                "trim target {} > current {}", next_prior_ctx_len, next_captured.seq_len);
+            debug_assert!(
+                next_prior_ctx_len <= next_captured.seq_len,
+                "trim target {} > current {}",
+                next_prior_ctx_len,
+                next_captured.seq_len
+            );
             super::hidden_capture::trim_capture_to(&mut next_captured, next_prior_ctx_len);
             prior_captured = next_captured;
         }
-        if let Some(t) = t0_trim { t_trim_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        if let Some(t) = t0_trim {
+            t_trim_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
         let _ = verify_seq_len_for_path; // silence unused warning when not branched on
     }
 
@@ -1190,18 +1251,30 @@ mod tests {
         // these from target's embed + hidden capture).
         let h_elem = (block_size as usize) * (hidden as usize);
         let mut h = device
-            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                h_elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h");
         {
             let s = h.as_mut_slice::<f32>().expect("h slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
         let thc_elem = (ctx_chunk as usize) * (fc_in as usize);
         let mut target_hidden = device
-            .alloc_buffer(thc_elem * 4, DType::F32, vec![ctx_chunk as usize, fc_in as usize])
+            .alloc_buffer(
+                thc_elem * 4,
+                DType::F32,
+                vec![ctx_chunk as usize, fc_in as usize],
+            )
             .expect("alloc target_hidden");
         {
-            let s = target_hidden.as_mut_slice::<f32>().expect("target_hidden slice");
+            let s = target_hidden
+                .as_mut_slice::<f32>()
+                .expect("target_hidden slice");
             for (i, v) in s.iter_mut().enumerate() {
                 *v = 0.1 + ((i % 17) as f32) / 170.0;
             }
@@ -1209,11 +1282,21 @@ mod tests {
 
         // Run drafter forward → h_final [L, hidden]
         let h_final = dispatch_dflash_model_forward(
-            &mut registry, &device, &h, &target_hidden,
-            &tensors, &mut cache, &cfg, block_size, ctx_chunk,
+            &mut registry,
+            &device,
+            &h,
+            &target_hidden,
+            &tensors,
+            &mut cache,
+            &cfg,
+            block_size,
+            ctx_chunk,
         )
         .expect("drafter forward");
-        assert_eq!(h_final.element_count(), (block_size as usize) * (hidden as usize));
+        assert_eq!(
+            h_final.element_count(),
+            (block_size as usize) * (hidden as usize)
+        );
 
         // Caller would now apply target's lm_head + softcap on h_final
         // to get K draft tokens. For this test, we SIMULATE:
@@ -1277,17 +1360,13 @@ mod tests {
     #[ignore = "requires gemma-4-26b GGUF + DFlash drafter HF cache + ~22GB RAM"]
     fn e2e_dispatch_dflash_generate_gemma4_26b() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use crate::inference::models::gemma4::MlxModelWeights;
         use crate::inference::spec_decode::dflash::{
             kv_cache::DFlashKvCache,
             tensors::DFlashModelTensors,
             weights::{DFlashWeights, DFlashWeightsFile},
         };
-        use crate::serve::{
-            config::Gemma4Config,
-            gpu::GpuContext,
-            header::LoadProgress,
-        };
-        use crate::inference::models::gemma4::MlxModelWeights;
+        use crate::serve::{config::Gemma4Config, gpu::GpuContext, header::LoadProgress};
         use std::path::PathBuf;
 
         // ---- Resolve paths ----
@@ -1295,9 +1374,8 @@ mod tests {
             "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/\
              gemma4-ara-2pass-APEX-Q5_K_M.gguf",
         );
-        let tokenizer_path = PathBuf::from(
-            "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json",
-        );
+        let tokenizer_path =
+            PathBuf::from("/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json");
         let home = std::env::var("HOME").expect("HOME env set");
         let drafter_dir = format!(
             "{home}/.cache/huggingface/hub/\
@@ -1323,23 +1401,18 @@ mod tests {
 
         // ---- Init GPU + load target ----
         let mut gpu = GpuContext::new().expect("Metal device available");
-        let gguf = mlx_native::gguf::GgufFile::open(&target_gguf)
-            .expect("open target GGUF");
+        let gguf = mlx_native::gguf::GgufFile::open(&target_gguf).expect("open target GGUF");
         let target_cfg = Gemma4Config::from_gguf(&gguf).expect("gemma4 cfg from gguf");
         let mut progress = LoadProgress::new(false, 0, 0);
-        let mut target = MlxModelWeights::load_from_gguf(
-            &gguf,
-            &target_cfg,
-            &mut gpu,
-            &mut progress,
-        )
-        .expect("load target weights from GGUF");
+        let mut target =
+            MlxModelWeights::load_from_gguf(&gguf, &target_cfg, &mut gpu, &mut progress)
+                .expect("load target weights from GGUF");
 
         // ---- Load drafter ----
-        let drafter_cfg = DFlashConfig::from_json_path(&drafter_cfg_path)
-            .expect("drafter config.json");
-        let drafter_file = DFlashWeightsFile::open(&drafter_safetensors_path)
-            .expect("drafter safetensors open");
+        let drafter_cfg =
+            DFlashConfig::from_json_path(&drafter_cfg_path).expect("drafter config.json");
+        let drafter_file =
+            DFlashWeightsFile::open(&drafter_safetensors_path).expect("drafter safetensors open");
         let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg)
             .expect("drafter validated load");
         let drafter_tensors = {
@@ -1367,11 +1440,13 @@ mod tests {
         // spec-decode path produces the same argmax sequence as the
         // single-token decode path.  Whether the model is confused by
         // the prompt is orthogonal.
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .expect("load tokenizer.json");
-        let prompt_text = std::env::var("HF2Q_TEST_PROMPT")
-            .unwrap_or_else(|_| "Q: What is 2+2?\nA:".to_string());
-        let encoding = tokenizer.encode(prompt_text.as_str(), false).expect("encode");
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(&tokenizer_path).expect("load tokenizer.json");
+        let prompt_text =
+            std::env::var("HF2Q_TEST_PROMPT").unwrap_or_else(|_| "Q: What is 2+2?\nA:".to_string());
+        let encoding = tokenizer
+            .encode(prompt_text.as_str(), false)
+            .expect("encode");
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         assert!(!prompt_tokens.is_empty(), "prompt encoding empty");
         eprintln!(
@@ -1489,7 +1564,11 @@ mod tests {
         eprintln!("[e2e] baseline_new = {baseline_new:?}");
         eprintln!("[e2e] spec_new     = {spec_new:?}");
         for i in 0..n_compare {
-            let mark = if baseline_new[i] == spec_new[i] { "✓" } else { "✗" };
+            let mark = if baseline_new[i] == spec_new[i] {
+                "✓"
+            } else {
+                "✗"
+            };
             eprintln!(
                 "[e2e]   pos {i}: baseline={} spec={} {mark}",
                 baseline_new[i], spec_new[i]
@@ -1565,17 +1644,13 @@ mod tests {
     #[ignore = "iter-67 dual-axis diagnostic; requires gemma-4-26b GGUF + DFlash drafter"]
     fn e2e_coherence_gemma4_chat_templated_prompt() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use crate::inference::models::gemma4::MlxModelWeights;
         use crate::inference::spec_decode::dflash::{
             kv_cache::DFlashKvCache,
             tensors::DFlashModelTensors,
             weights::{DFlashWeights, DFlashWeightsFile},
         };
-        use crate::serve::{
-            config::Gemma4Config,
-            gpu::GpuContext,
-            header::LoadProgress,
-        };
-        use crate::inference::models::gemma4::MlxModelWeights;
+        use crate::serve::{config::Gemma4Config, gpu::GpuContext, header::LoadProgress};
         use std::path::PathBuf;
 
         let target_gguf = PathBuf::from(
@@ -1604,12 +1679,15 @@ mod tests {
         let gguf = mlx_native::gguf::GgufFile::open(&target_gguf).expect("open gguf");
         let target_cfg = Gemma4Config::from_gguf(&gguf).expect("gemma4 cfg");
         let mut progress = LoadProgress::new(false, 0, 0);
-        let mut target = MlxModelWeights::load_from_gguf(&gguf, &target_cfg, &mut gpu, &mut progress)
-            .expect("load target");
+        let mut target =
+            MlxModelWeights::load_from_gguf(&gguf, &target_cfg, &mut gpu, &mut progress)
+                .expect("load target");
 
         let drafter_cfg = DFlashConfig::from_json_path(&drafter_cfg_path).expect("drafter cfg");
-        let drafter_file = DFlashWeightsFile::open(&drafter_safetensors_path).expect("drafter file");
-        let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg).expect("drafter weights");
+        let drafter_file =
+            DFlashWeightsFile::open(&drafter_safetensors_path).expect("drafter file");
+        let drafter_weights =
+            DFlashWeights::load(drafter_file.bytes(), &drafter_cfg).expect("drafter weights");
         let drafter_tensors = {
             let (exec, _reg) = gpu.split();
             DFlashModelTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
@@ -1625,9 +1703,8 @@ mod tests {
         // The exact 24-token sequence cmd_generate produces for the
         // canonical "Q: What is 2+2?\nA:" prompt via render_chat_template.
         let prompt_tokens: Vec<u32> = vec![
-            2, 105, 2364, 107, 236935, 236787, 2900, 563, 236743, 236778,
-            236862, 236778, 105470, 169631, 236787, 106, 107, 105, 4368,
-            107, 100, 45518, 107, 101,
+            2, 105, 2364, 107, 236935, 236787, 2900, 563, 236743, 236778, 236862, 236778, 105470,
+            169631, 236787, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
         ];
         let prompt_len = prompt_tokens.len();
         let max_new_tokens = 8usize;
@@ -1669,10 +1746,18 @@ mod tests {
             let argmax = target
                 .forward_prefill_batched(&prefix, max_decode_for_alloc, 0, &mut gpu)
                 .expect("diag forward_prefill_batched");
-            let mark = if argmax == baseline_new[i] { "✓" } else { "✗" };
+            let mark = if argmax == baseline_new[i] {
+                "✓"
+            } else {
+                "✗"
+            };
             eprintln!(
                 "[e2e-tmpl]   DIAG L={} argmax={} baseline_new[{}]={} {}",
-                prefix.len(), argmax, i, baseline_new[i], mark,
+                prefix.len(),
+                argmax,
+                i,
+                baseline_new[i],
+                mark,
             );
             target.rollback_kv(prefix.len());
         }
@@ -1696,7 +1781,11 @@ mod tests {
 
         let n_compare = baseline_new.len().min(spec_new.len());
         for i in 0..n_compare {
-            let mark = if baseline_new[i] == spec_new[i] { "✓" } else { "✗" };
+            let mark = if baseline_new[i] == spec_new[i] {
+                "✓"
+            } else {
+                "✗"
+            };
             eprintln!(
                 "[e2e-tmpl]   pos {i}: baseline={} spec={} {mark}",
                 baseline_new[i], spec_new[i]
@@ -1727,7 +1816,11 @@ mod tests {
             }
             eprintln!(
                 "[e2e-tmpl]   SELF L={} argmax={} spec_new[{}]={} {}",
-                prefix.len(), argmax, i, spec_new[i], mark,
+                prefix.len(),
+                argmax,
+                i,
+                spec_new[i],
+                mark,
             );
             target.rollback_kv(prefix.len());
         }
@@ -1753,10 +1846,12 @@ mod tests {
         // this axis until the batched_prefill bug is fixed separately.
         assert_eq!(spec_new.len(), baseline_new.len(), "length mismatch");
         for (i, (b, s)) in baseline_new.iter().zip(spec_new.iter()).enumerate() {
-            assert_eq!(b, s,
+            assert_eq!(
+                b, s,
                 "coherence gate FAILED on chat-templated prompt at new-token position {i}: \
                  baseline={b} spec={s} — root cause is forward_prefill_batched coherence \
-                 (see DIAG output for axis-2 failures).");
+                 (see DIAG output for axis-2 failures)."
+            );
         }
         eprintln!("[e2e-tmpl] FULL COHERENCE PASS for chat-templated prompt");
     }

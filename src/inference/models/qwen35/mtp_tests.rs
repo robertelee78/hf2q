@@ -1,9 +1,9 @@
-use super::load_mtp_weights_if_present;
 use super::super::gpu_full_attn::upload_f32;
 use super::super::kv_cache::HybridKvCache;
 use super::super::mtp::MtpFfnKind;
 use super::super::mtp_weights_load::mtp_tensor_names;
 use super::super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+use super::load_mtp_weights_if_present;
 use mlx_native::gguf::GgufFile;
 use mlx_native::{KernelRegistry, MlxDevice};
 use std::io::Write;
@@ -58,23 +58,91 @@ fn tiny_tensors() -> Vec<TestTensor> {
     let v = 64usize;
     let m = 32usize;
     vec![
-        TestTensor { name: "blk.2.nextn.enorm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.nextn.hnorm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.nextn.eh_proj.weight", dims: vec![(2 * h) as u64, h as u64], data: ones(2 * h * h) },
-        TestTensor { name: "blk.2.nextn.embed_tokens.weight", dims: vec![h as u64, v as u64], data: zeros(v * h) },
-        TestTensor { name: "blk.2.nextn.shared_head_norm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.nextn.shared_head_head.weight", dims: vec![h as u64, v as u64], data: zeros(v * h) },
-        TestTensor { name: "blk.2.attn_norm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.post_attention_norm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.attn_q.weight", dims: vec![h as u64, h as u64], data: zeros(h * h) },
-        TestTensor { name: "blk.2.attn_k.weight", dims: vec![h as u64, h as u64], data: zeros(h * h) },
-        TestTensor { name: "blk.2.attn_v.weight", dims: vec![h as u64, h as u64], data: zeros(h * h) },
-        TestTensor { name: "blk.2.attn_output.weight", dims: vec![h as u64, h as u64], data: zeros(h * h) },
-        TestTensor { name: "blk.2.attn_q_norm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.attn_k_norm.weight", dims: vec![h as u64], data: ones(h) },
-        TestTensor { name: "blk.2.ffn_gate.weight", dims: vec![h as u64, m as u64], data: zeros(m * h) },
-        TestTensor { name: "blk.2.ffn_up.weight", dims: vec![h as u64, m as u64], data: zeros(m * h) },
-        TestTensor { name: "blk.2.ffn_down.weight", dims: vec![m as u64, h as u64], data: zeros(h * m) },
+        TestTensor {
+            name: "blk.2.nextn.enorm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.nextn.hnorm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.nextn.eh_proj.weight",
+            dims: vec![(2 * h) as u64, h as u64],
+            data: ones(2 * h * h),
+        },
+        TestTensor {
+            name: "blk.2.nextn.embed_tokens.weight",
+            dims: vec![h as u64, v as u64],
+            data: zeros(v * h),
+        },
+        TestTensor {
+            name: "blk.2.nextn.shared_head_norm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.nextn.shared_head_head.weight",
+            dims: vec![h as u64, v as u64],
+            data: zeros(v * h),
+        },
+        TestTensor {
+            name: "blk.2.attn_norm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.post_attention_norm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.attn_q.weight",
+            dims: vec![h as u64, h as u64],
+            data: zeros(h * h),
+        },
+        TestTensor {
+            name: "blk.2.attn_k.weight",
+            dims: vec![h as u64, h as u64],
+            data: zeros(h * h),
+        },
+        TestTensor {
+            name: "blk.2.attn_v.weight",
+            dims: vec![h as u64, h as u64],
+            data: zeros(h * h),
+        },
+        TestTensor {
+            name: "blk.2.attn_output.weight",
+            dims: vec![h as u64, h as u64],
+            data: zeros(h * h),
+        },
+        TestTensor {
+            name: "blk.2.attn_q_norm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.attn_k_norm.weight",
+            dims: vec![h as u64],
+            data: ones(h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_gate.weight",
+            dims: vec![h as u64, m as u64],
+            data: zeros(m * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_up.weight",
+            dims: vec![h as u64, m as u64],
+            data: zeros(m * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_down.weight",
+            dims: vec![m as u64, h as u64],
+            data: zeros(h * m),
+        },
     ]
 }
 
@@ -138,7 +206,11 @@ fn mtp_absent_scan_returns_empty() {
     let tmp = std::env::temp_dir().join(format!("mtp_absent_{}.gguf", std::process::id()));
     write_gguf(
         &tmp,
-        &[TestTensor { name: "blk.0.attn_norm.weight", dims: vec![32], data: ones(32) }],
+        &[TestTensor {
+            name: "blk.0.attn_norm.weight",
+            dims: vec![32],
+            data: ones(32),
+        }],
     );
     let gguf = GgufFile::open(&tmp).expect("open");
     assert!(mtp_tensor_names(&gguf, 2).is_empty());
@@ -246,7 +318,15 @@ fn mtp_forward_draft_returns_logits() {
     let prev = upload_f32(&vec![0.0; 32], &device).expect("prev");
     let embed = upload_f32(&vec![0.0; 32], &device).expect("embed");
     let logits = mtp
-        .forward_draft(&prev, &embed, &mut kv, &[0, 0, 0, 0], &device, &mut registry, &cfg)
+        .forward_draft(
+            &prev,
+            &embed,
+            &mut kv,
+            &[0, 0, 0, 0],
+            &device,
+            &mut registry,
+            &cfg,
+        )
         .expect("forward");
     assert_eq!(logits.element_count(), 64);
     std::fs::remove_file(&tmp).ok();
@@ -382,9 +462,8 @@ fn mtp_loads_canonical_moe_mtp_q4_k_m_with_moe_variant_2026_05_21() {
 #[test]
 fn mtp_loads_canonical_dense_mtp_q8_0_with_dense_variant_2026_05_21() {
     let Some(device) = try_device() else { return };
-    let path = std::path::PathBuf::from(
-        "/opt/hf2q/models/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q8_0-mtp.gguf",
-    );
+    let path =
+        std::path::PathBuf::from("/opt/hf2q/models/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q8_0-mtp.gguf");
     if !path.exists() {
         eprintln!(
             "skipping: canonical dense MTP fixture not at {}",

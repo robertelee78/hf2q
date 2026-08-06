@@ -26,20 +26,20 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::LazyLock;
 use mlx_native::metal::MTLSize;
-use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32};
+use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::gather::dispatch_gather_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
-use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_f16};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use std::sync::LazyLock;
 
 /// ADR-005 Phase 2c iter-120 (W49), repurposed at iter-129 — F32-attention
 /// development override.
@@ -160,13 +160,7 @@ pub fn vit_linear_gpu(
                 src1_batch: 1,
             };
             dense_matmul_f16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                weight,
-                input,
-                &mut dst,
-                &params,
+                encoder, registry, device, weight, input, &mut dst, &params,
             )
             .context("vit_linear_gpu: dense_matmul_f16_f32_tensor")?;
         }
@@ -181,13 +175,7 @@ pub fn vit_linear_gpu(
                 src1_batch: 1,
             };
             dense_matmul_bf16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                weight,
-                input,
-                &mut dst,
-                &params,
+                encoder, registry, device, weight, input, &mut dst, &params,
             )
             .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor (BF16-native)")?;
         }
@@ -301,9 +289,8 @@ pub fn vit_rms_norm_gpu(
         .map_err(|e| anyhow!("vit_rms_norm_gpu: alloc params: {e}"))?;
     {
         // SAFETY: just-allocated f32 buffer; no aliasing.
-        let s: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2)
-        };
+        let s: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2) };
         s[0] = eps;
         s[1] = dim as f32;
     }
@@ -356,7 +343,9 @@ pub fn vit_per_head_rms_norm_gpu(
     let rows = batch
         .checked_mul(num_heads)
         .ok_or_else(|| anyhow!("vit_per_head_rms_norm_gpu: batch*num_heads overflow"))?;
-    vit_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, head_dim, eps)
+    vit_rms_norm_gpu(
+        encoder, registry, device, input, gain_f32, rows, head_dim, eps,
+    )
 }
 
 /// GPU softmax along the last dimension of a `[rows, cols]` F32 tensor.
@@ -397,9 +386,8 @@ pub fn vit_softmax_last_dim_gpu(
         .map_err(|e| anyhow!("vit_softmax_last_dim_gpu: alloc params: {e}"))?;
     {
         // SAFETY: just-allocated f32 buffer; no aliasing.
-        let s: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2)
-        };
+        let s: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2) };
         s[0] = cols as f32;
         s[1] = 0.0;
     }
@@ -613,13 +601,7 @@ pub fn vit_attention_scores_gpu(
     if scale != 1.0 {
         encoder.memory_barrier();
         scalar_mul_f32(
-            encoder,
-            registry,
-            metal_dev,
-            &scores,
-            &scores,
-            n_scores,
-            scale,
+            encoder, registry, metal_dev, &scores, &scores, n_scores, scale,
         )
         .context("scale scores")?;
     }
@@ -689,8 +671,17 @@ pub fn vit_attention_gpu(
     let metal_dev = device.metal_device();
 
     // --- Stage 1: scores = (Q @ K^T) * scale, shape [num_heads, batch, batch] ---
-    let scores =
-        vit_attention_scores_gpu(encoder, registry, device, q_seq_major, k_seq_major, batch, num_heads, head_dim, scale)?;
+    let scores = vit_attention_scores_gpu(
+        encoder,
+        registry,
+        device,
+        q_seq_major,
+        k_seq_major,
+        batch,
+        num_heads,
+        head_dim,
+        scale,
+    )?;
     encoder.memory_barrier();
 
     // --- Stage 2: softmax along last dim. Treat scores as
@@ -787,9 +778,9 @@ pub fn vit_attention_gpu(
         )
         .map_err(|e| anyhow!("alloc attn_head_major: {e}"))?;
     let params = DenseMmF16F32Params {
-        m: batch,      // batch_q
-        n: head_dim,   // output last dim
-        k: batch,      // batch_k (contract)
+        m: batch,    // batch_q
+        n: head_dim, // output last dim
+        k: batch,    // batch_k (contract)
         src0_batch: num_heads,
         src1_batch: num_heads,
     };
@@ -918,7 +909,11 @@ pub fn vit_silu_mul_gpu(
 
     // Step 1: silu(gate) via sigmoid_mul(gate, gate).
     let silu_out = device
-        .alloc_buffer((n_elements as usize) * 4, DType::F32, vec![n_elements as usize])
+        .alloc_buffer(
+            (n_elements as usize) * 4,
+            DType::F32,
+            vec![n_elements as usize],
+        )
         .map_err(|e| anyhow!("alloc silu_out: {e}"))?;
     // sigmoid_mul takes a params_buf with the count (u32 cast as f32 element).
     let params_buf = device
@@ -926,9 +921,8 @@ pub fn vit_silu_mul_gpu(
         .map_err(|e| anyhow!("alloc sigmoid_mul params: {e}"))?;
     {
         // SAFETY: just-allocated f32 buffer.
-        let s: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut u32, 1)
-        };
+        let s: &mut [u32] =
+            unsafe { std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut u32, 1) };
         s[0] = n_elements;
     }
     dispatch_sigmoid_mul(
@@ -946,7 +940,11 @@ pub fn vit_silu_mul_gpu(
 
     // Step 2: out = silu_out * up.
     let out = device
-        .alloc_buffer((n_elements as usize) * 4, DType::F32, vec![n_elements as usize])
+        .alloc_buffer(
+            (n_elements as usize) * 4,
+            DType::F32,
+            vec![n_elements as usize],
+        )
         .map_err(|e| anyhow!("alloc final out: {e}"))?;
     elementwise_mul(
         encoder,
@@ -1103,16 +1101,7 @@ pub fn apply_vit_block_forward_gpu(
     // attention takes [batch, num_heads, head_dim]; q_norm/k_norm/v are
     // [batch, hidden] in memory which IS [batch, num_heads, head_dim].
     let attn = vit_attention_gpu(
-        encoder,
-        registry,
-        device,
-        &q_norm,
-        &k_norm,
-        &v,
-        batch,
-        num_heads,
-        head_dim,
-        scale,
+        encoder, registry, device, &q_norm, &k_norm, &v, batch, num_heads, head_dim, scale,
     )?;
     encoder.memory_barrier();
 
@@ -1405,9 +1394,7 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
     // SAFETY: `T: Copy + repr(C)` with primitive fields means the in-memory
     // representation is a contiguous block of `size_of::<T>()` bytes with
     // no uninitialized padding (we use only u32 fields packed naturally).
-    unsafe {
-        std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>())
-    }
+    unsafe { std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
 /// Register the iter-51c custom shaders with the kernel registry.
@@ -1464,10 +1451,7 @@ pub fn vit_avg_pool_2x2_gpu(
         .get_pipeline("vit_avg_pool_2x2_f32", device.metal_device())
         .map_err(|e| anyhow!("vit_avg_pool_2x2_gpu: get_pipeline: {e}"))?;
 
-    let params = AvgPool2x2GpuParams {
-        n_side,
-        hidden,
-    };
+    let params = AvgPool2x2GpuParams { n_side, hidden };
     let bytes = pod_as_bytes(&params);
     let grid = MTLSize::new(hidden as u64, out_side as u64, out_side as u64);
     // Threadgroup sized to fit the inner-most (hidden) dim into reasonable
@@ -1556,7 +1540,12 @@ pub fn vit_avg_pool_kxk_gpu(
         .get_pipeline("vit_avg_pool_kxk_f32", device.metal_device())
         .map_err(|e| anyhow!("vit_avg_pool_kxk_gpu: get_pipeline: {e}"))?;
 
-    let params = AvgPoolKxKGpuParams { n_x, n_y, k, hidden };
+    let params = AvgPoolKxKGpuParams {
+        n_x,
+        n_y,
+        k,
+        hidden,
+    };
     let bytes = pod_as_bytes(&params);
     let grid = MTLSize::new(hidden as u64, out_x as u64, out_y as u64);
     let tg_x = std::cmp::min(64, hidden as u64);
@@ -1710,10 +1699,7 @@ pub fn vit_std_bias_scale_gpu(
         .get_pipeline("vit_std_bias_scale_f32", device.metal_device())
         .map_err(|e| anyhow!("vit_std_bias_scale_gpu: get_pipeline: {e}"))?;
 
-    let params = StdBiasScaleGpuParams {
-        hidden,
-        batch,
-    };
+    let params = StdBiasScaleGpuParams { hidden, batch };
     let bytes = pod_as_bytes(&params);
     let grid = MTLSize::new(hidden as u64, batch as u64, 1);
     let tg = MTLSize::new(std::cmp::min(64, hidden as u64), 1, 1);
@@ -1789,8 +1775,9 @@ pub fn apply_vit_blocks_loop_gpu(
     scale: f32,
 ) -> Result<MlxBuffer> {
     // Run block 0 with the input as residual stream.
-    let mut hidden_states =
-        apply_vit_block_forward_gpu(encoder, registry, device, weights, cfg, 0, input, batch, scale)?;
+    let mut hidden_states = apply_vit_block_forward_gpu(
+        encoder, registry, device, weights, cfg, 0, input, batch, scale,
+    )?;
     encoder.memory_barrier();
     // Chain remaining blocks; each block_idx's output becomes next's input.
     for block_idx in 1..(cfg.num_hidden_layers as usize) {
@@ -1918,14 +1905,7 @@ pub fn apply_vit_full_forward_gpu(
 
     // --- Stage 3: 27-block transformer loop ---
     let after_blocks = apply_vit_blocks_loop_gpu(
-        encoder,
-        registry,
-        device,
-        weights,
-        cfg,
-        &input_gpu,
-        n_patches,
-        scale,
+        encoder, registry, device, weights, cfg, &input_gpu, n_patches, scale,
     )?;
     encoder.memory_barrier();
 
@@ -2008,10 +1988,7 @@ pub fn apply_vit_full_forward_gpu(
     {
         // SAFETY: just-allocated f32 buffer.
         let s: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                ones.contents_ptr() as *mut f32,
-                text_hidden as usize,
-            )
+            std::slice::from_raw_parts_mut(ones.contents_ptr() as *mut f32, text_hidden as usize)
         };
         for v in s.iter_mut() {
             *v = 1.0;
@@ -2064,9 +2041,8 @@ pub fn warmup_vit_gpu(
 ) -> Result<()> {
     use mlx_native::{GraphExecutor, MlxDevice};
 
-    let executor = GraphExecutor::new(
-        MlxDevice::new().map_err(|e| anyhow!("warmup_vit_gpu device: {e}"))?,
-    );
+    let executor =
+        GraphExecutor::new(MlxDevice::new().map_err(|e| anyhow!("warmup_vit_gpu device: {e}"))?);
     let mut session = executor
         .begin()
         .map_err(|e| anyhow!("warmup_vit_gpu begin: {e}"))?;
@@ -2134,14 +2110,13 @@ pub fn compute_vision_embeddings_gpu(
 
     let mut out = Vec::with_capacity(images.len());
     for (idx, img) in images.iter().enumerate() {
-        let executor = GraphExecutor::new(
-            MlxDevice::new().map_err(|e| {
+        let executor =
+            GraphExecutor::new(MlxDevice::new().map_err(|e| {
                 anyhow!("compute_vision_embeddings_gpu image {}: device: {e}", idx)
-            })?,
-        );
-        let mut session = executor.begin().map_err(|e| {
-            anyhow!("compute_vision_embeddings_gpu image {}: begin: {e}", idx)
-        })?;
+            })?);
+        let mut session = executor
+            .begin()
+            .map_err(|e| anyhow!("compute_vision_embeddings_gpu image {}: begin: {e}", idx))?;
         let mut registry = KernelRegistry::new();
         mlx_native::ops::softmax::register(&mut registry);
         mlx_native::ops::sigmoid_mul::register(&mut registry);
@@ -2244,13 +2219,17 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
 
     let mut out = Vec::with_capacity(images.len());
     for (idx, img) in images.iter().enumerate() {
-        let executor = GraphExecutor::new(
-            MlxDevice::new().map_err(|e| {
-                anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: device: {e}", idx)
-            })?,
-        );
+        let executor = GraphExecutor::new(MlxDevice::new().map_err(|e| {
+            anyhow!(
+                "compute_vision_embeddings_gpu_gemma4v image {}: device: {e}",
+                idx
+            )
+        })?);
         let mut session = executor.begin().map_err(|e| {
-            anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: begin: {e}", idx)
+            anyhow!(
+                "compute_vision_embeddings_gpu_gemma4v image {}: begin: {e}",
+                idx
+            )
         })?;
         let mut registry = KernelRegistry::new();
         mlx_native::ops::softmax::register(&mut registry);
@@ -2280,7 +2259,10 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
                     img.n_y,
                 )
                 .map_err(|e| {
-                    anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}", idx)
+                    anyhow!(
+                        "compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}",
+                        idx
+                    )
                 })
             })?
         } else {
@@ -2297,12 +2279,18 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
                 img.n_y,
             )
             .map_err(|e| {
-                anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}", idx)
+                anyhow!(
+                    "compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}",
+                    idx
+                )
             })?;
             (b, Vec::new())
         };
         session.finish().map_err(|e| {
-            anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: finish: {e}", idx)
+            anyhow!(
+                "compute_vision_embeddings_gpu_gemma4v image {}: finish: {e}",
+                idx
+            )
         })?;
 
         // After GPU finish: shared-memory buffers are safe to read on
@@ -2316,19 +2304,16 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
                 dir.clone()
             };
             if !img_dir.exists() {
-                std::fs::create_dir_all(&img_dir).map_err(|e| {
-                    anyhow!("create dump subdir {}: {e}", img_dir.display())
-                })?;
+                std::fs::create_dir_all(&img_dir)
+                    .map_err(|e| anyhow!("create dump subdir {}: {e}", img_dir.display()))?;
             }
             for mirror in super::vit_dump::drain_cpu_mirrors() {
-                super::vit_dump::write_dump_cpu(&img_dir, &mirror).map_err(|e| {
-                    anyhow!("write CPU dump {}: {e}", mirror.name)
-                })?;
+                super::vit_dump::write_dump_cpu(&img_dir, &mirror)
+                    .map_err(|e| anyhow!("write CPU dump {}: {e}", mirror.name))?;
             }
             for (name, buffer) in &collected {
-                super::vit_dump::write_dump_gpu(&img_dir, name, buffer).map_err(|e| {
-                    anyhow!("write GPU dump {}: {e}", name)
-                })?;
+                super::vit_dump::write_dump_gpu(&img_dir, name, buffer)
+                    .map_err(|e| anyhow!("write GPU dump {}: {e}", name))?;
             }
             // ADR-005 iter 130 (W61) — drain the dtype-audit collector
             // and write the metadata-only sidecar JSON. No-op when
@@ -2337,9 +2322,8 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
             // intermediate's `(name, dtype, shape)`.
             let audit_entries = super::vit_dump::drain_audit_entries();
             if !audit_entries.is_empty() {
-                super::vit_dump::write_dtype_audit(&img_dir, &audit_entries).map_err(|e| {
-                    anyhow!("write dtype audit JSON: {e}")
-                })?;
+                super::vit_dump::write_dtype_audit(&img_dir, &audit_entries)
+                    .map_err(|e| anyhow!("write dtype audit JSON: {e}"))?;
             }
         }
 
@@ -2604,14 +2588,7 @@ pub fn gemma4v_patch_embed_gpu(
         return Err(anyhow!("gemma4v_patch_embed_gpu: n_patches must be > 0"));
     }
     vit_linear_gpu(
-        encoder,
-        registry,
-        device,
-        patches,
-        weight,
-        n_patches,
-        inner,
-        hidden,
+        encoder, registry, device, patches, weight, n_patches, inner, hidden,
     )
     .context("gemma4v_patch_embed_gpu: vit_linear_gpu")
 }
@@ -2764,8 +2741,15 @@ pub fn gemma4v_apply_position_embed_gpu(
             "gemma4v_apply_position_embed_gpu: n_patches*hidden ({n_elem}) exceeds u32::MAX"
         ));
     }
-    vit_residual_add_gpu(encoder, registry, device, patch_embeds, &pos_emb, n_elem as u32)
-        .context("gemma4v_apply_position_embed_gpu: residual add")
+    vit_residual_add_gpu(
+        encoder,
+        registry,
+        device,
+        patch_embeds,
+        &pos_emb,
+        n_elem as u32,
+    )
+    .context("gemma4v_apply_position_embed_gpu: residual add")
 }
 
 // ---------------------------------------------------------------------------
@@ -2792,9 +2776,7 @@ pub fn gemma4v_apply_position_embed_gpu(
 use mlx_native::ops::elementwise::elementwise_mul as mlx_elementwise_mul;
 use mlx_native::ops::gelu::dispatch_gelu;
 use mlx_native::ops::rms_norm::dispatch_rms_norm_no_scale_f32;
-use mlx_native::ops::vision_2d_rope::{
-    build_vision_2d_rope_params, dispatch_vision_2d_rope,
-};
+use mlx_native::ops::vision_2d_rope::{build_vision_2d_rope_params, dispatch_vision_2d_rope};
 
 /// Gemma4 ViT RMSNorm on GPU: `y = x * rsqrt(mean(x²) + eps) * weight`
 /// (literal gain).
@@ -2868,7 +2850,9 @@ pub fn vit_gemma_per_head_rms_norm_gpu(
     let rows = batch
         .checked_mul(num_heads)
         .ok_or_else(|| anyhow!("vit_gemma_per_head_rms_norm_gpu: batch*num_heads overflow"))?;
-    vit_gemma_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, head_dim, eps)
+    vit_gemma_rms_norm_gpu(
+        encoder, registry, device, input, gain_f32, rows, head_dim, eps,
+    )
 }
 
 /// V-norm (no learned gain) on GPU. Wraps mlx-native's
@@ -2894,7 +2878,11 @@ pub fn vit_v_norm_no_scale_gpu(
         .ok_or_else(|| anyhow!("vit_v_norm_no_scale_gpu: batch*num_kv_heads overflow"))?;
     let n_elem = (rows as usize) * (head_dim as usize);
     let output = device
-        .alloc_buffer(n_elem * 4, DType::F32, vec![rows as usize, head_dim as usize])
+        .alloc_buffer(
+            n_elem * 4,
+            DType::F32,
+            vec![rows as usize, head_dim as usize],
+        )
         .map_err(|e| anyhow!("vit_v_norm_no_scale_gpu: alloc output: {e}"))?;
     // Params: [eps, dim] (matches the rms_norm shader convention).
     let params_buf = device
@@ -3003,15 +2991,16 @@ pub fn vit_repeat_kv_gpu(
     // Build the gather index table on the host: out_row r = b * num_heads + h
     //   → src_row = b * num_kv_heads + (h / num_kv_groups).
     let idx_buf = device
-        .alloc_buffer(n_out_rows as usize * 4, DType::U32, vec![n_out_rows as usize])
+        .alloc_buffer(
+            n_out_rows as usize * 4,
+            DType::U32,
+            vec![n_out_rows as usize],
+        )
         .map_err(|e| anyhow!("vit_repeat_kv_gpu: alloc idx: {e}"))?;
     {
         // SAFETY: just-allocated u32 buffer.
         let s: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                idx_buf.contents_ptr() as *mut u32,
-                n_out_rows as usize,
-            )
+            std::slice::from_raw_parts_mut(idx_buf.contents_ptr() as *mut u32, n_out_rows as usize)
         };
         for b in 0..batch {
             for h in 0..num_heads {
@@ -3023,7 +3012,11 @@ pub fn vit_repeat_kv_gpu(
 
     let n_out_elem = (n_out_rows as usize) * (head_dim as usize);
     let output = device
-        .alloc_buffer(n_out_elem * 4, DType::F32, vec![n_out_rows as usize, head_dim as usize])
+        .alloc_buffer(
+            n_out_elem * 4,
+            DType::F32,
+            vec![n_out_rows as usize, head_dim as usize],
+        )
         .map_err(|e| anyhow!("vit_repeat_kv_gpu: alloc output: {e}"))?;
     dispatch_gather_f32(
         encoder,
@@ -3213,8 +3206,8 @@ pub fn gemma4v_block_forward_gpu(
     //
     // Disk cost bound: 4 blocks × ~11 named stages × ~196 patches × 1152
     //   hidden × 4 bytes ≈ 40 MB total — bounded, dev-only.
-    let dump_intra = super::vit_dump::is_armed()
-        && (block_idx <= 1 || block_idx == 25 || block_idx == 26);
+    let dump_intra =
+        super::vit_dump::is_armed() && (block_idx <= 1 || block_idx == 25 || block_idx == 26);
     let intra_name = |suffix: &str| format!("03_block_{:02}_{}", block_idx, suffix);
 
     // ADR-005 iter 130 (W61) — comprehensive dtype audit instrumentation.
@@ -3228,8 +3221,7 @@ pub fn gemma4v_block_forward_gpu(
     // unset, so no production overhead.
     //
     // INSTRUMENTATION ONLY — no production behaviour change.
-    let audit_intra = super::vit_dump::is_dtype_audit_armed()
-        && super::vit_dump::is_armed();
+    let audit_intra = super::vit_dump::is_dtype_audit_armed() && super::vit_dump::is_armed();
 
     // ---------- Attention half ----------
     let cur = vit_gemma_rms_norm_gpu(
@@ -3344,7 +3336,14 @@ pub fn gemma4v_block_forward_gpu(
         );
     }
     let v = vit_v_norm_no_scale_gpu(
-        encoder, registry, device, &v, batch, num_kv_heads, head_dim, eps,
+        encoder,
+        registry,
+        device,
+        &v,
+        batch,
+        num_kv_heads,
+        head_dim,
+        eps,
     )?;
     encoder.memory_barrier();
     if audit_intra {
@@ -3360,7 +3359,16 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_q_rope"), &q);
     }
     let k = vit_vision_2d_rope_gpu(
-        encoder, registry, device, &k, pos_x_idx, pos_y_idx, batch, num_kv_heads, head_dim, theta,
+        encoder,
+        registry,
+        device,
+        &k,
+        pos_x_idx,
+        pos_y_idx,
+        batch,
+        num_kv_heads,
+        head_dim,
+        theta,
     )?;
     encoder.memory_barrier();
     if audit_intra {
@@ -3378,14 +3386,28 @@ pub fn gemma4v_block_forward_gpu(
 
     // GQA: expand K and V to match Q's head count.
     let k_full = vit_repeat_kv_gpu(
-        encoder, registry, device, &k, batch, num_kv_heads, num_kv_groups, head_dim,
+        encoder,
+        registry,
+        device,
+        &k,
+        batch,
+        num_kv_heads,
+        num_kv_groups,
+        head_dim,
     )?;
     encoder.memory_barrier();
     if audit_intra {
         super::vit_dump::record_audit(&intra_name("attn_k_full_gqa"), &k_full);
     }
     let v_full = vit_repeat_kv_gpu(
-        encoder, registry, device, &v, batch, num_kv_heads, num_kv_groups, head_dim,
+        encoder,
+        registry,
+        device,
+        &v,
+        batch,
+        num_kv_heads,
+        num_kv_groups,
+        head_dim,
     )?;
     encoder.memory_barrier();
     if audit_intra {
@@ -3503,10 +3525,7 @@ pub fn gemma4v_block_forward_gpu(
     }
     if audit_intra {
         super::vit_dump::record_audit(&intra_name("ffn_inp_normed"), &cur);
-        super::vit_dump::record_audit(
-            &intra_name("ln2_weight_storage"),
-            block("ln2.weight")?,
-        );
+        super::vit_dump::record_audit(&intra_name("ln2_weight_storage"), block("ln2.weight")?);
     }
 
     let gate = vit_linear_gpu(
@@ -3857,36 +3876,35 @@ pub fn gemma4v_apply_full_forward_gpu(
     {
         // SAFETY: just-allocated f32 buffer; copy-in is exclusive.
         let dst: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                patches_buf.contents_ptr() as *mut f32,
-                expected_patches,
-            )
+            std::slice::from_raw_parts_mut(patches_buf.contents_ptr() as *mut f32, expected_patches)
         };
         dst.copy_from_slice(patches);
     }
     let pos_x_buf = device
-        .alloc_buffer((n_patches as usize) * 4, DType::U32, vec![n_patches as usize])
+        .alloc_buffer(
+            (n_patches as usize) * 4,
+            DType::U32,
+            vec![n_patches as usize],
+        )
         .map_err(|e| anyhow!("alloc pos_x: {e}"))?;
     {
         // SAFETY: just-allocated U32 buffer; copy-in is exclusive.
         let dst: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                pos_x_buf.contents_ptr() as *mut u32,
-                n_patches as usize,
-            )
+            std::slice::from_raw_parts_mut(pos_x_buf.contents_ptr() as *mut u32, n_patches as usize)
         };
         dst.copy_from_slice(pos_x);
     }
     let pos_y_buf = device
-        .alloc_buffer((n_patches as usize) * 4, DType::U32, vec![n_patches as usize])
+        .alloc_buffer(
+            (n_patches as usize) * 4,
+            DType::U32,
+            vec![n_patches as usize],
+        )
         .map_err(|e| anyhow!("alloc pos_y: {e}"))?;
     {
         // SAFETY: just-allocated U32 buffer.
         let dst: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                pos_y_buf.contents_ptr() as *mut u32,
-                n_patches as usize,
-            )
+            std::slice::from_raw_parts_mut(pos_y_buf.contents_ptr() as *mut u32, n_patches as usize)
         };
         dst.copy_from_slice(pos_y);
     }
@@ -3941,11 +3959,7 @@ pub fn gemma4v_apply_full_forward_gpu(
                 }
             }
         }
-        super::vit_dump::record_f32(
-            "00_pre_patchify",
-            &planar,
-            vec![3, h, w],
-        );
+        super::vit_dump::record_f32("00_pre_patchify", &planar, vec![3, h, w]);
     }
 
     // --- Stage 2: patch-embed (Linear, no bias) ---
@@ -3953,7 +3967,14 @@ pub fn gemma4v_apply_full_forward_gpu(
         .patch_embd_weight()
         .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: {e}"))?;
     let patch_embeds = gemma4v_patch_embed_gpu(
-        encoder, registry, device, &patches_buf, patch_w, n_patches, inner, hidden,
+        encoder,
+        registry,
+        device,
+        &patches_buf,
+        patch_w,
+        n_patches,
+        inner,
+        hidden,
     )?;
     encoder.memory_barrier();
     super::vit_dump::record("01_patch_embd", &patch_embeds);
@@ -3968,8 +3989,16 @@ pub fn gemma4v_apply_full_forward_gpu(
         ));
     }
     let after_pos = gemma4v_apply_position_embed_gpu(
-        encoder, registry, device, &patch_embeds, pe_table, &pos_x_buf, &pos_y_buf,
-        n_patches, pos_size, hidden,
+        encoder,
+        registry,
+        device,
+        &patch_embeds,
+        pe_table,
+        &pos_x_buf,
+        &pos_y_buf,
+        n_patches,
+        pos_size,
+        hidden,
     )?;
     encoder.memory_barrier();
     super::vit_dump::record("02_pos_embd", &after_pos);
@@ -4006,8 +4035,8 @@ pub fn gemma4v_apply_full_forward_gpu(
     };
 
     let mut hidden_states = gemma4v_block_forward_gpu(
-        encoder, registry, device, weights, &shape, 0, &after_pos,
-        &pos_x_buf, &pos_y_buf, n_patches,
+        encoder, registry, device, weights, &shape, 0, &after_pos, &pos_x_buf, &pos_y_buf,
+        n_patches,
     )?;
     encoder.memory_barrier();
     if super::vit_dump::is_armed() {
@@ -4015,15 +4044,20 @@ pub fn gemma4v_apply_full_forward_gpu(
     }
     for block_idx in 1..(cfg.num_hidden_layers as usize) {
         hidden_states = gemma4v_block_forward_gpu(
-            encoder, registry, device, weights, &shape, block_idx, &hidden_states,
-            &pos_x_buf, &pos_y_buf, n_patches,
+            encoder,
+            registry,
+            device,
+            weights,
+            &shape,
+            block_idx,
+            &hidden_states,
+            &pos_x_buf,
+            &pos_y_buf,
+            n_patches,
         )?;
         encoder.memory_barrier();
         if super::vit_dump::is_armed() {
-            super::vit_dump::record(
-                &format!("03_block_{:02}", block_idx),
-                &hidden_states,
-            );
+            super::vit_dump::record(&format!("03_block_{:02}", block_idx), &hidden_states);
         }
     }
 
@@ -4033,9 +4067,8 @@ pub fn gemma4v_apply_full_forward_gpu(
     // as set by `preprocess_gemma4v`). The pool kernel interprets this
     // as a `[n_y, n_x, hidden]` 3-D tensor — same backing buffer, just a
     // different shape view, no copy needed.
-    let pooled = gemma4v_avg_pool_3x3_gpu(
-        encoder, registry, device, &hidden_states, n_x, n_y, hidden,
-    )?;
+    let pooled =
+        gemma4v_avg_pool_3x3_gpu(encoder, registry, device, &hidden_states, n_x, n_y, hidden)?;
     encoder.memory_barrier();
     super::vit_dump::record("30_final_pool", &pooled);
 
@@ -4044,7 +4077,11 @@ pub fn gemma4v_apply_full_forward_gpu(
 
     // --- Stage 6: scale by sqrt(hidden) ---
     vit_scale_gpu(
-        encoder, registry, device, &pooled, pooled_total as u32,
+        encoder,
+        registry,
+        device,
+        &pooled,
+        pooled_total as u32,
         (hidden as f32).sqrt(),
     )?;
     encoder.memory_barrier();
@@ -4058,8 +4095,14 @@ pub fn gemma4v_apply_full_forward_gpu(
         .get("v.std_scale")
         .ok_or_else(|| anyhow!("gemma4v_apply_full_forward_gpu: missing v.std_scale"))?;
     let normed = vit_std_bias_scale_gpu(
-        encoder, registry, device, &pooled, std_bias, std_scale,
-        pooled_n as u32, hidden,
+        encoder,
+        registry,
+        device,
+        &pooled,
+        std_bias,
+        std_scale,
+        pooled_n as u32,
+        hidden,
     )?;
     encoder.memory_barrier();
     super::vit_dump::record("32_std_bias_scale", &normed);
@@ -4081,8 +4124,15 @@ pub fn gemma4v_apply_full_forward_gpu(
     }
     let bounds = weights.mm_0_bounds();
     let projected = gemma4v_clippable_linear_gpu(
-        encoder, registry, device, &normed, mm0, &bounds,
-        pooled_n as u32, hidden, text_hidden,
+        encoder,
+        registry,
+        device,
+        &normed,
+        mm0,
+        &bounds,
+        pooled_n as u32,
+        hidden,
+        text_hidden,
     )?;
     encoder.memory_barrier();
     super::vit_dump::record("33_projector", &projected);
@@ -4098,18 +4148,21 @@ pub fn gemma4v_apply_full_forward_gpu(
     {
         // SAFETY: just-allocated f32 buffer.
         let s: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                ones.contents_ptr() as *mut f32,
-                text_hidden as usize,
-            )
+            std::slice::from_raw_parts_mut(ones.contents_ptr() as *mut f32, text_hidden as usize)
         };
         for v in s.iter_mut() {
             *v = 1.0;
         }
     }
     let post_proj_rms = vit_rms_norm_gpu(
-        encoder, registry, device, &projected, &ones,
-        pooled_n as u32, text_hidden, cfg.layer_norm_eps,
+        encoder,
+        registry,
+        device,
+        &projected,
+        &ones,
+        pooled_n as u32,
+        text_hidden,
+        cfg.layer_norm_eps,
     )?;
     super::vit_dump::record("34_post_proj_rms", &post_proj_rms);
     Ok(post_proj_rms)
@@ -4122,18 +4175,17 @@ pub fn gemma4v_apply_full_forward_gpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::vision::mmproj::MmprojConfig;
+    use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
     use crate::inference::vision::vit::{
         apply_vit_block_forward as apply_vit_block_forward_cpu, elementwise_mul_in_place,
         gemma4v_block_forward as gemma4v_block_forward_cpu,
         gemma4v_patch_embed_forward as gemma4v_patch_embed_cpu,
-        gemma4v_position_embed_lookup as gemma4v_pos_embed_cpu,
-        linear_forward as linear_cpu, per_head_rms_norm_forward as per_head_rms_cpu,
-        residual_add as residual_add_cpu, rms_norm_forward as rms_norm_cpu,
-        scaled_dot_product_attention as attention_cpu, silu_in_place,
-        softmax_last_dim as softmax_cpu,
+        gemma4v_position_embed_lookup as gemma4v_pos_embed_cpu, linear_forward as linear_cpu,
+        per_head_rms_norm_forward as per_head_rms_cpu, residual_add as residual_add_cpu,
+        rms_norm_forward as rms_norm_cpu, scaled_dot_product_attention as attention_cpu,
+        silu_in_place, softmax_last_dim as softmax_cpu,
     };
-    use crate::inference::vision::mmproj::MmprojConfig;
-    use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
     use mlx_native::gguf::GgufFile;
     use mlx_native::{GraphExecutor, MlxDevice};
     use std::path::Path;
@@ -4325,28 +4377,22 @@ mod tests {
         // `element_count()` (dtype-agnostic).
         let text_hidden = mm0.element_count() / hidden;
         assert_eq!(text_hidden, 2816);
-        let weight_cpu: Vec<f32> = weights
-            .tensor_as_f32_owned(mm0)
-            .expect("mm.0 widen");
+        let weight_cpu: Vec<f32> = weights.tensor_as_f32_owned(mm0).expect("mm.0 widen");
 
         // Synthetic input — deterministic sine-based so CPU and GPU
         // see identical float bytes on both sides.
         let input_cpu: Vec<f32> = (0..seq * hidden)
             .map(|i| ((i as f32) * 1e-4).sin() * 0.1)
             .collect();
-        let expected = linear_cpu(&input_cpu, &weight_cpu, None, seq, hidden, text_hidden)
-            .expect("cpu ref");
+        let expected =
+            linear_cpu(&input_cpu, &weight_cpu, None, seq, hidden, text_hidden).expect("cpu ref");
 
         // GPU path.
         let exec_device = MlxDevice::new().expect("device2");
         let executor = GraphExecutor::new(exec_device);
         let input_buf = upload_f32(executor.device(), &input_cpu, vec![seq, hidden]);
         // Re-upload weight to the new device (weights Arc is on a different device).
-        let weight_buf = upload_f32(
-            executor.device(),
-            &weight_cpu,
-            vec![text_hidden, hidden],
-        );
+        let weight_buf = upload_f32(executor.device(), &weight_cpu, vec![text_hidden, hidden]);
 
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
@@ -4453,8 +4499,14 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let input = executor.device().alloc_buffer(16 * 4, DType::F32, vec![4, 4]).expect("a");
-        let gain = executor.device().alloc_buffer(4 * 4, DType::F32, vec![4]).expect("b");
+        let input = executor
+            .device()
+            .alloc_buffer(16 * 4, DType::F32, vec![4, 4])
+            .expect("a");
+        let gain = executor
+            .device()
+            .alloc_buffer(4 * 4, DType::F32, vec![4])
+            .expect("b");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
@@ -4557,8 +4609,11 @@ mod tests {
 
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let input_buf =
-            upload_f32(executor.device(), &input_cpu, vec![batch, num_heads, head_dim]);
+        let input_buf = upload_f32(
+            executor.device(),
+            &input_cpu,
+            vec![batch, num_heads, head_dim],
+        );
         let gain_buf = upload_f32(executor.device(), &gain_cpu, vec![head_dim]);
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
@@ -4584,7 +4639,10 @@ mod tests {
             .zip(expected.iter())
             .map(|(g, e)| (g - e).abs())
             .fold(0f32, f32::max);
-        assert!(max_diff < 1e-4, "per_head_rms GPU vs CPU max_diff = {max_diff}");
+        assert!(
+            max_diff < 1e-4,
+            "per_head_rms GPU vs CPU max_diff = {max_diff}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4760,9 +4818,7 @@ mod tests {
         // For (head=0, batch=1): in[1, 0, dim] = 100 + dim
         // For (head=1, batch=0): in[0, 1, dim] = 10 + dim
         // For (head=1, batch=1): in[1, 1, dim] = 110 + dim
-        let layout = |head: usize, b: usize, d: usize| {
-            head * batch * head_dim + b * head_dim + d
-        };
+        let layout = |head: usize, b: usize, d: usize| head * batch * head_dim + b * head_dim + d;
         for d in 0..head_dim {
             assert_eq!(got[layout(0, 0, d)], d as f32, "h0 b0 d{d}");
             assert_eq!(got[layout(0, 1, d)], (100 + d) as f32, "h0 b1 d{d}");
@@ -4905,8 +4961,8 @@ mod tests {
             .map(|i| ((i as f32) * 0.11).sin() * ((i as f32) * 0.13).cos() * 0.5)
             .collect();
 
-        let expected = attention_cpu(&q_cpu, &k_cpu, &v_cpu, batch, num_heads, head_dim)
-            .expect("cpu ref");
+        let expected =
+            attention_cpu(&q_cpu, &k_cpu, &v_cpu, batch, num_heads, head_dim).expect("cpu ref");
 
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
@@ -4953,7 +5009,10 @@ mod tests {
         assert!(
             frac < 0.01,
             "{}/{} elements ({:.3}%) exceeded 1e-2, max_diff = {}",
-            fail_count, total, frac * 100.0, max_diff
+            fail_count,
+            total,
+            frac * 100.0,
+            max_diff
         );
     }
 
@@ -4991,7 +5050,11 @@ mod tests {
         session.finish().expect("finish");
         let got = readback_f32(&out_buf, n);
 
-        let max_diff = got.iter().zip(expected.iter()).map(|(g, e)| (g - e).abs()).fold(0f32, f32::max);
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
         assert!(max_diff < 1e-6, "residual_add max_diff = {max_diff}");
     }
 
@@ -5000,8 +5063,14 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let a = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
-        let b = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("b");
+        let a = executor
+            .device()
+            .alloc_buffer(16, DType::F32, vec![4])
+            .expect("a");
+        let b = executor
+            .device()
+            .alloc_buffer(16, DType::F32, vec![4])
+            .expect("b");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
@@ -5050,7 +5119,11 @@ mod tests {
         session.finish().expect("finish");
         let got = readback_f32(&out_buf, n);
 
-        let max_diff = got.iter().zip(expected.iter()).map(|(g, e)| (g - e).abs()).fold(0f32, f32::max);
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
         // F32 throughout — tight tolerance.
         assert!(max_diff < 1e-5, "silu_mul max_diff = {max_diff}");
     }
@@ -5060,14 +5133,20 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let g = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("g");
-        let u = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("u");
+        let g = executor
+            .device()
+            .alloc_buffer(16, DType::F32, vec![4])
+            .expect("g");
+        let u = executor
+            .device()
+            .alloc_buffer(16, DType::F32, vec![4])
+            .expect("u");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        let err = vit_silu_mul_gpu(session.encoder_mut(), &mut registry, device, &g, &u, 0)
-            .unwrap_err();
+        let err =
+            vit_silu_mul_gpu(session.encoder_mut(), &mut registry, device, &g, &u, 0).unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
     }
 
@@ -5087,10 +5166,8 @@ mod tests {
     fn iter50_bisect_block_forward_gpu_vs_cpu_real_gemma4() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit::{
-            linear_forward as linear_cpu_fn,
-            per_head_rms_norm_forward as per_head_rms_cpu_fn,
-            rms_norm_forward as rms_norm_cpu_fn,
-            scaled_dot_product_attention as attention_cpu_fn,
+            linear_forward as linear_cpu_fn, per_head_rms_norm_forward as per_head_rms_cpu_fn,
+            rms_norm_forward as rms_norm_cpu_fn, scaled_dot_product_attention as attention_cpu_fn,
         };
 
         let path = Path::new(GEMMA4_MMPROJ_PATH);
@@ -5131,7 +5208,9 @@ mod tests {
             let mut sum_sq = 0f32;
             for (x, y) in a.iter().zip(b.iter()) {
                 let d = (x - y).abs();
-                if d > max_d { max_d = d; }
+                if d > max_d {
+                    max_d = d;
+                }
                 sum_sq += d * d;
             }
             (max_d, sum_sq.sqrt())
@@ -5153,11 +5232,24 @@ mod tests {
         let mut reg = KernelRegistry::new();
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
-        let stage_a = vit_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &in_a, &ln1_a, batch as u32, hidden as u32, eps).unwrap();
+        let stage_a = vit_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &in_a,
+            &ln1_a,
+            batch as u32,
+            hidden as u32,
+            eps,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let stage_a_cpu = readback_f32(&stage_a, batch * hidden);
         let (md, l2v) = l2(&stage_a_cpu, &ref_after_ln1);
-        eprintln!("STAGE A (ln1 rms_norm)            : max_diff = {:.6}, l2 = {:.6}", md, l2v);
+        eprintln!(
+            "STAGE A (ln1 rms_norm)            : max_diff = {:.6}, l2 = {:.6}",
+            md, l2v
+        );
         assert!(md < 1e-3, "STAGE A diverges: max_diff = {md}");
 
         // ---------------- STAGE B: + Q linear ----------------
@@ -5171,15 +5263,31 @@ mod tests {
         let mut reg = KernelRegistry::new();
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
-        let stage_b = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur_b, &qw_b, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let stage_b = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur_b,
+            &qw_b,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let stage_b_cpu = readback_f32(&stage_b, batch * hidden);
         let (md, l2v) = l2(&stage_b_cpu, &ref_q);
-        eprintln!("STAGE B (Q linear, uploaded ln1 ref input): max_diff = {:.6}, l2 = {:.6}", md, l2v);
+        eprintln!(
+            "STAGE B (Q linear, uploaded ln1 ref input): max_diff = {:.6}, l2 = {:.6}",
+            md, l2v
+        );
         // BF16 weight cast + 1152-term sum → expected max_diff ~ 0.2.
         // Treat anything < 0.5 as plausible BF16 noise; tighter
         // thresholds expose chain-specific bugs.
-        assert!(md < 0.5, "STAGE B diverges WAY beyond BF16: max_diff = {md}");
+        assert!(
+            md < 0.5,
+            "STAGE B diverges WAY beyond BF16: max_diff = {md}"
+        );
 
         // ---------------- STAGE B': Q linear with weights from .as_slice ----------------
         // Same as B but use the weights buffer directly (no upload).
@@ -5192,11 +5300,24 @@ mod tests {
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
         let qw_native = weights.block_tensor(0, "attn_q.weight").unwrap();
-        let stage_bp = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur_bp, qw_native, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let stage_bp = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur_bp,
+            qw_native,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let stage_bp_cpu = readback_f32(&stage_bp, batch * hidden);
         let (md, l2v) = l2(&stage_bp_cpu, &ref_q);
-        eprintln!("STAGE B' (Q linear, native weight buffer): max_diff = {:.6}, l2 = {:.6}", md, l2v);
+        eprintln!(
+            "STAGE B' (Q linear, native weight buffer): max_diff = {:.6}, l2 = {:.6}",
+            md, l2v
+        );
         // No assert — diagnostic only. If THIS diverges from B, it's
         // the cross-device buffer issue.
 
@@ -5209,13 +5330,36 @@ mod tests {
         let mut reg = KernelRegistry::new();
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
-        let cur = vit_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &in_c, &ln1_c, batch as u32, hidden as u32, eps).unwrap();
+        let cur = vit_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &in_c,
+            &ln1_c,
+            batch as u32,
+            hidden as u32,
+            eps,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let stage_c = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &qw_c, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let stage_c = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &qw_c,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let stage_c_cpu = readback_f32(&stage_c, batch * hidden);
         let (md, l2v) = l2(&stage_c_cpu, &ref_q);
-        eprintln!("STAGE C (ln1 → Q linear, single session): max_diff = {:.6}, l2 = {:.6}", md, l2v);
+        eprintln!(
+            "STAGE C (ln1 → Q linear, single session): max_diff = {:.6}, l2 = {:.6}",
+            md, l2v
+        );
 
         // ---------------- STAGE D: + K, V linears, then per-head Q/K norms ----------------
         let k_w = block("attn_k.weight");
@@ -5242,17 +5386,79 @@ mod tests {
         let mut reg = KernelRegistry::new();
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
-        let cur = vit_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &in_d, &ln1_d, batch as u32, hidden as u32, eps).unwrap();
+        let cur = vit_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &in_d,
+            &ln1_d,
+            batch as u32,
+            hidden as u32,
+            eps,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let q = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &qw_d, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let q = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &qw_d,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let k = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &kw_d, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let k = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &kw_d,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let v = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &vw_d, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let v = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &vw_d,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let q_norm_gpu = vit_per_head_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &q, &qn_d, batch as u32, num_heads as u32, head_dim as u32, eps).unwrap();
+        let q_norm_gpu = vit_per_head_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &q,
+            &qn_d,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            eps,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let k_norm_gpu = vit_per_head_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &k, &kn_d, batch as u32, num_heads as u32, head_dim as u32, eps).unwrap();
+        let k_norm_gpu = vit_per_head_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &k,
+            &kn_d,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            eps,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let q_norm_cpu_back = readback_f32(&q_norm_gpu, batch * hidden);
         let k_norm_cpu_back = readback_f32(&k_norm_gpu, batch * hidden);
@@ -5267,7 +5473,8 @@ mod tests {
         assert!(md_k < 0.5, "STAGE D K-norm diverges: max_diff = {md_k}");
 
         // ---------------- STAGE E: + attention ----------------
-        let ref_attn = attention_cpu_fn(&ref_q_norm, &ref_k_norm, &ref_v, batch, num_heads, head_dim).unwrap();
+        let ref_attn =
+            attention_cpu_fn(&ref_q_norm, &ref_k_norm, &ref_v, batch, num_heads, head_dim).unwrap();
 
         let exec = GraphExecutor::new(MlxDevice::new().expect("e_e"));
         let qn_e = upload_f32(exec.device(), &ref_q_norm, vec![batch, num_heads, head_dim]);
@@ -5278,16 +5485,34 @@ mod tests {
         mlx_native::ops::softmax::register(&mut reg);
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
-        let attn_e = vit_attention_gpu(sess.encoder_mut(), &mut reg, dev, &qn_e, &kn_e, &v_e, batch as u32, num_heads as u32, head_dim as u32, scale).unwrap();
+        let attn_e = vit_attention_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &qn_e,
+            &kn_e,
+            &v_e,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let attn_e_back = readback_f32(&attn_e, batch * hidden);
         let (md_attn, l2_attn) = l2(&attn_e_back, &ref_attn);
-        eprintln!("STAGE E (attention, CPU-uploaded inputs): max_diff = {:.6}, l2 = {:.6}", md_attn, l2_attn);
+        eprintln!(
+            "STAGE E (attention, CPU-uploaded inputs): max_diff = {:.6}, l2 = {:.6}",
+            md_attn, l2_attn
+        );
         // Diagnostics on input/output magnitudes.
         let stat = |name: &str, v: &[f32]| {
             let max_abs = v.iter().map(|x| x.abs()).fold(0f32, f32::max);
             let mean_abs = v.iter().map(|x| x.abs()).sum::<f32>() / (v.len() as f32);
-            eprintln!("  {}: max_abs = {:.4}, mean_abs = {:.4}", name, max_abs, mean_abs);
+            eprintln!(
+                "  {}: max_abs = {:.4}, mean_abs = {:.4}",
+                name, max_abs, mean_abs
+            );
         };
         stat("ref_q_norm", &ref_q_norm);
         stat("ref_k_norm", &ref_k_norm);
@@ -5309,23 +5534,100 @@ mod tests {
         mlx_native::ops::softmax::register(&mut reg);
         let dr: *const MlxDevice = exec.device() as *const _;
         let dev: &MlxDevice = unsafe { &*dr };
-        let cur = vit_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &in_f, &ln1_f, batch as u32, hidden as u32, eps).unwrap();
+        let cur = vit_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &in_f,
+            &ln1_f,
+            batch as u32,
+            hidden as u32,
+            eps,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let q = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &qw_f, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let q = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &qw_f,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let k = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &kw_f, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let k = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &kw_f,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let v = vit_linear_gpu(sess.encoder_mut(), &mut reg, dev, &cur, &vw_f, batch as u32, hidden as u32, hidden as u32).unwrap();
+        let v = vit_linear_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &cur,
+            &vw_f,
+            batch as u32,
+            hidden as u32,
+            hidden as u32,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let qn = vit_per_head_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &q, &qn_f, batch as u32, num_heads as u32, head_dim as u32, eps).unwrap();
+        let qn = vit_per_head_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &q,
+            &qn_f,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            eps,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let kn = vit_per_head_rms_norm_gpu(sess.encoder_mut(), &mut reg, dev, &k, &kn_f, batch as u32, num_heads as u32, head_dim as u32, eps).unwrap();
+        let kn = vit_per_head_rms_norm_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &k,
+            &kn_f,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            eps,
+        )
+        .unwrap();
         sess.encoder_mut().memory_barrier();
-        let attn_f = vit_attention_gpu(sess.encoder_mut(), &mut reg, dev, &qn, &kn, &v, batch as u32, num_heads as u32, head_dim as u32, scale).unwrap();
+        let attn_f = vit_attention_gpu(
+            sess.encoder_mut(),
+            &mut reg,
+            dev,
+            &qn,
+            &kn,
+            &v,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .unwrap();
         sess.finish().unwrap();
         let attn_f_back = readback_f32(&attn_f, batch * hidden);
         let (md_attn_f, l2_attn_f) = l2(&attn_f_back, &ref_attn);
-        eprintln!("STAGE F (full chain through attention): max_diff = {:.6}, l2 = {:.6}", md_attn_f, l2_attn_f);
+        eprintln!(
+            "STAGE F (full chain through attention): max_diff = {:.6}, l2 = {:.6}",
+            md_attn_f, l2_attn_f
+        );
     }
     // -----------------------------------------------------------------------
     // vit_avg_pool_2x2_gpu + vit_std_bias_scale_gpu (iter 51c)
@@ -5415,7 +5717,10 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
-        let in_buf = executor.device().alloc_buffer(27 * 4, DType::F32, vec![3, 3, 3]).expect("a");
+        let in_buf = executor
+            .device()
+            .alloc_buffer(27 * 4, DType::F32, vec![3, 3, 3])
+            .expect("a");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
@@ -5457,13 +5762,23 @@ mod tests {
         let device: &MlxDevice = unsafe { &*device_ref };
 
         let out_2x2 = vit_avg_pool_2x2_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf,
-            n_side as u32, hidden as u32,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            n_side as u32,
+            hidden as u32,
         )
         .expect("2x2");
         let out_kxk = vit_avg_pool_kxk_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf,
-            n_side as u32, n_side as u32, 2, hidden as u32,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            n_side as u32,
+            n_side as u32,
+            2,
+            hidden as u32,
         )
         .expect("kxk");
         session.finish().expect("finish");
@@ -5512,8 +5827,14 @@ mod tests {
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
         let out_buf = vit_avg_pool_kxk_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf,
-            n_x as u32, n_y as u32, k as u32, hidden as u32,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            n_x as u32,
+            n_y as u32,
+            k as u32,
+            hidden as u32,
         )
         .expect("kxk k=3");
         session.finish().expect("finish");
@@ -5575,7 +5896,14 @@ mod tests {
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
         let out_buf = vit_avg_pool_kxk_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf, n_x, n_y, k, hidden,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            n_x,
+            n_y,
+            k,
+            hidden,
         )
         .expect("kxk rect");
         session.finish().expect("finish");
@@ -5605,7 +5933,14 @@ mod tests {
         let device: &MlxDevice = unsafe { &*device_ref };
         // n_x=9, n_y=7, k=3 — 7 is not a multiple of 3.
         let err = vit_avg_pool_kxk_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf, 9, 7, 3, 4,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            9,
+            7,
+            3,
+            4,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("multiples of k"));
@@ -5628,8 +5963,13 @@ mod tests {
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
         let out_buf = vit_clip_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf,
-            input_cpu.len() as u32, -2.0, 3.0,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            input_cpu.len() as u32,
+            -2.0,
+            3.0,
         )
         .expect("clip");
         session.finish().expect("finish");
@@ -5652,8 +5992,13 @@ mod tests {
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
         let out_buf = vit_clip_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf,
-            input_cpu.len() as u32, f32::NEG_INFINITY, f32::INFINITY,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            input_cpu.len() as u32,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
         )
         .expect("clip");
         session.finish().expect("finish");
@@ -5672,7 +6017,13 @@ mod tests {
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
         let err = vit_clip_gpu(
-            session.encoder_mut(), &mut registry, device, &in_buf, 3, 5.0, 1.0,
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            3,
+            5.0,
+            1.0,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("min_val") || format!("{err}").contains("> max_val"));
@@ -5690,8 +6041,7 @@ mod tests {
     fn gemma4v_clippable_linear_with_and_without_clamp() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit::{
-            gemma4v_clippable_linear_forward as cpu_clip_linear,
-            Gemma4ClippableLinearBounds,
+            gemma4v_clippable_linear_forward as cpu_clip_linear, Gemma4ClippableLinearBounds,
         };
         let batch = 4usize;
         let in_features = 64usize;
@@ -5723,10 +6073,9 @@ mod tests {
             ("both", &bounds_both),
         ] {
             // CPU reference.
-            let cpu_out = cpu_clip_linear(
-                &input, &weight, bounds, batch, in_features, out_features,
-            )
-            .expect("cpu clip linear");
+            let cpu_out =
+                cpu_clip_linear(&input, &weight, bounds, batch, in_features, out_features)
+                    .expect("cpu clip linear");
 
             // GPU dispatch.
             let device = MlxDevice::new().expect("dev");
@@ -5739,8 +6088,15 @@ mod tests {
             let device_ref: *const MlxDevice = executor.device() as *const _;
             let device: &MlxDevice = unsafe { &*device_ref };
             let out_buf = gemma4v_clippable_linear_gpu(
-                session.encoder_mut(), &mut registry, device, &in_buf, &w_buf, bounds,
-                batch as u32, in_features as u32, out_features as u32,
+                session.encoder_mut(),
+                &mut registry,
+                device,
+                &in_buf,
+                &w_buf,
+                bounds,
+                batch as u32,
+                in_features as u32,
+                out_features as u32,
             )
             .expect("gpu clip linear");
             session.finish().expect("finish");
@@ -5754,10 +6110,7 @@ mod tests {
                 .zip(cpu_out.iter())
                 .map(|(g, c)| (g - c).abs())
                 .fold(0f32, f32::max);
-            assert!(
-                max_diff < 5e-3,
-                "[{label}] gpu/cpu max_diff = {max_diff}"
-            );
+            assert!(max_diff < 5e-3, "[{label}] gpu/cpu max_diff = {max_diff}");
             // Verify clamps actually fired when bounds were set: every
             // GPU output element must respect the output clamp.
             if let Some(mn) = bounds.output_min {
@@ -5859,13 +6212,25 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
-        let buf = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
+        let buf = executor
+            .device()
+            .alloc_buffer(16, DType::F32, vec![4])
+            .expect("a");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        let err = vit_std_bias_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, &buf, &buf, 0, 4)
-            .unwrap_err();
+        let err = vit_std_bias_scale_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &buf,
+            &buf,
+            &buf,
+            0,
+            4,
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
     }
 
@@ -5888,12 +6253,23 @@ mod tests {
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, n as u32, scalar)
-            .expect("scale");
+        vit_scale_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &buf,
+            n as u32,
+            scalar,
+        )
+        .expect("scale");
         session.finish().expect("finish");
         let got = readback_f32(&buf, n);
 
-        let max_diff = got.iter().zip(expected.iter()).map(|(g, e)| (g - e).abs()).fold(0f32, f32::max);
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
         assert!(max_diff < 1e-6, "scale GPU max_diff = {max_diff}");
     }
 
@@ -5909,8 +6285,15 @@ mod tests {
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, n as u32, 1.0)
-            .expect("scale");
+        vit_scale_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &buf,
+            n as u32,
+            1.0,
+        )
+        .expect("scale");
         session.finish().expect("finish");
         let got = readback_f32(&buf, n);
         for (g, c) in got.iter().zip(cpu_in.iter()) {
@@ -5923,13 +6306,16 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
-        let buf = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
+        let buf = executor
+            .device()
+            .alloc_buffer(16, DType::F32, vec![4])
+            .expect("a");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        let err = vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, 0, 1.0)
-            .unwrap_err();
+        let err =
+            vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, 0, 1.0).unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
     }
 
@@ -5947,8 +6333,7 @@ mod tests {
         let gguf = GgufFile::open(path).expect("open");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
         let weights =
-            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
-                .expect("w");
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev")).expect("w");
         let t0 = std::time::Instant::now();
         warmup_vit_gpu(&weights, &cfg).expect("warmup");
         eprintln!("warmup_vit_gpu (cold): {:?}", t0.elapsed());
@@ -5974,8 +6359,7 @@ mod tests {
         let gguf = GgufFile::open(path).expect("open");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
         let weights =
-            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
-                .expect("w");
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev")).expect("w");
 
         let img = cfg.image_size as usize;
         let make_image = |seed: u32| -> PreprocessedImage {
@@ -5983,11 +6367,10 @@ mod tests {
             for c in 0..3 {
                 for y in 0..img {
                     for x in 0..img {
-                        pixels[c * img * img + y * img + x] =
-                            ((c + 1) as f32) * 0.05
-                                + (y as f32) * 0.001
-                                + (x as f32) * 0.001
-                                + (seed as f32) * 0.0001;
+                        pixels[c * img * img + y * img + x] = ((c + 1) as f32) * 0.05
+                            + (y as f32) * 0.001
+                            + (x as f32) * 0.001
+                            + (seed as f32) * 0.0001;
                     }
                 }
             }
@@ -6030,7 +6413,10 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         eprintln!("inter-image L2 = {:.4}", l2);
-        assert!(l2 > 1e-2, "two different images produced identical embeddings");
+        assert!(
+            l2 > 1e-2,
+            "two different images produced identical embeddings"
+        );
     }
 
     /// Iter 51d: full GPU ViT forward on real Gemma 4 mmproj.
@@ -6047,8 +6433,7 @@ mod tests {
         let gguf = GgufFile::open(path).expect("open");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
         let weights =
-            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
-                .expect("w");
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev")).expect("w");
         assert_eq!(cfg.num_hidden_layers, 27);
         assert_eq!(cfg.num_patches_side, 14);
 
@@ -6129,7 +6514,10 @@ mod tests {
 
         let max_abs = got.iter().map(|v| v.abs()).fold(0f32, f32::max);
         let mean_abs = got.iter().map(|v| v.abs()).sum::<f32>() / (got.len() as f32);
-        eprintln!("output: max_abs = {:.4}, mean_abs = {:.4}", max_abs, mean_abs);
+        eprintln!(
+            "output: max_abs = {:.4}, mean_abs = {:.4}",
+            max_abs, mean_abs
+        );
     }
 
     /// Iter 51a: 27-block GPU forward on real Gemma 4 mmproj. Tests the
@@ -6152,8 +6540,7 @@ mod tests {
         let gguf = GgufFile::open(path).expect("open");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
         let weights =
-            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
-                .expect("w");
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev")).expect("w");
         assert_eq!(cfg.num_hidden_layers, 27);
 
         let hidden = cfg.hidden_size as usize;
@@ -6208,7 +6595,10 @@ mod tests {
         //    blow up to 1e6 or collapse to 0.
         assert!(max_abs > 1e-3, "max_abs collapsed to ~0: {max_abs}");
         assert!(max_abs < 1e4, "max_abs blew up: {max_abs}");
-        assert!(mean_abs > 1e-4 && mean_abs < 1e3, "mean_abs out of range: {mean_abs}");
+        assert!(
+            mean_abs > 1e-4 && mean_abs < 1e3,
+            "mean_abs out of range: {mean_abs}"
+        );
         // 3. Cross-token diversity preserved. After 27 blocks of mixing,
         //    different input tokens should still produce different outputs.
         let token_0 = &got[0..hidden];
@@ -6219,7 +6609,11 @@ mod tests {
             .map(|(a, b)| (a - b).powi(2))
             .sum::<f32>()
             .sqrt();
-        eprintln!("cross-token L2 (token 0 vs token {}) = {:.4}", batch - 1, l2_diff);
+        eprintln!(
+            "cross-token L2 (token 0 vs token {}) = {:.4}",
+            batch - 1,
+            l2_diff
+        );
         assert!(
             l2_diff > 1e-2,
             "all tokens collapsed to identical output — diversity lost"
@@ -6260,8 +6654,8 @@ mod tests {
         }
         let gguf = GgufFile::open(path).expect("open");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
-        let weights = LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
-            .expect("load");
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev")).expect("load");
 
         let hidden = cfg.hidden_size as usize;
         let head_dim = hidden / cfg.num_attention_heads as usize;
@@ -6327,7 +6721,10 @@ mod tests {
         let frac = (fail_count as f32) / (total as f32);
         eprintln!(
             "block 0 GPU vs CPU: {}/{} = {:.3}% > 5e-2, max_diff = {}",
-            fail_count, total, frac * 100.0, max_diff
+            fail_count,
+            total,
+            frac * 100.0,
+            max_diff
         );
         assert!(
             frac < 0.05,
@@ -6355,12 +6752,10 @@ mod tests {
 
         let q_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).sin() * 0.3).collect();
         let k_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).cos() * 0.3).collect();
-        let v_cpu: Vec<f32> = (0..n)
-            .map(|i| ((i as f32) * 0.11).sin() * 0.4)
-            .collect();
+        let v_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.11).sin() * 0.4).collect();
 
-        let expected = attention_cpu(&q_cpu, &k_cpu, &v_cpu, batch, num_heads, head_dim)
-            .expect("cpu");
+        let expected =
+            attention_cpu(&q_cpu, &k_cpu, &v_cpu, batch, num_heads, head_dim).expect("cpu");
 
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
@@ -6391,7 +6786,9 @@ mod tests {
         let mut max_diff = 0f32;
         for (g, e) in got.iter().zip(expected.iter()) {
             let d = (g - e).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
         }
         eprintln!(
             "head_dim=72 isolated attention: max_diff = {}, expected_sample = {}",
@@ -6410,9 +6807,18 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let q = executor.device().alloc_buffer(2*2*16*4, DType::F32, vec![2,2,16]).expect("q");
-        let k = executor.device().alloc_buffer(2*2*16*4, DType::F32, vec![2,2,16]).expect("k");
-        let v = executor.device().alloc_buffer(2*2*16*4, DType::F32, vec![2,2,16]).expect("v");
+        let q = executor
+            .device()
+            .alloc_buffer(2 * 2 * 16 * 4, DType::F32, vec![2, 2, 16])
+            .expect("q");
+        let k = executor
+            .device()
+            .alloc_buffer(2 * 2 * 16 * 4, DType::F32, vec![2, 2, 16])
+            .expect("k");
+        let v = executor
+            .device()
+            .alloc_buffer(2 * 2 * 16 * 4, DType::F32, vec![2, 2, 16])
+            .expect("v");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         mlx_native::ops::softmax::register(&mut registry);
@@ -6422,8 +6828,13 @@ mod tests {
             session.encoder_mut(),
             &mut registry,
             device,
-            &q, &k, &v,
-            2, 2, 16, 1.0,
+            &q,
+            &k,
+            &v,
+            2,
+            2,
+            16,
+            1.0,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("head_dim"));
@@ -6474,15 +6885,9 @@ mod tests {
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        let err = vit_softmax_last_dim_gpu(
-            session.encoder_mut(),
-            &mut registry,
-            device,
-            &input,
-            0,
-            4,
-        )
-        .unwrap_err();
+        let err =
+            vit_softmax_last_dim_gpu(session.encoder_mut(), &mut registry, device, &input, 0, 4)
+                .unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
     }
 
@@ -6491,8 +6896,14 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let input = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
-        let gain = executor.device().alloc_buffer(8 * 4, DType::F32, vec![8]).expect("b");
+        let input = executor
+            .device()
+            .alloc_buffer(64 * 4, DType::F32, vec![64])
+            .expect("a");
+        let gain = executor
+            .device()
+            .alloc_buffer(8 * 4, DType::F32, vec![8])
+            .expect("b");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
@@ -6522,9 +6933,8 @@ mod tests {
         let buf = device
             .alloc_buffer(bytes, DType::F32, shape)
             .expect("alloc upload u32");
-        let slice: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len())
-        };
+        let slice: &mut [u32] =
+            unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len()) };
         slice.copy_from_slice(data);
         buf
     }
@@ -6591,8 +7001,14 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let p = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
-        let w = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("b");
+        let p = executor
+            .device()
+            .alloc_buffer(64 * 4, DType::F32, vec![64])
+            .expect("a");
+        let w = executor
+            .device()
+            .alloc_buffer(64 * 4, DType::F32, vec![64])
+            .expect("b");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
@@ -6624,14 +7040,9 @@ mod tests {
         let pos_y: Vec<u32> = vec![0, 0, 1, 2, 3, 1];
         let n_patches = pos_x.len() as u32;
 
-        let expect_cpu = gemma4v_pos_embed_cpu(
-            &pos_x,
-            &pos_y,
-            &pe_cpu,
-            pos_size as u32,
-            hidden as u32,
-        )
-        .expect("cpu pos lookup");
+        let expect_cpu =
+            gemma4v_pos_embed_cpu(&pos_x, &pos_y, &pe_cpu, pos_size as u32, hidden as u32)
+                .expect("cpu pos lookup");
 
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
@@ -6674,9 +7085,18 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
-        let pe = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
-        let px = executor.device().alloc_buffer(4 * 4, DType::F32, vec![4]).expect("b");
-        let py = executor.device().alloc_buffer(4 * 4, DType::F32, vec![4]).expect("c");
+        let pe = executor
+            .device()
+            .alloc_buffer(64 * 4, DType::F32, vec![64])
+            .expect("a");
+        let px = executor
+            .device()
+            .alloc_buffer(4 * 4, DType::F32, vec![4])
+            .expect("b");
+        let py = executor
+            .device()
+            .alloc_buffer(4 * 4, DType::F32, vec![4])
+            .expect("c");
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         let device_ref: *const MlxDevice = executor.device() as *const _;
@@ -6705,8 +7125,7 @@ mod tests {
         let hidden = 4usize;
         let pe_cpu: Vec<f32> = vec![
             // X-table:
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-            // Y-table:
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // Y-table:
             10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
         ];
         let pos_x: Vec<u32> = vec![0, 1, 0];
@@ -6715,12 +7134,8 @@ mod tests {
         let patch_embeds_cpu: Vec<f32> = vec![1.0; (n_patches as usize) * hidden];
 
         // Expected: (pe_x + pe_y) row-wise, plus 1 baseline.
-        let pos_emb = gemma4v_pos_embed_cpu(
-            &pos_x, &pos_y, &pe_cpu,
-            pos_size as u32,
-            hidden as u32,
-        )
-        .unwrap();
+        let pos_emb =
+            gemma4v_pos_embed_cpu(&pos_x, &pos_y, &pe_cpu, pos_size as u32, hidden as u32).unwrap();
         let mut expect: Vec<f32> = patch_embeds_cpu.clone();
         for (e, s) in expect.iter_mut().zip(pos_emb.iter()) {
             *e += *s;
@@ -6730,7 +7145,11 @@ mod tests {
         let executor = GraphExecutor::new(device);
         let pe_buf = upload_f32(executor.device(), &pe_cpu, vec![2, pos_size, hidden]);
         let pe_table = pe_buf;
-        let patch_buf = upload_f32(executor.device(), &patch_embeds_cpu, vec![n_patches as usize, hidden]);
+        let patch_buf = upload_f32(
+            executor.device(),
+            &patch_embeds_cpu,
+            vec![n_patches as usize, hidden],
+        );
         let posx_buf = upload_u32(executor.device(), &pos_x, vec![pos_x.len()]);
         let posy_buf = upload_u32(executor.device(), &pos_y, vec![pos_y.len()]);
 
@@ -6767,35 +7186,32 @@ mod tests {
     // gemma4v_block_forward — CPU+GPU parity + dimension + 4-RMSNorm tests
     // -------------------------------------------------------------------
 
-    use crate::inference::vision::vit::{
-        Gemma4VisionBlockShape, Gemma4VisionBlockWeights,
-    };
+    use crate::inference::vision::vit::{Gemma4VisionBlockShape, Gemma4VisionBlockWeights};
 
     /// Synthesize a small gemma4v block fixture: weights + shape +
     /// positions. Sizes are chosen so the BF16 cast inside `vit_linear_gpu`
     /// (`in_features >= 32`) is satisfied for every projection while the
     /// numeric domain stays small enough for f32 parity comparisons.
-    fn synth_gemma4v_block_fixture()
-        -> (
-            Gemma4VisionBlockShape,
-            usize,                  // batch (== num_patches == seq_len)
-            Vec<f32>,               // input_layernorm.weight  [hidden]
-            Vec<f32>,               // post_attention_layernorm [hidden]
-            Vec<f32>,               // pre_feedforward_layernorm [hidden]
-            Vec<f32>,               // post_feedforward_layernorm [hidden]
-            Vec<f32>,               // q_proj [num_heads*head_dim, hidden]
-            Vec<f32>,               // k_proj [num_kv_heads*head_dim, hidden]
-            Vec<f32>,               // v_proj [num_kv_heads*head_dim, hidden]
-            Vec<f32>,               // o_proj [hidden, num_heads*head_dim]
-            Vec<f32>,               // q_norm [head_dim]
-            Vec<f32>,               // k_norm [head_dim]
-            Vec<f32>,               // gate_proj [intermediate, hidden]
-            Vec<f32>,               // up_proj   [intermediate, hidden]
-            Vec<f32>,               // down_proj [hidden, intermediate]
-            Vec<u32>,               // pos_x
-            Vec<u32>,               // pos_y
-            Vec<f32>,               // input [batch, hidden]
-        ) {
+    fn synth_gemma4v_block_fixture() -> (
+        Gemma4VisionBlockShape,
+        usize,    // batch (== num_patches == seq_len)
+        Vec<f32>, // input_layernorm.weight  [hidden]
+        Vec<f32>, // post_attention_layernorm [hidden]
+        Vec<f32>, // pre_feedforward_layernorm [hidden]
+        Vec<f32>, // post_feedforward_layernorm [hidden]
+        Vec<f32>, // q_proj [num_heads*head_dim, hidden]
+        Vec<f32>, // k_proj [num_kv_heads*head_dim, hidden]
+        Vec<f32>, // v_proj [num_kv_heads*head_dim, hidden]
+        Vec<f32>, // o_proj [hidden, num_heads*head_dim]
+        Vec<f32>, // q_norm [head_dim]
+        Vec<f32>, // k_norm [head_dim]
+        Vec<f32>, // gate_proj [intermediate, hidden]
+        Vec<f32>, // up_proj   [intermediate, hidden]
+        Vec<f32>, // down_proj [hidden, intermediate]
+        Vec<u32>, // pos_x
+        Vec<u32>, // pos_y
+        Vec<f32>, // input [batch, hidden]
+    ) {
         // 4 heads × 32 head_dim = hidden 128. KV groups = 2 → num_kv_heads = 2.
         // Intermediate = 64. Batch = 32 patches (matches `vit_attention_gpu`'s
         // tensor-core tile constraint K=batch >= 32 for the scores @ V matmul).
@@ -6817,32 +7233,46 @@ mod tests {
         // Use deterministic small magnitudes so projections stay in a
         // domain where f32 sums don't accumulate large absolute error.
         let mk = |seed: f32, n: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32) * seed + 0.13).sin() * 0.05).collect()
+            (0..n)
+                .map(|i| ((i as f32) * seed + 0.13).sin() * 0.05)
+                .collect()
         };
-        let input_ln    = mk(0.011, hidden);
+        let input_ln = mk(0.011, hidden);
         let post_attn_ln = mk(0.013, hidden);
-        let pre_ff_ln    = mk(0.017, hidden);
-        let post_ff_ln   = mk(0.019, hidden);
-        let q_w  = mk(0.021, num_heads * head_dim * hidden);
-        let k_w  = mk(0.023, num_kv_heads * head_dim * hidden);
-        let v_w  = mk(0.025, num_kv_heads * head_dim * hidden);
-        let o_w  = mk(0.027, hidden * num_heads * head_dim);
-        let q_n  = mk(0.031, head_dim);
-        let k_n  = mk(0.033, head_dim);
-        let g_w  = mk(0.041, intermediate * hidden);
-        let u_w  = mk(0.043, intermediate * hidden);
-        let d_w  = mk(0.045, hidden * intermediate);
+        let pre_ff_ln = mk(0.017, hidden);
+        let post_ff_ln = mk(0.019, hidden);
+        let q_w = mk(0.021, num_heads * head_dim * hidden);
+        let k_w = mk(0.023, num_kv_heads * head_dim * hidden);
+        let v_w = mk(0.025, num_kv_heads * head_dim * hidden);
+        let o_w = mk(0.027, hidden * num_heads * head_dim);
+        let q_n = mk(0.031, head_dim);
+        let k_n = mk(0.033, head_dim);
+        let g_w = mk(0.041, intermediate * hidden);
+        let u_w = mk(0.043, intermediate * hidden);
+        let d_w = mk(0.045, hidden * intermediate);
         let pos_x: Vec<u32> = (0..batch as u32).collect();
         let pos_y: Vec<u32> = (0..batch as u32).rev().collect();
         let input: Vec<f32> = (0..batch * hidden)
             .map(|i| ((i as f32) * 0.07).cos() * 0.04)
             .collect();
         (
-            shape, batch,
-            input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
-            q_w, k_w, v_w, o_w, q_n, k_n,
-            g_w, u_w, d_w,
-            pos_x, pos_y,
+            shape,
+            batch,
+            input_ln,
+            post_attn_ln,
+            pre_ff_ln,
+            post_ff_ln,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            q_n,
+            k_n,
+            g_w,
+            u_w,
+            d_w,
+            pos_x,
+            pos_y,
             input,
         )
     }
@@ -6864,11 +7294,23 @@ mod tests {
         // each of the 4 gain tensors actually influences the output by
         // perturbing one and observing a delta.
         let (
-            shape, batch,
-            input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
-            q_w, k_w, v_w, o_w, q_n, k_n,
-            g_w, u_w, d_w,
-            pos_x, pos_y,
+            shape,
+            batch,
+            input_ln,
+            post_attn_ln,
+            pre_ff_ln,
+            post_ff_ln,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            q_n,
+            k_n,
+            g_w,
+            u_w,
+            d_w,
+            pos_x,
+            pos_y,
             input,
         ) = synth_gemma4v_block_fixture();
 
@@ -6879,12 +7321,21 @@ mod tests {
                 post_attention_layernorm: &post_attn_ln,
                 pre_feedforward_layernorm: &pre_ff_ln,
                 post_feedforward_layernorm: &post_ff_ln,
-                q_proj: &q_w, k_proj: &k_w, v_proj: &v_w, o_proj: &o_w,
-                q_norm: &q_n, k_norm: &k_n,
-                gate_proj: &g_w, up_proj: &u_w, down_proj: &d_w,
+                q_proj: &q_w,
+                k_proj: &k_w,
+                v_proj: &v_w,
+                o_proj: &o_w,
+                q_norm: &q_n,
+                k_norm: &k_n,
+                gate_proj: &g_w,
+                up_proj: &u_w,
+                down_proj: &d_w,
             },
-            &shape, &pos_x, &pos_y,
-        ).expect("baseline");
+            &shape,
+            &pos_x,
+            &pos_y,
+        )
+        .expect("baseline");
         assert_eq!(baseline.len(), batch * shape.hidden as usize);
 
         // Perturb each of the 4 norm-gain tensors INDIVIDUALLY and confirm
@@ -6908,13 +7359,24 @@ mod tests {
                     post_attention_layernorm: &pal,
                     pre_feedforward_layernorm: &pre,
                     post_feedforward_layernorm: &post,
-                    q_proj: &q_w, k_proj: &k_w, v_proj: &v_w, o_proj: &o_w,
-                    q_norm: &q_n, k_norm: &k_n,
-                    gate_proj: &g_w, up_proj: &u_w, down_proj: &d_w,
+                    q_proj: &q_w,
+                    k_proj: &k_w,
+                    v_proj: &v_w,
+                    o_proj: &o_w,
+                    q_norm: &q_n,
+                    k_norm: &k_n,
+                    gate_proj: &g_w,
+                    up_proj: &u_w,
+                    down_proj: &d_w,
                 },
-                &shape, &pos_x, &pos_y,
-            ).expect("perturbed");
-            let max_d = baseline.iter().zip(perturbed_out.iter())
+                &shape,
+                &pos_x,
+                &pos_y,
+            )
+            .expect("perturbed");
+            let max_d = baseline
+                .iter()
+                .zip(perturbed_out.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(
@@ -6966,11 +7428,23 @@ mod tests {
     fn gemma4v_block_forward_cpu_gpu_parity() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let (
-            shape, batch,
-            input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
-            q_w, k_w, v_w, o_w, q_n, k_n,
-            g_w, u_w, d_w,
-            pos_x, pos_y,
+            shape,
+            batch,
+            input_ln,
+            post_attn_ln,
+            pre_ff_ln,
+            post_ff_ln,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            q_n,
+            k_n,
+            g_w,
+            u_w,
+            d_w,
+            pos_x,
+            pos_y,
             input,
         ) = synth_gemma4v_block_fixture();
         let hidden = shape.hidden as usize;
@@ -6985,22 +7459,34 @@ mod tests {
             post_attention_layernorm: &post_attn_ln,
             pre_feedforward_layernorm: &pre_ff_ln,
             post_feedforward_layernorm: &post_ff_ln,
-            q_proj: &q_w, k_proj: &k_w, v_proj: &v_w, o_proj: &o_w,
-            q_norm: &q_n, k_norm: &k_n,
-            gate_proj: &g_w, up_proj: &u_w, down_proj: &d_w,
+            q_proj: &q_w,
+            k_proj: &k_w,
+            v_proj: &v_w,
+            o_proj: &o_w,
+            q_norm: &q_n,
+            k_norm: &k_n,
+            gate_proj: &g_w,
+            up_proj: &u_w,
+            down_proj: &d_w,
         };
-        let cpu_out = gemma4v_block_forward_cpu(
-            input.clone(), &bw_cpu, &shape, &pos_x, &pos_y,
-        ).expect("cpu forward");
+        let cpu_out = gemma4v_block_forward_cpu(input.clone(), &bw_cpu, &shape, &pos_x, &pos_y)
+            .expect("cpu forward");
 
         // ---- GPU forward via synthetic LoadedMmprojWeights ----
         let device = MlxDevice::new().expect("device");
 
         // Build a tensor map under the gemma4v block-suffix names.
-        let mut tensors: std::collections::HashMap<String, MlxBuffer> = std::collections::HashMap::new();
-        let put = |tensors: &mut std::collections::HashMap<String, MlxBuffer>, dev: &MlxDevice, key: String, data: &[f32], shape: Vec<usize>| {
+        let mut tensors: std::collections::HashMap<String, MlxBuffer> =
+            std::collections::HashMap::new();
+        let put = |tensors: &mut std::collections::HashMap<String, MlxBuffer>,
+                   dev: &MlxDevice,
+                   key: String,
+                   data: &[f32],
+                   shape: Vec<usize>| {
             let bytes = data.len() * 4;
-            let buf = dev.alloc_buffer(bytes, DType::F32, shape).expect("alloc tensor");
+            let buf = dev
+                .alloc_buffer(bytes, DType::F32, shape)
+                .expect("alloc tensor");
             let slice: &mut [f32] = unsafe {
                 std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, data.len())
             };
@@ -7017,26 +7503,97 @@ mod tests {
         //   - ln2            = pre-FFN norm          (was: ffn_norm)   (l.90)
         //   - ffn_post_norm  = post-FFN norm         (was: post_ffw)   (l.95)
         //   - attn_out       = attn output projection (was: attn_output) (l.82)
-        put(&mut tensors, &device, block_key("ln1.weight"), &input_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("attn_post_norm.weight"), &post_attn_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("ln2.weight"), &pre_ff_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("ffn_post_norm.weight"), &post_ff_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("attn_q.weight"), &q_w,
-            vec![num_heads * head_dim, hidden]);
-        put(&mut tensors, &device, block_key("attn_k.weight"), &k_w,
-            vec![num_kv_heads * head_dim, hidden]);
-        put(&mut tensors, &device, block_key("attn_v.weight"), &v_w,
-            vec![num_kv_heads * head_dim, hidden]);
-        put(&mut tensors, &device, block_key("attn_out.weight"), &o_w,
-            vec![hidden, num_heads * head_dim]);
-        put(&mut tensors, &device, block_key("attn_q_norm.weight"), &q_n, vec![head_dim]);
-        put(&mut tensors, &device, block_key("attn_k_norm.weight"), &k_n, vec![head_dim]);
-        put(&mut tensors, &device, block_key("ffn_gate.weight"), &g_w,
-            vec![intermediate, hidden]);
-        put(&mut tensors, &device, block_key("ffn_up.weight"), &u_w,
-            vec![intermediate, hidden]);
-        put(&mut tensors, &device, block_key("ffn_down.weight"), &d_w,
-            vec![hidden, intermediate]);
+        put(
+            &mut tensors,
+            &device,
+            block_key("ln1.weight"),
+            &input_ln,
+            vec![hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_post_norm.weight"),
+            &post_attn_ln,
+            vec![hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("ln2.weight"),
+            &pre_ff_ln,
+            vec![hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("ffn_post_norm.weight"),
+            &post_ff_ln,
+            vec![hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_q.weight"),
+            &q_w,
+            vec![num_heads * head_dim, hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_k.weight"),
+            &k_w,
+            vec![num_kv_heads * head_dim, hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_v.weight"),
+            &v_w,
+            vec![num_kv_heads * head_dim, hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_out.weight"),
+            &o_w,
+            vec![hidden, num_heads * head_dim],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_q_norm.weight"),
+            &q_n,
+            vec![head_dim],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("attn_k_norm.weight"),
+            &k_n,
+            vec![head_dim],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("ffn_gate.weight"),
+            &g_w,
+            vec![intermediate, hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("ffn_up.weight"),
+            &u_w,
+            vec![intermediate, hidden],
+        );
+        put(
+            &mut tensors,
+            &device,
+            block_key("ffn_down.weight"),
+            &d_w,
+            vec![hidden, intermediate],
+        );
 
         let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
 
@@ -7046,7 +7603,8 @@ mod tests {
         let in_buf = upload_f32(executor.device(), &input, vec![batch, hidden]);
         // Upload positions as DType::U32 (vision_2d_rope dispatch validates dtype).
         let upload_u32_typed = |dev: &MlxDevice, data: &[u32]| -> MlxBuffer {
-            let buf = dev.alloc_buffer(data.len() * 4, DType::U32, vec![data.len()])
+            let buf = dev
+                .alloc_buffer(data.len() * 4, DType::U32, vec![data.len()])
                 .expect("alloc u32 typed");
             let slice: &mut [u32] = unsafe {
                 std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len())
@@ -7070,16 +7628,27 @@ mod tests {
         let device: &MlxDevice = unsafe { &*device_ref };
 
         let shape_gpu = Gemma4VisionBlockShapeGpu {
-            hidden: shape.hidden, num_heads: shape.num_heads,
-            num_kv_heads: shape.num_kv_heads, head_dim: shape.head_dim,
+            hidden: shape.hidden,
+            num_heads: shape.num_heads,
+            num_kv_heads: shape.num_kv_heads,
+            head_dim: shape.head_dim,
             intermediate: shape.intermediate,
-            rms_norm_eps: shape.rms_norm_eps, rope_theta: shape.rope_theta,
+            rms_norm_eps: shape.rms_norm_eps,
+            rope_theta: shape.rope_theta,
         };
         let out = gemma4v_block_forward_gpu(
-            session.encoder_mut(), &mut registry, device,
-            &weights, &shape_gpu, 0, &in_buf,
-            &px_buf, &py_buf, batch as u32,
-        ).expect("gpu block forward");
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &weights,
+            &shape_gpu,
+            0,
+            &in_buf,
+            &px_buf,
+            &py_buf,
+            batch as u32,
+        )
+        .expect("gpu block forward");
         session.finish().expect("finish");
         let gpu_out = readback_f32(&out, batch * hidden);
 
@@ -7093,7 +7662,9 @@ mod tests {
         let na: f32 = cpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
         let nb: f32 = gpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
         let cos = dot / (na * nb).max(1e-30);
-        let max_abs = cpu_out.iter().zip(gpu_out.iter())
+        let max_abs = cpu_out
+            .iter()
+            .zip(gpu_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         eprintln!(
@@ -7140,7 +7711,7 @@ mod tests {
         let num_kv_heads: u32 = 2;
         let head_dim: u32 = hidden / num_heads; // 32
         let intermediate: u32 = 64;
-        let patch_size: u32 = 4;                 // inner = 4*4*3 = 48 >= 32
+        let patch_size: u32 = 4; // inner = 4*4*3 = 48 >= 32
         let inner: u32 = patch_size * patch_size * 3;
         let num_layers: u32 = 2;
         // text_hidden — projector output; pick any > 0.
@@ -7154,7 +7725,9 @@ mod tests {
         let n_patches = n_x * n_y;
 
         let mk = |seed: f32, n: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32) * seed + 0.13).sin() * 0.05).collect()
+            (0..n)
+                .map(|i| ((i as f32) * seed + 0.13).sin() * 0.05)
+                .collect()
         };
 
         let device = MlxDevice::new().expect("synth dev");
@@ -7267,28 +7840,40 @@ mod tests {
                 &mut tensors,
                 &device,
                 format!("{prefix}attn_q.weight"),
-                &mk(0.031 + layer_idx as f32 * 0.001, (num_heads * head_dim * hidden) as usize),
+                &mk(
+                    0.031 + layer_idx as f32 * 0.001,
+                    (num_heads * head_dim * hidden) as usize,
+                ),
                 vec![(num_heads * head_dim) as usize, hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
                 format!("{prefix}attn_k.weight"),
-                &mk(0.033 + layer_idx as f32 * 0.001, (num_kv_heads * head_dim * hidden) as usize),
+                &mk(
+                    0.033 + layer_idx as f32 * 0.001,
+                    (num_kv_heads * head_dim * hidden) as usize,
+                ),
                 vec![(num_kv_heads * head_dim) as usize, hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
                 format!("{prefix}attn_v.weight"),
-                &mk(0.035 + layer_idx as f32 * 0.001, (num_kv_heads * head_dim * hidden) as usize),
+                &mk(
+                    0.035 + layer_idx as f32 * 0.001,
+                    (num_kv_heads * head_dim * hidden) as usize,
+                ),
                 vec![(num_kv_heads * head_dim) as usize, hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
                 format!("{prefix}attn_out.weight"),
-                &mk(0.037 + layer_idx as f32 * 0.001, (hidden * num_heads * head_dim) as usize),
+                &mk(
+                    0.037 + layer_idx as f32 * 0.001,
+                    (hidden * num_heads * head_dim) as usize,
+                ),
                 vec![hidden as usize, (num_heads * head_dim) as usize],
             );
             put(
@@ -7309,21 +7894,30 @@ mod tests {
                 &mut tensors,
                 &device,
                 format!("{prefix}ffn_gate.weight"),
-                &mk(0.051 + layer_idx as f32 * 0.001, (intermediate * hidden) as usize),
+                &mk(
+                    0.051 + layer_idx as f32 * 0.001,
+                    (intermediate * hidden) as usize,
+                ),
                 vec![intermediate as usize, hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
                 format!("{prefix}ffn_up.weight"),
-                &mk(0.053 + layer_idx as f32 * 0.001, (intermediate * hidden) as usize),
+                &mk(
+                    0.053 + layer_idx as f32 * 0.001,
+                    (intermediate * hidden) as usize,
+                ),
                 vec![intermediate as usize, hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
                 format!("{prefix}ffn_down.weight"),
-                &mk(0.055 + layer_idx as f32 * 0.001, (hidden * intermediate) as usize),
+                &mk(
+                    0.055 + layer_idx as f32 * 0.001,
+                    (hidden * intermediate) as usize,
+                ),
                 vec![hidden as usize, intermediate as usize],
             );
         }
@@ -7580,9 +8174,8 @@ mod tests {
             eprintln!("skip: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
             return;
         }
-        let img_path = Path::new(
-            "/opt/hf2q/tests/fixtures/vision/four_dots_in_corners_128x128.png",
-        );
+        let img_path =
+            Path::new("/opt/hf2q/tests/fixtures/vision/four_dots_in_corners_128x128.png");
         let img_bytes = std::fs::read(img_path).expect("read four-dots fixture");
 
         let pre = crate::inference::vision::preprocess::preprocess_gemma4v(
@@ -7594,8 +8187,7 @@ mod tests {
         let gguf = GgufFile::open(mmproj_path).expect("open mmproj");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
         let device = MlxDevice::new().expect("device");
-        let weights =
-            LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load mmproj");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load mmproj");
 
         let img = Gemma4vPreprocessedImage {
             patches: pre.patches,
@@ -7606,12 +8198,8 @@ mod tests {
             source_label: "four_dots_in_corners_128x128.png".to_string(),
         };
 
-        let out = compute_vision_embeddings_gpu_gemma4v(
-            std::slice::from_ref(&img),
-            &weights,
-            &cfg,
-        )
-        .expect("forward");
+        let out = compute_vision_embeddings_gpu_gemma4v(std::slice::from_ref(&img), &weights, &cfg)
+            .expect("forward");
         assert_eq!(out.len(), 1);
         assert!(!out[0].is_empty());
 

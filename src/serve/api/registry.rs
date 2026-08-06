@@ -122,7 +122,9 @@ impl ModelRegistration {
     /// Case-insensitive substring scan over `id_substrings`.
     pub fn matches(&self, model_id: &str) -> bool {
         let lower = model_id.to_ascii_lowercase();
-        self.id_substrings.iter().any(|s| lower.contains(&s.to_ascii_lowercase()))
+        self.id_substrings
+            .iter()
+            .any(|s| lower.contains(&s.to_ascii_lowercase()))
     }
 
     /// Returns `true` if this registration has a usable reasoning span.
@@ -178,12 +180,15 @@ impl ModelRegistration {
         shape: GrammarShape,
     ) -> Result<String, String> {
         match self.family {
-            "gemma4" => gemma4_tool_call_gbnf(fn_name, params_schema, shape)
-                .map_err(|e| e.to_string()),
-            "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema, shape)
-                .map_err(|e| e.to_string()),
-            "deepseek4" => deepseek4_tool_call_gbnf(fn_name, params_schema, shape)
-                .map_err(|e| e.to_string()),
+            "gemma4" => {
+                gemma4_tool_call_gbnf(fn_name, params_schema, shape).map_err(|e| e.to_string())
+            }
+            "qwen35" => {
+                qwen35_tool_call_gbnf(fn_name, params_schema, shape).map_err(|e| e.to_string())
+            }
+            "deepseek4" => {
+                deepseek4_tool_call_gbnf(fn_name, params_schema, shape).map_err(|e| e.to_string())
+            }
             other => Err(format!(
                 "tool_call_gbnf: no per-model grammar emitter for family '{}'",
                 other
@@ -404,13 +409,10 @@ pub const BUILTIN_REGISTRATIONS: &[ModelRegistration] = &[GEMMA4, QWEN35, DEEPSE
 
 /// Dynamic registry, seeded with `BUILTIN_REGISTRATIONS` plus any runtime
 /// additions via `register`.
-static REGISTRY: OnceLock<std::sync::RwLock<Vec<ModelRegistration>>> =
-    OnceLock::new();
+static REGISTRY: OnceLock<std::sync::RwLock<Vec<ModelRegistration>>> = OnceLock::new();
 
 fn reg() -> &'static std::sync::RwLock<Vec<ModelRegistration>> {
-    REGISTRY.get_or_init(|| {
-        std::sync::RwLock::new(BUILTIN_REGISTRATIONS.to_vec())
-    })
+    REGISTRY.get_or_init(|| std::sync::RwLock::new(BUILTIN_REGISTRATIONS.to_vec()))
 }
 
 /// Find a registration matching `model_id`, or `None` if no family matches.
@@ -486,10 +488,7 @@ impl ReasoningSplitter {
     /// close marker into `content`. A redundant model-emitted open
     /// marker while seeded open is reasoning TEXT (today's nested-open
     /// behavior), not swallowed.
-    pub fn from_registration_forced(
-        reg: &ModelRegistration,
-        forced_open: bool,
-    ) -> Option<Self> {
+    pub fn from_registration_forced(reg: &ModelRegistration, forced_open: bool) -> Option<Self> {
         let (open, close) = match (reg.reasoning_open, reg.reasoning_close) {
             (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => (o, c),
             _ => return None,
@@ -677,9 +676,12 @@ fn family_resync_markers(open_marker: &str) -> &'static [&'static str] {
     match open_marker {
         "<|tool_call>" => &[
             // Gemma 4 family.
-            "<|tool_response>", "<tool_response|>",
-            "<|channel>", "<channel|>",
-            "<|turn>", "<turn|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|channel>",
+            "<channel|>",
+            "<|turn>",
+            "<turn|>",
         ],
         "<tool_call>" => &[
             // Qwen 3.5/3.6 family.
@@ -775,7 +777,10 @@ impl ToolCallSplitter {
             // synthesizes a ToolCallClose). Without this, a `<tool_call|>`
             // following an aborted call would bleed into Content.
             #[derive(Clone, Copy)]
-            enum Hit { StateFlip(&'static str), Swallow(&'static str) }
+            enum Hit {
+                StateFlip(&'static str),
+                Swallow(&'static str),
+            }
             let hit: Option<(usize, Hit)> = if self.in_tool_call {
                 let mut best: Option<(usize, Hit)> = scan[scan_cursor..]
                     .find(self.close_marker)
@@ -919,17 +924,26 @@ pub struct ParsedToolCall {
 /// these tokens into `delta.content`.
 const ALL_FAMILY_LEAK_MARKERS: &[&str] = &[
     // Gemma 4 reasoning + tool + turn
-    "<|channel>", "<channel|>",
-    "<|tool_call>", "<tool_call|>",
-    "<|tool_response>", "<tool_response|>",
-    "<|turn>", "<turn|>",
+    "<|channel>",
+    "<channel|>",
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|tool_response>",
+    "<tool_response|>",
+    "<|turn>",
+    "<turn|>",
     // Qwen 3.5 / 3.6 reasoning + tool
-    "<think>", "</think>",
-    "<tool_call>", "</tool_call>",
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "</tool_call>",
     // DeepSeek-V4 DSML tool block + inner records
-    "<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>",
-    "<｜DSML｜invoke", "</｜DSML｜invoke>",
-    "<｜DSML｜parameter", "</｜DSML｜parameter>",
+    "<｜DSML｜tool_calls>",
+    "</｜DSML｜tool_calls>",
+    "<｜DSML｜invoke",
+    "</｜DSML｜invoke>",
+    "<｜DSML｜parameter",
+    "</｜DSML｜parameter>",
 ];
 
 /// Scrub all registered family special-token markers from `body` so they
@@ -977,7 +991,9 @@ pub fn scrub_special_tokens(body: &str) -> String {
 /// an unparseable tool-call body.
 pub fn is_valid_tool_name(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Parse a tool-call body emitted between the open/close markers.
@@ -1000,10 +1016,7 @@ pub fn parse_tool_call_body(reg: &ModelRegistration, body: &str) -> Option<Parse
 /// Parse all function calls represented by one registered outer tool block.
 /// Gemma/Qwen marker pairs each contain one call; DeepSeek DSML deliberately
 /// permits multiple invokes inside a single pair.
-pub fn parse_tool_call_bodies(
-    reg: &ModelRegistration,
-    body: &str,
-) -> Option<Vec<ParsedToolCall>> {
+pub fn parse_tool_call_bodies(reg: &ModelRegistration, body: &str) -> Option<Vec<ParsedToolCall>> {
     match reg.family {
         "gemma4" => parse_gemma4_tool_call(body).map(|call| vec![call]),
         "qwen35" => parse_qwen35_tool_call(body).map(|call| vec![call]),
@@ -1063,8 +1076,7 @@ fn parse_gemma4_tool_call(body: &str) -> Option<ParsedToolCall> {
         }
         args.insert(key, gemma4_value_to_json(v.trim()));
     }
-    let arguments_json = serde_json::to_string(&serde_json::Value::Object(args))
-        .ok()?;
+    let arguments_json = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
     Some(ParsedToolCall {
         name,
         arguments_json,
@@ -1231,14 +1243,20 @@ fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
     let mut args = serde_json::Map::new();
     let mut cursor = 0usize;
     while cursor < inner.len() {
-        let Some(rel_open) = inner[cursor..].find("<parameter=") else { break };
+        let Some(rel_open) = inner[cursor..].find("<parameter=") else {
+            break;
+        };
         let p_open = cursor + rel_open;
         let key_start = p_open + "<parameter=".len();
-        let Some(rel_gt) = inner[key_start..].find('>') else { break };
+        let Some(rel_gt) = inner[key_start..].find('>') else {
+            break;
+        };
         let key_end = key_start + rel_gt;
         let key = inner[key_start..key_end].trim().to_string();
         let val_start = key_end + 1;
-        let Some(rel_close) = inner[val_start..].find("</parameter>") else { break };
+        let Some(rel_close) = inner[val_start..].find("</parameter>") else {
+            break;
+        };
         let val_end = val_start + rel_close;
         let val_raw = inner[val_start..val_end].trim();
         // Try JSON-literal parse first (for numbers/booleans/objects);
@@ -1296,17 +1314,12 @@ pub fn prompt_seeds_reasoning_open(rendered: &str, reg: &ModelRegistration) -> b
         // Both sides trimmed: markers may carry a trailing newline
         // (Gemma's `<|channel>thought\n`), which `trim_end()` on the
         // prompt side would otherwise make unmatchable.
-        Some(open) if !open.trim_end().is_empty() => {
-            rendered.trim_end().ends_with(open.trim_end())
-        }
+        Some(open) if !open.trim_end().is_empty() => rendered.trim_end().ends_with(open.trim_end()),
         _ => false,
     }
 }
 
-pub fn split_full_output(
-    reg: &ModelRegistration,
-    full_text: &str,
-) -> (String, Option<String>) {
+pub fn split_full_output(reg: &ModelRegistration, full_text: &str) -> (String, Option<String>) {
     split_full_output_forced(reg, full_text, false)
 }
 
@@ -1338,7 +1351,14 @@ pub fn split_full_output_forced(
             SplitSlot::Reasoning => reasoning.push_str(&frag),
         }
     }
-    (content, if reasoning.is_empty() { None } else { Some(reasoning) })
+    (
+        content,
+        if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,10 +1402,7 @@ pub fn split_full_output_forced(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitterError {
     /// `required` array length exceeds `MAX_REQUIRED_KEYS` (8).
-    TooManyRequiredKeys {
-        fn_name: String,
-        count: usize,
-    },
+    TooManyRequiredKeys { fn_name: String, count: usize },
     /// Nested schema feature the iter-231b recursive compiler cannot
     /// enforce — see variant docs above.
     UnsupportedSchemaFeature {
@@ -1505,7 +1522,14 @@ fn gemma4_value_gbnf(
         let alts: Vec<String> = values
             .iter()
             .filter_map(|v| v.as_str())
-            .map(|s| format!("{} {} {}", gbnf_literal("<|\"|>"), gbnf_literal(s), gbnf_literal("<|\"|>")))
+            .map(|s| {
+                format!(
+                    "{} {} {}",
+                    gbnf_literal("<|\"|>"),
+                    gbnf_literal(s),
+                    gbnf_literal("<|\"|>")
+                )
+            })
             .collect();
         if !alts.is_empty() {
             return Ok(format!("( {} )", alts.join(" | ")));
@@ -1567,8 +1591,7 @@ fn gemma4_value_gbnf(
 /// Top-level value body for untyped / unknown-typed Gemma parameters:
 /// the template's `format_argument` renders strings (`<|"|>…<|"|>`),
 /// bare scalars, AND structured kv-list values, so all are accepted.
-const GEMMA4_TOP_ANY_VAL: &str =
-    "( gemma4-any-val | gemma4-json-obj | gemma4-json-arr )";
+const GEMMA4_TOP_ANY_VAL: &str = "( gemma4-any-val | gemma4-json-obj | gemma4-json-arr )";
 
 /// iter-231b — recursive nested-schema compiler for Gemma 4 tool
 /// parameters (`format_argument` kv surface: strings `<|"|>…<|"|>`, bare
@@ -1777,8 +1800,10 @@ fn gemma4_nested_object(
     depth: usize,
 ) -> Result<String, EmitterError> {
     let properties = obj.get("properties").and_then(|p| p.as_object());
-    let additional_closed =
-        matches!(obj.get("additionalProperties"), Some(serde_json::Value::Bool(false)));
+    let additional_closed = matches!(
+        obj.get("additionalProperties"),
+        Some(serde_json::Value::Bool(false))
+    );
 
     let props = match properties {
         Some(p) if !p.is_empty() => p,
@@ -1844,15 +1869,8 @@ fn gemma4_nested_object(
         Some(r#"gemma4-json-key ":" gemma4-json-val"#.to_string())
     };
 
-    build_nested_obj_body(
-        "g4n",
-        req_kv,
-        opt_kv,
-        extra_kv,
-        rules,
-        rule_counter,
-    )
-    .map(|inner| format!(r#""{{" {} "}}""#, inner))
+    build_nested_obj_body("g4n", req_kv, opt_kv, extra_kv, rules, rule_counter)
+        .map(|inner| format!(r#""{{" {} "}}""#, inner))
 }
 
 /// iter-231b — nested `array` compiler (Gemma kv surface).
@@ -1875,10 +1893,7 @@ fn gemma4_nested_array(
                 rule_counter,
                 depth + 1,
             )?;
-            Ok(format!(
-                r#""[" ( {0} ("," {0})* )? "]""#,
-                item_rule
-            ))
+            Ok(format!(r#""[" ( {0} ("," {0})* )? "]""#, item_rule))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
             fn_name: fn_name.to_string(),
@@ -1955,16 +1970,14 @@ fn gemma4_tool_call_gbnf(
     ));
     rules.push((
         "gemma4-num-val".to_string(),
-        r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#.to_string(),
+        r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#
+            .to_string(),
     ));
     rules.push((
         "gemma4-bool-val".to_string(),
         r#""true" | "false""#.to_string(),
     ));
-    rules.push((
-        "gemma4-null-val".to_string(),
-        r#""null""#.to_string(),
-    ));
+    rules.push(("gemma4-null-val".to_string(), r#""null""#.to_string()));
     rules.push((
         "gemma4-any-val".to_string(),
         r#"gemma4-str-val | gemma4-num-val | gemma4-bool-val | gemma4-null-val"#.to_string(),
@@ -2054,7 +2067,13 @@ fn gemma4_tool_call_gbnf(
             for key in &sorted_keys {
                 let val_schema = &props[*key];
                 // iter-231a: array/object map to permissive json rules.
-                let val_rule = gemma4_value_gbnf(fn_name, key.as_str(), val_schema, &mut rules, &mut rule_counter)?;
+                let val_rule = gemma4_value_gbnf(
+                    fn_name,
+                    key.as_str(),
+                    val_schema,
+                    &mut rules,
+                    &mut rule_counter,
+                )?;
                 let key_lit = gbnf_literal(key.as_str());
                 let kv_body = format!("{} {} {}", key_lit, gbnf_literal(":"), val_rule);
                 let kv_name = format!("gemma4-kv-{}", sanitize_rule_name_local(key));
@@ -2113,11 +2132,11 @@ fn gemma4_tool_call_gbnf(
             format!("{} {} {} {}", prefix_lit, open_lit, kv_body_rule, close_lit)
         }
     } else {
-        rules.push((
-            "gemma4-any-kv-char".to_string(),
-            r#"[^}]"#.to_string(),
-        ));
-        format!("{} {} gemma4-any-kv-char* {}", prefix_lit, open_lit, close_lit)
+        rules.push(("gemma4-any-kv-char".to_string(), r#"[^}]"#.to_string()));
+        format!(
+            "{} {} gemma4-any-kv-char* {}",
+            prefix_lit, open_lit, close_lit
+        )
     };
 
     // Wave 2.7 W-η + Wave 3.5 HIGH-1: select root rule per `shape`.
@@ -2189,10 +2208,7 @@ fn gemma4_tool_call_gbnf(
                     g4_call_rule.clone(),
                     format!("{} {} {}", open_marker, single_body, close_marker),
                 ));
-                format!(
-                    "{} {} {}*",
-                    single_body, close_marker, g4_call_rule
-                )
+                format!("{} {} {}*", single_body, close_marker, g4_call_rule)
             } else {
                 format!("{} {}", single_body, close_marker)
             }
@@ -2236,7 +2252,11 @@ fn build_gemma4_required_permutation(
         .collect();
     // Truncate the rule name to avoid hitting GBNF parser limits for large
     // key sets; the sorted join is unique enough within a single function.
-    let rule_name = format!("g4req-{}-{}", sanitize_rule_name_local(slug), name_parts.join("-"));
+    let rule_name = format!(
+        "g4req-{}-{}",
+        sanitize_rule_name_local(slug),
+        name_parts.join("-")
+    );
 
     if rules.iter().any(|(n, _)| n == &rule_name) {
         return rule_name;
@@ -2309,26 +2329,21 @@ fn qwen35_tool_call_gbnf(
         // Conservative but correct: template HTML-escapes `<` in string values.
         r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
     ));
-    rules.push((
-        "qwen35-str-val".to_string(),
-        "qwen35-str-char*".to_string(),
-    ));
+    rules.push(("qwen35-str-val".to_string(), "qwen35-str-char*".to_string()));
     rules.push((
         "qwen35-int-val".to_string(),
         r#""-"? ([0] | [1-9] [0-9]{0,15})"#.to_string(),
     ));
     rules.push((
         "qwen35-num-val".to_string(),
-        r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#.to_string(),
+        r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#
+            .to_string(),
     ));
     rules.push((
         "qwen35-bool-val".to_string(),
         r#""true" | "false""#.to_string(),
     ));
-    rules.push((
-        "qwen35-null-val".to_string(),
-        r#""null""#.to_string(),
-    ));
+    rules.push(("qwen35-null-val".to_string(), r#""null""#.to_string()));
     rules.push((
         "qwen35-any-val".to_string(),
         r#"qwen35-str-val | qwen35-num-val | qwen35-bool-val | qwen35-null-val"#.to_string(),
@@ -2442,7 +2457,12 @@ fn qwen35_tool_call_gbnf(
                 //   `{{- '\n</parameter>\n' }}` unconditionally.
                 let block_body = format!(
                     "{} {} {} {} {} {}",
-                    param_open_lit, newline_lit, val_rule, newline_lit, param_close_lit, newline_lit
+                    param_open_lit,
+                    newline_lit,
+                    val_rule,
+                    newline_lit,
+                    param_close_lit,
+                    newline_lit
                 );
                 let block_name = format!("qwen35-param-{}", sanitize_rule_name_local(key));
                 rules.push((block_name.clone(), block_body));
@@ -2462,18 +2482,12 @@ fn qwen35_tool_call_gbnf(
                 let param_item_rule = "qwen35-param-item".to_string();
                 rules.push((param_item_rule.clone(), format!("( {} )", alts)));
                 let param_list_rule = "qwen35-param-list".to_string();
-                rules.push((
-                    param_list_rule.clone(),
-                    format!("{}*", param_item_rule),
-                ));
+                rules.push((param_list_rule.clone(), format!("{}*", param_item_rule)));
                 param_list_rule
             } else {
                 // Case B: required permutation + optional suffix.
-                let req_top = build_qwen35_required_permutation(
-                    fn_name,
-                    &required_block_names,
-                    &mut rules,
-                );
+                let req_top =
+                    build_qwen35_required_permutation(fn_name, &required_block_names, &mut rules);
                 if optional_block_names.is_empty() {
                     req_top
                 } else {
@@ -2547,10 +2561,7 @@ fn qwen35_tool_call_gbnf(
             if parallel {
                 // `call ("\n" call)*` — Qwen separates calls 2+ with literal `\n`
                 // (template's loop "else" branch — see citation above).
-                format!(
-                    "{} ( {} {} )*",
-                    qwen_call_rule, newline_lit, qwen_call_rule
-                )
+                format!("{} ( {} {} )*", qwen_call_rule, newline_lit, qwen_call_rule)
             } else {
                 qwen_call_rule
             }
@@ -2583,10 +2594,7 @@ fn qwen35_tool_call_gbnf(
             } else {
                 // Single call: body + `\n</tool_call>` (close marker
                 // preceded by `\n` per the template emission pattern).
-                format!(
-                    "{} {} {}",
-                    single_body, newline_lit, close_marker
-                )
+                format!("{} {} {}", single_body, newline_lit, close_marker)
             }
         }
     };
@@ -2707,43 +2715,42 @@ fn deepseek4_tool_call_gbnf(
             }
         }
     }
-    let parameter_sequence = if required_parameter_rules.is_empty()
-        && optional_parameter_rules.is_empty()
-    {
-        None
-    } else if required_parameter_rules.is_empty() {
-        let item = "dsml-optional-param".to_string();
-        rules.push((
-            item.clone(),
-            format!("( {} )", optional_parameter_rules.join(" | ")),
-        ));
-        let list = "dsml-param-list".to_string();
-        rules.push((list.clone(), format!("{}*", item)));
-        Some(list)
-    } else {
-        let required = build_dsml_required_permutation(
-            fn_name,
-            &required_parameter_rules,
-            &mut rules,
-        );
-        if optional_parameter_rules.is_empty() {
-            Some(required)
-        } else {
+    let parameter_sequence =
+        if required_parameter_rules.is_empty() && optional_parameter_rules.is_empty() {
+            None
+        } else if required_parameter_rules.is_empty() {
             let item = "dsml-optional-param".to_string();
             rules.push((
                 item.clone(),
                 format!("( {} )", optional_parameter_rules.join(" | ")),
             ));
             let list = "dsml-param-list".to_string();
-            rules.push((list.clone(), format!("{} {}*", required, item)));
+            rules.push((list.clone(), format!("{}*", item)));
             Some(list)
-        }
-    };
+        } else {
+            let required =
+                build_dsml_required_permutation(fn_name, &required_parameter_rules, &mut rules);
+            if optional_parameter_rules.is_empty() {
+                Some(required)
+            } else {
+                let item = "dsml-optional-param".to_string();
+                rules.push((
+                    item.clone(),
+                    format!("( {} )", optional_parameter_rules.join(" | ")),
+                ));
+                let list = "dsml-param-list".to_string();
+                rules.push((list.clone(), format!("{} {}*", required, item)));
+                Some(list)
+            }
+        };
 
     let invoke_open = gbnf_literal(&format!("<｜DSML｜invoke name=\"{}\">", fn_name));
     let invoke_close = gbnf_literal("</｜DSML｜invoke>");
     let invoke = if let Some(parameters) = parameter_sequence {
-        format!("{} {} {} {}", invoke_open, newline, parameters, invoke_close)
+        format!(
+            "{} {} {} {}",
+            invoke_open, newline, parameters, invoke_close
+        )
     } else {
         // The official formatter emits one blank line for an empty argument
         // map: `<invoke>\n\n</invoke>`.
@@ -2951,8 +2958,7 @@ fn qwen35_value_rule(
 /// Top-level value body for untyped / unknown-typed parameters: the
 /// template renders string args RAW and non-string args via `tojson`, so
 /// any scalar (raw) or any structured JSON value is accepted.
-const QWEN35_TOP_ANY_VAL: &str =
-    "( qwen35-any-val | qwen35-json-obj | qwen35-json-arr )";
+const QWEN35_TOP_ANY_VAL: &str = "( qwen35-any-val | qwen35-json-obj | qwen35-json-arr )";
 
 /// iter-231c — compile a JSON Schema `pattern` keyword for the given
 /// string surface via `grammar::regex_gbnf`.  Returns `Ok(None)` when
@@ -3211,8 +3217,10 @@ fn qwen35_nested_object(
     depth: usize,
 ) -> Result<String, EmitterError> {
     let properties = obj.get("properties").and_then(|p| p.as_object());
-    let additional_closed =
-        matches!(obj.get("additionalProperties"), Some(serde_json::Value::Bool(false)));
+    let additional_closed = matches!(
+        obj.get("additionalProperties"),
+        Some(serde_json::Value::Bool(false))
+    );
 
     let props = match properties {
         Some(p) if !p.is_empty() => p,
@@ -3283,15 +3291,8 @@ fn qwen35_nested_object(
         Some(r#"qwen35-json-str ":" qwen35-json-val"#.to_string())
     };
 
-    build_nested_obj_body(
-        "q35n",
-        req_kv,
-        opt_kv,
-        extra_kv,
-        rules,
-        rule_counter,
-    )
-    .map(|inner| format!(r#""{{" {} "}}""#, inner))
+    build_nested_obj_body("q35n", req_kv, opt_kv, extra_kv, rules, rule_counter)
+        .map(|inner| format!(r#""{{" {} "}}""#, inner))
 }
 
 /// iter-231b — nested `array` compiler (Qwen compact-JSON surface).
@@ -3314,10 +3315,7 @@ fn qwen35_nested_array(
                 rule_counter,
                 depth + 1,
             )?;
-            Ok(format!(
-                r#""[" ( {0} ("," {0})* )? "]""#,
-                item_rule
-            ))
+            Ok(format!(r#""[" ( {0} ("," {0})* )? "]""#, item_rule))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
             fn_name: fn_name.to_string(),
@@ -3369,13 +3367,14 @@ fn build_nested_obj_body(
         *rule_counter += 1;
         let item_name = format!("{}-{}-item", prefix, *rule_counter);
         rules.push((item_name.clone(), format!("( {} )", opt_items.join(" | "))));
-        Ok(format!(
-            "( {} ( {} {} )* )?",
-            item_name, comma, item_name
-        ))
+        Ok(format!("( {} ( {} {} )* )?", item_name, comma, item_name))
     } else {
-        let req_top =
-            build_nested_kv_permutation(&format!("{}-{}", prefix, *rule_counter), &req_kv, comma, rules);
+        let req_top = build_nested_kv_permutation(
+            &format!("{}-{}", prefix, *rule_counter),
+            &req_kv,
+            comma,
+            rules,
+        );
         if opt_items.is_empty() {
             Ok(req_top)
         } else {
@@ -3525,7 +3524,10 @@ mod tests {
         let (content, reasoning) =
             split_full_output_forced(&QWEN35, "endless pondering with no close", true);
         assert_eq!(content, "");
-        assert_eq!(reasoning.as_deref(), Some("endless pondering with no close"));
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("endless pondering with no close")
+        );
     }
 
     /// Unseeded (forced_open=false) behavior is byte-identical to the
@@ -3635,14 +3637,8 @@ mod tests {
         // Regression: don't conflate Qwen's `<think>` / `</think>` HF
         // convention with Gemma's asymmetric `<|channel>` / `<channel|>`
         // channel-block convention.
-        assert_ne!(
-            GEMMA4.reasoning_open,
-            QWEN35.reasoning_open
-        );
-        assert_ne!(
-            GEMMA4.reasoning_close,
-            QWEN35.reasoning_close
-        );
+        assert_ne!(GEMMA4.reasoning_open, QWEN35.reasoning_open);
+        assert_ne!(GEMMA4.reasoning_close, QWEN35.reasoning_close);
     }
 
     #[test]
@@ -3738,10 +3734,7 @@ mod tests {
 
     #[test]
     fn splitter_multiple_reasoning_spans() {
-        let out = split(
-            &GEMMA4,
-            "a<|channel>b<channel|>c<|channel>d<channel|>e",
-        );
+        let out = split(&GEMMA4, "a<|channel>b<channel|>c<|channel>d<channel|>e");
         let joined = coalesce(&out);
         assert_eq!(
             joined,
@@ -3770,7 +3763,10 @@ mod tests {
         assert_eq!(
             joined,
             vec![
-                (SplitSlot::Reasoning, "thought\nlet me compute 73 * 47".into()),
+                (
+                    SplitSlot::Reasoning,
+                    "thought\nlet me compute 73 * 47".into()
+                ),
                 (SplitSlot::Content, "The answer is 3431".into()),
             ]
         );
@@ -3950,10 +3946,7 @@ mod tests {
 
     #[test]
     fn tool_call_splitter_single_call_gemma4_markers() {
-        let out = tcfeed(
-            &GEMMA4,
-            "pre <|tool_call>call:f{x:1}<tool_call|> post",
-        );
+        let out = tcfeed(&GEMMA4, "pre <|tool_call>call:f{x:1}<tool_call|> post");
         let joined = tc_coalesce(&out);
         assert_eq!(
             joined,
@@ -4144,9 +4137,7 @@ mod tests {
                 ToolCallEvent::ToolCallText(t),
                 ToolCallEvent::ToolCallClose,
             ) if t == "call:f{x:1}" => {}
-            _ => panic!(
-                "iter-219c: close_marker MUST win over later resync; got: {joined:#?}"
-            ),
+            _ => panic!("iter-219c: close_marker MUST win over later resync; got: {joined:#?}"),
         }
     }
 
@@ -4191,8 +4182,7 @@ mod tests {
         assert_eq!(parsed.name, "get_current_weather");
         // Order is HashMap-iteration → json string canonicalized via
         // serde_json (sorted keys not guaranteed but the SET of fields is).
-        let v: serde_json::Value =
-            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
         assert_eq!(v["location"], "Paris");
     }
 
@@ -4204,21 +4194,16 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(parsed.name, "f");
-        let v: serde_json::Value =
-            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
         assert_eq!(v["location"], "San Francisco");
         assert_eq!(v["unit"], "celsius");
     }
 
     #[test]
     fn parse_gemma4_numeric_and_bool_args() {
-        let parsed = parse_tool_call_body(
-            &GEMMA4,
-            "call:f{count:42,enabled:true,ratio:1.5}",
-        )
-        .expect("parse");
-        let v: serde_json::Value =
-            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        let parsed = parse_tool_call_body(&GEMMA4, "call:f{count:42,enabled:true,ratio:1.5}")
+            .expect("parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
         assert_eq!(v["count"], 42);
         assert_eq!(v["enabled"], true);
         assert_eq!(v["ratio"], 1.5);
@@ -4232,8 +4217,7 @@ mod tests {
             "call:f{addr:<|\"|>1, Main St<|\"|>,city:<|\"|>NYC<|\"|>}",
         )
         .expect("parse");
-        let v: serde_json::Value =
-            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
         assert_eq!(v["addr"], "1, Main St");
         assert_eq!(v["city"], "NYC");
     }
@@ -4263,8 +4247,7 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(parsed.name, "get_current_weather");
-        let v: serde_json::Value =
-            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
         // Qwen recommends `tojson`; bare `Paris` is not valid JSON → string fallback.
         assert_eq!(v["location"], "Paris");
     }
@@ -4276,8 +4259,7 @@ mod tests {
             "<function=set>\n<parameter=count>\n42\n</parameter>\n</function>",
         )
         .expect("parse");
-        let v: serde_json::Value =
-            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
         // 42 IS valid JSON → number.
         assert_eq!(v["count"], 42);
     }
@@ -4323,26 +4305,35 @@ mod tests {
     fn grammar_runtime_for_gbnf(gbnf: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
         let g = crate::serve::api::grammar::parser::parse(gbnf)
             .unwrap_or_else(|e| panic!("parse GBNF:\n{}\nerror: {}", gbnf, e));
-        let rid = g.rule_id("root")
+        let rid = g
+            .rule_id("root")
             .unwrap_or_else(|| panic!("no root rule in GBNF:\n{}", gbnf));
         crate::serve::api::grammar::sampler::GrammarRuntime::new(g, rid)
             .unwrap_or_else(|| panic!("GrammarRuntime::new returned None for GBNF:\n{}", gbnf))
     }
 
-    fn gemma4_runtime(fn_name: &str, schema_json: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+    fn gemma4_runtime(
+        fn_name: &str,
+        schema_json: &str,
+    ) -> crate::serve::api::grammar::sampler::GrammarRuntime {
         // Wave 2.7 W-η: legacy tests use body-only grammars (no markers in the
         // grammar; lazy/auto path).  Tests that exercise the eager
         // marker-wrapped form pass `OneOrMoreCalls{...}` directly via the
         // public emitter API.
         let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
-        let gbnf = GEMMA4.tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
+        let gbnf = GEMMA4
+            .tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
             .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
         grammar_runtime_for_gbnf(&gbnf)
     }
 
-    fn qwen35_runtime(fn_name: &str, schema_json: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+    fn qwen35_runtime(
+        fn_name: &str,
+        schema_json: &str,
+    ) -> crate::serve::api::grammar::sampler::GrammarRuntime {
         let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
-        let gbnf = QWEN35.tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
+        let gbnf = QWEN35
+            .tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
             .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
         grammar_runtime_for_gbnf(&gbnf)
     }
@@ -4489,7 +4480,10 @@ mod tests {
         // `call_:get_weather{...}` — underscore between `call` and `:`.
         let input = b"call_:get_weather{location:<|\"|>SF<|\"|>}";
         let ok = rt.accept_bytes(input);
-        assert!(!(ok && rt.is_accepted()), "malformed prefix accepted (should reject)");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "malformed prefix accepted (should reject)"
+        );
     }
 
     /// A wrong delimiter (parentheses instead of braces) must be rejected.
@@ -4503,7 +4497,10 @@ mod tests {
         // `call:get_weather(SF)` — parentheses instead of braces.
         let input = b"call:get_weather(SF)";
         let ok = rt.accept_bytes(input);
-        assert!(!(ok && rt.is_accepted()), "wrong delimiter accepted (should reject)");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "wrong delimiter accepted (should reject)"
+        );
     }
 
     /// When additionalProperties:false is not explicitly declared in the
@@ -4553,7 +4550,11 @@ mod tests {
         let schema_json = r#"{"type":"object","properties":{"x":{"type":"integer"}}}"#;
         let schema_v: serde_json::Value = serde_json::from_str(schema_json).unwrap();
         let gbnf = GEMMA4
-            .tool_call_gbnf("f", &schema_v, GrammarShape::OneOrMoreCallsBodyOnly { parallel: false })
+            .tool_call_gbnf(
+                "f",
+                &schema_v,
+                GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+            )
             .expect("tool_call_gbnf");
         let mut rt = grammar_runtime_for_gbnf(&gbnf);
         // Accept canonical body + close marker per the lazy-gate contract
@@ -4595,7 +4596,10 @@ mod tests {
             "iter-219b: post-close grammar must reject `<` (start of any \
              special-token leak like <|tool_response>)"
         );
-        assert!(clone_lt.is_dead(), "is_dead must flip on rejected `<` after close");
+        assert!(
+            clone_lt.is_dead(),
+            "is_dead must flip on rejected `<` after close"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4644,9 +4648,13 @@ mod tests {
         }"#;
         let mut rt = qwen35_runtime("get_weather", schema);
         // `[function=get_weather]` — square brackets instead of angle brackets.
-        let input = b"[function=get_weather]\n[parameter=location]\nParis\n[/parameter]\n[/function]";
+        let input =
+            b"[function=get_weather]\n[parameter=location]\nParis\n[/parameter]\n[/function]";
         let ok = rt.accept_bytes(input);
-        assert!(!(ok && rt.is_accepted()), "malformed wrapper accepted (should reject)");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "malformed wrapper accepted (should reject)"
+        );
     }
 
     /// Empty parameter list (no arguments).
@@ -4744,7 +4752,10 @@ mod tests {
         let mut rt = gemma4_runtime("get_weather", schema);
         // city is required; units is optional but we include it too.
         let input = b"call:get_weather{city:<|\"|>Paris<|\"|>,units:<|\"|>metric<|\"|>}";
-        assert!(rt.accept_bytes(input), "required key present should be accepted");
+        assert!(
+            rt.accept_bytes(input),
+            "required key present should be accepted"
+        );
         assert!(rt.is_accepted());
     }
 
@@ -4763,7 +4774,10 @@ mod tests {
         // Only units supplied; city (required) is absent.
         let input = b"call:get_weather{units:<|\"|>metric<|\"|>}";
         let ok = rt.accept_bytes(input);
-        assert!(!(ok && rt.is_accepted()), "missing required key must be rejected");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "missing required key must be rejected"
+        );
     }
 
     /// B1 Gemma4: required key permuted (opposite order) → still accepted.
@@ -4780,7 +4794,10 @@ mod tests {
         let mut rt = gemma4_runtime("add", schema);
         // b before a — permutation grammar must accept both orderings.
         let input = b"call:add{b:2,a:1}";
-        assert!(rt.accept_bytes(input), "permuted required keys must be accepted");
+        assert!(
+            rt.accept_bytes(input),
+            "permuted required keys must be accepted"
+        );
         assert!(rt.is_accepted());
     }
 
@@ -4804,8 +4821,16 @@ mod tests {
         let result = GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "9 required keys must return Err");
         let msg = result.unwrap_err();
-        assert!(msg.contains("9"), "error message should mention count: {}", msg);
-        assert!(msg.contains("8"), "error message should mention cap: {}", msg);
+        assert!(
+            msg.contains("9"),
+            "error message should mention count: {}",
+            msg
+        );
+        assert!(
+            msg.contains("8"),
+            "error message should mention cap: {}",
+            msg
+        );
     }
 
     /// W-ζ HIGH-2: Gemma4 boundary — exactly 8 required keys compiles OK.
@@ -4825,7 +4850,10 @@ mod tests {
             "required": required
         });
         let result = GEMMA4.tool_call_gbnf("tool9", &schema, GrammarShape::SingleBody);
-        assert!(result.is_err(), "9 required keys must return TooManyRequiredKeys");
+        assert!(
+            result.is_err(),
+            "9 required keys must return TooManyRequiredKeys"
+        );
         let msg = result.unwrap_err();
         assert!(msg.contains("9"), "error must mention count 9: {}", msg);
         assert!(msg.contains("8"), "error must mention cap 8: {}", msg);
@@ -4863,7 +4891,10 @@ mod tests {
         }"#;
         let mut rt = qwen35_runtime("get_weather", schema);
         let input = b"<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\nmetric\n</parameter>\n</function>";
-        assert!(rt.accept_bytes(input), "required key present should be accepted");
+        assert!(
+            rt.accept_bytes(input),
+            "required key present should be accepted"
+        );
         assert!(rt.is_accepted());
     }
 
@@ -4882,7 +4913,10 @@ mod tests {
         // Only units supplied; city (required) is absent.
         let input = b"<function=get_weather>\n<parameter=units>\nmetric\n</parameter>\n</function>";
         let ok = rt.accept_bytes(input);
-        assert!(!(ok && rt.is_accepted()), "missing required key must be rejected");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "missing required key must be rejected"
+        );
     }
 
     /// B1 Qwen35: required keys permuted → accept.
@@ -4899,7 +4933,10 @@ mod tests {
         let mut rt = qwen35_runtime("add", schema);
         // b before a.
         let input = b"<function=add>\n<parameter=b>\n2\n</parameter>\n<parameter=a>\n1\n</parameter>\n</function>";
-        assert!(rt.accept_bytes(input), "permuted required keys must be accepted");
+        assert!(
+            rt.accept_bytes(input),
+            "permuted required keys must be accepted"
+        );
         assert!(rt.is_accepted());
     }
 
@@ -4922,8 +4959,16 @@ mod tests {
         let result = QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "9 required keys must return Err");
         let msg = result.unwrap_err();
-        assert!(msg.contains("9"), "error message should mention count: {}", msg);
-        assert!(msg.contains("8"), "error message should mention cap: {}", msg);
+        assert!(
+            msg.contains("9"),
+            "error message should mention count: {}",
+            msg
+        );
+        assert!(
+            msg.contains("8"),
+            "error message should mention cap: {}",
+            msg
+        );
     }
 
     /// W-ζ HIGH-2: Qwen35 boundary — 9 required keys returns TooManyRequiredKeys.
@@ -4942,7 +4987,10 @@ mod tests {
             "required": required
         });
         let result = QWEN35.tool_call_gbnf("qtool9", &schema, GrammarShape::SingleBody);
-        assert!(result.is_err(), "9 required keys must return TooManyRequiredKeys");
+        assert!(
+            result.is_err(),
+            "9 required keys must return TooManyRequiredKeys"
+        );
         let msg = result.unwrap_err();
         assert!(msg.contains("9"), "error must mention count 9: {}", msg);
         assert!(msg.contains("8"), "error must mention cap 8: {}", msg);
@@ -5102,8 +5150,18 @@ mod tests {
                 "enabled": {"type": "boolean"}
             }
         });
-        assert!(GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must compile");
-        assert!(QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must compile");
+        assert!(
+            GEMMA4
+                .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
+                .is_ok(),
+            "scalars must compile"
+        );
+        assert!(
+            QWEN35
+                .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
+                .is_ok(),
+            "scalars must compile"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5191,7 +5249,8 @@ mod tests {
             }
         }"#;
         let mut rt = qwen35_runtime("f", closed);
-        let input = b"<function=f>\n<parameter=cfg>\n{\"a\":1,\"zzz\":2}\n</parameter>\n</function>";
+        let input =
+            b"<function=f>\n<parameter=cfg>\n{\"a\":1,\"zzz\":2}\n</parameter>\n</function>";
         let ok = rt.accept_bytes(input);
         assert!(
             !(ok && rt.is_accepted()),
@@ -5284,7 +5343,10 @@ mod tests {
         // the object is CLOSED — no wildcard tail to rescue it.
         let bad2 = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"limit\":3.5}\n</parameter>\n</function>";
         let ok2 = rt3.accept_bytes(bad2);
-        assert!(!(ok2 && rt3.is_accepted()), "anyOf-mismatched value accepted on closed object");
+        assert!(
+            !(ok2 && rt3.is_accepted()),
+            "anyOf-mismatched value accepted on closed object"
+        );
     }
 
     /// Qwen35 (documented contract): for OPEN objects the wildcard
@@ -5342,7 +5404,11 @@ mod tests {
             .expect_err("$ref must error");
         let msg = err.to_string();
         assert!(msg.contains("$ref"), "error must name the feature: {}", msg);
-        assert!(msg.contains("/cfg/properties/x"), "error must carry the dot-path: {}", msg);
+        assert!(
+            msg.contains("/cfg/properties/x"),
+            "error must carry the dot-path: {}",
+            msg
+        );
     }
 
     /// Qwen35: >8 nested required keys → TooManyRequiredKeys (same SOTA
@@ -5423,13 +5489,19 @@ mod tests {
         // port missing.
         let input = b"call:connect{server:{host:<|\"|>example.com<|\"|>}}";
         let ok = rt.accept_bytes(input);
-        assert!(!(ok && rt.is_accepted()), "missing nested required accepted");
+        assert!(
+            !(ok && rt.is_accepted()),
+            "missing nested required accepted"
+        );
 
         let mut rt2 = gemma4_runtime("connect", schema);
         // integer items against items:string.
         let input2 = b"call:connect{server:{host:<|\"|>h<|\"|>,port:1},tags:[1,2]}";
         let ok2 = rt2.accept_bytes(input2);
-        assert!(!(ok2 && rt2.is_accepted()), "typed array accepted wrong item type");
+        assert!(
+            !(ok2 && rt2.is_accepted()),
+            "typed array accepted wrong item type"
+        );
     }
 
     /// Gemma4 parser (iter-231b): nested structured arguments round-trip
@@ -5496,13 +5568,20 @@ mod tests {
     fn iter231b_untyped_params_accept_structured_values() {
         let schema = r#"{"type": "object", "properties": {"payload": {}}}"#;
         let mut rt = qwen35_runtime("f", schema);
-        let q_input = b"<function=f>\n<parameter=payload>\n{\"k\":[1,2]}\n</parameter>\n</function>";
-        assert!(rt.accept_bytes(q_input), "qwen untyped structured value rejected");
+        let q_input =
+            b"<function=f>\n<parameter=payload>\n{\"k\":[1,2]}\n</parameter>\n</function>";
+        assert!(
+            rt.accept_bytes(q_input),
+            "qwen untyped structured value rejected"
+        );
         assert!(rt.is_accepted());
 
         let mut rt2 = gemma4_runtime("f", schema);
         let g_input = b"call:f{payload:{k:[1,2]}}";
-        assert!(rt2.accept_bytes(g_input), "gemma untyped structured value rejected");
+        assert!(
+            rt2.accept_bytes(g_input),
+            "gemma untyped structured value rejected"
+        );
         assert!(rt2.is_accepted());
     }
 
@@ -5536,12 +5615,18 @@ mod tests {
         let mut rt2 = qwen35_runtime("cli_help", schema);
         let bad = b"<function=cli_help>\n<parameter=argv>\n[\"Bad\"]\n</parameter>\n</function>";
         let ok = rt2.accept_bytes(bad);
-        assert!(!(ok && rt2.is_accepted()), "pattern-violating item accepted");
+        assert!(
+            !(ok && rt2.is_accepted()),
+            "pattern-violating item accepted"
+        );
 
         // "-x" (dash start) also violates it.
         let mut rt3 = qwen35_runtime("cli_help", schema);
         let bad2 = b"<function=cli_help>\n<parameter=argv>\n[\"-x\"]\n</parameter>\n</function>";
-        assert!(!(rt3.accept_bytes(bad2) && rt3.is_accepted()), "dash-start item accepted");
+        assert!(
+            !(rt3.accept_bytes(bad2) && rt3.is_accepted()),
+            "dash-start item accepted"
+        );
     }
 
     /// Quantified + alternation patterns on a nested string (year +
@@ -5561,18 +5646,27 @@ mod tests {
         // applies to the unquoted text.
         let mut rt = qwen35_runtime("f", schema);
         let good = b"<function=f>\n<parameter=year>\n2026\n</parameter>\n<parameter=method>\npost\n</parameter>\n</function>";
-        assert!(rt.accept_bytes(good), "valid quantifier/alternation strings rejected");
+        assert!(
+            rt.accept_bytes(good),
+            "valid quantifier/alternation strings rejected"
+        );
         assert!(rt.is_accepted());
 
         let mut rt2 = qwen35_runtime("f", schema);
         // "202" is 3 digits — violates \d{4}.
         let bad = b"<function=f>\n<parameter=year>\n202\n</parameter>\n</function>";
-        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "3-digit year accepted");
+        assert!(
+            !(rt2.accept_bytes(bad) && rt2.is_accepted()),
+            "3-digit year accepted"
+        );
 
         let mut rt3 = qwen35_runtime("f", schema);
         // "patch" is outside the alternation.
         let bad2 = b"<function=f>\n<parameter=year>\n2026\n</parameter>\n<parameter=method>\npatch\n</parameter>\n</function>";
-        assert!(!(rt3.accept_bytes(bad2) && rt3.is_accepted()), "non-alternation method accepted");
+        assert!(
+            !(rt3.accept_bytes(bad2) && rt3.is_accepted()),
+            "non-alternation method accepted"
+        );
     }
 
     /// Unanchored pattern = JSON Schema "contains" semantics: prefix and
@@ -5592,7 +5686,10 @@ mod tests {
 
         let mut rt2 = qwen35_runtime("f", schema);
         let bad = b"<function=f>\n<parameter=text>\n\"nothing here\"\n</parameter>\n</function>";
-        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "non-containing accepted");
+        assert!(
+            !(rt2.accept_bytes(bad) && rt2.is_accepted()),
+            "non-containing accepted"
+        );
     }
 
     /// Gemma 4: pattern between the `<|"|>` markers.
@@ -5614,7 +5711,10 @@ mod tests {
 
         let mut rt2 = gemma4_runtime("cli_help", schema);
         let bad = b"call:cli_help{argv:[<|\"|>Bad<|\"|>]}";
-        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "pattern-violating item accepted (gemma)");
+        assert!(
+            !(rt2.accept_bytes(bad) && rt2.is_accepted()),
+            "pattern-violating item accepted (gemma)"
+        );
     }
 
     /// Top-level string parameter with `pattern` (raw Qwen surface).
@@ -5628,12 +5728,18 @@ mod tests {
         }"#;
         let mut rt = qwen35_runtime("cli", schema);
         let good = b"<function=cli>\n<parameter=subcommand>\nstatus\n</parameter>\n</function>";
-        assert!(rt.accept_bytes(good), "valid top-level pattern string rejected");
+        assert!(
+            rt.accept_bytes(good),
+            "valid top-level pattern string rejected"
+        );
         assert!(rt.is_accepted());
 
         let mut rt2 = qwen35_runtime("cli", schema);
         let bad = b"<function=cli>\n<parameter=subcommand>\nStatus\n</parameter>\n</function>";
-        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "invalid top-level pattern string accepted");
+        assert!(
+            !(rt2.accept_bytes(bad) && rt2.is_accepted()),
+            "invalid top-level pattern string accepted"
+        );
     }
 
     /// Non-regular regex features (backreference) remain an HONEST error
@@ -5649,7 +5755,11 @@ mod tests {
         let err = QWEN35
             .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
             .expect_err("backreference must error");
-        assert!(err.contains("backreference"), "error names the feature: {}", err);
+        assert!(
+            err.contains("backreference"),
+            "error names the feature: {}",
+            err
+        );
         assert!(err.contains("/x"), "error carries the path: {}", err);
     }
 
@@ -5802,14 +5912,14 @@ mod tests {
         // token_bytes table mirrors what `Engine::token_bytes_table`
         // produces from `Tokenizer::decode(&[id], false)`.
         let token_bytes: Vec<Vec<u8>> = vec![
-            b"<".to_vec(),                  // 0: starts <|tool_call> — survives
-            b"<|tool_call>".to_vec(),       // 1: full open marker     — survives
-            b"hello".to_vec(),              // 2: plain content        — masked
-            b"the".to_vec(),                // 3: plain content        — masked
-            b" ".to_vec(),                  // 4: whitespace           — masked
-            b"\n".to_vec(),                 // 5: newline              — masked
-            b"call:".to_vec(),              // 6: body-prefix          — masked
-            b"".to_vec(),                   // 7: empty / EOS          — exempt by design
+            b"<".to_vec(),            // 0: starts <|tool_call> — survives
+            b"<|tool_call>".to_vec(), // 1: full open marker     — survives
+            b"hello".to_vec(),        // 2: plain content        — masked
+            b"the".to_vec(),          // 3: plain content        — masked
+            b" ".to_vec(),            // 4: whitespace           — masked
+            b"\n".to_vec(),           // 5: newline              — masked
+            b"call:".to_vec(),        // 6: body-prefix          — masked
+            b"".to_vec(),             // 7: empty / EOS          — exempt by design
         ];
         let mut logits = vec![0.0_f32; token_bytes.len()];
         let masked = mask::mask_invalid_tokens(&rt, &token_bytes, &mut logits);
@@ -5817,8 +5927,14 @@ mod tests {
         // Marker-prefix tokens (0, 1) survive; empty token (7) is exempt;
         // everything else (2..=6) is masked to -inf.  That's 5 masked tokens.
         assert_eq!(masked, 5, "expected 5 masked tokens, logits = {:?}", logits);
-        assert!(logits[0].is_finite(), "token 0 (`<`) must survive — prefixes open marker");
-        assert!(logits[1].is_finite(), "token 1 (`<|tool_call>`) must survive — full open marker");
+        assert!(
+            logits[0].is_finite(),
+            "token 0 (`<`) must survive — prefixes open marker"
+        );
+        assert!(
+            logits[1].is_finite(),
+            "token 1 (`<|tool_call>`) must survive — full open marker"
+        );
         assert!(!logits[2].is_finite(), "token 2 (`hello`) must be masked");
         assert!(!logits[3].is_finite(), "token 3 (`the`) must be masked");
         assert!(!logits[4].is_finite(), "token 4 (` `) must be masked");
@@ -5865,9 +5981,17 @@ mod tests {
         ];
         let mut logits = vec![0.0_f32; token_bytes.len()];
         let masked = mask::mask_invalid_tokens(&rt, &token_bytes, &mut logits);
-        assert_eq!(masked, 0, "lazy/awaiting_trigger runtime must mask zero tokens");
+        assert_eq!(
+            masked, 0,
+            "lazy/awaiting_trigger runtime must mask zero tokens"
+        );
         for (i, l) in logits.iter().enumerate() {
-            assert!(l.is_finite(), "token {} masked under awaiting_trigger; logits = {:?}", i, logits);
+            assert!(
+                l.is_finite(),
+                "token {} masked under awaiting_trigger; logits = {:?}",
+                i,
+                logits
+            );
         }
     }
 

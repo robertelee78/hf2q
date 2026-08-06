@@ -175,13 +175,16 @@ impl Eagle3DrafterConfig {
         })?;
         // kv_proj_out() reuse — checked here once so the helper can
         // stay simple at call sites.
-        let _kv_out = self.num_kv_heads.checked_mul(self.head_dim).ok_or_else(|| {
-            anyhow!(
-                "num_kv_heads * head_dim overflows usize (num_kv_heads={}, head_dim={})",
-                self.num_kv_heads,
-                self.head_dim
-            )
-        })?;
+        let _kv_out = self
+            .num_kv_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| {
+                anyhow!(
+                    "num_kv_heads * head_dim overflows usize (num_kv_heads={}, head_dim={})",
+                    self.num_kv_heads,
+                    self.head_dim
+                )
+            })?;
         ensure!(self.vocab_size > 0, "vocab_size must be > 0");
         ensure!(self.draft_vocab_size > 0, "draft_vocab_size must be > 0");
         ensure!(
@@ -190,7 +193,10 @@ impl Eagle3DrafterConfig {
             self.draft_vocab_size,
             self.vocab_size,
         );
-        ensure!(self.target_hidden_size > 0, "target_hidden_size must be > 0");
+        ensure!(
+            self.target_hidden_size > 0,
+            "target_hidden_size must be > 0"
+        );
         ensure!(
             self.num_aux_hidden_states > 0,
             "num_aux_hidden_states must be > 0"
@@ -282,7 +288,9 @@ pub(crate) mod tests {
 
     #[test]
     fn adr_037_e3b_qwen35_default_validates_2026_05_22() {
-        qwen35_default().validate().expect("default should validate");
+        qwen35_default()
+            .validate()
+            .expect("default should validate");
     }
 
     #[test]
@@ -348,7 +356,8 @@ pub(crate) mod tests {
     fn g4_cfa4_norm_before_residual_false_validates_2026_05_22() {
         let mut cfg = qwen35_default();
         cfg.norm_before_residual = false;
-        cfg.validate().expect("norm_before_residual=false must validate");
+        cfg.validate()
+            .expect("norm_before_residual=false must validate");
     }
 
     /// AC-G4-CFA-4.2 — norm_before_residual=true validates (Gemma4/RedHatAI).
@@ -356,7 +365,8 @@ pub(crate) mod tests {
     fn g4_cfa4_norm_before_residual_true_validates_2026_05_22() {
         let mut cfg = qwen35_default();
         cfg.norm_before_residual = true;
-        cfg.validate().expect("norm_before_residual=true must validate");
+        cfg.validate()
+            .expect("norm_before_residual=true must validate");
     }
 
     /// AC-G4-CFA-4.3 — default_gemma4_eagle3_config shape matches RedHatAI schema.
@@ -380,8 +390,8 @@ pub(crate) mod tests {
             hidden_size: 5376,
             intermediate_size: 21504,
             head_dim: 256,
-            num_q_heads: 32,    // 32 * 256 = 8192 = q_proj_out (Llama-style)
-            num_kv_heads: 16,   // 32/16=2 (GQA ratio 2:1, divisible ✓)
+            num_q_heads: 32,  // 32 * 256 = 8192 = q_proj_out (Llama-style)
+            num_kv_heads: 16, // 32/16=2 (GQA ratio 2:1, divisible ✓)
             vocab_size: 262144,
             draft_vocab_size: 32000,
             target_hidden_size: 5376,
@@ -398,10 +408,23 @@ pub(crate) mod tests {
             rope_dim: 256,
             norm_before_residual: true,
         };
-        cfg.validate().expect("Gemma4 RedHatAI config shape must validate");
-        assert_eq!(cfg.fc_input_size(), 5376 * 3, "fc_input_size = 3 aux * 5376");
+        cfg.validate()
+            .expect("Gemma4 RedHatAI config shape must validate");
+        assert_eq!(
+            cfg.fc_input_size(),
+            5376 * 3,
+            "fc_input_size = 3 aux * 5376"
+        );
         assert_eq!(cfg.norm_before_residual, true);
-        assert_eq!(cfg.q_proj_out(), 8192, "q_proj_out = num_q_heads(32) * head_dim(256)");
-        assert_eq!(cfg.kv_proj_out(), 4096, "kv_proj_out = num_kv_heads(16) * head_dim(256)");
+        assert_eq!(
+            cfg.q_proj_out(),
+            8192,
+            "q_proj_out = num_q_heads(32) * head_dim(256)"
+        );
+        assert_eq!(
+            cfg.kv_proj_out(),
+            4096,
+            "kv_proj_out = num_kv_heads(16) * head_dim(256)"
+        );
     }
 }

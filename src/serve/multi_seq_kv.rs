@@ -765,7 +765,11 @@ mod tests {
         cache.append_for_seq(SlotId(0), 5).unwrap();
         cache.fork_seq(SlotId(0), SlotId(2)).unwrap();
         assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 5, "dst must match src");
-        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 5, "src must be unchanged");
+        assert_eq!(
+            cache.seq_len(SlotId(0)).unwrap(),
+            5,
+            "src must be unchanged"
+        );
         // Untouched slot remains zero (per-slot O(1) invariant).
         assert_eq!(cache.seq_len(SlotId(1)).unwrap(), 0);
     }
@@ -992,14 +996,20 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("1024"), "Display missing needed: {s}");
         assert!(s.contains("256"), "Display missing budget: {s}");
-        assert!(s.contains("429"), "Display must reference the 429 mapping: {s}");
+        assert!(
+            s.contains("429"),
+            "Display must reference the 429 mapping: {s}"
+        );
 
         // LayoutNotSupported — names the layout.
         let e = MultiSeqError::LayoutNotSupported {
             layout: MultiSeqLayout::Paged,
         };
         let d = format!("{e:?}");
-        assert!(d.contains("LayoutNotSupported"), "Debug missing variant: {d}");
+        assert!(
+            d.contains("LayoutNotSupported"),
+            "Debug missing variant: {d}"
+        );
         assert!(d.contains("Paged"), "Debug missing layout: {d}");
         let s = format!("{e}");
         assert!(s.contains("Paged"), "Display missing layout: {s}");
@@ -1093,10 +1103,8 @@ mod tests {
         // `Box<dyn MultiSeqKvCache>` so it can swap between the fixture
         // (in tests) and the per-model impls (in production).  Pin
         // here that the trait is object-safe.
-        let mut cache: Box<dyn MultiSeqKvCache> = Box::new(NoopMultiSeqKvCache::new(
-            2,
-            MultiSeqLayout::SeparateSlots,
-        ));
+        let mut cache: Box<dyn MultiSeqKvCache> =
+            Box::new(NoopMultiSeqKvCache::new(2, MultiSeqLayout::SeparateSlots));
         assert_eq!(cache.slot_count(), 2);
         cache.append_for_seq(SlotId(0), 4).unwrap();
         assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 4);

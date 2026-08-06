@@ -285,10 +285,7 @@ impl ConvertOrchestrator {
     /// Per [[feedback-no-loop-suppression-2026-05-17]]: every typed
     /// policy / quantizer error surfaces here, before any GGUF bytes
     /// are emitted. Clean failure mode — no partial files.
-    pub fn plan_tensors(
-        &mut self,
-        entries: Vec<PlanEntry>,
-    ) -> Result<(), OrchestratorError> {
+    pub fn plan_tensors(&mut self, entries: Vec<PlanEntry>) -> Result<(), OrchestratorError> {
         if !self.planned.is_empty() {
             return Err(OrchestratorError::StreamProtocol(format!(
                 "plan_tensors called twice (already planned {} tensors)",
@@ -484,7 +481,10 @@ impl ConvertOrchestrator {
 
         // Every orig_idx in 0..entries.len() appears in canonical_order
         // exactly once (it's a permutation), so every slot is Some.
-        self.planned = planned.into_iter().map(|p| p.expect("permutation covers all indices")).collect();
+        self.planned = planned
+            .into_iter()
+            .map(|p| p.expect("permutation covers all indices"))
+            .collect();
         Ok(())
     }
 
@@ -842,12 +842,15 @@ impl<W: Write + Seek> StreamingWriter<W> {
             }
         };
 
-        let input_f32_bytes = data.len().checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
-            OrchestratorError::StreamProtocol(format!(
-                "stream_tensor_chunk: tensor `{}` input byte count overflow",
-                p.name
-            ))
-        })?;
+        let input_f32_bytes = data
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                OrchestratorError::StreamProtocol(format!(
+                    "stream_tensor_chunk: tensor `{}` input byte count overflow",
+                    p.name
+                ))
+            })?;
         let quantized = !matches!(p.ggml_type, GgmlType::F16 | GgmlType::F32 | GgmlType::I32);
         let f16_roundtrip_f32_bytes = if quantized { input_f32_bytes } else { 0 };
         let quantized_payload_bytes = if quantized { payload.len() } else { 0 };
@@ -1094,7 +1097,7 @@ fn is_f32_keep_tensor(name: &str, n_dims: usize) -> bool {
         || name.contains(".rel_pos")       // (6) llama-quant.cpp:350
         || name.contains(".patch_embd")    // (6) llama-quant.cpp:351
         || name.contains(".patch_merger")  // (6) llama-quant.cpp:352
-        || name == "rope_freqs.weight"     // (7) Gemma 4 synthesized
+        || name == "rope_freqs.weight" // (7) Gemma 4 synthesized
 }
 
 // -----------------------------------------------------------------------------
@@ -1732,11 +1735,8 @@ mod tests {
             n_layer: N_LAYER,
             n_mtp_layers: 0,
         };
-        let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
-            ArchName::Gemma4,
-            hparams,
-        );
+        let mut orch =
+            ConvertOrchestrator::new(LlamaFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("gemma4".into()),
@@ -1777,16 +1777,18 @@ mod tests {
         // promotion on ffn_down. See
         // `docs/adr-033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
         // §8.2 for the bartowski/canonical agreement on this set.
-        let canonical_promoted: std::collections::HashSet<usize> = [
-            0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29,
-        ].into_iter().collect();
+        let canonical_promoted: std::collections::HashSet<usize> =
+            [0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29]
+                .into_iter()
+                .collect();
 
         // Walk planned tensors and assert: for each blk.<i>.ffn_down.weight
         // the picked type is Q6_K iff i ∈ canonical_promoted.
         let mut q6k_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for pt in orch.planned.iter() {
             if pt.name.ends_with(".ffn_down.weight") && pt.name.starts_with("blk.") {
-                let layer: usize = pt.name
+                let layer: usize = pt
+                    .name
                     .strip_prefix("blk.")
                     .and_then(|s| s.split('.').next())
                     .and_then(|s| s.parse().ok())
@@ -1828,11 +1830,8 @@ mod tests {
             n_layer: N_LAYER,
             n_mtp_layers: 0,
         };
-        let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
-            ArchName::Gemma4,
-            hparams,
-        );
+        let mut orch =
+            ConvertOrchestrator::new(LlamaFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("gemma4".into()),
@@ -1866,7 +1865,8 @@ mod tests {
             i < n / 8 || i >= 7 * n / 8 || (i.saturating_sub(n / 8)) % 3 == 2
         }
         for pt in orch.planned.iter() {
-            let layer: u32 = pt.name
+            let layer: u32 = pt
+                .name
                 .strip_prefix("blk.")
                 .and_then(|s| s.split('.').next())
                 .and_then(|s| s.parse().ok())
@@ -2088,7 +2088,9 @@ mod tests {
         // construction (not via `make_dense_imatrix`) because we want
         // imatrix values that are NOT just sum-of-squares of `data`.
         let mut registry = crate::quantize::imatrix::AccumulatorRegistry::new();
-        let acc = registry.register(tensor_name, n_per_row, 1).expect("register");
+        let acc = registry
+            .register(tensor_name, n_per_row, 1)
+            .expect("register");
         // Inject a synthetic heavy-tailed activation pattern.
         let synthetic_row: Vec<f32> = (0..n_per_row)
             .map(|i| {
@@ -2415,9 +2417,9 @@ mod tests {
                 assert_eq!(ipr, imatrix_n_per_row);
                 assert_eq!(mpr, model_n_per_row);
             }
-            other => panic!(
-                "expected OrchestratorError::Imatrix(ApplyShapeMismatch), got {other:?}"
-            ),
+            other => {
+                panic!("expected OrchestratorError::Imatrix(ApplyShapeMismatch), got {other:?}")
+            }
         }
     }
 

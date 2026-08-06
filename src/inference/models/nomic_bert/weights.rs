@@ -209,9 +209,9 @@ impl LoadedNomicBertWeights {
 
         for (name, src) in &tensors {
             // Match `blk.{N}.{suffix}` where suffix ∈ LINEAR_WEIGHT_SUFFIXES.
-            let is_linear = LINEAR_WEIGHT_SUFFIXES.iter().any(|sfx| {
-                name.starts_with("blk.") && name.ends_with(sfx)
-            });
+            let is_linear = LINEAR_WEIGHT_SUFFIXES
+                .iter()
+                .any(|sfx| name.starts_with("blk.") && name.ends_with(sfx));
             if !is_linear {
                 continue;
             }
@@ -286,15 +286,14 @@ impl LoadedNomicBertWeights {
         let mut registry = KernelRegistry::new();
         if let Ok(mut encoder) = device.command_encoder() {
             for (name, src) in &tensors {
-                let is_linear = LINEAR_WEIGHT_SUFFIXES.iter().any(|sfx| {
-                    name.starts_with("blk.") && name.ends_with(sfx)
-                });
+                let is_linear = LINEAR_WEIGHT_SUFFIXES
+                    .iter()
+                    .any(|sfx| name.starts_with("blk.") && name.ends_with(sfx));
                 if !is_linear {
                     continue;
                 }
                 let n_elems = src.element_count();
-                if let Ok(dst) =
-                    device.alloc_buffer(n_elems * 2, DType::BF16, src.shape().to_vec())
+                if let Ok(dst) = device.alloc_buffer(n_elems * 2, DType::BF16, src.shape().to_vec())
                 {
                     if cast(
                         &mut encoder,
@@ -380,12 +379,7 @@ impl LoadedNomicBertWeights {
     pub fn embed_norm_bias(&self) -> Result<&MlxBuffer> {
         self.tensors
             .get(NOMIC_BERT_TENSOR_EMBED_NORM_BIAS)
-            .ok_or_else(|| {
-                anyhow!(
-                    "nomic-bert missing '{}'",
-                    NOMIC_BERT_TENSOR_EMBED_NORM_BIAS
-                )
-            })
+            .ok_or_else(|| anyhow!("nomic-bert missing '{}'", NOMIC_BERT_TENSOR_EMBED_NORM_BIAS))
     }
 
     // -----------------------------------------------------------------------
@@ -413,8 +407,8 @@ impl LoadedNomicBertWeights {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::NomicBertConfig;
     use super::super::super::bert::config::PoolingType;
+    use super::super::config::NomicBertConfig;
     use super::*;
 
     /// Build a synthetic config that drives `validate_tensor_set` and
@@ -562,7 +556,10 @@ mod tests {
         let err = validate_tensor_set(&gguf, &cfg)
             .expect_err("bge must fail nomic-bert validation (no fused QKV)");
         let msg = format!("{err}");
-        assert!(msg.contains("missing"), "error must say 'missing', got: {msg}");
+        assert!(
+            msg.contains("missing"),
+            "error must say 'missing', got: {msg}"
+        );
         assert!(
             msg.contains("attn_qkv.weight") || msg.contains("ffn_gate.weight"),
             "error must name a nomic-only tensor, got: {msg}"

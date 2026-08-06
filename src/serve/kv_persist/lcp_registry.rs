@@ -129,8 +129,8 @@ pub fn gemma_lcp_snapshot_fits_budget(est_bytes: u64) -> bool {
 
 pub fn default_lcp_byte_budget() -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
-    const FLOOR: u64 = GIB;          // 1 GiB minimum
-    const CEILING: u64 = 16 * GIB;  // 16 GiB maximum
+    const FLOOR: u64 = GIB; // 1 GiB minimum
+    const CEILING: u64 = 16 * GIB; // 16 GiB maximum
 
     static LOG_ONCE: Once = Once::new();
 

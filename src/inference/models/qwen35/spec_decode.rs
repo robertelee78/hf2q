@@ -50,13 +50,15 @@ fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> Result<MlxB
     ensure!(
         total % h == 0 && total >= h,
         "nth_hidden_row: hidden buffer element_count {} not a positive multiple of hidden_size {}",
-        total, h
+        total,
+        h
     );
     let seq_len = (total / h) as u64;
     ensure!(
         row < seq_len,
         "nth_hidden_row: row {} out of range (seq_len {})",
-        row, seq_len
+        row,
+        seq_len
     );
     let byte_offset = row * (h as u64) * 4; // F32 = 4 bytes
     Ok(hidden.slice_view(byte_offset, h))
@@ -71,7 +73,11 @@ fn greedy_argmax_slice(logits_row: &[f32]) -> u32 {
         .iter()
         .enumerate()
         .fold((0u32, f32::NEG_INFINITY), |(best_i, best_v), (i, &v)| {
-            if v > best_v { (i as u32, v) } else { (best_i, best_v) }
+            if v > best_v {
+                (i as u32, v)
+            } else {
+                (best_i, best_v)
+            }
         })
         .0
 }
@@ -142,7 +148,10 @@ pub struct SpecSampler {
 impl SpecSampler {
     /// Greedy sampler (no MH; argmax at every accept site). Default.
     pub const fn greedy() -> Self {
-        Self { temperature: 0.0, seed: 0 }
+        Self {
+            temperature: 0.0,
+            seed: 0,
+        }
     }
 
     /// Stochastic sampler with the given temperature + seed.
@@ -291,8 +300,7 @@ impl<'a> SpecDecode<'a> {
         eos_token_ids: Vec<u32>,
         slot_id: SlotId,
     ) -> Result<Self> {
-        Ok(Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?
-            .with_slot_id(slot_id))
+        Ok(Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?.with_slot_id(slot_id))
     }
 
     /// ADR-034 task #91 (2026-05-21) — multi-EOS constructor with sampler.
@@ -306,8 +314,7 @@ impl<'a> SpecDecode<'a> {
         eos_token_ids: Vec<u32>,
         sampler: SpecSampler,
     ) -> Result<Self> {
-        Ok(Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?
-            .with_sampler(sampler))
+        Ok(Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?.with_sampler(sampler))
     }
 
     /// ADR-034 task #91 (2026-05-21) — sampler-aware entry point.
@@ -415,7 +422,11 @@ impl<'a> SpecDecode<'a> {
         while generated.len() < max_new {
             // ADR-028 iter-159: whole-iter timer to find loop overhead.
             let mtp_profile_iter = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
-            let iter_t0 = if mtp_profile_iter { Some(Instant::now()) } else { None };
+            let iter_t0 = if mtp_profile_iter {
+                Some(Instant::now())
+            } else {
+                None
+            };
 
             // ADR-034 task #91 (2026-05-21) — MH stochastic mode requires
             // the per-iter `token_next` to MATCH the previously-preemitted
@@ -424,10 +435,15 @@ impl<'a> SpecDecode<'a> {
             // In greedy mode argmax(logits_t) deterministically reconstructs
             // the preemitted token, so this branch is a no-op for greedy.
             let token_next = if preemitted_argmax {
-                *generated.last().expect("preemitted_argmax implies generated non-empty")
+                *generated
+                    .last()
+                    .expect("preemitted_argmax implies generated non-empty")
             } else if is_mh {
-                let probs = crate::inference::spec_decode::dflash
-                    ::rejection_sampler::softmax_with_temp(&logits_t, sampler_temp);
+                let probs =
+                    crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
+                        &logits_t,
+                        sampler_temp,
+                    );
                 sample_from_probs(&probs, &mut rng)
             } else {
                 greedy_argmax_last_token(&logits_t, vocab)
@@ -500,7 +516,11 @@ impl<'a> SpecDecode<'a> {
                 }
                 let hidden_size_u32 = self.verifier.cfg.hidden_size;
                 let vsz = vocab as usize;
-                let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                let mtp_t0 = if mtp_profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
 
                 // Snapshot pre-iter slot lengths so we can roll back precisely
                 // on partial reject. Verifier full-attn slots start at
@@ -588,7 +608,8 @@ impl<'a> SpecDecode<'a> {
                                     // temp, sample stochastically. Store the
                                     // probability vector so leviathan_accept_prefix
                                     // below has q_v at each draft position.
-                                    let logits_cpu = super::gpu_full_attn::download_f32(&draft_logits)?;
+                                    let logits_cpu =
+                                        super::gpu_full_attn::download_f32(&draft_logits)?;
                                     let probs = crate::inference::spec_decode::dflash
                                         ::rejection_sampler::softmax_with_temp(
                                             &logits_cpu,
@@ -598,12 +619,7 @@ impl<'a> SpecDecode<'a> {
                                     out_probs.push(probs);
                                     t
                                 } else {
-                                    argmax_logits_gpu(
-                                        device,
-                                        registry,
-                                        &draft_logits,
-                                        mtp_vocab,
-                                    )?
+                                    argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)?
                                 };
                                 out.push(tok);
                                 chain_hidden = Some(draft_hidden);
@@ -618,7 +634,11 @@ impl<'a> SpecDecode<'a> {
                 self.stats.proposed += spec_k;
 
                 // Single batched verify of K+1 tokens.
-                let verify_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                let verify_t0 = if mtp_profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let mut verify_input = Vec::with_capacity(spec_k + 1);
                 verify_input.push(token_next);
                 verify_input.extend(drafts.iter().copied());
@@ -718,11 +738,9 @@ impl<'a> SpecDecode<'a> {
                                 Ok(other) => other.parse::<u64>().unwrap_or(0),
                                 _ => 0,
                             };
-                            next_iter_hidden_row =
-                                (spec_k as u64).min(hidden_row_cap);
-                            next_iter_logits = verify_logits
-                                [spec_k * vsz..(spec_k + 1) * vsz]
-                                .to_vec();
+                            next_iter_hidden_row = (spec_k as u64).min(hidden_row_cap);
+                            next_iter_logits =
+                                verify_logits[spec_k * vsz..(spec_k + 1) * vsz].to_vec();
                             if self.is_eos(continuation) {
                                 hit_eos = true;
                             }
@@ -788,8 +806,7 @@ impl<'a> SpecDecode<'a> {
                     // MTP slot also wrote spec_k+1 valid entries via the
                     // catch-up step, so both slots are aligned at
                     // (prior_len + spec_k + 1) with no stale tail.
-                    let bonus_row =
-                        &verify_logits[spec_k * vsz..(spec_k + 1) * vsz];
+                    let bonus_row = &verify_logits[spec_k * vsz..(spec_k + 1) * vsz];
                     let bonus = greedy_argmax_slice(bonus_row);
                     if generated.len() < max_new {
                         generated.push(bonus);
@@ -817,13 +834,12 @@ impl<'a> SpecDecode<'a> {
                     //   "off" or "max": legacy row-spec_k (degenerates on K>=2)
                     //   "1": cap at 1 (intermediate)
                     //   "<N>": cap at <N>
-                    let hidden_row_cap: u64 = match std::env::var(
-                        "HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP",
-                    ).as_deref() {
-                        Ok("off") | Ok("max") => spec_k as u64,
-                        Ok(other) => other.parse::<u64>().unwrap_or(0),
-                        _ => 0,
-                    };
+                    let hidden_row_cap: u64 =
+                        match std::env::var("HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP").as_deref() {
+                            Ok("off") | Ok("max") => spec_k as u64,
+                            Ok(other) => other.parse::<u64>().unwrap_or(0),
+                            _ => 0,
+                        };
                     next_iter_hidden_row = (spec_k as u64).min(hidden_row_cap);
                     next_iter_logits = bonus_row.to_vec();
                     if self.is_eos(bonus) {
@@ -847,16 +863,10 @@ impl<'a> SpecDecode<'a> {
                     // Err on OOR; the .context() turns that into the
                     // existing error-propagation path.
                     self.kv_cache
-                        .truncate_full_attn_to_for_slot(
-                            slot_id,
-                            prior_full_attn_len + valid_count,
-                        )
+                        .truncate_full_attn_to_for_slot(slot_id, prior_full_attn_len + valid_count)
                         .context("K=N partial-reject: truncate_full_attn_to_for_slot")?;
                     self.kv_cache
-                        .truncate_mtp_to_for_slot(
-                            slot_id,
-                            prior_mtp_len + valid_count,
-                        )
+                        .truncate_mtp_to_for_slot(slot_id, prior_mtp_len + valid_count)
                         .context("K=N partial-reject: truncate_mtp_to_for_slot")?;
                     // ADR-034 task #90 Step 4 (2026-05-21) — roll back the
                     // DeltaNet recurrent state via the per-position capture
@@ -879,26 +889,19 @@ impl<'a> SpecDecode<'a> {
                     // note above).  SlotId(0) at n_seqs==1 is
                     // byte-identical to pre-B4d.
                     self.kv_cache
-                        .rollback_la_to(
-                            slot_id,
-                            accepted as u32,
-                        )
+                        .rollback_la_to(slot_id, accepted as u32)
                         .context("K=N partial-reject: rollback_la_to")?;
                 }
 
                 // State update for next iter.
                 hidden_pos = next_pos + accepted as i32;
-                hidden_t = nth_hidden_row(
-                    &verify_hidden,
-                    hidden_size_u32,
-                    next_iter_hidden_row,
-                )
-                .with_context(|| {
-                    format!(
-                        "SpecDecode K={spec_k} accept-walk row {} hidden slice",
-                        next_iter_hidden_row
-                    )
-                })?;
+                hidden_t = nth_hidden_row(&verify_hidden, hidden_size_u32, next_iter_hidden_row)
+                    .with_context(|| {
+                        format!(
+                            "SpecDecode K={spec_k} accept-walk row {} hidden slice",
+                            next_iter_hidden_row
+                        )
+                    })?;
                 logits_t = next_iter_logits;
                 // Both full-accept (bonus emitted) and partial-reject
                 // (corrected emitted) paths just pushed a token at the
@@ -928,7 +931,11 @@ impl<'a> SpecDecode<'a> {
             }
 
             // ---- legacy K=0 / K=1 path (single MTP draft + 1-or-2-token verify) ----
-            let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+            let mtp_t0 = if mtp_profile {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let kv_cache_ref = &mut self.kv_cache;
             let hidden_ref = &hidden_t;
             // ADR-034 task #91 (2026-05-21): MH path needs the FULL draft
@@ -944,9 +951,8 @@ impl<'a> SpecDecode<'a> {
             // closure to avoid borrowing `rng` across the closure boundary.
             let (draft_token_argmax, draft_logits_cpu_opt): (Option<u32>, Option<Vec<f32>>) =
                 self.verifier.with_gpu_cache_mut(|device, registry| {
-                    let embed_next = embed_token_on_device(
-                        token_embd, token_next, cfg.hidden_size, device,
-                    )?;
+                    let embed_next =
+                        embed_token_on_device(token_embd, token_next, cfg.hidden_size, device)?;
                     let draft_logits = mtp
                         .forward_draft(
                             hidden_ref,
@@ -966,17 +972,21 @@ impl<'a> SpecDecode<'a> {
                         Ok::<_, anyhow::Error>((Some(tok), None))
                     }
                 })?;
-            let (proposed, draft_probs_opt): (u32, Option<Vec<f32>>) = if let Some(
-                logits_cpu,
-            ) = draft_logits_cpu_opt
-            {
-                let draft_probs = crate::inference::spec_decode::dflash
-                    ::rejection_sampler::softmax_with_temp(&logits_cpu, sampler_temp);
-                let sampled = sample_from_probs(&draft_probs, &mut rng);
-                (sampled, Some(draft_probs))
-            } else {
-                (draft_token_argmax.expect("argmax token present in greedy mode"), None)
-            };
+            let (proposed, draft_probs_opt): (u32, Option<Vec<f32>>) =
+                if let Some(logits_cpu) = draft_logits_cpu_opt {
+                    let draft_probs =
+                        crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
+                            &logits_cpu,
+                            sampler_temp,
+                        );
+                    let sampled = sample_from_probs(&draft_probs, &mut rng);
+                    (sampled, Some(draft_probs))
+                } else {
+                    (
+                        draft_token_argmax.expect("argmax token present in greedy mode"),
+                        None,
+                    )
+                };
             let mtp_ms = mtp_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
             self.stats.proposed += 1;
 
@@ -1009,7 +1019,11 @@ impl<'a> SpecDecode<'a> {
                 _ => matches!(mtp.ffn_kind(), super::mtp::MtpFfnKind::Dense),
             };
 
-            let verify_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+            let verify_t0 = if mtp_profile {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let hidden_size_u32 = self.verifier.cfg.hidden_size;
             let vsz = vocab as usize;
 
@@ -1019,9 +1033,8 @@ impl<'a> SpecDecode<'a> {
             // the correct token = proposed = verified_at_n1). On reject,
             // forward B is skipped — next iter's verifier writes K[N+1]
             // with the corrected token.
-            let two_calls = k1_batched
-                && std::env::var("HF2Q_SPEC_DECODE_K1_TWO_CALLS")
-                    .as_deref() == Ok("1");
+            let two_calls =
+                k1_batched && std::env::var("HF2Q_SPEC_DECODE_K1_TWO_CALLS").as_deref() == Ok("1");
 
             if two_calls {
                 // ADR-034 task #91 (2026-05-21) codex review #3 —
@@ -1047,17 +1060,16 @@ impl<'a> SpecDecode<'a> {
                         // ADR-040 Phase B4d (2026-05-30) — route
                         // through `self.slot_id` (was hard-coded
                         // SlotId(0) per B4d deferral).
-                        &[token_next], &pos_a, &mut self.kv_cache, slot_id,
+                        &[token_next],
+                        &pos_a,
+                        &mut self.kv_cache,
+                        slot_id,
                     )
-                    .with_context(|| {
-                        format!("K1 TWO_CALLS_PROPER A pos {next_pos}")
-                    })?;
+                    .with_context(|| format!("K1 TWO_CALLS_PROPER A pos {next_pos}"))?;
                 let last_a = last_logits(&logits_a, vocab)?.to_vec();
                 let verified_at_n1 = greedy_argmax_slice(&last_a);
 
-                if std::env::var("HF2Q_SPEC_DECODE_K1_TRACE").as_deref()
-                    == Ok("1")
-                {
+                if std::env::var("HF2Q_SPEC_DECODE_K1_TRACE").as_deref() == Ok("1") {
                     eprintln!(
                         "[K1_TRACE_TC] iter={} pos={} tn={} prop={} v_at_n1={} match={}",
                         self.stats.proposed,
@@ -1079,28 +1091,24 @@ impl<'a> SpecDecode<'a> {
                             // ADR-040 Phase B4d (2026-05-30) — route
                             // through `self.slot_id` (was hard-coded
                             // SlotId(0) per B4d deferral).
-                            &[proposed], &pos_b, &mut self.kv_cache, slot_id,
+                            &[proposed],
+                            &pos_b,
+                            &mut self.kv_cache,
+                            slot_id,
                         )
-                        .with_context(|| {
-                            format!("K1 TWO_CALLS_PROPER B pos {}", next_pos + 1)
-                        })?;
+                        .with_context(|| format!("K1 TWO_CALLS_PROPER B pos {}", next_pos + 1))?;
                     let last_b = last_logits(&logits_b, vocab)?.to_vec();
                     let next_iter_token_next = greedy_argmax_slice(&last_b);
 
-                    let no_amort = std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT")
-                        .as_deref() == Ok("1");
+                    let no_amort =
+                        std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT").as_deref() == Ok("1");
                     generated.push(proposed);
-                    if !no_amort
-                        && generated.len() < max_new
-                        && !self.is_eos(proposed)
-                    {
+                    if !no_amort && generated.len() < max_new && !self.is_eos(proposed) {
                         generated.push(next_iter_token_next);
                     }
                     preemitted_argmax = !no_amort;
                     self.stats.accepted += 1;
-                    if self.is_eos(proposed)
-                        || (!no_amort && self.is_eos(next_iter_token_next))
-                    {
+                    if self.is_eos(proposed) || (!no_amort && self.is_eos(next_iter_token_next)) {
                         break;
                     }
                     if generated.len() >= max_new {
@@ -1147,8 +1155,7 @@ impl<'a> SpecDecode<'a> {
                 let mut hidden_row_1: Option<MlxBuffer> = None;
                 let (verify_logits, verify_hidden) = {
                     let verify_positions_2 = positions_for_range(next_pos, 2);
-                    self
-                        .verifier
+                    self.verifier
                         .forward_gpu_with_hidden(
                             &[token_next, proposed],
                             &verify_positions_2,
@@ -1158,16 +1165,15 @@ impl<'a> SpecDecode<'a> {
                             // SlotId(0) per B4d deferral).
                             slot_id,
                         )
-                        .with_context(|| {
-                            format!("SpecDecode K1 verifier step pos {next_pos}")
-                        })?
+                        .with_context(|| format!("SpecDecode K1 verifier step pos {next_pos}"))?
                 };
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                 ensure!(
                     verify_logits.len() == 2 * vsz,
                     "SpecDecode K1: expected 2*vocab={} logits, got {}",
-                    2 * vsz, verify_logits.len()
+                    2 * vsz,
+                    verify_logits.len()
                 );
                 let logits_row0 = &verify_logits[0..vsz];
                 let logits_row1 = &verify_logits[vsz..2 * vsz];
@@ -1186,10 +1192,13 @@ impl<'a> SpecDecode<'a> {
                     let draft_probs = draft_probs_opt
                         .as_ref()
                         .expect("MH mode must have draft_probs from MTP draft sampling");
-                    let target_probs = crate::inference::spec_decode::dflash
-                        ::rejection_sampler::softmax_with_temp(logits_row0, sampler_temp);
-                    let step = crate::inference::spec_decode::dflash
-                        ::rejection_sampler::leviathan_step(
+                    let target_probs =
+                        crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
+                            logits_row0,
+                            sampler_temp,
+                        );
+                    let step =
+                        crate::inference::spec_decode::dflash::rejection_sampler::leviathan_step(
                             proposed,
                             &target_probs,
                             draft_probs,
@@ -1241,8 +1250,8 @@ impl<'a> SpecDecode<'a> {
                     // STILL wrong with NO_AMORT, the bug is in the 2-token
                     // verifier state propagation. If output is CORRECT
                     // with NO_AMORT, the bug is in the speculative push.
-                    let no_amort = std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT")
-                        .as_deref() == Ok("1");
+                    let no_amort =
+                        std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT").as_deref() == Ok("1");
                     // ADR-034 task #91 — stochastic bonus token in MH mode.
                     let next_iter_token_next = if is_mh {
                         let row1_probs = crate::inference::spec_decode::dflash
@@ -1252,10 +1261,7 @@ impl<'a> SpecDecode<'a> {
                         greedy_argmax_slice(logits_row1)
                     };
                     generated.push(proposed);
-                    if !no_amort
-                        && generated.len() < max_new
-                        && !self.is_eos(proposed)
-                    {
+                    if !no_amort && generated.len() < max_new && !self.is_eos(proposed) {
                         generated.push(next_iter_token_next);
                     }
                     // preemitted=true if we pushed next_iter_token_next.
@@ -1263,9 +1269,7 @@ impl<'a> SpecDecode<'a> {
                     // push token_next at start (= the same N+2 prediction).
                     preemitted_argmax = !no_amort;
                     self.stats.accepted += 1;
-                    if self.is_eos(proposed)
-                        || (!no_amort && self.is_eos(next_iter_token_next))
-                    {
+                    if self.is_eos(proposed) || (!no_amort && self.is_eos(next_iter_token_next)) {
                         break;
                     }
                     if generated.len() >= max_new {
@@ -1322,12 +1326,19 @@ impl<'a> SpecDecode<'a> {
                         // ADR-040 Phase B4d (2026-05-30) — route
                         // through `self.slot_id` (was hard-coded
                         // SlotId(0) per B4d deferral).
-                        &[token_next], &verify_positions, &mut self.kv_cache, slot_id,
+                        &[token_next],
+                        &verify_positions,
+                        &mut self.kv_cache,
+                        slot_id,
                     )
                     .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
-                let post_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                let post_t0 = if mtp_profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 // ADR-034 task #91 Step 3 (2026-05-21) — MH stochastic
                 // acceptance for K=0 path. At temp > 0:
                 //   accept iff u < min(1, p_target(proposed) / q_draft(proposed))
@@ -1338,10 +1349,13 @@ impl<'a> SpecDecode<'a> {
                     let draft_probs = draft_probs_opt
                         .as_ref()
                         .expect("MH mode must have draft_probs from MTP draft sampling");
-                    let target_probs = crate::inference::spec_decode::dflash
-                        ::rejection_sampler::softmax_with_temp(last_verify_logits, sampler_temp);
-                    let step = crate::inference::spec_decode::dflash
-                        ::rejection_sampler::leviathan_step(
+                    let target_probs =
+                        crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
+                            last_verify_logits,
+                            sampler_temp,
+                        );
+                    let step =
+                        crate::inference::spec_decode::dflash::rejection_sampler::leviathan_step(
                             proposed,
                             &target_probs,
                             draft_probs,
@@ -1360,14 +1374,21 @@ impl<'a> SpecDecode<'a> {
                 };
                 let argmax_ms = post_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
-                let slice_t0 = if mtp_profile { Some(Instant::now()) } else { None };
-                hidden_t = last_hidden_row(&verify_hidden, hidden_size_u32)
-                    .with_context(|| {
-                        format!("SpecDecode verify last_hidden_row slice pos {next_pos}")
-                    })?;
+                let slice_t0 = if mtp_profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                hidden_t = last_hidden_row(&verify_hidden, hidden_size_u32).with_context(|| {
+                    format!("SpecDecode verify last_hidden_row slice pos {next_pos}")
+                })?;
                 let slice_ms = slice_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
-                let copy_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                let copy_t0 = if mtp_profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 logits_t = last_logits(&verify_logits, vocab)?.to_vec();
                 let copy_ms = copy_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 hidden_pos = next_pos;
@@ -1376,8 +1397,10 @@ impl<'a> SpecDecode<'a> {
                     let iter_ms = iter_t0
                         .map(|t| t.elapsed().as_secs_f64() * 1000.0)
                         .unwrap_or(0.0);
-                    let summed = mtp_ms.unwrap_or(0.0) + v_ms.unwrap_or(0.0)
-                        + argmax_ms.unwrap_or(0.0) + slice_ms.unwrap_or(0.0)
+                    let summed = mtp_ms.unwrap_or(0.0)
+                        + v_ms.unwrap_or(0.0)
+                        + argmax_ms.unwrap_or(0.0)
+                        + slice_ms.unwrap_or(0.0)
                         + copy_ms.unwrap_or(0.0);
                     eprintln!(
                         "[MTP_PROFILE] iter {}: mtp={:.2} ver={:.2} arg={:.2} sl={:.2} cp={:.2} summed={:.2} ITER={:.2} delta={:.2}",
@@ -1392,8 +1415,8 @@ impl<'a> SpecDecode<'a> {
                 // sourced from MH step at temp>0, falls back to greedy
                 // proposed==verified at temp=0 (byte-identical).
                 let k0_accepted = match mh_accepted_k0 {
-                    Some(b) => b,                     // MH path: accept iff leviathan_step returned Accept
-                    None => proposed == verified,     // greedy: argmax-match
+                    Some(b) => b,                 // MH path: accept iff leviathan_step returned Accept
+                    None => proposed == verified, // greedy: argmax-match
                 };
                 if k0_accepted && generated.len() < max_new {
                     generated.push(verified);
@@ -1433,15 +1456,11 @@ impl<'a> SpecDecode<'a> {
         // time (~4ms). Pick K maximizing the ratio.
         if std::env::var("HF2Q_VERIFIER_NBENCH").as_deref() == Ok("1") {
             let bench_start_pos = hidden_pos + 1;
-            eprintln!(
-                "[VERIFIER_NBENCH] starting bench at pos {bench_start_pos}"
-            );
+            eprintln!("[VERIFIER_NBENCH] starting bench at pos {bench_start_pos}");
             let mut cumulative_pos = bench_start_pos;
             for n in 1..=4usize {
-                let synth_tokens: Vec<u32> =
-                    (0..n).map(|i| (i as u32) % 100).collect();
-                let synth_positions =
-                    positions_for_range(cumulative_pos, n);
+                let synth_tokens: Vec<u32> = (0..n).map(|i| (i as u32) % 100).collect();
+                let synth_positions = positions_for_range(cumulative_pos, n);
                 let t0 = Instant::now();
                 let _ = self
                     .verifier
@@ -1454,11 +1473,8 @@ impl<'a> SpecDecode<'a> {
                         // hard-coded SlotId(0) per B4d deferral).
                         slot_id,
                     )
-                    .with_context(|| {
-                        format!("VerifierN bench N={n}")
-                    })?;
-                let elapsed_ms =
-                    t0.elapsed().as_secs_f64() * 1000.0;
+                    .with_context(|| format!("VerifierN bench N={n}"))?;
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 eprintln!(
                     "[VERIFIER_NBENCH] N={} T_v={:.2}ms per-tok={:.2}ms",
                     n,

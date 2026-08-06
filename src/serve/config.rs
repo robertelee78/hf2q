@@ -69,9 +69,12 @@ impl Gemma4Config {
             .with_context(|| format!("Cannot read {}", path.display()))?;
         let raw: RawConfig = serde_json::from_str(&content)
             .with_context(|| format!("Cannot parse {}", path.display()))?;
-        let tc = raw.text_config.context("Missing text_config in config.json")?;
+        let tc = raw
+            .text_config
+            .context("Missing text_config in config.json")?;
 
-        let layer_types: Vec<LayerType> = tc.layer_types
+        let layer_types: Vec<LayerType> = tc
+            .layer_types
             .unwrap_or_default()
             .iter()
             .map(|s| match s.as_str() {
@@ -84,7 +87,13 @@ impl Gemma4Config {
         let layer_types = if layer_types.is_empty() {
             // Default: every 6th layer is full attention
             (0..num_layers)
-                .map(|i| if (i + 1) % 6 == 0 { LayerType::Full } else { LayerType::Sliding })
+                .map(|i| {
+                    if (i + 1) % 6 == 0 {
+                        LayerType::Full
+                    } else {
+                        LayerType::Sliding
+                    }
+                })
                 .collect()
         } else {
             layer_types
@@ -187,22 +196,18 @@ impl Gemma4Config {
         // `gemma4/forward_gpu.rs` branches on `num_experts > 0`, treating 0
         // as the dense-SwiGLU path). Default the three knobs to 0 when absent
         // — the existing MoE GGUFs continue to populate them explicitly.
-        let num_experts =
-            gguf.metadata_u32("gemma4.expert_count").unwrap_or(0) as usize;
-        let top_k_experts =
-            gguf.metadata_u32("gemma4.expert_used_count").unwrap_or(0) as usize;
-        let moe_inter =
-            gguf.metadata_u32("gemma4.expert_feed_forward_length").unwrap_or(0) as usize;
+        let num_experts = gguf.metadata_u32("gemma4.expert_count").unwrap_or(0) as usize;
+        let top_k_experts = gguf.metadata_u32("gemma4.expert_used_count").unwrap_or(0) as usize;
+        let moe_inter = gguf
+            .metadata_u32("gemma4.expert_feed_forward_length")
+            .unwrap_or(0) as usize;
         let final_softcap = gguf
             .metadata_f32("gemma4.final_logit_softcapping")
             .map(|v| v as f64);
 
         // Per-layer head_count_kv array — same length as block_count.
         let head_count_kv_arr: Vec<u32> = match gguf.metadata("gemma4.attention.head_count_kv") {
-            Some(MetadataValue::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| v.as_u32())
-                .collect(),
+            Some(MetadataValue::Array(arr)) => arr.iter().filter_map(|v| v.as_u32()).collect(),
             Some(other) => anyhow::bail!(
                 "gemma4.attention.head_count_kv has unexpected type {:?}",
                 std::mem::discriminant(other)
@@ -226,9 +231,7 @@ impl Gemma4Config {
                 })
                 .collect(),
             // Fallback: every 6th layer is full (matches `from_config_json`).
-            Some(_) | None => (0..num_layers)
-                .map(|i| (i + 1) % 6 != 0)
-                .collect(),
+            Some(_) | None => (0..num_layers).map(|i| (i + 1) % 6 != 0).collect(),
         };
         anyhow::ensure!(
             pattern.len() == num_layers,
@@ -239,7 +242,13 @@ impl Gemma4Config {
 
         let layer_types: Vec<LayerType> = pattern
             .iter()
-            .map(|&is_sliding| if is_sliding { LayerType::Sliding } else { LayerType::Full })
+            .map(|&is_sliding| {
+                if is_sliding {
+                    LayerType::Sliding
+                } else {
+                    LayerType::Full
+                }
+            })
             .collect();
 
         // Sliding kv-head count = first sliding layer's value (typically all sliding layers share).
@@ -344,12 +353,20 @@ impl Gemma4Config {
 
     /// Head dim for the given layer.
     pub fn head_dim_for_layer(&self, idx: usize) -> usize {
-        if self.is_full_attention(idx) { self.global_head_dim } else { self.head_dim }
+        if self.is_full_attention(idx) {
+            self.global_head_dim
+        } else {
+            self.head_dim
+        }
     }
 
     /// Number of KV heads for the given layer.
     pub fn num_kv_heads_for_layer(&self, idx: usize) -> usize {
-        if self.is_full_attention(idx) { self.num_global_key_value_heads } else { self.num_key_value_heads }
+        if self.is_full_attention(idx) {
+            self.num_global_key_value_heads
+        } else {
+            self.num_key_value_heads
+        }
     }
 }
 
@@ -421,7 +438,10 @@ mod tests {
             "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
         );
         if !gguf_path.exists() {
-            eprintln!("SKIP: {} not present (CI / fresh checkout)", gguf_path.display());
+            eprintln!(
+                "SKIP: {} not present (CI / fresh checkout)",
+                gguf_path.display()
+            );
             return;
         }
         let gguf = GgufFile::open(gguf_path).expect("open gemma4 GGUF");
@@ -435,13 +455,23 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 30, "num_hidden_layers");
         assert_eq!(cfg.num_attention_heads, 16, "num_attention_heads");
         assert_eq!(cfg.num_key_value_heads, 8, "num_key_value_heads (sliding)");
-        assert_eq!(cfg.num_global_key_value_heads, 2, "num_global_key_value_heads");
+        assert_eq!(
+            cfg.num_global_key_value_heads, 2,
+            "num_global_key_value_heads"
+        );
         assert_eq!(cfg.head_dim, 256, "head_dim (sliding)");
         assert_eq!(cfg.global_head_dim, 512, "global_head_dim (full)");
         assert!((cfg.rms_norm_eps - 1e-6).abs() < 1e-9, "rms_norm_eps");
         assert_eq!(cfg.sliding_window, 1024, "sliding_window");
-        assert_eq!(cfg.max_position_embeddings, 262144, "max_position_embeddings");
-        assert_eq!(cfg.final_logit_softcapping, Some(30.0), "final_logit_softcapping");
+        assert_eq!(
+            cfg.max_position_embeddings, 262144,
+            "max_position_embeddings"
+        );
+        assert_eq!(
+            cfg.final_logit_softcapping,
+            Some(30.0),
+            "final_logit_softcapping"
+        );
         assert_eq!(cfg.num_experts, 128, "num_experts");
         // top_k_experts: GGUF `expert_used_count` is the source of truth (2 in this build).
         assert!(

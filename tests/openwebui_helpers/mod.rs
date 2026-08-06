@@ -125,17 +125,17 @@ impl ServerGuard {
         let mut cmd = Command::new(&bin);
         cmd.args([
             "serve",
-            "--model", gguf,
-            "--host", HOST,
-            "--port", &PORT.to_string(),
+            "--model",
+            gguf,
+            "--host",
+            HOST,
+            "--port",
+            &PORT.to_string(),
         ]);
         if let Some(mp) = mmproj {
             cmd.args(["--mmproj", mp]);
         }
-        let child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         Ok(Self(child))
     }
 }
@@ -180,12 +180,15 @@ pub fn wait_for_readyz() {
 pub fn http_get_status(host: &str, port: u16, path: &str) -> std::io::Result<u16> {
     use std::net::TcpStream;
     let mut s = TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().map_err(std::io::Error::other)?,
+        &format!("{host}:{port}")
+            .parse()
+            .map_err(std::io::Error::other)?,
         Duration::from_secs(5),
     )?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )?;
     let mut head = [0u8; 64];
     let n = s.read(&mut head)?;
@@ -412,9 +415,7 @@ pub async fn streaming_chat_extract_reasoning(
                                 }
                                 cap.accumulated_reasoning.push_str(text);
                             }
-                            if let Some(fr) =
-                                v["choices"][0]["finish_reason"].as_str()
-                            {
+                            if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
                                 cap.finish_reason = Some(fr.to_string());
                             }
                         }
@@ -465,7 +466,10 @@ pub async fn streaming_chat(
         // Capture the body so the test failure is actionable rather than
         // just "got 400". The handler returns OpenAI-shaped error bodies
         // (`{"error": {"message": ..., "type": ..., "param": ...}}`).
-        let body_text = resp.text().await.unwrap_or_else(|_| "<unreadable body>".into());
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".into());
         panic!(
             "/v1/chat/completions stream status != 200: {status}; body={body_text}; \
              request body sent={}",
@@ -503,8 +507,7 @@ pub async fn streaming_chat(
 
     while let Some(next) = stream.next().await {
         let bytes = next.expect("SSE bytes_stream chunk error");
-        let s = std::str::from_utf8(&bytes)
-            .expect("SSE chunk not valid UTF-8");
+        let s = std::str::from_utf8(&bytes).expect("SSE chunk not valid UTF-8");
         buf.push_str(s);
         loop {
             // Find end of the next SSE message.
@@ -654,9 +657,8 @@ pub async fn nonstreaming_chat_status_and_body(
         .text()
         .await
         .unwrap_or_else(|_| "<unreadable body>".into());
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| {
-        serde_json::json!({"_unparsed_body": text})
-    });
+    let json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({"_unparsed_body": text}));
     (status, json)
 }
 
@@ -778,7 +780,9 @@ pub fn assert_nonstreaming_invariants(resp: &serde_json::Value) {
         "non-streaming response object field != chat.completion: {resp}"
     );
     assert!(
-        resp["id"].as_str().is_some_and(|s| s.starts_with("chatcmpl-")),
+        resp["id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("chatcmpl-")),
         "non-streaming response id missing or not chatcmpl-prefixed: {resp}"
     );
     let msg = &resp["choices"][0]["message"];
@@ -788,7 +792,9 @@ pub fn assert_nonstreaming_invariants(resp: &serde_json::Value) {
         "non-streaming message.role != assistant: {resp}"
     );
     assert!(
-        msg["content"].as_str().is_some_and(|s| !s.trim().is_empty()),
+        msg["content"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty()),
         "non-streaming message.content empty: {resp}"
     );
     assert!(
@@ -840,10 +846,7 @@ pub fn normalize_chunk_for_replay(s: &str) -> String {
                 for tc in tcs {
                     if let Some(obj) = tc.as_object_mut() {
                         if obj.contains_key("id") && !obj["id"].is_null() {
-                            obj.insert(
-                                "id".into(),
-                                serde_json::json!("<tool-call-id>"),
-                            );
+                            obj.insert("id".into(), serde_json::json!("<tool-call-id>"));
                         }
                     }
                 }

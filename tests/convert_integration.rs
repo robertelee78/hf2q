@@ -183,8 +183,7 @@ fn synthesize_tiny_llama3_no_norms(dir: &Path) {
         .collect();
     let view_refs: Vec<(String, &TensorView<'_>)> =
         views.iter().map(|(n, v)| (n.clone(), v)).collect();
-    let st_bytes =
-        safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
+    let st_bytes = safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
     fs::write(dir.join("model.safetensors"), st_bytes).expect("write safetensors");
 
     let cfg = serde_json::json!({
@@ -329,9 +328,7 @@ fn convert_unsupported_arch_errors_typed() {
         .failure();
     // Exit code 3 = EXIT_INPUT_ERROR per src/main.rs (AppError::Input
     // dispatch in cmd_convert wrapper).
-    assert
-        .code(3)
-        .stderr(predicates::str::contains("mamba"));
+    assert.code(3).stderr(predicates::str::contains("mamba"));
 }
 
 // ----------------------------------------------------------------------------
@@ -456,8 +453,7 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
         .collect();
     let view_refs: Vec<(String, &TensorView<'_>)> =
         views.iter().map(|(n, v)| (n.clone(), v)).collect();
-    let st_bytes =
-        safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
+    let st_bytes = safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
     fs::write(dir.join("model.safetensors"), st_bytes).expect("write safetensors");
 
     // Minimal Qwen3MoE config.json. All required keys per
@@ -545,7 +541,10 @@ fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
     );
 
     // `general.architecture` = "qwen3moe" per qwen35moe::build_metadata.
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
 
     // `general.file_type` = approximate_for_apex(Balanced) = MostlyQ5_K_M = 17.
     // Apex tiers map to the CLOSEST standard ftype for the header byte;
@@ -640,7 +639,10 @@ fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
 
     // Same shape as the apex sibling: 2 globals + 7 per-layer × 2 layers = 16.
     assert_eq!(gguf.tensor_count(), 16, "expected 16 tensors");
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
 
     // file_type = MostlyQ4_K_M = 15.
     assert_eq!(
@@ -714,7 +716,10 @@ fn convert_q5_k_m_tiny_qwen35moe_round_trip() {
     let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
 
     assert_eq!(gguf.tensor_count(), 16, "expected 16 tensors");
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
 
     // file_type = MostlyQ5_K_M = 17.
     assert_eq!(
@@ -783,7 +788,10 @@ fn convert_q6_k_tiny_qwen35moe_round_trip() {
 
     let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
     assert_eq!(gguf.tensor_count(), 16);
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
     // file_type = MostlyQ6_K = 18.
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(18));
 
@@ -845,7 +853,10 @@ fn convert_iq4_nl_tiny_qwen35moe_round_trip() {
 
     let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
     assert_eq!(gguf.tensor_count(), 16);
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
     // file_type = MostlyIQ4_NL = 25.
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(25));
 
@@ -906,7 +917,10 @@ fn convert_q4_0_tiny_qwen35moe_round_trip() {
 
     let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
     assert_eq!(gguf.tensor_count(), 16);
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
     // file_type = MostlyQ4_0 = 2.
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(2));
 
@@ -966,7 +980,10 @@ fn convert_q5_1_tiny_qwen35moe_round_trip() {
 
     let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
     assert_eq!(gguf.tensor_count(), 16);
-    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("qwen3moe")
+    );
     // file_type = MostlyQ5_1 = 9.
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(9));
 
@@ -1129,8 +1146,7 @@ fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
         .collect();
     let view_refs: Vec<(String, &TensorView<'_>)> =
         views.iter().map(|(n, v)| (n.clone(), v)).collect();
-    let st_bytes =
-        safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
+    let st_bytes = safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
     fs::write(dir.join("model.safetensors"), st_bytes).expect("write safetensors");
 
     // Minimal Gemma 4 config matching the real google-gemma-4-26b-a4b-it
@@ -1279,7 +1295,10 @@ fn convert_gemma4_real_arch_round_trip() {
     );
     // RoPE dims: global = global_head_dim = 8; swa = head_dim * 1.0 = 8.
     assert_eq!(gguf.metadata_u32("gemma4.rope.dimension_count"), Some(8));
-    assert_eq!(gguf.metadata_u32("gemma4.rope.dimension_count_swa"), Some(8));
+    assert_eq!(
+        gguf.metadata_u32("gemma4.rope.dimension_count_swa"),
+        Some(8)
+    );
     // head_count_kv stays scalar (no num_global_key_value_heads in fixture).
     assert_eq!(gguf.metadata_u32("gemma4.attention.head_count_kv"), Some(4));
     // feed_forward_length stays scalar (use_double_wide_mlp=false).
@@ -1415,7 +1434,8 @@ fn convert_gemma4_real_arch_round_trip() {
     // 2*moe_ffn, hidden]` orientation, even though the on-disk GGUF
     // bytes encode `[hidden, 2*moe_ffn, n_experts]` innermost-first.
     assert_eq!(
-        exps.shape, vec![4_usize, 64, 32],
+        exps.shape,
+        vec![4_usize, 64, 32],
         "ffn_gate_up_exps shape mismatch — expected reader-orientation \
          [n_experts=4, 2*moe_ffn=64, hidden=32]"
     );
@@ -1636,9 +1656,11 @@ fn parse_time_max_rss(stderr: &str) -> Option<u64> {
         }
     }
     // GNU time -f "%M": prints just an integer KiB on the last stderr line.
-    if let Some(last) = stderr.lines().rev().find(|l| {
-        !l.trim().is_empty() && l.trim().chars().all(|c| c.is_ascii_digit())
-    }) {
+    if let Some(last) = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c.is_ascii_digit()))
+    {
         let kib: u64 = last.trim().parse().ok()?;
         return Some(kib * 1024);
     }

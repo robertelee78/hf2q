@@ -160,7 +160,11 @@ impl fmt::Debug for LazyState {
                 .finish(),
             LazyState::MaterializedShared(bytes) => f
                 .debug_tuple("MaterializedShared")
-                .field(&format_args!("<{} bytes, refcount {}>", bytes.len(), std::sync::Arc::strong_count(bytes)))
+                .field(&format_args!(
+                    "<{} bytes, refcount {}>",
+                    bytes.len(),
+                    std::sync::Arc::strong_count(bytes)
+                ))
                 .finish(),
             LazyState::Pending(_) => f.debug_tuple("Pending").field(&"<closure>").finish(),
         }
@@ -329,8 +333,9 @@ impl LazyTensor {
             LazyState::Pending(_) => {
                 return Err(MaterializeError::Transform {
                     name: self.meta.name.clone(),
-                    reason: "borrowed materialization is only available for already-resident tensors"
-                        .to_string(),
+                    reason:
+                        "borrowed materialization is only available for already-resident tensors"
+                            .to_string(),
                 });
             }
         };
@@ -683,11 +688,7 @@ mod tests {
 
         // Mirror what `clone_tensor_map_to_lazy` does at main.rs:482-500.
         let lazy = LazyTensor::from_arc_bytes(
-            LazyMeta::new(
-                tensor.name.clone(),
-                tensor.shape.clone(),
-                tensor.dtype,
-            ),
+            LazyMeta::new(tensor.name.clone(), tensor.shape.clone(), tensor.dtype),
             Arc::clone(&tensor.data),
         );
 
@@ -806,7 +807,10 @@ mod tests {
                 let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * 2.0;
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
-            Ok(TensorRef { data: std::sync::Arc::new(data), ..t })
+            Ok(TensorRef {
+                data: std::sync::Arc::new(data),
+                ..t
+            })
         });
 
         let lazy = lazy.map(|t| {
@@ -815,7 +819,10 @@ mod tests {
                 let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) + 1.0;
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
-            Ok(TensorRef { data: std::sync::Arc::new(data), ..t })
+            Ok(TensorRef {
+                data: std::sync::Arc::new(data),
+                ..t
+            })
         });
 
         let lazy = lazy.map(|t| {
@@ -824,7 +831,10 @@ mod tests {
                 let v = -f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
-            Ok(TensorRef { data: std::sync::Arc::new(data), ..t })
+            Ok(TensorRef {
+                data: std::sync::Arc::new(data),
+                ..t
+            })
         });
 
         let realised = lazy.materialize().unwrap();
@@ -1136,10 +1146,8 @@ mod tests {
         let pre_count = Arc::strong_count(&arc);
         assert_eq!(pre_count, 1, "test setup: only the test holds the Arc");
 
-        let lazy = LazyTensor::from_arc_bytes(
-            meta("share-test", vec![4], DType::F32),
-            Arc::clone(&arc),
-        );
+        let lazy =
+            LazyTensor::from_arc_bytes(meta("share-test", vec![4], DType::F32), Arc::clone(&arc));
         // After construction: caller's `arc` + lazy's clone = 2.
         assert_eq!(Arc::strong_count(&arc), 2);
 

@@ -172,7 +172,9 @@ impl<'a> PrefillCapture<'a> {
         if end > self.hidden_output.len() {
             return Err(anyhow!(
                 "PrefillCapture::write_layer_slab: write out of bounds (start {}, end {}, buf {})",
-                start, end, self.hidden_output.len()
+                start,
+                end,
+                self.hidden_output.len()
             ));
         }
         self.hidden_output[start..end].copy_from_slice(pf_hidden_data);
@@ -263,8 +265,7 @@ pub fn extract_drafter_concat(
         for t in 0..seq_len {
             let src = (combined_idx * seq_len + t) * hidden_size;
             let dst = (t * drafter_n + drafter_l) * hidden_size;
-            out[dst..dst + hidden_size]
-                .copy_from_slice(&hidden_output[src..src + hidden_size]);
+            out[dst..dst + hidden_size].copy_from_slice(&hidden_output[src..src + hidden_size]);
         }
     }
     Ok(out)
@@ -286,7 +287,8 @@ pub fn extract_final_layer_slab(
         .ok_or_else(|| {
             anyhow!(
                 "extract_final_layer_slab: final_layer_idx {} not in combined capture set {:?}",
-                final_layer_idx, combined_capture_layer_ids
+                final_layer_idx,
+                combined_capture_layer_ids
             )
         })?;
     let start = final_combined_idx * seq_len * hidden_size;
@@ -294,7 +296,8 @@ pub fn extract_final_layer_slab(
     if end > hidden_output.len() {
         return Err(anyhow!(
             "extract_final_layer_slab: end offset {} > buffer len {}",
-            end, hidden_output.len()
+            end,
+            hidden_output.len()
         ));
     }
     Ok(hidden_output[start..end].to_vec())
@@ -366,12 +369,8 @@ impl DFlashCaptureSession {
                 pf_hidden_data.len(), self.seq_len, self.hidden_size, slab_len
             ));
         }
-        let start = PrefillCapture::offset_for(
-            capture_layer_idx,
-            0,
-            self.seq_len,
-            self.hidden_size,
-        );
+        let start =
+            PrefillCapture::offset_for(capture_layer_idx, 0, self.seq_len, self.hidden_size);
         let end = start + slab_len;
         if end > self.hidden_output.len() {
             return Err(anyhow!(
@@ -424,7 +423,8 @@ pub fn append_capture_positions(
     if n_committed > verify_captured.seq_len {
         return Err(anyhow!(
             "append_capture_positions: n_committed ({}) > verify_captured.seq_len ({})",
-            n_committed, verify_captured.seq_len
+            n_committed,
+            verify_captured.seq_len
         ));
     }
     let hs = prior.hidden_size;
@@ -436,13 +436,15 @@ pub fn append_capture_positions(
         let new_layer_base = layer * new_seq * hs;
         // (a) Copy prior's positions [0..prior_seq) for this layer.
         let prior_layer_base = layer * prior_seq * hs;
-        new_hidden[new_layer_base..new_layer_base + prior_seq * hs]
-            .copy_from_slice(&prior.hidden_output[prior_layer_base..prior_layer_base + prior_seq * hs]);
+        new_hidden[new_layer_base..new_layer_base + prior_seq * hs].copy_from_slice(
+            &prior.hidden_output[prior_layer_base..prior_layer_base + prior_seq * hs],
+        );
         // (b) Append verify_captured's positions [0..n_committed) for this layer.
         let verify_layer_base = layer * verify_captured.seq_len * hs;
         let new_extended = new_layer_base + prior_seq * hs;
-        new_hidden[new_extended..new_extended + n_committed * hs]
-            .copy_from_slice(&verify_captured.hidden_output[verify_layer_base..verify_layer_base + n_committed * hs]);
+        new_hidden[new_extended..new_extended + n_committed * hs].copy_from_slice(
+            &verify_captured.hidden_output[verify_layer_base..verify_layer_base + n_committed * hs],
+        );
     }
     Ok(DFlashCaptureSession {
         target_layer_ids: prior.target_layer_ids.clone(),
@@ -459,10 +461,8 @@ mod tests {
     use crate::inference::spec_decode::dflash::config::DFlashConfig;
 
     fn gemma4_cfg() -> DFlashConfig {
-        DFlashConfig::from_json_str(
-            super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
-        )
-        .expect("config parse")
+        DFlashConfig::from_json_str(super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG)
+            .expect("config parse")
     }
 
     #[test]
@@ -568,7 +568,9 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut sess = DFlashCaptureSession::new(vec![1, 6], 3, 4, false);
         let orig_len = sess.hidden_output.len();
-        for v in sess.hidden_output.iter_mut() { *v = 7.0; }
+        for v in sess.hidden_output.iter_mut() {
+            *v = 7.0;
+        }
         trim_capture_to(&mut sess, 5); // 5 > 3, no-op
         assert_eq!(sess.seq_len, 3);
         assert_eq!(sess.hidden_output.len(), orig_len);
@@ -582,7 +584,9 @@ mod tests {
         let combined = vec![1, 6, 29];
         let drafter_ids = vec![1, 100];
         let mut hidden = vec![0.0f32; 3 * 3 * 4];
-        for v in hidden.iter_mut() { *v = 1.0; }
+        for v in hidden.iter_mut() {
+            *v = 1.0;
+        }
         let err = extract_drafter_concat(&hidden, &combined, &drafter_ids, 3, 4).unwrap_err();
         assert!(format!("{err}").contains("not in combined"));
     }
@@ -667,12 +671,17 @@ mod tests {
         };
         // Write layer 2's slab as ones
         let slab = vec![1.0f32; 4 * 2816];
-        cap.write_layer_slab(2, &slab, 4, 2816).expect("write_layer_slab");
+        cap.write_layer_slab(2, &slab, 4, 2816)
+            .expect("write_layer_slab");
         // Verify: layer 2's slab is ones; layer 0/1/3/4/5 still zero
         let layer2_start = 2 * 4 * 2816;
         let layer2_end = 3 * 4 * 2816;
         for i in 0..hidden.len() {
-            let expected = if i >= layer2_start && i < layer2_end { 1.0 } else { 0.0 };
+            let expected = if i >= layer2_start && i < layer2_end {
+                1.0
+            } else {
+                0.0
+            };
             assert_eq!(hidden[i], expected, "at index {i}");
         }
     }
@@ -681,14 +690,12 @@ mod tests {
     #[test]
     fn session_new_allocates_correct_sizes() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let sess = DFlashCaptureSession::new(
-            vec![1, 6, 11, 17, 22, 27],
-            4,
-            2816,
-            true,
-        );
+        let sess = DFlashCaptureSession::new(vec![1, 6, 11, 17, 22, 27], 4, 2816, true);
         assert_eq!(sess.hidden_output.len(), 6 * 4 * 2816);
-        assert_eq!(sess.per_position_argmaxes.as_ref().map(|v| v.len()), Some(4));
+        assert_eq!(
+            sess.per_position_argmaxes.as_ref().map(|v| v.len()),
+            Some(4)
+        );
         assert_eq!(sess.seq_len, 4);
         assert_eq!(sess.hidden_size, 2816);
 
@@ -774,29 +781,20 @@ mod tests {
         let hs = 16usize; // small for fast test
 
         // Initial prefill capture (prompt only).
-        let mut prior_captured = DFlashCaptureSession::new(
-            combined_ids.clone(),
-            prompt_len,
-            hs,
-            false,
-        );
+        let mut prior_captured =
+            DFlashCaptureSession::new(combined_ids.clone(), prompt_len, hs, false);
         for (cli, &_clid) in combined_ids.iter().enumerate() {
             for t in 0..prompt_len {
                 for d in 0..hs {
                     let off = (cli * prompt_len + t) * hs + d;
-                    prior_captured.hidden_output[off] =
-                        (cli * 1000 + t * 10 + d) as f32;
+                    prior_captured.hidden_output[off] = (cli * 1000 + t * 10 + d) as f32;
                 }
             }
         }
 
         // Round-1 verify capture (block_size rows at start_pos=prompt_len).
-        let mut verify_captured = DFlashCaptureSession::new(
-            combined_ids.clone(),
-            block_size,
-            hs,
-            false,
-        );
+        let mut verify_captured =
+            DFlashCaptureSession::new(combined_ids.clone(), block_size, hs, false);
         for (cli, &_clid) in combined_ids.iter().enumerate() {
             for t in 0..block_size {
                 for d in 0..hs {
@@ -809,12 +807,8 @@ mod tests {
 
         // Round-1 accept-prefix = 0 → n_committed = 1 (target's bonus token).
         let n_committed = 1usize;
-        let next_prior = append_capture_positions(
-            &prior_captured,
-            &verify_captured,
-            n_committed,
-        )
-        .expect("append_capture_positions");
+        let next_prior = append_capture_positions(&prior_captured, &verify_captured, n_committed)
+            .expect("append_capture_positions");
         assert_eq!(next_prior.seq_len, prompt_len + n_committed);
 
         // Round-2 drafter extraction.
@@ -842,14 +836,14 @@ mod tests {
         //     drafter_concat_new[drafter_l * hs .. (drafter_l+1) * hs]
         //     == verify_captured[combined_idx_of(target_layer_ids[drafter_l]), 0, :]
         for (drafter_l, &dl_id) in drafter_target_layer_ids.iter().enumerate() {
-            let combined_idx = combined_ids.iter().position(|&c| c == dl_id)
+            let combined_idx = combined_ids
+                .iter()
+                .position(|&c| c == dl_id)
                 .expect("drafter layer in combined");
             let verify_layer_base = combined_idx * block_size * hs;
             let verify_pos0_base = verify_layer_base; // pos 0 → +0
-            let expected = &verify_captured.hidden_output
-                [verify_pos0_base..verify_pos0_base + hs];
-            let actual = &drafter_concat_new
-                [drafter_l * hs..(drafter_l + 1) * hs];
+            let expected = &verify_captured.hidden_output[verify_pos0_base..verify_pos0_base + hs];
+            let actual = &drafter_concat_new[drafter_l * hs..(drafter_l + 1) * hs];
             assert_eq!(
                 actual, expected,
                 "drafter_l={} (target_layer_id={}, combined_idx={}): \
@@ -878,28 +872,19 @@ mod tests {
         let block_size = 8usize;
         let hs = 16usize;
 
-        let mut prior_captured = DFlashCaptureSession::new(
-            combined_ids.clone(),
-            prompt_len,
-            hs,
-            false,
-        );
+        let mut prior_captured =
+            DFlashCaptureSession::new(combined_ids.clone(), prompt_len, hs, false);
         for cli in 0..combined_ids.len() {
             for t in 0..prompt_len {
                 for d in 0..hs {
                     let off = (cli * prompt_len + t) * hs + d;
-                    prior_captured.hidden_output[off] =
-                        (cli * 1000 + t * 10 + d) as f32;
+                    prior_captured.hidden_output[off] = (cli * 1000 + t * 10 + d) as f32;
                 }
             }
         }
 
-        let mut verify_captured = DFlashCaptureSession::new(
-            combined_ids.clone(),
-            block_size,
-            hs,
-            false,
-        );
+        let mut verify_captured =
+            DFlashCaptureSession::new(combined_ids.clone(), block_size, hs, false);
         for cli in 0..combined_ids.len() {
             for t in 0..block_size {
                 for d in 0..hs {
@@ -911,12 +896,8 @@ mod tests {
         }
 
         let n_committed = 5usize; // 4 accepts + 1 target bonus
-        let next_prior = append_capture_positions(
-            &prior_captured,
-            &verify_captured,
-            n_committed,
-        )
-        .expect("append");
+        let next_prior = append_capture_positions(&prior_captured, &verify_captured, n_committed)
+            .expect("append");
         assert_eq!(next_prior.seq_len, prompt_len + n_committed);
 
         let drafter_concat = extract_drafter_concat(
@@ -939,14 +920,15 @@ mod tests {
         // verify_captured[combined_idx, t, :] for t in [0..5).
         for t in 0..n_committed {
             for (drafter_l, &dl_id) in drafter_target_layer_ids.iter().enumerate() {
-                let combined_idx = combined_ids.iter().position(|&c| c == dl_id)
+                let combined_idx = combined_ids
+                    .iter()
+                    .position(|&c| c == dl_id)
                     .expect("drafter layer in combined");
                 let verify_pos_t_base = (combined_idx * block_size + t) * hs;
-                let expected = &verify_captured.hidden_output
-                    [verify_pos_t_base..verify_pos_t_base + hs];
+                let expected =
+                    &verify_captured.hidden_output[verify_pos_t_base..verify_pos_t_base + hs];
                 let actual_row_base = (t * drafter_n + drafter_l) * hs;
-                let actual = &drafter_concat_new
-                    [actual_row_base..actual_row_base + hs];
+                let actual = &drafter_concat_new[actual_row_base..actual_row_base + hs];
                 assert_eq!(
                     actual, expected,
                     "t={t} drafter_l={drafter_l} (target_layer_id={dl_id}, combined_idx={combined_idx}): \
@@ -1043,14 +1025,22 @@ mod tests {
             .expect("alloc h");
         {
             let s = h.as_mut_slice::<f32>().expect("h slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
 
         // Run drafter forward end-to-end on the permuted captured hidden
         let h_final = dispatch_dflash_model_forward(
-            &mut registry, &device, &h, &target_hidden,
-            &tensors, &mut cache, &cfg,
-            block_size, ctx_chunk as u32,
+            &mut registry,
+            &device,
+            &h,
+            &target_hidden,
+            &tensors,
+            &mut cache,
+            &cfg,
+            block_size,
+            ctx_chunk as u32,
         )
         .expect("drafter forward on permuted capture");
 
@@ -1059,7 +1049,8 @@ mod tests {
         let host: &[f32] = h_final.as_slice::<f32>().expect("h_final slice");
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         assert_eq!(
-            n_finite, host.len(),
+            n_finite,
+            host.len(),
             "drafter output on permuted capture must be all finite"
         );
     }
@@ -1095,8 +1086,10 @@ mod tests {
                 for d in 0..hidden_size {
                     let dst = (t * n_layers + layer_idx) * hidden_size + d;
                     let expected = (layer_idx * 10) as f32 + t as f32 + (d as f32) * 0.1;
-                    assert_eq!(concat[dst], expected,
-                        "concat mismatch t={t} layer={layer_idx} d={d}");
+                    assert_eq!(
+                        concat[dst], expected,
+                        "concat mismatch t={t} layer={layer_idx} d={d}"
+                    );
                 }
             }
         }

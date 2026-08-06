@@ -196,7 +196,9 @@ mod tests {
             ArchName::MiniMaxM2,
         ] {
             assert!(
-                arch.name().chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '-' || c.is_ascii_digit()),
+                arch.name()
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c == '-' || c.is_ascii_digit()),
                 "arch name {} must be lowercase/digits/_-",
                 arch.name()
             );

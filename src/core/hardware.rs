@@ -417,8 +417,8 @@ mod tests {
     #[test]
     fn test_estimated_tok_s() {
         let profile = make_profile("Apple M4 Max"); // 546 GB/s
-        // 546 GB/s = 546e9 B/s, model = 10 GB = 10e9 B
-        // tok/s = 546e9 / 10e9 = 54.6
+                                                    // 546 GB/s = 546e9 B/s, model = 10 GB = 10e9 B
+                                                    // tok/s = 546e9 / 10e9 = 54.6
         let tok_s = profile.estimated_tok_s(10_000_000_000);
         assert!((tok_s - 54.6).abs() < 0.01);
 
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn test_max_model_bytes_for_tok_s() {
         let profile = make_profile("Apple M4 Max"); // 546 GB/s
-        // target 10 tok/s -> 546e9 / 10 = 54.6e9
+                                                    // target 10 tok/s -> 546e9 / 10 = 54.6e9
         let max_bytes = profile.max_model_bytes_for_tok_s(10.0);
         assert_eq!(max_bytes, 54_600_000_000);
 

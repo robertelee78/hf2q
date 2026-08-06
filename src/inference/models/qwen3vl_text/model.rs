@@ -38,20 +38,14 @@ impl Qwen3VlTextModel {
     /// `progress` is driven layer-by-layer. Pass an
     /// [`LoadProgress::new(false, 0, n_layers)`] for the silent
     /// (non-TTY / `-v`) path.
-    pub fn load_from_gguf(
-        gguf: &GgufFile,
-        progress: &mut LoadProgress,
-    ) -> Result<Self> {
-        let cfg = Qwen3VlTextConfig::from_gguf(gguf)
-            .context("Qwen3VlTextConfig::from_gguf")?;
-        let ctx = GpuContext::new()
-            .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+    pub fn load_from_gguf(gguf: &GgufFile, progress: &mut LoadProgress) -> Result<Self> {
+        let cfg = Qwen3VlTextConfig::from_gguf(gguf).context("Qwen3VlTextConfig::from_gguf")?;
+        let ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
         // Borrow the device from the context for the load pass; the
         // context owns the Metal device handle for the lifetime of
         // the bundle.
-        let weights =
-            Qwen3VlTextWeights::load_from_gguf(gguf, &cfg, ctx.device(), progress)
-                .context("Qwen3VlTextWeights::load_from_gguf")?;
+        let weights = Qwen3VlTextWeights::load_from_gguf(gguf, &cfg, ctx.device(), progress)
+            .context("Qwen3VlTextWeights::load_from_gguf")?;
         Ok(Self { cfg, weights, ctx })
     }
 

@@ -202,8 +202,7 @@ mod adr040_phase_a4_cont_acceptance_telemetry_tests {
     /// DFlash target).
     #[test]
     fn h233d_emission_call_sites_grep_able_2026_05_30() {
-        let orchestrator_src =
-            include_str!("../../inference/spec_decode/eagle3_orchestrator.rs");
+        let orchestrator_src = include_str!("../../inference/spec_decode/eagle3_orchestrator.rs");
         assert!(
             orchestrator_src.contains("emit_acceptance_metric"),
             "H233d FALSIFIED: eagle3_orchestrator.rs does NOT name \
@@ -219,8 +218,7 @@ mod adr040_phase_a4_cont_acceptance_telemetry_tests {
              site.  Future-iter implementers + operator triage depend \
              on this label being grep-able."
         );
-        let dflash_target_src =
-            include_str!("../../inference/spec_decode/dflash/qwen35_target.rs");
+        let dflash_target_src = include_str!("../../inference/spec_decode/dflash/qwen35_target.rs");
         assert!(
             dflash_target_src.contains("emit_acceptance_metric"),
             "H233d FALSIFIED: dflash/qwen35_target.rs does NOT name \

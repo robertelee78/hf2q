@@ -20,10 +20,10 @@
 //! newtype is necessary. The Arc-pin invariant (§6 R3) is testable without
 //! Metal because `Arc::strong_count` is payload-agnostic.
 
-use hf2q::serve::kv_persist::lcp_registry::{
-    ByteSized, LcpKey, LcpRegistry, LcpStoreError, default_lcp_byte_budget,
-};
 use hf2q::serve::kv_persist::format::ModelFingerprint;
+use hf2q::serve::kv_persist::lcp_registry::{
+    default_lcp_byte_budget, ByteSized, LcpKey, LcpRegistry, LcpStoreError,
+};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,9 +92,7 @@ fn lcp_registry_returns_partial_match() {
 
     // New prompt: shares first 12 tokens, diverges at position 12.
     let new_prompt: Vec<u32> = (1..=12).chain(900..=905).collect();
-    let hit = reg
-        .lookup(&k, &new_prompt)
-        .expect("partial match must hit");
+    let hit = reg.lookup(&k, &new_prompt).expect("partial match must hit");
 
     assert_eq!(hit.k, 12, "LCP=12 expected (1..=12 shared)");
     assert_eq!(hit.dense_kvs.len(), 4, "per-layer payload preserved");
@@ -148,14 +146,8 @@ fn lcp_registry_returns_none_on_fingerprint_mismatch() {
     let store_key = key(0xAA, "tenant-a", 42);
     let lookup_key = key(0xBB, "tenant-a", 42); // different fingerprint
 
-    reg.store(
-        store_key,
-        vec![1, 2, 3, 4, 5],
-        payload(2, 0xCC),
-        4096,
-        4096,
-    )
-    .expect("store");
+    reg.store(store_key, vec![1, 2, 3, 4, 5], payload(2, 0xCC), 4096, 4096)
+        .expect("store");
 
     let hit = reg.lookup(&lookup_key, &[1, 2, 3]);
     assert!(
@@ -172,14 +164,8 @@ fn lcp_registry_returns_none_on_tenant_mismatch() {
     let store_key = key(0xAA, "tenant-a", 42);
     let lookup_key = key(0xAA, "tenant-b", 42); // different tenant
 
-    reg.store(
-        store_key,
-        vec![1, 2, 3, 4, 5],
-        payload(2, 0xCC),
-        4096,
-        4096,
-    )
-    .expect("store");
+    reg.store(store_key, vec![1, 2, 3, 4, 5], payload(2, 0xCC), 4096, 4096)
+        .expect("store");
 
     let hit = reg.lookup(&lookup_key, &[1, 2, 3]);
     assert!(
@@ -197,20 +183,11 @@ fn lcp_registry_returns_none_on_params_mismatch() {
     let store_key = key(0xAA, "tenant-a", 42);
     let lookup_key = key(0xAA, "tenant-a", 99); // different params_hash
 
-    reg.store(
-        store_key,
-        vec![1, 2, 3, 4, 5],
-        payload(2, 0xCC),
-        4096,
-        4096,
-    )
-    .expect("store");
+    reg.store(store_key, vec![1, 2, 3, 4, 5], payload(2, 0xCC), 4096, 4096)
+        .expect("store");
 
     let hit = reg.lookup(&lookup_key, &[1, 2, 3]);
-    assert!(
-        hit.is_none(),
-        "params_hash mismatch must return None"
-    );
+    assert!(hit.is_none(), "params_hash mismatch must return None");
 }
 
 #[test]
@@ -247,7 +224,11 @@ fn lcp_registry_pins_dense_kvs_arc_across_eviction() {
     // it's done reading); only `pinned` remains as the "in-flight"
     // proxy. strong_count = 3 (caller + registry + pinned).
     drop(hit);
-    assert_eq!(Arc::strong_count(&pinned), 3, "after dropping hit: pl + reg + pinned");
+    assert_eq!(
+        Arc::strong_count(&pinned),
+        3,
+        "after dropping hit: pl + reg + pinned"
+    );
 
     // Now clear the registry — simulating concurrent eviction during
     // an in-flight prefill.
@@ -318,7 +299,10 @@ fn lcp_registry_lookup_promotes_to_mru() {
     reg.store(k3.clone(), vec![5, 6], payload(1, 0xA3), 4096, 4096)
         .expect("store k3");
 
-    assert!(reg.lookup(&k1, &[1, 999]).is_some(), "k1 survived (was MRU)");
+    assert!(
+        reg.lookup(&k1, &[1, 999]).is_some(),
+        "k1 survived (was MRU)"
+    );
     assert!(reg.lookup(&k2, &[3, 999]).is_none(), "k2 LRU-evicted");
     assert!(reg.lookup(&k3, &[5, 999]).is_some(), "k3 just inserted");
 }
@@ -354,7 +338,10 @@ fn lcp_registry_store_overwrites_same_key() {
 
     // Use [1,2,3,4,999] so k=4 partial-prefix (not k=4 full-equality).
     let hit = reg.lookup(&k, &[1, 2, 3, 4, 999]).expect("must hit v2");
-    assert_eq!(hit.k, 4, "v2's prompt[1,2,3,4,5] vs lookup [1,2,3,4,999] → LCP=4");
+    assert_eq!(
+        hit.k, 4,
+        "v2's prompt[1,2,3,4,5] vs lookup [1,2,3,4,999] → LCP=4"
+    );
     assert!(
         Arc::ptr_eq(&hit.dense_kvs[0], &pl_v2[0]),
         "lookup returns v2's payload (overwrite-wins)"
@@ -426,7 +413,8 @@ fn probe_lcp_opportunity_gates_off_multimodal() {
     let new_prompt: Vec<u32> = (1..=8).chain([900u32].iter().copied()).collect();
     use hf2q::serve::kv_persist::lcp_registry::probe_lcp_opportunity;
 
-    let multimodal = probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ true);
+    let multimodal =
+        probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ true);
     assert_eq!(
         multimodal, None,
         "multimodal request must NEVER probe LCP, even on cache-prone prompt"
@@ -434,7 +422,8 @@ fn probe_lcp_opportunity_gates_off_multimodal() {
 
     // Sanity: same call with multimodal=false DOES hit, proving the gate
     // (not absence of cache) caused the None above.
-    let text_only = probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ false);
+    let text_only =
+        probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ false);
     assert_eq!(
         text_only,
         Some(8),
@@ -457,8 +446,7 @@ fn probe_lcp_opportunity_returns_none_on_full_equality() {
     use hf2q::serve::kv_persist::lcp_registry::probe_lcp_opportunity;
 
     // Identical prompt — full equality.
-    let probe_full =
-        probe_lcp_opportunity(&mut reg, &k, &cached, /*has_soft_tokens=*/ false);
+    let probe_full = probe_lcp_opportunity(&mut reg, &k, &cached, /*has_soft_tokens=*/ false);
     assert_eq!(
         probe_full, None,
         "full-equality lookup must yield None — PromptCache (E.b) handles that case"
@@ -568,7 +556,11 @@ fn take_prefix_no_op_on_miss() {
     // Try take_prefix with key_b (no entry exists for k_b).
     let miss = reg.take_prefix(&k_b, &[1, 2, 3]);
     assert!(miss.is_none(), "take on missing key must be None");
-    assert_eq!(reg.len(), 1, "registry must keep the unrelated entry intact");
+    assert_eq!(
+        reg.len(),
+        1,
+        "registry must keep the unrelated entry intact"
+    );
 
     // Sanity: lookup against k_a still hits (entry preserved).
     let hit = reg.lookup(&k_a, &[1, 2, 999]);
@@ -643,7 +635,11 @@ fn byte_budget_evicts_lru_when_second_entry_exceeds_budget() {
 
     reg.store(k1.clone(), vec![1, 2], payload_bytes(600), 4096, 4096)
         .expect("store k1");
-    assert_eq!(reg.current_bytes(), 600, "first insert: current_bytes == 600");
+    assert_eq!(
+        reg.current_bytes(),
+        600,
+        "first insert: current_bytes == 600"
+    );
     assert_eq!(reg.len(), 1);
 
     reg.store(k2.clone(), vec![3, 4], payload_bytes(600), 4096, 4096)
@@ -709,7 +705,11 @@ fn byte_budget_evicts_lru_under_varying_sizes() {
     );
 
     // Registry unchanged after the rejected insert.
-    assert_eq!(reg.current_bytes(), 350, "current_bytes unchanged after rejection");
+    assert_eq!(
+        reg.current_bytes(),
+        350,
+        "current_bytes unchanged after rejection"
+    );
     assert_eq!(reg.len(), 3, "entry count unchanged after rejection");
 }
 
@@ -735,7 +735,11 @@ fn byte_budget_returns_err_when_entry_exceeds_entire_budget() {
         "unexpected error variant: {:?}",
         err
     );
-    assert_eq!(reg.current_bytes(), 0, "registry must be empty after failed insert");
+    assert_eq!(
+        reg.current_bytes(),
+        0,
+        "registry must be empty after failed insert"
+    );
     assert_eq!(reg.len(), 0);
 }
 
@@ -752,8 +756,14 @@ fn byte_budget_same_key_reinsert_no_double_count() {
     assert_eq!(reg.current_bytes(), 300, "after v1 insert: 300 bytes");
 
     // Overwrite with 150 bytes (different-sized payload on same key).
-    reg.store(k.clone(), vec![1, 2, 3, 4, 5], payload_bytes(150), 4096, 4096)
-        .expect("store v2 (overwrite)");
+    reg.store(
+        k.clone(),
+        vec![1, 2, 3, 4, 5],
+        payload_bytes(150),
+        4096,
+        4096,
+    )
+    .expect("store v2 (overwrite)");
     assert_eq!(
         reg.current_bytes(),
         150,
@@ -762,8 +772,14 @@ fn byte_budget_same_key_reinsert_no_double_count() {
     assert_eq!(reg.len(), 1, "still one entry");
 
     // Overwrite again with a larger payload (400 bytes).
-    reg.store(k.clone(), vec![1, 2, 3, 4, 5, 6, 7], payload_bytes(400), 4096, 4096)
-        .expect("store v3 (overwrite)");
+    reg.store(
+        k.clone(),
+        vec![1, 2, 3, 4, 5, 6, 7],
+        payload_bytes(400),
+        4096,
+        4096,
+    )
+    .expect("store v3 (overwrite)");
     assert_eq!(
         reg.current_bytes(),
         400,
@@ -790,13 +806,7 @@ fn byte_budget_same_key_reinsert_exceeds_budget_returns_err() {
     assert_eq!(bytes_before, 300);
 
     // Overwrite same key with 2048 bytes — single entry > 1024 byte budget.
-    let result = reg.store(
-        k.clone(),
-        vec![1, 2, 3, 4],
-        payload_bytes(2048),
-        4096,
-        4096,
-    );
+    let result = reg.store(k.clone(), vec![1, 2, 3, 4], payload_bytes(2048), 4096, 4096);
     match result {
         Err(LcpStoreError::EntryExceedsBudget {
             entry_bytes,
@@ -812,7 +822,11 @@ fn byte_budget_same_key_reinsert_exceeds_budget_returns_err() {
     }
 
     // Registry state unchanged after the rejected store.
-    assert_eq!(reg.len(), 1, "registry length must remain 1 after rejected reinsert");
+    assert_eq!(
+        reg.len(),
+        1,
+        "registry length must remain 1 after rejected reinsert"
+    );
     assert_eq!(
         reg.current_bytes(),
         bytes_before,
@@ -823,7 +837,10 @@ fn byte_budget_same_key_reinsert_exceeds_budget_returns_err() {
     let prefix = reg
         .lookup(&k, &[1, 2, 3, 99])
         .expect("v1 entry still indexed under k after rejected oversize reinsert");
-    assert_eq!(prefix.k, 3, "v1 prompt [1,2,3] still matches as prefix of [1,2,3,99]");
+    assert_eq!(
+        prefix.k, 3,
+        "v1 prompt [1,2,3] still matches as prefix of [1,2,3,99]"
+    );
 }
 
 #[test]

@@ -177,11 +177,7 @@ fn tail_string(s: &str, max_bytes: usize) -> String {
 /// Runs `llama-quantize <input.gguf> <output.gguf> <variant>`. Used
 /// by the uncalibrated and imatrix Q4_K_M peer cells (after
 /// [`run_convert_hf_to_gguf`] materialises the float source).
-pub fn run_llama_quantize(
-    input_gguf: &Path,
-    output_gguf: &Path,
-    variant: &str,
-) -> RunMetrics {
+pub fn run_llama_quantize(input_gguf: &Path, output_gguf: &Path, variant: &str) -> RunMetrics {
     let bin = match resolve_binary("HF2Q_LLAMA_QUANTIZE_BIN", "llama-quantize") {
         Some(b) => b,
         None => {
@@ -397,7 +393,11 @@ mod tests {
             "real /bin/echo invocation must NOT produce missing-binary sentinel; got {:?}",
             m
         );
-        assert!(m.wall_s >= 0.0, "wall_s must be non-negative; got {}", m.wall_s);
+        assert!(
+            m.wall_s >= 0.0,
+            "wall_s must be non-negative; got {}",
+            m.wall_s
+        );
         assert_eq!(m.exit_code, 0, "/bin/echo always exits 0");
     }
 
@@ -423,7 +423,8 @@ mod tests {
     /// prefix).
     #[test]
     fn perplexity_parser_extracts_plain_final_estimate() {
-        let stderr = "perplexity: 1.23 seconds per pass\nFinal estimate: PPL = 5.4200 +/- 0.05000\n";
+        let stderr =
+            "perplexity: 1.23 seconds per pass\nFinal estimate: PPL = 5.4200 +/- 0.05000\n";
         let v = parse_llama_perplexity_final_estimate(stderr);
         assert_eq!(v, Some(5.42));
     }
@@ -503,7 +504,10 @@ mod tests {
             metrics.is_missing_binary(),
             "missing binary must surface sentinel; got {metrics:?}"
         );
-        assert!(ppl.is_none(), "missing binary must yield None ppl; got {ppl:?}");
+        assert!(
+            ppl.is_none(),
+            "missing binary must yield None ppl; got {ppl:?}"
+        );
         assert!(metrics.stderr_tail.contains("llama-perplexity"));
     }
 }

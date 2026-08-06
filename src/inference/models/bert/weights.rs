@@ -195,10 +195,11 @@ impl LoadedBertWeights {
     /// default `MlxDevice`, validates, and loads. Used by the server
     /// startup path when the operator passes `--embedding-model X.gguf`.
     pub fn load_from_path(path: &Path, cfg: &BertConfig) -> Result<Self> {
-        let gguf = GgufFile::open(path)
-            .map_err(|e| anyhow!("open BERT GGUF {}: {e}", path.display()))?;
+        let gguf =
+            GgufFile::open(path).map_err(|e| anyhow!("open BERT GGUF {}: {e}", path.display()))?;
         validate_tensor_set(&gguf, cfg)?;
-        let device = MlxDevice::new().map_err(|e| anyhow!("create MlxDevice for BERT load: {e}"))?;
+        let device =
+            MlxDevice::new().map_err(|e| anyhow!("create MlxDevice for BERT load: {e}"))?;
         Self::load(&gguf, cfg, device)
     }
 

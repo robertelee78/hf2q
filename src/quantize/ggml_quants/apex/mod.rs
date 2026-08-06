@@ -45,8 +45,7 @@ pub use arches::{
 };
 pub use error::ApexError;
 pub use fingerprint::{
-    detect_apex_config, manifest_entries, vendor_config_content, ApexConfigRef,
-    FingerprintHParams,
+    detect_apex_config, manifest_entries, vendor_config_content, ApexConfigRef, FingerprintHParams,
 };
 pub use mudler_config::{load_mudler_config, MudlerConfig};
 pub use policy::ApexPolicy;

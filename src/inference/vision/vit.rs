@@ -202,12 +202,7 @@ pub fn layer_norm_forward(
 /// - `input.len() % hidden != 0`
 /// - `gamma.len() != hidden`
 /// - `hidden == 0`
-pub fn rms_norm_forward(
-    input: &mut [f32],
-    gamma: &[f32],
-    hidden: usize,
-    eps: f32,
-) -> Result<()> {
+pub fn rms_norm_forward(input: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) -> Result<()> {
     if hidden == 0 {
         return Err(anyhow!("rms_norm_forward: hidden must be > 0"));
     }
@@ -281,7 +276,9 @@ pub fn per_head_rms_norm_forward(
     if batch == 0 || num_heads == 0 || head_dim == 0 {
         return Err(anyhow!(
             "per_head_rms_norm_forward: batch ({}), num_heads ({}), head_dim ({}) must all be > 0",
-            batch, num_heads, head_dim
+            batch,
+            num_heads,
+            head_dim
         ));
     }
     let expected_input_len = batch * num_heads * head_dim;
@@ -558,7 +555,8 @@ pub fn patch_embed_forward(
                         let w_row_base = w_ic_base + dy * ws_y;
                         let p_row_base = p_ic_base + (y0 + dy) * ps_y + x0;
                         for dx in 0..p {
-                            acc += pixel_values[p_row_base + dx] * patch_embd_weight[w_row_base + dx];
+                            acc +=
+                                pixel_values[p_row_base + dx] * patch_embd_weight[w_row_base + dx];
                         }
                     }
                 }
@@ -674,8 +672,8 @@ pub fn patch_embed_forward_hw(
                         let w_row_base = w_ic_base + dy * ws_y;
                         let p_row_base = p_ic_base + (y0 + dy) * ps_y + x0;
                         for dx in 0..p {
-                            acc += pixel_values[p_row_base + dx]
-                                * patch_embd_weight[w_row_base + dx];
+                            acc +=
+                                pixel_values[p_row_base + dx] * patch_embd_weight[w_row_base + dx];
                         }
                     }
                 }
@@ -925,11 +923,7 @@ pub fn scale_in_place(x: &mut [f32], c: f32) {
 /// - `input.len() != n_patches * hidden`
 /// - `n_side * n_side != n_patches`
 /// - `n_side % 2 != 0`
-pub fn avg_pool_2x2_spatial(
-    input: &[f32],
-    n_side: usize,
-    hidden: usize,
-) -> Result<Vec<f32>> {
+pub fn avg_pool_2x2_spatial(input: &[f32], n_side: usize, hidden: usize) -> Result<Vec<f32>> {
     let n_patches = n_side * n_side;
     if input.len() != n_patches * hidden {
         return Err(anyhow!(
@@ -1098,60 +1092,25 @@ pub fn apply_vit_block_forward(
     let mut cur = residual.clone();
     rms_norm_forward(&mut cur, &ln1_w, hidden, eps)?;
 
-    let (mut q, mut k, v) = qkv_projection_forward(
-        &cur,
-        &attn_q_w,
-        &attn_k_w,
-        &attn_v_w,
-        batch,
-        hidden,
-    )?;
-    per_head_rms_norm_forward(
-        &mut q,
-        &attn_q_norm_w,
-        batch,
-        num_heads,
-        head_dim,
-        eps,
-    )?;
-    per_head_rms_norm_forward(
-        &mut k,
-        &attn_k_norm_w,
-        batch,
-        num_heads,
-        head_dim,
-        eps,
-    )?;
+    let (mut q, mut k, v) =
+        qkv_projection_forward(&cur, &attn_q_w, &attn_k_w, &attn_v_w, batch, hidden)?;
+    per_head_rms_norm_forward(&mut q, &attn_q_norm_w, batch, num_heads, head_dim, eps)?;
+    per_head_rms_norm_forward(&mut k, &attn_k_norm_w, batch, num_heads, head_dim, eps)?;
 
     let attn = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)?;
-    let attn_projected = linear_forward(
-        &attn,
-        &attn_output_w,
-        None,
-        batch,
-        hidden,
-        hidden,
-    )?;
+    let attn_projected = linear_forward(&attn, &attn_output_w, None, batch, hidden, hidden)?;
     residual_add(&mut residual, &attn_projected)?;
 
     // --- FFN half ---
     let mut cur = residual.clone();
     rms_norm_forward(&mut cur, &ln2_w, hidden, eps)?;
 
-    let mut gate =
-        linear_forward(&cur, &ffn_gate_w, None, batch, hidden, intermediate)?;
+    let mut gate = linear_forward(&cur, &ffn_gate_w, None, batch, hidden, intermediate)?;
     let up = linear_forward(&cur, &ffn_up_w, None, batch, hidden, intermediate)?;
     silu_in_place(&mut gate);
     elementwise_mul_in_place(&mut gate, &up)?;
 
-    let mut down = linear_forward(
-        &gate,
-        &ffn_down_w,
-        None,
-        batch,
-        intermediate,
-        hidden,
-    )?;
+    let mut down = linear_forward(&gate, &ffn_down_w, None, batch, intermediate, hidden)?;
     rms_norm_forward(&mut down, &post_ffw_norm_w, hidden, eps)?;
     residual_add(&mut residual, &down)?;
 
@@ -1643,11 +1602,7 @@ pub fn gemma_per_head_rms_norm_forward(
 /// Used for V-norm in gemma4v (per `/opt/candle/.../gemma4/vision.rs:43-50`).
 /// Internally f32 — even when called with an f32 input, this stays
 /// numerically equivalent to the candle reference's `to_dtype(F32)` cast.
-pub fn v_norm_no_scale_forward(
-    input: &mut [f32],
-    hidden: usize,
-    eps: f32,
-) -> Result<()> {
+pub fn v_norm_no_scale_forward(input: &mut [f32], hidden: usize, eps: f32) -> Result<()> {
     if hidden == 0 {
         return Err(anyhow!("v_norm_no_scale_forward: hidden must be > 0"));
     }
@@ -2038,34 +1993,20 @@ pub fn gemma4v_block_forward(
     gemma_rms_norm_forward(&mut cur, block_weights.input_layernorm, hidden, eps)?;
 
     // QKV projections
-    let mut q = linear_forward(
-        &cur,
-        block_weights.q_proj,
-        None,
-        batch,
-        hidden,
-        q_dim,
-    )?;
-    let mut k = linear_forward(
-        &cur,
-        block_weights.k_proj,
-        None,
-        batch,
-        hidden,
-        kv_dim,
-    )?;
-    let mut v = linear_forward(
-        &cur,
-        block_weights.v_proj,
-        None,
-        batch,
-        hidden,
-        kv_dim,
-    )?;
+    let mut q = linear_forward(&cur, block_weights.q_proj, None, batch, hidden, q_dim)?;
+    let mut k = linear_forward(&cur, block_weights.k_proj, None, batch, hidden, kv_dim)?;
+    let mut v = linear_forward(&cur, block_weights.v_proj, None, batch, hidden, kv_dim)?;
 
     // q_norm / k_norm (Gemma4 per-head RMSNorm — literal weight gain) and
     // v_norm (no learned gain — `with_scale=False` in HF Gemma4VisionAttention).
-    gemma_per_head_rms_norm_forward(&mut q, block_weights.q_norm, batch, num_heads, head_dim, eps)?;
+    gemma_per_head_rms_norm_forward(
+        &mut q,
+        block_weights.q_norm,
+        batch,
+        num_heads,
+        head_dim,
+        eps,
+    )?;
     gemma_per_head_rms_norm_forward(
         &mut k,
         block_weights.k_norm,
@@ -2092,14 +2033,7 @@ pub fn gemma4v_block_forward(
     let attn = gemma4v_attention_unit_scale(&q, &k_full, &v_full, batch, num_heads, head_dim)?;
 
     // o_proj
-    let attn_proj = linear_forward(
-        &attn,
-        block_weights.o_proj,
-        None,
-        batch,
-        hidden,
-        hidden,
-    )?;
+    let attn_proj = linear_forward(&attn, block_weights.o_proj, None, batch, hidden, hidden)?;
 
     // post_attention_layernorm (applied to the attention OUTPUT before the residual add).
     let mut attn_out = attn_proj;
@@ -2239,19 +2173,19 @@ pub struct Gemma4VisionBlockShape {
 /// for projection weights, and `[head_dim]` (or `[hidden]`) for norms.
 #[derive(Debug)]
 pub struct Gemma4VisionBlockWeights<'a> {
-    pub input_layernorm: &'a [f32],            // ln1.weight,        [hidden]
-    pub post_attention_layernorm: &'a [f32],    // ln2.weight,        [hidden]
-    pub pre_feedforward_layernorm: &'a [f32],   // ffn_norm.weight,   [hidden]
-    pub post_feedforward_layernorm: &'a [f32],  // post_ffw_norm,     [hidden]
-    pub q_proj: &'a [f32],                      // attn_q.weight,     [num_heads*head_dim, hidden]
-    pub k_proj: &'a [f32],                      // attn_k.weight,     [num_kv_heads*head_dim, hidden]
-    pub v_proj: &'a [f32],                      // attn_v.weight,     [num_kv_heads*head_dim, hidden]
-    pub o_proj: &'a [f32],                      // attn_output.weight,[hidden, num_heads*head_dim]
-    pub q_norm: &'a [f32],                      // attn_q_norm.weight,[head_dim]
-    pub k_norm: &'a [f32],                      // attn_k_norm.weight,[head_dim]
-    pub gate_proj: &'a [f32],                   // ffn_gate.weight,   [intermediate, hidden]
-    pub up_proj: &'a [f32],                     // ffn_up.weight,     [intermediate, hidden]
-    pub down_proj: &'a [f32],                   // ffn_down.weight,   [hidden, intermediate]
+    pub input_layernorm: &'a [f32],          // ln1.weight,        [hidden]
+    pub post_attention_layernorm: &'a [f32], // ln2.weight,        [hidden]
+    pub pre_feedforward_layernorm: &'a [f32], // ffn_norm.weight,   [hidden]
+    pub post_feedforward_layernorm: &'a [f32], // post_ffw_norm,     [hidden]
+    pub q_proj: &'a [f32],                   // attn_q.weight,     [num_heads*head_dim, hidden]
+    pub k_proj: &'a [f32],                   // attn_k.weight,     [num_kv_heads*head_dim, hidden]
+    pub v_proj: &'a [f32],                   // attn_v.weight,     [num_kv_heads*head_dim, hidden]
+    pub o_proj: &'a [f32],                   // attn_output.weight,[hidden, num_heads*head_dim]
+    pub q_norm: &'a [f32],                   // attn_q_norm.weight,[head_dim]
+    pub k_norm: &'a [f32],                   // attn_k_norm.weight,[head_dim]
+    pub gate_proj: &'a [f32],                // ffn_gate.weight,   [intermediate, hidden]
+    pub up_proj: &'a [f32],                  // ffn_up.weight,     [intermediate, hidden]
+    pub down_proj: &'a [f32],                // ffn_down.weight,   [hidden, intermediate]
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,10 +2222,7 @@ mod tests {
     }
 
     /// Build a CHW pixel tensor from a closure `pixel(c, y, x) -> f32`.
-    fn make_pixels<F: FnMut(usize, usize, usize) -> f32>(
-        image_size: usize,
-        mut f: F,
-    ) -> Vec<f32> {
+    fn make_pixels<F: FnMut(usize, usize, usize) -> f32>(image_size: usize, mut f: F) -> Vec<f32> {
         let mut p = vec![0f32; 3 * image_size * image_size];
         for c in 0..3 {
             for y in 0..image_size {
@@ -2339,7 +2270,7 @@ mod tests {
         assert_eq!(out[p(0, 0)], 0.0); // c=0 pixel (0,0) = 0
         assert_eq!(out[p(0, 1)], 100.0); // c=1 pixel (0,0) = 100
         assert_eq!(out[p(0, 2)], 200.0); // c=2 pixel (0,0) = 200
-        // Patch (0,1) — top-left at (0,4).
+                                         // Patch (0,1) — top-left at (0,4).
         assert_eq!(out[p(1, 0)], 4.0); // c=0 pixel (0,4) = 4
         assert_eq!(out[p(1, 1)], 104.0);
         assert_eq!(out[p(1, 2)], 204.0);
@@ -2658,7 +2589,10 @@ mod tests {
         layer_norm_forward(&mut x, &gamma, &beta, 8, 1e-5).unwrap();
         for v in &x {
             assert!(v.is_finite(), "got non-finite {}", v);
-            assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
+            assert!(
+                v.abs() < 1e-5,
+                "constant row should normalize to 0, got {v}"
+            );
         }
     }
 
@@ -2743,7 +2677,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -2798,7 +2735,10 @@ mod tests {
             .map(|(a, b)| (a - b).powi(2))
             .sum::<f32>()
             .sqrt();
-        assert!(l2 > 1e-3, "token 0 and token 48 collapsed to identical output");
+        assert!(
+            l2 > 1e-3,
+            "token 0 and token 48 collapsed to identical output"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2906,7 +2846,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -2958,7 +2901,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -3009,7 +2955,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -3087,15 +3036,8 @@ mod tests {
         .unwrap();
         let attn =
             scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
-        let attn_projected = linear_forward(
-            &attn,
-            &attn_output_w,
-            None,
-            num_patches,
-            hidden,
-            hidden,
-        )
-        .unwrap();
+        let attn_projected =
+            linear_forward(&attn, &attn_output_w, None, num_patches, hidden, hidden).unwrap();
         let mut post_attn = residual_stream.clone();
         residual_add(&mut post_attn, &attn_projected).unwrap();
         let mut pre_ffn = post_attn.clone();
@@ -3109,15 +3051,8 @@ mod tests {
             intermediate,
         )
         .unwrap();
-        let up = linear_forward(
-            &pre_ffn,
-            &ffn_up_w,
-            None,
-            num_patches,
-            hidden,
-            intermediate,
-        )
-        .unwrap();
+        let up =
+            linear_forward(&pre_ffn, &ffn_up_w, None, num_patches, hidden, intermediate).unwrap();
         silu_in_place(&mut gate);
         elementwise_mul_in_place(&mut gate, &up).unwrap();
         let activated = gate;
@@ -3137,8 +3072,7 @@ mod tests {
         // post_ffw_norm applied to the FFN output BEFORE the residual add
         // (matches llama.cpp build_vit: `cur = build_norm(cur, ff_post_norm_w)`
         // before `cur = inpL + cur`).
-        rms_norm_forward(&mut down, &post_ffw_norm_w, hidden, 1e-6)
-            .expect("post_ffw_norm");
+        rms_norm_forward(&mut down, &post_ffw_norm_w, hidden, 1e-6).expect("post_ffw_norm");
 
         let mut block_out = post_attn.clone();
         residual_add(&mut block_out, &down).expect("ffn residual");
@@ -3276,7 +3210,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -3306,7 +3243,9 @@ mod tests {
         // see `apply_vit_block_forward` for the same pattern.
         let widen = |suffix: &str| -> Vec<f32> {
             let buf = weights.block_tensor(0, suffix).expect("block_tensor");
-            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+            weights
+                .tensor_as_f32_owned(buf)
+                .expect("tensor_as_f32_owned")
         };
         let ln1_w = widen("ln1.weight");
         let attn_q_w = widen("attn_q.weight");
@@ -3348,15 +3287,8 @@ mod tests {
         .unwrap();
         let attn =
             scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
-        let attn_projected = linear_forward(
-            &attn,
-            &attn_output_w,
-            None,
-            num_patches,
-            hidden,
-            hidden,
-        )
-        .unwrap();
+        let attn_projected =
+            linear_forward(&attn, &attn_output_w, None, num_patches, hidden, hidden).unwrap();
         let mut post_attn = residual_stream.clone();
         residual_add(&mut post_attn, &attn_projected).unwrap();
         let mut pre_ffn = post_attn.clone();
@@ -3373,9 +3305,8 @@ mod tests {
         assert_eq!(up_w.len(), intermediate * hidden);
 
         // gate = pre_ffn @ gate_w.T → [num_patches, intermediate]
-        let mut gate =
-            linear_forward(&pre_ffn, &gate_w, None, num_patches, hidden, intermediate)
-                .expect("gate proj");
+        let mut gate = linear_forward(&pre_ffn, &gate_w, None, num_patches, hidden, intermediate)
+            .expect("gate proj");
         let up = linear_forward(&pre_ffn, &up_w, None, num_patches, hidden, intermediate)
             .expect("up proj");
 
@@ -3390,17 +3321,14 @@ mod tests {
         // Sanity: activated has non-trivial variance. A silent silu-no-op
         // or wrong-stride bug would collapse the distribution.
         let mean: f32 = activated.iter().sum::<f32>() / (activated.len() as f32);
-        let var: f32 = activated
-            .iter()
-            .map(|v| (v - mean).powi(2))
-            .sum::<f32>()
-            / (activated.len() as f32);
+        let var: f32 =
+            activated.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / (activated.len() as f32);
         assert!(var > 1e-6, "activated variance too low: {var}");
         // Different patches should produce different post-gate rows.
         let p0 = &activated[0..intermediate];
-        let p_last =
-            &activated[(num_patches - 1) * intermediate..num_patches * intermediate];
-        let l2_diff: f32 = p0.iter()
+        let p_last = &activated[(num_patches - 1) * intermediate..num_patches * intermediate];
+        let l2_diff: f32 = p0
+            .iter()
             .zip(p_last.iter())
             .map(|(a, b)| (a - b).powi(2))
             .sum::<f32>()
@@ -3469,7 +3397,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -3501,7 +3432,9 @@ mod tests {
         // see `apply_vit_block_forward` for the same pattern.
         let widen = |suffix: &str| -> Vec<f32> {
             let buf = weights.block_tensor(0, suffix).expect("block_tensor");
-            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+            weights
+                .tensor_as_f32_owned(buf)
+                .expect("tensor_as_f32_owned")
         };
         let ln1_w = widen("ln1.weight");
         let attn_q_w = widen("attn_q.weight");
@@ -3678,7 +3611,7 @@ mod tests {
         // Local helper: index into the [token][dim] K layout.
         let kidx = |tok: usize, dim: usize| tok * head_dim + dim;
         k[kidx(0, 0)] = 100.0; // token 0's key points huge along dim 0
-        // Token 1: orthogonal
+                               // Token 1: orthogonal
         k[kidx(1, 1)] = 100.0;
         // Token 2: orthogonal
         k[kidx(2, 2)] = 100.0;
@@ -3694,10 +3627,7 @@ mod tests {
         for b in 0..batch {
             for d in 0..head_dim {
                 let got = out[b * head_dim + d];
-                assert!(
-                    (got - 7.0).abs() < 0.1,
-                    "b{b} d{d}: {got} (expected ≈7.0)"
-                );
+                assert!((got - 7.0).abs() < 0.1, "b{b} d{d}: {got} (expected ≈7.0)");
             }
         }
     }
@@ -3741,8 +3671,7 @@ mod tests {
         let q = vec![0f32; n - 1];
         let k = vec![0f32; n];
         let v = vec![0f32; n];
-        let err = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)
-            .unwrap_err();
+        let err = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim).unwrap_err();
         assert!(format!("{err}").contains("q len"));
     }
 
@@ -3756,8 +3685,7 @@ mod tests {
         let q = vec![0f32; n];
         let k = vec![0f32; n + 1];
         let v = vec![0f32; n];
-        let err = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)
-            .unwrap_err();
+        let err = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim).unwrap_err();
         assert!(format!("{err}").contains("k len"));
     }
 
@@ -3774,7 +3702,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -3802,7 +3733,9 @@ mod tests {
         // W59 iter-128: widen F16 block weights once.
         let widen = |suffix: &str| -> Vec<f32> {
             let buf = weights.block_tensor(0, suffix).expect("block_tensor");
-            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+            weights
+                .tensor_as_f32_owned(buf)
+                .expect("tensor_as_f32_owned")
         };
         let ln1_w = widen("ln1.weight");
         let attn_q_w = widen("attn_q.weight");
@@ -3888,19 +3821,14 @@ mod tests {
             }
         }
         let gamma = vec![1.0f32; head_dim];
-        per_head_rms_norm_forward(&mut input, &gamma, batch, num_heads, head_dim, 1e-6)
-            .unwrap();
+        per_head_rms_norm_forward(&mut input, &gamma, batch, num_heads, head_dim, 1e-6).unwrap();
         // Every head slice should have mean(x²) ≈ 1 since γ=1.
         for b in 0..batch {
             for h in 0..num_heads {
                 let off = b * (num_heads * head_dim) + h * head_dim;
                 let slice = &input[off..off + head_dim];
                 let ms: f32 = slice.iter().map(|v| v * v).sum::<f32>() / (head_dim as f32);
-                assert!(
-                    (ms - 1.0).abs() < 1e-3,
-                    "head ({},{}): ms = {}",
-                    b, h, ms
-                );
+                assert!((ms - 1.0).abs() < 1e-3, "head ({},{}): ms = {}", b, h, ms);
             }
         }
     }
@@ -3916,8 +3844,7 @@ mod tests {
         let head_dim = 4;
         let mut input = vec![5.0f32; batch * num_heads * head_dim];
         let gamma = vec![0.5f32, 1.0, 2.0, 4.0];
-        per_head_rms_norm_forward(&mut input, &gamma, batch, num_heads, head_dim, 1e-6)
-            .unwrap();
+        per_head_rms_norm_forward(&mut input, &gamma, batch, num_heads, head_dim, 1e-6).unwrap();
         for h in 0..num_heads {
             let off = h * head_dim;
             for (i, g) in gamma.iter().enumerate() {
@@ -3935,8 +3862,7 @@ mod tests {
     #[test]
     fn per_head_rms_norm_rejects_zero_dims() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let err =
-            per_head_rms_norm_forward(&mut [], &[], 0, 1, 1, 1e-5).unwrap_err();
+        let err = per_head_rms_norm_forward(&mut [], &[], 0, 1, 1, 1e-5).unwrap_err();
         assert!(format!("{err}").contains("must all be > 0"));
     }
 
@@ -3945,8 +3871,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut input = vec![0f32; 5];
         let gamma = vec![1f32; 2];
-        let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5)
-            .unwrap_err();
+        let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5).unwrap_err();
         assert!(format!("{err}").contains("input len"));
     }
 
@@ -3955,8 +3880,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut input = vec![0f32; 8];
         let gamma = vec![1f32; 3]; // should be 2 (head_dim)
-        let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5)
-            .unwrap_err();
+        let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5).unwrap_err();
         assert!(format!("{err}").contains("gamma len"));
     }
 
@@ -3972,7 +3896,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -4007,7 +3934,9 @@ mod tests {
         // W59 iter-128: widen F16 block weights once.
         let widen = |suffix: &str| -> Vec<f32> {
             let buf = weights.block_tensor(0, suffix).expect("block_tensor");
-            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+            weights
+                .tensor_as_f32_owned(buf)
+                .expect("tensor_as_f32_owned")
         };
         let ln1_gamma = widen("ln1.weight");
         let q_w = widen("attn_q.weight");
@@ -4020,24 +3949,32 @@ mod tests {
         rms_norm_forward(&mut hidden_states, &ln1_gamma, hidden, 1e-6).expect("rms ln1");
 
         // Stage 3: QKV projection.
-        let (mut q, mut k, v) = qkv_projection_forward(
-            &hidden_states,
-            &q_w,
-            &k_w,
-            &v_w,
-            num_patches,
-            hidden,
-        )
-        .expect("qkv");
+        let (mut q, mut k, v) =
+            qkv_projection_forward(&hidden_states, &q_w, &k_w, &v_w, num_patches, hidden)
+                .expect("qkv");
 
         // Stage 4: per-head RMSNorm on Q and K (Gemma 4 quirk).
         assert_eq!(q_norm_gamma.len(), head_dim);
         assert_eq!(k_norm_gamma.len(), head_dim);
 
-        per_head_rms_norm_forward(&mut q, &q_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
-            .expect("per-head Q");
-        per_head_rms_norm_forward(&mut k, &k_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
-            .expect("per-head K");
+        per_head_rms_norm_forward(
+            &mut q,
+            &q_norm_gamma,
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head Q");
+        per_head_rms_norm_forward(
+            &mut k,
+            &k_norm_gamma,
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head K");
 
         // V stays un-normalized — sanity-check it's still finite from
         // stage 3 but deliberately NOT shaped by per-head norm.
@@ -4177,14 +4114,19 @@ mod tests {
         let q_w = vec![1f32; hidden * hidden];
         let k_w = vec![2f32; hidden * hidden];
         let v_w = vec![3f32; hidden * hidden];
-        let (q, k, v) =
-            qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden).unwrap();
+        let (q, k, v) = qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden).unwrap();
         assert_eq!(q.len(), batch * hidden);
         assert_eq!(k.len(), batch * hidden);
         assert_eq!(v.len(), batch * hidden);
-        for val in &q { assert!((*val - 4.0).abs() < 1e-5); }
-        for val in &k { assert!((*val - 8.0).abs() < 1e-5); }
-        for val in &v { assert!((*val - 12.0).abs() < 1e-5); }
+        for val in &q {
+            assert!((*val - 4.0).abs() < 1e-5);
+        }
+        for val in &k {
+            assert!((*val - 8.0).abs() < 1e-5);
+        }
+        for val in &v {
+            assert!((*val - 12.0).abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -4215,7 +4157,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -4248,8 +4193,8 @@ mod tests {
                 input[p * hidden + h] = 0.01 + (p as f32) * 0.0001 + (h as f32) * 1e-5;
             }
         }
-        let (q, k, v) = qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden)
-            .expect("qkv");
+        let (q, k, v) =
+            qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden).expect("qkv");
         assert_eq!(q.len(), batch * hidden);
 
         // Sanity: Q, K, V distributions should differ (they're separate
@@ -4413,7 +4358,10 @@ mod tests {
         use mlx_native::gguf::GgufFile;
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open");
@@ -4438,8 +4386,7 @@ mod tests {
         for v in &input {
             assert!(v.is_finite(), "non-finite post-RMS: {v}");
         }
-        let mean_sq: f32 = input.iter().map(|v| v * v).sum::<f32>()
-            / (input.len() as f32);
+        let mean_sq: f32 = input.iter().map(|v| v * v).sum::<f32>() / (input.len() as f32);
         // Per-row unit-RMS gets modulated by γ. Gemma's γ values are
         // O(1) so the overall mean-sq stays near γ²-ish ≈ 0.1..10 range.
         assert!(
@@ -4492,11 +4439,7 @@ mod tests {
         let mut x = vec![5.0f32; 8];
         softmax_last_dim(&mut x, 8).unwrap();
         for v in &x {
-            assert!(
-                (*v - 0.125).abs() < 1e-6,
-                "expected 1/8 = 0.125, got {}",
-                v
-            );
+            assert!((*v - 0.125).abs() < 1e-6, "expected 1/8 = 0.125, got {}", v);
         }
     }
 
@@ -4717,7 +4660,10 @@ mod tests {
 
         let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open gemma4 mmproj");
@@ -4741,9 +4687,7 @@ mod tests {
             for y in 0..img {
                 for x in 0..img {
                     let idx = c * img * img + y * img + x;
-                    pixels[idx] = ((c + 1) as f32) * 0.1
-                        + (y as f32) * 0.001
-                        + (x as f32) * 0.001;
+                    pixels[idx] = ((c + 1) as f32) * 0.1 + (y as f32) * 0.001 + (x as f32) * 0.001;
                 }
             }
         }
@@ -4772,7 +4716,10 @@ mod tests {
             .map(|(a, b)| (a - b).powi(2))
             .sum::<f32>()
             .sqrt();
-        assert!(l2_diff > 1e-3, "patch 0 and patch 195 are identical — stride bug");
+        assert!(
+            l2_diff > 1e-3,
+            "patch 0 and patch 195 are identical — stride bug"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -4791,8 +4738,7 @@ mod tests {
         let weight: Vec<f32> = (0..(hidden * inner))
             .map(|i| ((i % 5) as f32) * 0.1 - 0.2)
             .collect();
-        let out =
-            gemma4v_patch_embed_forward(&patches, &weight, n_patches, inner, hidden).unwrap();
+        let out = gemma4v_patch_embed_forward(&patches, &weight, n_patches, inner, hidden).unwrap();
         assert_eq!(out.len(), (n_patches * hidden) as usize);
 
         // Spot-check one cell against the formula directly.
@@ -4804,10 +4750,7 @@ mod tests {
             expect += patches[n * in_us + i] * weight[o * in_us + i];
         }
         let got = out[n * (hidden as usize) + o];
-        assert!(
-            (got - expect).abs() < 1e-5,
-            "got {got} expect {expect}"
-        );
+        assert!((got - expect).abs() < 1e-5, "got {got} expect {expect}");
     }
 
     #[test]
@@ -4837,8 +4780,8 @@ mod tests {
         // Table[0] (X-axis): rows [10,11,12,13], [20,21,22,23], [30,31,32,33]
         // Table[1] (Y-axis): rows [40,41,42,43], [50,51,52,53], [60,61,62,63]
         let pe: Vec<f32> = vec![
-            10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0, 30.0, 31.0, 32.0, 33.0,
-            40.0, 41.0, 42.0, 43.0, 50.0, 51.0, 52.0, 53.0, 60.0, 61.0, 62.0, 63.0,
+            10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0, 30.0, 31.0, 32.0, 33.0, 40.0, 41.0,
+            42.0, 43.0, 50.0, 51.0, 52.0, 53.0, 60.0, 61.0, 62.0, 63.0,
         ];
         // 4 patches at (x, y) = (0,0), (1,0), (0,1), (2,2).
         let pos_x = vec![0u32, 1, 0, 2];
@@ -4873,8 +4816,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let pe = vec![0f32; 12];
         // Mismatched pos arrays.
-        let err =
-            gemma4v_position_embed_lookup(&[0u32, 1], &[0u32], &pe, 3, 2).unwrap_err();
+        let err = gemma4v_position_embed_lookup(&[0u32, 1], &[0u32], &pe, 3, 2).unwrap_err();
         assert!(format!("{err}").contains("pos_x.len()"));
         // Wrong table size.
         let err2 = gemma4v_position_embed_lookup(&[0u32], &[0u32], &pe, 7, 2).unwrap_err();
@@ -4885,7 +4827,7 @@ mod tests {
     fn gemma4v_position_embed_add_in_place() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut patch_embeds = vec![1.0_f32; 8]; // [2, 4]
-        // pos_size=2, hidden=4 → table is 16 floats.
+                                                 // pos_size=2, hidden=4 → table is 16 floats.
         let pe: Vec<f32> = vec![
             // X-table:
             1.0, 2.0, 3.0, 4.0, // row 0
@@ -4915,24 +4857,27 @@ mod tests {
         let in_features = 4usize;
         let out_features = 2usize;
         let input: Vec<f32> = vec![
-            -1.0, 2.0, 3.0, 4.0,
-             5.0, -6.0, 7.0, 8.0,
-            -9.0, 10.0, -11.0, 12.0,
+            -1.0, 2.0, 3.0, 4.0, 5.0, -6.0, 7.0, 8.0, -9.0, 10.0, -11.0, 12.0,
         ];
-        let weight: Vec<f32> = vec![
-            0.1, 0.2, 0.3, 0.4,
-            0.5, 0.6, 0.7, 0.8,
-        ];
+        let weight: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
         let bounds = Gemma4ClippableLinearBounds::default();
         assert!(!bounds.any());
 
         let plain =
             linear_forward(&input, &weight, None, batch, in_features, out_features).unwrap();
         let clipped = gemma4v_clippable_linear_forward(
-            &input, &weight, &bounds, batch, in_features, out_features,
+            &input,
+            &weight,
+            &bounds,
+            batch,
+            in_features,
+            out_features,
         )
         .unwrap();
-        assert_eq!(plain, clipped, "no-bounds clippable_linear must match plain linear");
+        assert_eq!(
+            plain, clipped,
+            "no-bounds clippable_linear must match plain linear"
+        );
     }
 
     #[test]
@@ -4951,7 +4896,12 @@ mod tests {
             output_max: None,
         };
         let out = gemma4v_clippable_linear_forward(
-            &input, &weight, &bounds, batch, in_features, out_features,
+            &input,
+            &weight,
+            &bounds,
+            batch,
+            in_features,
+            out_features,
         )
         .unwrap();
         // Expected: clamp(-100, -1, 1) = -1, then dot([- 1, 1, 1, 1], [1, 1, 1, 1]) = 2.
@@ -4974,7 +4924,12 @@ mod tests {
             output_max: Some(3.0),
         };
         let out = gemma4v_clippable_linear_forward(
-            &input, &weight, &bounds, batch, in_features, out_features,
+            &input,
+            &weight,
+            &bounds,
+            batch,
+            in_features,
+            out_features,
         )
         .unwrap();
         // After input clamp: [2, 2, 2, 2]. dot = 8. Output clamped to 3.

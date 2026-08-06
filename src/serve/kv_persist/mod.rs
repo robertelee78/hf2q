@@ -37,12 +37,20 @@ pub mod writer;
 #[allow(unused_imports)]
 pub use block_store::{DiskBlockStore, WriteJob, MAX_BLOCK_BYTES};
 #[allow(unused_imports)]
+pub use format::{
+    compute_block_hash, compute_model_fingerprint, read_envelope_body, read_envelope_header,
+    write_envelope, BlockHash, CacheFormatVersion, EnvelopeHeader, ModelFingerprint,
+    ParentBlockHash, BLOCK_TOKENS, CURRENT_FORMAT_VERSION,
+};
+#[allow(unused_imports)]
+pub use index::{BlockIndex, BlockMeta};
+#[allow(unused_imports)]
+pub use loader_wrapper::LoaderWrapper;
+#[allow(unused_imports)]
 pub use metrics::{
     KvCacheMetricsSink, KvQuarantineReason, KV_EVICTION_TRIGGERS, KV_EVICTION_TRIGGER_COUNT,
     KV_QUARANTINE_REASONS, KV_QUARANTINE_REASON_COUNT,
 };
-#[allow(unused_imports)]
-pub use loader_wrapper::LoaderWrapper;
 #[allow(unused_imports)]
 pub use recovery::{
     quarantine_corrupted_block, quarantine_corrupted_block_with_counters, recover_from_disk,
@@ -54,14 +62,6 @@ pub use registry::KvPersistRegistry;
 pub use spiller::{BlockPrefixCacheSpiller, KvCacheSpill, StubGemma4Spill};
 #[allow(unused_imports)]
 pub use writer::{AsyncWriterHandle, DEFAULT_CHANNEL_CAPACITY};
-#[allow(unused_imports)]
-pub use format::{
-    compute_block_hash, compute_model_fingerprint, read_envelope_body, read_envelope_header,
-    write_envelope, BlockHash, CacheFormatVersion, EnvelopeHeader, ModelFingerprint,
-    ParentBlockHash, BLOCK_TOKENS, CURRENT_FORMAT_VERSION,
-};
-#[allow(unused_imports)]
-pub use index::{BlockIndex, BlockMeta};
 
 // ---------------------------------------------------------------------------
 // EngineBindable — Phase C.1 additive trait surface for binding the live

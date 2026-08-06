@@ -14,9 +14,9 @@
 //! - After all tokens: extract last-row logits, argmax → first decode token
 
 use anyhow::Result;
-use mlx_native::MlxBuffer;
-use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
+use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
+use mlx_native::MlxBuffer;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -271,10 +271,18 @@ pub fn build_qwen3vl_positions(
         // wrong channel — `t_chan[q]` now panics cleanly on bounds error
         // instead of silently corrupting `y_chan`.
         let mut channels = flat.chunks_exact_mut(prompt_len);
-        let t_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
-        let y_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
-        let x_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
-        let z_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let t_chan = channels
+            .next()
+            .expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let y_chan = channels
+            .next()
+            .expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let x_chan = channels
+            .next()
+            .expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let z_chan = channels
+            .next()
+            .expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
 
         // Global temporal counter — advances by 1 for every text token, by
         // `max(n_x, n_y)` for every image chunk.
@@ -291,10 +299,10 @@ pub fn build_qwen3vl_positions(
                 for i in 0..n_tokens {
                     let q = p + i;
                     let i_i32 = i as i32;
-                    t_chan[q] = t_img;                  // t (constant)
-                    y_chan[q] = t_img + (i_i32 / n_x);  // y
-                    x_chan[q] = t_img + (i_i32 % n_x);  // x
-                    z_chan[q] = 0;                      // z
+                    t_chan[q] = t_img; // t (constant)
+                    y_chan[q] = t_img + (i_i32 / n_x); // y
+                    x_chan[q] = t_img + (i_i32 % n_x); // x
+                    z_chan[q] = 0; // z
                 }
                 t_global += grid.temporal_advance() as i32;
                 p += n_tokens;
@@ -312,9 +320,9 @@ pub fn build_qwen3vl_positions(
     }
     Ok(flat)
 }
-use crate::inference::models::gemma4::{MlxModelWeights, DenseKvBuffers, HbKvBuffers, MlxKvCache};
+use super::config::LayerType;
+use super::gpu::GpuContext;
 use crate::inference::models::gemma4::kv_cache::{
-    MultiSeqHbKvBuffers, MultiSeqHybridKvBuffers,
     // ADR-040 iter-B4c-kernel iter-2C + iter-2D + iter-2-decode-D (2026-05-30) —
     // multi-seq scaffold types for the legacy 4-bit (cb_bits==0) +
     // dense F32 (HF2Q_USE_DENSE=1) opt-in pre-default surfaces.  Their
@@ -322,14 +330,16 @@ use crate::inference::models::gemma4::kv_cache::{
     // `alloc_multi_seq_dense_kv_for_layer`) are exposed for the
     // iter-C2c-cont-cont spawn-time provisioning Phase 3 (dense) +
     // Phase 4 (mlx) on `GemmaLoadedModel`.  See ADR-040 §6.1.46.
-    MultiSeqDenseKvBuffers, MultiSeqMlxKvCache,
+    MultiSeqDenseKvBuffers,
+    MultiSeqHbKvBuffers,
+    MultiSeqHybridKvBuffers,
+    MultiSeqMlxKvCache,
 };
+use crate::inference::models::gemma4::{DenseKvBuffers, HbKvBuffers, MlxKvCache, MlxModelWeights};
 use crate::serve::forward_mlx_shared::{
     dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
 use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
-use super::config::LayerType;
-use super::gpu::GpuContext;
 
 /// Helper: dump an F32 MlxBuffer's first `n_elems` to a file at dump_dir.
 fn write_dump_f32(
@@ -340,16 +350,21 @@ fn write_dump_f32(
     buf: &MlxBuffer,
     n_elems: usize,
 ) -> Result<()> {
-    let data: &[f32] = buf.as_slice()
+    let data: &[f32] = buf
+        .as_slice()
         .map_err(|e| anyhow::anyhow!("dump {name} L{layer} T{tok}: {e}"))?;
     let path = format!("{dump_dir}/hf2q_prefill_{name}_layer{layer:02}_tok{tok:03}.bin");
     let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8,
-            n_elems * std::mem::size_of::<f32>())
+        std::slice::from_raw_parts(
+            data.as_ptr() as *const u8,
+            n_elems * std::mem::size_of::<f32>(),
+        )
     };
-    std::fs::write(&path, bytes)
-        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-    eprintln!("[PREFILL DUMP] {} L{} T{} ({} f32) -> {}", name, layer, tok, n_elems, path);
+    std::fs::write(&path, bytes).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    eprintln!(
+        "[PREFILL DUMP] {} L{} T{} ({} f32) -> {}",
+        name, layer, tok, n_elems, path
+    );
     Ok(())
 }
 
@@ -519,7 +534,8 @@ impl MlxModelWeights {
             if st.range.start >= st.range.end {
                 anyhow::bail!(
                     "forward_prefill: soft_tokens[{}].range {:?} is empty or reversed",
-                    i, st.range
+                    i,
+                    st.range
                 );
             }
             let needed_bytes = st.range.len() * hs * 4;
@@ -527,7 +543,11 @@ impl MlxModelWeights {
                 anyhow::bail!(
                     "forward_prefill: soft_tokens[{}].embeddings byte_len={} < required {} \
                      ({} positions × {} hidden × 4 bytes)",
-                    i, st.embeddings.byte_len(), needed_bytes, st.range.len(), hs
+                    i,
+                    st.embeddings.byte_len(),
+                    needed_bytes,
+                    st.range.len(),
+                    hs
                 );
             }
         }
@@ -539,7 +559,10 @@ impl MlxModelWeights {
                 if a.start < b.end && b.start < a.end {
                     anyhow::bail!(
                         "forward_prefill: soft_tokens ranges overlap — [{}]={:?} vs [{}]={:?}",
-                        i, a, j, b
+                        i,
+                        a,
+                        j,
+                        b
                     );
                 }
             }
@@ -641,7 +664,11 @@ impl MlxModelWeights {
         // F32 remains the default; F16 is opt-in via HF2Q_F16_KV=1 for the
         // follow-up investigation into the F16-specific regression.
         let use_f16_kv = INVESTIGATION_ENV.f16_kv;
-        let kv_dtype = if use_f16_kv { mlx_native::DType::F16 } else { mlx_native::DType::F32 };
+        let kv_dtype = if use_f16_kv {
+            mlx_native::DType::F16
+        } else {
+            mlx_native::DType::F32
+        };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
         tracing::debug!("Prefill: KV cache dtype = {:?}", kv_dtype);
 
@@ -728,9 +755,10 @@ impl MlxModelWeights {
                 // at slot 0) + H182 (real slot routing landed for iter-2D
                 // dense F32).
                 if self.dense_kvs.is_some() {
-                    let cached_arcs = self.dense_kvs.take().expect(
-                        "iter-2D consume-gate: self.dense_kvs.is_some() validated above",
-                    );
+                    let cached_arcs = self
+                        .dense_kvs
+                        .take()
+                        .expect("iter-2D consume-gate: self.dense_kvs.is_some() validated above");
                     // "gemma-hybrid-lcp" SerialFifo leftover discipline
                     // (2026-08-03): when `slot_aware == false`, a stale
                     // mount from a PREVIOUS request is opportunistic
@@ -748,19 +776,18 @@ impl MlxModelWeights {
                     // multi-seq scaffold contract (iter-2D invariant).
                     let leftover_usable = !slot_aware
                         && cached_arcs.len() == num_layers
-                        && cached_arcs.iter().zip(self.layers.iter()).all(
-                            |(arc, layer)| {
-                                let layer_is_ring =
-                                    layer.layer_type == LayerType::Sliding;
+                        && cached_arcs
+                            .iter()
+                            .zip(self.layers.iter())
+                            .all(|(arc, layer)| {
+                                let layer_is_ring = layer.layer_type == LayerType::Sliding;
                                 let required_cap = if layer_is_ring {
                                     sliding_layer_capacity
                                 } else {
                                     linear_capacity
                                 };
-                                arc.capacity >= required_cap
-                                    && arc.is_sliding == layer_is_ring
-                            },
-                        );
+                                arc.capacity >= required_cap && arc.is_sliding == layer_is_ring
+                            });
                     if !leftover_usable && !slot_aware {
                         // Drop the stale mount, then run the SAME
                         // fresh-alloc body the None-mount branch uses.
@@ -776,10 +803,16 @@ impl MlxModelWeights {
                                 linear_capacity
                             };
                             let n = nkv * capacity * hd;
-                            let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                                .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
-                            let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                                .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
+                            let kbuf = dev
+                                .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                                .map_err(|e| {
+                                    anyhow::anyhow!("prefill dense K L{layer_idx}: {e}")
+                                })?;
+                            let vbuf = dev
+                                .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                                .map_err(|e| {
+                                    anyhow::anyhow!("prefill dense V L{layer_idx}: {e}")
+                                })?;
                             v.push(DenseKvBuffers {
                                 k: kbuf,
                                 v: vbuf,
@@ -790,56 +823,55 @@ impl MlxModelWeights {
                         }
                         v
                     } else {
-                    if cached_arcs.len() != num_layers {
-                        anyhow::bail!(
-                            "forward_prefill iter-2D consume-gate: cached dense_kvs len {} \
-                             != num_layers {}",
-                            cached_arcs.len(),
-                            num_layers
-                        );
-                    }
-                    let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-                    let mut cached_iter = cached_arcs.into_iter();
-                    for (layer_idx, layer) in self.layers.iter().enumerate() {
-                        let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                        let required_cap = if layer_is_ring {
-                            sliding_layer_capacity
-                        } else {
-                            linear_capacity
-                        };
-                        let cached_arc = cached_iter.next().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "forward_prefill iter-2D consume-gate: missing \
-                                 cached dense_kvs[layer={}]",
-                                layer_idx
-                            )
-                        })?;
-                        let cached_cap = cached_arc.capacity;
-                        if cached_cap < required_cap {
+                        if cached_arcs.len() != num_layers {
                             anyhow::bail!(
-                                "forward_prefill iter-2D consume-gate: cached \
+                                "forward_prefill iter-2D consume-gate: cached dense_kvs len {} \
+                             != num_layers {}",
+                                cached_arcs.len(),
+                                num_layers
+                            );
+                        }
+                        let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                        let mut cached_iter = cached_arcs.into_iter();
+                        for (layer_idx, layer) in self.layers.iter().enumerate() {
+                            let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                            let required_cap = if layer_is_ring {
+                                sliding_layer_capacity
+                            } else {
+                                linear_capacity
+                            };
+                            let cached_arc = cached_iter.next().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "forward_prefill iter-2D consume-gate: missing \
+                                 cached dense_kvs[layer={}]",
+                                    layer_idx
+                                )
+                            })?;
+                            let cached_cap = cached_arc.capacity;
+                            if cached_cap < required_cap {
+                                anyhow::bail!(
+                                    "forward_prefill iter-2D consume-gate: cached \
                                  dense_kvs[layer={}] capacity {} < required {} \
                                  (slot-aware mount requires scaffold capacity ≥ \
                                   request capacity; iter-C2c-cont-cont must \
                                   provision n_seqs × max_position_embeddings buffer)",
-                                layer_idx,
-                                cached_cap,
-                                required_cap
-                            );
-                        }
-                        if cached_arc.is_sliding != layer_is_ring {
-                            anyhow::bail!(
-                                "forward_prefill iter-2D consume-gate: cached \
+                                    layer_idx,
+                                    cached_cap,
+                                    required_cap
+                                );
+                            }
+                            if cached_arc.is_sliding != layer_is_ring {
+                                anyhow::bail!(
+                                    "forward_prefill iter-2D consume-gate: cached \
                                  dense_kvs[layer={}] is_sliding={} != model \
                                  layer is_sliding={} (slot-aware mount \
                                  architecture mismatch)",
-                                layer_idx,
-                                cached_arc.is_sliding,
-                                layer_is_ring
-                            );
-                        }
-                        let owned = std::sync::Arc::try_unwrap(cached_arc)
-                            .map_err(|_arc| {
+                                    layer_idx,
+                                    cached_arc.is_sliding,
+                                    layer_is_ring
+                                );
+                            }
+                            let owned = std::sync::Arc::try_unwrap(cached_arc).map_err(|_arc| {
                                 anyhow::anyhow!(
                                     "forward_prefill iter-2D consume-gate: \
                                      cached dense_kvs[layer={}] Arc not exclusive \
@@ -848,9 +880,9 @@ impl MlxModelWeights {
                                     layer_idx
                                 )
                             })?;
-                        v.push(owned);
-                    }
-                    v
+                            v.push(owned);
+                        }
+                        v
                     }
                 } else {
                     // Pre-iter-3 fresh-alloc path (byte-identical to the
@@ -876,9 +908,11 @@ impl MlxModelWeights {
                             linear_capacity
                         };
                         let n = nkv * capacity * hd;
-                        let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                        let kbuf = dev
+                            .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
                             .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
-                        let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                        let vbuf = dev
+                            .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
                             .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
                         v.push(DenseKvBuffers {
                             k: kbuf,
@@ -989,13 +1023,17 @@ impl MlxModelWeights {
         // Tmp buffer for flash_attn_vec (sized for largest layer config)
         let max_nh = self.num_attention_heads;
         let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
-        let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
-            max_nh as u32, max_hd as u32);
-        let sdpa_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
-            vec![tmp_bytes / 4])
+        let tmp_bytes =
+            mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(max_nh as u32, max_hd as u32);
+        let sdpa_tmp = dev
+            .alloc_buffer(tmp_bytes, mlx_native::DType::F32, vec![tmp_bytes / 4])
             .map_err(|e| anyhow::anyhow!("prefill sdpa_tmp: {e}"))?;
 
-        tracing::debug!("Prefill: {} tokens × {} layers (dense SDPA)", seq_len, num_layers);
+        tracing::debug!(
+            "Prefill: {} tokens × {} layers (dense SDPA)",
+            seq_len,
+            num_layers
+        );
 
         // iter-222 (ADR-005 closure, 2026-05-01): the iter-21 Track A
         // `leg_f_kvs` shadow-cache allocation block (~30 LOC) was deleted
@@ -1010,10 +1048,13 @@ impl MlxModelWeights {
         //   unset (DEFAULT) = 8-bit native HB SDPA
         //   "4"             = legacy 4-bit (no HB buffers)
         //   "5" | "6" | "8" = corresponding HB bits
-        let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+        let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref()
+        {
             Ok("4") => 0,
-            Ok("5") => 5, Ok("6") => 6, Ok("8") => 8,
-            _ => 8,  // DEFAULT: 8-bit
+            Ok("5") => 5,
+            Ok("6") => 6,
+            Ok("8") => 8,
+            _ => 8, // DEFAULT: 8-bit
         };
         if tq_codebook_bits_prefill >= 5 {
             // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V routing,
@@ -1072,7 +1113,8 @@ impl MlxModelWeights {
                 if self.hybrid_kv.is_none() {
                     eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit) [prefill]",
                         num_layers, tq_codebook_bits_prefill);
-                    let mut hybrid_vec: Vec<crate::inference::models::gemma4::HybridKvBuffers> = Vec::with_capacity(num_layers);
+                    let mut hybrid_vec: Vec<crate::inference::models::gemma4::HybridKvBuffers> =
+                        Vec::with_capacity(num_layers);
                     for (layer_idx, layer) in self.layers.iter().enumerate() {
                         let nkv = layer.num_kv_heads;
                         let hd = layer.head_dim;
@@ -1089,8 +1131,16 @@ impl MlxModelWeights {
                         } else {
                             linear_capacity
                         };
-                        hybrid_vec.push(crate::inference::models::gemma4::kv_cache::alloc_hybrid_kv_for_layer(
-                            dev, layer_idx, nkv, hd, capacity, layer_is_ring)?);
+                        hybrid_vec.push(
+                            crate::inference::models::gemma4::kv_cache::alloc_hybrid_kv_for_layer(
+                                dev,
+                                layer_idx,
+                                nkv,
+                                hd,
+                                capacity,
+                                layer_is_ring,
+                            )?,
+                        );
                     }
                     self.hybrid_kv = Some(hybrid_vec);
                 }
@@ -1140,8 +1190,10 @@ impl MlxModelWeights {
                 // path gate; SerialFifo byte-equivalence verified at the
                 // source-grep level via H86 sibling-signature pin).
                 if self.leg_hb_encoded.is_none() {
-                    eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers)",
-                              tq_codebook_bits_prefill, num_layers);
+                    eprintln!(
+                        "[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers)",
+                        tq_codebook_bits_prefill, num_layers
+                    );
                     let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
                     for (layer_idx, layer) in self.layers.iter().enumerate() {
                         let nkv = layer.num_kv_heads;
@@ -1150,21 +1202,58 @@ impl MlxModelWeights {
                         let capacity = if layer_is_ring { sw } else { linear_capacity };
                         let norms_per_pos = (hd / 256).max(1);
                         let norms_n = nkv * capacity * norms_per_pos;
-                        let k_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
-                            vec![nkv, capacity, hd])
-                            .map_err(|e| anyhow::anyhow!("leg_hb prefill K packed L{layer_idx}: {e}"))?;
-                        let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-                            if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
-                            .map_err(|e| anyhow::anyhow!("leg_hb prefill K norms L{layer_idx}: {e}"))?;
-                        let v_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
-                            vec![nkv, capacity, hd])
-                            .map_err(|e| anyhow::anyhow!("leg_hb prefill V packed L{layer_idx}: {e}"))?;
-                        let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-                            if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
-                            .map_err(|e| anyhow::anyhow!("leg_hb prefill V norms L{layer_idx}: {e}"))?;
+                        let k_packed = dev
+                            .alloc_buffer(
+                                nkv * capacity * hd,
+                                mlx_native::DType::U8,
+                                vec![nkv, capacity, hd],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("leg_hb prefill K packed L{layer_idx}: {e}")
+                            })?;
+                        let k_norms = dev
+                            .alloc_buffer(
+                                norms_n * 4,
+                                mlx_native::DType::F32,
+                                if norms_per_pos == 1 {
+                                    vec![nkv, capacity]
+                                } else {
+                                    vec![nkv, capacity, norms_per_pos]
+                                },
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("leg_hb prefill K norms L{layer_idx}: {e}")
+                            })?;
+                        let v_packed = dev
+                            .alloc_buffer(
+                                nkv * capacity * hd,
+                                mlx_native::DType::U8,
+                                vec![nkv, capacity, hd],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("leg_hb prefill V packed L{layer_idx}: {e}")
+                            })?;
+                        let v_norms = dev
+                            .alloc_buffer(
+                                norms_n * 4,
+                                mlx_native::DType::F32,
+                                if norms_per_pos == 1 {
+                                    vec![nkv, capacity]
+                                } else {
+                                    vec![nkv, capacity, norms_per_pos]
+                                },
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("leg_hb prefill V norms L{layer_idx}: {e}")
+                            })?;
                         leg_hb_vec.push(HbKvBuffers {
-                            k_packed, k_norms, v_packed, v_norms,
-                            capacity, is_sliding: layer_is_ring, norms_per_pos,
+                            k_packed,
+                            k_norms,
+                            v_packed,
+                            v_norms,
+                            capacity,
+                            is_sliding: layer_is_ring,
+                            norms_per_pos,
                         });
                     }
                     self.leg_hb_encoded = Some(leg_hb_vec);
@@ -1175,7 +1264,10 @@ impl MlxModelWeights {
                     // see file-level iter-222 closure note in `forward_mlx.rs`.
                     // `flash_attn_vec_tq_hb` reads `leg_hb_encoded` directly with no
                     // F32 round-trip.
-                    eprintln!("[iter-21 Track B] leg_hb_encoded ready ({} layers)", num_layers);
+                    eprintln!(
+                        "[iter-21 Track B] leg_hb_encoded ready ({} layers)",
+                        num_layers
+                    );
                 }
                 // ADR-040 iter-B4c-kernel iter-2A-cont: when
                 // `self.leg_hb_encoded.is_some()`, the slot-aware caller
@@ -1191,16 +1283,21 @@ impl MlxModelWeights {
         // Gated on HF2Q_DUMP_NORM_WEIGHT="layer" (e.g. "7"). Writes to HF2Q_DUMP_DIR.
         if let Some(target_l) = INVESTIGATION_ENV.dump_norm_weight {
             if target_l < num_layers {
-                let w: &[f32] = self.layers[target_l].norms.input_layernorm.as_slice()
+                let w: &[f32] = self.layers[target_l]
+                    .norms
+                    .input_layernorm
+                    .as_slice()
                     .map_err(|e| anyhow::anyhow!("norm weight read L{target_l}: {e}"))?;
                 let dir = &INVESTIGATION_ENV.dump_dir;
                 let path = format!("{dir}/hf2q_input_layernorm_weight_layer{target_l:02}.bin");
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
-                std::fs::write(&path, bytes)
-                    .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                eprintln!("[DUMP] input_layernorm weight L{target_l} [{}] f32 -> {}",
-                          w.len(), path);
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
+                std::fs::write(&path, bytes).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                eprintln!(
+                    "[DUMP] input_layernorm weight L{target_l} [{}] f32 -> {}",
+                    w.len(),
+                    path
+                );
             }
         }
 
@@ -1243,7 +1340,10 @@ impl MlxModelWeights {
         // zeroed once up front and never written. Cost: hs * 4 bytes wiped
         // once per forward_prefill call; <1 µs on M-series unified memory.
         if self.num_experts == 0 {
-            let buf = self.activations.moe_accum.as_mut_slice::<f32>()
+            let buf = self
+                .activations
+                .moe_accum
+                .as_mut_slice::<f32>()
                 .map_err(|e| anyhow::anyhow!("prefill dense moe_accum zero: {e}"))?;
             buf.fill(0.0);
         }
@@ -1253,7 +1353,10 @@ impl MlxModelWeights {
 
             // Write position buffer
             {
-                let pos_dst: &mut [u32] = self.activations.position.as_mut_slice()
+                let pos_dst: &mut [u32] = self
+                    .activations
+                    .position
+                    .as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("position write: {e}"))?;
                 pos_dst[0] = seq_pos as u32;
             }
@@ -1265,8 +1368,10 @@ impl MlxModelWeights {
                 let write_pos = self.kv_caches[layer_idx].write_pos;
                 let capacity = self.kv_caches[layer_idx].capacity;
                 self.kv_caches[layer_idx].write_pos += 1;
-                self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len
-                    .saturating_add(1).min(capacity);
+                self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx]
+                    .seq_len
+                    .saturating_add(1)
+                    .min(capacity);
                 let kv_seq_len = self.kv_caches[layer_idx].seq_len;
                 kv_info.push((is_sliding, write_pos, capacity, kv_seq_len));
             }
@@ -1275,7 +1380,8 @@ impl MlxModelWeights {
             // Single GPU session per token (same structure as forward_decode)
             // ===============================================================
             {
-                let mut s = exec.begin()
+                let mut s = exec
+                    .begin()
                     .map_err(|e| anyhow::anyhow!("prefill session T{tok_i}: {e}"))?;
 
                 // --- 1. Embedding ---
@@ -1290,32 +1396,40 @@ impl MlxModelWeights {
                 // (= `hs` consecutive F32s) from `embeddings` into
                 // `self.activations.hidden`.  Otherwise the standard
                 // language-model `embedding_gather_scale_f32` runs.
-                let soft_override = soft_tokens
-                    .iter()
-                    .find(|st| st.range.contains(&tok_i));
+                let soft_override = soft_tokens.iter().find(|st| st.range.contains(&tok_i));
                 if let Some(st) = soft_override {
                     let row_idx = tok_i - st.range.start;
                     let src_offset = row_idx * hs;
                     mlx_native::ops::copy::dispatch_copy_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         st.embeddings,
                         &self.activations.hidden,
                         src_offset,
                         0,
                         hs,
-                    ).map_err(|e| anyhow::anyhow!(
-                        "prefill soft-token copy T{tok_i} (range {:?}, row {}): {e}",
-                        st.range, row_idx
-                    ))?;
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "prefill soft-token copy T{tok_i} (range {:?}, row {}): {e}",
+                            st.range,
+                            row_idx
+                        )
+                    })?;
                     s.track_dispatch(&[st.embeddings], &[&self.activations.hidden]);
                 } else {
                     mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.embed_weight,
                         &self.activations.hidden,
-                        tok, hs,
+                        tok,
+                        hs,
                         (hs as f32).sqrt(),
-                    ).map_err(|e| anyhow::anyhow!("prefill embed T{tok_i}: {e}"))?;
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill embed T{tok_i}: {e}"))?;
                     s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
                 }
 
@@ -1326,58 +1440,115 @@ impl MlxModelWeights {
                     let nkv = layer.num_kv_heads;
                     let nh = self.num_attention_heads;
                     let is_sliding = layer.layer_type == LayerType::Sliding;
-                    let (kv_is_sliding, kv_write_pos, kv_capacity, _kv_seq_len) = kv_info[layer_idx];
+                    let (kv_is_sliding, kv_write_pos, kv_capacity, _kv_seq_len) =
+                        kv_info[layer_idx];
 
                     // Active dump flag for this iteration
                     let dump_here = prefill_dump == Some((layer_idx, tok_i));
                     // Dump at layer-start: hidden = L(layer_idx-1) l_out (or embed for L0)
                     if dump_here {
-                        s.finish()
-                            .map_err(|e| anyhow::anyhow!("prefill dump L{layer_idx} T{tok_i} start finish: {e}"))?;
-                        write_dump_f32(dump_dir, "pre_layer_hidden", layer_idx, tok_i,
-                                        &self.activations.hidden, hs)?;
-                        s = exec.begin()
+                        s.finish().map_err(|e| {
+                            anyhow::anyhow!("prefill dump L{layer_idx} T{tok_i} start finish: {e}")
+                        })?;
+                        write_dump_f32(
+                            dump_dir,
+                            "pre_layer_hidden",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.hidden,
+                            hs,
+                        )?;
+                        s = exec
+                            .begin()
                             .map_err(|e| anyhow::anyhow!("prefill dump restart: {e}"))?;
                     }
 
                     // -- Pre-attention norm --
                     s.barrier_between(
-                        &[&self.activations.hidden, &self.layers[layer_idx].norms.input_layernorm],
+                        &[
+                            &self.activations.hidden,
+                            &self.layers[layer_idx].norms.input_layernorm,
+                        ],
                         &[&self.activations.norm_out],
                     );
                     s.rms_norm(
-                        reg, metal_dev,
+                        reg,
+                        metal_dev,
                         &self.activations.hidden,
                         &self.layers[layer_idx].norms.input_layernorm,
                         &self.activations.norm_out,
                         &self.activations.norm_params,
-                        1, hs as u32,
-                    ).map_err(|e| anyhow::anyhow!("prefill norm L{layer_idx} T{tok_i}: {e}"))?;
+                        1,
+                        hs as u32,
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill norm L{layer_idx} T{tok_i}: {e}"))?;
 
                     if dump_here {
-                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(dump_dir, "post_input_norm", layer_idx, tok_i,
-                                        &self.activations.norm_out, hs)?;
-                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(
+                            dump_dir,
+                            "post_input_norm",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.norm_out,
+                            hs,
+                        )?;
+                        s = exec
+                            .begin()
+                            .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
                     // -- QKV projections (concurrent) --
                     s.barrier_between(
                         &[&self.activations.norm_out],
-                        &[&self.activations.attn_q, &self.activations.attn_k, &self.activations.attn_v],
+                        &[
+                            &self.activations.attn_q,
+                            &self.activations.attn_k,
+                            &self.activations.attn_v,
+                        ],
                     );
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_q", layer: layer_idx })?;
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_k", layer: layer_idx })?;
+                    dispatch_qmatmul(
+                        &mut s,
+                        reg,
+                        dev,
+                        &self.activations.norm_out,
+                        &self.layers[layer_idx].attn.q_proj,
+                        &mut self.activations.attn_q,
+                        1,
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "attn_q",
+                            layer: layer_idx,
+                        },
+                    )?;
+                    dispatch_qmatmul(
+                        &mut s,
+                        reg,
+                        dev,
+                        &self.activations.norm_out,
+                        &self.layers[layer_idx].attn.k_proj,
+                        &mut self.activations.attn_k,
+                        1,
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "attn_k",
+                            layer: layer_idx,
+                        },
+                    )?;
                     let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
                     if !v_is_k {
-                        dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                        dispatch_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &self.activations.norm_out,
                             self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                            &mut self.activations.attn_v, 1,
-                            crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_v", layer: layer_idx })?;
+                            &mut self.activations.attn_v,
+                            1,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_v",
+                                layer: layer_idx,
+                            },
+                        )?;
                     }
 
                     // -- Fused per-head RMS norm + RoPE on Q and K --
@@ -1395,40 +1566,86 @@ impl MlxModelWeights {
 
                     s.barrier_between(
                         &[&self.activations.attn_q, &self.activations.attn_k],
-                        &[&self.activations.attn_q_normed, &self.activations.attn_k_normed],
+                        &[
+                            &self.activations.attn_q_normed,
+                            &self.activations.attn_k_normed,
+                        ],
                     );
                     mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.attn_q,
                         &self.activations.attn_q_normed,
                         Some(&self.layers[layer_idx].attn.q_norm_weight),
                         &self.activations.position,
                         ff_gpu,
-                        nh as u32, hd as u32, half_rope,
-                        eps, theta,
-                    ).map_err(|e| anyhow::anyhow!("prefill Q norm+RoPE L{layer_idx} T{tok_i}: {e}"))?;
+                        nh as u32,
+                        hd as u32,
+                        half_rope,
+                        eps,
+                        theta,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("prefill Q norm+RoPE L{layer_idx} T{tok_i}: {e}")
+                    })?;
                     mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.attn_k,
                         &self.activations.attn_k_normed,
                         Some(&self.layers[layer_idx].attn.k_norm_weight),
                         &self.activations.position,
                         ff_gpu,
-                        nkv as u32, hd as u32, half_rope,
-                        eps, theta,
-                    ).map_err(|e| anyhow::anyhow!("prefill K norm+RoPE L{layer_idx} T{tok_i}: {e}"))?;
+                        nkv as u32,
+                        hd as u32,
+                        half_rope,
+                        eps,
+                        theta,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("prefill K norm+RoPE L{layer_idx} T{tok_i}: {e}")
+                    })?;
 
                     if dump_here {
-                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(dump_dir, "q_pre_normed", layer_idx, tok_i,
-                                        &self.activations.attn_q, nh * hd)?;
-                        write_dump_f32(dump_dir, "k_pre_normed", layer_idx, tok_i,
-                                        &self.activations.attn_k, nkv * hd)?;
-                        write_dump_f32(dump_dir, "q_normed", layer_idx, tok_i,
-                                        &self.activations.attn_q_normed, nh * hd)?;
-                        write_dump_f32(dump_dir, "k_normed", layer_idx, tok_i,
-                                        &self.activations.attn_k_normed, nkv * hd)?;
-                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(
+                            dump_dir,
+                            "q_pre_normed",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.attn_q,
+                            nh * hd,
+                        )?;
+                        write_dump_f32(
+                            dump_dir,
+                            "k_pre_normed",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.attn_k,
+                            nkv * hd,
+                        )?;
+                        write_dump_f32(
+                            dump_dir,
+                            "q_normed",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.attn_q_normed,
+                            nh * hd,
+                        )?;
+                        write_dump_f32(
+                            dump_dir,
+                            "k_normed",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.attn_k_normed,
+                            nkv * hd,
+                        )?;
+                        s = exec
+                            .begin()
+                            .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
                     // -- V norm --
@@ -1438,12 +1655,11 @@ impl MlxModelWeights {
                         &self.activations.norm_params_global_hd
                     };
                     if v_is_k {
-                        s.barrier_between(
-                            &[&self.activations.attn_k],
-                            &[&self.activations.attn_v],
-                        );
+                        s.barrier_between(&[&self.activations.attn_k], &[&self.activations.attn_v]);
                         dispatch_rms_norm_unit_perhead(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &RmsNormPerHeadArgs {
                                 input: &self.activations.attn_k,
                                 output: &self.activations.attn_v,
@@ -1458,7 +1674,9 @@ impl MlxModelWeights {
                             &[&self.activations.moe_expert_out],
                         );
                         dispatch_rms_norm_unit_perhead(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &RmsNormPerHeadArgs {
                                 input: &self.activations.attn_v,
                                 output: &self.activations.moe_expert_out,
@@ -1502,34 +1720,62 @@ impl MlxModelWeights {
                     );
                     if use_f16_kv {
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &self.activations.attn_k_normed,
                             &dense_kvs_vec[layer_idx].k,
-                            nkv as u32, hd as u32,
-                            layer_dense_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("prefill F16 K copy L{layer_idx} T{tok_i}: {e}"))?;
+                            nkv as u32,
+                            hd as u32,
+                            layer_dense_cap as u32,
+                            write_slot,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill F16 K copy L{layer_idx} T{tok_i}: {e}")
+                        })?;
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             v_src,
                             &dense_kvs_vec[layer_idx].v,
-                            nkv as u32, hd as u32,
-                            layer_dense_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("prefill F16 V copy L{layer_idx} T{tok_i}: {e}"))?;
+                            nkv as u32,
+                            hd as u32,
+                            layer_dense_cap as u32,
+                            write_slot,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill F16 V copy L{layer_idx} T{tok_i}: {e}")
+                        })?;
                     } else {
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &self.activations.attn_k_normed,
                             &dense_kvs_vec[layer_idx].k,
-                            nkv as u32, hd as u32,
-                            layer_dense_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("prefill F32 K batch copy L{layer_idx} T{tok_i}: {e}"))?;
+                            nkv as u32,
+                            hd as u32,
+                            layer_dense_cap as u32,
+                            write_slot,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill F32 K batch copy L{layer_idx} T{tok_i}: {e}")
+                        })?;
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             v_src,
                             &dense_kvs_vec[layer_idx].v,
-                            nkv as u32, hd as u32,
-                            layer_dense_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("prefill F32 V batch copy L{layer_idx} T{tok_i}: {e}"))?;
+                            nkv as u32,
+                            hd as u32,
+                            layer_dense_cap as u32,
+                            write_slot,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill F32 V batch copy L{layer_idx} T{tok_i}: {e}")
+                        })?;
                     }
 
                     // Also TQ-encode into packed cache (for subsequent decode)
@@ -1541,29 +1787,45 @@ impl MlxModelWeights {
                         };
                         s.barrier_between(
                             &[&self.activations.attn_k_normed, v_src],
-                            &[&self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
-                              &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
+                            &[
+                                &self.kv_caches[layer_idx].k_packed,
+                                &self.kv_caches[layer_idx].k_norms,
+                                &self.kv_caches[layer_idx].v_packed,
+                                &self.kv_caches[layer_idx].v_norms,
+                            ],
                         );
                         mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &self.activations.attn_k_normed,
                             &self.kv_caches[layer_idx].k_packed,
                             &self.kv_caches[layer_idx].k_norms,
-                            nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                            nkv as u32,
+                            hd as u32,
+                            kv_capacity as u32,
+                            cache_pos_val,
                             kv_is_sliding,
                             None, // scale_factor_d512: bare=1.0 for prefill
                             None, // rms_scratch: probe not used during prefill
-                        ).map_err(|e| anyhow::anyhow!("prefill TQ K L{layer_idx} T{tok_i}: {e}"))?;
+                        )
+                        .map_err(|e| anyhow::anyhow!("prefill TQ K L{layer_idx} T{tok_i}: {e}"))?;
                         mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             v_src,
                             &self.kv_caches[layer_idx].v_packed,
                             &self.kv_caches[layer_idx].v_norms,
-                            nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                            nkv as u32,
+                            hd as u32,
+                            kv_capacity as u32,
+                            cache_pos_val,
                             kv_is_sliding,
                             None, // scale_factor_d512: bare=1.0 for prefill
                             None, // rms_scratch: probe not used during prefill
-                        ).map_err(|e| anyhow::anyhow!("prefill TQ V L{layer_idx} T{tok_i}: {e}"))?;
+                        )
+                        .map_err(|e| anyhow::anyhow!("prefill TQ V L{layer_idx} T{tok_i}: {e}"))?;
                     }
 
                     // iter-222 (ADR-005 closure, 2026-05-01): the iter-21 Track A
@@ -1581,44 +1843,47 @@ impl MlxModelWeights {
                     // — the inline-fused HB SDPA kernel does not consume an
                     // F32 shadow.
                     if tq_codebook_bits_prefill >= 5 && !INVESTIGATION_ENV.skip_tq_encode {
-                    if INVESTIGATION_ENV.hybrid_kv {
-                        // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V
-                        // prefill encode path. F16 K copy + V-only TQ-HB encode.
-                        if let Some(ref hybrid_kv) = self.hybrid_kv {
-                            let hb_cap = hybrid_kv[layer_idx].capacity;
-                            let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
-                            // "gemma-hybrid-lcp" long-resume: LINEAR
-                            // sliding writes (slot=tok_i) when LONG_RESUME
-                            // is on — mirrors the dense leg's write_slot
-                            // branch at line ~1364. With the ring off,
-                            // slot == logical position for the
-                            // mask_type=2 hybrid SDPA kernel.
-                            let hb_write_slot = if hb_is_ring && !kv_lcp_long_resume {
-                                (tok_i % hb_cap) as u32
-                            } else {
-                                tok_i as u32
-                            };
-                            // F32 K → F16 K cache.
-                            s.barrier_between(
-                                &[&self.activations.attn_k_normed, v_src],
-                                &[&hybrid_kv[layer_idx].k,
-                                  &hybrid_kv[layer_idx].v_packed, &hybrid_kv[layer_idx].v_norms],
-                            );
-                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                        if INVESTIGATION_ENV.hybrid_kv {
+                            // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V
+                            // prefill encode path. F16 K copy + V-only TQ-HB encode.
+                            if let Some(ref hybrid_kv) = self.hybrid_kv {
+                                let hb_cap = hybrid_kv[layer_idx].capacity;
+                                let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
+                                // "gemma-hybrid-lcp" long-resume: LINEAR
+                                // sliding writes (slot=tok_i) when LONG_RESUME
+                                // is on — mirrors the dense leg's write_slot
+                                // branch at line ~1364. With the ring off,
+                                // slot == logical position for the
+                                // mask_type=2 hybrid SDPA kernel.
+                                let hb_write_slot = if hb_is_ring && !kv_lcp_long_resume {
+                                    (tok_i % hb_cap) as u32
+                                } else {
+                                    tok_i as u32
+                                };
+                                // F32 K → F16 K cache.
+                                s.barrier_between(
+                                    &[&self.activations.attn_k_normed, v_src],
+                                    &[
+                                        &hybrid_kv[layer_idx].k,
+                                        &hybrid_kv[layer_idx].v_packed,
+                                        &hybrid_kv[layer_idx].v_norms,
+                                    ],
+                                );
+                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                                 s.encoder_mut(), reg, metal_dev,
                                 &self.activations.attn_k_normed,
                                 &hybrid_kv[layer_idx].k,
                                 nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                             ).map_err(|e| anyhow::anyhow!("prefill hybrid F16 K L{layer_idx} T{tok_i}: {e}"))?;
-                            // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
-                            // FWHT V quantize.  See forward_mlx.rs ~L3724 for the
-                            // empirical justification — real gemma4 V has kurtosis
-                            // up to 72.88 and max|v| up to 14.63, far outside the
-                            // 8-bit Lloyd-Max codebook range (±5.07).  Hadamard
-                            // rotation distributes outliers across all 256 dims
-                            // before quantization.  SDPA-side fwht_sign_undo at
-                            // forward_mlx.rs's hybrid branch recovers raw output.
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                                // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
+                                // FWHT V quantize.  See forward_mlx.rs ~L3724 for the
+                                // empirical justification — real gemma4 V has kurtosis
+                                // up to 72.88 and max|v| up to 14.63, far outside the
+                                // 8-bit Lloyd-Max codebook range (±5.07).  Hadamard
+                                // rotation distributes outliers across all 256 dims
+                                // before quantization.  SDPA-side fwht_sign_undo at
+                                // forward_mlx.rs's hybrid branch recovers raw output.
+                                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
                                 s.encoder_mut(), reg, metal_dev,
                                 v_src,
                                 &hybrid_kv[layer_idx].v_packed,
@@ -1626,22 +1891,25 @@ impl MlxModelWeights {
                                 nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                                 hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
                             ).map_err(|e| anyhow::anyhow!("prefill hybrid V FWHT quant L{layer_idx} T{tok_i}: {e}"))?;
-                        }
-                    } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
-                        let hb_cap = leg_hb_enc[layer_idx].capacity;
-                        let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
-                        let hb_write_slot = if hb_is_ring {
-                            (tok_i % hb_cap) as u32
-                        } else {
-                            tok_i as u32
-                        };
+                            }
+                        } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
+                            let hb_cap = leg_hb_enc[layer_idx].capacity;
+                            let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
+                            let hb_write_slot = if hb_is_ring {
+                                (tok_i % hb_cap) as u32
+                            } else {
+                                tok_i as u32
+                            };
 
-                        // HB encode K → leg_hb_enc.k_packed
-                        s.barrier_between(
-                            &[&self.activations.attn_k_normed, v_src],
-                            &[&leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms],
-                        );
-                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            // HB encode K → leg_hb_enc.k_packed
+                            s.barrier_between(
+                                &[&self.activations.attn_k_normed, v_src],
+                                &[
+                                    &leg_hb_enc[layer_idx].k_packed,
+                                    &leg_hb_enc[layer_idx].k_norms,
+                                ],
+                            );
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
                             s.encoder_mut(), reg, metal_dev,
                             &self.activations.attn_k_normed,
                             &leg_hb_enc[layer_idx].k_packed,
@@ -1650,12 +1918,15 @@ impl MlxModelWeights {
                             hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
                         ).map_err(|e| anyhow::anyhow!("prefill hb_encode K L{layer_idx} T{tok_i}: {e}"))?;
 
-                        // HB encode V → leg_hb_enc.v_packed
-                        s.barrier_between(
-                            &[v_src],
-                            &[&leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
-                        );
-                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            // HB encode V → leg_hb_enc.v_packed
+                            s.barrier_between(
+                                &[v_src],
+                                &[
+                                    &leg_hb_enc[layer_idx].v_packed,
+                                    &leg_hb_enc[layer_idx].v_norms,
+                                ],
+                            );
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
                             s.encoder_mut(), reg, metal_dev,
                             v_src,
                             &leg_hb_enc[layer_idx].v_packed,
@@ -1663,7 +1934,7 @@ impl MlxModelWeights {
                             nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                             hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
                         ).map_err(|e| anyhow::anyhow!("prefill hb_encode V L{layer_idx} T{tok_i}: {e}"))?;
-                    } // end if let Some(leg_hb_enc)
+                        } // end if let Some(leg_hb_enc)
                     } // end if tq_codebook_bits_prefill >= 5
 
                     // ====================================================
@@ -1696,8 +1967,11 @@ impl MlxModelWeights {
                         (tok_i + 1) as u32
                     };
                     s.barrier_between(
-                        &[&self.activations.attn_q_normed,
-                          &dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
+                        &[
+                            &self.activations.attn_q_normed,
+                            &dense_kvs_vec[layer_idx].k,
+                            &dense_kvs_vec[layer_idx].v,
+                        ],
                         &[&self.activations.sdpa_out],
                     );
                     let (mask_type_val, sliding_window_val) = if use_linear_sliding {
@@ -1724,19 +1998,31 @@ impl MlxModelWeights {
                         q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
                     };
                     mlx_native::ops::flash_attn_vec::flash_attn_vec(
-                        s.encoder_mut(), reg, dev,
+                        s.encoder_mut(),
+                        reg,
+                        dev,
                         &self.activations.attn_q_normed,
                         &dense_kvs_vec[layer_idx].k,
                         &dense_kvs_vec[layer_idx].v,
                         &self.activations.sdpa_out,
                         &sdpa_tmp,
                         &p,
-                    ).map_err(|e| anyhow::anyhow!("prefill dense SDPA L{layer_idx} T{tok_i}: {e}"))?;
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("prefill dense SDPA L{layer_idx} T{tok_i}: {e}")
+                    })?;
 
                     if dump_here {
-                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(dump_dir, "sdpa_out", layer_idx, tok_i,
-                                        &self.activations.sdpa_out, nh * hd)?;
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(
+                            dump_dir,
+                            "sdpa_out",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.sdpa_out,
+                            nh * hd,
+                        )?;
                         // ADR-010 sub-stage dump: full dense K,V cache up to
                         // (and including) the target token, packed as
                         // [nkv, tok_i+1, hd] for comparison with llama's
@@ -1744,49 +2030,83 @@ impl MlxModelWeights {
                         if !use_f16_kv {
                             let cap = dense_kvs_vec[layer_idx].capacity;
                             let n_valid = tok_i + 1;
-                            let k_full: &[f32] = dense_kvs_vec[layer_idx].k.as_slice()
+                            let k_full: &[f32] = dense_kvs_vec[layer_idx]
+                                .k
+                                .as_slice()
                                 .map_err(|e| anyhow::anyhow!("dump K cache L{layer_idx}: {e}"))?;
-                            let v_full: &[f32] = dense_kvs_vec[layer_idx].v.as_slice()
+                            let v_full: &[f32] = dense_kvs_vec[layer_idx]
+                                .v
+                                .as_slice()
                                 .map_err(|e| anyhow::anyhow!("dump V cache L{layer_idx}: {e}"))?;
                             let mut k_valid = Vec::<f32>::with_capacity(nkv * n_valid * hd);
                             let mut v_valid = Vec::<f32>::with_capacity(nkv * n_valid * hd);
                             for h in 0..nkv {
                                 for p in 0..n_valid {
                                     let off = h * cap * hd + p * hd;
-                                    k_valid.extend_from_slice(&k_full[off..off+hd]);
-                                    v_valid.extend_from_slice(&v_full[off..off+hd]);
+                                    k_valid.extend_from_slice(&k_full[off..off + hd]);
+                                    v_valid.extend_from_slice(&v_full[off..off + hd]);
                                 }
                             }
-                            for (name, buf) in [("k_cache_upto", &k_valid), ("v_cache_upto", &v_valid)] {
+                            for (name, buf) in
+                                [("k_cache_upto", &k_valid), ("v_cache_upto", &v_valid)]
+                            {
                                 let path = format!(
                                     "{dump_dir}/hf2q_prefill_{name}_layer{layer_idx:02}_tok{tok_i:03}.bin");
                                 let bytes: &[u8] = unsafe {
                                     std::slice::from_raw_parts(
-                                        buf.as_ptr() as *const u8, buf.len() * 4) };
+                                        buf.as_ptr() as *const u8,
+                                        buf.len() * 4,
+                                    )
+                                };
                                 std::fs::write(&path, bytes)
                                     .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
                                 eprintln!(
                                     "[PREFILL DUMP] {} [{},{},{}] f32 -> {}",
-                                    name, nkv, n_valid, hd, path);
+                                    name, nkv, n_valid, hd, path
+                                );
                             }
                         }
-                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                        s = exec
+                            .begin()
+                            .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
                     // -- O-proj (same as decode) --
                     s.barrier_between(
-                        &[&self.activations.sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
+                        &[
+                            &self.activations.sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj.buffer,
+                        ],
                         &[&self.activations.attn_out],
                     );
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
-                        &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_output", layer: layer_idx })?;
+                    dispatch_qmatmul(
+                        &mut s,
+                        reg,
+                        dev,
+                        &self.activations.sdpa_out,
+                        &self.layers[layer_idx].attn.o_proj,
+                        &mut self.activations.attn_out,
+                        1,
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "attn_output",
+                            layer: layer_idx,
+                        },
+                    )?;
 
                     if dump_here {
-                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(dump_dir, "attn_out_pre_resid", layer_idx, tok_i,
-                                        &self.activations.attn_out, hs)?;
-                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(
+                            dump_dir,
+                            "attn_out_pre_resid",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.attn_out,
+                            hs,
+                        )?;
+                        s = exec
+                            .begin()
+                            .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
                     // -- Fused post-attention norm + residual add --
@@ -1795,19 +2115,33 @@ impl MlxModelWeights {
                         &[&self.activations.residual],
                     );
                     mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.hidden,
                         &self.activations.attn_out,
                         &self.layers[layer_idx].norms.post_attention_layernorm,
                         &self.activations.residual,
-                        hs as u32, 1, eps,
-                    ).map_err(|e| anyhow::anyhow!("prefill post-attn L{layer_idx} T{tok_i}: {e}"))?;
+                        hs as u32,
+                        1,
+                        eps,
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill post-attn L{layer_idx} T{tok_i}: {e}"))?;
 
                     if dump_here {
-                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(dump_dir, "residual", layer_idx, tok_i,
-                                        &self.activations.residual, hs)?;
-                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(
+                            dump_dir,
+                            "residual",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.residual,
+                            hs,
+                        )?;
+                        s = exec
+                            .begin()
+                            .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
                     // ============================================================
@@ -1819,38 +2153,64 @@ impl MlxModelWeights {
                     // B8: pre-FF norms [3 concurrent]
                     s.barrier_between(
                         &[&self.activations.residual],
-                        &[&self.activations.norm_out, &self.activations.moe_norm_out,
-                          &self.activations.router_norm_out],
+                        &[
+                            &self.activations.norm_out,
+                            &self.activations.moe_norm_out,
+                            &self.activations.router_norm_out,
+                        ],
                     );
-                    s.rms_norm(reg, metal_dev,
+                    s.rms_norm(
+                        reg,
+                        metal_dev,
                         &self.activations.residual,
                         &self.layers[layer_idx].norms.pre_feedforward_layernorm,
                         &self.activations.norm_out,
-                        &self.activations.norm_params, 1, hs as u32,
-                    ).map_err(|e| anyhow::anyhow!("prefill pre-FF1 L{layer_idx} T{tok_i}: {e}"))?;
-                    s.rms_norm(reg, metal_dev,
+                        &self.activations.norm_params,
+                        1,
+                        hs as u32,
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill pre-FF1 L{layer_idx} T{tok_i}: {e}"))?;
+                    s.rms_norm(
+                        reg,
+                        metal_dev,
                         &self.activations.residual,
                         &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
                         &self.activations.moe_norm_out,
-                        &self.activations.norm_params, 1, hs as u32,
-                    ).map_err(|e| anyhow::anyhow!("prefill pre-FF2 L{layer_idx} T{tok_i}: {e}"))?;
+                        &self.activations.norm_params,
+                        1,
+                        hs as u32,
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill pre-FF2 L{layer_idx} T{tok_i}: {e}"))?;
                     // ADR-038 G4-CFA-5f: router norm/proj read MoE-only weights
                     // that are 1-element placeholders on dense GGUFs. Skip both.
                     if num_experts > 0 {
-                        s.rms_norm(reg, metal_dev,
+                        s.rms_norm(
+                            reg,
+                            metal_dev,
                             &self.activations.residual,
                             &self.layers[layer_idx].moe.router_combined_weight,
                             &self.activations.router_norm_out,
-                            &self.activations.norm_params, 1, hs as u32,
-                        ).map_err(|e| anyhow::anyhow!("prefill router norm L{layer_idx} T{tok_i}: {e}"))?;
+                            &self.activations.norm_params,
+                            1,
+                            hs as u32,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill router norm L{layer_idx} T{tok_i}: {e}")
+                        })?;
                     }
 
                     // B9: gate + up + (router if MoE) [2 or 3 concurrent]
                     if num_experts > 0 {
                         s.barrier_between(
-                            &[&self.activations.norm_out, &self.activations.router_norm_out],
-                            &[&self.activations.mlp_gate, &self.activations.mlp_up,
-                              &self.activations.moe_router_logits],
+                            &[
+                                &self.activations.norm_out,
+                                &self.activations.router_norm_out,
+                            ],
+                            &[
+                                &self.activations.mlp_gate,
+                                &self.activations.mlp_up,
+                                &self.activations.moe_router_logits,
+                            ],
                         );
                     } else {
                         s.barrier_between(
@@ -1858,26 +2218,61 @@ impl MlxModelWeights {
                             &[&self.activations.mlp_gate, &self.activations.mlp_up],
                         );
                     }
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate", layer: layer_idx })?;
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_up", layer: layer_idx })?;
+                    dispatch_qmatmul(
+                        &mut s,
+                        reg,
+                        dev,
+                        &self.activations.norm_out,
+                        &self.layers[layer_idx].mlp.gate_proj,
+                        &mut self.activations.mlp_gate,
+                        1,
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "ffn_gate",
+                            layer: layer_idx,
+                        },
+                    )?;
+                    dispatch_qmatmul(
+                        &mut s,
+                        reg,
+                        dev,
+                        &self.activations.norm_out,
+                        &self.layers[layer_idx].mlp.up_proj,
+                        &mut self.activations.mlp_up,
+                        1,
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "ffn_up",
+                            layer: layer_idx,
+                        },
+                    )?;
                     if num_experts > 0 {
-                        dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
+                        dispatch_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &self.activations.router_norm_out,
                             &self.layers[layer_idx].moe.router_proj,
-                            &mut self.activations.moe_router_logits, 1,
-                            crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate_inp", layer: layer_idx })?;
+                            &mut self.activations.moe_router_logits,
+                            1,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "ffn_gate_inp",
+                                layer: layer_idx,
+                            },
+                        )?;
                     }
 
                     // B10: gelu_mul (+ moe_routing if MoE)
                     if num_experts > 0 {
                         s.barrier_between(
-                            &[&self.activations.mlp_gate, &self.activations.mlp_up,
-                              &self.activations.moe_router_logits],
-                            &[&self.activations.mlp_fused,
-                              &self.activations.moe_expert_ids, &self.activations.moe_routing_weights_gpu],
+                            &[
+                                &self.activations.mlp_gate,
+                                &self.activations.mlp_up,
+                                &self.activations.moe_router_logits,
+                            ],
+                            &[
+                                &self.activations.mlp_fused,
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_routing_weights_gpu,
+                            ],
                         );
                     } else {
                         s.barrier_between(
@@ -1890,7 +2285,8 @@ impl MlxModelWeights {
                         let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
                         let pipeline = reg.get_pipeline("fused_gelu_mul", metal_dev)?;
                         encode_with_args(
-                            s.encoder_mut(), pipeline,
+                            s.encoder_mut(),
+                            pipeline,
                             &[
                                 (0, KernelArg::Buffer(&self.activations.mlp_gate)),
                                 (1, KernelArg::Buffer(&self.activations.mlp_up)),
@@ -1899,18 +2295,27 @@ impl MlxModelWeights {
                             ],
                             mlx_native::MTLSize::new(self.intermediate_size as u64, 1, 1),
                             mlx_native::MTLSize::new(
-                                std::cmp::min(256, self.intermediate_size as u64), 1, 1),
+                                std::cmp::min(256, self.intermediate_size as u64),
+                                1,
+                                1,
+                            ),
                         );
                     }
                     if num_experts > 0 {
                         mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &self.activations.moe_router_logits,
                             &self.activations.moe_expert_ids,
                             &self.activations.moe_routing_weights_gpu,
                             &self.layers[layer_idx].moe.per_expert_scale,
-                            num_experts as u32, top_k as u32,
-                        ).map_err(|e| anyhow::anyhow!("prefill MoE routing L{layer_idx} T{tok_i}: {e}"))?;
+                            num_experts as u32,
+                            top_k as u32,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill MoE routing L{layer_idx} T{tok_i}: {e}")
+                        })?;
                     }
 
                     // MoE expert dispatch (fused _id path) — MoE only
@@ -1919,27 +2324,46 @@ impl MlxModelWeights {
                         && (self.layers[layer_idx].moe.stacked_gate_up.is_none()
                             || self.layers[layer_idx].moe.stacked_down.is_none())
                     {
-                        anyhow::bail!("Prefill requires fused _id path (stacked weights) at L{layer_idx}");
+                        anyhow::bail!(
+                            "Prefill requires fused _id path (stacked weights) at L{layer_idx}"
+                        );
                     }
 
                     // B11: dense down + gate_up_id
                     s.barrier_between(
-                        &[&self.activations.mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
+                        &[
+                            &self.activations.mlp_fused,
+                            &self.layers[layer_idx].mlp.down_proj.buffer,
+                        ],
                         &[&self.activations.mlp_down],
                     );
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                        &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_down", layer: layer_idx })?;
+                    dispatch_qmatmul(
+                        &mut s,
+                        reg,
+                        dev,
+                        &self.activations.mlp_fused,
+                        &self.layers[layer_idx].mlp.down_proj,
+                        &mut self.activations.mlp_down,
+                        1,
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "ffn_down",
+                            layer: layer_idx,
+                        },
+                    )?;
 
                     if num_experts > 0 {
                         let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
                         s.barrier_between(
-                            &[&self.activations.moe_norm_out, &self.activations.moe_expert_ids,
-                              self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
+                            &[
+                                &self.activations.moe_norm_out,
+                                &self.activations.moe_expert_ids,
+                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                            ],
                             &[&self.activations.moe_gate_up_id_out],
                         );
                         s.quantized_matmul_id_ggml(
-                            reg, dev,
+                            reg,
+                            dev,
                             &self.activations.moe_norm_out,
                             self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
                             &self.activations.moe_expert_ids,
@@ -1953,7 +2377,10 @@ impl MlxModelWeights {
                                 expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
                                 ggml_type: ggml_type_gu,
                             },
-                        ).map_err(|e| anyhow::anyhow!("prefill gate_up_id L{layer_idx} T{tok_i}: {e}"))?;
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill gate_up_id L{layer_idx} T{tok_i}: {e}")
+                        })?;
 
                         // B12: swiglu
                         s.barrier_between(
@@ -1961,21 +2388,31 @@ impl MlxModelWeights {
                             &[&self.activations.moe_swiglu_id_out],
                         );
                         mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &self.activations.moe_gate_up_id_out,
                             &self.activations.moe_swiglu_id_out,
-                            moe_int, top_k,
-                        ).map_err(|e| anyhow::anyhow!("prefill swiglu L{layer_idx} T{tok_i}: {e}"))?;
+                            moe_int,
+                            top_k,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill swiglu L{layer_idx} T{tok_i}: {e}")
+                        })?;
 
                         // B13: down_id
                         let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
                         s.barrier_between(
-                            &[&self.activations.moe_swiglu_id_out, &self.activations.moe_expert_ids,
-                              self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
+                            &[
+                                &self.activations.moe_swiglu_id_out,
+                                &self.activations.moe_expert_ids,
+                                self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                            ],
                             &[&self.activations.moe_down_id_out],
                         );
                         s.quantized_matmul_id_ggml(
-                            reg, dev,
+                            reg,
+                            dev,
                             &self.activations.moe_swiglu_id_out,
                             self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
                             &self.activations.moe_expert_ids,
@@ -1989,34 +2426,48 @@ impl MlxModelWeights {
                                 expert_stride: self.layers[layer_idx].moe.down_expert_stride,
                                 ggml_type: ggml_type_dn,
                             },
-                        ).map_err(|e| anyhow::anyhow!("prefill down_id L{layer_idx} T{tok_i}: {e}"))?;
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill down_id L{layer_idx} T{tok_i}: {e}")
+                        })?;
                     }
 
-                    s.barrier_between(
-                        &[&self.activations.mlp_down],
-                        &[&self.activations.attn_out],
-                    );
-                    s.rms_norm(reg, metal_dev,
+                    s.barrier_between(&[&self.activations.mlp_down], &[&self.activations.attn_out]);
+                    s.rms_norm(
+                        reg,
+                        metal_dev,
                         &self.activations.mlp_down,
                         &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
                         &self.activations.attn_out,
-                        &self.activations.norm_params, 1, hs as u32,
-                    ).map_err(|e| anyhow::anyhow!("prefill post-FF1 L{layer_idx} T{tok_i}: {e}"))?;
+                        &self.activations.norm_params,
+                        1,
+                        hs as u32,
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill post-FF1 L{layer_idx} T{tok_i}: {e}"))?;
 
                     // B14: weighted_sum — MoE only. On dense, moe_accum was
                     // zeroed once before the per-token loop (G4-CFA-5f).
                     if num_experts > 0 {
                         s.barrier_between(
-                            &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
+                            &[
+                                &self.activations.moe_down_id_out,
+                                &self.activations.moe_routing_weights_gpu,
+                            ],
                             &[&self.activations.moe_accum],
                         );
                         mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
-                            s.encoder_mut(), reg, metal_dev,
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
                             &self.activations.moe_down_id_out,
                             &self.activations.moe_routing_weights_gpu,
                             &self.activations.moe_accum,
-                            hs, top_k,
-                        ).map_err(|e| anyhow::anyhow!("prefill weighted_sum L{layer_idx} T{tok_i}: {e}"))?;
+                            hs,
+                            top_k,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill weighted_sum L{layer_idx} T{tok_i}: {e}")
+                        })?;
                     }
 
                     // Post-FF norm2 + combine
@@ -2025,13 +2476,18 @@ impl MlxModelWeights {
                         &[&self.activations.mlp_down],
                     );
                     mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.attn_out,
                         &self.activations.moe_accum,
                         &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
                         &self.activations.mlp_down,
-                        hs as u32, 1, eps,
-                    ).map_err(|e| anyhow::anyhow!("prefill post-FF2 L{layer_idx} T{tok_i}: {e}"))?;
+                        hs as u32,
+                        1,
+                        eps,
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill post-FF2 L{layer_idx} T{tok_i}: {e}"))?;
 
                     // End-of-layer: norm + residual + scalar
                     let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
@@ -2040,21 +2496,35 @@ impl MlxModelWeights {
                         &[&self.activations.hidden],
                     );
                     mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.residual,
                         &self.activations.mlp_down,
                         &self.layers[layer_idx].norms.post_feedforward_layernorm,
                         &self.activations.hidden,
                         &self.layers[layer_idx].layer_scalar,
-                        1, hs as u32, eps,
+                        1,
+                        hs as u32,
+                        eps,
                         scalar_is_vector,
-                    ).map_err(|e| anyhow::anyhow!("prefill end-layer L{layer_idx} T{tok_i}: {e}"))?;
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill end-layer L{layer_idx} T{tok_i}: {e}"))?;
 
                     if dump_here {
-                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(dump_dir, "l_out", layer_idx, tok_i,
-                                        &self.activations.hidden, hs)?;
-                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(
+                            dump_dir,
+                            "l_out",
+                            layer_idx,
+                            tok_i,
+                            &self.activations.hidden,
+                            hs,
+                        )?;
+                        s = exec
+                            .begin()
+                            .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
                 }
 
@@ -2073,13 +2543,21 @@ impl MlxModelWeights {
                         let nkv = layer.num_kv_heads;
                         let (kv_is_sliding, _kv_write_pos, kv_capacity, kv_seq_len) = kv_info[li];
                         let hd_half = hd / 2;
-                        let k_raw: &[u8] = self.kv_caches[li].k_packed.as_slice()
+                        let k_raw: &[u8] = self.kv_caches[li]
+                            .k_packed
+                            .as_slice()
                             .map_err(|e| anyhow::anyhow!("tq_dump nb k_packed L{li}: {e}"))?;
-                        let v_raw: &[u8] = self.kv_caches[li].v_packed.as_slice()
+                        let v_raw: &[u8] = self.kv_caches[li]
+                            .v_packed
+                            .as_slice()
                             .map_err(|e| anyhow::anyhow!("tq_dump nb v_packed L{li}: {e}"))?;
-                        let k_norms_raw: &[f32] = self.kv_caches[li].k_norms.as_slice()
+                        let k_norms_raw: &[f32] = self.kv_caches[li]
+                            .k_norms
+                            .as_slice()
                             .map_err(|e| anyhow::anyhow!("tq_dump nb k_norms L{li}: {e}"))?;
-                        let v_norms_raw: &[f32] = self.kv_caches[li].v_norms.as_slice()
+                        let v_norms_raw: &[f32] = self.kv_caches[li]
+                            .v_norms
+                            .as_slice()
                             .map_err(|e| anyhow::anyhow!("tq_dump nb v_norms L{li}: {e}"))?;
                         let mut k_tight = vec![0u8; nkv * kv_seq_len * hd_half];
                         let mut v_tight = vec![0u8; nkv * kv_seq_len * hd_half];
@@ -2108,17 +2586,25 @@ impl MlxModelWeights {
                             .map_err(|e| anyhow::anyhow!("write {kp}: {e}"))?;
                         std::fs::write(&vp, &v_tight)
                             .map_err(|e| anyhow::anyhow!("write {vp}: {e}"))?;
-                        eprintln!("[TQ_DUMP] k_packed L{li:02} [{nkv},{kv_seq_len},{hd_half}] u8 -> {kp}");
-                        eprintln!("[TQ_DUMP] v_packed L{li:02} [{nkv},{kv_seq_len},{hd_half}] u8 -> {vp}");
+                        eprintln!(
+                            "[TQ_DUMP] k_packed L{li:02} [{nkv},{kv_seq_len},{hd_half}] u8 -> {kp}"
+                        );
+                        eprintln!(
+                            "[TQ_DUMP] v_packed L{li:02} [{nkv},{kv_seq_len},{hd_half}] u8 -> {vp}"
+                        );
                         let kn = format!("{dir}/hf2q_k_norms_layer{li:02}_pos{kv_seq_len}.f32.bin");
                         let vn = format!("{dir}/hf2q_v_norms_layer{li:02}_pos{kv_seq_len}.f32.bin");
                         let kn_bytes: &[u8] = unsafe {
                             std::slice::from_raw_parts(
-                                kn_tight.as_ptr() as *const u8, kn_tight.len() * 4)
+                                kn_tight.as_ptr() as *const u8,
+                                kn_tight.len() * 4,
+                            )
                         };
                         let vn_bytes: &[u8] = unsafe {
                             std::slice::from_raw_parts(
-                                vn_tight.as_ptr() as *const u8, vn_tight.len() * 4)
+                                vn_tight.as_ptr() as *const u8,
+                                vn_tight.len() * 4,
+                            )
                         };
                         std::fs::write(&kn, kn_bytes)
                             .map_err(|e| anyhow::anyhow!("write {kn}: {e}"))?;
@@ -2147,7 +2633,8 @@ impl MlxModelWeights {
                             .map_err(|e| anyhow::anyhow!("write {mp}: {e}"))?;
                         eprintln!("[TQ_DUMP] meta L{li:02} -> {mp}");
                     }
-                    s = exec.begin()
+                    s = exec
+                        .begin()
                         .map_err(|e| anyhow::anyhow!("tq_dump nonbatched re-begin: {e}"))?;
                 }
 
@@ -2156,12 +2643,17 @@ impl MlxModelWeights {
                     &[&self.activations.hidden, &self.final_norm],
                     &[&self.activations.norm_out],
                 );
-                s.rms_norm(reg, metal_dev,
+                s.rms_norm(
+                    reg,
+                    metal_dev,
                     &self.activations.hidden,
                     &self.final_norm,
                     &self.activations.norm_out,
-                    &self.activations.norm_params, 1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("prefill final norm T{tok_i}: {e}"))?;
+                    &self.activations.norm_params,
+                    1,
+                    hs as u32,
+                )
+                .map_err(|e| anyhow::anyhow!("prefill final norm T{tok_i}: {e}"))?;
 
                 // ADR-028 iter-188: prefer Q6_K-native lm_head (HF2Q_LMHEAD_Q6K=1).
                 if let Some(ref q6k) = self.lm_head_q6k {
@@ -2170,74 +2662,96 @@ impl MlxModelWeights {
                         &[&self.activations.logits],
                     );
                     crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                        &mut s, reg, dev,
+                        &mut s,
+                        reg,
+                        dev,
                         &self.activations.norm_out,
                         q6k,
                         &mut self.activations.logits,
                         1,
                         crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                    ).map_err(|e| anyhow::anyhow!("prefill lm_head Q6_K T{tok_i}: {e}"))?;
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill lm_head Q6_K T{tok_i}: {e}"))?;
                 } else if let Some(ref q8) = self.lm_head_q8 {
                     s.barrier_between(
                         &[&self.activations.norm_out, &q8.buffer],
                         &[&self.activations.logits],
                     );
                     crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                        &mut s, reg, dev,
+                        &mut s,
+                        reg,
+                        dev,
                         &self.activations.norm_out,
                         q8,
                         &mut self.activations.logits,
                         1,
                         crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                    ).map_err(|e| anyhow::anyhow!("prefill lm_head Q8 T{tok_i}: {e}"))?;
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill lm_head Q8 T{tok_i}: {e}"))?;
                 } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
                     s.barrier_between(
                         &[&self.activations.norm_out, lm_head_f16],
                         &[&self.activations.logits],
                     );
                     mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.norm_out,
                         lm_head_f16,
                         &self.activations.logits,
-                        &DenseGemmF16Params { m: 1, n: vocab_size as u32, k: hs as u32 },
-                    ).map_err(|e| anyhow::anyhow!("prefill lm_head T{tok_i}: {e}"))?;
+                        &DenseGemmF16Params {
+                            m: 1,
+                            n: vocab_size as u32,
+                            k: hs as u32,
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill lm_head T{tok_i}: {e}"))?;
                 } else {
                     anyhow::bail!("Prefill requires GPU lm_head (F16 or Q8 weight)");
                 }
 
                 if let Some(cap) = self.final_logit_softcapping {
-                    s.barrier_between(
-                        &[&self.activations.logits],
-                        &[&self.activations.logits],
-                    );
+                    s.barrier_between(&[&self.activations.logits], &[&self.activations.logits]);
                     mlx_native::ops::softcap::dispatch_softcap(
-                        s.encoder_mut(), reg, metal_dev,
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
                         &self.activations.logits,
                         &self.activations.logits,
                         &self.activations.softcap_params,
                         cap,
-                    ).map_err(|e| anyhow::anyhow!("prefill softcap T{tok_i}: {e}"))?;
+                    )
+                    .map_err(|e| anyhow::anyhow!("prefill softcap T{tok_i}: {e}"))?;
                 }
 
                 s.barrier_between(
                     &[&self.activations.logits],
-                    &[&self.activations.argmax_index, &self.activations.argmax_value],
+                    &[
+                        &self.activations.argmax_index,
+                        &self.activations.argmax_value,
+                    ],
                 );
                 mlx_native::ops::argmax::dispatch_argmax_f32(
-                    s.encoder_mut(), reg, metal_dev,
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
                     &self.activations.logits,
                     &self.activations.argmax_index,
                     &self.activations.argmax_value,
                     &self.activations.argmax_params,
                     vocab_size as u32,
-                ).map_err(|e| anyhow::anyhow!("prefill argmax T{tok_i}: {e}"))?;
+                )
+                .map_err(|e| anyhow::anyhow!("prefill argmax T{tok_i}: {e}"))?;
 
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("prefill finish T{tok_i}: {e}"))?;
 
                 last_token = {
-                    let idx: &[u32] = self.activations.argmax_index.as_slice()
+                    let idx: &[u32] = self
+                        .activations
+                        .argmax_index
+                        .as_slice()
                         .map_err(|e| anyhow::anyhow!("prefill argmax read T{tok_i}: {e}"))?;
                     idx[0]
                 };
@@ -2342,30 +2856,28 @@ impl MlxModelWeights {
         // HB-encoded opt-out regime (neither flag) stays byte-identical
         // to pre-sub-iter: no snapshot, no store (its packed-K leg has
         // no restore path this sub-iter).
-        let lcp_resumable_regime = crate::debug::INVESTIGATION_ENV.use_dense
-            || self.hybrid_kv.is_some();
+        let lcp_resumable_regime =
+            crate::debug::INVESTIGATION_ENV.use_dense || self.hybrid_kv.is_some();
         // Pre-copy budget gate (2026-08-03): estimate the dual-leg entry
         // bytes from shapes BEFORE allocating ~2×live-KV of snapshot
         // copies; skip when the entry cannot fit the registry budget
         // (97K-token dual-leg ≈ 64 GB → swap-storm, measured live).
-        let lcp_snap_cap_est = sw.max(seq_len + max_decode_tokens
-            + if kv_lcp_long_resume { 4096 } else { 0 });
+        let lcp_snap_cap_est =
+            sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
         let lcp_est_bytes: u64 = {
             let dense: u64 = self
                 .layers
                 .iter()
                 .map(|l| {
-                    (2 * l.num_kv_heads * lcp_snap_cap_est * l.head_dim
-                        * kv_elem_bytes) as u64
+                    (2 * l.num_kv_heads * lcp_snap_cap_est * l.head_dim * kv_elem_bytes) as u64
                 })
                 .sum();
             let hybrid: u64 = if self.hybrid_kv.is_some() {
                 self.layers
                     .iter()
                     .map(|l| {
-                        (l.num_kv_heads
-                            * lcp_snap_cap_est
-                            * (l.head_dim * 2 + l.head_dim + 4)) as u64
+                        (l.num_kv_heads * lcp_snap_cap_est * (l.head_dim * 2 + l.head_dim + 4))
+                            as u64
                     })
                     .sum()
             } else {
@@ -2374,12 +2886,8 @@ impl MlxModelWeights {
             dense + hybrid
         };
         let lcp_fits_budget =
-            crate::serve::kv_persist::lcp_registry::gemma_lcp_snapshot_fits_budget(
-                lcp_est_bytes,
-            );
-        if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-            && lcp_resumable_regime
-            && !lcp_fits_budget
+            crate::serve::kv_persist::lcp_registry::gemma_lcp_snapshot_fits_budget(lcp_est_bytes);
+        if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && lcp_resumable_regime && !lcp_fits_budget
         {
             tracing::debug!(
                 "lcp_snapshot skipped (budget): est entry {} bytes > registry budget                  ({} bytes) — snapshots skipped, registry stays without this prompt",
@@ -2395,8 +2903,7 @@ impl MlxModelWeights {
             {
                 // Allocate fresh per-layer buffers + memcpy bytes from
                 // each live `dense_kvs_vec[i]` into the new snapshot.
-                let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> =
-                    Vec::with_capacity(num_layers);
+                let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> = Vec::with_capacity(num_layers);
                 // ADR-017 Phase E.a iter-3.5d + iter-7 — snapshot
                 // capacity policy.
                 //
@@ -2426,11 +2933,16 @@ impl MlxModelWeights {
                 // 2031). +4096 under long-resume keeps typical turn
                 // growth admissible; only the snapshot over-allocates,
                 // the per-request live buffers stay exact.
-                let snap_cap = sw.max(seq_len + max_decode_tokens
-                    + if kv_lcp_long_resume { 4096 } else { 0 });
+                let snap_cap =
+                    sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
                 for live_layer in dense_kvs_vec.iter() {
                     let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
-                    let live_cap_dim = live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                    let live_cap_dim = live_layer
+                        .k
+                        .shape()
+                        .get(1)
+                        .copied()
+                        .unwrap_or(live_layer.capacity);
                     let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
                     let elem_bytes_layer = live_layer.dtype.size_of();
                     // Snapshot-side capacity = sw for both layer
@@ -2441,10 +2953,18 @@ impl MlxModelWeights {
                     let snap_nbytes = nkv_dim * snap_cap * hd_dim * elem_bytes_layer;
                     let live_nbytes = nkv_dim * live_cap_dim * hd_dim * elem_bytes_layer;
                     let mut k_snap = dev
-                        .alloc_buffer(snap_nbytes, live_layer.dtype, vec![nkv_dim, snap_cap, hd_dim])
+                        .alloc_buffer(
+                            snap_nbytes,
+                            live_layer.dtype,
+                            vec![nkv_dim, snap_cap, hd_dim],
+                        )
                         .map_err(|e| anyhow::anyhow!("snapshot K alloc: {e}"))?;
                     let mut v_snap = dev
-                        .alloc_buffer(snap_nbytes, live_layer.dtype, vec![nkv_dim, snap_cap, hd_dim])
+                        .alloc_buffer(
+                            snap_nbytes,
+                            live_layer.dtype,
+                            vec![nkv_dim, snap_cap, hd_dim],
+                        )
                         .map_err(|e| anyhow::anyhow!("snapshot V alloc: {e}"))?;
                     // CPU memcpy via StorageModeShared. Copy length
                     // is `seq_len * nkv * hd * elem_bytes` (only the
@@ -2547,7 +3067,8 @@ impl MlxModelWeights {
                          snapshot can faithfully reconstruct [0..K). The \
                          engine-side guard at engine.rs:4516 also skips \
                          store; both guards stay aligned.",
-                        seq_len, sw
+                        seq_len,
+                        sw
                     );
                 }
                 None
@@ -2576,15 +3097,20 @@ impl MlxModelWeights {
                     // Same capacity policy as the dense snapshot
                     // (mirrors line ~2229): sw headroom for short
                     // prompts, seq_len + decode for long ones.
-                    let snap_cap = sw.max(seq_len + max_decode_tokens
-                    + if kv_lcp_long_resume { 4096 } else { 0 });
+                    let snap_cap = sw.max(
+                        seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
+                    );
                     let mut hsnap: Vec<
                         std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
                     > = Vec::with_capacity(live_hybrid.len());
                     for live_layer in live_hybrid.iter() {
                         let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
-                        let live_cap_dim =
-                            live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                        let live_cap_dim = live_layer
+                            .k
+                            .shape()
+                            .get(1)
+                            .copied()
+                            .unwrap_or(live_layer.capacity);
                         let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
                         let npp = live_layer.norms_per_pos.max(1);
                         // K: F16 (2 B/elem); v_packed: U8 (1 B/elem);
@@ -2687,12 +3213,7 @@ impl MlxModelWeights {
             // for the hybrid leg snapshot.
             self.hybrid_kv_snapshot_for_lcp = hybrid_snapshot_for_lcp;
 
-            self.dense_kvs = Some(
-                dense_kvs_vec
-                    .into_iter()
-                    .map(std::sync::Arc::new)
-                    .collect(),
-            );
+            self.dense_kvs = Some(dense_kvs_vec.into_iter().map(std::sync::Arc::new).collect());
             self.dense_sdpa_tmp = Some(sdpa_tmp);
         } else {
             drop(snapshot_for_lcp);
@@ -3080,7 +3601,10 @@ impl MlxModelWeights {
             // Surface the typed MultiSeqError variant inside an anyhow
             // chain so the worker arm's logging hooks see both the
             // structured variant + the diagnostic context.
-            let err = MultiSeqError::SlotOutOfRange { slot: slot_id, max_slots: n_seqs };
+            let err = MultiSeqError::SlotOutOfRange {
+                slot: slot_id,
+                max_slots: n_seqs,
+            };
             anyhow::bail!(
                 "forward_prefill_with_soft_tokens_slot_aware: slot_id={} out of range \
                  (n_seqs={}). ADR-040 iter-B4c-kernel iter-2A bounds-first contract — \
@@ -3243,37 +3767,53 @@ impl MlxModelWeights {
                 let elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(hd))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "dense slot-view elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dense slot-view elem count overflow at L{layer_idx} \
                          (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2D"
-                    ))?;
+                        )
+                    })?;
                 let bytes_per_slot: u64 = (elems_per_slot as u64)
                     .checked_mul(dtype_size as u64)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "dense slot-view byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dense slot-view byte size overflow at L{layer_idx} \
                          (dtype_size={}) — ADR-040 iter-B4c-kernel iter-2D",
-                        dtype_size,
-                    ))?;
-                let byte_offset: u64 = (slot_id.0 as u64)
-                    .checked_mul(bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "dense slot-view byte offset overflow at L{layer_idx} \
+                            dtype_size,
+                        )
+                    })?;
+                let byte_offset: u64 =
+                    (slot_id.0 as u64)
+                        .checked_mul(bytes_per_slot)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "dense slot-view byte offset overflow at L{layer_idx} \
                          (slot_id={} bytes_per_slot={}) \
                          — ADR-040 iter-B4c-kernel iter-2D",
-                        slot_id.0, bytes_per_slot,
-                    ))?;
-                let k_view = buf.k.slice_view(byte_offset, elems_per_slot)
+                                slot_id.0,
+                                bytes_per_slot,
+                            )
+                        })?;
+                let k_view = buf
+                    .k
+                    .slice_view(byte_offset, elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "dense slot-view K with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "dense slot-view K with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2D"
-                    ))?;
-                let v_view = buf.v.slice_view(byte_offset, elems_per_slot)
+                        )
+                    })?;
+                let v_view = buf
+                    .v
+                    .slice_view(byte_offset, elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "dense slot-view V with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "dense slot-view V with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2D"
-                    ))?;
+                        )
+                    })?;
 
                 // Construct the legacy single-seq `DenseKvBuffers`
                 // wrapper around the slot-views (mirror of iter-2A-cont
@@ -3442,8 +3982,7 @@ impl MlxModelWeights {
             // 1278-1283` alloc layout: packed = `[nkv, cap, hd/2]`;
             // norms = `[nkv, cap]` (norms_per_pos==1) or
             // `[nkv, cap, norms_per_pos]` (otherwise).
-            let mut slot_view_kv: Vec<MlxKvCache> =
-                Vec::with_capacity(multi_seq_kv_mlx.len());
+            let mut slot_view_kv: Vec<MlxKvCache> = Vec::with_capacity(multi_seq_kv_mlx.len());
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let nkv = layer.num_kv_heads;
                 let hd = layer.head_dim;
@@ -3455,73 +3994,96 @@ impl MlxModelWeights {
                 let packed_elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(hd_half))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "MLX slot-view packed elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MLX slot-view packed elem count overflow at L{layer_idx} \
                          (nkv={nkv} cap={cap} hd_half={hd_half}) \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
+                        )
+                    })?;
                 let packed_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "MLX slot-view packed byte offset overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MLX slot-view packed byte offset overflow at L{layer_idx} \
                          (slot_id={} packed_elems_per_slot={}) \
                          — ADR-040 iter-B4c-kernel iter-2C",
-                        slot_id.0, packed_elems_per_slot,
-                    ))?;
-                let k_packed_view = buf.k_packed
+                            slot_id.0,
+                            packed_elems_per_slot,
+                        )
+                    })?;
+                let k_packed_view = buf
+                    .k_packed
                     .slice_view(packed_byte_offset, packed_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd_half])
-                    .map_err(|e| anyhow::anyhow!(
-                        "MLX slot-view K_packed with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "MLX slot-view K_packed with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
-                let v_packed_view = buf.v_packed
+                        )
+                    })?;
+                let v_packed_view = buf
+                    .v_packed
                     .slice_view(packed_byte_offset, packed_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd_half])
-                    .map_err(|e| anyhow::anyhow!(
-                        "MLX slot-view V_packed with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "MLX slot-view V_packed with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
+                        )
+                    })?;
                 // K_norms / V_norms (F32 = 4 bytes/elem).
                 let norms_elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(norms_per_pos))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "MLX slot-view norms elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MLX slot-view norms elem count overflow at L{layer_idx} \
                          (nkv={nkv} cap={cap} norms_per_pos={norms_per_pos}) \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
+                        )
+                    })?;
                 let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
                     .checked_mul(4u64) // F32 = 4 bytes/elem
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "MLX slot-view norms byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MLX slot-view norms byte size overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
+                        )
+                    })?;
                 let norms_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(norms_bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
+                    .ok_or_else(|| {
+                    anyhow::anyhow!(
                         "MLX slot-view norms byte offset overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
+                    )
+                })?;
                 let norms_shape = if norms_per_pos == 1 {
                     vec![nkv, cap]
                 } else {
                     vec![nkv, cap, norms_per_pos]
                 };
-                let k_norms_view = buf.k_norms
+                let k_norms_view = buf
+                    .k_norms
                     .slice_view(norms_byte_offset, norms_elems_per_slot)
                     .with_shape(norms_shape.clone())
-                    .map_err(|e| anyhow::anyhow!(
-                        "MLX slot-view K_norms with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "MLX slot-view K_norms with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
-                let v_norms_view = buf.v_norms
+                        )
+                    })?;
+                let v_norms_view = buf
+                    .v_norms
                     .slice_view(norms_byte_offset, norms_elems_per_slot)
                     .with_shape(norms_shape)
-                    .map_err(|e| anyhow::anyhow!(
-                        "MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2C"
-                    ))?;
+                        )
+                    })?;
 
                 // Construct legacy single-seq `MlxKvCache` wrapper
                 // around the 4 slot-views.  Mirror of iter-2A-cont
@@ -3772,9 +4334,9 @@ impl MlxModelWeights {
                 .iter()
                 .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some());
             if xlen_engaged {
-                let all_consistent = multi_seq_kv_hybrid.iter().all(|buf| {
-                    buf.bf16_xlen_k.is_some() && buf.bf16_xlen_v.is_some()
-                });
+                let all_consistent = multi_seq_kv_hybrid
+                    .iter()
+                    .all(|buf| buf.bf16_xlen_k.is_some() && buf.bf16_xlen_v.is_some());
                 if !all_consistent {
                     let err = MultiSeqError::CapabilityUnsupported {
                         capability: "gemma4-forward-prefill-slot-N-hybrid-xlen-mixed-presence (iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.47 — alloc-helper invariant violation: bf16_xlen_k/v must be Some on ALL layers or NONE, never mixed; if you see this in production, gemma4/kv_cache.rs:1102-1115 lost atomicity across layer-vec alloc loop)",
@@ -3804,9 +4366,8 @@ impl MlxModelWeights {
             //     lines 971-999).
             //   * V_norms: F32 (or 4-byte dummy when full_f16_v=1).
             //     `norms_per_pos = max(1, hd/256)`.
-            let mut slot_view_hybrid: Vec<
-                crate::inference::models::gemma4::HybridKvBuffers,
-            > = Vec::with_capacity(multi_seq_kv_hybrid.len());
+            let mut slot_view_hybrid: Vec<crate::inference::models::gemma4::HybridKvBuffers> =
+                Vec::with_capacity(multi_seq_kv_hybrid.len());
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let nkv = layer.num_kv_heads;
                 let hd = layer.head_dim;
@@ -3816,29 +4377,40 @@ impl MlxModelWeights {
                 let k_elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(hd))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "slot-view K elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "slot-view K elem count overflow at L{layer_idx} \
                          (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2B"
-                    ))?;
+                        )
+                    })?;
                 let k_bytes_per_slot: u64 = (k_elems_per_slot as u64)
                     .checked_mul(2u64) // F16 = 2 bytes/elem
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "slot-view K byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "slot-view K byte size overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2B"
-                    ))?;
+                        )
+                    })?;
                 let k_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(k_bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "slot-view K byte offset overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "slot-view K byte offset overflow at L{layer_idx} \
                          (slot_id={} k_bytes_per_slot={}) — ADR-040 iter-B4c-kernel iter-2B",
-                        slot_id.0, k_bytes_per_slot,
-                    ))?;
-                let k_view = buf.k.slice_view(k_byte_offset, k_elems_per_slot)
+                            slot_id.0,
+                            k_bytes_per_slot,
+                        )
+                    })?;
+                let k_view = buf
+                    .k
+                    .slice_view(k_byte_offset, k_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "slot-view K with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "slot-view K with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2B"
-                    ))?;
+                        )
+                    })?;
 
                 // V: dtype-aware.  U8 (TQ-packed) → 1 byte/elem;
                 // F16 → 2 bytes/elem.  `.dtype().size_of()` is the
@@ -3846,23 +4418,31 @@ impl MlxModelWeights {
                 let v_dtype_size = buf.v_packed.dtype().size_of();
                 let v_bytes_per_slot: u64 = (k_elems_per_slot as u64)
                     .checked_mul(v_dtype_size as u64)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "slot-view V byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "slot-view V byte size overflow at L{layer_idx} \
                          (v_dtype_size={}) — ADR-040 iter-B4c-kernel iter-2B",
-                        v_dtype_size,
-                    ))?;
+                            v_dtype_size,
+                        )
+                    })?;
                 let v_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(v_bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "slot-view V byte offset overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "slot-view V byte offset overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2B"
-                    ))?;
-                let v_view = buf.v_packed.slice_view(v_byte_offset, k_elems_per_slot)
+                        )
+                    })?;
+                let v_view = buf
+                    .v_packed
+                    .slice_view(v_byte_offset, k_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "slot-view V with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "slot-view V with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2B"
-                    ))?;
+                        )
+                    })?;
 
                 // V_norms: F32 (4 bytes/elem) with shape
                 // `[nkv, cap, norms_per_pos]` per the multi-seq
@@ -3877,43 +4457,55 @@ impl MlxModelWeights {
                     // 4-byte F32 buffer (kernel's v_is_f16 FC=1 skips
                     // the read).  Match `alloc_hybrid_kv_for_layer`'s
                     // dummy shape `vec![1]`.
-                    buf.v_norms.slice_view(0, 1)
+                    buf.v_norms
+                        .slice_view(0, 1)
                         .with_shape(vec![1])
-                        .map_err(|e| anyhow::anyhow!(
-                            "slot-view V_norms (dummy) with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "slot-view V_norms (dummy) with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2B"
-                        ))?
+                            )
+                        })?
                 } else {
                     let norms_elems_per_slot: usize = nkv
                         .checked_mul(cap)
                         .and_then(|x| x.checked_mul(norms_per_pos))
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "slot-view V_norms elem count overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "slot-view V_norms elem count overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2B"
-                        ))?;
+                            )
+                        })?;
                     let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
                         .checked_mul(4u64) // F32 = 4 bytes/elem
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "slot-view V_norms byte size overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "slot-view V_norms byte size overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2B"
-                        ))?;
+                            )
+                        })?;
                     let norms_byte_offset: u64 = (slot_id.0 as u64)
                         .checked_mul(norms_bytes_per_slot)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "slot-view V_norms byte offset overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "slot-view V_norms byte offset overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2B"
-                        ))?;
+                            )
+                        })?;
                     let v_norms_shape = if norms_per_pos == 1 {
                         vec![nkv, cap]
                     } else {
                         vec![nkv, cap, norms_per_pos]
                     };
-                    buf.v_norms.slice_view(norms_byte_offset, norms_elems_per_slot)
+                    buf.v_norms
+                        .slice_view(norms_byte_offset, norms_elems_per_slot)
                         .with_shape(v_norms_shape)
-                        .map_err(|e| anyhow::anyhow!(
-                            "slot-view V_norms with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "slot-view V_norms with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2B"
-                        ))?
+                            )
+                        })?
                 };
 
                 // ADR-040 iter-B4c-kernel iter-2B-xlen — BF16 xlen K/V
@@ -3935,12 +4527,14 @@ impl MlxModelWeights {
                 // reads BF16 dtype from the slot-view's underlying
                 // Metal buffer; the slice_view preserves the dtype tag.
                 let (bf16_xlen_k_view, bf16_xlen_v_view) = if xlen_engaged {
-                    let xlen_bk = buf.bf16_xlen_k.as_ref().expect(
-                        "xlen consistency guard above: bf16_xlen_k Some",
-                    );
-                    let xlen_bv = buf.bf16_xlen_v.as_ref().expect(
-                        "xlen consistency guard above: bf16_xlen_v Some",
-                    );
+                    let xlen_bk = buf
+                        .bf16_xlen_k
+                        .as_ref()
+                        .expect("xlen consistency guard above: bf16_xlen_k Some");
+                    let xlen_bv = buf
+                        .bf16_xlen_v
+                        .as_ref()
+                        .expect("xlen consistency guard above: bf16_xlen_v Some");
                     // BF16 K + V share the same `[nkv, cap, hd]`
                     // per-slot layout as F16 K (alloc helper at
                     // `gemma4/kv_cache.rs:1102-1115`).  Per-slot
@@ -3949,32 +4543,41 @@ impl MlxModelWeights {
                     // path — identical formula).
                     let xlen_bytes_per_slot: u64 = (k_elems_per_slot as u64)
                         .checked_mul(2u64) // BF16 = 2 bytes/elem
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "slot-view BF16 xlen byte size overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "slot-view BF16 xlen byte size overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2B-xlen"
-                        ))?;
+                            )
+                        })?;
                     let xlen_byte_offset: u64 = (slot_id.0 as u64)
                         .checked_mul(xlen_bytes_per_slot)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "slot-view BF16 xlen byte offset overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "slot-view BF16 xlen byte offset overflow at L{layer_idx} \
                              (slot_id={} xlen_bytes_per_slot={}) \
                              — ADR-040 iter-B4c-kernel iter-2B-xlen",
-                            slot_id.0, xlen_bytes_per_slot,
-                        ))?;
+                                slot_id.0,
+                                xlen_bytes_per_slot,
+                            )
+                        })?;
                     let bk_view = xlen_bk
                         .slice_view(xlen_byte_offset, k_elems_per_slot)
                         .with_shape(vec![nkv, cap, hd])
-                        .map_err(|e| anyhow::anyhow!(
-                            "slot-view BF16 xlen K with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "slot-view BF16 xlen K with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2B-xlen"
-                        ))?;
+                            )
+                        })?;
                     let bv_view = xlen_bv
                         .slice_view(xlen_byte_offset, k_elems_per_slot)
                         .with_shape(vec![nkv, cap, hd])
-                        .map_err(|e| anyhow::anyhow!(
-                            "slot-view BF16 xlen V with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "slot-view BF16 xlen V with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2B-xlen"
-                        ))?;
+                            )
+                        })?;
                     (Some(bk_view), Some(bv_view))
                 } else {
                     (None, None)
@@ -3990,18 +4593,16 @@ impl MlxModelWeights {
                 // iter-2B-xlen sub-stage: bf16_xlen_k/v are Some(view)
                 // when HF2Q_DFLASH_XLEN_SDPA=1 was set at alloc time,
                 // else None (H193 default-path pin).
-                slot_view_hybrid.push(
-                    crate::inference::models::gemma4::HybridKvBuffers {
-                        k: k_view,
-                        v_packed: v_view,
-                        v_norms: v_norms_view,
-                        capacity: cap,
-                        is_sliding: buf.is_sliding,
-                        norms_per_pos,
-                        bf16_xlen_k: bf16_xlen_k_view,
-                        bf16_xlen_v: bf16_xlen_v_view,
-                    },
-                );
+                slot_view_hybrid.push(crate::inference::models::gemma4::HybridKvBuffers {
+                    k: k_view,
+                    v_packed: v_view,
+                    v_norms: v_norms_view,
+                    capacity: cap,
+                    is_sliding: buf.is_sliding,
+                    norms_per_pos,
+                    bf16_xlen_k: bf16_xlen_k_view,
+                    bf16_xlen_v: bf16_xlen_v_view,
+                });
             }
 
             // Mount the slot-view bundle on `self.hybrid_kv`.  Save the
@@ -4164,8 +4765,7 @@ impl MlxModelWeights {
         // byte-equivalence chain.
         //
         // Build per-layer slot-views + mount on self.leg_hb_encoded.
-        let mut slot_view_hb: Vec<HbKvBuffers> =
-            Vec::with_capacity(multi_seq_kv_hb.len());
+        let mut slot_view_hb: Vec<HbKvBuffers> = Vec::with_capacity(multi_seq_kv_hb.len());
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let nkv = layer.num_kv_heads;
             let hd = layer.head_dim;
@@ -4177,33 +4777,44 @@ impl MlxModelWeights {
             let packed_elems_per_slot: usize = nkv
                 .checked_mul(cap)
                 .and_then(|x| x.checked_mul(hd))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "HB slot-view packed elem count overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HB slot-view packed elem count overflow at L{layer_idx} \
                      (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
+                    )
+                })?;
             // K_packed / V_packed: U8 = 1 byte/elem.
             let packed_byte_offset: u64 = (slot_id.0 as u64)
                 .checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem
-                .ok_or_else(|| anyhow::anyhow!(
-                    "HB slot-view packed byte offset overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HB slot-view packed byte offset overflow at L{layer_idx} \
                      (slot_id={} packed_elems_per_slot={}) \
                      — ADR-040 iter-B4c-kernel iter-2A-cont",
-                    slot_id.0, packed_elems_per_slot,
-                ))?;
-            let k_packed_view = buf.k_packed
+                        slot_id.0,
+                        packed_elems_per_slot,
+                    )
+                })?;
+            let k_packed_view = buf
+                .k_packed
                 .slice_view(packed_byte_offset, packed_elems_per_slot)
                 .with_shape(vec![nkv, cap, hd])
-                .map_err(|e| anyhow::anyhow!(
-                    "HB slot-view K_packed with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "HB slot-view K_packed with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
-            let v_packed_view = buf.v_packed
+                    )
+                })?;
+            let v_packed_view = buf
+                .v_packed
                 .slice_view(packed_byte_offset, packed_elems_per_slot)
                 .with_shape(vec![nkv, cap, hd])
-                .map_err(|e| anyhow::anyhow!(
-                    "HB slot-view V_packed with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "HB slot-view V_packed with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
+                    )
+                })?;
 
             // K_norms / V_norms: F32 = 4 bytes/elem with shape
             // `[nkv, cap, norms_per_pos]` (or `[nkv, cap]` when
@@ -4214,42 +4825,54 @@ impl MlxModelWeights {
             let norms_elems_per_slot: usize = nkv
                 .checked_mul(cap)
                 .and_then(|x| x.checked_mul(norms_per_pos))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "HB slot-view norms elem count overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HB slot-view norms elem count overflow at L{layer_idx} \
                      (nkv={nkv} cap={cap} norms_per_pos={norms_per_pos}) \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
+                    )
+                })?;
             let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
                 .checked_mul(4u64) // F32 = 4 bytes/elem
-                .ok_or_else(|| anyhow::anyhow!(
-                    "HB slot-view norms byte size overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HB slot-view norms byte size overflow at L{layer_idx} \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
+                    )
+                })?;
             let norms_byte_offset: u64 = (slot_id.0 as u64)
                 .checked_mul(norms_bytes_per_slot)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "HB slot-view norms byte offset overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HB slot-view norms byte offset overflow at L{layer_idx} \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
+                    )
+                })?;
             let norms_shape = if norms_per_pos == 1 {
                 vec![nkv, cap]
             } else {
                 vec![nkv, cap, norms_per_pos]
             };
-            let k_norms_view = buf.k_norms
+            let k_norms_view = buf
+                .k_norms
                 .slice_view(norms_byte_offset, norms_elems_per_slot)
                 .with_shape(norms_shape.clone())
-                .map_err(|e| anyhow::anyhow!(
-                    "HB slot-view K_norms with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "HB slot-view K_norms with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
-            let v_norms_view = buf.v_norms
+                    )
+                })?;
+            let v_norms_view = buf
+                .v_norms
                 .slice_view(norms_byte_offset, norms_elems_per_slot)
                 .with_shape(norms_shape)
-                .map_err(|e| anyhow::anyhow!(
-                    "HB slot-view V_norms with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "HB slot-view V_norms with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2A-cont"
-                ))?;
+                    )
+                })?;
 
             // Construct the legacy single-seq `HbKvBuffers` wrapper
             // around the slot-views.  The sibling fn's consumer at
@@ -4476,8 +5099,15 @@ impl MlxModelWeights {
         multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
     ) -> Result<u32> {
         self.forward_decode_slot_aware_impl(
-            input_token, seq_pos, gpu, profile, slot_id,
-            multi_seq_kv_hb, multi_seq_kv_hybrid, multi_seq_kv_dense, multi_seq_kv_mlx,
+            input_token,
+            seq_pos,
+            gpu,
+            profile,
+            slot_id,
+            multi_seq_kv_hb,
+            multi_seq_kv_hybrid,
+            multi_seq_kv_dense,
+            multi_seq_kv_mlx,
             false,
         )
     }
@@ -4501,8 +5131,15 @@ impl MlxModelWeights {
         multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
     ) -> Result<()> {
         self.forward_decode_slot_aware_impl(
-            input_token, seq_pos, gpu, profile, slot_id,
-            multi_seq_kv_hb, multi_seq_kv_hybrid, multi_seq_kv_dense, multi_seq_kv_mlx,
+            input_token,
+            seq_pos,
+            gpu,
+            profile,
+            slot_id,
+            multi_seq_kv_hb,
+            multi_seq_kv_hybrid,
+            multi_seq_kv_dense,
+            multi_seq_kv_mlx,
             true,
         )
         .map(|_| ())
@@ -4565,7 +5202,10 @@ impl MlxModelWeights {
         }
         let n_seqs = multi_seq_kv_hb[0].n_seqs;
         if slot_id.0 >= n_seqs {
-            let err = MultiSeqError::SlotOutOfRange { slot: slot_id, max_slots: n_seqs };
+            let err = MultiSeqError::SlotOutOfRange {
+                slot: slot_id,
+                max_slots: n_seqs,
+            };
             anyhow::bail!(
                 "forward_decode_slot_aware: slot_id={} out of range \
                  (n_seqs={}). ADR-040 iter-B4c-kernel iter-2-decode-A bounds-first contract. {}",
@@ -4678,34 +5318,49 @@ impl MlxModelWeights {
                 let elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(hd))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode dense slot-view elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode dense slot-view elem count overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 let bytes_per_slot: u64 = (elems_per_slot as u64)
                     .checked_mul(dtype_size as u64)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode dense slot-view byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode dense slot-view byte size overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
-                let byte_offset: u64 = (slot_id.0 as u64)
-                    .checked_mul(bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode dense slot-view byte offset overflow at L{layer_idx} \
+                        )
+                    })?;
+                let byte_offset: u64 =
+                    (slot_id.0 as u64)
+                        .checked_mul(bytes_per_slot)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decode dense slot-view byte offset overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
-                let k_view = buf.k.slice_view(byte_offset, elems_per_slot)
+                            )
+                        })?;
+                let k_view = buf
+                    .k
+                    .slice_view(byte_offset, elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode dense slot-view K with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode dense slot-view K with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
-                let v_view = buf.v.slice_view(byte_offset, elems_per_slot)
+                        )
+                    })?;
+                let v_view = buf
+                    .v
+                    .slice_view(byte_offset, elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode dense slot-view V with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode dense slot-view V with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 slot_view_dense.push(std::sync::Arc::new(DenseKvBuffers {
                     k: k_view,
                     v: v_view,
@@ -4722,7 +5377,8 @@ impl MlxModelWeights {
             // cursor for attention bookkeeping; re-derive from per-slot seq_pos
             // so interleaved slots don't collide, restore after.
             let prior_cursors = self.set_per_slot_kv_cursor(seq_pos);
-            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
+            let result =
+                self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
             self.restore_kv_cursor(&prior_cursors);
             self.dense_kvs = prior_dense_kvs;
             return result;
@@ -4787,8 +5443,7 @@ impl MlxModelWeights {
 
             // Build per-layer slot-views (mirror of iter-2C prefill at
             // line ~2940-3076).  Same 4-buffer per-layer construction.
-            let mut slot_view_kv: Vec<MlxKvCache> =
-                Vec::with_capacity(multi_seq_kv_mlx.len());
+            let mut slot_view_kv: Vec<MlxKvCache> = Vec::with_capacity(multi_seq_kv_mlx.len());
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let nkv = layer.num_kv_heads;
                 let hd = layer.head_dim;
@@ -4799,68 +5454,90 @@ impl MlxModelWeights {
                 let packed_elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(hd_half))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode MLX slot-view packed elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view packed elem count overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 let packed_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(packed_elems_per_slot as u64)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode MLX slot-view packed byte offset overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view packed byte offset overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
-                let k_packed_view = buf.k_packed
+                        )
+                    })?;
+                let k_packed_view = buf
+                    .k_packed
                     .slice_view(packed_byte_offset, packed_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd_half])
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode MLX slot-view K_packed with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view K_packed with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
-                let v_packed_view = buf.v_packed
+                        )
+                    })?;
+                let v_packed_view = buf
+                    .v_packed
                     .slice_view(packed_byte_offset, packed_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd_half])
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode MLX slot-view V_packed with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view V_packed with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 let norms_elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(norms_per_pos))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode MLX slot-view norms elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view norms elem count overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
                     .checked_mul(4u64)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode MLX slot-view norms byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view norms byte size overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 let norms_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(norms_bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
+                    .ok_or_else(|| {
+                    anyhow::anyhow!(
                         "decode MLX slot-view norms byte offset overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                    )
+                })?;
                 let norms_shape = if norms_per_pos == 1 {
                     vec![nkv, cap]
                 } else {
                     vec![nkv, cap, norms_per_pos]
                 };
-                let k_norms_view = buf.k_norms
+                let k_norms_view = buf
+                    .k_norms
                     .slice_view(norms_byte_offset, norms_elems_per_slot)
                     .with_shape(norms_shape.clone())
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode MLX slot-view K_norms with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view K_norms with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
-                let v_norms_view = buf.v_norms
+                        )
+                    })?;
+                let v_norms_view = buf
+                    .v_norms
                     .slice_view(norms_byte_offset, norms_elems_per_slot)
                     .with_shape(norms_shape)
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
-                    ))?;
+                        )
+                    })?;
                 // ADR-040 STEP-1b (2026-06-24) — PER-SLOT KV CURSOR (4-bit
                 // branch).  The persistent scaffold's `seq_lens[slot]` is
                 // NEVER advanced (only reset → always 0), so the legacy
@@ -4892,15 +5569,15 @@ impl MlxModelWeights {
             }
 
             let prior_kv_caches = std::mem::replace(&mut self.kv_caches, slot_view_kv);
-            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
+            let result =
+                self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
             // After decode advances slot's write_pos/seq_len, write the
             // updated cursor back into the persistent multi-seq scaffold's
             // seq_lens before restoring.  This preserves the per-slot
             // cursor across decode calls (the legacy single-seq cursor
             // would live in the swapped-in MlxKvCache; we mirror it out).
             if result.is_ok() {
-                let updated_cursor =
-                    self.kv_caches.get(0).map(|c| c.seq_len as u32);
+                let updated_cursor = self.kv_caches.get(0).map(|c| c.seq_len as u32);
                 if let Some(new_cursor) = updated_cursor {
                     // Iter-scope: the persistent scaffold's seq_lens
                     // tracking is best-effort here (we don't have a
@@ -5000,9 +5677,9 @@ impl MlxModelWeights {
                 .iter()
                 .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some());
             if xlen_engaged {
-                let all_consistent = multi_seq_kv_hybrid.iter().all(|buf| {
-                    buf.bf16_xlen_k.is_some() && buf.bf16_xlen_v.is_some()
-                });
+                let all_consistent = multi_seq_kv_hybrid
+                    .iter()
+                    .all(|buf| buf.bf16_xlen_k.is_some() && buf.bf16_xlen_v.is_some());
                 if !all_consistent {
                     let err = MultiSeqError::CapabilityUnsupported {
                         capability: "gemma4-forward-decode-slot-N-hybrid-xlen-mixed-presence (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.47 — alloc-helper invariant violation: bf16_xlen_k/v must be Some on ALL layers or NONE, never mixed; if you see this in production, gemma4/kv_cache.rs:1102-1115 lost atomicity across layer-vec alloc loop)",
@@ -5025,9 +5702,8 @@ impl MlxModelWeights {
             // wrapper around the per-slot slice_view of the persistent multi-
             // seq scaffold's buffers.  The slot-view ARC handles keep the
             // underlying Metal storage alive for the call duration.
-            let mut slot_view_hybrid: Vec<
-                crate::inference::models::gemma4::HybridKvBuffers,
-            > = Vec::with_capacity(multi_seq_kv_hybrid.len());
+            let mut slot_view_hybrid: Vec<crate::inference::models::gemma4::HybridKvBuffers> =
+                Vec::with_capacity(multi_seq_kv_hybrid.len());
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let nkv = layer.num_kv_heads;
                 let hd = layer.head_dim;
@@ -5037,16 +5713,20 @@ impl MlxModelWeights {
                 let k_elems_per_slot: usize = nkv
                     .checked_mul(cap)
                     .and_then(|x| x.checked_mul(hd))
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode slot-view K elem count overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode slot-view K elem count overflow at L{layer_idx} \
                          (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                    ))?;
+                        )
+                    })?;
                 let k_bytes_per_slot: u64 = (k_elems_per_slot as u64)
                     .checked_mul(2u64) // F16 = 2 bytes/elem
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode slot-view K byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode slot-view K byte size overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                    ))?;
+                        )
+                    })?;
                 let k_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(k_bytes_per_slot)
                     .ok_or_else(|| anyhow::anyhow!(
@@ -5054,12 +5734,16 @@ impl MlxModelWeights {
                          (slot_id={} k_bytes_per_slot={}) — ADR-040 iter-B4c-kernel iter-2-decode-A",
                         slot_id.0, k_bytes_per_slot,
                     ))?;
-                let k_view = buf.k.slice_view(k_byte_offset, k_elems_per_slot)
+                let k_view = buf
+                    .k
+                    .slice_view(k_byte_offset, k_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode slot-view K with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode slot-view K with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                    ))?;
+                        )
+                    })?;
 
                 // V: dtype-aware.  U8 (TQ-packed) → 1 byte/elem;
                 // F16 → 2 bytes/elem.  `.dtype().size_of()` is the
@@ -5067,23 +5751,31 @@ impl MlxModelWeights {
                 let v_dtype_size = buf.v_packed.dtype().size_of();
                 let v_bytes_per_slot: u64 = (k_elems_per_slot as u64)
                     .checked_mul(v_dtype_size as u64)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode slot-view V byte size overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode slot-view V byte size overflow at L{layer_idx} \
                          (v_dtype_size={}) — ADR-040 iter-B4c-kernel iter-2-decode-A",
-                        v_dtype_size,
-                    ))?;
+                            v_dtype_size,
+                        )
+                    })?;
                 let v_byte_offset: u64 = (slot_id.0 as u64)
                     .checked_mul(v_bytes_per_slot)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "decode slot-view V byte offset overflow at L{layer_idx} \
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "decode slot-view V byte offset overflow at L{layer_idx} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                    ))?;
-                let v_view = buf.v_packed.slice_view(v_byte_offset, k_elems_per_slot)
+                        )
+                    })?;
+                let v_view = buf
+                    .v_packed
+                    .slice_view(v_byte_offset, k_elems_per_slot)
                     .with_shape(vec![nkv, cap, hd])
-                    .map_err(|e| anyhow::anyhow!(
-                        "decode slot-view V with_shape at L{layer_idx}: {e} \
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode slot-view V with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                    ))?;
+                        )
+                    })?;
 
                 // V_norms: F32 (4 bytes/elem) with shape
                 // `[nkv, cap, norms_per_pos]` per the multi-seq
@@ -5095,43 +5787,55 @@ impl MlxModelWeights {
                 let norms_per_pos = buf.norms_per_pos;
                 let v_norms_is_dummy = buf.v_norms.byte_len() == 4;
                 let v_norms_view = if v_norms_is_dummy {
-                    buf.v_norms.slice_view(0, 1)
+                    buf.v_norms
+                        .slice_view(0, 1)
                         .with_shape(vec![1])
-                        .map_err(|e| anyhow::anyhow!(
-                            "decode slot-view V_norms (dummy) with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decode slot-view V_norms (dummy) with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                        ))?
+                            )
+                        })?
                 } else {
                     let norms_elems_per_slot: usize = nkv
                         .checked_mul(cap)
                         .and_then(|x| x.checked_mul(norms_per_pos))
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "decode slot-view V_norms elem count overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decode slot-view V_norms elem count overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                        ))?;
+                            )
+                        })?;
                     let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
                         .checked_mul(4u64) // F32 = 4 bytes/elem
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "decode slot-view V_norms byte size overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decode slot-view V_norms byte size overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                        ))?;
+                            )
+                        })?;
                     let norms_byte_offset: u64 = (slot_id.0 as u64)
                         .checked_mul(norms_bytes_per_slot)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "decode slot-view V_norms byte offset overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decode slot-view V_norms byte offset overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                        ))?;
+                            )
+                        })?;
                     let v_norms_shape = if norms_per_pos == 1 {
                         vec![nkv, cap]
                     } else {
                         vec![nkv, cap, norms_per_pos]
                     };
-                    buf.v_norms.slice_view(norms_byte_offset, norms_elems_per_slot)
+                    buf.v_norms
+                        .slice_view(norms_byte_offset, norms_elems_per_slot)
                         .with_shape(v_norms_shape)
-                        .map_err(|e| anyhow::anyhow!(
-                            "decode slot-view V_norms with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decode slot-view V_norms with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A"
-                        ))?
+                            )
+                        })?
                 };
 
                 // ADR-040 iter-B4c-kernel iter-2-decode-A-xlen — BF16
@@ -5147,12 +5851,14 @@ impl MlxModelWeights {
                 // by alloc-helper invariant (verified by the consistency
                 // check above) → slot-views materialize per layer.
                 let (bf16_xlen_k_view, bf16_xlen_v_view) = if xlen_engaged {
-                    let xlen_bk = buf.bf16_xlen_k.as_ref().expect(
-                        "decode xlen consistency guard above: bf16_xlen_k Some",
-                    );
-                    let xlen_bv = buf.bf16_xlen_v.as_ref().expect(
-                        "decode xlen consistency guard above: bf16_xlen_v Some",
-                    );
+                    let xlen_bk = buf
+                        .bf16_xlen_k
+                        .as_ref()
+                        .expect("decode xlen consistency guard above: bf16_xlen_k Some");
+                    let xlen_bv = buf
+                        .bf16_xlen_v
+                        .as_ref()
+                        .expect("decode xlen consistency guard above: bf16_xlen_v Some");
                     // Per-slot element count = `nkv * cap * hd` (reuse
                     // `k_elems_per_slot` from F16 K path — identical
                     // formula).  BF16 stride = 2 bytes/elem
@@ -5162,32 +5868,41 @@ impl MlxModelWeights {
                     // from the slot-view's underlying Metal buffer).
                     let xlen_bytes_per_slot: u64 = (k_elems_per_slot as u64)
                         .checked_mul(2u64) // BF16 = 2 bytes/elem
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "decode slot-view BF16 xlen byte size overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decode slot-view BF16 xlen byte size overflow at L{layer_idx} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen"
-                        ))?;
+                            )
+                        })?;
                     let xlen_byte_offset: u64 = (slot_id.0 as u64)
                         .checked_mul(xlen_bytes_per_slot)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "decode slot-view BF16 xlen byte offset overflow at L{layer_idx} \
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decode slot-view BF16 xlen byte offset overflow at L{layer_idx} \
                              (slot_id={} xlen_bytes_per_slot={}) \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen",
-                            slot_id.0, xlen_bytes_per_slot,
-                        ))?;
+                                slot_id.0,
+                                xlen_bytes_per_slot,
+                            )
+                        })?;
                     let bk_view = xlen_bk
                         .slice_view(xlen_byte_offset, k_elems_per_slot)
                         .with_shape(vec![nkv, cap, hd])
-                        .map_err(|e| anyhow::anyhow!(
-                            "decode slot-view BF16 xlen K with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decode slot-view BF16 xlen K with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen"
-                        ))?;
+                            )
+                        })?;
                     let bv_view = xlen_bv
                         .slice_view(xlen_byte_offset, k_elems_per_slot)
                         .with_shape(vec![nkv, cap, hd])
-                        .map_err(|e| anyhow::anyhow!(
-                            "decode slot-view BF16 xlen V with_shape at L{layer_idx}: {e} \
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decode slot-view BF16 xlen V with_shape at L{layer_idx}: {e} \
                              — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen"
-                        ))?;
+                            )
+                        })?;
                     (Some(bk_view), Some(bv_view))
                 } else {
                     (None, None)
@@ -5200,18 +5915,16 @@ impl MlxModelWeights {
                 // and indexes `[layer_idx]` directly — slot_view_hybrid's
                 // shape MUST match the legacy alloc output bit-for-bit
                 // (mirror of iter-2B prefill).
-                slot_view_hybrid.push(
-                    crate::inference::models::gemma4::HybridKvBuffers {
-                        k: k_view,
-                        v_packed: v_view,
-                        v_norms: v_norms_view,
-                        capacity: cap,
-                        is_sliding: buf.is_sliding,
-                        norms_per_pos,
-                        bf16_xlen_k: bf16_xlen_k_view,
-                        bf16_xlen_v: bf16_xlen_v_view,
-                    },
-                );
+                slot_view_hybrid.push(crate::inference::models::gemma4::HybridKvBuffers {
+                    k: k_view,
+                    v_packed: v_view,
+                    v_norms: v_norms_view,
+                    capacity: cap,
+                    is_sliding: buf.is_sliding,
+                    norms_per_pos,
+                    bf16_xlen_k: bf16_xlen_k_view,
+                    bf16_xlen_v: bf16_xlen_v_view,
+                });
             }
 
             // Mount the slot-view bundle on `self.hybrid_kv`.  Save the
@@ -5235,7 +5948,8 @@ impl MlxModelWeights {
             // mount survives (H128 source-grep pin) and the per-layer
             // K/V writes inside `encode_one_layer` land in the per-slot
             // byte region of the persistent multi-seq scaffold.
-            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
+            let result =
+                self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
 
             self.restore_kv_cursor(&prior_cursors);
 
@@ -5281,8 +5995,7 @@ impl MlxModelWeights {
         //   3. Delegate to `forward_decode(input_token, seq_pos, gpu,
         //      profile)` — sibling fn signature UNCHANGED (H128 pin).
         //   4. Restore `self.leg_hb_encoded` on exit regardless of result.
-        let mut slot_view_hb: Vec<HbKvBuffers> =
-            Vec::with_capacity(multi_seq_kv_hb.len());
+        let mut slot_view_hb: Vec<HbKvBuffers> = Vec::with_capacity(multi_seq_kv_hb.len());
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let nkv = layer.num_kv_heads;
             let hd = layer.head_dim;
@@ -5295,72 +6008,95 @@ impl MlxModelWeights {
             let packed_elems_per_slot: usize = nkv
                 .checked_mul(cap)
                 .and_then(|x| x.checked_mul(hd))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "decode HB slot-view packed elem count overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view packed elem count overflow at L{layer_idx} \
                      (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
+                    )
+                })?;
             let packed_byte_offset: u64 = (slot_id.0 as u64)
                 .checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem
-                .ok_or_else(|| anyhow::anyhow!(
-                    "decode HB slot-view packed byte offset overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view packed byte offset overflow at L{layer_idx} \
                      (slot_id={} packed_elems_per_slot={}) \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B",
-                    slot_id.0, packed_elems_per_slot,
-                ))?;
-            let k_packed_view = buf.k_packed
+                        slot_id.0,
+                        packed_elems_per_slot,
+                    )
+                })?;
+            let k_packed_view = buf
+                .k_packed
                 .slice_view(packed_byte_offset, packed_elems_per_slot)
                 .with_shape(vec![nkv, cap, hd])
-                .map_err(|e| anyhow::anyhow!(
-                    "decode HB slot-view K_packed with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view K_packed with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
-            let v_packed_view = buf.v_packed
+                    )
+                })?;
+            let v_packed_view = buf
+                .v_packed
                 .slice_view(packed_byte_offset, packed_elems_per_slot)
                 .with_shape(vec![nkv, cap, hd])
-                .map_err(|e| anyhow::anyhow!(
-                    "decode HB slot-view V_packed with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view V_packed with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
+                    )
+                })?;
 
             let norms_elems_per_slot: usize = nkv
                 .checked_mul(cap)
                 .and_then(|x| x.checked_mul(norms_per_pos))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "decode HB slot-view norms elem count overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view norms elem count overflow at L{layer_idx} \
                      (nkv={nkv} cap={cap} norms_per_pos={norms_per_pos}) \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
+                    )
+                })?;
             let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
                 .checked_mul(4u64) // F32 = 4 bytes/elem
-                .ok_or_else(|| anyhow::anyhow!(
-                    "decode HB slot-view norms byte size overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view norms byte size overflow at L{layer_idx} \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
+                    )
+                })?;
             let norms_byte_offset: u64 = (slot_id.0 as u64)
                 .checked_mul(norms_bytes_per_slot)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "decode HB slot-view norms byte offset overflow at L{layer_idx} \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view norms byte offset overflow at L{layer_idx} \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
+                    )
+                })?;
             let norms_shape = if norms_per_pos == 1 {
                 vec![nkv, cap]
             } else {
                 vec![nkv, cap, norms_per_pos]
             };
-            let k_norms_view = buf.k_norms
+            let k_norms_view = buf
+                .k_norms
                 .slice_view(norms_byte_offset, norms_elems_per_slot)
                 .with_shape(norms_shape.clone())
-                .map_err(|e| anyhow::anyhow!(
-                    "decode HB slot-view K_norms with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view K_norms with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
-            let v_norms_view = buf.v_norms
+                    )
+                })?;
+            let v_norms_view = buf
+                .v_norms
                 .slice_view(norms_byte_offset, norms_elems_per_slot)
                 .with_shape(norms_shape)
-                .map_err(|e| anyhow::anyhow!(
-                    "decode HB slot-view V_norms with_shape at L{layer_idx}: {e} \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode HB slot-view V_norms with_shape at L{layer_idx}: {e} \
                      — ADR-040 iter-B4c-kernel iter-2-decode-B"
-                ))?;
+                    )
+                })?;
 
             slot_view_hb.push(HbKvBuffers {
                 k_packed: k_packed_view,
@@ -5507,7 +6243,7 @@ mod qwen3vl_position_tests {
     fn build_qwen3vl_positions_rejects_overlapping_images() {
         let img1 = Qwen3VlImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
         let img2 = Qwen3VlImageGrid { n_x: 2, n_y: 2 }; // 4 tokens
-        // img1 starts at 0, ends at 16; img2 at 10 overlaps.
+                                                        // img1 starts at 0, ends at 16; img2 at 10 overlaps.
         let err = build_qwen3vl_positions(20, &[(img1, 0), (img2, 10)]).unwrap_err();
         assert!(format!("{err}").contains("before the prior region"));
     }
@@ -5515,7 +6251,7 @@ mod qwen3vl_position_tests {
     #[test]
     fn build_qwen3vl_positions_rejects_image_past_prompt_len() {
         let img = Qwen3VlImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
-        // img at seq=10, region = 10..26, prompt_len=20.
+                                                       // img at seq=10, region = 10..26, prompt_len=20.
         let err = build_qwen3vl_positions(20, &[(img, 10)]).unwrap_err();
         assert!(format!("{err}").contains("extends past prompt_len"));
     }

@@ -149,10 +149,7 @@ mod tests {
     #[test]
     fn bundle_sha_returns_none_when_all_shards_lack_sha() {
         // Non-LFS files (config.json, tokenizer.json) carry no sha256.
-        let shards = vec![
-            shard("config.json", None),
-            shard("tokenizer.json", None),
-        ];
+        let shards = vec![shard("config.json", None), shard("tokenizer.json", None)];
         assert!(compute_source_bundle_sha256(&shards).is_none());
     }
 
@@ -167,7 +164,8 @@ mod tests {
         assert_eq!(h1, h2, "bundle SHA must be order-independent");
         assert_eq!(h1.len(), 64, "must be 64-hex SHA-256");
         assert!(
-            h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            h1.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "must be lowercase hex"
         );
     }

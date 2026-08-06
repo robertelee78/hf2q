@@ -99,10 +99,7 @@ use crate::backends::gguf::types::MetaValue;
 pub enum MappedTensor {
     /// Standard 1:1 HF→GGUF tensor (embeddings, norms, attention
     /// projections, dense FFN, lm_head).
-    Dense {
-        hf: String,
-        gguf: String,
-    },
+    Dense { hf: String, gguf: String },
     /// Per-expert weight that will be stacked along an expert axis
     /// before being written to GGUF. The stacker concatenates all
     /// `n_experts` instances at the same `(layer, role)` into one
@@ -124,10 +121,7 @@ pub enum MappedTensor {
     /// Router gate / expert-selection bias — emitted as a single
     /// tensor per block; semantically distinct from `Dense` so a
     /// caller can apply a different quant policy if needed.
-    Router {
-        hf: String,
-        gguf: String,
-    },
+    Router { hf: String, gguf: String },
 }
 
 /// SwiGLU role for an expert weight. MiniMax follows the Mixtral
@@ -237,8 +231,7 @@ pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
         // `_bias` suffix to `.bias` before mapping). Mirrors GGUF
         // `MODEL_TENSOR.FFN_EXP_PROBS_B` named `blk.{bid}.exp_probs_b`
         // with the standard `.bias` suffix.
-        "block_sparse_moe.e_score_correction_bias"
-        | "block_sparse_moe.e_score_correction.bias" => {
+        "block_sparse_moe.e_score_correction_bias" | "block_sparse_moe.e_score_correction.bias" => {
             return Some(MappedTensor::Router {
                 hf: hf_name.to_string(),
                 gguf: format!("blk.{layer}.exp_probs_b.bias"),
@@ -246,8 +239,7 @@ pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
         }
         // Defensive: if a future MiniMax variant ships the bare
         // `.weight` form, still map (no canonical sighting yet).
-        "block_sparse_moe.e_score_correction"
-        | "block_sparse_moe.e_score_correction.weight" => {
+        "block_sparse_moe.e_score_correction" | "block_sparse_moe.e_score_correction.weight" => {
             return Some(MappedTensor::Router {
                 hf: hf_name.to_string(),
                 gguf: format!("blk.{layer}.exp_probs_b.weight"),
@@ -372,7 +364,8 @@ pub fn build_metadata(
         .expect("config.json missing required key `num_attention_heads`") as u32;
     let ctx_len = config["max_position_embeddings"]
         .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+        .expect("config.json missing required key `max_position_embeddings`")
+        as u32;
     let rms_eps = config["rms_norm_eps"]
         .as_f64()
         .expect("config.json missing required key `rms_norm_eps`") as f32;
@@ -482,16 +475,10 @@ pub fn build_metadata(
         kv.push(("minimax-m2.expert_used_count".into(), MetaValue::U32(n)));
     }
     if let Some(g) = expert_gating_func {
-        kv.push((
-            "minimax-m2.expert_gating_func".into(),
-            MetaValue::U32(g),
-        ));
+        kv.push(("minimax-m2.expert_gating_func".into(), MetaValue::U32(g)));
     }
     if let Some(hd) = head_dim {
-        kv.push((
-            "minimax-m2.attention.key_length".into(),
-            MetaValue::U32(hd),
-        ));
+        kv.push(("minimax-m2.attention.key_length".into(), MetaValue::U32(hd)));
         kv.push((
             "minimax-m2.attention.value_length".into(),
             MetaValue::U32(hd),
@@ -568,7 +555,9 @@ mod tests {
                     assert_eq!(h, hf);
                     assert_eq!(gguf, expected_gguf);
                 }
-                other => panic!("map_tensor_name({hf:?}) = {other:?}, want Dense({expected_gguf:?})"),
+                other => {
+                    panic!("map_tensor_name({hf:?}) = {other:?}, want Dense({expected_gguf:?})")
+                }
             }
         }
     }
@@ -671,13 +660,9 @@ mod tests {
         // Malformed layer index
         assert!(map_tensor_name("model.layers.01.input_layernorm.weight").is_none());
         // Malformed expert id
-        assert!(
-            map_tensor_name("model.layers.0.block_sparse_moe.experts.01.w1.weight").is_none()
-        );
+        assert!(map_tensor_name("model.layers.0.block_sparse_moe.experts.01.w1.weight").is_none());
         // Unknown expert role
-        assert!(
-            map_tensor_name("model.layers.0.block_sparse_moe.experts.0.w4.weight").is_none()
-        );
+        assert!(map_tensor_name("model.layers.0.block_sparse_moe.experts.0.w4.weight").is_none());
         // Dense Mixtral-style FFN names — NOT used by MiniMax-M2 (it's
         // pure MoE, every block goes through the router).
         assert!(map_tensor_name("model.layers.0.mlp.gate_proj.weight").is_none());
@@ -746,7 +731,10 @@ mod tests {
             by_key["minimax-m2.expert_feed_forward_length"],
             MetaValue::U32(9216)
         );
-        assert_eq!(by_key["minimax-m2.attention.head_count"], MetaValue::U32(64));
+        assert_eq!(
+            by_key["minimax-m2.attention.head_count"],
+            MetaValue::U32(64)
+        );
         assert_eq!(
             by_key["minimax-m2.attention.head_count_kv"],
             MetaValue::U32(8)

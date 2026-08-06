@@ -91,7 +91,10 @@ impl ServerGuard {
         self.port
     }
     pub fn log_tail(&self) -> Vec<String> {
-        self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
     /// ADR-017 Closure iter-2 (2026-05-04): non-blocking child status
     /// check for `wait_for_graceful_exit`.  Returns
@@ -140,10 +143,7 @@ pub fn spawn_hf2q_serve_with_kv_persist(
         )));
     }
     std::fs::create_dir_all(cache_dir).map_err(|e| {
-        DriverError::SpawnFailed(format!(
-            "mkdir cache_dir {}: {e}",
-            cache_dir.display()
-        ))
+        DriverError::SpawnFailed(format!("mkdir cache_dir {}: {e}", cache_dir.display()))
     })?;
     let mut cmd = Command::new(bin);
     cmd.args([
@@ -219,10 +219,8 @@ fn http_get_status(host: &str, port: u16, path: &str) -> std::io::Result<u16> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.write_all(
-        format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-        )
-        .as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )?;
     let mut head = [0u8; 64];
     let n = s.read(&mut head)?;
@@ -261,14 +259,8 @@ pub fn wait_for_readyz(server: &ServerGuard) -> Result<(), DriverError> {
 /// Accepted.  Caller should subsequently call
 /// `wait_for_graceful_exit` to block until the process actually
 /// terminates (the drain runs after this response).
-pub fn trigger_graceful_shutdown(
-    server: &ServerGuard,
-) -> Result<serde_json::Value, DriverError> {
-    let url = format!(
-        "http://{}:{}/shutdown",
-        server.host(),
-        server.port()
-    );
+pub fn trigger_graceful_shutdown(server: &ServerGuard) -> Result<serde_json::Value, DriverError> {
+    let url = format!("http://{}:{}/shutdown", server.host(), server.port());
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -315,9 +307,7 @@ pub fn wait_for_graceful_exit(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                return Err(DriverError::Transport(format!(
-                    "try_wait_child: {e}"
-                )));
+                return Err(DriverError::Transport(format!("try_wait_child: {e}")));
             }
         }
     }
@@ -326,11 +316,7 @@ pub fn wait_for_graceful_exit(
 /// Fetch the canonical model id from `/v1/models` so subsequent
 /// requests use a model name the server recognizes.
 pub fn fetch_canonical_model_id(server: &ServerGuard) -> Result<String, DriverError> {
-    let url = format!(
-        "http://{}:{}/v1/models",
-        server.host(),
-        server.port()
-    );
+    let url = format!("http://{}:{}/v1/models", server.host(), server.port());
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -464,9 +450,7 @@ pub fn decode_full_text(
         }
     }
     let ttft_ms = ttft_ms.ok_or_else(|| {
-        DriverError::Sse(
-            "no non-empty content delta observed; cannot measure TTFT".into(),
-        )
+        DriverError::Sse("no non-empty content delta observed; cannot measure TTFT".into())
     })?;
     Ok(DecodeCapture {
         text,
@@ -516,14 +500,9 @@ pub fn force_eviction_via_symlink(
             let mmproj_src = model_parent.join(format!("{src_stem}-mmproj.gguf"));
             if mmproj_src.exists() {
                 if let Some(link_stem) = link_path.file_stem().and_then(|s| s.to_str()) {
-                    let mmproj_dst =
-                        tmp_link_dir.join(format!("{link_stem}-mmproj.gguf"));
-                    if let Err(e) =
-                        std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst)
-                    {
-                        return Err(DriverError::Transport(format!(
-                            "symlink mmproj: {e}"
-                        )));
+                    let mmproj_dst = tmp_link_dir.join(format!("{link_stem}-mmproj.gguf"));
+                    if let Err(e) = std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst) {
+                        return Err(DriverError::Transport(format!("symlink mmproj: {e}")));
                     }
                 }
             }
@@ -591,9 +570,8 @@ pub fn force_eviction_via_symlink(
         }
     }
     let eviction_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let second_ttft_ms = ttft_ms.ok_or_else(|| {
-        DriverError::Sse("no content delta on swap-back-in turn".into())
-    })?;
+    let second_ttft_ms =
+        ttft_ms.ok_or_else(|| DriverError::Sse("no content delta on swap-back-in turn".into()))?;
     Ok((link_path, eviction_wall_ms, second_ttft_ms))
 }
 

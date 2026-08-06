@@ -68,7 +68,6 @@ pub struct FaPrefillArena {
     // The arena is sized for the actual prefill seq_len. Per-layer calls
     // may have the same or shorter seq_len; validate_fits() guards against
     // accidental overrun.
-
     /// The `seq_capacity` value the arena was allocated for.
     pub seq_capacity: u32,
     /// The `n_heads` value the arena was allocated for.
@@ -190,10 +189,7 @@ impl FaPrefillArena {
                 self.seq_capacity
             ));
         }
-        if n_heads != self.n_heads
-            || n_kv_heads != self.n_kv_heads
-            || head_dim != self.head_dim
-        {
+        if n_heads != self.n_heads || n_kv_heads != self.n_kv_heads || head_dim != self.head_dim {
             return Err(anyhow!(
                 "FaPrefillArena::validate_fits: shape mismatch — \
                  arena (n_heads={}, n_kv_heads={}, head_dim={}) vs \
@@ -250,7 +246,11 @@ mod tests {
         assert_eq!(arena.k_bf16_hm.byte_len(), k_bytes, "k_bf16_hm byte_len");
         assert_eq!(arena.v_bf16_seq.byte_len(), k_bytes, "v_bf16_seq byte_len");
         assert_eq!(arena.v_bf16_hm.byte_len(), k_bytes, "v_bf16_hm byte_len");
-        assert_eq!(arena.out_bf16_hm.byte_len(), q_bytes, "out_bf16_hm byte_len");
+        assert_eq!(
+            arena.out_bf16_hm.byte_len(),
+            q_bytes,
+            "out_bf16_hm byte_len"
+        );
     }
 
     /// Qwen3.5/3.6 canonical shape at pp=4096: verifies no allocation failure
@@ -265,8 +265,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaPrefillArena::new(&device, 4096, 16, 2, 256).expect("arena new pp4096");
+        let arena = FaPrefillArena::new(&device, 4096, 16, 2, 256).expect("arena new pp4096");
         assert_eq!(arena.seq_capacity, 4096);
     }
 
@@ -331,8 +330,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaPrefillArena::new(&device, 128, 16, 2, 256).expect("arena new seq128");
+        let arena = FaPrefillArena::new(&device, 128, 16, 2, 256).expect("arena new seq128");
         assert!(
             arena.validate_fits(256, 16, 2, 256).is_err(),
             "seq_len=256 > capacity=128 should be rejected"
@@ -350,8 +348,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaPrefillArena::new(&device, 128, 16, 2, 256).expect("arena new nh16");
+        let arena = FaPrefillArena::new(&device, 128, 16, 2, 256).expect("arena new nh16");
         assert!(
             arena.validate_fits(128, 8, 2, 256).is_err(),
             "n_heads=8 vs arena n_heads=16 should be rejected"
@@ -378,8 +375,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaPrefillArena::new(&device, 128, 16, 2, 256).expect("arena new seq128");
+        let arena = FaPrefillArena::new(&device, 128, 16, 2, 256).expect("arena new seq128");
         assert!(
             arena.validate_fits(128, 16, 2, 256).is_ok(),
             "exact-match validate_fits should return Ok"
@@ -405,8 +401,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            FaPrefillArena::new(&device, 64, 16, 2, 256).expect("arena new seq64");
+        let arena = FaPrefillArena::new(&device, 64, 16, 2, 256).expect("arena new seq64");
 
         let bufs: [(&MlxBuffer, &str); 7] = [
             (&arena.q_bf16_seq, "q_bf16_seq"),
@@ -424,8 +419,7 @@ mod tests {
             let check_len = 16.min(slice.len());
             for (i, &v) in slice[..check_len].iter().enumerate() {
                 assert_eq!(
-                    v,
-                    0u16,
+                    v, 0u16,
                     "{name}[{i}] = {v:#06x} (BF16 0x0000 = +0.0), expected zero"
                 );
             }

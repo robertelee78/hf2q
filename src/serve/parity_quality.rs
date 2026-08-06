@@ -53,8 +53,8 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::cli;
-use crate::serve::config::Gemma4Config;
 use crate::inference::models::gemma4::{DecodeRegime, MlxModelWeights};
+use crate::serve::config::Gemma4Config;
 use crate::serve::forward_mlx_shared::cosine_pairwise_f32;
 use crate::serve::gpu;
 use crate::serve::header;
@@ -129,9 +129,7 @@ pub fn cmd_parity_capture_tq_quality(
     }
 
     let evals_dir = Path::new("tests/evals");
-    let prompt_file = evals_dir
-        .join("prompts")
-        .join(format!("{prompt_name}.txt"));
+    let prompt_file = evals_dir.join("prompts").join(format!("{prompt_name}.txt"));
     anyhow::ensure!(
         prompt_file.exists(),
         "Prompt file not found: {}",
@@ -143,10 +141,8 @@ pub fn cmd_parity_capture_tq_quality(
     // existing manifest's bound when present, else fall back to 1000.
     let tokens = max_tokens.unwrap_or(1000);
 
-    let dump_root = std::env::temp_dir().join(format!(
-        "hf2q_gate_h_capture_{}",
-        std::process::id()
-    ));
+    let dump_root =
+        std::env::temp_dir().join(format!("hf2q_gate_h_capture_{}", std::process::id()));
     fs::create_dir_all(&dump_root)?;
     let dense_dump_dir = dump_root.join("dense");
     let tq_dump_dir = dump_root.join("tq");
@@ -155,7 +151,11 @@ pub fn cmd_parity_capture_tq_quality(
 
     eprintln!("=== Gate H Capture: {} ===", prompt_name);
     eprintln!("Model:        {}", model_path.display());
-    eprintln!("Prompt:       {} ({} chars)", prompt_name, prompt_text.len());
+    eprintln!(
+        "Prompt:       {} ({} chars)",
+        prompt_name,
+        prompt_text.len()
+    );
     eprintln!("Tokens:       {}", tokens);
     eprintln!("Dump root:    {}", dump_root.display());
     eprintln!();
@@ -169,8 +169,8 @@ pub fn cmd_parity_capture_tq_quality(
         &tq_dump_dir,
     )?;
 
-    let model_sha = sha256_file(model_path)
-        .with_context(|| format!("hash model: {}", model_path.display()))?;
+    let model_sha =
+        sha256_file(model_path).with_context(|| format!("hash model: {}", model_path.display()))?;
     let git_head = git_head_sha();
     let captured_at = iso8601_utc_now();
 
@@ -196,17 +196,13 @@ pub fn cmd_parity_capture_tq_quality(
 
     fs::create_dir_all(output_dir)?;
     let out_path = output_dir.join(format!("{prompt_name}_tq_quality.json"));
-    let pretty = serde_json::to_string_pretty(&fixture)
-        .context("serialize fixture")?;
+    let pretty = serde_json::to_string_pretty(&fixture).context("serialize fixture")?;
     fs::write(&out_path, pretty)?;
     eprintln!();
     eprintln!("Wrote fixture: {}", out_path.display());
     eprintln!(
         "  cosine_mean={:.6}  cosine_p1={:.6}  argmax_div={:.4}  ppl_delta={:.4}",
-        envelope.cosine.mean,
-        envelope.cosine.p1,
-        envelope.argmax_flip_rate,
-        envelope.ppl_delta_pct
+        envelope.cosine.mean, envelope.cosine.p1, envelope.argmax_flip_rate, envelope.ppl_delta_pct
     );
 
     // Best-effort cleanup of dump scratch dir; ignore errors so we don't
@@ -238,8 +234,7 @@ pub fn cmd_parity_check_tq_quality(
     );
     let fixture_str = fs::read_to_string(fixture_path)
         .with_context(|| format!("read fixture: {}", fixture_path.display()))?;
-    let fixture: JsonValue =
-        serde_json::from_str(&fixture_str).context("parse fixture JSON")?;
+    let fixture: JsonValue = serde_json::from_str(&fixture_str).context("parse fixture JSON")?;
 
     let fixture_prompt = fixture["prompt"].as_str().unwrap_or("");
     anyhow::ensure!(
@@ -270,9 +265,7 @@ pub fn cmd_parity_check_tq_quality(
     }
 
     let evals_dir = Path::new("tests/evals");
-    let prompt_file = evals_dir
-        .join("prompts")
-        .join(format!("{prompt_name}.txt"));
+    let prompt_file = evals_dir.join("prompts").join(format!("{prompt_name}.txt"));
     anyhow::ensure!(
         prompt_file.exists(),
         "Prompt file not found: {}",
@@ -280,10 +273,7 @@ pub fn cmd_parity_check_tq_quality(
     );
     let prompt_text = fs::read_to_string(&prompt_file)?.trim().to_string();
 
-    let dump_root = std::env::temp_dir().join(format!(
-        "hf2q_gate_h_check_{}",
-        std::process::id()
-    ));
+    let dump_root = std::env::temp_dir().join(format!("hf2q_gate_h_check_{}", std::process::id()));
     fs::create_dir_all(&dump_root)?;
     let dense_dump_dir = dump_root.join("dense");
     let tq_dump_dir = dump_root.join("tq");
@@ -429,23 +419,18 @@ fn run_two_regime_decode(
     // other thread is concurrently reading them; cmd_parity is a single-
     // threaded entry point, so there's no race here.
     unsafe {
-        std::env::set_var(
-            "HF2Q_DUMP_SDPA_MAX_POS",
-            tokens.to_string(),
-        );
+        std::env::set_var("HF2Q_DUMP_SDPA_MAX_POS", tokens.to_string());
     }
 
     // STEP 2 — load model.
     let tokenizer_path = super::find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new()
-        .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.
     let cfg = Gemma4Config::from_gguf(&gguf)?;
     let mut progress = header::LoadProgress::new(false, 1, 0);
-    let mut mlx_w =
-        MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut progress)?;
+    let mut mlx_w = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut progress)?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
@@ -500,7 +485,10 @@ fn run_two_regime_decode(
     // per-instance step counter reset (set_decode_regime resets it).  The
     // dump dir is `dump_root` for both passes; we move files into the
     // per-pass dirs after each `run_one_pass` returns.
-    eprintln!("[gate-h] Pass 1/2: dense forced regime ({} tokens)...", tokens);
+    eprintln!(
+        "[gate-h] Pass 1/2: dense forced regime ({} tokens)...",
+        tokens
+    );
     mlx_w.set_decode_regime(DecodeRegime::ForceDense);
     mlx_w.set_dump_overrides(Some(dump_root.to_path_buf()), Some(true));
     let dense_capture = run_one_pass(
@@ -572,11 +560,7 @@ fn run_two_regime_decode(
             ));
         }
     }
-    let argmax_flip_rate = if n == 0 {
-        0.0
-    } else {
-        flips as f32 / n as f32
-    };
+    let argmax_flip_rate = if n == 0 { 0.0 } else { flips as f32 / n as f32 };
     if !flip_positions.is_empty() {
         eprintln!("[GATE_H_DIAG] argmax flip positions (step, dense_token, tq_token):");
         for (step, d, t) in &flip_positions {
@@ -695,12 +679,7 @@ fn argmax_from_logits(logits: &[f32]) -> u32 {
 ///
 /// We only move files within the expected range so any leftover dumps
 /// from a previous run / previous pass don't contaminate.
-fn move_sdpa_dumps(
-    src: &Path,
-    dst: &Path,
-    prompt_len: usize,
-    tokens: usize,
-) -> Result<()> {
+fn move_sdpa_dumps(src: &Path, dst: &Path, prompt_len: usize, tokens: usize) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
@@ -759,8 +738,7 @@ fn synthesize_cosine(
     let mut cosines_per_layer: Vec<Vec<f32>> = vec![Vec::new(); num_layers];
     // ADR-032 followup 2026-05-17: track (step, cosine) per layer to localize
     // outliers.  Mean+min alone don't say WHICH position diverged.
-    let mut cosines_per_layer_with_step: Vec<Vec<(usize, f32)>> =
-        vec![Vec::new(); num_layers];
+    let mut cosines_per_layer_with_step: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_layers];
 
     for layer_idx in 0..num_layers {
         let nh = mlx_w.num_attention_heads;
@@ -788,10 +766,7 @@ fn synthesize_cosine(
             } else {
                 prompt_len + step - 1
             };
-            let fname = format!(
-                "hf2q_sdpa_out_layer{:02}_pos{}.bin",
-                layer_idx, seq_pos
-            );
+            let fname = format!("hf2q_sdpa_out_layer{:02}_pos{}.bin", layer_idx, seq_pos);
             let dense_path = dense_dir.join(&fname);
             let tq_path = tq_dir.join(&fname);
             if !dense_path.exists() || !tq_path.exists() {
@@ -828,7 +803,11 @@ fn synthesize_cosine(
             .unwrap_or((usize::MAX, f32::INFINITY));
         eprintln!(
             "  layer {:02}: mean={:.6}  min={:.6}  min_step={}  n={}",
-            layer_idx, mean, min, min_step, cs.len()
+            layer_idx,
+            mean,
+            min,
+            min_step,
+            cs.len()
         );
     }
 
@@ -861,8 +840,7 @@ fn synthesize_cosine(
 }
 
 fn read_f32_bin(path: &Path, n_elems: usize) -> Result<Vec<f32>> {
-    let mut f = fs::File::open(path)
-        .with_context(|| format!("open dump: {}", path.display()))?;
+    let mut f = fs::File::open(path).with_context(|| format!("open dump: {}", path.display()))?;
     let mut bytes = Vec::with_capacity(n_elems * 4);
     f.read_to_end(&mut bytes)
         .with_context(|| format!("read dump: {}", path.display()))?;
@@ -893,8 +871,7 @@ fn nll_to_ppl(nlls: &[f32]) -> f64 {
 
 /// SHA-256 of a file as lowercase hex.
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = fs::File::open(path)
-        .with_context(|| format!("open: {}", path.display()))?;
+    let mut f = fs::File::open(path).with_context(|| format!("open: {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -917,7 +894,9 @@ fn git_head_sha() -> String {
         .ok()
         .and_then(|o| {
             if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -955,8 +934,5 @@ fn iso8601_utc_now() -> String {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if mo <= 2 { y + 1 } else { y };
 
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, mo, d, h, m, s
-    )
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, mo, d, h, m, s)
 }

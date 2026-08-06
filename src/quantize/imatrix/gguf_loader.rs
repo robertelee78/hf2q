@@ -68,18 +68,18 @@ impl LoadedImatrix {
         }
 
         // --- 2. Required header KVs ------------------------------------
-        let chunk_count = gguf
-            .metadata_u32(KV_KEY_CHUNK_COUNT)
-            .ok_or_else(|| ImatrixError::MissingKv {
-                path: source_path.clone(),
-                key: KV_KEY_CHUNK_COUNT,
-            })?;
-        let chunk_size = gguf
-            .metadata_u32(KV_KEY_CHUNK_SIZE)
-            .ok_or_else(|| ImatrixError::MissingKv {
-                path: source_path.clone(),
-                key: KV_KEY_CHUNK_SIZE,
-            })?;
+        let chunk_count =
+            gguf.metadata_u32(KV_KEY_CHUNK_COUNT)
+                .ok_or_else(|| ImatrixError::MissingKv {
+                    path: source_path.clone(),
+                    key: KV_KEY_CHUNK_COUNT,
+                })?;
+        let chunk_size =
+            gguf.metadata_u32(KV_KEY_CHUNK_SIZE)
+                .ok_or_else(|| ImatrixError::MissingKv {
+                    path: source_path.clone(),
+                    key: KV_KEY_CHUNK_SIZE,
+                })?;
 
         // --- 3. Datasets array (optional per imatrix.cpp:744) ----------
         // `mlx_native::gguf` doesn't expose a typed array-of-strings
@@ -100,8 +100,7 @@ impl LoadedImatrix {
         let mut halves: BTreeMap<String, (bool, bool)> = BTreeMap::new();
         let mut registry = AccumulatorRegistry::new();
 
-        let names: Vec<String> =
-            gguf.tensor_names().iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = gguf.tensor_names().iter().map(|s| s.to_string()).collect();
 
         // Pass 1: in_sum2 (registers each accumulator + loads values).
         for name in &names {
@@ -109,14 +108,16 @@ impl LoadedImatrix {
                 Some(s) => s,
                 None => continue,
             };
-            halves.entry(stripped.to_string()).or_insert((false, false)).0 = true;
+            halves
+                .entry(stripped.to_string())
+                .or_insert((false, false))
+                .0 = true;
             let info = gguf
                 .tensor_info(name)
                 .expect("name from tensor_names is valid");
             let (n_per_row, n_mat) = shape_to_n_per_row_and_n_mat(&info.shape);
             let acc = registry.register(stripped, n_per_row, n_mat)?;
-            let payload =
-                read_f32_tensor(path, &gguf, info).map_err(ImatrixError::from)?;
+            let payload = read_f32_tensor(path, &gguf, info).map_err(ImatrixError::from)?;
             if payload.len() != acc.values.len() {
                 return Err(ImatrixError::Parse {
                     detail: format!(
@@ -136,7 +137,10 @@ impl LoadedImatrix {
                 Some(s) => s,
                 None => continue,
             };
-            halves.entry(stripped.to_string()).or_insert((false, false)).1 = true;
+            halves
+                .entry(stripped.to_string())
+                .or_insert((false, false))
+                .1 = true;
             let info = gguf
                 .tensor_info(name)
                 .expect("name from tensor_names is valid");
@@ -157,12 +161,13 @@ impl LoadedImatrix {
                     });
                 }
             };
-            let acc = registry
-                .get_mut(stripped)
-                .ok_or_else(|| ImatrixError::MismatchedTensorPair {
-                    path: source_path.clone(),
-                    name: stripped.to_string(),
-                })?;
+            let acc =
+                registry
+                    .get_mut(stripped)
+                    .ok_or_else(|| ImatrixError::MismatchedTensorPair {
+                        path: source_path.clone(),
+                        name: stripped.to_string(),
+                    })?;
             if acc.n_mat != n_mat {
                 return Err(ImatrixError::Parse {
                     detail: format!(
@@ -172,8 +177,7 @@ impl LoadedImatrix {
                     ),
                 });
             }
-            let payload =
-                read_f32_tensor(path, &gguf, info).map_err(ImatrixError::from)?;
+            let payload = read_f32_tensor(path, &gguf, info).map_err(ImatrixError::from)?;
             if payload.len() != n_mat {
                 return Err(ImatrixError::Parse {
                     detail: format!(
@@ -400,11 +404,8 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut w = GgufWriter::new(buf);
         w.write_header(0, 2).unwrap();
-        w.write_metadata_kv(
-            "general.type",
-            &MetaValue::String("imatrix".to_string()),
-        )
-        .unwrap();
+        w.write_metadata_kv("general.type", &MetaValue::String("imatrix".to_string()))
+            .unwrap();
         // Has chunk_size but NOT chunk_count.
         w.write_metadata_kv("imatrix.chunk_size", &MetaValue::U32(512))
             .unwrap();
@@ -495,18 +496,13 @@ mod tests {
         // returns entries in insertion order; both writer + loader
         // preserve order so positional iteration is sound for the
         // round-trip case.
-        for ((name1, acc1), (name2, acc2)) in
-            loaded1.registry.iter().zip(loaded2.registry.iter())
-        {
+        for ((name1, acc1), (name2, acc2)) in loaded1.registry.iter().zip(loaded2.registry.iter()) {
             assert_eq!(name1, name2, "tensor name mismatch");
             assert_eq!(
                 acc1.n_per_row, acc2.n_per_row,
                 "tensor `{name1}` n_per_row mismatch"
             );
-            assert_eq!(
-                acc1.n_mat, acc2.n_mat,
-                "tensor `{name1}` n_mat mismatch"
-            );
+            assert_eq!(acc1.n_mat, acc2.n_mat, "tensor `{name1}` n_mat mismatch");
             assert_eq!(
                 acc1.values, acc2.values,
                 "tensor `{name1}` in_sum2 payload (values) mismatch"
@@ -630,7 +626,11 @@ mod tests {
             worst_abs_tensor,
             worst_rel,
             worst_rel_tensor,
-            mean, p50, p90, p99, p999,
+            mean,
+            p50,
+            p90,
+            p99,
+            p999,
         );
         // This test is diagnostic — it never panics on numeric mismatch.
         // The point is to MEASURE the divergence so the operator can

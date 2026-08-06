@@ -254,10 +254,7 @@ mod tests {
 
     #[test]
     fn quality_thresholds_are_adr012_defaults() {
-        assert_eq!(
-            ENTRY.quality_thresholds,
-            QualityThresholds::ADR_012_DEFAULT
-        );
+        assert_eq!(ENTRY.quality_thresholds, QualityThresholds::ADR_012_DEFAULT);
     }
 
     #[test]

@@ -14,16 +14,16 @@ pub mod cli;
 // `core` is the in-place precursor to the planned `hf2q-core` crate
 // (workspace v0.1.0 split). See `src/core/mod.rs` for the boundary
 // rule and the planned submodule layout.
-pub mod core;
 pub mod convert;
+pub mod core;
 mod debug;
 mod doctor;
-pub mod models;
 pub mod gguf_patch;
 pub mod inference;
 pub mod input;
 pub mod intelligence;
 pub mod ir;
+pub mod models;
 pub mod progress;
 pub mod quantize;
 mod serve;
@@ -58,7 +58,10 @@ enum AppError {
     /// AppError default. Without this variant, every distinct smoke
     /// failure mode collapses to exit 1 — defeating Decision 16's
     /// "distinct non-zero code" contract at the OS-process level.
-    Smoke { code: u8, msg: anyhow::Error },
+    Smoke {
+        code: u8,
+        msg: anyhow::Error,
+    },
 }
 
 impl AppError {
@@ -106,8 +109,7 @@ fn main() -> ExitCode {
         EnvFilter::new(format!("hf2q={lvl},mlx_native={lvl}", lvl = lvl.as_str()))
     } else {
         match cli.verbose {
-            0 => EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("hf2q=warn")),
+            0 => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hf2q=warn")),
             1 => EnvFilter::new("hf2q=info,mlx_native=info"),
             2 => EnvFilter::new("hf2q=debug,mlx_native=debug"),
             _ => EnvFilter::new("hf2q=trace,mlx_native=trace"),
@@ -170,19 +172,26 @@ fn run(cli: Cli) -> Result<(), AppError> {
 fn cmd_tokenizer(args: cli::TokenizerArgs) -> Result<(), AppError> {
     use cli::TokenizerAction;
     match args.action {
-        TokenizerAction::FixBos { path, gguf, bos_id, bos_text } => {
+        TokenizerAction::FixBos {
+            path,
+            gguf,
+            bos_id,
+            bos_text,
+        } => {
             // If a sibling GGUF is provided, read BOS metadata from it
             // (matches the runtime adapter's resolution path).
             let (resolved_id, resolved_text) = if let Some(gguf_path) = gguf {
-                let g = mlx_native::gguf::GgufFile::open(&gguf_path)
-                    .map_err(|e| AppError::Input(anyhow::anyhow!(
-                        "open GGUF {}: {e}", gguf_path.display()
-                    )))?;
-                let id = g.metadata_u32("tokenizer.ggml.bos_token_id")
-                    .ok_or_else(|| AppError::Input(anyhow::anyhow!(
-                        "GGUF {} has no tokenizer.ggml.bos_token_id metadata",
-                        gguf_path.display()
-                    )))?;
+                let g = mlx_native::gguf::GgufFile::open(&gguf_path).map_err(|e| {
+                    AppError::Input(anyhow::anyhow!("open GGUF {}: {e}", gguf_path.display()))
+                })?;
+                let id = g
+                    .metadata_u32("tokenizer.ggml.bos_token_id")
+                    .ok_or_else(|| {
+                        AppError::Input(anyhow::anyhow!(
+                            "GGUF {} has no tokenizer.ggml.bos_token_id metadata",
+                            gguf_path.display()
+                        ))
+                    })?;
                 // The runtime adapter resolves BOS *text* via the
                 // tokenizer's vocab. Here we don't have the tokenizer
                 // loaded yet (we're about to patch its file), so fall
@@ -192,16 +201,20 @@ fn cmd_tokenizer(args: cli::TokenizerArgs) -> Result<(), AppError> {
                 (bos_id, bos_text)
             };
 
-            let mutated = core::tokenizer_adapter::fix_tokenizer_json_bos(
-                &path, &resolved_text, resolved_id,
-            )
-            .map_err(|e| AppError::Input(anyhow::anyhow!(
-                "fix_tokenizer_json_bos {}: {e}", path.display()
-            )))?;
+            let mutated =
+                core::tokenizer_adapter::fix_tokenizer_json_bos(&path, &resolved_text, resolved_id)
+                    .map_err(|e| {
+                        AppError::Input(anyhow::anyhow!(
+                            "fix_tokenizer_json_bos {}: {e}",
+                            path.display()
+                        ))
+                    })?;
             if mutated {
                 println!(
                     "Patched {}: prepended BOS SpecialToken {:?} (id={}) to post_processor.single",
-                    path.display(), resolved_text, resolved_id,
+                    path.display(),
+                    resolved_text,
+                    resolved_id,
                 );
             } else {
                 println!(
@@ -255,25 +268,16 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         }
         (Some(path), None, None) => (path, None),
         (None, Some(repo), revision) => {
-            validate_hf_repo_id(&repo)
-                .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+            validate_hf_repo_id(&repo).map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
             let revision = immutable_hf_revision(revision.as_deref())
                 .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
             let path = download_repo_via_hf_cli(&repo, &revision)
                 .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
-            let verified = crate::input::integrity::verify_remote_conversion_source(
-                &repo,
-                &revision,
-                &path,
-            )
-            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
-            let source = RemoteConversionSource::from_verified(
-                repo,
-                revision,
-                &path,
-                &verified,
-            )
-            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+            let verified =
+                crate::input::integrity::verify_remote_conversion_source(&repo, &revision, &path)
+                    .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+            let source = RemoteConversionSource::from_verified(repo, revision, &path, &verified)
+                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
             (path, Some(source))
         }
         (None, None, _) => {
@@ -310,17 +314,13 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         | ConvertError::RepoAndDirMutuallyExclusive
         | ConvertError::ImmutableRevisionRequired { .. }
         | ConvertError::RevisionRequiresRepo
-        | ConvertError::InvalidRepoId { .. } => {
-            AppError::Input(anyhow::anyhow!("{e}"))
-        }
+        | ConvertError::InvalidRepoId { .. } => AppError::Input(anyhow::anyhow!("{e}")),
         ConvertError::Source(_)
         | ConvertError::Orchestrator(_)
         | ConvertError::Io(_)
         | ConvertError::Integrity(_)
         | ConvertError::Receipt(_)
-        | ConvertError::HfDownload { .. } => {
-            AppError::Conversion(anyhow::anyhow!("{e}"))
-        }
+        | ConvertError::HfDownload { .. } => AppError::Conversion(anyhow::anyhow!("{e}")),
     })
 }
 
@@ -459,7 +459,13 @@ fn hf_download_command(
         command.arg("--include").arg(pattern);
     }
     for pattern in [
-        "*.gguf", "*.bin", "*.pt", "*.pth", "*.onnx", "*.h5", "*.msgpack",
+        "*.gguf",
+        "*.bin",
+        "*.pt",
+        "*.pth",
+        "*.onnx",
+        "*.h5",
+        "*.msgpack",
     ] {
         command.arg("--exclude").arg(pattern);
     }
@@ -506,9 +512,10 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
     let outcome = arch::smoke::dispatch(&smoke_args, &env);
     let code = outcome.exit_code();
     let rendered = arch::smoke::render_outcome(&outcome);
-    if matches!(outcome, arch::smoke::SmokeOutcome::Pass { .. }
-                        | arch::smoke::SmokeOutcome::Skipped { .. })
-    {
+    if matches!(
+        outcome,
+        arch::smoke::SmokeOutcome::Pass { .. } | arch::smoke::SmokeOutcome::Skipped { .. }
+    ) {
         println!("{}", rendered);
         Ok(())
     } else {
@@ -525,7 +532,6 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
     }
 }
 
-
 /// Handle the `info` subcommand.
 fn cmd_info(args: cli::InfoArgs) -> Result<()> {
     let input_dir = resolve_info_input(&args)?;
@@ -538,14 +544,11 @@ fn cmd_info(args: cli::InfoArgs) -> Result<()> {
         );
     }
 
-    let metadata = input::config_parser::parse_config(&config_path)
-        .context("Failed to parse model config")?;
+    let metadata =
+        input::config_parser::parse_config(&config_path).context("Failed to parse model config")?;
 
     println!();
-    println!(
-        "{}",
-        console::style("Model Information").bold().green()
-    );
+    println!("{}", console::style("Model Information").bold().green());
     println!("{}", input::config_parser::format_info(&metadata));
     println!();
 
@@ -693,13 +696,19 @@ mod tests {
     #[test]
     fn cache_slug_cannot_resolve_to_parent_component() {
         assert_eq!(sanitize_repo_for_cache_dir(".."), "_..");
-        assert_eq!(sanitize_repo_for_cache_dir("org/../../model"), "org__..__..__model");
+        assert_eq!(
+            sanitize_repo_for_cache_dir("org/../../model"),
+            "org__..__..__model"
+        );
     }
 
     #[test]
     fn repo_validation_blocks_option_and_path_injection() {
         for invalid in ["", "--help", "../model", "org//model", "org/model?"] {
-            assert!(validate_hf_repo_id(invalid).is_err(), "accepted {invalid:?}");
+            assert!(
+                validate_hf_repo_id(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
         }
         validate_hf_repo_id("deepseek-ai/DeepSeek-V4").unwrap();
     }

@@ -131,9 +131,7 @@ impl GpuInfo {
     /// selection rule's intent (per ADR-005:905) is "memory available to host
     /// the model right now," not the machine's nameplate RAM. On a busy host
     /// these can differ by tens of GiB.
-    pub fn from_hardware_profile(
-        profile: &crate::core::hardware::HardwareProfile,
-    ) -> Self {
+    pub fn from_hardware_profile(profile: &crate::core::hardware::HardwareProfile) -> Self {
         Self::from_bytes(profile.available_memory_bytes)
     }
 

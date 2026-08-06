@@ -458,10 +458,7 @@ fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() 
     cache.restore(&snapshot).unwrap();
     assert_eq!(cache.position(), 7);
     assert_eq!(
-        cache.layers()[1]
-            .attention_kv
-            .as_slice::<u16>()
-            .unwrap()[3],
+        cache.layers()[1].attention_kv.as_slice::<u16>().unwrap()[3],
         0x1234
     );
     assert_eq!(
@@ -490,10 +487,7 @@ fn snapshot_restore_recovers_kv_recurrent_state_and_position_without_aliasing() 
         .unwrap()[3] = 0xabcd;
     cache.restore(&snapshot).unwrap();
     assert_eq!(
-        cache.layers()[1]
-            .attention_kv
-            .as_slice::<u16>()
-            .unwrap()[3],
+        cache.layers()[1].attention_kv.as_slice::<u16>().unwrap()[3],
         0x1234
     );
 }

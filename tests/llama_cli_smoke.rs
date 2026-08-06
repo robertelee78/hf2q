@@ -113,7 +113,10 @@ fn smoke_cell(model_dir: &str, quant: &str) {
 }
 
 fn short_name(p: &str) -> &str {
-    Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or(p)
+    Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p)
 }
 
 macro_rules! smoke_test {

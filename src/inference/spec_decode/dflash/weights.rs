@@ -91,26 +91,68 @@ pub fn expected_manifest(cfg: &DFlashConfig) -> Vec<ExpectedTensor> {
     let mut m = Vec::with_capacity(3 + cfg.num_hidden_layers * 11);
 
     // Globals (ordered to match common safetensors traversal).
-    m.push(ExpectedTensor { name: "fc.weight".into(), shape: vec![h, fc_in] });
-    m.push(ExpectedTensor { name: "hidden_norm.weight".into(), shape: vec![h] });
+    m.push(ExpectedTensor {
+        name: "fc.weight".into(),
+        shape: vec![h, fc_in],
+    });
+    m.push(ExpectedTensor {
+        name: "hidden_norm.weight".into(),
+        shape: vec![h],
+    });
 
     // Per-layer (5 × 11 = 55 tensors for the 5-layer gemma-4 drafter).
     for i in 0..cfg.num_hidden_layers {
         let p = format!("layers.{i}");
-        m.push(ExpectedTensor { name: format!("{p}.input_layernorm.weight"), shape: vec![h] });
-        m.push(ExpectedTensor { name: format!("{p}.mlp.down_proj.weight"), shape: vec![h, inter] });
-        m.push(ExpectedTensor { name: format!("{p}.mlp.gate_proj.weight"), shape: vec![inter, h] });
-        m.push(ExpectedTensor { name: format!("{p}.mlp.up_proj.weight"), shape: vec![inter, h] });
-        m.push(ExpectedTensor { name: format!("{p}.post_attention_layernorm.weight"), shape: vec![h] });
-        m.push(ExpectedTensor { name: format!("{p}.self_attn.k_norm.weight"), shape: vec![dh] });
-        m.push(ExpectedTensor { name: format!("{p}.self_attn.k_proj.weight"), shape: vec![kh_dh, h] });
-        m.push(ExpectedTensor { name: format!("{p}.self_attn.o_proj.weight"), shape: vec![h, qh_dh] });
-        m.push(ExpectedTensor { name: format!("{p}.self_attn.q_norm.weight"), shape: vec![dh] });
-        m.push(ExpectedTensor { name: format!("{p}.self_attn.q_proj.weight"), shape: vec![qh_dh, h] });
-        m.push(ExpectedTensor { name: format!("{p}.self_attn.v_proj.weight"), shape: vec![kh_dh, h] });
+        m.push(ExpectedTensor {
+            name: format!("{p}.input_layernorm.weight"),
+            shape: vec![h],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.mlp.down_proj.weight"),
+            shape: vec![h, inter],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.mlp.gate_proj.weight"),
+            shape: vec![inter, h],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.mlp.up_proj.weight"),
+            shape: vec![inter, h],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.post_attention_layernorm.weight"),
+            shape: vec![h],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.self_attn.k_norm.weight"),
+            shape: vec![dh],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.self_attn.k_proj.weight"),
+            shape: vec![kh_dh, h],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.self_attn.o_proj.weight"),
+            shape: vec![h, qh_dh],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.self_attn.q_norm.weight"),
+            shape: vec![dh],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.self_attn.q_proj.weight"),
+            shape: vec![qh_dh, h],
+        });
+        m.push(ExpectedTensor {
+            name: format!("{p}.self_attn.v_proj.weight"),
+            shape: vec![kh_dh, h],
+        });
     }
 
-    m.push(ExpectedTensor { name: "norm.weight".into(), shape: vec![h] });
+    m.push(ExpectedTensor {
+        name: "norm.weight".into(),
+        shape: vec![h],
+    });
 
     m
 }
@@ -134,8 +176,7 @@ impl DFlashWeightsFile {
         // SAFETY: we keep `_mmap` alive on this struct, so the slice
         // is valid for the lifetime of `self`. Callers borrow tensors
         // through `view()` which constrains the lifetime correctly.
-        let bytes: &'static [u8] =
-            unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
+        let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
         Ok(Self { _mmap: mmap, bytes })
     }
 
@@ -158,10 +199,7 @@ impl<'data> DFlashWeights<'data> {
     /// expected-tensor manifest derived from `cfg`. Strict: every
     /// expected tensor MUST be present, in BF16, with the expected
     /// shape; no extra tensors allowed (mantra: no shortcuts).
-    pub fn load<'cfg>(
-        bytes: &'data [u8],
-        cfg: &'cfg DFlashConfig,
-    ) -> Result<Self, WeightsError> {
+    pub fn load<'cfg>(bytes: &'data [u8], cfg: &'cfg DFlashConfig) -> Result<Self, WeightsError> {
         let st = SafeTensors::deserialize(bytes)?;
         let manifest = expected_manifest(cfg);
 
@@ -243,7 +281,10 @@ mod tests {
     fn manifest_fc_shape_is_h_times_fc_in() {
         let cfg = gemma4_26b_a4b_dflash_config();
         let m = expected_manifest(&cfg);
-        let fc = m.iter().find(|t| t.name == "fc.weight").expect("fc.weight in manifest");
+        let fc = m
+            .iter()
+            .find(|t| t.name == "fc.weight")
+            .expect("fc.weight in manifest");
         assert_eq!(fc.shape, vec![2816, 6 * 2816]);
     }
 
@@ -251,10 +292,22 @@ mod tests {
     fn manifest_layer_qkv_shapes_match_qwen3_style() {
         let cfg = gemma4_26b_a4b_dflash_config();
         let m = expected_manifest(&cfg);
-        let q = m.iter().find(|t| t.name == "layers.0.self_attn.q_proj.weight").unwrap();
-        let k = m.iter().find(|t| t.name == "layers.0.self_attn.k_proj.weight").unwrap();
-        let v = m.iter().find(|t| t.name == "layers.0.self_attn.v_proj.weight").unwrap();
-        let o = m.iter().find(|t| t.name == "layers.0.self_attn.o_proj.weight").unwrap();
+        let q = m
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        let k = m
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.k_proj.weight")
+            .unwrap();
+        let v = m
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.v_proj.weight")
+            .unwrap();
+        let o = m
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.o_proj.weight")
+            .unwrap();
         // Drafter: 32 q heads × 128 dim = 4096; 8 kv heads × 128 dim = 1024
         assert_eq!(q.shape, vec![4096, 2816]);
         assert_eq!(k.shape, vec![1024, 2816]);
@@ -267,10 +320,16 @@ mod tests {
         let cfg = gemma4_26b_a4b_dflash_config();
         let m = expected_manifest(&cfg);
         // q_norm/k_norm are per-head_dim (128)
-        let qn = m.iter().find(|t| t.name == "layers.0.self_attn.q_norm.weight").unwrap();
+        let qn = m
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.q_norm.weight")
+            .unwrap();
         assert_eq!(qn.shape, vec![128]);
         // input_layernorm / post_attention_layernorm are per-hidden_size (2816)
-        let il = m.iter().find(|t| t.name == "layers.0.input_layernorm.weight").unwrap();
+        let il = m
+            .iter()
+            .find(|t| t.name == "layers.0.input_layernorm.weight")
+            .unwrap();
         assert_eq!(il.shape, vec![2816]);
     }
 
@@ -299,8 +358,10 @@ mod tests {
         assert_eq!(w.tensors.len(), 58);
         // Sanity: total bytes ≈ 425M params × 2 bytes ≈ 850MB.
         let bytes = w.total_data_bytes();
-        assert!((780_000_000..=900_000_000).contains(&bytes),
-            "expected ~820MB data, got {bytes}");
+        assert!(
+            (780_000_000..=900_000_000).contains(&bytes),
+            "expected ~820MB data, got {bytes}"
+        );
     }
 
     /// ADR-034 prep 2026-05-21: real-safetensors validation across all 3 downloaded
@@ -333,9 +394,10 @@ mod tests {
             eprintln!("skipping: {cfg_path} not on disk");
             return;
         }
-        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path)
-            .expect("parse cfg");
-        let Some(bytes) = load_real_drafter(dir, &cfg) else { return };
+        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path).expect("parse cfg");
+        let Some(bytes) = load_real_drafter(dir, &cfg) else {
+            return;
+        };
         // 27B drafter: 5 layers × (~150M params) ≈ 1.6 GB.  We saw 3.3 GB on disk
         // for the directory but ~1.6 GB is the model.safetensors itself.
         assert!(
@@ -352,9 +414,10 @@ mod tests {
             eprintln!("skipping: {cfg_path} not on disk");
             return;
         }
-        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path)
-            .expect("parse cfg");
-        let Some(bytes) = load_real_drafter(dir, &cfg) else { return };
+        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path).expect("parse cfg");
+        let Some(bytes) = load_real_drafter(dir, &cfg) else {
+            return;
+        };
         // 35B-A3B drafter: 8 layers × (smaller hidden=2048) ≈ 800 MB.
         assert!(
             (500_000_000..=1_500_000_000).contains(&bytes),
@@ -370,9 +433,10 @@ mod tests {
             eprintln!("skipping: {cfg_path} not on disk");
             return;
         }
-        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path)
-            .expect("parse cfg");
-        let Some(bytes) = load_real_drafter(dir, &cfg) else { return };
+        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path).expect("parse cfg");
+        let Some(bytes) = load_real_drafter(dir, &cfg) else {
+            return;
+        };
         // Gemma 4 26B drafter: 5 layers × hidden=2816 ≈ 800 MB (same family as
         // the embedded config test above).
         assert!(

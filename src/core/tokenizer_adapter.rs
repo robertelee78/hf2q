@@ -97,16 +97,14 @@ fn llama_cpp_special_token_id(
     llama_cpp_special_token_id_for_model(tokenizer_model, metadata_key)
 }
 
-fn llama_cpp_special_token_id_for_model(
-    tokenizer_model: &str,
-    metadata_key: &str,
-) -> Option<u32> {
+fn llama_cpp_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
     match (tokenizer_model, metadata_key) {
         // Mirrors `/opt/llama.cpp/src/llama-vocab.cpp`: for tokenizer
         // model `gpt2`, llama.cpp initializes both BOS and EOS to
         // token id 11 before applying GGUF metadata overrides.
-        ("gpt2", "tokenizer.ggml.bos_token_id")
-        | ("gpt2", "tokenizer.ggml.eos_token_id") => Some(11),
+        ("gpt2", "tokenizer.ggml.bos_token_id") | ("gpt2", "tokenizer.ggml.eos_token_id") => {
+            Some(11)
+        }
         _ => None,
     }
 }
@@ -126,11 +124,7 @@ pub fn tokenize_with_bos_eos_from_gguf(
     let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
     if gguf_bool(gguf, "tokenizer.ggml.add_bos_token") {
-        if let Some(bos) = resolve_token_id(
-            gguf,
-            tokenizer,
-            "tokenizer.ggml.bos_token_id",
-        ) {
+        if let Some(bos) = resolve_token_id(gguf, tokenizer, "tokenizer.ggml.bos_token_id") {
             if prompt_tokens.first() != Some(&bos) {
                 prompt_tokens.insert(0, bos);
             }
@@ -138,11 +132,7 @@ pub fn tokenize_with_bos_eos_from_gguf(
     }
 
     if gguf_bool(gguf, "tokenizer.ggml.add_eos_token") {
-        if let Some(eos) = resolve_token_id(
-            gguf,
-            tokenizer,
-            "tokenizer.ggml.eos_token_id",
-        ) {
+        if let Some(eos) = resolve_token_id(gguf, tokenizer, "tokenizer.ggml.eos_token_id") {
             if prompt_tokens.last() != Some(&eos) {
                 prompt_tokens.push(eos);
             }
@@ -204,20 +194,18 @@ pub fn fix_tokenizer_json_bos(
 ) -> Result<bool> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("fix_tokenizer_json_bos: read {}: {e}", path.display()))?;
-    let mut tk: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("fix_tokenizer_json_bos: parse JSON {}: {e}", path.display()))?;
+    let mut tk: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!("fix_tokenizer_json_bos: parse JSON {}: {e}", path.display())
+    })?;
 
-    let pp = tk
-        .get_mut("post_processor")
-        .ok_or_else(|| anyhow::anyhow!(
+    let pp = tk.get_mut("post_processor").ok_or_else(|| {
+        anyhow::anyhow!(
             "fix_tokenizer_json_bos: tokenizer.json has no post_processor field at {}",
             path.display()
-        ))?;
+        )
+    })?;
 
-    let pp_type = pp
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let pp_type = pp.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if pp_type != "TemplateProcessing" {
         anyhow::bail!(
             "fix_tokenizer_json_bos: refusing to mutate post_processor of type {:?} \
@@ -230,10 +218,12 @@ pub fn fix_tokenizer_json_bos(
     let single = pp
         .get_mut("single")
         .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!(
-            "fix_tokenizer_json_bos: post_processor.single is not an array at {}",
-            path.display()
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "fix_tokenizer_json_bos: post_processor.single is not an array at {}",
+                path.display()
+            )
+        })?;
 
     let already_starts_with_bos = single
         .first()
@@ -259,10 +249,12 @@ pub fn fix_tokenizer_json_bos(
     let special_tokens = pp
         .get_mut("special_tokens")
         .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!(
-            "fix_tokenizer_json_bos: post_processor.special_tokens is not an object at {}",
-            path.display()
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "fix_tokenizer_json_bos: post_processor.special_tokens is not an object at {}",
+                path.display()
+            )
+        })?;
     special_tokens.insert(
         bos_token_text.to_string(),
         serde_json::json!({
@@ -354,8 +346,8 @@ mod tests {
     #[test]
     fn fix_tokenizer_json_bos_makes_encode_prepend_bos_2026_05_23() {
         let tmp = synth_legacy_tokenizer_json();
-        let patched = fix_tokenizer_json_bos(tmp.path(), "<bos>", 2)
-            .expect("fix_tokenizer_json_bos");
+        let patched =
+            fix_tokenizer_json_bos(tmp.path(), "<bos>", 2).expect("fix_tokenizer_json_bos");
         assert!(patched, "first patch should mutate the file");
 
         let tk = tokenizers::Tokenizer::from_file(tmp.path()).expect("load patched");

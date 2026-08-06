@@ -46,9 +46,9 @@ const KVALUES_IQ4NL: [i8; 16] = [
 /// `scales_h` / `scales_l` are unused, so we drop them. The final
 /// nibble-pack at :4898-4902 collapses to one `i==0` iteration.
 fn quantize_block_iq4_nl(
-    x: &[f32],                  // length QK4_NL
-    out: &mut [u8],             // length BLOCK_BYTES (18)
-    values: &[i8],              // KVALUES_IQ4NL
+    x: &[f32],                     // length QK4_NL
+    out: &mut [u8],                // length BLOCK_BYTES (18)
+    values: &[i8],                 // KVALUES_IQ4NL
     quant_weights: Option<&[f32]>, // length QK4_NL when Some
     ntry: i32,
 ) {
@@ -238,15 +238,17 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
     // (`quantize_block_iq4_nl`) writes into the slice the caller passes
     // — no shared output state between blocks. Parallelize across rows.
     let mut out = vec![0u8; nrows * row_bytes];
-    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, row_dst)| {
-        let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
-        for ibl in 0..nblock_per_row {
-            let xb = &row_src[ibl * QK4_NL..(ibl + 1) * QK4_NL];
-            let qw_block = imatrix.map(|im| &im[ibl * QK4_NL..(ibl + 1) * QK4_NL]);
-            let blk_out = &mut row_dst[ibl * BLOCK_BYTES..(ibl + 1) * BLOCK_BYTES];
-            quantize_block_iq4_nl(xb, blk_out, &KVALUES_IQ4NL, qw_block, ntry);
-        }
-    });
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, row_dst)| {
+            let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
+            for ibl in 0..nblock_per_row {
+                let xb = &row_src[ibl * QK4_NL..(ibl + 1) * QK4_NL];
+                let qw_block = imatrix.map(|im| &im[ibl * QK4_NL..(ibl + 1) * QK4_NL]);
+                let blk_out = &mut row_dst[ibl * BLOCK_BYTES..(ibl + 1) * BLOCK_BYTES];
+                quantize_block_iq4_nl(xb, blk_out, &KVALUES_IQ4NL, qw_block, ntry);
+            }
+        });
 
     out
 }
@@ -258,8 +260,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set by cargo test");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo test");
         PathBuf::from(manifest)
             .join("tests/fixtures/ggml_quants")
             .join(name)
@@ -363,7 +365,8 @@ mod tests {
         // qs = 0x88 repeated 16 times (L=8 packed as 8|(8<<4) = 0x88)
         for i in 2..18 {
             assert_eq!(
-                got[i], 0x88,
+                got[i],
+                0x88,
                 "qs[{}] should be 0x88 (packed L=8 from best_index_int8(0)), got 0x{:02x}",
                 i - 2,
                 got[i]

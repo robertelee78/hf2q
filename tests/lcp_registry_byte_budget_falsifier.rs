@@ -43,8 +43,8 @@
 //! Expected: 1/0/0 (one test, zero failures, zero ignored). Typical
 //! run time: well under 1 second on release build.
 
-use hf2q::serve::kv_persist::lcp_registry::{ByteSized, LcpKey, LcpRegistry, LcpStoreError};
 use hf2q::serve::kv_persist::format::ModelFingerprint;
+use hf2q::serve::kv_persist::lcp_registry::{ByteSized, LcpKey, LcpRegistry, LcpStoreError};
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,12 +78,18 @@ struct Lcg {
 impl Lcg {
     fn seed_from_u64(seed: u64) -> Self {
         // Mix the seed into the lower 32 bits.
-        Self { state: seed & 0xFFFF_FFFF }
+        Self {
+            state: seed & 0xFFFF_FFFF,
+        }
     }
 
     /// Next pseudorandom u32.
     fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) & 0xFFFF_FFFF;
+        self.state = self
+            .state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223)
+            & 0xFFFF_FFFF;
         self.state as u32
     }
 
@@ -167,7 +173,10 @@ fn lcp_registry_byte_budget_stress_1000_iter() {
         // must hold in either branch.
         match reg.store(key, prompt, payload, 4096, 4096) {
             Ok(()) => {}
-            Err(LcpStoreError::EntryExceedsBudget { entry_bytes, budget_bytes }) => {
+            Err(LcpStoreError::EntryExceedsBudget {
+                entry_bytes,
+                budget_bytes,
+            }) => {
                 // This path is only reachable if the payload exceeds the entire
                 // budget. With PAYLOAD_HI=50_000 and BYTE_BUDGET=100_000 this
                 // should never fire; if it does the invariant still holds (registry

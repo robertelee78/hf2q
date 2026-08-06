@@ -140,8 +140,8 @@ use std::time::{Duration, Instant};
 /// shipped the type + the report formatter so D2's data lands cleanly.
 #[derive(Debug, Clone)]
 pub struct ThroughputCell {
-    pub policy: &'static str,        // "fifo_serial" | "inflight_batched"
-    pub concurrency: u32,            // N
+    pub policy: &'static str, // "fifo_serial" | "inflight_batched"
+    pub concurrency: u32,     // N
     pub aggregate_tokens_per_sec: f64,
     pub ttft_p50_ms: f64,
     pub ttft_p95_ms: f64,
@@ -168,13 +168,18 @@ impl ThroughputCell {
 /// Render a vector of cells as a markdown table — D2 calls this to emit
 /// the bench report to stdout.
 pub fn render_report(cells: &[ThroughputCell]) -> String {
-    let mut s = String::from("| policy | N | agg tok/s | TTFT p50 | TTFT p95 | per-slot tok/s | 429s |\n");
+    let mut s =
+        String::from("| policy | N | agg tok/s | TTFT p50 | TTFT p95 | per-slot tok/s | 429s |\n");
     s.push_str("|--------|---|-----------|----------|----------|----------------|------|\n");
     for c in cells {
         s.push_str(&format!(
             "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} |\n",
-            c.policy, c.concurrency, c.aggregate_tokens_per_sec,
-            c.ttft_p50_ms, c.ttft_p95_ms, c.per_slot_tokens_per_sec,
+            c.policy,
+            c.concurrency,
+            c.aggregate_tokens_per_sec,
+            c.ttft_p50_ms,
+            c.ttft_p95_ms,
+            c.per_slot_tokens_per_sec,
             c.rejected_429_count
         ));
     }
@@ -222,12 +227,18 @@ impl ThroughputCellStable {
     /// Panics if cells differ in `policy` or `concurrency` (mixing
     /// reps from different cells would silently corrupt the medians).
     pub fn from_reps(cells: Vec<ThroughputCell>) -> Self {
-        assert!(!cells.is_empty(), "ThroughputCellStable::from_reps requires ≥1 cell");
+        assert!(
+            !cells.is_empty(),
+            "ThroughputCellStable::from_reps requires ≥1 cell"
+        );
         let policy = cells[0].policy;
         let concurrency = cells[0].concurrency;
         for c in &cells {
             assert_eq!(c.policy, policy, "from_reps: mixed policies across reps");
-            assert_eq!(c.concurrency, concurrency, "from_reps: mixed concurrency across reps");
+            assert_eq!(
+                c.concurrency, concurrency,
+                "from_reps: mixed concurrency across reps"
+            );
         }
         let rep_count = cells.len() as u32;
         let aggregates: Vec<f64> = cells.iter().map(|c| c.aggregate_tokens_per_sec).collect();
@@ -351,7 +362,10 @@ pub enum Ac4Outcome {
     StabilityBlocked,
     /// AC-4 fired and PASSED — aggregate ratio ≥ 1.5× and TTFT ratio
     /// ≤ 2.0×. Carries the two ratios for diagnostic emission.
-    Passed { aggregate_ratio: f64, ttft_ratio: f64 },
+    Passed {
+        aggregate_ratio: f64,
+        ttft_ratio: f64,
+    },
     /// AC-4 fired and FAILED — either aggregate ratio < 1.5× or TTFT
     /// ratio > 2.0×. Carries both ratios + a phrase naming which half
     /// failed so the env-gated body can panic with a precise message.
@@ -394,16 +408,27 @@ pub fn ac4_outcome(
     let Some(base) = fifo_n1 else {
         return Ac4Outcome::Misconfigured;
     };
-    let aggregate_ratio = i.aggregate_tokens_per_sec_median
-        / f.aggregate_tokens_per_sec_median.max(1e-6);
+    let aggregate_ratio =
+        i.aggregate_tokens_per_sec_median / f.aggregate_tokens_per_sec_median.max(1e-6);
     let ttft_ratio = i.ttft_p95_ms_median / base.ttft_p95_ms_median.max(1e-6);
     if aggregate_ratio < 1.5 {
-        return Ac4Outcome::Failed { aggregate_ratio, ttft_ratio, which: "aggregate" };
+        return Ac4Outcome::Failed {
+            aggregate_ratio,
+            ttft_ratio,
+            which: "aggregate",
+        };
     }
     if ttft_ratio > 2.0 {
-        return Ac4Outcome::Failed { aggregate_ratio, ttft_ratio, which: "ttft" };
+        return Ac4Outcome::Failed {
+            aggregate_ratio,
+            ttft_ratio,
+            which: "ttft",
+        };
     }
-    Ac4Outcome::Passed { aggregate_ratio, ttft_ratio }
+    Ac4Outcome::Passed {
+        aggregate_ratio,
+        ttft_ratio,
+    }
 }
 
 fn hf2q_binary_path() -> PathBuf {
@@ -629,10 +654,22 @@ fn d3_render_report_stable_emits_header_and_sigma_column() {
         rejected_429_count_total: 3,
     }];
     let report = render_report_stable(&cells);
-    assert!(report.contains("sigma_pct"), "header missing sigma_pct: {report}");
-    assert!(report.contains("agg tok/s median"), "header missing median: {report}");
-    assert!(report.contains("| fifo_serial | 4 | 3 |"), "data row missing: {report}");
-    assert!(report.contains("9.5%"), "sigma_pct formatted row missing: {report}");
+    assert!(
+        report.contains("sigma_pct"),
+        "header missing sigma_pct: {report}"
+    );
+    assert!(
+        report.contains("agg tok/s median"),
+        "header missing median: {report}"
+    );
+    assert!(
+        report.contains("| fifo_serial | 4 | 3 |"),
+        "data row missing: {report}"
+    );
+    assert!(
+        report.contains("9.5%"),
+        "sigma_pct formatted row missing: {report}"
+    );
 }
 
 #[test]
@@ -687,8 +724,11 @@ fn ac4_outcome_missing_inflight_n4_returns_deferred() {
     let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
     let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
     let out = ac4_outcome(Some(&f4), None, Some(&f1));
-    assert_eq!(out, Ac4Outcome::Deferred,
-        "Deferred when InflightBatched N=4 is absent (Phase C2c/C2d gated)");
+    assert_eq!(
+        out,
+        Ac4Outcome::Deferred,
+        "Deferred when InflightBatched N=4 is absent (Phase C2c/C2d gated)"
+    );
 }
 
 #[test]
@@ -696,8 +736,11 @@ fn ac4_outcome_missing_fifo_n4_returns_deferred() {
     let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
     let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
     let out = ac4_outcome(None, Some(&i4), Some(&f1));
-    assert_eq!(out, Ac4Outcome::Deferred,
-        "Deferred when FifoSerial N=4 is absent");
+    assert_eq!(
+        out,
+        Ac4Outcome::Deferred,
+        "Deferred when FifoSerial N=4 is absent"
+    );
 }
 
 #[test]
@@ -710,10 +753,13 @@ fn ac4_outcome_both_n4_present_but_missing_n1_returns_misconfigured() {
     let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
     let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
     let out = ac4_outcome(Some(&f4), Some(&i4), None);
-    assert_eq!(out, Ac4Outcome::Misconfigured,
+    assert_eq!(
+        out,
+        Ac4Outcome::Misconfigured,
         "BOTH N=4 cells + missing N=1 baseline ⇒ Misconfigured (hard error, \
          not silent skip — pre-iter-A5b [ac-4 PARTIAL] would have let a \
-         TTFT regression pass)");
+         TTFT regression pass)"
+    );
 }
 
 #[test]
@@ -723,14 +769,20 @@ fn ac4_outcome_stability_blocked_when_sigma_pct_above_threshold() {
     let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
     let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
     let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
-    assert_eq!(out, Ac4Outcome::StabilityBlocked,
-        "fifo_serial sigma_pct > threshold ⇒ StabilityBlocked");
+    assert_eq!(
+        out,
+        Ac4Outcome::StabilityBlocked,
+        "fifo_serial sigma_pct > threshold ⇒ StabilityBlocked"
+    );
 
     let f4_ok = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
     let i4_noisy = stable_cell("inflight_batched", 4, 200.0, 30.0, 70.0); // 30% > 20%
     let out2 = ac4_outcome(Some(&f4_ok), Some(&i4_noisy), Some(&f1));
-    assert_eq!(out2, Ac4Outcome::StabilityBlocked,
-        "inflight_batched sigma_pct > threshold ⇒ StabilityBlocked");
+    assert_eq!(
+        out2,
+        Ac4Outcome::StabilityBlocked,
+        "inflight_batched sigma_pct > threshold ⇒ StabilityBlocked"
+    );
 }
 
 #[test]
@@ -742,7 +794,10 @@ fn ac4_outcome_passed_when_aggregate_above_1_5x_and_ttft_under_2x() {
     let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
     let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
     match out {
-        Ac4Outcome::Passed { aggregate_ratio, ttft_ratio } => {
+        Ac4Outcome::Passed {
+            aggregate_ratio,
+            ttft_ratio,
+        } => {
             assert!((aggregate_ratio - 2.0).abs() < 1e-6);
             assert!((ttft_ratio - 1.4).abs() < 1e-6);
         }
@@ -758,10 +813,16 @@ fn ac4_outcome_failed_aggregate_when_ratio_below_1_5x() {
     let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
     let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
     match out {
-        Ac4Outcome::Failed { aggregate_ratio, which, .. } => {
+        Ac4Outcome::Failed {
+            aggregate_ratio,
+            which,
+            ..
+        } => {
             assert!((aggregate_ratio - 1.4).abs() < 1e-6);
-            assert_eq!(which, "aggregate",
-                "aggregate ratio failure surfaces `which='aggregate'`");
+            assert_eq!(
+                which, "aggregate",
+                "aggregate ratio failure surfaces `which='aggregate'`"
+            );
         }
         other => panic!("expected Failed/aggregate, got {other:?}"),
     }
@@ -776,10 +837,11 @@ fn ac4_outcome_failed_ttft_when_ratio_above_2x() {
     let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
     let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
     match out {
-        Ac4Outcome::Failed { ttft_ratio, which, .. } => {
+        Ac4Outcome::Failed {
+            ttft_ratio, which, ..
+        } => {
             assert!((ttft_ratio - 3.0).abs() < 1e-6);
-            assert_eq!(which, "ttft",
-                "ttft ratio failure surfaces `which='ttft'`");
+            assert_eq!(which, "ttft", "ttft ratio failure surfaces `which='ttft'`");
         }
         other => panic!("expected Failed/ttft, got {other:?}"),
     }
@@ -808,7 +870,10 @@ fn render_report_two_cells_emits_two_data_rows() {
         },
     ];
     let report = render_report(&cells);
-    let data_rows = report.lines().filter(|l| l.starts_with("|") && !l.contains("---")).count();
+    let data_rows = report
+        .lines()
+        .filter(|l| l.starts_with("|") && !l.contains("---"))
+        .count();
     // header + 2 data rows
     assert_eq!(data_rows, 3, "expected header + 2 data, got: {}", report);
 }
@@ -861,10 +926,14 @@ impl BenchServer {
         let policy_cli = policy.replace('_', "-");
         cmd.args([
             "serve",
-            "--model", gguf,
-            "--host", "127.0.0.1",
-            "--port", &port.to_string(),
-            "--scheduler", &policy_cli,
+            "--model",
+            gguf,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--scheduler",
+            &policy_cli,
         ]);
         // `--max-slots` is only honored under inflight_batched per ADR-040
         // §6 Phase C iter-4 (C4); pass it for both policies — fifo_serial
@@ -873,10 +942,7 @@ impl BenchServer {
         if policy == "inflight_batched" {
             cmd.args(["--max-slots", &max_slots.to_string()]);
         }
-        let child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         Ok(Self { child, port })
     }
 }
@@ -1016,11 +1082,16 @@ fn run_stream(port: u16, prompt: &str, max_tokens: u32, model: &str) -> StreamRe
     cmd.args([
         "-s",
         "-N",
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "--max-time", &STREAM_BUDGET_SECS.to_string(),
-        "-w", "\n__HTTP_STATUS__:%{http_code}\n",
-        "-d", &body,
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "--max-time",
+        &STREAM_BUDGET_SECS.to_string(),
+        "-w",
+        "\n__HTTP_STATUS__:%{http_code}\n",
+        "-d",
+        &body,
         &format!("http://127.0.0.1:{port}/v1/chat/completions"),
     ])
     .stdout(Stdio::piped())
@@ -1152,8 +1223,8 @@ fn run_bench_cell(gguf: &str, policy: &'static str, n: u32) -> Result<Throughput
     let port = next_port();
     eprintln!("[cb-throughput] cell: policy={policy}, N={n}, port={port}, gguf={gguf}");
 
-    let mut server = BenchServer::spawn(gguf, policy, n, port)
-        .map_err(|e| format!("spawn hf2q serve: {e}"))?;
+    let mut server =
+        BenchServer::spawn(gguf, policy, n, port).map_err(|e| format!("spawn hf2q serve: {e}"))?;
 
     wait_for_readyz(&mut server)?;
     eprintln!("[cb-throughput] /readyz=200 on port={port}");
@@ -1161,8 +1232,7 @@ fn run_bench_cell(gguf: &str, policy: &'static str, n: u32) -> Result<Throughput
     // Resolve canonical model id via /v1/models for the SSE POST body.
     // The server returns a registry-keyed id; using it directly avoids
     // the auto-pipeline path-classification overhead per request.
-    let model_id = fetch_model_id(port)
-        .map_err(|e| format!("GET /v1/models: {e}"))?;
+    let model_id = fetch_model_id(port).map_err(|e| format!("GET /v1/models: {e}"))?;
     eprintln!("[cb-throughput] resolved model_id={model_id}");
 
     // Per-thread results via std::thread::scope. Mirrors the same shape
@@ -1301,9 +1371,7 @@ fn fetch_model_id(port: u16) -> std::io::Result<String> {
         Duration::from_secs(5),
     )?;
     s.set_read_timeout(Some(Duration::from_secs(30)))?;
-    s.write_all(
-        b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    )?;
+    s.write_all(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)?;
     let body = String::from_utf8_lossy(&buf);
@@ -1363,7 +1431,10 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
                 .expect("HF2Q_CB_THROUGHPUT_CONCURRENCY must be comma-separated u32 list")
         })
         .collect();
-    assert!(!concurrency.is_empty(), "concurrency list must be non-empty");
+    assert!(
+        !concurrency.is_empty(),
+        "concurrency list must be non-empty"
+    );
     for &n in &concurrency {
         assert!(n > 0, "concurrency entries must be > 0, got {n}");
     }
@@ -1480,8 +1551,7 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
                  skipping it would let a TTFT regression slip past the gate. \
                  Re-run with HF2Q_CB_THROUGHPUT_CONCURRENCY including `1` (e.g. \
                  `1,2,4,8` — the default).",
-                f.aggregate_tokens_per_sec_median,
-                i.aggregate_tokens_per_sec_median,
+                f.aggregate_tokens_per_sec_median, i.aggregate_tokens_per_sec_median,
             );
         }
         Ac4Outcome::StabilityBlocked => {
@@ -1508,7 +1578,11 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
                 i.aggregate_tokens_per_sec_max,
             );
         }
-        Ac4Outcome::Failed { aggregate_ratio, ttft_ratio, which } => {
+        Ac4Outcome::Failed {
+            aggregate_ratio,
+            ttft_ratio,
+            which,
+        } => {
             let f = fifo_n4.expect("Failed requires fifo_n4 present");
             let i = inflight_n4.expect("Failed requires inflight_n4 present");
             if which == "aggregate" {
@@ -1529,7 +1603,10 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
                 i.ttft_p95_ms_median,
             );
         }
-        Ac4Outcome::Passed { aggregate_ratio, ttft_ratio } => {
+        Ac4Outcome::Passed {
+            aggregate_ratio,
+            ttft_ratio,
+        } => {
             eprintln!(
                 "[ac-4 PASS] aggregate ratio {:.2}× ≥ 1.5× ✓ ; TTFT p95 ratio {:.2}× ≤ 2.0× ✓",
                 aggregate_ratio, ttft_ratio,
@@ -1547,8 +1624,8 @@ fn cb_throughput_required_env_vars_documented() {
         return;
     }
     let model = std::env::var("HF2Q_CB_THROUGHPUT_MODEL");
-    let concurrency = std::env::var("HF2Q_CB_THROUGHPUT_CONCURRENCY")
-        .unwrap_or_else(|_| String::from("1,2,4,8"));
+    let concurrency =
+        std::env::var("HF2Q_CB_THROUGHPUT_CONCURRENCY").unwrap_or_else(|_| String::from("1,2,4,8"));
     assert!(
         model.is_ok(),
         "HF2Q_CB_THROUGHPUT_E2E=1 set but HF2Q_CB_THROUGHPUT_MODEL absent — \
@@ -1558,7 +1635,11 @@ fn cb_throughput_required_env_vars_documented() {
         .split(',')
         .map(|s| s.trim().parse::<u32>())
         .collect();
-    assert!(parsed.is_ok(), "HF2Q_CB_THROUGHPUT_CONCURRENCY parse failed: {:?}", parsed);
+    assert!(
+        parsed.is_ok(),
+        "HF2Q_CB_THROUGHPUT_CONCURRENCY parse failed: {:?}",
+        parsed
+    );
     let ns = parsed.unwrap();
     assert!(!ns.is_empty(), "at least one N value required");
     for &n in &ns {
@@ -1696,9 +1777,7 @@ fn a4_inflection_bench_acceptance_dimension_scaffold() {
     // once the per-slot kernel routing exists — see the docstring.
     let cells: Vec<AcceptanceCell> = vec![AcceptanceCell::synthetic_for_smoke()];
     let report = render_acceptance_report(&cells);
-    println!(
-        "\n=== ADR-040 §6.1.55 iter-A4-cont-inflection-bench (scaffold) ===\n{report}"
-    );
+    println!("\n=== ADR-040 §6.1.55 iter-A4-cont-inflection-bench (scaffold) ===\n{report}");
 }
 
 // ============================================================================

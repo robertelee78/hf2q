@@ -178,7 +178,7 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
 /// to surface the error).
 fn pooling_type_u32(mode: Option<&str>) -> Option<u32> {
     match mode {
-        None => Some(1),                  // default MEAN
+        None => Some(1), // default MEAN
         Some("mean") | Some("MEAN") => Some(1),
         Some("cls") | Some("CLS") => Some(2),
         Some("last") | Some("lasttoken") | Some("LAST") => Some(3),
@@ -259,7 +259,8 @@ pub fn build_metadata(
         .expect("config.json missing required key `num_attention_heads`") as u32;
     let ctx_len = config["max_position_embeddings"]
         .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+        .expect("config.json missing required key `max_position_embeddings`")
+        as u32;
     let ln_eps = config["layer_norm_eps"]
         .as_f64()
         .expect("config.json missing required key `layer_norm_eps`") as f32;
@@ -291,9 +292,7 @@ pub fn build_metadata(
             // Sort by integer key
             let mut entries: Vec<(i64, String)> = m
                 .iter()
-                .filter_map(|(k, v)| {
-                    Some((k.parse::<i64>().ok()?, v.as_str()?.to_string()))
-                })
+                .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.as_str()?.to_string())))
                 .collect();
             if entries.is_empty() {
                 return None;
@@ -329,14 +328,8 @@ pub fn build_metadata(
     // (BERT has no GQA; the C runtime treats absent as = n_head).
     kv.push(("bert.block_count".into(), MetaValue::U32(n_layers)));
     kv.push(("bert.context_length".into(), MetaValue::U32(ctx_len)));
-    kv.push((
-        "bert.embedding_length".into(),
-        MetaValue::U32(hidden_size),
-    ));
-    kv.push((
-        "bert.feed_forward_length".into(),
-        MetaValue::U32(ffn_len),
-    ));
+    kv.push(("bert.embedding_length".into(), MetaValue::U32(hidden_size)));
+    kv.push(("bert.feed_forward_length".into(), MetaValue::U32(ffn_len)));
     kv.push(("bert.attention.head_count".into(), MetaValue::U32(n_head)));
     kv.push((
         "bert.attention.layer_norm_epsilon".into(),
@@ -368,10 +361,7 @@ mod tests {
     fn bert_tensor_name_round_trip() {
         let cases: &[(&str, &str)] = &[
             // ----- Embedding globals -----
-            (
-                "embeddings.word_embeddings.weight",
-                "token_embd.weight",
-            ),
+            ("embeddings.word_embeddings.weight", "token_embd.weight"),
             (
                 "embeddings.position_embeddings.weight",
                 "position_embd.weight",
@@ -380,14 +370,8 @@ mod tests {
                 "embeddings.token_type_embeddings.weight",
                 "token_types.weight",
             ),
-            (
-                "embeddings.LayerNorm.weight",
-                "token_embd_norm.weight",
-            ),
-            (
-                "embeddings.LayerNorm.bias",
-                "token_embd_norm.bias",
-            ),
+            ("embeddings.LayerNorm.weight", "token_embd_norm.weight"),
+            ("embeddings.LayerNorm.bias", "token_embd_norm.bias"),
             // ----- Per-block: edge (L=0) -----
             (
                 "encoder.layer.0.attention.self.query.weight",
@@ -441,10 +425,7 @@ mod tests {
                 "encoder.layer.0.output.dense.weight",
                 "blk.0.ffn_down.weight",
             ),
-            (
-                "encoder.layer.0.output.dense.bias",
-                "blk.0.ffn_down.bias",
-            ),
+            ("encoder.layer.0.output.dense.bias", "blk.0.ffn_down.bias"),
             (
                 "encoder.layer.0.output.LayerNorm.weight",
                 "blk.0.layer_output_norm.weight",
@@ -497,10 +478,7 @@ mod tests {
                 "bert.embeddings.word_embeddings.weight",
                 "token_embd.weight",
             ),
-            (
-                "bert.embeddings.LayerNorm.bias",
-                "token_embd_norm.bias",
-            ),
+            ("bert.embeddings.LayerNorm.bias", "token_embd_norm.bias"),
             (
                 "bert.encoder.layer.5.attention.self.value.bias",
                 "blk.5.attn_v.bias",
@@ -528,10 +506,7 @@ mod tests {
         // Unknown embedding global.
         assert_eq!(map_tensor_name("embeddings.unknown.weight"), None);
         // Wrong prefix (transformer-style — not BERT).
-        assert_eq!(
-            map_tensor_name("transformer.h.0.attn.c_attn.weight"),
-            None
-        );
+        assert_eq!(map_tensor_name("transformer.h.0.attn.c_attn.weight"), None);
         // Llama-3-style key shouldn't match BERT mapper.
         assert_eq!(
             map_tensor_name("model.layers.0.self_attn.q_proj.weight"),
@@ -558,10 +533,7 @@ mod tests {
             None
         );
         // Unknown per-block suffix.
-        assert_eq!(
-            map_tensor_name("encoder.layer.0.unknown.weight"),
-            None
-        );
+        assert_eq!(map_tensor_name("encoder.layer.0.unknown.weight"), None);
         // BERT has no rotary / no ffn_gate — these must NOT map.
         assert_eq!(
             map_tensor_name("encoder.layer.0.attention.self.rotary_emb.inv_freq"),
@@ -628,10 +600,7 @@ mod tests {
             "pooling=cls → PoolingType::CLS = 2"
         );
         assert_eq!(by_key["general.file_type"], MetaValue::U32(1));
-        assert_eq!(
-            by_key["general.quantization_version"],
-            MetaValue::U32(2)
-        );
+        assert_eq!(by_key["general.quantization_version"], MetaValue::U32(2));
     }
 
     /// Sibling — verify the optional-key defaults: missing
@@ -673,4 +642,3 @@ mod tests {
         );
     }
 }
-

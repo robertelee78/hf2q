@@ -78,7 +78,9 @@ impl LlamaFtype {
             LlamaFtype::MostlyQ8_0 => GgmlType::Q8_0,
             LlamaFtype::MostlyIQ4_NL => GgmlType::IQ4_NL,
             LlamaFtype::MostlyQ2_K | LlamaFtype::MostlyQ2_K_S => GgmlType::Q2_K,
-            LlamaFtype::MostlyQ3_K_S | LlamaFtype::MostlyQ3_K_M | LlamaFtype::MostlyQ3_K_L => GgmlType::Q3_K,
+            LlamaFtype::MostlyQ3_K_S | LlamaFtype::MostlyQ3_K_M | LlamaFtype::MostlyQ3_K_L => {
+                GgmlType::Q3_K
+            }
             LlamaFtype::MostlyQ4_K_S | LlamaFtype::MostlyQ4_K_M => GgmlType::Q4_K,
             LlamaFtype::MostlyQ5_K_S | LlamaFtype::MostlyQ5_K_M => GgmlType::Q5_K,
             LlamaFtype::MostlyQ6_K => GgmlType::Q6_K,
@@ -258,7 +260,9 @@ mod tests {
 
     #[test]
     fn u32_round_trip() {
-        for v in [0u32, 1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 25, 32] {
+        for v in [
+            0u32, 1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 25, 32,
+        ] {
             let f = LlamaFtype::try_from(v).unwrap();
             assert_eq!(u32::from(f), v);
         }

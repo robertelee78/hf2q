@@ -57,12 +57,20 @@ mod tests {
         let tok = build_nomic_wordpiece_tokenizer(path).expect("build tokenizer");
         let ids = tok.encode("hello world", true);
         // Structural lock: 4 tokens with [CLS] and [SEP] bracketing.
-        assert_eq!(ids.len(), 4, "expected 4 tokens for [CLS] hello world [SEP], got {ids:?}");
+        assert_eq!(
+            ids.len(),
+            4,
+            "expected 4 tokens for [CLS] hello world [SEP], got {ids:?}"
+        );
         // First and last are special tokens — vocab-IDs depend on the
         // model but [CLS]=101 and [SEP]=102 are the BERT-family
         // convention nomic inherits. Locking those values catches a
         // wrong-special-tokens regression.
-        assert_eq!(ids.first(), Some(&101u32), "expected [CLS]=101, got {ids:?}");
+        assert_eq!(
+            ids.first(),
+            Some(&101u32),
+            "expected [CLS]=101, got {ids:?}"
+        );
         assert_eq!(ids.last(), Some(&102u32), "expected [SEP]=102, got {ids:?}");
     }
 }

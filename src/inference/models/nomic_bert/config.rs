@@ -202,7 +202,10 @@ mod tests {
         // GGUF strings for both BERT and nomic-bert.
         assert_eq!(NOMIC_BERT_TENSOR_TOKEN_EMBD, "token_embd.weight");
         assert_eq!(NOMIC_BERT_TENSOR_TOKEN_TYPES, "token_types.weight");
-        assert_eq!(NOMIC_BERT_TENSOR_EMBED_NORM_WEIGHT, "token_embd_norm.weight");
+        assert_eq!(
+            NOMIC_BERT_TENSOR_EMBED_NORM_WEIGHT,
+            "token_embd_norm.weight"
+        );
         assert_eq!(NOMIC_BERT_TENSOR_EMBED_NORM_BIAS, "token_embd_norm.bias");
     }
 
@@ -283,8 +286,7 @@ mod tests {
             return;
         }
         let gguf = GgufFile::open(path).expect("open bge GGUF");
-        let err = NomicBertConfig::from_gguf(&gguf)
-            .expect_err("parser must reject 'bert' arch");
+        let err = NomicBertConfig::from_gguf(&gguf).expect_err("parser must reject 'bert' arch");
         let msg = format!("{err}");
         assert!(
             msg.contains("'bert'") && msg.contains(ARCH_NOMIC_BERT),

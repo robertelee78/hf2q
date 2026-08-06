@@ -90,9 +90,8 @@ impl Qwen35DiskPersistor {
     pub fn new_with_budget(cache_dir: PathBuf, budget_bytes: u64) -> Result<Self> {
         // Validate the parent dir is creatable; do not pre-create
         // per-cfg subdirs (we don't know which cfgs will be used yet).
-        fs::create_dir_all(&cache_dir).with_context(|| {
-            format!("Qwen35DiskPersistor: mkdir {}", cache_dir.display())
-        })?;
+        fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("Qwen35DiskPersistor: mkdir {}", cache_dir.display()))?;
         Ok(Self {
             cache_dir,
             budget_bytes,
@@ -226,7 +225,10 @@ impl Qwen35DiskPersistor {
                 format!("Qwen35DiskPersistor::write: create {}", tmp_path.display())
             })?;
             tmp.write_all(&bytes).with_context(|| {
-                format!("Qwen35DiskPersistor::write: write_all {}", tmp_path.display())
+                format!(
+                    "Qwen35DiskPersistor::write: write_all {}",
+                    tmp_path.display()
+                )
             })?;
             tmp.sync_all().with_context(|| {
                 format!("Qwen35DiskPersistor::write: sync {}", tmp_path.display())
@@ -271,14 +273,13 @@ impl Qwen35DiskPersistor {
                 ))
             }
         };
-        let pair = deserialize_hybrid_with_sidecar(&bytes, cfg, device)
-            .with_context(|| {
-                format!(
-                    "Qwen35DiskPersistor::read: deserialize {} ({} bytes)",
-                    path.display(),
-                    bytes.len()
-                )
-            })?;
+        let pair = deserialize_hybrid_with_sidecar(&bytes, cfg, device).with_context(|| {
+            format!(
+                "Qwen35DiskPersistor::read: deserialize {} ({} bytes)",
+                path.display(),
+                bytes.len()
+            )
+        })?;
         Ok(Some(pair))
     }
 
@@ -333,9 +334,7 @@ impl Qwen35DiskPersistor {
             }
             let lcp_key_hex = name.trim_end_matches(".bin").to_string();
             match self.read(cfg, &lcp_key_hex, device) {
-                Ok(Some((snap, sidecar))) => {
-                    out.push((lcp_key_hex, snap, sidecar))
-                }
+                Ok(Some((snap, sidecar))) => out.push((lcp_key_hex, snap, sidecar)),
                 Ok(None) => {
                     // Race window: file vanished between read_dir and
                     // open. Skip silently.
@@ -446,14 +445,10 @@ mod tests {
     /// Standalone synth-snapshot helper for the disk-persistor tests
     /// (avoids cross-module test imports). Mirrors the pattern in
     /// qwen35_hybrid_persistor::tests::synth_full_attn_only_snapshot.
-    fn synth_snapshot(
-        device: &MlxDevice,
-        cfg: &Qwen35HybridConfig,
-    ) -> HybridKvCacheSnapshot {
+    fn synth_snapshot(device: &MlxDevice, cfg: &Qwen35HybridConfig) -> HybridKvCacheSnapshot {
         let elems_full: usize = cfg.full_attn_shape.iter().product::<u64>() as usize;
         let bytes_full = elems_full * std::mem::size_of::<f32>();
-        let shape_full: Vec<usize> =
-            cfg.full_attn_shape.iter().map(|d| *d as usize).collect();
+        let shape_full: Vec<usize> = cfg.full_attn_shape.iter().map(|d| *d as usize).collect();
 
         let mut full_attn_k = Vec::with_capacity(cfg.n_full_attn as usize);
         let mut full_attn_v = Vec::with_capacity(cfg.n_full_attn as usize);
@@ -485,8 +480,7 @@ mod tests {
 
         let elems_conv: usize = cfg.linear_conv_shape.iter().product::<u64>() as usize;
         let bytes_conv = elems_conv * std::mem::size_of::<f32>();
-        let shape_conv: Vec<usize> =
-            cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
+        let shape_conv: Vec<usize> = cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
         let elems_rec: usize = cfg.linear_recurrent_shape.iter().product::<u64>() as usize;
         let bytes_rec = elems_rec * std::mem::size_of::<f32>();
         let shape_rec: Vec<usize> = cfg
@@ -593,13 +587,29 @@ mod tests {
         for i in 0..a.full_attn_k.len() {
             // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — compare
             // Some-to-Some byte-equal.
-            if a.full_attn_k[i].as_ref().expect("a.k some").as_slice::<u8>().unwrap()
-                != b.full_attn_k[i].as_ref().expect("b.k some").as_slice::<u8>().unwrap()
+            if a.full_attn_k[i]
+                .as_ref()
+                .expect("a.k some")
+                .as_slice::<u8>()
+                .unwrap()
+                != b.full_attn_k[i]
+                    .as_ref()
+                    .expect("b.k some")
+                    .as_slice::<u8>()
+                    .unwrap()
             {
                 return false;
             }
-            if a.full_attn_v[i].as_ref().expect("a.v some").as_slice::<u8>().unwrap()
-                != b.full_attn_v[i].as_ref().expect("b.v some").as_slice::<u8>().unwrap()
+            if a.full_attn_v[i]
+                .as_ref()
+                .expect("a.v some")
+                .as_slice::<u8>()
+                .unwrap()
+                != b.full_attn_v[i]
+                    .as_ref()
+                    .expect("b.v some")
+                    .as_slice::<u8>()
+                    .unwrap()
             {
                 return false;
             }
@@ -781,16 +791,17 @@ mod tests {
         let mut snap_b = synth_snapshot(&device, &cfg);
         {
             // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V.
-            let dst = snap_b.full_attn_k[0].as_mut().expect("snap_b.k[0] some").as_mut_slice::<u8>().unwrap();
+            let dst = snap_b.full_attn_k[0]
+                .as_mut()
+                .expect("snap_b.k[0] some")
+                .as_mut_slice::<u8>()
+                .unwrap();
             for b in dst.iter_mut() {
                 *b = b.wrapping_add(7);
             }
         }
         persistor.write(&cfg, "the_key", &snap_b, &sidecar).unwrap();
-        let (restored_snap, _) = persistor
-            .read(&cfg, "the_key", &device)
-            .unwrap()
-            .unwrap();
+        let (restored_snap, _) = persistor.read(&cfg, "the_key", &device).unwrap().unwrap();
         assert!(snapshots_byte_equal(&snap_b, &restored_snap));
         assert!(!snapshots_byte_equal(&snap_a, &restored_snap));
         let _ = fs::remove_dir_all(&tempdir);
@@ -911,8 +922,7 @@ mod tests {
         } // persistor_a dropped — simulates process exit
 
         // ── Process B: fresh persistor + fresh registry; hydrate ──
-        let mut registry: LcpRegistry<HybridKvCacheSnapshot> =
-            LcpRegistry::new(8);
+        let mut registry: LcpRegistry<HybridKvCacheSnapshot> = LcpRegistry::new(8);
         assert_eq!(registry.len(), 0, "fresh registry must be empty");
 
         let persistor_b = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
@@ -1019,20 +1029,43 @@ mod tests {
             let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
             let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
             let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
-            for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+            for (i, b) in k_packed
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *b = ((slot * 41 + i * 13) % 251) as u8;
             }
-            for (i, b) in v_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+            for (i, b) in v_packed
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *b = ((slot * 17 + i * 23) % 251) as u8;
             }
-            for (i, f) in k_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            for (i, f) in k_norms
+                .as_mut_slice::<f32>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *f = (slot as f32) * 0.75 + (i as f32) * 0.25;
             }
-            for (i, f) in v_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            for (i, f) in v_norms
+                .as_mut_slice::<f32>()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 *f = (slot as f32) * 0.5 + (i as f32) * 0.125;
             }
             full_attn_tq.push(Some(TqKvSnapshot {
-                k_packed, k_norms, v_packed, v_norms,
+                k_packed,
+                k_norms,
+                v_packed,
+                v_norms,
                 norms_per_pos: 1,
             }));
         }
@@ -1085,7 +1118,9 @@ mod tests {
                 sliding_window: 4096,
                 linear_capacity: 2048,
             };
-            persistor_a.write(&cfg, "tqkey0001", &snap, &sidecar).unwrap();
+            persistor_a
+                .write(&cfg, "tqkey0001", &snap, &sidecar)
+                .unwrap();
         } // persistor_a + snap dropped — simulates process exit
 
         // ── Process B: fresh persistor + fresh registry; hydrate ──
@@ -1130,10 +1165,14 @@ mod tests {
             }
             // K/V remain None (TQ-only mode).
             for i in 0..n_full_attn {
-                assert!(hydrated_snap.full_attn_k[i].is_none(),
-                    "K must remain None across round-trip for slot[{i}]");
-                assert!(hydrated_snap.full_attn_v[i].is_none(),
-                    "V must remain None across round-trip for slot[{i}]");
+                assert!(
+                    hydrated_snap.full_attn_k[i].is_none(),
+                    "K must remain None across round-trip for slot[{i}]"
+                );
+                assert!(
+                    hydrated_snap.full_attn_v[i].is_none(),
+                    "V must remain None across round-trip for slot[{i}]"
+                );
             }
             // Re-store into registry (mirror production hydrate path).
             let key = LcpKey {
@@ -1141,17 +1180,20 @@ mod tests {
                 tenant_id: sidecar.tenant_id.clone(),
                 params_hash: sidecar.params_hash,
             };
-            registry.store(
-                key,
-                sidecar.prompt_tokens.clone(),
-                vec![std::sync::Arc::new(hydrated_snap)],
-                sidecar.sliding_window as usize,
-                sidecar.linear_capacity as usize,
-            ).expect("registry stores hydrated TQ snapshot");
+            registry
+                .store(
+                    key,
+                    sidecar.prompt_tokens.clone(),
+                    vec![std::sync::Arc::new(hydrated_snap)],
+                    sidecar.sliding_window as usize,
+                    sidecar.linear_capacity as usize,
+                )
+                .expect("registry stores hydrated TQ snapshot");
         }
 
         // Lookup with shared prefix (LCP=7) succeeds.
-        let prefix = registry.lookup(&original_key, &new_request_prompt)
+        let prefix = registry
+            .lookup(&original_key, &new_request_prompt)
             .expect("post-hydrate lookup with original key must hit");
         assert_eq!(prefix.k, 7, "LCP length must match shared prefix");
 
@@ -1258,7 +1300,11 @@ mod tests {
         // Hydrate tolerates the evicted gap: it returns exactly the
         // surviving entries, no error.
         let triples = persistor.hydrate_for_cfg(&cfg, &device).unwrap();
-        assert_eq!(triples.len(), 2, "hydrate must return the two surviving snapshots");
+        assert_eq!(
+            triples.len(),
+            2,
+            "hydrate must return the two surviving snapshots"
+        );
 
         let _ = fs::remove_dir_all(&tempdir);
     }

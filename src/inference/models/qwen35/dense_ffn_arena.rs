@@ -276,7 +276,6 @@ pub struct MoeFfnArena {
     //   a_s_buf:      4096 × 512 × 4 = 8.0 MB
     //   b_s_buf:      4096 × 512 × 4 = 8.0 MB
     // Total: ~18 MB — negligible vs the existing ~870 MB MoeFfnArena.
-
     /// `[seq, num_experts]` F32 — router logits.  Replaces the
     /// helper-local `proj_pooled` allocation at `gpu_ffn.rs:2651`.
     pub logits_buf: MlxBuffer,
@@ -894,12 +893,20 @@ mod tests {
         let n_out_bytes = (seq as usize) * (h as usize) * 4;
         assert_eq!(arena.gate_buf.byte_len(), n_h_bytes, "gate_buf byte_len");
         assert_eq!(arena.up_buf.byte_len(), n_h_bytes, "up_buf byte_len");
-        assert_eq!(arena.hidden_buf.byte_len(), n_h_bytes, "hidden_buf byte_len");
+        assert_eq!(
+            arena.hidden_buf.byte_len(),
+            n_h_bytes,
+            "hidden_buf byte_len"
+        );
         assert_eq!(arena.silu_params_buf.byte_len(), 4, "silu_params byte_len");
         // iter92: down_out_buf scratch (final-output sister; ring slot is the
         // FINAL final-output, but down_out_buf is intermediate when residual
         // is folded).
-        assert_eq!(arena.down_out_buf.byte_len(), n_out_bytes, "down_out_buf byte_len");
+        assert_eq!(
+            arena.down_out_buf.byte_len(),
+            n_out_bytes,
+            "down_out_buf byte_len"
+        );
     }
 
     /// Smaller shape sanity-check.
@@ -1019,7 +1026,10 @@ mod tests {
             .silu_params_buf
             .as_slice::<u32>()
             .expect("silu_params as_slice::<u32>");
-        assert_eq!(slice[0], 0u32, "silu_params[0] should be zero from device.alloc_buffer");
+        assert_eq!(
+            slice[0], 0u32,
+            "silu_params[0] should be zero from device.alloc_buffer"
+        );
     }
 
     // ── MoeFfnArena tests ───────────────────────────────────────────────
@@ -1037,7 +1047,8 @@ mod tests {
             }
         };
         let (seq, h, topk, m_moe, m_sh, ne) = (4096u32, 5120u32, 8u32, 512u32, 512u32, 128u32);
-        let arena = MoeFfnArena::new(&device, seq, h, topk, m_moe, m_sh, ne).expect("moe arena new");
+        let arena =
+            MoeFfnArena::new(&device, seq, h, topk, m_moe, m_sh, ne).expect("moe arena new");
 
         assert_eq!(arena.seq_capacity, seq);
         assert_eq!(arena.hidden_size, h);
@@ -1050,7 +1061,11 @@ mod tests {
         let gate_all_bytes = total_rows * (m_moe as usize) * 4;
         let y_all_bytes = total_rows * (h as usize) * 4;
         let h_s_bytes = (seq as usize) * (m_sh as usize) * 4;
-        assert_eq!(arena.gate_all_buf.byte_len(), gate_all_bytes, "gate_all_buf");
+        assert_eq!(
+            arena.gate_all_buf.byte_len(),
+            gate_all_bytes,
+            "gate_all_buf"
+        );
         assert_eq!(arena.up_all_buf.byte_len(), gate_all_bytes, "up_all_buf");
         assert_eq!(arena.h_all_buf.byte_len(), gate_all_bytes, "h_all_buf");
         assert_eq!(arena.y_all_buf.byte_len(), y_all_bytes, "y_all_buf");
@@ -1061,7 +1076,11 @@ mod tests {
         let sh_logit_bytes = (seq as usize) * 4;
         let a_s_bytes = (seq as usize) * (m_sh as usize) * 4;
         assert_eq!(arena.logits_buf.byte_len(), logits_bytes, "logits_buf");
-        assert_eq!(arena.sh_logit_buf.byte_len(), sh_logit_bytes, "sh_logit_buf");
+        assert_eq!(
+            arena.sh_logit_buf.byte_len(),
+            sh_logit_bytes,
+            "sh_logit_buf"
+        );
         assert_eq!(arena.a_s_buf.byte_len(), a_s_bytes, "a_s_buf");
         assert_eq!(arena.b_s_buf.byte_len(), a_s_bytes, "b_s_buf");
     }
@@ -1160,9 +1179,7 @@ mod tests {
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "test_layer_boundary_arena_new_apex_shape: skipping — no Metal device"
-                );
+                eprintln!("test_layer_boundary_arena_new_apex_shape: skipping — no Metal device");
                 return;
             }
         };
@@ -1200,9 +1217,7 @@ mod tests {
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "test_layer_boundary_arena_validate_fits: skipping — no Metal device"
-                );
+                eprintln!("test_layer_boundary_arena_validate_fits: skipping — no Metal device");
                 return;
             }
         };
@@ -1355,8 +1370,16 @@ mod tests {
         // Layer 2 wraps back to slot0; layer 3 to slot1; etc.
         assert_eq!(ring.slot_mut(2).contents_ptr(), slot0_ptr, "even rotation");
         assert_eq!(ring.slot_mut(3).contents_ptr(), slot1_ptr, "odd rotation");
-        assert_eq!(ring.slot_mut(64).contents_ptr(), slot0_ptr, "high layer wrap");
-        assert_eq!(ring.slot_mut(65).contents_ptr(), slot1_ptr, "high layer wrap");
+        assert_eq!(
+            ring.slot_mut(64).contents_ptr(),
+            slot0_ptr,
+            "high layer wrap"
+        );
+        assert_eq!(
+            ring.slot_mut(65).contents_ptr(),
+            slot1_ptr,
+            "high layer wrap"
+        );
 
         // slot_clone preserves the same underlying allocation (Arc clone).
         let clone0 = ring.slot_clone(0);

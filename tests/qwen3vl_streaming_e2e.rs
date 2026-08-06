@@ -187,7 +187,11 @@ fn qwen3vl_streaming_e2e_default_skips_when_env_gate_unset() {
 #[test]
 fn qwen3vl_streaming_e2e_handler_does_not_emit_wedge4d_501() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let handlers = crate_root.join("src").join("serve").join("api").join("handlers.rs");
+    let handlers = crate_root
+        .join("src")
+        .join("serve")
+        .join("api")
+        .join("handlers.rs");
     let src = std::fs::read_to_string(&handlers).expect("read handlers.rs");
     assert!(
         !src.contains("streaming chat with Qwen3-VL DeepStack injection is not yet"),
@@ -208,7 +212,11 @@ fn qwen3vl_streaming_e2e_handler_does_not_emit_wedge4d_501() {
 #[test]
 fn qwen3vl_streaming_e2e_engine_drops_phase2c_guard() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let engine = crate_root.join("src").join("serve").join("api").join("engine.rs");
+    let engine = crate_root
+        .join("src")
+        .join("serve")
+        .join("api")
+        .join("engine.rs");
     let src = std::fs::read_to_string(&engine).expect("read engine.rs");
     assert!(
         !src.contains("Qwen35 streaming path does not yet support"),
@@ -294,10 +302,7 @@ fn qwen3vl_streaming_e2e_real() {
     };
 
     let img_bytes = std::fs::read(&fixture).expect("read fixture image");
-    let img_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &img_bytes,
-    );
+    let img_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &img_bytes);
     let data_uri = format!("data:image/png;base64,{img_b64}");
 
     // Wedge-4e: STREAMING request body. `stream: true` is the field
@@ -346,9 +351,7 @@ fn qwen3vl_streaming_e2e_real() {
     );
     assert_and_kill(
         content_type.contains("text/event-stream"),
-        format!(
-            "expected content-type to be text/event-stream, got: {content_type}"
-        ),
+        format!("expected content-type to be text/event-stream, got: {content_type}"),
     );
 
     // Parse SSE: collect data: events, accumulate content, look for [DONE].
@@ -373,8 +376,7 @@ fn qwen3vl_streaming_e2e_real() {
                         delta_count += 1;
                     }
                 }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
-                {
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                     accumulated_reasoning.push_str(reasoning);
                 }
             }
@@ -387,9 +389,7 @@ fn qwen3vl_streaming_e2e_real() {
     );
     assert_and_kill(
         delta_count >= 5,
-        format!(
-            "expected >=5 non-empty content delta events, got {delta_count}"
-        ),
+        format!("expected >=5 non-empty content delta events, got {delta_count}"),
     );
 
     if let Err(reason) = coherence_check(&accumulated_content) {
@@ -474,10 +474,7 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
     };
 
     let img_bytes = std::fs::read(&fixture).expect("read fixture image");
-    let img_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &img_bytes,
-    );
+    let img_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &img_bytes);
     let data_uri = format!("data:image/png;base64,{img_b64}");
 
     let req_body = serde_json::json!({
@@ -528,10 +525,7 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
             panic!("{msg}\nresponse body: {body_text}");
         }
     };
-    assert_and_kill(
-        status.is_success(),
-        format!("expected 2xx, got {status}"),
-    );
+    assert_and_kill(status.is_success(), format!("expected 2xx, got {status}"));
 
     // Collect tool_call argument fragments across delta events.
     // OpenAI streams tool calls as { tool_calls: [{ id, type, function:
@@ -680,10 +674,7 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
     };
 
     let img_bytes = std::fs::read(&fixture).expect("read fixture image");
-    let img_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &img_bytes,
-    );
+    let img_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &img_bytes);
     let data_uri = format!("data:image/png;base64,{img_b64}");
 
     const FORCED_NAME: &str = "describe_image_region";
@@ -740,10 +731,7 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
             panic!("{msg}\nresponse body: {body_text}");
         }
     };
-    assert_and_kill(
-        status.is_success(),
-        format!("expected 2xx, got {status}"),
-    );
+    assert_and_kill(status.is_success(), format!("expected 2xx, got {status}"));
 
     // Collect tool_call deltas — we EXPECT one (the model cannot
     // decline under forced function tool_choice).
@@ -782,15 +770,14 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
     // FORCED-function pin: a tool_call MUST have been emitted (the
     // grammar-constrained sampler cannot produce text content).
     let tool_check_result: Result<(), String> = (|| {
-        let name = tool_name_seen
-            .as_deref()
-            .ok_or_else(|| {
-                "FORCED-function tool_choice produced NO tool_call delta — \
+        let name = tool_name_seen.as_deref().ok_or_else(|| {
+            "FORCED-function tool_choice produced NO tool_call delta — \
                  the grammar gate at handlers.rs:1112-1115 should have \
                  physically prevented text-content fallback. Either the \
                  grammar compile failed silently OR the server didn't \
-                 honor the forced name.".to_string()
-            })?;
+                 honor the forced name."
+                .to_string()
+        })?;
         if name != FORCED_NAME {
             return Err(format!(
                 "FORCED-function tool_choice asked for {FORCED_NAME:?} but \
@@ -798,18 +785,14 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
             ));
         }
         if tool_args_concat.is_empty() {
-            return Err(
-                "FORCED-function emitted tool_call but arguments were empty"
-                    .to_string(),
-            );
+            return Err("FORCED-function emitted tool_call but arguments were empty".to_string());
         }
-        let parsed: serde_json::Value = serde_json::from_str(&tool_args_concat)
-            .map_err(|e| {
-                format!(
-                    "FORCED-function tool_call arguments did not parse \
+        let parsed: serde_json::Value = serde_json::from_str(&tool_args_concat).map_err(|e| {
+            format!(
+                "FORCED-function tool_call arguments did not parse \
                      as JSON: {e}\nargs: {tool_args_concat:?}"
-                )
-            })?;
+            )
+        })?;
         let obj = parsed.as_object().ok_or_else(|| {
             format!("FORCED-function arguments parsed but not an object: {parsed}")
         })?;

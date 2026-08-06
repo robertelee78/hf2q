@@ -28,12 +28,7 @@
 use super::config::Eagle3DrafterConfig;
 use super::kv_cache::DrafterKvCache;
 use super::tensors::Eagle3DrafterTensors;
-use crate::inference::models::qwen35::gpu_full_attn::{
-    apply_imrope, apply_linear_projection_f32,
-};
-use mlx_native::ops::tree_attention::{
-    self as tree_attn_ops, TreeAttentionParams,
-};
+use crate::inference::models::qwen35::gpu_full_attn::{apply_imrope, apply_linear_projection_f32};
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
 use mlx_native::ops::elementwise::elementwise_add;
@@ -41,6 +36,7 @@ use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::ops::transpose::permute_021_f32;
+use mlx_native::ops::tree_attention::{self as tree_attn_ops, TreeAttentionParams};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// EAGLE-3 FC projection.
@@ -106,15 +102,13 @@ pub fn dispatch_eagle3_fc(
     // Codex /cfa E4b.2 Major (2026-05-22): checked multiply for the
     // expected element count. Otherwise large seq_len could wrap on
     // release and let an undersized buffer pass validation.
-    let expected_input_elems = (seq_len as usize)
-        .checked_mul(fc_in_usize)
-        .ok_or_else(|| {
-            anyhow!(
-                "dispatch_eagle3_fc: seq_len ({}) * fc_input_size ({}) overflows usize",
-                seq_len,
-                fc_in_usize
-            )
-        })?;
+    let expected_input_elems = (seq_len as usize).checked_mul(fc_in_usize).ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_fc: seq_len ({}) * fc_input_size ({}) overflows usize",
+            seq_len,
+            fc_in_usize
+        )
+    })?;
     let actual_elems = concat_hidden_gpu.element_count();
     if actual_elems != expected_input_elems {
         return Err(anyhow!(
@@ -123,9 +117,14 @@ pub fn dispatch_eagle3_fc(
         ));
     }
     apply_linear_projection_f32(
-        encoder, registry, device,
-        concat_hidden_gpu, &tensors.fc,
-        seq_len, fc_in, hidden,
+        encoder,
+        registry,
+        device,
+        concat_hidden_gpu,
+        &tensors.fc,
+        seq_len,
+        fc_in,
+        hidden,
     )
     .context("dispatch_eagle3_fc")
 }
@@ -151,11 +150,7 @@ const RMS_NORM_DIM_F32_EXACT_MAX: u32 = 1 << 24;
 
 /// Build the `[eps, dim]` F32 params buffer required by
 /// `dispatch_rms_norm`. Allocates a fresh tiny buffer per call.
-fn alloc_rms_norm_params_eagle3(
-    device: &MlxDevice,
-    eps: f32,
-    dim: u32,
-) -> Result<MlxBuffer> {
+fn alloc_rms_norm_params_eagle3(device: &MlxDevice, eps: f32, dim: u32) -> Result<MlxBuffer> {
     if dim > RMS_NORM_DIM_F32_EXACT_MAX {
         return Err(anyhow!(
             "alloc_rms_norm_params_eagle3: dim {} exceeds 2^24 — `as f32` would round-to-even",
@@ -275,11 +270,7 @@ fn dispatch_eagle3_rms_norm_seq_x_hidden(
             )
         })?;
     let out = device
-        .alloc_buffer(
-            out_bytes,
-            DType::F32,
-            vec![seq_len as usize, hidden_usize],
-        )
+        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, hidden_usize])
         .map_err(|e| anyhow!("alloc {label} output: {e}"))?;
     let params = alloc_rms_norm_params_eagle3(device, cfg.rms_norm_eps, hidden)?;
     dispatch_rms_norm(
@@ -650,9 +641,14 @@ fn dispatch_eagle3_projection_with_optional_bias(
     }
     // Dispatch the matmul.
     let out = apply_linear_projection_f32(
-        encoder, registry, device,
-        input, weight,
-        seq_len, in_features, out_features,
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        seq_len,
+        in_features,
+        out_features,
     )
     .with_context(|| format!("apply_linear_projection_f32 {label}"))?;
     // Optional bias add — `add_bias_row_2d_f32` broadcasts `[N]` bias
@@ -696,7 +692,9 @@ pub fn dispatch_eagle3_q_proj(
     seq_len: u32,
 ) -> Result<MlxBuffer> {
     dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         concat_input,
         &tensors.q_proj,
         tensors.q_bias.as_ref(),
@@ -721,7 +719,9 @@ pub fn dispatch_eagle3_k_proj(
     seq_len: u32,
 ) -> Result<MlxBuffer> {
     dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         concat_input,
         &tensors.k_proj,
         tensors.k_bias.as_ref(),
@@ -746,7 +746,9 @@ pub fn dispatch_eagle3_v_proj(
     seq_len: u32,
 ) -> Result<MlxBuffer> {
     dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         concat_input,
         &tensors.v_proj,
         tensors.v_bias.as_ref(),
@@ -804,7 +806,9 @@ fn dispatch_eagle3_head_norm(
     if seq_len == 0 || num_heads == 0 {
         return Err(anyhow!(
             "dispatch_eagle3_head_norm ({}): seq_len ({}) and num_heads ({}) must both be > 0",
-            label, seq_len, num_heads
+            label,
+            seq_len,
+            num_heads
         ));
     }
     let head_dim_usize = cfg.head_dim;
@@ -843,7 +847,9 @@ fn dispatch_eagle3_head_norm(
         .ok_or_else(|| {
             anyhow!(
                 "dispatch_eagle3_head_norm ({}): seq_len ({}) * num_heads ({}) overflows usize",
-                label, seq_len, num_heads
+                label,
+                seq_len,
+                num_heads
             )
         })?;
     if rows_usize > (u32::MAX as usize) {
@@ -855,14 +861,14 @@ fn dispatch_eagle3_head_norm(
     }
     let rows: u32 = rows_usize as u32;
     // expected element count for proj = rows * head_dim
-    let expected_elems = rows_usize
-        .checked_mul(head_dim_usize)
-        .ok_or_else(|| {
-            anyhow!(
-                "dispatch_eagle3_head_norm ({}): rows ({}) * head_dim ({}) overflows usize",
-                label, rows_usize, head_dim_usize
-            )
-        })?;
+    let expected_elems = rows_usize.checked_mul(head_dim_usize).ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_head_norm ({}): rows ({}) * head_dim ({}) overflows usize",
+            label,
+            rows_usize,
+            head_dim_usize
+        )
+    })?;
     if proj.element_count() != expected_elems {
         return Err(anyhow!(
             "dispatch_eagle3_head_norm ({}): proj has {} elements, expected {} (rows={} * head_dim={})",
@@ -874,7 +880,8 @@ fn dispatch_eagle3_head_norm(
         .ok_or_else(|| {
             anyhow!(
                 "dispatch_eagle3_head_norm ({}): expected_elems ({}) * 4 overflows usize",
-                label, expected_elems
+                label,
+                expected_elems
             )
         })?;
     let out = device
@@ -946,8 +953,14 @@ pub fn dispatch_eagle3_q_head_norm(
         )
     })?;
     dispatch_eagle3_head_norm(
-        encoder, registry, device,
-        q_proj_out, q_norm, cfg, seq_len, num_q_heads,
+        encoder,
+        registry,
+        device,
+        q_proj_out,
+        q_norm,
+        cfg,
+        seq_len,
+        num_q_heads,
         "q_norm",
     )
 }
@@ -983,8 +996,14 @@ pub fn dispatch_eagle3_k_head_norm(
         )
     })?;
     dispatch_eagle3_head_norm(
-        encoder, registry, device,
-        k_proj_out, k_norm, cfg, seq_len, num_kv_heads,
+        encoder,
+        registry,
+        device,
+        k_proj_out,
+        k_norm,
+        cfg,
+        seq_len,
+        num_kv_heads,
         "k_norm",
     )
 }
@@ -1348,8 +1367,7 @@ pub fn dispatch_eagle3_tree_attention(
         .map_err(|e| anyhow!("alloc tree_attention output: {e}"))?;
 
     // tmp buffer for the reduce pass: sized by mlx-native helper.
-    let tmp_bytes =
-        tree_attn_ops::tmp_buffer_bytes(num_q_heads, head_dim, q_seq_len);
+    let tmp_bytes = tree_attn_ops::tmp_buffer_bytes(num_q_heads, head_dim, q_seq_len);
     let tmp = device
         .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
         .map_err(|e| anyhow!("alloc tree_attention tmp: {e}"))?;
@@ -1371,16 +1389,7 @@ pub fn dispatch_eagle3_tree_attention(
     encoder.memory_barrier();
 
     tree_attn_ops::tree_attention(
-        encoder,
-        registry,
-        device,
-        q,
-        k,
-        v,
-        tree_mask,
-        &output,
-        &tmp,
-        &params,
+        encoder, registry, device, q, k, v, tree_mask, &output, &tmp, &params,
     )
     .context("tree_attention")?;
 
@@ -1427,7 +1436,9 @@ pub fn dispatch_eagle3_o_proj(
     // (head_norm) and E4b.6 (tree_attention).
     encoder.memory_barrier();
     dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         attn_out,
         &tensors.o_proj,
         tensors.o_bias.as_ref(),
@@ -1461,9 +1472,7 @@ pub fn dispatch_eagle3_residual_add(
         ));
     }
     if seq_len == 0 {
-        return Err(anyhow!(
-            "dispatch_eagle3_residual_add: seq_len must be > 0"
-        ));
+        return Err(anyhow!("dispatch_eagle3_residual_add: seq_len must be > 0"));
     }
     let hidden_usize = cfg.hidden_size;
     if hidden_usize == 0 {
@@ -1506,11 +1515,7 @@ pub fn dispatch_eagle3_residual_add(
     }
     let out_bytes = n_elements
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            anyhow!(
-                "dispatch_eagle3_residual_add: n_elements * 4 overflows usize"
-            )
-        })?;
+        .ok_or_else(|| anyhow!("dispatch_eagle3_residual_add: n_elements * 4 overflows usize"))?;
     let out = device
         .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, hidden_usize])
         .map_err(|e| anyhow!("alloc residual_add output: {e}"))?;
@@ -1601,7 +1606,9 @@ pub fn dispatch_eagle3_mlp(
 
     // 1. gate_proj(input) — [seq, hidden] → [seq, intermediate].
     let gate = dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         input,
         &tensors.mlp_gate,
         None, // no bias on standard SwiGLU
@@ -1612,7 +1619,9 @@ pub fn dispatch_eagle3_mlp(
     )?;
     // 2. up_proj(input) — [seq, hidden] → [seq, intermediate].
     let up = dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         input,
         &tensors.mlp_up,
         None,
@@ -1672,7 +1681,9 @@ pub fn dispatch_eagle3_mlp(
     // pre-matmul barrier; the silu_mul write to `activated` needs one.
     encoder.memory_barrier();
     dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         &activated,
         &tensors.mlp_down,
         None,
@@ -1720,7 +1731,13 @@ pub fn dispatch_eagle3_drafter_forward(
 
     // 1. fc
     let fc_out = dispatch_eagle3_fc(
-        &mut enc, registry, device, target_aux_gpu, tensors, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        target_aux_gpu,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     // 2. embeds_normed
     let embeds_normed = dispatch_eagle3_input_layernorm(
@@ -1730,9 +1747,8 @@ pub fn dispatch_eagle3_drafter_forward(
     // checkpoint): residual = hidden_normed (the normed hidden). When false
     // (Qwen default): residual = fc_out (pre-norm). See vLLM
     // llama_eagle3.py:72-93 _norm_before_residual / _norm_after_residual.
-    let hidden_normed = dispatch_eagle3_hidden_norm(
-        &mut enc, registry, device, &fc_out, tensors, cfg, seq_len,
-    )?;
+    let hidden_normed =
+        dispatch_eagle3_hidden_norm(&mut enc, registry, device, &fc_out, tensors, cfg, seq_len)?;
     let attn_residual_src: &MlxBuffer = if cfg.norm_before_residual {
         &hidden_normed
     } else {
@@ -1740,59 +1756,83 @@ pub fn dispatch_eagle3_drafter_forward(
     };
     // 4. concat
     let concat = dispatch_eagle3_concat_2x_hidden(
-        &mut enc, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &embeds_normed,
+        &hidden_normed,
+        cfg,
+        seq_len,
     )?;
     // 5-7. Q/K/V projections
-    let q = dispatch_eagle3_q_proj(
-        &mut enc, registry, device, &concat, tensors, cfg, seq_len,
-    )?;
-    let k = dispatch_eagle3_k_proj(
-        &mut enc, registry, device, &concat, tensors, cfg, seq_len,
-    )?;
-    let v = dispatch_eagle3_v_proj(
-        &mut enc, registry, device, &concat, tensors, cfg, seq_len,
-    )?;
+    let q = dispatch_eagle3_q_proj(&mut enc, registry, device, &concat, tensors, cfg, seq_len)?;
+    let k = dispatch_eagle3_k_proj(&mut enc, registry, device, &concat, tensors, cfg, seq_len)?;
+    let v = dispatch_eagle3_v_proj(&mut enc, registry, device, &concat, tensors, cfg, seq_len)?;
     // 8. Optional Q/K head-norm.
     let (q_normed, k_normed) = if cfg.use_qk_norm {
-        let qn = dispatch_eagle3_q_head_norm(
-            &mut enc, registry, device, &q, tensors, cfg, seq_len,
-        )?;
-        let kn = dispatch_eagle3_k_head_norm(
-            &mut enc, registry, device, &k, tensors, cfg, seq_len,
-        )?;
+        let qn =
+            dispatch_eagle3_q_head_norm(&mut enc, registry, device, &q, tensors, cfg, seq_len)?;
+        let kn =
+            dispatch_eagle3_k_head_norm(&mut enc, registry, device, &k, tensors, cfg, seq_len)?;
         (qn, kn)
     } else {
         (q, k)
     };
     // 9. RoPE on Q + K.
     let q_roped = dispatch_eagle3_rope(
-        &mut enc, registry, device, &q_normed, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &q_normed,
+        cfg,
+        seq_len,
         u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
-        None, base_pos, "q_rope",
+        None,
+        base_pos,
+        "q_rope",
     )?;
     let k_roped = dispatch_eagle3_rope(
-        &mut enc, registry, device, &k_normed, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &k_normed,
+        cfg,
+        seq_len,
         u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
-        None, base_pos, "k_rope",
+        None,
+        base_pos,
+        "k_rope",
     )?;
     // 10. Permute Q/K/V to head-outer.
     let q_perm = dispatch_eagle3_permute_seq_to_head_outer(
-        &mut enc, registry, device, &q_roped,
+        &mut enc,
+        registry,
+        device,
+        &q_roped,
         seq_len,
         u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
-        cfg.head_dim, "q_permute",
+        cfg.head_dim,
+        "q_permute",
     )?;
     let k_perm = dispatch_eagle3_permute_seq_to_head_outer(
-        &mut enc, registry, device, &k_roped,
+        &mut enc,
+        registry,
+        device,
+        &k_roped,
         seq_len,
         u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
-        cfg.head_dim, "k_permute",
+        cfg.head_dim,
+        "k_permute",
     )?;
     let v_perm = dispatch_eagle3_permute_seq_to_head_outer(
-        &mut enc, registry, device, &v,
+        &mut enc,
+        registry,
+        device,
+        &v,
         seq_len,
         u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
-        cfg.head_dim, "v_permute",
+        cfg.head_dim,
+        "v_permute",
     )?;
     // 11. tree_attention with all-attended causal-equivalent mask.
     // For single-token decode (seq_len=1) the mask is just one row,
@@ -1815,34 +1855,79 @@ pub fn dispatch_eagle3_drafter_forward(
         .copy_from_slice(&mask_data);
     let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
     let attn_out = dispatch_eagle3_tree_attention(
-        &mut enc, registry, device,
-        &q_perm, &k_perm, &v_perm, &mask_gpu,
-        cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+        &mut enc,
+        registry,
+        device,
+        &q_perm,
+        &k_perm,
+        &v_perm,
+        &mask_gpu,
+        cfg,
+        seq_len,
+        kv_seq_len,
+        kv_capacity,
+        mask_stride,
+        scale,
     )?;
     // 12. O + residual. Uses attn_residual_src which is hidden_normed when
     // norm_before_residual=true, or fc_out when norm_before_residual=false.
-    let o_out = dispatch_eagle3_o_proj(
-        &mut enc, registry, device, &attn_out, tensors, cfg, seq_len,
-    )?;
+    let o_out =
+        dispatch_eagle3_o_proj(&mut enc, registry, device, &attn_out, tensors, cfg, seq_len)?;
     let attn_residual = dispatch_eagle3_residual_add(
-        &mut enc, registry, device, &o_out, attn_residual_src, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &o_out,
+        attn_residual_src,
+        cfg,
+        seq_len,
     )?;
     // 13. post_attn_norm + MLP + residual.
     let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
-        &mut enc, registry, device, &attn_residual, tensors, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &attn_residual,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let mlp_out = dispatch_eagle3_mlp(
-        &mut enc, registry, device, &post_attn_normed, tensors, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &post_attn_normed,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let final_residual = dispatch_eagle3_residual_add(
-        &mut enc, registry, device, &mlp_out, &attn_residual, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &mlp_out,
+        &attn_residual,
+        cfg,
+        seq_len,
     )?;
     // 14. final_norm + lm_head.
     let final_normed = dispatch_eagle3_final_norm(
-        &mut enc, registry, device, &final_residual, tensors, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &final_residual,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let logits = dispatch_eagle3_lm_head(
-        &mut enc, registry, device, &final_normed, tensors, cfg, seq_len,
+        &mut enc,
+        registry,
+        device,
+        &final_normed,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     enc.commit_and_wait()
         .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward: commit: {e}"))?;
@@ -1974,14 +2059,19 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
         .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc1: {e}"))?;
 
     let fc_out = dispatch_eagle3_fc(
-        &mut enc1, registry, device, target_aux_gpu, tensors, cfg, seq_len,
+        &mut enc1,
+        registry,
+        device,
+        target_aux_gpu,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let embeds_normed = dispatch_eagle3_input_layernorm(
         &mut enc1, registry, device, embeds_gpu, tensors, cfg, seq_len,
     )?;
-    let hidden_normed = dispatch_eagle3_hidden_norm(
-        &mut enc1, registry, device, &fc_out, tensors, cfg, seq_len,
-    )?;
+    let hidden_normed =
+        dispatch_eagle3_hidden_norm(&mut enc1, registry, device, &fc_out, tensors, cfg, seq_len)?;
     // attn_residual_src: norm_before_residual=true → normed hidden;
     // norm_before_residual=false → raw fc_out (Qwen default).
     let attn_residual_src_kv: &MlxBuffer = if cfg.norm_before_residual {
@@ -1990,55 +2080,79 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
         &fc_out
     };
     let concat = dispatch_eagle3_concat_2x_hidden(
-        &mut enc1, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
+        &mut enc1,
+        registry,
+        device,
+        &embeds_normed,
+        &hidden_normed,
+        cfg,
+        seq_len,
     )?;
-    let q = dispatch_eagle3_q_proj(
-        &mut enc1, registry, device, &concat, tensors, cfg, seq_len,
-    )?;
-    let k = dispatch_eagle3_k_proj(
-        &mut enc1, registry, device, &concat, tensors, cfg, seq_len,
-    )?;
-    let v = dispatch_eagle3_v_proj(
-        &mut enc1, registry, device, &concat, tensors, cfg, seq_len,
-    )?;
+    let q = dispatch_eagle3_q_proj(&mut enc1, registry, device, &concat, tensors, cfg, seq_len)?;
+    let k = dispatch_eagle3_k_proj(&mut enc1, registry, device, &concat, tensors, cfg, seq_len)?;
+    let v = dispatch_eagle3_v_proj(&mut enc1, registry, device, &concat, tensors, cfg, seq_len)?;
     let (q_normed, k_normed) = if cfg.use_qk_norm {
-        let qn = dispatch_eagle3_q_head_norm(
-            &mut enc1, registry, device, &q, tensors, cfg, seq_len,
-        )?;
-        let kn = dispatch_eagle3_k_head_norm(
-            &mut enc1, registry, device, &k, tensors, cfg, seq_len,
-        )?;
+        let qn =
+            dispatch_eagle3_q_head_norm(&mut enc1, registry, device, &q, tensors, cfg, seq_len)?;
+        let kn =
+            dispatch_eagle3_k_head_norm(&mut enc1, registry, device, &k, tensors, cfg, seq_len)?;
         (qn, kn)
     } else {
         (q, k)
     };
     let q_roped = dispatch_eagle3_rope(
-        &mut enc1, registry, device, &q_normed, cfg, seq_len,
+        &mut enc1,
+        registry,
+        device,
+        &q_normed,
+        cfg,
+        seq_len,
         u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
-        None, base_pos, "q_rope",
+        None,
+        base_pos,
+        "q_rope",
     )?;
     let k_roped = dispatch_eagle3_rope(
-        &mut enc1, registry, device, &k_normed, cfg, seq_len,
+        &mut enc1,
+        registry,
+        device,
+        &k_normed,
+        cfg,
+        seq_len,
         u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
-        None, base_pos, "k_rope",
+        None,
+        base_pos,
+        "k_rope",
     )?;
     let q_perm = dispatch_eagle3_permute_seq_to_head_outer(
-        &mut enc1, registry, device, &q_roped,
+        &mut enc1,
+        registry,
+        device,
+        &q_roped,
         seq_len,
         u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
-        cfg.head_dim, "q_permute",
+        cfg.head_dim,
+        "q_permute",
     )?;
     let k_perm = dispatch_eagle3_permute_seq_to_head_outer(
-        &mut enc1, registry, device, &k_roped,
+        &mut enc1,
+        registry,
+        device,
+        &k_roped,
         seq_len,
         u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
-        cfg.head_dim, "k_permute",
+        cfg.head_dim,
+        "k_permute",
     )?;
     let v_perm = dispatch_eagle3_permute_seq_to_head_outer(
-        &mut enc1, registry, device, &v,
+        &mut enc1,
+        registry,
+        device,
+        &v,
         seq_len,
         u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
-        cfg.head_dim, "v_permute",
+        cfg.head_dim,
+        "v_permute",
     )?;
 
     enc1.commit_and_wait()
@@ -2081,24 +2195,16 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
             v_row[dst_offset..dst_offset + head_dim]
                 .copy_from_slice(&v_perm_data[src_offset..src_offset + head_dim]);
         }
-        cache.append(&k_row, &v_row).with_context(|| {
-            format!("cache append at position {} of {}", p, s_usize)
-        })?;
+        cache
+            .append(&k_row, &v_row)
+            .with_context(|| format!("cache append at position {} of {}", p, s_usize))?;
     }
 
     // ---- Encoder 2: tree_attention from cache + rest of chain. ----
-    let kv_seq_len = u32::try_from(cache.len()).map_err(|_| {
-        anyhow!(
-            "cache len {} exceeds u32::MAX",
-            cache.len()
-        )
-    })?;
-    let kv_capacity = u32::try_from(cache.capacity).map_err(|_| {
-        anyhow!(
-            "cache capacity {} exceeds u32::MAX",
-            cache.capacity
-        )
-    })?;
+    let kv_seq_len = u32::try_from(cache.len())
+        .map_err(|_| anyhow!("cache len {} exceeds u32::MAX", cache.len()))?;
+    let kv_capacity = u32::try_from(cache.capacity)
+        .map_err(|_| anyhow!("cache capacity {} exceeds u32::MAX", cache.capacity))?;
 
     let mut enc2 = device
         .command_encoder()
@@ -2131,11 +2237,7 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| anyhow!("mask bytes overflows usize"))?;
     let mut mask_gpu = device
-        .alloc_buffer(
-            mask_bytes,
-            DType::F32,
-            vec![s_usize, mask_stride as usize],
-        )
+        .alloc_buffer(mask_bytes, DType::F32, vec![s_usize, mask_stride as usize])
         .map_err(|e| anyhow!("alloc mask: {e}"))?;
     mask_gpu
         .as_mut_slice::<f32>()
@@ -2144,30 +2246,76 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
 
     let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
     let attn_out = dispatch_eagle3_tree_attention(
-        &mut enc2, registry, device,
-        &q_perm, &cache.k_buf, &cache.v_buf, &mask_gpu,
-        cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+        &mut enc2,
+        registry,
+        device,
+        &q_perm,
+        &cache.k_buf,
+        &cache.v_buf,
+        &mask_gpu,
+        cfg,
+        seq_len,
+        kv_seq_len,
+        kv_capacity,
+        mask_stride,
+        scale,
     )?;
     let o_out = dispatch_eagle3_o_proj(
         &mut enc2, registry, device, &attn_out, tensors, cfg, seq_len,
     )?;
     let attn_residual = dispatch_eagle3_residual_add(
-        &mut enc2, registry, device, &o_out, attn_residual_src_kv, cfg, seq_len,
+        &mut enc2,
+        registry,
+        device,
+        &o_out,
+        attn_residual_src_kv,
+        cfg,
+        seq_len,
     )?;
     let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
-        &mut enc2, registry, device, &attn_residual, tensors, cfg, seq_len,
+        &mut enc2,
+        registry,
+        device,
+        &attn_residual,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let mlp_out = dispatch_eagle3_mlp(
-        &mut enc2, registry, device, &post_attn_normed, tensors, cfg, seq_len,
+        &mut enc2,
+        registry,
+        device,
+        &post_attn_normed,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let final_residual = dispatch_eagle3_residual_add(
-        &mut enc2, registry, device, &mlp_out, &attn_residual, cfg, seq_len,
+        &mut enc2,
+        registry,
+        device,
+        &mlp_out,
+        &attn_residual,
+        cfg,
+        seq_len,
     )?;
     let final_normed = dispatch_eagle3_final_norm(
-        &mut enc2, registry, device, &final_residual, tensors, cfg, seq_len,
+        &mut enc2,
+        registry,
+        device,
+        &final_residual,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     let logits = dispatch_eagle3_lm_head(
-        &mut enc2, registry, device, &final_normed, tensors, cfg, seq_len,
+        &mut enc2,
+        registry,
+        device,
+        &final_normed,
+        tensors,
+        cfg,
+        seq_len,
     )?;
     enc2.commit_and_wait()
         .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc2 commit: {e}"))?;
@@ -2405,7 +2553,9 @@ pub fn dispatch_eagle3_lm_head(
         (lh, cfg.draft_vocab_size)
     };
     dispatch_eagle3_projection_with_optional_bias(
-        encoder, registry, device,
+        encoder,
+        registry,
+        device,
         normed_hidden,
         weight,
         None, // lm_head has no bias
@@ -2514,10 +2664,7 @@ mod tests {
     /// Build a safetensors blob with custom `fc.weight` bytes. All
     /// other manifest tensors get zero bytes (sufficient for upload —
     /// we only consume `fc` in this test).
-    fn build_blob_with_fc_weight(
-        manifest: &[ExpectedTensor],
-        fc_bytes: &[u8],
-    ) -> Vec<u8> {
+    fn build_blob_with_fc_weight(manifest: &[ExpectedTensor], fc_bytes: &[u8]) -> Vec<u8> {
         let mut storage: Vec<Vec<u8>> = Vec::with_capacity(manifest.len());
         for exp in manifest {
             let elem_bytes = match exp.dtype {
@@ -2535,23 +2682,15 @@ mod tests {
         }
         let mut tensors: BTreeMap<String, TensorView> = BTreeMap::new();
         for (i, exp) in manifest.iter().enumerate() {
-            let view =
-                TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
-                    .expect("synthetic view");
+            let view = TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
+                .expect("synthetic view");
             tensors.insert(exp.name.clone(), view);
         }
-        safetensors::serialize(
-            &tensors,
-            None::<std::collections::HashMap<String, String>>,
-        )
-        .expect("serialize")
+        safetensors::serialize(&tensors, None::<std::collections::HashMap<String, String>>)
+            .expect("serialize")
     }
 
-    fn upload_f32_to_gpu(
-        device: &MlxDevice,
-        data: &[f32],
-        shape: Vec<usize>,
-    ) -> MlxBuffer {
+    fn upload_f32_to_gpu(device: &MlxDevice, data: &[f32], shape: Vec<usize>) -> MlxBuffer {
         let bytes = data.len() * 4;
         let mut buf = device
             .alloc_buffer(bytes, DType::F32, shape)
@@ -2595,26 +2734,25 @@ mod tests {
         // GPU path: build synthetic safetensors blob, load + upload, dispatch.
         let blob = build_blob_with_fc_weight(&manifest, &weight_bf16_bytes);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights)
-            .expect("upload tensors");
-        let input_gpu = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![seq_len as usize, fc_in],
-        );
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload tensors");
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, fc_in]);
 
         let mut enc = device.command_encoder().expect("encoder");
-        let out_buf =
-            dispatch_eagle3_fc(&mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len)
-                .expect("dispatch_eagle3_fc");
+        let out_buf = dispatch_eagle3_fc(
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
+        )
+        .expect("dispatch_eagle3_fc");
         enc.commit_and_wait().expect("commit");
 
         let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
-        assert_eq!(
-            gpu_out.len(),
-            (seq_len as usize) * hidden,
-            "output shape"
-        );
+        assert_eq!(gpu_out.len(), (seq_len as usize) * hidden, "output shape");
 
         // Compare GPU vs CPU within tolerance. BF16 quantized weights ×
         // F32 input × seq=4 accumulation gives relative error ~1e-3
@@ -2663,14 +2801,20 @@ mod tests {
 
         let blob = build_blob_with_fc_weight(&manifest, &weight_bf16_bytes);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![1, fc_in]);
 
         let mut enc = device.command_encoder().expect("encoder");
-        let out_buf =
-            dispatch_eagle3_fc(&mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, 1)
-                .expect("dispatch_eagle3_fc (seq=1)");
+        let out_buf = dispatch_eagle3_fc(
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            1,
+        )
+        .expect("dispatch_eagle3_fc (seq=1)");
         enc.commit_and_wait().expect("commit");
 
         let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
@@ -2701,8 +2845,7 @@ mod tests {
             &vec![0u8; cfg.hidden_size * cfg.fc_input_size() * 2],
         );
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         // Allocate input with wrong size — should be seq_len * fc_in
         // = 4 * 768 = 3072 floats. Allocate 100 instead.
@@ -2710,9 +2853,16 @@ mod tests {
         let bad_input = upload_f32_to_gpu(&device, &bad_data, vec![100]);
 
         let mut enc = device.command_encoder().expect("encoder");
-        let err =
-            dispatch_eagle3_fc(&mut enc, &mut registry, &device, &bad_input, &tensors, &cfg, 4)
-                .unwrap_err();
+        let err = dispatch_eagle3_fc(
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad_input,
+            &tensors,
+            &cfg,
+            4,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("concat_hidden has"),
@@ -2738,8 +2888,7 @@ mod tests {
             &vec![0u8; cfg.hidden_size * cfg.fc_input_size() * 2],
         );
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         // Allocate a BF16 input with the correct element count. Wrapper
         // should reject due to wrong dtype, not pass through.
@@ -2755,7 +2904,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_fc(
-            &mut enc, &mut registry, &device, &bad_input, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad_input,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -2771,8 +2926,8 @@ mod tests {
 
     /// CPU reference RMSNorm: out[s, d] = x[s, d] / sqrt(mean(x^2) + eps) * w[d].
     fn cpu_rms_norm_f32(
-        input: &[f32],   // [seq, dim]
-        weight: &[f32],  // [dim]
+        input: &[f32],  // [seq, dim]
+        weight: &[f32], // [dim]
         seq_len: usize,
         dim: usize,
         eps: f32,
@@ -2781,8 +2936,8 @@ mod tests {
         for s in 0..seq_len {
             let row = &input[s * dim..(s + 1) * dim];
             // Use f64 accumulator (matches mlx-native's rms_norm_f32_v2 scheme).
-            let mean_sq: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
-                / (dim as f64);
+            let mean_sq: f64 =
+                row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / (dim as f64);
             let inv_rms = 1.0 / ((mean_sq as f32 + eps).sqrt());
             for d in 0..dim {
                 out[s * dim + d] = row[d] * inv_rms * weight[d];
@@ -2807,7 +2962,12 @@ mod tests {
             };
             let nelem: usize = exp.shape.iter().product();
             if let Some(bytes) = overrides.get(&exp.name) {
-                assert_eq!(bytes.len(), nelem * elem_bytes, "override bytes for {}", exp.name);
+                assert_eq!(
+                    bytes.len(),
+                    nelem * elem_bytes,
+                    "override bytes for {}",
+                    exp.name
+                );
                 storage.push(bytes.clone());
             } else {
                 storage.push(vec![0u8; nelem * elem_bytes]);
@@ -2815,16 +2975,12 @@ mod tests {
         }
         let mut tensors: BTreeMap<String, TensorView> = BTreeMap::new();
         for (i, exp) in manifest.iter().enumerate() {
-            let view =
-                TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
-                    .expect("synthetic view");
+            let view = TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
+                .expect("synthetic view");
             tensors.insert(exp.name.clone(), view);
         }
-        safetensors::serialize(
-            &tensors,
-            None::<std::collections::HashMap<String, String>>,
-        )
-        .expect("serialize")
+        safetensors::serialize(&tensors, None::<std::collections::HashMap<String, String>>)
+            .expect("serialize")
     }
 
     #[test]
@@ -2852,8 +3008,11 @@ mod tests {
         let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
 
         let cpu_out = cpu_rms_norm_f32(
-            &input_data, &weight_bf16_q,
-            seq_len as usize, hidden, cfg.rms_norm_eps,
+            &input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            hidden,
+            cfg.rms_norm_eps,
         );
 
         let mut overrides = std::collections::HashMap::new();
@@ -2863,15 +3022,18 @@ mod tests {
         );
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(
-            &device, &input_data, vec![seq_len as usize, hidden],
-        );
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_input_layernorm(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("dispatch_eagle3_input_layernorm");
         enc.commit_and_wait().expect("commit");
@@ -2910,26 +3072,29 @@ mod tests {
         let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
 
         let cpu_out = cpu_rms_norm_f32(
-            &input_data, &weight_bf16_q,
-            seq_len as usize, hidden, cfg.rms_norm_eps,
+            &input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            hidden,
+            cfg.rms_norm_eps,
         );
 
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert(
-            "layers.0.hidden_norm.weight".to_string(),
-            weight_bf16_bytes,
-        );
+        overrides.insert("layers.0.hidden_norm.weight".to_string(), weight_bf16_bytes);
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(
-            &device, &input_data, vec![seq_len as usize, hidden],
-        );
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_hidden_norm(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("dispatch_eagle3_hidden_norm");
         enc.commit_and_wait().expect("commit");
@@ -2961,8 +3126,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let _tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let _tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len: u32 = 3;
         let hidden = cfg.hidden_size;
@@ -2978,17 +3142,18 @@ mod tests {
                 hidden_data[s * hidden + d] = -((s * 1000 + d + 1) as f32);
             }
         }
-        let embeds_gpu = upload_f32_to_gpu(
-            &device, &embeds_data, vec![seq_len as usize, hidden],
-        );
-        let hidden_gpu = upload_f32_to_gpu(
-            &device, &hidden_data, vec![seq_len as usize, hidden],
-        );
+        let embeds_gpu = upload_f32_to_gpu(&device, &embeds_data, vec![seq_len as usize, hidden]);
+        let hidden_gpu = upload_f32_to_gpu(&device, &hidden_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_concat_2x_hidden(
-            &mut enc, &mut registry, &device,
-            &embeds_gpu, &hidden_gpu, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &embeds_gpu,
+            &hidden_gpu,
+            &cfg,
+            seq_len,
         )
         .expect("concat dispatch");
         enc.commit_and_wait().expect("commit");
@@ -3020,8 +3185,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 2_u32;
         let bf16_input = device
@@ -3034,7 +3198,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_input_layernorm(
-            &mut enc, &mut registry, &device, &bf16_input, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bf16_input,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(
@@ -3057,14 +3227,19 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let empty_input = device
             .alloc_buffer(4, DType::F32, vec![1])
             .expect("alloc empty");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_input_layernorm(
-            &mut enc, &mut registry, &device, &empty_input, &tensors, &cfg, 0,
+            &mut enc,
+            &mut registry,
+            &device,
+            &empty_input,
+            &tensors,
+            &cfg,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -3085,8 +3260,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let _tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let _tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let empty_a = device
             .alloc_buffer(4, DType::F32, vec![1])
             .expect("alloc a");
@@ -3095,7 +3269,13 @@ mod tests {
             .expect("alloc b");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_concat_2x_hidden(
-            &mut enc, &mut registry, &device, &empty_a, &empty_b, &cfg, 0,
+            &mut enc,
+            &mut registry,
+            &device,
+            &empty_a,
+            &empty_b,
+            &cfg,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -3114,9 +3294,9 @@ mod tests {
         registry: &mut KernelRegistry,
         cfg: &Eagle3DrafterConfig,
         seq_len: u32,
-        q_weight_f32: &[f32],   // [q_out, qkv_in]
+        q_weight_f32: &[f32],       // [q_out, qkv_in]
         q_bias_f32: Option<&[f32]>, // [q_out] when attention_bias=true
-        input_data: &[f32],     // [seq, qkv_in]
+        input_data: &[f32],         // [seq, qkv_in]
     ) -> (Vec<f32>, Vec<f32>) {
         let manifest = expected_manifest(cfg);
         let mut overrides = std::collections::HashMap::new();
@@ -3132,8 +3312,7 @@ mod tests {
         }
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(device, cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(device, cfg, &weights).expect("upload");
         let input_gpu = upload_f32_to_gpu(
             device,
             input_data,
@@ -3147,14 +3326,10 @@ mod tests {
         .expect("dispatch_eagle3_q_proj");
         enc.commit_and_wait().expect("commit");
 
-        let gpu_out: Vec<f32> = out_buf
-            .as_slice::<f32>()
-            .expect("output slice")
-            .to_vec();
+        let gpu_out: Vec<f32> = out_buf.as_slice::<f32>().expect("output slice").to_vec();
 
         // CPU reference uses BF16-quantized weights + bias.
-        let weight_bf16_q: Vec<f32> =
-            q_weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = q_weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let mut cpu_out = cpu_fc_reference(
             input_data,
             &weight_bf16_q,
@@ -3278,8 +3453,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 3_u32;
         let input_data = vec![0.0f32; (seq_len as usize) * cfg.qkv_input_width()];
@@ -3291,7 +3465,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let k_out = dispatch_eagle3_k_proj(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("k_proj");
         enc.commit_and_wait().expect("commit");
@@ -3315,8 +3495,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 3_u32;
         let input_data = vec![0.0f32; (seq_len as usize) * cfg.qkv_input_width()];
@@ -3328,7 +3507,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let v_out = dispatch_eagle3_v_proj(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("v_proj");
         enc.commit_and_wait().expect("commit");
@@ -3351,8 +3536,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 2_u32;
         let bad_input = device
@@ -3365,13 +3549,16 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_q_proj(
-            &mut enc, &mut registry, &device, &bad_input, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad_input,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("dtype must be F32"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
     }
 
     #[test]
@@ -3386,17 +3573,15 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let empty = device
             .alloc_buffer(4, DType::F32, vec![1])
             .expect("alloc empty");
         let mut enc = device.command_encoder().expect("encoder");
-        let err = dispatch_eagle3_q_proj(
-            &mut enc, &mut registry, &device, &empty, &tensors, &cfg, 0,
-        )
-        .unwrap_err();
+        let err =
+            dispatch_eagle3_q_proj(&mut enc, &mut registry, &device, &empty, &tensors, &cfg, 0)
+                .unwrap_err();
         assert!(
             err.to_string().contains("seq_len must be > 0"),
             "got: {err}"
@@ -3435,8 +3620,7 @@ mod tests {
         fill_random(&mut weight_f32, 0xA52);
 
         // CPU reference per row (seq * head): RMSNorm over head_dim.
-        let weight_bf16_q: Vec<f32> =
-            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_rms_norm_f32(
             &proj_data,
             &weight_bf16_q,
@@ -3455,8 +3639,7 @@ mod tests {
         );
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let proj_gpu = upload_f32_to_gpu(
             &device,
             &proj_data,
@@ -3465,7 +3648,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_q_head_norm(
-            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &proj_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("q_head_norm");
         enc.commit_and_wait().expect("commit");
@@ -3501,8 +3690,7 @@ mod tests {
         let mut weight_f32 = vec![0.0f32; head_dim];
         fill_random(&mut weight_f32, 0xA62);
 
-        let weight_bf16_q: Vec<f32> =
-            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_rms_norm_f32(
             &proj_data,
             &weight_bf16_q,
@@ -3519,8 +3707,7 @@ mod tests {
         );
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let proj_gpu = upload_f32_to_gpu(
             &device,
             &proj_data,
@@ -3529,7 +3716,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_k_head_norm(
-            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &proj_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("k_head_norm");
         enc.commit_and_wait().expect("commit");
@@ -3560,19 +3753,25 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let seq_len = 2_u32;
         let n = (seq_len as usize) * cfg.num_q_heads * cfg.head_dim;
         let proj_data = vec![0.0f32; n];
         let proj_gpu = upload_f32_to_gpu(
-            &device, &proj_data,
+            &device,
+            &proj_data,
             vec![seq_len as usize, cfg.num_q_heads * cfg.head_dim],
         );
 
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_q_head_norm(
-            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &proj_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         // Now codex /cfa Major fix gates cfg.use_qk_norm BEFORE
@@ -3601,8 +3800,7 @@ mod tests {
         let manifest = expected_manifest(&load_cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &load_cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &load_cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &load_cfg, &weights).expect("upload");
         // But call with use_qk_norm=false (forces gate rejection)
         let mut dispatch_cfg = load_cfg.clone();
         dispatch_cfg.use_qk_norm = false;
@@ -3611,13 +3809,23 @@ mod tests {
         let n = (seq_len as usize) * dispatch_cfg.num_q_heads * dispatch_cfg.head_dim;
         let proj_data = vec![0.0f32; n];
         let proj_gpu = upload_f32_to_gpu(
-            &device, &proj_data,
-            vec![seq_len as usize, dispatch_cfg.num_q_heads * dispatch_cfg.head_dim],
+            &device,
+            &proj_data,
+            vec![
+                seq_len as usize,
+                dispatch_cfg.num_q_heads * dispatch_cfg.head_dim,
+            ],
         );
 
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_q_head_norm(
-            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &dispatch_cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &proj_gpu,
+            &tensors,
+            &dispatch_cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(
@@ -3638,8 +3846,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 2_u32;
         let n = (seq_len as usize) * cfg.num_q_heads * cfg.head_dim;
@@ -3652,7 +3859,13 @@ mod tests {
             .expect("alloc bad");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_q_head_norm(
-            &mut enc, &mut registry, &device, &bad, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
@@ -3667,8 +3880,8 @@ mod tests {
     /// `[seq * num_heads, head_dim]`. Position used: `positions[s]`
     /// (broadcast across heads). Untouched dims: `[rope_dim, head_dim)`.
     fn cpu_neox_rope(
-        input: &[f32],         // [seq * num_heads, head_dim]
-        positions: &[u32],     // [seq]
+        input: &[f32],     // [seq * num_heads, head_dim]
+        positions: &[u32], // [seq]
         seq_len: usize,
         num_heads: usize,
         head_dim: usize,
@@ -3687,8 +3900,7 @@ mod tests {
                 }
                 // Rotate pairs (d, d + half) for d in 0..half.
                 for d in 0..half {
-                    let inv_freq =
-                        (freq_base as f64).powf(-(2.0 * d as f64) / (rope_dim as f64));
+                    let inv_freq = (freq_base as f64).powf(-(2.0 * d as f64) / (rope_dim as f64));
                     let theta = (pos as f64) * inv_freq;
                     let (s_t, c_t) = (theta.sin() as f32, theta.cos() as f32);
                     let x = input[row_base + d];
@@ -3720,7 +3932,8 @@ mod tests {
         let mut input_data = vec![0.0f32; total];
         fill_random(&mut input_data, 0xB10);
         let input_gpu = upload_f32_to_gpu(
-            &device, &input_data,
+            &device,
+            &input_data,
             vec![seq_len as usize * num_heads, head_dim],
         );
 
@@ -3786,7 +3999,8 @@ mod tests {
         let mut input_data = vec![0.0f32; total];
         fill_random(&mut input_data, 0xB20);
         let input_gpu = upload_f32_to_gpu(
-            &device, &input_data,
+            &device,
+            &input_data,
             vec![seq_len as usize * num_heads, head_dim],
         );
 
@@ -3856,9 +4070,16 @@ mod tests {
         let bad_positions = vec![0u32, 1u32, 2u32]; // len != seq_len
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_rope(
-            &mut enc, &mut registry, &device,
-            &input, &cfg, seq_len, num_heads,
-            Some(&bad_positions), 0, "rope_bad_pos",
+            &mut enc,
+            &mut registry,
+            &device,
+            &input,
+            &cfg,
+            seq_len,
+            num_heads,
+            Some(&bad_positions),
+            0,
+            "rope_bad_pos",
         )
         .unwrap_err();
         assert!(
@@ -3890,9 +4111,16 @@ mod tests {
         let bad_positions = vec![0u32, (i32::MAX as u32) + 1];
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_rope(
-            &mut enc, &mut registry, &device,
-            &input, &cfg, seq_len, num_heads,
-            Some(&bad_positions), 0, "rope_overflow",
+            &mut enc,
+            &mut registry,
+            &device,
+            &input,
+            &cfg,
+            seq_len,
+            num_heads,
+            Some(&bad_positions),
+            0,
+            "rope_overflow",
         )
         .unwrap_err();
         assert!(
@@ -3922,9 +4150,16 @@ mod tests {
             .expect("alloc bad");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_rope(
-            &mut enc, &mut registry, &device,
-            &bad, &cfg, seq_len, num_heads,
-            None, 0, "rope_bad_dtype",
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad,
+            &cfg,
+            seq_len,
+            num_heads,
+            None,
+            0,
+            "rope_bad_dtype",
         )
         .unwrap_err();
         assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
@@ -3967,10 +4202,10 @@ mod tests {
     /// for our Q layout `[num_heads, q_seq, head_dim]` (head-outer).
     #[allow(clippy::too_many_arguments)]
     fn cpu_tree_attention_reference(
-        q: &[f32],         // [num_q_heads, q_seq_len, head_dim]
-        k: &[f32],         // [num_kv_heads, kv_capacity, head_dim]
-        v: &[f32],         // [num_kv_heads, kv_capacity, head_dim]
-        mask: &[f32],      // [q_seq_len, mask_stride]
+        q: &[f32],    // [num_q_heads, q_seq_len, head_dim]
+        k: &[f32],    // [num_kv_heads, kv_capacity, head_dim]
+        v: &[f32],    // [num_kv_heads, kv_capacity, head_dim]
+        mask: &[f32], // [q_seq_len, mask_stride]
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -4007,8 +4242,7 @@ mod tests {
                     .iter()
                     .map(|(_, s)| *s)
                     .fold(f32::NEG_INFINITY, f32::max);
-                let exp_s: Vec<f32> =
-                    scores.iter().map(|(_, s)| (*s - max_s).exp()).collect();
+                let exp_s: Vec<f32> = scores.iter().map(|(_, s)| (*s - max_s).exp()).collect();
                 let sum_e: f32 = exp_s.iter().sum();
                 let inv = if sum_e == 0.0 { 0.0 } else { 1.0 / sum_e };
                 // Output: [q_seq, n_q, hd] layout.
@@ -4084,27 +4318,57 @@ mod tests {
 
         // CPU reference
         let cpu_out = cpu_tree_attention_reference(
-            &q_data, &k_data, &v_data, &mask_data,
-            num_q_heads, num_kv_heads, head_dim,
-            q_seq_len as usize, kv_seq_len as usize, kv_capacity as usize,
-            mask_stride as usize, scale,
+            &q_data,
+            &k_data,
+            &v_data,
+            &mask_data,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            q_seq_len as usize,
+            kv_seq_len as usize,
+            kv_capacity as usize,
+            mask_stride as usize,
+            scale,
         );
 
         // GPU
-        let q_gpu = upload_f32_to_gpu(&device, &q_data,
-            vec![num_q_heads, q_seq_len as usize, head_dim]);
-        let k_gpu = upload_f32_to_gpu(&device, &k_data,
-            vec![num_kv_heads, kv_capacity as usize, head_dim]);
-        let v_gpu = upload_f32_to_gpu(&device, &v_data,
-            vec![num_kv_heads, kv_capacity as usize, head_dim]);
-        let mask_gpu = upload_f32_to_gpu(&device, &mask_data,
-            vec![q_seq_len as usize, mask_stride as usize]);
+        let q_gpu = upload_f32_to_gpu(
+            &device,
+            &q_data,
+            vec![num_q_heads, q_seq_len as usize, head_dim],
+        );
+        let k_gpu = upload_f32_to_gpu(
+            &device,
+            &k_data,
+            vec![num_kv_heads, kv_capacity as usize, head_dim],
+        );
+        let v_gpu = upload_f32_to_gpu(
+            &device,
+            &v_data,
+            vec![num_kv_heads, kv_capacity as usize, head_dim],
+        );
+        let mask_gpu = upload_f32_to_gpu(
+            &device,
+            &mask_data,
+            vec![q_seq_len as usize, mask_stride as usize],
+        );
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_tree_attention(
-            &mut enc, &mut registry, &device,
-            &q_gpu, &k_gpu, &v_gpu, &mask_gpu,
-            &cfg, q_seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+            &mut enc,
+            &mut registry,
+            &device,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &mask_gpu,
+            &cfg,
+            q_seq_len,
+            kv_seq_len,
+            kv_capacity,
+            mask_stride,
+            scale,
         )
         .expect("tree attn dispatch");
         enc.commit_and_wait().expect("commit");
@@ -4141,9 +4405,19 @@ mod tests {
             .expect("alloc dummy");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_tree_attention(
-            &mut enc, &mut registry, &device,
-            &dummy, &dummy, &dummy, &dummy,
-            &cfg, 0, 1, 1, 1, 1.0,
+            &mut enc,
+            &mut registry,
+            &device,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            &cfg,
+            0,
+            1,
+            1,
+            1,
+            1.0,
         )
         .unwrap_err();
         assert!(
@@ -4164,15 +4438,22 @@ mod tests {
         let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("alloc");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_tree_attention(
-            &mut enc, &mut registry, &device,
-            &dummy, &dummy, &dummy, &dummy,
-            &cfg, 1, 10, 5, 10, 1.0, // kv_capacity 5 < kv_seq_len 10
+            &mut enc,
+            &mut registry,
+            &device,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            &cfg,
+            1,
+            10,
+            5,
+            10,
+            1.0, // kv_capacity 5 < kv_seq_len 10
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("kv_capacity"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("kv_capacity"), "got: {err}");
     }
 
     // ----------------------------------------------------------------
@@ -4199,8 +4480,7 @@ mod tests {
         fill_random(&mut weight_f32, 0xD71);
 
         // CPU reference: BF16-quantized weight matmul.
-        let weight_bf16_q: Vec<f32> =
-            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_fc_reference(
             &input_data,
             &weight_bf16_q,
@@ -4218,17 +4498,19 @@ mod tests {
         );
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![seq_len as usize, in_features],
-        );
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu =
+            upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, in_features]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_o_proj(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("o_proj dispatch");
         enc.commit_and_wait().expect("commit");
@@ -4262,14 +4544,24 @@ mod tests {
         let mut b_data = vec![0.0f32; n];
         fill_random(&mut a_data, 0xE70);
         fill_random(&mut b_data, 0xE71);
-        let cpu_out: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(a, b)| a + b).collect();
+        let cpu_out: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .map(|(a, b)| a + b)
+            .collect();
 
         let a_gpu = upload_f32_to_gpu(&device, &a_data, vec![seq_len as usize, hidden]);
         let b_gpu = upload_f32_to_gpu(&device, &b_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_residual_add(
-            &mut enc, &mut registry, &device, &a_gpu, &b_gpu, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &a_gpu,
+            &b_gpu,
+            &cfg,
+            seq_len,
         )
         .expect("residual_add");
         enc.commit_and_wait().expect("commit");
@@ -4300,7 +4592,13 @@ mod tests {
             .expect("alloc f32");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_residual_add(
-            &mut enc, &mut registry, &device, &bf16, &f32_buf, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bf16,
+            &f32_buf,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(err.to_string().contains("must be F32"), "got: {err}");
@@ -4317,11 +4615,21 @@ mod tests {
         let cfg = tiny_cfg();
         let seq_len = 4_u32;
         let n = (seq_len as usize) * cfg.hidden_size;
-        let good = upload_f32_to_gpu(&device, &vec![0.0f32; n], vec![seq_len as usize, cfg.hidden_size]);
+        let good = upload_f32_to_gpu(
+            &device,
+            &vec![0.0f32; n],
+            vec![seq_len as usize, cfg.hidden_size],
+        );
         let bad = upload_f32_to_gpu(&device, &vec![0.0f32; 10], vec![10]);
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_residual_add(
-            &mut enc, &mut registry, &device, &good, &bad, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &good,
+            &bad,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(err.to_string().contains("b has"), "got: {err}");
@@ -4340,10 +4648,10 @@ mod tests {
     /// Uses BF16-quantized weights to match what the GPU GEMMs compute.
     #[allow(clippy::too_many_arguments)]
     fn cpu_swiglu_mlp_reference(
-        input: &[f32],                 // [seq, hidden]
-        gate_weight_bf16_q: &[f32],    // [inter, hidden]
-        up_weight_bf16_q: &[f32],      // [inter, hidden]
-        down_weight_bf16_q: &[f32],    // [hidden, inter]
+        input: &[f32],              // [seq, hidden]
+        gate_weight_bf16_q: &[f32], // [inter, hidden]
+        up_weight_bf16_q: &[f32],   // [inter, hidden]
+        down_weight_bf16_q: &[f32], // [hidden, inter]
         seq_len: usize,
         hidden: usize,
         inter: usize,
@@ -4389,8 +4697,13 @@ mod tests {
         let up_q: Vec<f32> = up_w.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let down_q: Vec<f32> = down_w.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_swiglu_mlp_reference(
-            &input_data, &gate_q, &up_q, &down_q,
-            seq_len as usize, hidden, inter,
+            &input_data,
+            &gate_q,
+            &up_q,
+            &down_q,
+            seq_len as usize,
+            hidden,
+            inter,
         );
 
         // GPU: blob with all 3 MLP weights overridden.
@@ -4411,13 +4724,17 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(
-            &device, &input_data, vec![seq_len as usize, hidden],
-        );
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_mlp(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("dispatch_eagle3_mlp");
         enc.commit_and_wait().expect("commit");
@@ -4468,12 +4785,21 @@ mod tests {
 
         let seq_len = 2_u32;
         let bf16 = device
-            .alloc_buffer((seq_len as usize) * cfg.hidden_size * 2, DType::BF16,
-                vec![seq_len as usize, cfg.hidden_size])
+            .alloc_buffer(
+                (seq_len as usize) * cfg.hidden_size * 2,
+                DType::BF16,
+                vec![seq_len as usize, cfg.hidden_size],
+            )
             .expect("alloc bad");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_mlp(
-            &mut enc, &mut registry, &device, &bf16, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bf16,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
@@ -4502,7 +4828,13 @@ mod tests {
         let bad = upload_f32_to_gpu(&device, &bad_data, vec![100]);
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_mlp(
-            &mut enc, &mut registry, &device, &bad, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(
@@ -4527,11 +4859,12 @@ mod tests {
 
         let empty = device.alloc_buffer(4, DType::F32, vec![1]).expect("alloc");
         let mut enc = device.command_encoder().expect("encoder");
-        let err = dispatch_eagle3_mlp(
-            &mut enc, &mut registry, &device, &empty, &tensors, &cfg, 0,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("seq_len must be > 0"), "got: {err}");
+        let err = dispatch_eagle3_mlp(&mut enc, &mut registry, &device, &empty, &tensors, &cfg, 0)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("seq_len must be > 0"),
+            "got: {err}"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -4555,11 +4888,13 @@ mod tests {
         let mut weight_f32 = vec![0.0f32; hidden];
         fill_random(&mut weight_f32, 0xF91);
 
-        let weight_bf16_q: Vec<f32> =
-            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_rms_norm_f32(
-            &input_data, &weight_bf16_q,
-            seq_len as usize, hidden, cfg.rms_norm_eps,
+            &input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            hidden,
+            cfg.rms_norm_eps,
         );
 
         let manifest = expected_manifest(&cfg);
@@ -4568,12 +4903,17 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(&device, &input_data,
-            vec![seq_len as usize, hidden]);
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_final_norm(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("final_norm");
         enc.commit_and_wait().expect("commit");
@@ -4616,28 +4956,32 @@ mod tests {
         let mut weight_f32 = vec![0.0f32; dvocab * hidden];
         fill_random(&mut weight_f32, 0xFA1);
 
-        let weight_bf16_q: Vec<f32> =
-            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_fc_reference(
-            &input_data, &weight_bf16_q,
-            seq_len as usize, hidden, dvocab,
+            &input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            hidden,
+            dvocab,
         );
 
         let manifest = expected_manifest(&cfg);
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert(
-            "lm_head.weight".to_string(),
-            f32_to_bf16_bytes(&weight_f32),
-        );
+        overrides.insert("lm_head.weight".to_string(), f32_to_bf16_bytes(&weight_f32));
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(&device, &input_data,
-            vec![seq_len as usize, hidden]);
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_lm_head(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("lm_head untied");
         enc.commit_and_wait().expect("commit");
@@ -4676,18 +5020,23 @@ mod tests {
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 2_u32;
-        let input = upload_f32_to_gpu(&device,
+        let input = upload_f32_to_gpu(
+            &device,
             &vec![0.0f32; (seq_len as usize) * cfg.hidden_size],
-            vec![seq_len as usize, cfg.hidden_size]);
+            vec![seq_len as usize, cfg.hidden_size],
+        );
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_lm_head(
-            &mut enc, &mut registry, &device, &input, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("draft_vocab_size"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("draft_vocab_size"), "got: {err}");
     }
 
     #[test]
@@ -4711,18 +5060,23 @@ mod tests {
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 2_u32;
-        let input = upload_f32_to_gpu(&device,
+        let input = upload_f32_to_gpu(
+            &device,
             &vec![0.0f32; (seq_len as usize) * cfg.hidden_size],
-            vec![seq_len as usize, cfg.hidden_size]);
+            vec![seq_len as usize, cfg.hidden_size],
+        );
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_lm_head(
-            &mut enc, &mut registry, &device, &input, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("embed_tokens"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("embed_tokens"), "got: {err}");
     }
 
     // ----------------------------------------------------------------
@@ -4757,14 +5111,21 @@ mod tests {
             }
         }
         let input_gpu = upload_f32_to_gpu(
-            &device, &input_data,
+            &device,
+            &input_data,
             vec![seq as usize, n_heads as usize, hd],
         );
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, &mut registry, &device,
-            &input_gpu, seq, n_heads, hd, "permute_sentinel",
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            seq,
+            n_heads,
+            hd,
+            "permute_sentinel",
         )
         .expect("permute dispatch");
         enc.commit_and_wait().expect("commit");
@@ -4804,7 +5165,8 @@ mod tests {
         let mut input_data = vec![0.0f32; total];
         fill_random(&mut input_data, 0xB10B);
         let input_gpu = upload_f32_to_gpu(
-            &device, &input_data,
+            &device,
+            &input_data,
             vec![seq as usize, n_heads as usize, hd],
         );
 
@@ -4822,8 +5184,14 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, &mut registry, &device,
-            &input_gpu, seq, n_heads, hd, "permute_random",
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            seq,
+            n_heads,
+            hd,
+            "permute_random",
         )
         .expect("permute dispatch");
         enc.commit_and_wait().expect("commit");
@@ -4852,7 +5220,14 @@ mod tests {
             .expect("alloc bad");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, &mut registry, &device, &bf16, 2, 4, 4, "permute_bad",
+            &mut enc,
+            &mut registry,
+            &device,
+            &bf16,
+            2,
+            4,
+            4,
+            "permute_bad",
         )
         .unwrap_err();
         assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
@@ -4874,7 +5249,14 @@ mod tests {
         let bad = upload_f32_to_gpu(&device, &bad_data, vec![8]);
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, &mut registry, &device, &bad, 2, 4, 4, "permute_wrong_count",
+            &mut enc,
+            &mut registry,
+            &device,
+            &bad,
+            2,
+            4,
+            4,
+            "permute_wrong_count",
         )
         .unwrap_err();
         assert!(
@@ -4894,10 +5276,20 @@ mod tests {
         let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("alloc");
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, &mut registry, &device, &dummy, 0, 4, 4, "permute_zero",
+            &mut enc,
+            &mut registry,
+            &device,
+            &dummy,
+            0,
+            4,
+            4,
+            "permute_zero",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("all dims must be > 0"), "got: {err}");
+        assert!(
+            err.to_string().contains("all dims must be > 0"),
+            "got: {err}"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -4920,11 +5312,13 @@ mod tests {
         fill_random(&mut input_data, 0xB22);
         let mut weight_f32 = vec![0.0f32; hidden];
         fill_random(&mut weight_f32, 0xB23);
-        let weight_bf16_q: Vec<f32> =
-            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
         let cpu_out = cpu_rms_norm_f32(
-            &input_data, &weight_bf16_q,
-            seq_len as usize, hidden, cfg.rms_norm_eps,
+            &input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            hidden,
+            cfg.rms_norm_eps,
         );
 
         let manifest = expected_manifest(&cfg);
@@ -4936,12 +5330,17 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
-        let input_gpu = upload_f32_to_gpu(&device, &input_data,
-            vec![seq_len as usize, hidden]);
+        let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_post_attention_layernorm(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("post_attention_layernorm");
         enc.commit_and_wait().expect("commit");
@@ -4994,7 +5393,8 @@ mod tests {
         let mut overrides = std::collections::HashMap::new();
         for tensor in &manifest {
             // Generate deterministic small F32 values seeded by tensor name.
-            let name_hash: u64 = tensor.name
+            let name_hash: u64 = tensor
+                .name
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             let n_elem: usize = tensor.shape.iter().product();
@@ -5042,19 +5442,31 @@ mod tests {
         for (i, v) in embeds.iter_mut().enumerate() {
             *v = pseudo_random(0xD0FFEE + i as u64) * 0.5;
         }
-        let target_aux_gpu = upload_f32_to_gpu(&device, &target_aux,
-            vec![seq_len as usize, cfg.fc_input_size()]);
-        let embeds_gpu = upload_f32_to_gpu(&device, &embeds,
-            vec![seq_len as usize, hidden]);
+        let target_aux_gpu = upload_f32_to_gpu(
+            &device,
+            &target_aux,
+            vec![seq_len as usize, cfg.fc_input_size()],
+        );
+        let embeds_gpu = upload_f32_to_gpu(&device, &embeds, vec![seq_len as usize, hidden]);
 
         // Run forward TWICE — second run must produce bit-identical output.
         let logits_run1 = run_full_eagle3_forward(
-            &device, &mut registry, &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, seq_len,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         );
         let logits_run2 = run_full_eagle3_forward(
-            &device, &mut registry, &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, seq_len,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         );
 
         // Shape check.
@@ -5098,15 +5510,14 @@ mod tests {
         // Then verify top-K extraction works on the logits.
         let row0_logits = &logits_run1[..dvocab];
         let top_k = crate::inference::spec_decode::eagle3::drafter::extract_top_k_from_row_logits(
-            row0_logits, 5,
+            row0_logits,
+            5,
         )
         .expect("top-K extraction");
         assert_eq!(top_k.len(), 5);
         // Validate against Phase E4a Drafter contract.
-        crate::inference::spec_decode::eagle3::drafter::validate_candidates(
-            &top_k, 5,
-        )
-        .expect("Phase E4a contract");
+        crate::inference::spec_decode::eagle3::drafter::validate_candidates(&top_k, 5)
+            .expect("Phase E4a contract");
     }
 
     /// Helper: run the full Eagle3 forward chain end-to-end and
@@ -5124,7 +5535,13 @@ mod tests {
 
         // 1. fc projection: [seq, num_aux*hidden] → [seq, hidden]
         let fc_out = dispatch_eagle3_fc(
-            &mut enc, registry, device, target_aux_gpu, tensors, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            target_aux_gpu,
+            tensors,
+            cfg,
+            seq_len,
         )
         .expect("fc");
 
@@ -5135,30 +5552,29 @@ mod tests {
         .expect("input_layernorm");
 
         // 3. hidden_normed = hidden_norm(fc_out)
-        let hidden_normed = dispatch_eagle3_hidden_norm(
-            &mut enc, registry, device, &fc_out, tensors, cfg, seq_len,
-        )
-        .expect("hidden_norm");
+        let hidden_normed =
+            dispatch_eagle3_hidden_norm(&mut enc, registry, device, &fc_out, tensors, cfg, seq_len)
+                .expect("hidden_norm");
 
         // 4. concat: [seq, 2*hidden]
         let concat = dispatch_eagle3_concat_2x_hidden(
-            &mut enc, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &embeds_normed,
+            &hidden_normed,
+            cfg,
+            seq_len,
         )
         .expect("concat");
 
         // 5-7. Q/K/V projections.
-        let q = dispatch_eagle3_q_proj(
-            &mut enc, registry, device, &concat, tensors, cfg, seq_len,
-        )
-        .expect("q_proj");
-        let k = dispatch_eagle3_k_proj(
-            &mut enc, registry, device, &concat, tensors, cfg, seq_len,
-        )
-        .expect("k_proj");
-        let v = dispatch_eagle3_v_proj(
-            &mut enc, registry, device, &concat, tensors, cfg, seq_len,
-        )
-        .expect("v_proj");
+        let q = dispatch_eagle3_q_proj(&mut enc, registry, device, &concat, tensors, cfg, seq_len)
+            .expect("q_proj");
+        let k = dispatch_eagle3_k_proj(&mut enc, registry, device, &concat, tensors, cfg, seq_len)
+            .expect("k_proj");
+        let v = dispatch_eagle3_v_proj(&mut enc, registry, device, &concat, tensors, cfg, seq_len)
+            .expect("v_proj");
 
         // 8. Optional Q/K head-norm (gated by cfg.use_qk_norm).
         // Codex /cfa E4b.10b.2 Major fix (2026-05-22): branch through
@@ -5166,14 +5582,12 @@ mod tests {
         // otherwise reuse the projection output. The prior unconditional
         // skip silently tested the wrong forward path on QK-norm configs.
         let (q_normed, k_normed) = if cfg.use_qk_norm {
-            let qn = dispatch_eagle3_q_head_norm(
-                &mut enc, registry, device, &q, tensors, cfg, seq_len,
-            )
-            .expect("q_head_norm");
-            let kn = dispatch_eagle3_k_head_norm(
-                &mut enc, registry, device, &k, tensors, cfg, seq_len,
-            )
-            .expect("k_head_norm");
+            let qn =
+                dispatch_eagle3_q_head_norm(&mut enc, registry, device, &q, tensors, cfg, seq_len)
+                    .expect("q_head_norm");
+            let kn =
+                dispatch_eagle3_k_head_norm(&mut enc, registry, device, &k, tensors, cfg, seq_len)
+                    .expect("k_head_norm");
             (qn, kn)
         } else {
             (q, k)
@@ -5181,30 +5595,64 @@ mod tests {
 
         // 9. RoPE on Q and K (linear positions for this simple test).
         let q_roped = dispatch_eagle3_rope(
-            &mut enc, registry, device, &q_normed, cfg, seq_len,
-            cfg.num_q_heads as u32, None, 0, "q_rope",
+            &mut enc,
+            registry,
+            device,
+            &q_normed,
+            cfg,
+            seq_len,
+            cfg.num_q_heads as u32,
+            None,
+            0,
+            "q_rope",
         )
         .expect("q_rope");
         let k_roped = dispatch_eagle3_rope(
-            &mut enc, registry, device, &k_normed, cfg, seq_len,
-            cfg.num_kv_heads as u32, None, 0, "k_rope",
+            &mut enc,
+            registry,
+            device,
+            &k_normed,
+            cfg,
+            seq_len,
+            cfg.num_kv_heads as u32,
+            None,
+            0,
+            "k_rope",
         )
         .expect("k_rope");
 
         // 10. Permute Q/K/V from seq-outer to head-outer.
         let q_perm = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, registry, device, &q_roped,
-            seq_len, cfg.num_q_heads as u32, cfg.head_dim, "q_permute",
+            &mut enc,
+            registry,
+            device,
+            &q_roped,
+            seq_len,
+            cfg.num_q_heads as u32,
+            cfg.head_dim,
+            "q_permute",
         )
         .expect("q_permute");
         let k_perm = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, registry, device, &k_roped,
-            seq_len, cfg.num_kv_heads as u32, cfg.head_dim, "k_permute",
+            &mut enc,
+            registry,
+            device,
+            &k_roped,
+            seq_len,
+            cfg.num_kv_heads as u32,
+            cfg.head_dim,
+            "k_permute",
         )
         .expect("k_permute");
         let v_perm = dispatch_eagle3_permute_seq_to_head_outer(
-            &mut enc, registry, device, &v,
-            seq_len, cfg.num_kv_heads as u32, cfg.head_dim, "v_permute",
+            &mut enc,
+            registry,
+            device,
+            &v,
+            seq_len,
+            cfg.num_kv_heads as u32,
+            cfg.head_dim,
+            "v_permute",
         )
         .expect("v_permute");
 
@@ -5216,48 +5664,96 @@ mod tests {
         // Build all-attended mask [seq, mask_stride] F32 zeros.
         let mask_elems = (seq_len as usize) * (mask_stride as usize);
         let mask_data = vec![EAGLE3_TREE_MASK_ATTENDED; mask_elems];
-        let mask_gpu = upload_f32_to_gpu(device, &mask_data,
-            vec![seq_len as usize, mask_stride as usize]);
+        let mask_gpu = upload_f32_to_gpu(
+            device,
+            &mask_data,
+            vec![seq_len as usize, mask_stride as usize],
+        );
         let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
         let attn_out = dispatch_eagle3_tree_attention(
-            &mut enc, registry, device,
-            &q_perm, &k_perm, &v_perm, &mask_gpu,
-            cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+            &mut enc,
+            registry,
+            device,
+            &q_perm,
+            &k_perm,
+            &v_perm,
+            &mask_gpu,
+            cfg,
+            seq_len,
+            kv_seq_len,
+            kv_capacity,
+            mask_stride,
+            scale,
         )
         .expect("tree_attention");
 
         // 12. O projection + residual add (residual = hidden_normed
         // per vLLM line 84-86 _residual_norm convention).
-        let o_out = dispatch_eagle3_o_proj(
-            &mut enc, registry, device, &attn_out, tensors, cfg, seq_len,
-        )
-        .expect("o_proj");
+        let o_out =
+            dispatch_eagle3_o_proj(&mut enc, registry, device, &attn_out, tensors, cfg, seq_len)
+                .expect("o_proj");
         let attn_residual = dispatch_eagle3_residual_add(
-            &mut enc, registry, device, &o_out, &hidden_normed, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &o_out,
+            &hidden_normed,
+            cfg,
+            seq_len,
         )
         .expect("attn_residual_add");
 
         // 13. post_attention_layernorm + MLP + residual add.
         let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
-            &mut enc, registry, device, &attn_residual, tensors, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &attn_residual,
+            tensors,
+            cfg,
+            seq_len,
         )
         .expect("post_attention_layernorm");
         let mlp_out = dispatch_eagle3_mlp(
-            &mut enc, registry, device, &post_attn_normed, tensors, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &post_attn_normed,
+            tensors,
+            cfg,
+            seq_len,
         )
         .expect("mlp");
         let final_residual = dispatch_eagle3_residual_add(
-            &mut enc, registry, device, &mlp_out, &attn_residual, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &mlp_out,
+            &attn_residual,
+            cfg,
+            seq_len,
         )
         .expect("final_residual_add");
 
         // 14. final_norm + lm_head.
         let final_normed = dispatch_eagle3_final_norm(
-            &mut enc, registry, device, &final_residual, tensors, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &final_residual,
+            tensors,
+            cfg,
+            seq_len,
         )
         .expect("final_norm");
         let logits = dispatch_eagle3_lm_head(
-            &mut enc, registry, device, &final_normed, tensors, cfg, seq_len,
+            &mut enc,
+            registry,
+            device,
+            &final_normed,
+            tensors,
+            cfg,
+            seq_len,
         )
         .expect("lm_head");
         enc.commit_and_wait().expect("commit");
@@ -5277,21 +5773,25 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let _tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let _tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 2_u32;
         let good_data = vec![0.0f32; (seq_len as usize) * cfg.hidden_size];
-        let good_gpu = upload_f32_to_gpu(
-            &device, &good_data, vec![seq_len as usize, cfg.hidden_size],
-        );
+        let good_gpu =
+            upload_f32_to_gpu(&device, &good_data, vec![seq_len as usize, cfg.hidden_size]);
         // hidden branch undersized
         let bad_data = vec![0.0f32; 10];
         let bad_gpu = upload_f32_to_gpu(&device, &bad_data, vec![10]);
 
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_concat_2x_hidden(
-            &mut enc, &mut registry, &device, &good_gpu, &bad_gpu, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &good_gpu,
+            &bad_gpu,
+            &cfg,
+            seq_len,
         )
         .unwrap_err();
         assert!(
@@ -5311,12 +5811,18 @@ mod tests {
     fn e5b_test_setup(
         device: &MlxDevice,
         seq_len: u32,
-    ) -> Option<(Eagle3DrafterConfig, Eagle3DrafterTensors, MlxBuffer, MlxBuffer)> {
+    ) -> Option<(
+        Eagle3DrafterConfig,
+        Eagle3DrafterTensors,
+        MlxBuffer,
+        MlxBuffer,
+    )> {
         let cfg = cfg_for_full_forward_test();
         let manifest = expected_manifest(&cfg);
         let mut overrides = std::collections::HashMap::new();
         for tensor in &manifest {
-            let name_hash: u64 = tensor.name
+            let name_hash: u64 = tensor
+                .name
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             let n_elem: usize = tensor.shape.iter().product();
@@ -5351,11 +5857,8 @@ mod tests {
             &target_aux,
             vec![seq_len as usize, cfg.fc_input_size()],
         );
-        let embeds_gpu = upload_f32_to_gpu(
-            device,
-            &embeds,
-            vec![seq_len as usize, cfg.hidden_size],
-        );
+        let embeds_gpu =
+            upload_f32_to_gpu(device, &embeds, vec![seq_len as usize, cfg.hidden_size]);
         Some((cfg, tensors, target_aux_gpu, embeds_gpu))
     }
 
@@ -5367,20 +5870,22 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 1) {
-                Some(t) => t,
-                None => return,
-            };
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 1, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
+            Some(t) => t,
+            None => return,
+        };
+        let mut cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("alloc cache");
         assert_eq!(cache.len(), 0);
         let logits = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
             &mut cache,
             None,
         )
@@ -5400,20 +5905,22 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 1) {
-                Some(t) => t,
-                None => return,
-            };
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
+            Some(t) => t,
+            None => return,
+        };
         // Wrong num_kv_heads (cfg uses 2, cache uses 3).
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads + 1, 1, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let mut cache = DrafterKvCache::new(&device, cfg.num_kv_heads + 1, 1, cfg.head_dim)
+            .expect("alloc cache");
         let err = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
             &mut cache,
             None,
         )
@@ -5432,19 +5939,21 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 1) {
-                Some(t) => t,
-                None => return,
-            };
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 1, cfg.head_dim + 1,
-        )
-        .expect("alloc cache");
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
+            Some(t) => t,
+            None => return,
+        };
+        let mut cache = DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim + 1)
+            .expect("alloc cache");
         let err = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
             &mut cache,
             None,
         )
@@ -5463,19 +5972,21 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 2) {
-                Some(t) => t,
-                None => return,
-            };
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 2) {
+            Some(t) => t,
+            None => return,
+        };
+        let mut cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         let err = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 2, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            2,
+            0,
             &mut cache,
             None,
         )
@@ -5494,29 +6005,36 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 1) {
-                Some(t) => t,
-                None => return,
-            };
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
+            Some(t) => t,
+            None => return,
+        };
         // capacity=1, populate once, then call again to overflow.
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 1, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let mut cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("alloc cache");
         let _ = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
             &mut cache,
             None,
         )
         .expect("first call");
         assert_eq!(cache.len(), 1);
         let err = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 1,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            1,
             &mut cache,
             None,
         )
@@ -5544,27 +6062,34 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 1) {
-                Some(t) => t,
-                None => return,
-            };
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
+            Some(t) => t,
+            None => return,
+        };
         // Reference: unbatched variant.
         let logits_ref = dispatch_eagle3_drafter_forward(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
         )
         .expect("unbatched");
         // New cache-aware variant.
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 1, cfg.head_dim,
-        )
-        .expect("cache");
+        let mut cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("cache");
         let logits_cache = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
             &mut cache,
             None,
         )
@@ -5575,7 +6100,9 @@ mod tests {
                 a.to_bits(),
                 b.to_bits(),
                 "logits drift at idx {}: ref={} cache={}",
-                i, a, b,
+                i,
+                a,
+                b,
             );
         }
         assert_eq!(cache.len(), 1);
@@ -5596,28 +6123,35 @@ mod tests {
             Err(_) => return,
         };
         let mut registry = KernelRegistry::new();
-        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
-            match e5b_test_setup(&device, 1) {
-                Some(t) => t,
-                None => return,
-            };
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 2, cfg.head_dim,
-        )
-        .expect("cache");
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) = match e5b_test_setup(&device, 1) {
+            Some(t) => t,
+            None => return,
+        };
+        let mut cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 2, cfg.head_dim).expect("cache");
         let logits1 = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 0,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            0,
             &mut cache,
             None,
         )
         .expect("first");
         assert_eq!(cache.len(), 1);
         let logits2 = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device, &mut registry,
-            &target_aux_gpu, &embeds_gpu,
-            &tensors, &cfg, 1, 1,
+            &device,
+            &mut registry,
+            &target_aux_gpu,
+            &embeds_gpu,
+            &tensors,
+            &cfg,
+            1,
+            1,
             &mut cache,
             None,
         )
@@ -5646,8 +6180,7 @@ mod tests {
             &vec![0u8; cfg.hidden_size * cfg.fc_input_size() * 2],
         );
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         let seq_len = 8_u32;
         let input_data = vec![0.0f32; (seq_len as usize) * cfg.fc_input_size()];
@@ -5659,7 +6192,13 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("encoder");
         let out_buf = dispatch_eagle3_fc(
-            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &tensors,
+            &cfg,
+            seq_len,
         )
         .expect("dispatch");
         enc.commit_and_wait().expect("commit");

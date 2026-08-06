@@ -158,14 +158,23 @@ mod stress_driver {
     }
 
     impl ServerGuard {
-        pub fn host(&self) -> &str { &self.host }
-        pub fn port(&self) -> u16 { self.port }
+        pub fn host(&self) -> &str {
+            &self.host
+        }
+        pub fn port(&self) -> u16 {
+            self.port
+        }
         /// PID of the spawned child — needed by the stress sampler
         /// for `ps -o rss=` and `lsof -p`. Distinct from the upstream
         /// `phase_d_driver` which hides `Child`.
-        pub fn pid(&self) -> u32 { self.child.id() }
+        pub fn pid(&self) -> u32 {
+            self.child.id()
+        }
         pub fn log_tail(&self) -> Vec<String> {
-            self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+            self.stderr_tail
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -197,10 +206,7 @@ mod stress_driver {
             )));
         }
         std::fs::create_dir_all(cache_dir).map_err(|e| {
-            DriverError::SpawnFailed(format!(
-                "mkdir cache_dir {}: {e}",
-                cache_dir.display()
-            ))
+            DriverError::SpawnFailed(format!("mkdir cache_dir {}: {e}", cache_dir.display()))
         })?;
         let mut child = Command::new(bin)
             .args([
@@ -233,8 +239,7 @@ mod stress_driver {
         // via flush after every line). Lets post-run grep for
         // [KV-DIAG] without having to panic the test to surface the
         // ring-buffer tail.
-        let stderr_log_path = std::env::var_os("HF2Q_STRESS_STDERR_LOG")
-            .map(PathBuf::from);
+        let stderr_log_path = std::env::var_os("HF2Q_STRESS_STDERR_LOG").map(PathBuf::from);
         let stderr_thread = if let Some(stderr) = child.stderr.take() {
             let tail = Arc::clone(&stderr_tail);
             Some(thread::spawn(move || {
@@ -289,10 +294,8 @@ mod stress_driver {
         let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.write_all(
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )?;
         let mut head = [0u8; 64];
         let n = s.read(&mut head)?;
@@ -322,11 +325,7 @@ mod stress_driver {
     }
 
     pub fn fetch_canonical_model_id(server: &ServerGuard) -> Result<String, DriverError> {
-        let url = format!(
-            "http://{}:{}/v1/models",
-            server.host(),
-            server.port()
-        );
+        let url = format!("http://{}:{}/v1/models", server.host(), server.port());
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -502,21 +501,13 @@ mod stress_driver {
                 }
             }
             if let Some(src_stem) = model_path.file_stem().and_then(|s| s.to_str()) {
-                let mmproj_src =
-                    model_parent.join(format!("{src_stem}-mmproj.gguf"));
+                let mmproj_src = model_parent.join(format!("{src_stem}-mmproj.gguf"));
                 if mmproj_src.exists() {
-                    if let Some(link_stem) =
-                        link_path.file_stem().and_then(|s| s.to_str())
-                    {
-                        let mmproj_dst =
-                            tmp_link_dir.join(format!("{link_stem}-mmproj.gguf"));
+                    if let Some(link_stem) = link_path.file_stem().and_then(|s| s.to_str()) {
+                        let mmproj_dst = tmp_link_dir.join(format!("{link_stem}-mmproj.gguf"));
                         let _ = std::fs::remove_file(&mmproj_dst);
-                        if let Err(e) =
-                            std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst)
-                        {
-                            return Err(DriverError::Transport(format!(
-                                "symlink mmproj: {e}"
-                            )));
+                        if let Err(e) = std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst) {
+                            return Err(DriverError::Transport(format!("symlink mmproj: {e}")));
                         }
                     }
                 }
@@ -630,7 +621,10 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// ADR-017 Closure iter-9 (2026-05-05) — vmmap summary in KiB,
@@ -768,7 +762,11 @@ fn now_nanos() -> u64 {
 fn resolve_model_path() -> Option<PathBuf> {
     let p = std::env::var(ENV_MODEL_PATH).ok()?;
     let pb = PathBuf::from(p);
-    if pb.exists() { Some(pb) } else { None }
+    if pb.exists() {
+        Some(pb)
+    } else {
+        None
+    }
 }
 
 fn resolve_u64(name: &str, default: u64) -> u64 {
@@ -841,8 +839,7 @@ fn kv_persist_stress_24h() {
         .unwrap_or(stress_driver::PORT_DEFAULT);
 
     let budget_kb = budget_mb.saturating_mul(1024);
-    let budget_kb_with_slack =
-        ((budget_kb as f64) * CACHE_BUDGET_SLACK).ceil() as u64;
+    let budget_kb_with_slack = ((budget_kb as f64) * CACHE_BUDGET_SLACK).ceil() as u64;
 
     // ---- Binary check ----
     let bin = stress_driver::hf2q_binary_path();
@@ -859,8 +856,7 @@ fn kv_persist_stress_24h() {
         now_nanos()
     ));
     std::fs::create_dir_all(&cache_dir).expect("[stress] mkdir cache_dir");
-    let tmp_link_dir = tempfile::tempdir()
-        .expect("[stress] tempdir for symlink-eviction-trick");
+    let tmp_link_dir = tempfile::tempdir().expect("[stress] tempdir for symlink-eviction-trick");
 
     eprintln!(
         "[stress] start — duration={duration_sec}s budget_mb={budget_mb} \
@@ -897,9 +893,7 @@ fn kv_persist_stress_24h() {
     });
     let canonical = stress_driver::fetch_canonical_model_id(&server)
         .expect("[stress] fetch canonical model id");
-    eprintln!(
-        "[stress] /readyz OK — pid={pid} model={canonical}"
-    );
+    eprintln!("[stress] /readyz OK — pid={pid} model={canonical}");
 
     // ---- Warmup iters (decode + eviction × N) ----
     //
@@ -964,12 +958,10 @@ fn kv_persist_stress_24h() {
     // heap arena is at typical working set. This makes the iter-to-iter
     // leak gate a real linear-growth detector rather than a "first-iter
     // overhead" detector.
-    let baseline_rss_kb = sample_rss_kb(pid).unwrap_or_else(|| {
-        panic!("[stress] failed to sample baseline RSS for pid={pid}")
-    });
-    let baseline_lsof = sample_lsof_count(pid).unwrap_or_else(|| {
-        panic!("[stress] failed to sample baseline lsof count for pid={pid}")
-    });
+    let baseline_rss_kb = sample_rss_kb(pid)
+        .unwrap_or_else(|| panic!("[stress] failed to sample baseline RSS for pid={pid}"));
+    let baseline_lsof = sample_lsof_count(pid)
+        .unwrap_or_else(|| panic!("[stress] failed to sample baseline lsof count for pid={pid}"));
     let baseline_cache_kb = sample_cache_kb(&cache_dir).unwrap_or(0);
     eprintln!(
         "[stress] baseline (post-warmup) rss={baseline_rss_kb}KB \
@@ -1032,12 +1024,7 @@ fn kv_persist_stress_24h() {
 
         // Decode at most PER_ITER_MAX_TOKENS tokens — short, cheap;
         // we want eviction churn, not long decodes.
-        match stress_driver::decode_full_text(
-            &server,
-            &canonical,
-            &prompt,
-            PER_ITER_MAX_TOKENS,
-        ) {
+        match stress_driver::decode_full_text(&server, &canonical, &prompt, PER_ITER_MAX_TOKENS) {
             Ok(_) => {}
             Err(e) => {
                 panic!(
@@ -1085,9 +1072,7 @@ fn kv_persist_stress_24h() {
             let rss_pct_delta = if baseline_rss_kb == 0 {
                 0.0
             } else {
-                ((current_rss_kb as f64 - baseline_rss_kb as f64)
-                    / baseline_rss_kb as f64)
-                    * 100.0
+                ((current_rss_kb as f64 - baseline_rss_kb as f64) / baseline_rss_kb as f64) * 100.0
             };
             let lsof_delta = current_lsof as i64 - baseline_lsof as i64;
 
@@ -1097,9 +1082,7 @@ fn kv_persist_stress_24h() {
             // by the kernel under pressure and should NOT count as a
             // true leak.
             let vmmap_str = match sample_vmmap_breakdown_kb(pid) {
-                Some((wr_kb, mf_kb)) => format!(
-                    " writeable={wr_kb}KB mapped_file={mf_kb}KB"
-                ),
+                Some((wr_kb, mf_kb)) => format!(" writeable={wr_kb}KB mapped_file={mf_kb}KB"),
                 None => String::new(),
             };
 
@@ -1130,8 +1113,8 @@ fn kv_persist_stress_24h() {
                 panic!(
                     "[stress] FAIL — descriptor leak detected at t={elapsed_sec}s: \
                      current_lsof={current_lsof} > baseline+tol={} \
-                     (baseline={baseline_lsof}, tol={lsof_tol}); iters={iters}"
-                    , baseline_lsof.saturating_add(lsof_tol)
+                     (baseline={baseline_lsof}, tol={lsof_tol}); iters={iters}",
+                    baseline_lsof.saturating_add(lsof_tol)
                 );
             }
 
@@ -1150,8 +1133,7 @@ fn kv_persist_stress_24h() {
     max_lsof = max_lsof.max(final_lsof);
     max_cache_kb = max_cache_kb.max(final_cache_kb);
 
-    let rss_ceiling =
-        ((baseline_rss_kb as f64) * (1.0 + rss_tol_pct / 100.0)).ceil() as u64;
+    let rss_ceiling = ((baseline_rss_kb as f64) * (1.0 + rss_tol_pct / 100.0)).ceil() as u64;
     let max_rss_pct = if baseline_rss_kb == 0 {
         0.0
     } else {
@@ -1173,8 +1155,8 @@ fn kv_persist_stress_24h() {
     assert!(
         max_lsof <= baseline_lsof.saturating_add(lsof_tol),
         "[stress] FINAL FAIL — descriptor leak: max_lsof={max_lsof} > baseline+tol={} \
-         (baseline={baseline_lsof}, tol={lsof_tol}); iters={iters}"
-        , baseline_lsof.saturating_add(lsof_tol)
+         (baseline={baseline_lsof}, tol={lsof_tol}); iters={iters}",
+        baseline_lsof.saturating_add(lsof_tol)
     );
 
     eprintln!(

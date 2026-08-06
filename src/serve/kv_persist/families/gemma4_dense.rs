@@ -225,11 +225,7 @@ impl std::fmt::Debug for EngineHandle {
             .field("device", &self.device)
             .field(
                 "dense_kvs_present",
-                &self
-                    .dense_kvs
-                    .read()
-                    .map(|g| g.is_some())
-                    .unwrap_or(false),
+                &self.dense_kvs.read().map(|g| g.is_some()).unwrap_or(false),
             )
             .field(
                 "write_positions_len",
@@ -728,9 +724,7 @@ fn read_kv_range_to_bytes(
     // spiller's eviction trigger fires from `HotSwapManager::evict` /
     // `load_or_get` after the engine's prefill+decode loop has
     // returned to idle, so all GPU work is drained.
-    let src_bytes: &[u8] = src
-        .as_slice::<u8>()
-        .map_err(|_| SpillErrorKind::CodecErr)?;
+    let src_bytes: &[u8] = src.as_slice::<u8>().map_err(|_| SpillErrorKind::CodecErr)?;
     let expected_bytes = nkv_heads * capacity * head_dim * elem_bytes;
     if src_bytes.len() < expected_bytes {
         return Err(SpillErrorKind::CodecErr);
@@ -879,11 +873,12 @@ impl Gemma4DenseSpill {
         let n_tokens = (range.end - range.start) as usize;
         let nkv_expected = self.nkv_heads[layer_rank];
         let hd_expected = self.head_dim[layer_rank];
-        let is_sliding_expected =
-            self.layer_types[layer_rank] == LayerType::Sliding;
+        let is_sliding_expected = self.layer_types[layer_rank] == LayerType::Sliding;
 
         // Send the request. Errors → None (skip).
-        let snap = engine.request_kv_snapshot(layer_rank, range.clone()).ok()??;
+        let snap = engine
+            .request_kv_snapshot(layer_rank, range.clone())
+            .ok()??;
 
         // Validate worker-reported shape against captured config.
         if snap.nkv_heads as usize != nkv_expected {
@@ -900,8 +895,7 @@ impl Gemma4DenseSpill {
             return None;
         }
         // Worker-side n_tokens vs spiller-side n_tokens.
-        let expected_kv_bytes =
-            nkv_expected * n_tokens * hd_expected * self.kv_dtype.size_of();
+        let expected_kv_bytes = nkv_expected * n_tokens * hd_expected * self.kv_dtype.size_of();
         if snap.k.len() != expected_kv_bytes || snap.v.len() != expected_kv_bytes {
             return None;
         }
@@ -959,9 +953,7 @@ impl Gemma4DenseSpill {
             hdr.dtype.to_dtype(),
         );
         let expected_kv = n_tokens_payload * stride;
-        if hdr.k_byte_len as usize != expected_kv
-            || hdr.v_byte_len as usize != expected_kv
-        {
+        if hdr.k_byte_len as usize != expected_kv || hdr.v_byte_len as usize != expected_kv {
             return Err(SpillErrorKind::CodecErr);
         }
         let body_start = PAYLOAD_HEADER_BYTES;
@@ -1160,9 +1152,7 @@ impl KvCacheSpill for Gemma4DenseSpill {
             hdr.dtype.to_dtype(),
         );
         let expected_kv = n_tokens_payload * stride;
-        if hdr.k_byte_len as usize != expected_kv
-            || hdr.v_byte_len as usize != expected_kv
-        {
+        if hdr.k_byte_len as usize != expected_kv || hdr.v_byte_len as usize != expected_kv {
             return Err(SpillErrorKind::CodecErr);
         }
         let body_start = PAYLOAD_HEADER_BYTES;
@@ -1177,10 +1167,7 @@ impl KvCacheSpill for Gemma4DenseSpill {
         //    a missing handle at restore time is a configuration
         //    bug — Phase C.1 wires the handle BEFORE post_admit
         //    fires).
-        let engine_guard = self
-            .engine
-            .read()
-            .map_err(|_| SpillErrorKind::CodecErr)?;
+        let engine_guard = self.engine.read().map_err(|_| SpillErrorKind::CodecErr)?;
         let engine = engine_guard.as_ref().ok_or(SpillErrorKind::CodecErr)?;
 
         // 6. Allocate dense_kvs if absent. The spiller fires
@@ -1322,15 +1309,13 @@ impl KvCacheSpill for Gemma4DenseSpill {
         // `compute_model_fingerprint(repo, quant.as_str(), "", "", "")`
         // — byte-identical to `BlockPrefixCacheSpiller::family_model_fp`'s
         // legacy fallback. This preserves pre-iter-211 cache hits.
-        Some(
-            crate::serve::kv_persist::format::compute_model_fingerprint(
-                repo,
-                quant.as_str(),
-                &prov.producer_version,
-                &prov.source_sha256,
-                &prov.tokenizer_chat_template_hash,
-            ),
-        )
+        Some(crate::serve::kv_persist::format::compute_model_fingerprint(
+            repo,
+            quant.as_str(),
+            &prov.producer_version,
+            &prov.source_sha256,
+            &prov.tokenizer_chat_template_hash,
+        ))
     }
 
     /// ADR-017 Closure iter-3 (2026-05-04) — real per-family layer
@@ -1363,7 +1348,10 @@ impl KvCacheSpill for Gemma4DenseSpill {
             .ok()
             .and_then(|g| g.as_ref().cloned())?;
         let result = engine.request_prompt_cache_snapshot().ok().flatten();
-        eprintln!("[KV-DIAG] snapshot_prompt_cache: result={} bytes", result.as_ref().map(|b| b.len()).unwrap_or(0));
+        eprintln!(
+            "[KV-DIAG] snapshot_prompt_cache: result={} bytes",
+            result.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
         result
     }
 
@@ -1373,7 +1361,10 @@ impl KvCacheSpill for Gemma4DenseSpill {
     /// `Err(SpillErrorKind::CodecErr)` on parse failure / engine
     /// gone / non-Gemma model.
     fn restore_prompt_cache(&mut self, payload: &[u8]) -> Result<(), SpillErrorKind> {
-        eprintln!("[KV-DIAG] restore_prompt_cache: payload {} bytes", payload.len());
+        eprintln!(
+            "[KV-DIAG] restore_prompt_cache: payload {} bytes",
+            payload.len()
+        );
         let engine = self
             .engine_arc
             .read()
@@ -1730,8 +1721,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir()
-            .join(format!("hf2q-gemma4-spill-{label}-{pid}-{nanos}-{n}"));
+        let dir = std::env::temp_dir().join(format!("hf2q-gemma4-spill-{label}-{pid}-{nanos}-{n}"));
         std::fs::create_dir_all(&dir).expect("temp_dir mkdir");
         dir
     }
@@ -1778,14 +1768,8 @@ mod tests {
     /// Build a fully-populated EngineHandle whose dense_kvs is
     /// allocated and filled with deterministic test bytes (one byte
     /// per token slot per head per dim).
-    fn populate_handle(
-        hook: &Gemma4DenseSpill,
-        device: Arc<MlxDevice>,
-        seed: u8,
-    ) -> EngineHandle {
-        let kvs = hook
-            .alloc_all_layers(&device, 0)
-            .expect("alloc_all_layers");
+    fn populate_handle(hook: &Gemma4DenseSpill, device: Arc<MlxDevice>, seed: u8) -> EngineHandle {
+        let kvs = hook.alloc_all_layers(&device, 0).expect("alloc_all_layers");
         // Fill K and V with `seed XOR <layer> XOR <byte_index>` so
         // every byte is distinct and recognisable in test asserts.
         let mut kvs = kvs;
@@ -1809,7 +1793,11 @@ mod tests {
 
     fn fresh_substrate(
         label: &str,
-    ) -> (Arc<DiskBlockStore>, Arc<AsyncWriterHandle>, std::path::PathBuf) {
+    ) -> (
+        Arc<DiskBlockStore>,
+        Arc<AsyncWriterHandle>,
+        std::path::PathBuf,
+    ) {
         let dir = temp_dir(label);
         let store = Arc::new(DiskBlockStore::new(dir.clone(), 0).expect("DiskBlockStore"));
         let writer = Arc::new(AsyncWriterHandle::spawn(Arc::clone(&store), 32));
@@ -1820,10 +1808,7 @@ mod tests {
     #[derive(Debug)]
     struct TestEngine;
 
-    fn fresh_loaded_engine(
-        repo: &str,
-        quant: QuantType,
-    ) -> Arc<LoadedEngine<TestEngine>> {
+    fn fresh_loaded_engine(repo: &str, quant: QuantType) -> Arc<LoadedEngine<TestEngine>> {
         Arc::new(LoadedEngine {
             engine: TestEngine,
             repo: repo.to_string(),
@@ -1915,17 +1900,14 @@ mod tests {
         let Some(device) = try_make_device() else {
             return;
         };
-        let hook =
-            Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
         let handle = populate_handle(&hook, device.clone(), 0x42);
         hook.set_engine_handle(handle);
         // Layer 2 is full-attention, head_dim 16, nkv 1. capacity =
         // max_decode_tokens (seq_len_hint=0) = 32.
         let layer = 2usize;
         let range = 0u32..8u32;
-        let payload = hook
-            .snapshot_block(layer, range.clone())
-            .expect("snapshot");
+        let payload = hook.snapshot_block(layer, range.clone()).expect("snapshot");
         // Header parses cleanly.
         let hdr = PayloadHeader::from_bytes(&payload).expect("hdr parse");
         assert_eq!(hdr.dtype, DtypeTag::F32);
@@ -1950,8 +1932,7 @@ mod tests {
         let Some(device) = try_make_device() else {
             return;
         };
-        let hook =
-            Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
         // Layer 0 is sliding, sliding_window = 16, nkv = 2, head_dim = 8.
         let handle = populate_handle(&hook, device.clone(), 0x10);
         hook.set_engine_handle(handle);
@@ -2011,14 +1992,11 @@ mod tests {
         let Some(device) = try_make_device() else {
             return;
         };
-        let hook =
-            Gemma4DenseSpill::new(small_cfg(DType::F16)).expect("new f16");
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F16)).expect("new f16");
         let handle = populate_handle(&hook, device.clone(), 0x77);
         hook.set_engine_handle(handle);
         let layer = 0usize;
-        let payload = hook
-            .snapshot_block(layer, 0..8)
-            .expect("snapshot f16");
+        let payload = hook.snapshot_block(layer, 0..8).expect("snapshot f16");
         let hdr = PayloadHeader::from_bytes(&payload).expect("hdr parse");
         assert_eq!(hdr.dtype, DtypeTag::F16);
         // 8 tokens * 2 nkv * 8 head_dim * 2 (F16) = 256 bytes per K/V.
@@ -2032,15 +2010,12 @@ mod tests {
         let Some(device) = try_make_device() else {
             return;
         };
-        let mut hook =
-            Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        let mut hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
         // Step 1: snapshot from a populated handle to get a real
         // payload.
         let producer_handle = populate_handle(&hook, device.clone(), 0xAB);
         hook.set_engine_handle(producer_handle);
-        let payload = hook
-            .snapshot_block(0, 0..8)
-            .expect("snapshot for restore");
+        let payload = hook.snapshot_block(0, 0..8).expect("snapshot for restore");
         // Step 2: install a NEW handle whose dense_kvs is None — the
         // post_admit-before-prefill case.
         let consumer_handle = fresh_handle_for_engine(device.clone());
@@ -2069,11 +2044,8 @@ mod tests {
         let producer = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new f32");
         let producer_handle = populate_handle(&producer, device.clone(), 0xCC);
         producer.set_engine_handle(producer_handle);
-        let payload = producer
-            .snapshot_block(0, 0..4)
-            .expect("snapshot f32");
-        let mut consumer =
-            Gemma4DenseSpill::new(small_cfg(DType::F16)).expect("new f16");
+        let payload = producer.snapshot_block(0, 0..4).expect("snapshot f32");
+        let mut consumer = Gemma4DenseSpill::new(small_cfg(DType::F16)).expect("new f16");
         consumer.set_engine_handle(fresh_handle_for_engine(device));
         let err = consumer.restore_block(0, 0..4, &payload).unwrap_err();
         assert_eq!(err, SpillErrorKind::CodecErr, "dtype mismatch → CodecErr");
@@ -2089,9 +2061,7 @@ mod tests {
         let h = populate_handle(&producer, device.clone(), 0x33);
         producer.set_engine_handle(h);
         // Snapshot from layer 0 (sliding).
-        let payload = producer
-            .snapshot_block(0, 0..4)
-            .expect("snapshot sliding");
+        let payload = producer.snapshot_block(0, 0..4).expect("snapshot sliding");
         // Consumer expects layer 0 to be Full — flip the layer_types.
         let mut bad_cfg = small_cfg(DType::F32);
         bad_cfg.layer_types[0] = LayerType::Full;
@@ -2176,8 +2146,7 @@ mod tests {
         let consumer = Gemma4DenseSpill::new(cfg2).expect("consumer new");
         let consumer_handle = fresh_handle_for_engine(device.clone());
         consumer.set_engine_handle(consumer_handle.clone());
-        let arc_consumer: Arc<Mutex<dyn KvCacheSpill>> =
-            Arc::new(Mutex::new(consumer));
+        let arc_consumer: Arc<Mutex<dyn KvCacheSpill>> = Arc::new(Mutex::new(consumer));
         // Re-register under the same key — the spiller's
         // register_family overwrites.
         spiller.register_family(
@@ -2328,8 +2297,7 @@ mod tests {
         let Some(device) = try_make_device() else {
             return;
         };
-        let mut hook =
-            Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        let mut hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
         hook.set_engine_handle(fresh_handle_for_engine(device));
         // Header size is 34 bytes; pass only 10 → must be rejected
         // before any further work.
@@ -2357,9 +2325,7 @@ mod tests {
         // longer than `header + k_byte_len + v_byte_len`.
         let producer = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("p");
         producer.set_engine_handle(populate_handle(&producer, device.clone(), 0x44));
-        let mut payload = producer
-            .snapshot_block(0, 0..4)
-            .expect("snapshot");
+        let mut payload = producer.snapshot_block(0, 0..4).expect("snapshot");
         let original_len = payload.len();
         payload.extend_from_slice(&[0xDEu8, 0xAD, 0xBE, 0xEF]);
         assert_eq!(payload.len(), original_len + 4);
@@ -2396,8 +2362,7 @@ mod tests {
         let producer = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("p");
         producer.set_engine_handle(populate_handle(&producer, device.clone(), 0x21));
 
-        let mut consumer =
-            Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("c");
+        let mut consumer = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("c");
         consumer.set_engine_handle(fresh_handle_for_engine(device));
 
         // For each of the 4 layers, snapshot a 4-token range and
@@ -2418,10 +2383,7 @@ mod tests {
 
             // Verify byte-exact for the touched range.
             let producer_kvs = {
-                let g = producer
-                    .engine
-                    .read()
-                    .unwrap();
+                let g = producer.engine.read().unwrap();
                 let h = g.as_ref().unwrap();
                 let kvs = h.dense_kvs.read().unwrap();
                 Arc::clone(&h.dense_kvs)
@@ -2556,10 +2518,7 @@ mod tests {
         let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
 
         // Pre-bind: no handle.
-        assert!(
-            hook.snapshot_block(0, 0..4).is_none(),
-            "no handle pre-bind"
-        );
+        assert!(hook.snapshot_block(0, 0..4).is_none(), "no handle pre-bind");
 
         // Pass a String wrapped in Arc<dyn Any>. Downcast to
         // EngineHandle MUST fail; the impl drops it silently.
@@ -2618,9 +2577,7 @@ mod tests {
         let device = match try_make_device() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "[B-dense.2 factory] no MlxDevice — skipping populated-handle test"
-                );
+                eprintln!("[B-dense.2 factory] no MlxDevice — skipping populated-handle test");
                 return;
             }
         };
@@ -2683,9 +2640,7 @@ mod tests {
         let device = match try_make_device() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "[B-dense.2 factory] no MlxDevice — skipping factory-construct test"
-                );
+                eprintln!("[B-dense.2 factory] no MlxDevice — skipping factory-construct test");
                 return;
             }
         };
@@ -2708,7 +2663,10 @@ mod tests {
             .lock()
             .expect("kv_hook Mutex poisoned in test")
             .block_alignment();
-        assert_eq!(alignment, BLOCK_TOKENS, "kv_hook is a real Gemma4DenseSpill");
+        assert_eq!(
+            alignment, BLOCK_TOKENS,
+            "kv_hook is a real Gemma4DenseSpill"
+        );
 
         // The bindable side is wired — unbind clears its engine slot
         // (we can't directly observe, but no-panic + idempotent
@@ -2804,11 +2762,9 @@ mod tests {
     #[test]
     fn followup_try_from_engine_arc_returns_none_on_qwen35_engine() {
         // Qwen35 synthetic engine has kv_spill_descriptor == None.
-        let engine = Arc::new(
-            crate::serve::api::engine::make_synthetic_engine_for_test(
-                crate::serve::api::engine::LoadedArch::Qwen35,
-            ),
-        );
+        let engine = Arc::new(crate::serve::api::engine::make_synthetic_engine_for_test(
+            crate::serve::api::engine::LoadedArch::Qwen35,
+        ));
         let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine;
         let sentinel_cfg = small_cfg(DType::F32);
         let result = Gemma4DenseSpill::try_from_engine_arc(sentinel_cfg, dyn_view);
@@ -2853,10 +2809,7 @@ mod tests {
         let payload2 = consumer_spill
             .snapshot_block(1, 0..8)
             .expect("snapshot consumer");
-        assert_eq!(
-            payload, payload2,
-            "snapshot→restore→snapshot is byte-exact"
-        );
+        assert_eq!(payload, payload2, "snapshot→restore→snapshot is byte-exact");
     }
 
     /// B-dense.2-followup test 4: factory.try_construct via Arc<Engine>
@@ -2886,10 +2839,7 @@ mod tests {
         let (kv_hook, _bindable_hook) = factory
             .try_construct(dyn_view)
             .expect("factory accepts Arc<Engine>");
-        let alignment = kv_hook
-            .lock()
-            .expect("kv_hook Mutex")
-            .block_alignment();
+        let alignment = kv_hook.lock().expect("kv_hook Mutex").block_alignment();
         assert_eq!(alignment, BLOCK_TOKENS, "real Gemma4DenseSpill on kv side");
         // Snapshot via the kv_hook side proves the Mutex-wrapped
         // spill is wired to the engine. arc_engine is still alive,
@@ -2989,11 +2939,10 @@ mod tests {
         // `Engine` by value; we wrap in `Arc` ourselves so we control
         // the strong-count baseline.
         let descriptor = small_descriptor(KvDType::F32);
-        let engine: Engine =
-            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
-                descriptor.clone(),
-                vec![(0usize, 0x42u8)],
-            );
+        let engine: Engine = crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+            descriptor.clone(),
+            vec![(0usize, 0x42u8)],
+        );
         let arc_engine: Arc<Engine> = Arc::new(engine);
 
         let baseline_count = Arc::strong_count(&arc_engine);
@@ -3009,8 +2958,7 @@ mod tests {
         // Mimic LoaderWrapper:301-302 — clone to Arc<dyn Any + Send +
         // Sync>, then pass to try_construct. dyn_view is consumed by
         // the call.
-        let dyn_view: Arc<dyn std::any::Any + Send + Sync> =
-            arc_engine.clone() as _;
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = arc_engine.clone() as _;
         assert_eq!(
             Arc::strong_count(&arc_engine),
             2,
@@ -3069,11 +3017,8 @@ mod tests {
 
         // Construct the spill directly. The engine clone goes into
         // new_with_engine; the spill must downgrade it.
-        let spill = Gemma4DenseSpill::new_with_engine(
-            descriptor.clone(),
-            arc_engine.clone(),
-        )
-        .expect("new_with_engine");
+        let spill = Gemma4DenseSpill::new_with_engine(descriptor.clone(), arc_engine.clone())
+            .expect("new_with_engine");
 
         // Spill is alive AND strong count is back to 1 — the spill
         // holds a Weak, not an Arc.
@@ -3161,11 +3106,7 @@ mod tests {
 
         let template = "<bos><start_of_turn>user\n{{prompt}}<end_of_turn>";
         let template_hash = KvSpillProvenance::hash_chat_template(template);
-        assert_eq!(
-            template_hash.len(),
-            64,
-            "lowercase-hex SHA-256 is 64 chars"
-        );
+        assert_eq!(template_hash.len(), 64, "lowercase-hex SHA-256 is 64 chars");
         let prov = KvSpillProvenance {
             producer_version: "hf2q 0.1.0".to_string(),
             source_sha256: "a".repeat(64),
@@ -3274,14 +3215,12 @@ mod tests {
         let prov_a = KvSpillProvenance {
             producer_version: producer.clone(),
             source_sha256: source.clone(),
-            tokenizer_chat_template_hash:
-                KvSpillProvenance::hash_chat_template(template_a),
+            tokenizer_chat_template_hash: KvSpillProvenance::hash_chat_template(template_a),
         };
         let prov_b = KvSpillProvenance {
             producer_version: producer,
             source_sha256: source,
-            tokenizer_chat_template_hash:
-                KvSpillProvenance::hash_chat_template(template_b),
+            tokenizer_chat_template_hash: KvSpillProvenance::hash_chat_template(template_b),
         };
         // Sanity: hashes differ for different templates.
         assert_ne!(

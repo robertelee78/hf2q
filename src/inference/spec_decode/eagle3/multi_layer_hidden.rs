@@ -81,11 +81,7 @@ impl Eagle3HiddenCollector {
     /// Per vLLM EAGLE-3 default: 3 aux layers (`num_aux_hidden_states`
     /// = 3). Other counts are supported up to 64 (the `written_mask`
     /// is a `u64`).
-    pub fn new(
-        target_layer_ids: Vec<usize>,
-        seq_len: usize,
-        hidden_size: usize,
-    ) -> Result<Self> {
+    pub fn new(target_layer_ids: Vec<usize>, seq_len: usize, hidden_size: usize) -> Result<Self> {
         ensure!(
             !target_layer_ids.is_empty(),
             "Eagle3HiddenCollector: target_layer_ids must be non-empty"
@@ -443,8 +439,7 @@ mod tests {
         let layer_ids = vec![8, 16, 32, 48];
         let seq_len = 200;
         let hidden_size = 5120;
-        let mut c = Eagle3HiddenCollector::new(layer_ids.clone(), seq_len, hidden_size)
-            .unwrap();
+        let mut c = Eagle3HiddenCollector::new(layer_ids.clone(), seq_len, hidden_size).unwrap();
         assert_eq!(c.num_aux(), 4);
         assert_eq!(c.fc_input_size(), 4 * 5120);
         // ~16 MB buffer per capture — well within prefill memory budget.

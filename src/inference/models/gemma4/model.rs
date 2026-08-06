@@ -1,26 +1,25 @@
 //! Gemma 4 model weights, loader, and core inference utilities.
 //!
 //! Owns `MlxModelWeights` — the top-level weight container for the Gemma 4
-//! mlx-native forward path. Also contains the GGUF loader, DWQ overlay, 
+//! mlx-native forward path. Also contains the GGUF loader, DWQ overlay,
 //! embed_tokens, and all per-instance setters.
 //!
 //! Moved from `src/serve/forward_mlx.rs` by ADR-038 Step 3.
 
 use anyhow::Result;
-use mlx_native::{
-    MlxBuffer, MlxDevice,
-};
+use mlx_native::{MlxBuffer, MlxDevice};
 
 use crate::debug::INVESTIGATION_ENV;
-use crate::serve::config::{Gemma4Config, LayerType};
-use crate::serve::gpu::{GpuContext, QuantWeightInfo};
-use crate::serve::forward_mlx_shared::{
-    load_gguf_qweight, populate_f16_shadow_if_enabled, MlxQWeight, MlxAffineMoeStack, MoeBaseRole, DwqOverlayRole,
-    parse_dwq_overlay_metadata, parse_dwq_overlay_role, parse_dwq_moe_expert_role,
-};
 use crate::inference::models::gemma4::kv_cache::{
-    MlxKvCache, HbKvBuffers, DenseKvBuffers, HybridKvBuffers, DecodeRegime,
+    DecodeRegime, DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxKvCache,
 };
+use crate::serve::config::{Gemma4Config, LayerType};
+use crate::serve::forward_mlx_shared::{
+    load_gguf_qweight, parse_dwq_moe_expert_role, parse_dwq_overlay_metadata,
+    parse_dwq_overlay_role, populate_f16_shadow_if_enabled, DwqOverlayRole, MlxAffineMoeStack,
+    MlxQWeight, MoeBaseRole,
+};
+use crate::serve::gpu::{GpuContext, QuantWeightInfo};
 
 // ---------------------------------------------------------------------------
 // Weight storage for the mlx-native forward path
@@ -58,11 +57,7 @@ fn alloc_one_f32_placeholder(
     label: &'static str,
 ) -> Result<MlxBuffer> {
     mlx_device
-        .alloc_buffer(
-            std::mem::size_of::<f32>(),
-            mlx_native::DType::F32,
-            vec![1],
-        )
+        .alloc_buffer(std::mem::size_of::<f32>(), mlx_native::DType::F32, vec![1])
         .map_err(|e| anyhow::anyhow!("dense MoE placeholder alloc ({label}): {e}"))
 }
 
@@ -218,7 +213,10 @@ impl MlxMoeWeights {
             down_ggml_dtype: mlx_native::GgmlType::F32,
             top_k: 0,
             moe_intermediate_size: 0,
-            router_combined_weight: alloc_one_f32_placeholder(mlx_device, "router_combined_weight")?,
+            router_combined_weight: alloc_one_f32_placeholder(
+                mlx_device,
+                "router_combined_weight",
+            )?,
             gate_up_affine: None,
             down_affine: None,
             decode_record_q6k_id_m1_gateup: std::sync::OnceLock::new(),
@@ -458,7 +456,6 @@ pub struct MlxModelWeights {
     // inline-fused TQ-native kernels (`flash_attn_vec_tq` / `flash_attn_vec_tq_hb`)
     // read directly from the TQ-packed `kv_caches[layer].{k,v}_packed` and
     // `leg_hb_encoded` buffers respectively — no F32 shadow cache required.
-
     /// iter-21 Track B: byte-packed higher-bit (5/6/8-bit) KV encoded cache.
     ///
     /// When `HF2Q_TQ_CODEBOOK_BITS=5|6|8` (default 8), K/V are encoded to
@@ -589,7 +586,8 @@ pub struct MlxModelWeights {
     /// production-path caller installs this; only the spec-decode
     /// orchestrator's `install_dflash_capture`/`take_dflash_capture`
     /// pair touches it.
-    pub dflash_capture: Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
+    pub dflash_capture:
+        Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
     /// ADR-029 iter-175 Step 1f — model-wide pre-baked `DispatchRecord`
     /// for hidden-size F32 `rms_norm` dispatches.  Populated on first call
     /// via `OnceLock::get_or_init` calling
@@ -664,8 +662,6 @@ const _: fn() = || {
     assert_send_sync::<MlxModelWeights>();
 };
 
-
-
 // HybridKvBuffers, alloc_hybrid_kv_for_layer, DecodeRegime moved to
 // crate::inference::models::gemma4::kv_cache (ADR-038 Step 2).
 
@@ -733,7 +729,11 @@ impl MlxModelWeights {
         let (exec, _reg) = gpu.split();
         let dev = exec.device();
         let mut out = dev
-            .alloc_buffer(n_tokens * hs * 4, mlx_native::DType::F32, vec![n_tokens, hs])
+            .alloc_buffer(
+                n_tokens * hs * 4,
+                mlx_native::DType::F32,
+                vec![n_tokens, hs],
+            )
             .map_err(|e| anyhow::anyhow!("alloc embed output: {e}"))?;
         let embed_f32: &[f32] = self
             .embed_weight
@@ -745,7 +745,8 @@ impl MlxModelWeights {
             if (tok as usize) >= vocab_in_buf {
                 anyhow::bail!(
                     "embed_tokens: token id {} out of vocab range {}",
-                    tok, vocab_in_buf
+                    tok,
+                    vocab_in_buf
                 );
             }
         }
@@ -764,7 +765,6 @@ impl MlxModelWeights {
         }
         Ok(out)
     }
-
 
     /// Load all model weights directly from a GGUF file into mlx-native
     /// MlxBuffers.
@@ -791,19 +791,27 @@ impl MlxModelWeights {
 
         // --- Embedding weight (F32) ---
         tracing::debug!("Loading embed_weight");
-        let embed_weight = gguf.load_tensor_f32("token_embd.weight", mlx_device)
+        let embed_weight = gguf
+            .load_tensor_f32("token_embd.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("embed: {e}"))?;
         if load_timing {
-            tracing::info!("[LOAD_TIMING] embed_weight_load={:.0}ms", t_pre.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] embed_weight_load={:.0}ms",
+                t_pre.elapsed().as_secs_f64() * 1000.0
+            );
         }
         let t_fn = std::time::Instant::now();
 
         // --- Final norm (F32) ---
         tracing::debug!("Loading final_norm");
-        let final_norm = gguf.load_tensor_f32("output_norm.weight", mlx_device)
+        let final_norm = gguf
+            .load_tensor_f32("output_norm.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("final_norm: {e}"))?;
         if load_timing {
-            tracing::info!("[LOAD_TIMING] final_norm_load={:.0}ms", t_fn.elapsed().as_secs_f64()*1000.0);
+            tracing::info!(
+                "[LOAD_TIMING] final_norm_load={:.0}ms",
+                t_fn.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // --- lm_head: auto-pick Q8_0 vs F16 based on model size ---
@@ -849,12 +857,11 @@ impl MlxModelWeights {
                 || v.eq_ignore_ascii_case("false")
                 || v.eq_ignore_ascii_case("off")
         );
-        let use_q6k = !q6k_env_off
-            && {
-                gguf.tensor_info("token_embd.weight")
-                    .map(|t| t.ggml_type == mlx_native::GgmlType::Q6_K)
-                    .unwrap_or(false)
-            };
+        let use_q6k = !q6k_env_off && {
+            gguf.tensor_info("token_embd.weight")
+                .map(|t| t.ggml_type == mlx_native::GgmlType::Q6_K)
+                .unwrap_or(false)
+        };
 
         let use_q8 = if use_q6k {
             false
@@ -877,7 +884,8 @@ impl MlxModelWeights {
         if use_q8 && cfg.hidden_size % 32 != 0 {
             anyhow::bail!(
                 "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
-                cfg.hidden_size);
+                cfg.hidden_size
+            );
         }
 
         let lm_head_q8: Option<MlxQWeight> = if need_q8 {
@@ -885,9 +893,13 @@ impl MlxModelWeights {
                 Some("1") => "forced",
                 _ => "auto",
             };
-            tracing::info!("Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)",
-                source, lm_head_f16_bytes as f64 / 1e6);
-            let embed_f32: &[f32] = embed_weight.as_slice()
+            tracing::info!(
+                "Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)",
+                source,
+                lm_head_f16_bytes as f64 / 1e6
+            );
+            let embed_f32: &[f32] = embed_weight
+                .as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
             let cols = cfg.hidden_size;
             // ADR-005 iter-214 follow-up — vocab-pad slice OOB fix.
@@ -915,7 +927,9 @@ impl MlxModelWeights {
                 anyhow::bail!(
                     "embed_weight length {} is not divisible by hidden_size {} \
                      (cannot derive Q8_0 LMHEAD row count)",
-                    embed_f32.len(), cols);
+                    embed_f32.len(),
+                    cols
+                );
             }
             let rows = embed_f32.len() / cols;
             if rows != cfg.vocab_size {
@@ -923,25 +937,27 @@ impl MlxModelWeights {
                     "Q8_0 LMHEAD: embed_weight has {} rows but cfg.vocab_size={} \
                      (ADR-012 Phase 1.8 vocab-pad de-pad likely fired; using tensor's \
                      actual row count for Q8 quantize loop bound)",
-                    rows, cfg.vocab_size);
+                    rows,
+                    cfg.vocab_size
+                );
             }
             let blocks_per_row = cols / 32;
             let block_bytes: usize = 34;
             let total_bytes = rows * blocks_per_row * block_bytes;
-            let q_buf = mlx_device.alloc_buffer(
-                total_bytes, mlx_native::DType::U8,
-                vec![rows, blocks_per_row * block_bytes],
-            ).map_err(|e| anyhow::anyhow!("lm_head_q8 alloc: {e}"))?;
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    q_buf.contents_ptr() as *mut u8,
+            let q_buf = mlx_device
+                .alloc_buffer(
                     total_bytes,
+                    mlx_native::DType::U8,
+                    vec![rows, blocks_per_row * block_bytes],
                 )
+                .map_err(|e| anyhow::anyhow!("lm_head_q8 alloc: {e}"))?;
+            let dst_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(q_buf.contents_ptr() as *mut u8, total_bytes)
             };
             for r in 0..rows {
                 let row_src = &embed_f32[r * cols..(r + 1) * cols];
-                let row_dst = &mut dst_bytes[r * blocks_per_row * block_bytes
-                    ..(r + 1) * blocks_per_row * block_bytes];
+                let row_dst = &mut dst_bytes
+                    [r * blocks_per_row * block_bytes..(r + 1) * blocks_per_row * block_bytes];
                 for b in 0..blocks_per_row {
                     let block_src = &row_src[b * 32..(b + 1) * 32];
                     let amax = block_src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
@@ -957,10 +973,16 @@ impl MlxModelWeights {
                     }
                 }
             }
-            tracing::info!("Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}",
+            tracing::info!(
+                "Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}",
                 total_bytes as f64 / 1e6,
                 lm_head_f16_bytes as f64 / total_bytes as f64,
-                if compare_mode { " [COMPARE MODE — F16 also resident]" } else { "" });
+                if compare_mode {
+                    " [COMPARE MODE — F16 also resident]"
+                } else {
+                    ""
+                }
+            );
             Some(MlxQWeight {
                 buffer: q_buf,
                 info: QuantWeightInfo {
@@ -985,8 +1007,10 @@ impl MlxModelWeights {
                 "Loading lm_head Q6_K natively (HF2Q_LMHEAD_Q6K=1, save \
                  ~179 MB vs Q8_0)"
             );
-            Some(load_gguf_qweight(gguf, "token_embd.weight", mlx_device)
-                .map_err(|e| anyhow::anyhow!("lm_head_q6k native load: {e}"))?)
+            Some(
+                load_gguf_qweight(gguf, "token_embd.weight", mlx_device)
+                    .map_err(|e| anyhow::anyhow!("lm_head_q6k native load: {e}"))?,
+            )
         } else {
             None
         };
@@ -999,22 +1023,28 @@ impl MlxModelWeights {
             } else if cfg.hidden_size % 32 != 0 {
                 format!("auto — hidden_size {} not divisible by 32", cfg.hidden_size)
             } else {
-                format!("auto — F16 size {:.1} MB ≤ 256 MB threshold",
-                    lm_head_f16_bytes as f64 / 1e6)
+                format!(
+                    "auto — F16 size {:.1} MB ≤ 256 MB threshold",
+                    lm_head_f16_bytes as f64 / 1e6
+                )
             };
-            eprintln!("  Creating F16 embed weight for GPU lm_head ({})...", reason);
-            let embed_f32: &[f32] = embed_weight.as_slice()
+            eprintln!(
+                "  Creating F16 embed weight for GPU lm_head ({})...",
+                reason
+            );
+            let embed_f32: &[f32] = embed_weight
+                .as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for f16 copy: {e}"))?;
             let n_elements = embed_f32.len();
-            let f16_buf = mlx_device.alloc_buffer(
-                lm_head_f16_bytes, mlx_native::DType::F16,
-                vec![cfg.vocab_size, cfg.hidden_size],
-            ).map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    f16_buf.contents_ptr() as *mut u8,
+            let f16_buf = mlx_device
+                .alloc_buffer(
                     lm_head_f16_bytes,
+                    mlx_native::DType::F16,
+                    vec![cfg.vocab_size, cfg.hidden_size],
                 )
+                .map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
+            let dst_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(f16_buf.contents_ptr() as *mut u8, lm_head_f16_bytes)
             };
             for i in 0..n_elements {
                 let f16_val = half::f16::from_f32(embed_f32[i]);
@@ -1022,8 +1052,11 @@ impl MlxModelWeights {
                 dst_bytes[i * 2] = (bits & 0xFF) as u8;
                 dst_bytes[i * 2 + 1] = (bits >> 8) as u8;
             }
-            eprintln!("  F16 embed weight created ({} elements, {:.1} MB).",
-                n_elements, lm_head_f16_bytes as f64 / 1e6);
+            eprintln!(
+                "  F16 embed weight created ({} elements, {:.1} MB).",
+                n_elements,
+                lm_head_f16_bytes as f64 / 1e6
+            );
             Some(f16_buf)
         } else {
             None
@@ -1059,17 +1092,22 @@ impl MlxModelWeights {
             let v_proj = if cfg.is_full_attention(i) && cfg.attention_k_eq_v {
                 None
             } else {
-                Some(load_gguf_qweight(gguf, &format!("blk.{i}.attn_v.weight"), mlx_device)?)
+                Some(load_gguf_qweight(
+                    gguf,
+                    &format!("blk.{i}.attn_v.weight"),
+                    mlx_device,
+                )?)
             };
-            let o_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_output.weight"), mlx_device)?;
+            let o_proj =
+                load_gguf_qweight(gguf, &format!("blk.{i}.attn_output.weight"), mlx_device)?;
 
             // -- Attention head norms (F32) --
-            let q_norm_weight = gguf.load_tensor_f32(
-                &format!("blk.{i}.attn_q_norm.weight"), mlx_device,
-            ).map_err(|e| anyhow::anyhow!("layer {i} q_norm: {e}"))?;
-            let k_norm_weight = gguf.load_tensor_f32(
-                &format!("blk.{i}.attn_k_norm.weight"), mlx_device,
-            ).map_err(|e| anyhow::anyhow!("layer {i} k_norm: {e}"))?;
+            let q_norm_weight = gguf
+                .load_tensor_f32(&format!("blk.{i}.attn_q_norm.weight"), mlx_device)
+                .map_err(|e| anyhow::anyhow!("layer {i} q_norm: {e}"))?;
+            let k_norm_weight = gguf
+                .load_tensor_f32(&format!("blk.{i}.attn_k_norm.weight"), mlx_device)
+                .map_err(|e| anyhow::anyhow!("layer {i} k_norm: {e}"))?;
             cum_attn_ns += t_attn.elapsed().as_nanos();
 
             let attn = MlxAttentionWeights {
@@ -1083,9 +1121,11 @@ impl MlxModelWeights {
 
             // -- Dense MLP (quantized) --
             let t_mlp = std::time::Instant::now();
-            let gate_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate.weight"), mlx_device)?;
+            let gate_proj =
+                load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate.weight"), mlx_device)?;
             let up_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_up.weight"), mlx_device)?;
-            let down_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_down.weight"), mlx_device)?;
+            let down_proj =
+                load_gguf_qweight(gguf, &format!("blk.{i}.ffn_down.weight"), mlx_device)?;
 
             let mlp = MlxMlpWeights {
                 gate_proj,
@@ -1135,7 +1175,8 @@ impl MlxModelWeights {
                 // safe; we already established both are Some above.
                 let t_gu = std::time::Instant::now();
                 let gu_info = gu_info_opt.unwrap();
-                let stacked_gate_up_buf = gguf.load_tensor(&gu_name, mlx_device)
+                let stacked_gate_up_buf = gguf
+                    .load_tensor(&gu_name, mlx_device)
                     .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
                 let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
                 let gate_up_ggml_dtype = gu_info.ggml_type;
@@ -1143,43 +1184,50 @@ impl MlxModelWeights {
 
                 let t_dn = std::time::Instant::now();
                 let dn_info = dn_info_opt.unwrap();
-                let stacked_down_buf = gguf.load_tensor(&dn_name, mlx_device)
+                let stacked_down_buf = gguf
+                    .load_tensor(&dn_name, mlx_device)
                     .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
                 let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
                 let down_ggml_dtype = dn_info.ggml_type;
                 cum_moe_down_ns += t_dn.elapsed().as_nanos();
 
                 if (i + 1) % 5 == 0 || i == 0 {
-                    tracing::debug!("GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
-                        i + 1, num_layers,
+                    tracing::debug!(
+                        "GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
+                        i + 1,
+                        num_layers,
                         stacked_gate_up_buf.byte_len() as f64 / 1e6,
-                        stacked_down_buf.byte_len() as f64 / 1e6);
+                        stacked_down_buf.byte_len() as f64 / 1e6
+                    );
                 }
 
                 // -- Router and scales (F32) --
-                let router_proj = load_gguf_qweight(
-                    gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device,
-                )?;
-                let router_scale = gguf.load_tensor_f32(
-                    &format!("blk.{i}.ffn_gate_inp.scale"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
-                let per_expert_scale = gguf.load_tensor_f32(
-                    &format!("blk.{i}.ffn_down_exps.scale"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} per_expert_scale: {e}"))?;
+                let router_proj =
+                    load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device)?;
+                let router_scale = gguf
+                    .load_tensor_f32(&format!("blk.{i}.ffn_gate_inp.scale"), mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
+                let per_expert_scale = gguf
+                    .load_tensor_f32(&format!("blk.{i}.ffn_down_exps.scale"), mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} per_expert_scale: {e}"))?;
 
                 // Pre-compute router combined weight:
                 //   router_combined_weight[j] = router_scale[j] * (hidden_size ^ -0.5)
                 let t_rcw = std::time::Instant::now();
                 let router_combined_weight = {
                     let scale_factor = (cfg.hidden_size as f32).powf(-0.5);
-                    let rs: &[f32] = router_scale.as_slice()
-                        .map_err(|e| anyhow::anyhow!("router_scale read for combined weight: {e}"))?;
-                    let mut combined = mlx_device.alloc_buffer(
-                        cfg.hidden_size * std::mem::size_of::<f32>(),
-                        mlx_native::DType::F32,
-                        vec![cfg.hidden_size],
-                    ).map_err(|e| anyhow::anyhow!("router_combined_weight alloc: {e}"))?;
-                    let dst: &mut [f32] = combined.as_mut_slice()
+                    let rs: &[f32] = router_scale.as_slice().map_err(|e| {
+                        anyhow::anyhow!("router_scale read for combined weight: {e}")
+                    })?;
+                    let mut combined = mlx_device
+                        .alloc_buffer(
+                            cfg.hidden_size * std::mem::size_of::<f32>(),
+                            mlx_native::DType::F32,
+                            vec![cfg.hidden_size],
+                        )
+                        .map_err(|e| anyhow::anyhow!("router_combined_weight alloc: {e}"))?;
+                    let dst: &mut [f32] = combined
+                        .as_mut_slice()
                         .map_err(|e| anyhow::anyhow!("router_combined_weight write: {e}"))?;
                     for j in 0..cfg.hidden_size {
                         dst[j] = rs[j] * scale_factor;
@@ -1226,7 +1274,8 @@ impl MlxModelWeights {
                     tracing::debug!(
                         "GGUF layer {}/{}: dense FFN detected (no {gu_name} / {dn_name}); \
                          skipping MoE expert load — using placeholder MoE bundle",
-                        i + 1, num_layers,
+                        i + 1,
+                        num_layers,
                     );
                 }
                 MlxMoeWeights::dense_placeholder(mlx_device)
@@ -1256,18 +1305,18 @@ impl MlxModelWeights {
             // dense-only entry point. A misroute would falsify the
             // `stacked_*.is_some()` gate, not silently consume garbage.
             let norms = MlxLayerNorms {
-                input_layernorm: gguf.load_tensor_f32(
-                    &format!("blk.{i}.attn_norm.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} attn_norm: {e}"))?,
-                post_attention_layernorm: gguf.load_tensor_f32(
-                    &format!("blk.{i}.post_attention_norm.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} post_attn_norm: {e}"))?,
-                pre_feedforward_layernorm: gguf.load_tensor_f32(
-                    &format!("blk.{i}.ffn_norm.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} ffn_norm: {e}"))?,
-                post_feedforward_layernorm: gguf.load_tensor_f32(
-                    &format!("blk.{i}.post_ffw_norm.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm: {e}"))?,
+                input_layernorm: gguf
+                    .load_tensor_f32(&format!("blk.{i}.attn_norm.weight"), mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} attn_norm: {e}"))?,
+                post_attention_layernorm: gguf
+                    .load_tensor_f32(&format!("blk.{i}.post_attention_norm.weight"), mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} post_attn_norm: {e}"))?,
+                pre_feedforward_layernorm: gguf
+                    .load_tensor_f32(&format!("blk.{i}.ffn_norm.weight"), mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} ffn_norm: {e}"))?,
+                post_feedforward_layernorm: gguf
+                    .load_tensor_f32(&format!("blk.{i}.post_ffw_norm.weight"), mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm: {e}"))?,
                 pre_feedforward_layernorm_2: load_optional_norm_or_placeholder(
                     gguf,
                     &format!("blk.{i}.pre_ffw_norm_2.weight"),
@@ -1289,15 +1338,19 @@ impl MlxModelWeights {
             };
 
             // -- Layer scalar (F32) --
-            let layer_scalar = gguf.load_tensor_f32(
-                &format!("blk.{i}.layer_output_scale.weight"), mlx_device,
-            ).map_err(|e| anyhow::anyhow!("layer {i} layer_scalar: {e}"))?;
+            let layer_scalar = gguf
+                .load_tensor_f32(&format!("blk.{i}.layer_output_scale.weight"), mlx_device)
+                .map_err(|e| anyhow::anyhow!("layer {i} layer_scalar: {e}"))?;
 
             // -- Per-layer config --
             let hd = cfg.head_dim_for_layer(i);
             let nkv = cfg.num_kv_heads_for_layer(i);
             let is_full = cfg.is_full_attention(i);
-            let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
+            let layer_type = if is_full {
+                LayerType::Full
+            } else {
+                LayerType::Sliding
+            };
 
             // -- KV cache allocation (identical to the old load_from_candle) --
             // ADR-040 §3.5 iter-A5c (cfa-A5b MAJOR #3): route the
@@ -1309,8 +1362,8 @@ impl MlxModelWeights {
             // `is_sliding: !is_full`), but capacity wiring matches the
             // helper so a future branch-swap of Full/Sliding in the helper
             // would also break this production alloc path.
-            let (_is_ring, capacity) = crate::inference::models::gemma4::kv_cache::
-                layer_type_to_alloc_params(
+            let (_is_ring, capacity) =
+                crate::inference::models::gemma4::kv_cache::layer_type_to_alloc_params(
                     layer_type,
                     cfg.sliding_window,
                     cfg.max_position_embeddings,
@@ -1324,20 +1377,42 @@ impl MlxModelWeights {
             let norms_elements = nkv * capacity * norms_per_pos;
             let norms_bytes = norms_elements * 4; // f32 = 4 bytes
 
-            let k_packed = mlx_device.alloc_buffer(
-                packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
-            ).map_err(|e| anyhow::anyhow!("KV cache K packed alloc: {e}"))?;
-            let k_norms = mlx_device.alloc_buffer(
-                norms_bytes, mlx_native::DType::F32,
-                if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] },
-            ).map_err(|e| anyhow::anyhow!("KV cache K norms alloc: {e}"))?;
-            let v_packed = mlx_device.alloc_buffer(
-                packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
-            ).map_err(|e| anyhow::anyhow!("KV cache V packed alloc: {e}"))?;
-            let v_norms = mlx_device.alloc_buffer(
-                norms_bytes, mlx_native::DType::F32,
-                if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] },
-            ).map_err(|e| anyhow::anyhow!("KV cache V norms alloc: {e}"))?;
+            let k_packed = mlx_device
+                .alloc_buffer(
+                    packed_bytes,
+                    mlx_native::DType::U8,
+                    vec![nkv, capacity, hd / 2],
+                )
+                .map_err(|e| anyhow::anyhow!("KV cache K packed alloc: {e}"))?;
+            let k_norms = mlx_device
+                .alloc_buffer(
+                    norms_bytes,
+                    mlx_native::DType::F32,
+                    if norms_per_pos == 1 {
+                        vec![nkv, capacity]
+                    } else {
+                        vec![nkv, capacity, norms_per_pos]
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("KV cache K norms alloc: {e}"))?;
+            let v_packed = mlx_device
+                .alloc_buffer(
+                    packed_bytes,
+                    mlx_native::DType::U8,
+                    vec![nkv, capacity, hd / 2],
+                )
+                .map_err(|e| anyhow::anyhow!("KV cache V packed alloc: {e}"))?;
+            let v_norms = mlx_device
+                .alloc_buffer(
+                    norms_bytes,
+                    mlx_native::DType::F32,
+                    if norms_per_pos == 1 {
+                        vec![nkv, capacity]
+                    } else {
+                        vec![nkv, capacity, norms_per_pos]
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("KV cache V norms alloc: {e}"))?;
 
             kv_caches.push(MlxKvCache {
                 k_packed,
@@ -1376,9 +1451,8 @@ impl MlxModelWeights {
                 num_layers,
             );
             // ADR-028 iter-463: MoE sub-buckets
-            let cum_moe_other_ns = cum_moe_ns.saturating_sub(
-                cum_moe_gate_up_ns + cum_moe_down_ns + cum_moe_router_cpu_ns
-            );
+            let cum_moe_other_ns = cum_moe_ns
+                .saturating_sub(cum_moe_gate_up_ns + cum_moe_down_ns + cum_moe_router_cpu_ns);
             tracing::info!(
                 "[LOAD_TIMING] moe_sub_buckets gate_up={:.0}ms down={:.0}ms router_cpu={:.0}ms other(router_proj+scales+placeholder)={:.0}ms",
                 cum_moe_gate_up_ns as f64 / 1e6,
@@ -1389,7 +1463,8 @@ impl MlxModelWeights {
         }
         tracing::info!(
             "Loaded {}/{} mlx-native layer weights from GGUF (including MoE)",
-            num_layers, num_layers
+            num_layers,
+            num_layers
         );
 
         // -- Allocate activation buffers --
@@ -1397,7 +1472,8 @@ impl MlxModelWeights {
 
         // -- RoPE freq_factors from GGUF --
         if let Some(_info) = gguf.tensor_info("rope_freqs.weight") {
-            let ff_buf = gguf.load_tensor_f32("rope_freqs.weight", mlx_device)
+            let ff_buf = gguf
+                .load_tensor_f32("rope_freqs.weight", mlx_device)
                 .map_err(|e| anyhow::anyhow!("rope_freqs: {e}"))?;
             activations.rope_freq_factors_gpu = ff_buf;
         }
@@ -1449,9 +1525,7 @@ impl MlxModelWeights {
             // until set_decode_regime is called (which refreshes it).
             gate_h_inactive: {
                 let env = &*INVESTIGATION_ENV;
-                !env.emit_nll
-                    && !env.decode_emit_tokens
-                    && env.decode_input_tokens.is_empty()
+                !env.emit_nll && !env.decode_emit_tokens && env.decode_input_tokens.is_empty()
                 // decode_regime is Default at construction, so the regime
                 // arm is true here without an extra read.
                 // replay_tokens is empty at construction (default Vec::new()),
@@ -1490,14 +1564,20 @@ impl MlxModelWeights {
         if let Ok(ref mut w) = result {
             // Softcap params: [cap, n_elements_as_f32_bits]
             if let Some(cap) = w.final_logit_softcapping {
-                let p: &mut [f32] = w.activations.softcap_params.as_mut_slice()
+                let p: &mut [f32] = w
+                    .activations
+                    .softcap_params
+                    .as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("softcap_params init: {e}"))?;
                 p[0] = cap;
                 p[1] = f32::from_bits(w.vocab_size as u32);
             }
             // Argmax params: [vocab_size]
             {
-                let p: &mut [u32] = w.activations.argmax_params.as_mut_slice()
+                let p: &mut [u32] = w
+                    .activations
+                    .argmax_params
+                    .as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
                 p[0] = w.vocab_size as u32;
             }
@@ -1534,31 +1614,55 @@ impl MlxModelWeights {
                 let t0 = std::time::Instant::now();
                 for li in 0..n_layers {
                     populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.q_proj, dev, &mut gpu.registry,
-                        &format!("blk.{li}.attn_q"))?;
+                        &mut w.layers[li].attn.q_proj,
+                        dev,
+                        &mut gpu.registry,
+                        &format!("blk.{li}.attn_q"),
+                    )?;
                     populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.k_proj, dev, &mut gpu.registry,
-                        &format!("blk.{li}.attn_k"))?;
+                        &mut w.layers[li].attn.k_proj,
+                        dev,
+                        &mut gpu.registry,
+                        &format!("blk.{li}.attn_k"),
+                    )?;
                     if let Some(ref mut v) = w.layers[li].attn.v_proj {
                         populate_f16_shadow_if_enabled(
-                            v, dev, &mut gpu.registry,
-                            &format!("blk.{li}.attn_v"))?;
+                            v,
+                            dev,
+                            &mut gpu.registry,
+                            &format!("blk.{li}.attn_v"),
+                        )?;
                     }
                     populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.o_proj, dev, &mut gpu.registry,
-                        &format!("blk.{li}.attn_output"))?;
+                        &mut w.layers[li].attn.o_proj,
+                        dev,
+                        &mut gpu.registry,
+                        &format!("blk.{li}.attn_output"),
+                    )?;
                     populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.gate_proj, dev, &mut gpu.registry,
-                        &format!("blk.{li}.ffn_gate"))?;
+                        &mut w.layers[li].mlp.gate_proj,
+                        dev,
+                        &mut gpu.registry,
+                        &format!("blk.{li}.ffn_gate"),
+                    )?;
                     populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.up_proj, dev, &mut gpu.registry,
-                        &format!("blk.{li}.ffn_up"))?;
+                        &mut w.layers[li].mlp.up_proj,
+                        dev,
+                        &mut gpu.registry,
+                        &format!("blk.{li}.ffn_up"),
+                    )?;
                     populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.down_proj, dev, &mut gpu.registry,
-                        &format!("blk.{li}.ffn_down"))?;
+                        &mut w.layers[li].mlp.down_proj,
+                        dev,
+                        &mut gpu.registry,
+                        &format!("blk.{li}.ffn_down"),
+                    )?;
                 }
                 let elapsed = t0.elapsed();
-                eprintln!("[ADR-029 H29] F16 shadow population done in {:.2}s", elapsed.as_secs_f64());
+                eprintln!(
+                    "[ADR-029 H29] F16 shadow population done in {:.2}s",
+                    elapsed.as_secs_f64()
+                );
             }
         }
 
@@ -1660,10 +1764,8 @@ impl MlxModelWeights {
         // ADR-020 AC#5 Iter C2.2 — stage MoE per-expert linears for
         // post-pass aggregation.  Key: `(layer_idx, MoeBaseRole)`,
         // value: Vec<(expert_idx, MlxAffineLinear)>.
-        type MoeBucket = std::collections::HashMap<
-            (usize, MoeBaseRole),
-            Vec<(usize, MlxAffineLinear)>,
-        >;
+        type MoeBucket =
+            std::collections::HashMap<(usize, MoeBaseRole), Vec<(usize, MlxAffineLinear)>>;
         let mut moe_buckets: MoeBucket = std::collections::HashMap::new();
 
         for stem in &stems {
@@ -1704,19 +1806,22 @@ impl MlxModelWeights {
             match parse_dwq_overlay_role(role) {
                 DwqOverlayRole::AttnQ => {
                     self.layers[layer_idx].attn.q_proj =
-                        MlxQWeight::from_mlx_affine_linear(device, &linear)
-                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                        MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(|| {
+                            format!("apply_dwq_overlay: build qweight for {stem}")
+                        })?;
                 }
                 DwqOverlayRole::AttnK => {
                     self.layers[layer_idx].attn.k_proj =
-                        MlxQWeight::from_mlx_affine_linear(device, &linear)
-                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                        MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(|| {
+                            format!("apply_dwq_overlay: build qweight for {stem}")
+                        })?;
                 }
                 DwqOverlayRole::AttnV => {
                     if self.layers[layer_idx].attn.v_proj.is_some() {
                         self.layers[layer_idx].attn.v_proj = Some(
-                            MlxQWeight::from_mlx_affine_linear(device, &linear)
-                                .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?,
+                            MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(
+                                || format!("apply_dwq_overlay: build qweight for {stem}"),
+                            )?,
                         );
                     } else {
                         tracing::warn!(stem = %stem, "DWQ overlay: attn_v but slot is None (k_eq_v); skipping");
@@ -1726,23 +1831,27 @@ impl MlxModelWeights {
                 }
                 DwqOverlayRole::AttnOutput => {
                     self.layers[layer_idx].attn.o_proj =
-                        MlxQWeight::from_mlx_affine_linear(device, &linear)
-                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                        MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(|| {
+                            format!("apply_dwq_overlay: build qweight for {stem}")
+                        })?;
                 }
                 DwqOverlayRole::FfnGate => {
                     self.layers[layer_idx].mlp.gate_proj =
-                        MlxQWeight::from_mlx_affine_linear(device, &linear)
-                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                        MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(|| {
+                            format!("apply_dwq_overlay: build qweight for {stem}")
+                        })?;
                 }
                 DwqOverlayRole::FfnUp => {
                     self.layers[layer_idx].mlp.up_proj =
-                        MlxQWeight::from_mlx_affine_linear(device, &linear)
-                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                        MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(|| {
+                            format!("apply_dwq_overlay: build qweight for {stem}")
+                        })?;
                 }
                 DwqOverlayRole::FfnDown => {
                     self.layers[layer_idx].mlp.down_proj =
-                        MlxQWeight::from_mlx_affine_linear(device, &linear)
-                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                        MlxQWeight::from_mlx_affine_linear(device, &linear).with_context(|| {
+                            format!("apply_dwq_overlay: build qweight for {stem}")
+                        })?;
                 }
                 DwqOverlayRole::MoeExpert => {
                     if let Some((base, expert_idx)) = parse_dwq_moe_expert_role(role) {
@@ -1815,10 +1924,8 @@ impl MlxModelWeights {
             // native dtype, mirroring mlx-lm's BF16 on-disk convention).
             let stack_words = n_experts * n * k_packed;
             let mut packed_stack: Vec<u32> = vec![0u32; stack_words];
-            let mut scales_stack_bf16: Vec<u16> =
-                vec![0u16; n_experts * n * groups_per_row];
-            let mut biases_stack_bf16: Vec<u16> =
-                vec![0u16; n_experts * n * groups_per_row];
+            let mut scales_stack_bf16: Vec<u16> = vec![0u16; n_experts * n * groups_per_row];
+            let mut biases_stack_bf16: Vec<u16> = vec![0u16; n_experts * n * groups_per_row];
             for (e, lin) in &linears {
                 for row in 0..n {
                     for kp in 0..k_packed {
@@ -2013,11 +2120,7 @@ impl MlxModelWeights {
     /// (Wired by iter-112b's `parity_quality::run_two_regime_decode`; no
     /// other in-tree caller.)
     #[allow(dead_code)]
-    pub fn set_dump_overrides(
-        &mut self,
-        dir: Option<std::path::PathBuf>,
-        all_cache: Option<bool>,
-    ) {
+    pub fn set_dump_overrides(&mut self, dir: Option<std::path::PathBuf>, all_cache: Option<bool>) {
         self.dump_dir_override = dir;
         self.dump_all_cache_override = all_cache;
         self.decode_step_dump_counter = 0;
@@ -2033,7 +2136,6 @@ impl MlxModelWeights {
     pub fn reset_decode_step_dump_counter(&mut self) {
         self.decode_step_dump_counter = 0;
     }
-
 }
 
 /// Wedge-4 / iter-227 — `MlxMoeWeights::dense_placeholder` invariants.
@@ -2120,7 +2222,9 @@ mod dense_placeholder_tests {
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
-                eprintln!("skipping iter227_dense_placeholder_buffers_are_one_element_each: no MlxDevice");
+                eprintln!(
+                    "skipping iter227_dense_placeholder_buffers_are_one_element_each: no MlxDevice"
+                );
                 return;
             }
         };
@@ -2170,18 +2274,21 @@ fn alloc_activation_buffers(
     let u32_sz = std::mem::size_of::<u32>();
 
     let alloc_f32 = |n: usize, name: &str| -> Result<MlxBuffer> {
-        device.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![n])
+        device
+            .alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![n])
             .map_err(|e| anyhow::anyhow!("alloc {name} ({n} f32): {e}"))
     };
     let alloc_u32 = |n: usize, name: &str| -> Result<MlxBuffer> {
-        device.alloc_buffer(n * u32_sz, mlx_native::DType::U32, vec![n])
+        device
+            .alloc_buffer(n * u32_sz, mlx_native::DType::U32, vec![n])
             .map_err(|e| anyhow::anyhow!("alloc {name} ({n} u32): {e}"))
     };
 
     // RMS norm params: [eps, dim] as f32
     let mut norm_params = alloc_f32(2, "norm_params")?;
     {
-        let p: &mut [f32] = norm_params.as_mut_slice()
+        let p: &mut [f32] = norm_params
+            .as_mut_slice()
             .map_err(|e| anyhow::anyhow!("norm_params init: {e}"))?;
         p[0] = cfg.rms_norm_eps as f32;
         p[1] = hs as f32;
@@ -2207,9 +2314,11 @@ fn alloc_activation_buffers(
         sdpa_out: alloc_f32(num_heads * max_hd, "sdpa_out")?,
         sdpa_tmp: {
             let tmp_bytes = mlx_native::ops::flash_attn_vec_tq::tmp_buffer_bytes(
-                num_heads as u32, max_hd as u32);
-            device.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
-                vec![tmp_bytes / 4])
+                num_heads as u32,
+                max_hd as u32,
+            );
+            device
+                .alloc_buffer(tmp_bytes, mlx_native::DType::F32, vec![tmp_bytes / 4])
                 .map_err(|e| anyhow::anyhow!("sdpa_tmp alloc: {e}"))?
         },
         norm_params,
@@ -2238,23 +2347,20 @@ fn alloc_activation_buffers(
             (cfg.top_k_experts * 2 * moe_interm).max(1),
             "moe_gate_up_id_out",
         )?,
-        moe_down_id_out: alloc_f32(
-            (cfg.top_k_experts * hs).max(1),
-            "moe_down_id_out",
-        )?,
-        moe_swiglu_id_out: alloc_f32(
-            (cfg.top_k_experts * moe_interm).max(1),
-            "moe_swiglu_id_out",
-        )?,
-        hidden_f16: device.alloc_buffer(hs * 2, mlx_native::DType::F16, vec![1, hs])
+        moe_down_id_out: alloc_f32((cfg.top_k_experts * hs).max(1), "moe_down_id_out")?,
+        moe_swiglu_id_out: alloc_f32((cfg.top_k_experts * moe_interm).max(1), "moe_swiglu_id_out")?,
+        hidden_f16: device
+            .alloc_buffer(hs * 2, mlx_native::DType::F16, vec![1, hs])
             .map_err(|e| anyhow::anyhow!("alloc hidden_f16 ({hs} f16): {e}"))?,
-        logits_f16: device.alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
+        logits_f16: device
+            .alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
             .map_err(|e| anyhow::anyhow!("alloc logits_f16 ({vocab} f16): {e}"))?,
         // --- Session merge buffers (S1+S2 collapse) ---
         norm_params_sliding_hd: {
             let sliding_hd = cfg.head_dim;
             let mut buf = alloc_f32(2, "norm_params_sliding_hd")?;
-            let p: &mut [f32] = buf.as_mut_slice()
+            let p: &mut [f32] = buf
+                .as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("norm_params_sliding_hd init: {e}"))?;
             p[0] = cfg.rms_norm_eps as f32;
             p[1] = sliding_hd as f32;
@@ -2263,7 +2369,8 @@ fn alloc_activation_buffers(
         norm_params_global_hd: {
             let global_hd = cfg.global_head_dim;
             let mut buf = alloc_f32(2, "norm_params_global_hd")?;
-            let p: &mut [f32] = buf.as_mut_slice()
+            let p: &mut [f32] = buf
+                .as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("norm_params_global_hd init: {e}"))?;
             p[0] = cfg.rms_norm_eps as f32;
             p[1] = global_hd as f32;

@@ -62,9 +62,9 @@ use mlx_native::MlxDevice;
 use thiserror::Error;
 use tokenizers::Tokenizer;
 
-use crate::core::traits::activation_capture::{ActivationCapture, LayerActivations};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
+use crate::core::traits::activation_capture::{ActivationCapture, LayerActivations};
 use crate::ir::lazy::LazyTensorMap;
 
 // ================================================================
@@ -110,10 +110,7 @@ pub enum RealActivationCaptureError {
 /// Allocates a fresh `HybridKvCache` sized to `tokens.len()` for the
 /// calibration pass; the cache is dropped on return so subsequent
 /// inference sessions are unaffected.
-pub fn run_calibration_prompt_gpu(
-    model: &Qwen35Model,
-    tokens: &[u32],
-) -> Result<LayerActivations> {
+pub fn run_calibration_prompt_gpu(model: &Qwen35Model, tokens: &[u32]) -> Result<LayerActivations> {
     if tokens.is_empty() {
         anyhow::bail!("run_calibration_prompt_gpu: tokens must be non-empty");
     }
@@ -129,8 +126,7 @@ pub fn run_calibration_prompt_gpu(
     }
     debug_assert_eq!(positions_flat.len(), (4 * seq_len) as usize);
 
-    let device = MlxDevice::new()
-        .context("run_calibration_prompt_gpu: MlxDevice::new")?;
+    let device = MlxDevice::new().context("run_calibration_prompt_gpu: MlxDevice::new")?;
 
     let mut kv_cache = HybridKvCache::new(&model.cfg, &device, seq_len.max(1), 1)
         .context("run_calibration_prompt_gpu: HybridKvCache::new")?;
@@ -273,8 +269,8 @@ impl ActivationCapture for RealActivationCapture {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Qwen35Config, Qwen35MoeConfig, Qwen35Variant};
+    use super::*;
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
     use crate::ir::DType;
 

@@ -177,8 +177,8 @@ pub fn try_dispatch_dflash_spec_decode(
 
     let block_size = resolve_block_size()?;
     let t_load = std::time::Instant::now();
-    let drafter_cfg = DFlashConfig::from_json_path(&cfg_path)
-        .context("parse DFlash drafter config.json")?;
+    let drafter_cfg =
+        DFlashConfig::from_json_path(&cfg_path).context("parse DFlash drafter config.json")?;
     let drafter_file =
         DFlashWeightsFile::open(&weights_path).context("open DFlash drafter safetensors")?;
     let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg)
@@ -397,9 +397,9 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     // override.
     let block_size: u32 = match std::env::var("HF2Q_DFLASH_BLOCK_SIZE") {
         Ok(s) => {
-            let n: u32 = s.parse().with_context(|| {
-                format!("HF2Q_DFLASH_BLOCK_SIZE must be integer; got {s:?}")
-            })?;
+            let n: u32 = s
+                .parse()
+                .with_context(|| format!("HF2Q_DFLASH_BLOCK_SIZE must be integer; got {s:?}"))?;
             anyhow::ensure!(n >= 2, "HF2Q_DFLASH_BLOCK_SIZE must be >= 2; got {n}");
             n
         }
@@ -415,8 +415,8 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
         }
     };
 
-    let drafter_file = DFlashWeightsFile::open(&weights_path)
-        .context("open Qwen35 DFlash drafter safetensors")?;
+    let drafter_file =
+        DFlashWeightsFile::open(&weights_path).context("open Qwen35 DFlash drafter safetensors")?;
     let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg)
         .context("validate + load Qwen35 DFlash drafter weights")?;
     // Drafter weights upload to the SAME MlxDevice as the Qwen35Model
@@ -492,10 +492,7 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     let kv_max_seq = kv_max_seq_usize as u32;
     let mut kv_cache = model.with_gpu_cache_mut(|device, _reg| {
         crate::inference::models::qwen35::kv_cache::HybridKvCache::new(
-            &model.cfg,
-            device,
-            kv_max_seq,
-            1,
+            &model.cfg, device, kv_max_seq, 1,
         )
         .context("alloc Qwen35 DFlash HybridKvCache")
     })?;
@@ -607,8 +604,12 @@ pub fn try_dispatch_qwen35_eagle3_spec_decode(
             .map_err(|e| anyhow::anyhow!("upload EAGLE-3 drafter tensors: {e}"))
     })?;
 
-    let cfg =
-        Eagle3OrchestratorConfig::qwen35_default(model, max_new_tokens.max(1), eos_token_ids, ignore_eos);
+    let cfg = Eagle3OrchestratorConfig::qwen35_default(
+        model,
+        max_new_tokens.max(1),
+        eos_token_ids,
+        ignore_eos,
+    );
     let max_seq = prompt_tokens
         .len()
         .checked_add(max_new_tokens)
@@ -777,18 +778,18 @@ fn resolve_ngram_k() -> Result<u32> {
 fn resolve_ngram_min() -> Result<u32> {
     match std::env::var("HF2Q_SPEC_NGRAM_MIN") {
         Err(_) => Ok(1),
-        Ok(s) => Ok(s.parse().with_context(|| {
-            format!("HF2Q_SPEC_NGRAM_MIN must be integer; got {s:?}")
-        })?),
+        Ok(s) => Ok(s
+            .parse()
+            .with_context(|| format!("HF2Q_SPEC_NGRAM_MIN must be integer; got {s:?}"))?),
     }
 }
 
 fn resolve_ngram_max() -> Result<u32> {
     match std::env::var("HF2Q_SPEC_NGRAM_MAX") {
         Err(_) => Ok(3),
-        Ok(s) => Ok(s.parse().with_context(|| {
-            format!("HF2Q_SPEC_NGRAM_MAX must be integer; got {s:?}")
-        })?),
+        Ok(s) => Ok(s
+            .parse()
+            .with_context(|| format!("HF2Q_SPEC_NGRAM_MAX must be integer; got {s:?}"))?),
     }
 }
 

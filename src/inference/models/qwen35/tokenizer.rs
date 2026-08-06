@@ -175,12 +175,12 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
         .enumerate()
         .map(|(i, m)| {
             let mut split = m.splitn(2, ' ');
-            let a = split.next().ok_or_else(|| {
-                anyhow!("merge[{i}] = {m:?} has no space separator")
-            })?;
-            let b = split.next().ok_or_else(|| {
-                anyhow!("merge[{i}] = {m:?} has only one half (need 'a b')")
-            })?;
+            let a = split
+                .next()
+                .ok_or_else(|| anyhow!("merge[{i}] = {m:?} has no space separator"))?;
+            let b = split
+                .next()
+                .ok_or_else(|| anyhow!("merge[{i}] = {m:?} has only one half (need 'a b')"))?;
             Ok::<_, anyhow::Error>((a.to_string(), b.to_string()))
         })
         .collect::<Result<_>>()?;
@@ -213,8 +213,7 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     )
     .map_err(|e| anyhow!("Split::new: {e}"))?;
     let byte_level_pre = ByteLevel::new(
-        /* add_prefix_space = */ false,
-        /* trim_offsets =     */ false,
+        /* add_prefix_space = */ false, /* trim_offsets =     */ false,
         /* use_regex =        */ false,
     );
     let pre_seq = PreSeq::new(vec![
@@ -228,8 +227,7 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     // `Ċ` → `\n`, etc., when joining decoded subword tokens back into
     // a string.
     let decoder = ByteLevelDec::new(
-        /* add_prefix_space = */ false,
-        /* trim_offsets =     */ false,
+        /* add_prefix_space = */ false, /* trim_offsets =     */ false,
         /* use_regex =        */ false,
     );
 
@@ -265,10 +263,7 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
             .zip(tokens.iter())
             .enumerate()
             .filter_map(|(_id, (ttype, name))| {
-                let is_special = matches!(
-                    *ttype,
-                    token_type::CONTROL | token_type::USER_DEFINED
-                );
+                let is_special = matches!(*ttype, token_type::CONTROL | token_type::USER_DEFINED);
                 if !is_special {
                     return None;
                 }
@@ -320,9 +315,7 @@ fn read_string_array(gguf: &GgufFile, key: &str) -> Result<Vec<String>> {
         .enumerate()
         .map(|(i, e)| match e {
             MetadataValue::String(s) => Ok(s.clone()),
-            other => Err(anyhow!(
-                "`{key}`[{i}] is not a string (got {other:?})"
-            )),
+            other => Err(anyhow!("`{key}`[{i}] is not a string (got {other:?})")),
         })
         .collect()
 }
@@ -345,9 +338,7 @@ fn read_i32_array(gguf: &GgufFile, key: &str) -> Result<Vec<i32>> {
             MetadataValue::Uint8(x) => Ok(*x as i32),
             MetadataValue::Int16(x) => Ok(*x as i32),
             MetadataValue::Uint16(x) => Ok(*x as i32),
-            other => Err(anyhow!(
-                "`{key}`[{i}] is not an integer (got {other:?})"
-            )),
+            other => Err(anyhow!("`{key}`[{i}] is not an integer (got {other:?})")),
         })
         .collect()
 }

@@ -418,11 +418,7 @@ pub fn bert_layer_norm_gpu(
         .get_pipeline("bert_layer_norm_f32", device.metal_device())
         .map_err(|e| anyhow!("bert_layer_norm_gpu: get_pipeline: {e}"))?;
 
-    let params = LayerNormGpuParams {
-        hidden,
-        batch,
-        eps,
-    };
+    let params = LayerNormGpuParams { hidden, batch, eps };
     let bytes = pod_as_bytes(&params);
 
     // Choose a power-of-two reduction width ≤ min(hidden, 256). Any
@@ -507,11 +503,7 @@ pub fn bert_residual_layer_norm_gpu(
         .get_pipeline("bert_residual_layer_norm_f32", device.metal_device())
         .map_err(|e| anyhow!("bert_residual_layer_norm_gpu: get_pipeline: {e}"))?;
 
-    let params = LayerNormGpuParams {
-        hidden,
-        batch,
-        eps,
-    };
+    let params = LayerNormGpuParams { hidden, batch, eps };
     let bytes = pod_as_bytes(&params);
 
     // Same threadgroup envelope as bert_layer_norm_f32 — the kernel
@@ -877,7 +869,9 @@ pub fn bert_gelu_gpu(
 ) -> Result<MlxBuffer> {
     let n = input.element_count();
     if n == 0 {
-        return Err(anyhow!("bert_gelu_gpu: input must have at least one element"));
+        return Err(anyhow!(
+            "bert_gelu_gpu: input must have at least one element"
+        ));
     }
     let bytes = match input.dtype() {
         DType::F32 => n * 4,
@@ -892,14 +886,8 @@ pub fn bert_gelu_gpu(
     let output = device
         .alloc_buffer(bytes, input.dtype(), input.shape().to_vec())
         .map_err(|e| anyhow!("alloc bert_gelu output: {e}"))?;
-    mlx_native::ops::gelu::dispatch_gelu(
-        encoder,
-        registry,
-        device.metal_device(),
-        input,
-        &output,
-    )
-    .map_err(|e| anyhow!("bert_gelu_gpu: dispatch_gelu: {e}"))?;
+    mlx_native::ops::gelu::dispatch_gelu(encoder, registry, device.metal_device(), input, &output)
+        .map_err(|e| anyhow!("bert_gelu_gpu: dispatch_gelu: {e}"))?;
     Ok(output)
 }
 
@@ -1098,9 +1086,7 @@ pub fn bert_attention_with_mask_gpu(
     head_dim: u32,
     scale: f32,
 ) -> Result<MlxBuffer> {
-    use crate::inference::vision::vit_gpu::{
-        vit_attention_scores_gpu, vit_softmax_last_dim_gpu,
-    };
+    use crate::inference::vision::vit_gpu::{vit_attention_scores_gpu, vit_softmax_last_dim_gpu};
     use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_bf16};
 
     if head_dim < 32 {
@@ -1118,7 +1104,15 @@ pub fn bert_attention_with_mask_gpu(
 
     // --- Stage 1: scores = (Q @ K^T) * scale, [num_heads, seq, seq] ---
     let scores = vit_attention_scores_gpu(
-        encoder, registry, device, q_seq_major, k_seq_major, seq_len, num_heads, head_dim, scale,
+        encoder,
+        registry,
+        device,
+        q_seq_major,
+        k_seq_major,
+        seq_len,
+        num_heads,
+        head_dim,
+        scale,
     )?;
     encoder.memory_barrier();
 
@@ -1130,8 +1124,14 @@ pub fn bert_attention_with_mask_gpu(
 
     // --- Stage 3: softmax along last dim. [num_heads * seq, seq] ---
     let n_rows = (num_heads as u64) * (seq_len as u64);
-    let softmaxed =
-        vit_softmax_last_dim_gpu(encoder, registry, device, &masked_scores, n_rows as u32, seq_len)?;
+    let softmaxed = vit_softmax_last_dim_gpu(
+        encoder,
+        registry,
+        device,
+        &masked_scores,
+        n_rows as u32,
+        seq_len,
+    )?;
     encoder.memory_barrier();
 
     // --- Stage 4: V layout transforms (mirrors vit_attention_gpu) ---
@@ -1212,7 +1212,13 @@ pub fn bert_attention_with_mask_gpu(
         src1_batch: num_heads,
     };
     dense_matmul_bf16_f32_tensor(
-        encoder, registry, device, &v_t_bf16, &softmaxed, &mut attn_head_major, &params,
+        encoder,
+        registry,
+        device,
+        &v_t_bf16,
+        &softmaxed,
+        &mut attn_head_major,
+        &params,
     )
     .context("attention scores @ V matmul")?;
     encoder.memory_barrier();
@@ -1382,17 +1388,41 @@ pub fn apply_bert_encoder_block_gpu(
 
     // --- Q/K/V projections ---
     let q = bert_linear_gpu(
-        encoder, registry, device, input, tensors.q_w, tensors.q_b, seq_len, hidden, hidden,
+        encoder,
+        registry,
+        device,
+        input,
+        tensors.q_w,
+        tensors.q_b,
+        seq_len,
+        hidden,
+        hidden,
     )
     .context("encoder block: Q projection")?;
     encoder.memory_barrier();
     let k = bert_linear_gpu(
-        encoder, registry, device, input, tensors.k_w, tensors.k_b, seq_len, hidden, hidden,
+        encoder,
+        registry,
+        device,
+        input,
+        tensors.k_w,
+        tensors.k_b,
+        seq_len,
+        hidden,
+        hidden,
     )
     .context("encoder block: K projection")?;
     encoder.memory_barrier();
     let v = bert_linear_gpu(
-        encoder, registry, device, input, tensors.v_w, tensors.v_b, seq_len, hidden, hidden,
+        encoder,
+        registry,
+        device,
+        input,
+        tensors.v_w,
+        tensors.v_b,
+        seq_len,
+        hidden,
+        hidden,
     )
     .context("encoder block: V projection")?;
     encoder.memory_barrier();
@@ -1466,8 +1496,8 @@ pub fn apply_bert_encoder_block_gpu(
     encoder.memory_barrier();
 
     // --- GeLU activation ---
-    let ffn_act = bert_gelu_gpu(encoder, registry, device, &ffn_up)
-        .context("encoder block: GeLU")?;
+    let ffn_act =
+        bert_gelu_gpu(encoder, registry, device, &ffn_up).context("encoder block: GeLU")?;
     encoder.memory_barrier();
 
     // --- FFN down: [seq, intermediate] → [seq, hidden] ---
@@ -1711,15 +1741,8 @@ pub fn bert_embeddings_gpu(
         )
         .context("embeddings: type gather")?;
         encoder.memory_barrier();
-        let s = bert_residual_add_gpu(
-            encoder,
-            registry,
-            device,
-            &tok_pos,
-            &typ,
-            n_hidden as u32,
-        )
-        .context("embeddings: + token_types add")?;
+        let s = bert_residual_add_gpu(encoder, registry, device, &tok_pos, &typ, n_hidden as u32)
+            .context("embeddings: + token_types add")?;
         encoder.memory_barrier();
         s
     } else {
@@ -1821,7 +1844,9 @@ pub fn bert_pool_gpu(
             let s: &mut [u32] =
                 unsafe { std::slice::from_raw_parts_mut(idx_buf.contents_ptr() as *mut u32, 1) };
             s[0] = idx_val;
-            bert_embed_gather_gpu(encoder, registry, device, input, &idx_buf, seq_len, hidden, 1)
+            bert_embed_gather_gpu(
+                encoder, registry, device, input, &idx_buf, seq_len, hidden, 1,
+            )
         }
     }
 }
@@ -1866,9 +1891,8 @@ pub fn bert_l2_normalize_gpu(
         .map_err(|e| anyhow!("alloc l2_norm params: {e}"))?;
     {
         // SAFETY: just-allocated f32 buffer.
-        let s: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2)
-        };
+        let s: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2) };
         s[0] = eps;
         s[1] = dim as f32;
     }
@@ -1973,11 +1997,13 @@ pub fn apply_bert_full_forward_gpu(
     // synthesize an all-zeros `[seq_len]` u32 buffer and pass it
     // through. That matches HuggingFace's BertEmbeddings default
     // behavior for single-segment inputs.
-    let synthesized_type_ids: Option<MlxBuffer> = match (type_ids_opt, weights.token_types_weight()) {
+    let synthesized_type_ids: Option<MlxBuffer> = match (type_ids_opt, weights.token_types_weight())
+    {
         (None, Some(_)) => Some(alloc_zero_type_ids(device, seq_len)?),
         _ => None,
     };
-    let effective_type_ids: Option<&MlxBuffer> = match (type_ids_opt, synthesized_type_ids.as_ref()) {
+    let effective_type_ids: Option<&MlxBuffer> = match (type_ids_opt, synthesized_type_ids.as_ref())
+    {
         (Some(b), _) => Some(b),
         (None, Some(b)) => Some(b),
         (None, None) => None,
@@ -2019,8 +2045,11 @@ pub fn apply_bert_full_forward_gpu(
     // cosine to 0.75-0.92 vs llama-embedding while the masked path
     // stays at 0.99999+. Always-mask is correct (zero mask is a no-op
     // mathematically) and uniform code-path-wise.
-    let mask_opt: Option<MlxBuffer> =
-        Some(alloc_bert_attention_mask(device, seq_len, valid_token_count)?);
+    let mask_opt: Option<MlxBuffer> = Some(alloc_bert_attention_mask(
+        device,
+        seq_len,
+        valid_token_count,
+    )?);
     let mask_ref = mask_opt.as_ref();
 
     // --- N encoder blocks ---
@@ -2318,9 +2347,8 @@ mod tests {
         // SAFETY: just allocated this buffer with f32 dtype; exclusive
         // access. Apple Silicon unified memory makes the contents_ptr
         // a CPU-visible pointer to the same bytes the GPU sees.
-        let slice: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, data.len())
-        };
+        let slice: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, data.len()) };
         slice.copy_from_slice(data);
         buf
     }
@@ -2406,7 +2434,10 @@ mod tests {
             (3.0 - 2.5) * inv_std,
             (4.0 - 2.5) * inv_std,
         ]) {
-            assert!((got - expected).abs() < 1e-6, "got {got}, expected {expected}");
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "got {got}, expected {expected}"
+            );
         }
     }
 
@@ -2419,7 +2450,9 @@ mod tests {
         }
         let batch = 4usize;
         let hidden = 8usize;
-        let input: Vec<f32> = (0..batch * hidden).map(|i| 0.1 * (i as f32) - 0.4).collect();
+        let input: Vec<f32> = (0..batch * hidden)
+            .map(|i| 0.1 * (i as f32) - 0.4)
+            .collect();
         let gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + 0.05 * i as f32).collect();
         let beta: Vec<f32> = (0..hidden).map(|i| 0.01 * i as f32).collect();
         let eps = 1e-12;
@@ -2828,7 +2861,10 @@ mod tests {
         for (g, c) in gpu.iter().zip(cpu.iter()) {
             max_diff = max_diff.max((g - c).abs());
         }
-        assert!(max_diff < 1e-5, "gelu max_diff at bge FFN shape: {max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "gelu max_diff at bge FFN shape: {max_diff}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -3225,9 +3261,8 @@ mod tests {
         let bytes = data.len() * 4;
         let buf = device.alloc_buffer(bytes, DType::U32, shape).unwrap();
         // SAFETY: just-allocated u32 buffer; exclusive access.
-        let slice: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len())
-        };
+        let slice: &mut [u32] =
+            unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len()) };
         slice.copy_from_slice(data);
         buf
     }
@@ -3349,7 +3384,9 @@ mod tests {
         let token_types = prand_f32(3, type_vocab * hidden);
         let embed_gamma = prand_f32(4, hidden);
         let embed_beta = prand_f32(5, hidden);
-        let input_ids: Vec<u32> = (0..seq).map(|i| (i.wrapping_mul(7) % vocab) as u32).collect();
+        let input_ids: Vec<u32> = (0..seq)
+            .map(|i| (i.wrapping_mul(7) % vocab) as u32)
+            .collect();
         let type_ids: Vec<u32> = (0..seq).map(|i| (i & 1) as u32).collect();
 
         let cpu = embeddings_cpu_ref(
@@ -3484,7 +3521,10 @@ mod tests {
         for (g, c) in gpu.iter().zip(cpu.iter()) {
             max_diff = max_diff.max((g - c).abs());
         }
-        assert!(max_diff < 1e-4, "embeddings (no types) max_diff: {max_diff}");
+        assert!(
+            max_diff < 1e-4,
+            "embeddings (no types) max_diff: {max_diff}"
+        );
     }
 
     #[test]
@@ -3882,12 +3922,7 @@ mod tests {
                 sum_sq += v * v;
             }
             let norm = sum_sq.sqrt() as f32;
-            assert!(
-                (norm - 1.0).abs() < 1e-4,
-                "row {} norm {} != 1.0",
-                r,
-                norm
-            );
+            assert!((norm - 1.0).abs() < 1e-4, "row {} norm {} != 1.0", r, norm);
         }
     }
 
@@ -3990,8 +4025,7 @@ mod tests {
 
         // Per-layer.
         for layer in 0..num_layers {
-            let key =
-                |s: &str| -> String { super::super::config::bert_layer_tensor(layer, s) };
+            let key = |s: &str| -> String { super::super::config::bert_layer_tensor(layer, s) };
             // Q/K/V/O linear layers — `[hidden, hidden]` weights + `[hidden]` biases.
             let qkvo_seed_base = 100 + layer * 100;
             for (i, name) in [
@@ -4033,11 +4067,19 @@ mod tests {
             // Post-attn LN.
             tensors.insert(
                 key("attn_output_norm.weight"),
-                upload_f32(device, &prand(qkvo_seed_base + 60, hidden, 0.0001, 1.0), vec![hidden]),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 60, hidden, 0.0001, 1.0),
+                    vec![hidden],
+                ),
             );
             tensors.insert(
                 key("attn_output_norm.bias"),
-                upload_f32(device, &prand(qkvo_seed_base + 61, hidden, 0.001, -0.5), vec![hidden]),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 61, hidden, 0.001, -0.5),
+                    vec![hidden],
+                ),
             );
             // FFN up/down.
             tensors.insert(
@@ -4075,11 +4117,19 @@ mod tests {
             // Post-FFN LN.
             tensors.insert(
                 key("layer_output_norm.weight"),
-                upload_f32(device, &prand(qkvo_seed_base + 80, hidden, 0.0001, 1.0), vec![hidden]),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 80, hidden, 0.0001, 1.0),
+                    vec![hidden],
+                ),
             );
             tensors.insert(
                 key("layer_output_norm.bias"),
-                upload_f32(device, &prand(qkvo_seed_base + 81, hidden, 0.001, -0.5), vec![hidden]),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 81, hidden, 0.001, -0.5),
+                    vec![hidden],
+                ),
             );
         }
 
@@ -4089,7 +4139,9 @@ mod tests {
         );
 
         // Synthetic input: arbitrary token ids modulo vocab.
-        let input_ids: Vec<u32> = (0..seq).map(|i| (i.wrapping_mul(7) % vocab) as u32).collect();
+        let input_ids: Vec<u32> = (0..seq)
+            .map(|i| (i.wrapping_mul(7) % vocab) as u32)
+            .collect();
         let type_ids: Vec<u32> = (0..seq).map(|i| (i & 1) as u32).collect();
         let input_ids_b = upload_u32(device, &input_ids, vec![seq]);
         let type_ids_b = upload_u32(device, &type_ids, vec![seq]);
@@ -4156,9 +4208,7 @@ mod tests {
         let executor = GraphExecutor::new(device);
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        let weights = super::super::weights::LoadedBertWeights::empty(
-            MlxDevice::new().unwrap(),
-        );
+        let weights = super::super::weights::LoadedBertWeights::empty(MlxDevice::new().unwrap());
         let input_ids = upload_u32(device, &[0u32; 32], vec![32]);
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
@@ -4207,9 +4257,7 @@ mod tests {
         let executor = GraphExecutor::new(device);
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
-        let weights = super::super::weights::LoadedBertWeights::empty(
-            MlxDevice::new().unwrap(),
-        );
+        let weights = super::super::weights::LoadedBertWeights::empty(MlxDevice::new().unwrap());
         let input_ids = upload_u32(device, &[0u32; 16], vec![16]);
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
@@ -4411,14 +4459,13 @@ mod tests {
     #[test]
     fn bge_full_forward_matches_llama_embedding_on_hello_world() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use std::path::Path;
-        use mlx_native::gguf::GgufFile;
         use super::super::config::{BertConfig, PoolingType};
         use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
         use super::super::weights::LoadedBertWeights;
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
         if !model_path.exists() {
             eprintln!("skipping: bge GGUF fixture not at {}", model_path.display());
             return;
@@ -4430,13 +4477,21 @@ mod tests {
         assert_eq!(cfg.hidden_size, 384, "expected bge hidden=384");
         assert_eq!(cfg.num_hidden_layers, 12);
         assert_eq!(cfg.num_attention_heads, 12);
-        assert_eq!(cfg.pooling_type, PoolingType::Cls, "bge GGUF must declare CLS pool");
+        assert_eq!(
+            cfg.pooling_type,
+            PoolingType::Cls,
+            "bge GGUF must declare CLS pool"
+        );
 
         let vocab = BertVocab::from_gguf(&gguf).expect("parse bge vocab");
         let tok = BertWpmTokenizer::new(&vocab);
         let real_ids = tok.encode("hello world", true);
         let valid_token_count: u32 = real_ids.len() as u32;
-        assert_eq!(real_ids.len(), 4, "bge tokenizer must produce 4 tokens for hello world, got {real_ids:?}");
+        assert_eq!(
+            real_ids.len(),
+            4,
+            "bge tokenizer must produce 4 tokens for hello world, got {real_ids:?}"
+        );
 
         // Pad to seq_len=32 with [PAD].
         let seq_len: u32 = 32;
@@ -4451,16 +4506,12 @@ mod tests {
         let mut registry = KernelRegistry::new();
         register_bert_custom_shaders(&mut registry);
 
-        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
-            .expect("load bge weights");
+        let weights =
+            LoadedBertWeights::load_from_path(model_path, &cfg).expect("load bge weights");
 
         // Build input_ids buffer.
         let input_ids = device
-            .alloc_buffer(
-                (seq_len as usize) * 4,
-                DType::U32,
-                vec![seq_len as usize],
-            )
+            .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
             .expect("alloc input_ids");
         {
             let slice: &mut [u32] = unsafe {
@@ -4496,7 +4547,11 @@ mod tests {
         let na: f32 = view.iter().map(|v| v * v).sum::<f32>().sqrt();
         let nb: f32 = truth.iter().map(|v| v * v).sum::<f32>().sqrt();
         let cosine = dot / (na * nb);
-        let max_abs_diff = view.iter().zip(truth.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+        let max_abs_diff = view
+            .iter()
+            .zip(truth.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
 
         eprintln!(
             "[bge parity] cosine={:.6}, ||hf2q||_2={:.6}, ||truth||_2={:.6}, max_abs_diff={:.4e}",
@@ -4505,7 +4560,8 @@ mod tests {
         eprintln!(
             "  hf2q  first4 = {:?}
   truth first4 = {:?}",
-            &view[..4], &truth[..4]
+            &view[..4],
+            &truth[..4]
         );
 
         assert!(
@@ -4526,14 +4582,13 @@ mod tests {
     #[test]
     fn bge_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use std::path::Path;
-        use mlx_native::gguf::GgufFile;
         use super::super::config::BertConfig;
         use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
         use super::super::weights::LoadedBertWeights;
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
         if !model_path.exists() {
             eprintln!("skipping: bge GGUF fixture not at {}", model_path.display());
             return;
@@ -4550,8 +4605,8 @@ mod tests {
         let device = MlxDevice::new().expect("create device");
         let mut registry = KernelRegistry::new();
         register_bert_custom_shaders(&mut registry);
-        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
-            .expect("load bge weights");
+        let weights =
+            LoadedBertWeights::load_from_path(model_path, &cfg).expect("load bge weights");
 
         let seq_lens: &[u32] = &[32, 64, 128, 256, 512];
         let mut outputs: Vec<(u32, Vec<f32>)> = Vec::with_capacity(seq_lens.len());
@@ -4577,8 +4632,15 @@ mod tests {
 
             let mut encoder = device.command_encoder().expect("command_encoder");
             let pooled = apply_bert_full_forward_gpu(
-                &mut encoder, &mut registry, &device, &input_ids, None,
-                &weights, &cfg, seq_len, valid_token_count,
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input_ids,
+                None,
+                &weights,
+                &cfg,
+                seq_len,
+                valid_token_count,
             )
             .unwrap_or_else(|e| panic!("bge forward at seq_len={seq_len}: {e}"));
             encoder.commit_and_wait().expect("commit_and_wait");
@@ -4613,7 +4675,8 @@ mod tests {
         }
         eprintln!(
             "[bge pad-invariance] PASS — max drift across {} seq_lens = {:.2e}",
-            seq_lens.len(), max_drift
+            seq_lens.len(),
+            max_drift
         );
     }
 
@@ -4890,16 +4953,18 @@ mod tests {
     #[test]
     fn mxbai_full_forward_matches_llama_embedding_on_hello_world() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use std::path::Path;
-        use mlx_native::gguf::GgufFile;
         use super::super::config::{BertConfig, PoolingType};
         use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
         use super::super::weights::LoadedBertWeights;
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/mxbai-embed-large-v1-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/mxbai-embed-large-v1-f16.gguf");
         if !model_path.exists() {
-            eprintln!("skipping: mxbai GGUF fixture not at {}", model_path.display());
+            eprintln!(
+                "skipping: mxbai GGUF fixture not at {}",
+                model_path.display()
+            );
             return;
         }
 
@@ -4927,15 +4992,11 @@ mod tests {
         let mut registry = KernelRegistry::new();
         register_bert_custom_shaders(&mut registry);
 
-        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
-            .expect("load mxbai weights");
+        let weights =
+            LoadedBertWeights::load_from_path(model_path, &cfg).expect("load mxbai weights");
 
         let input_ids = device
-            .alloc_buffer(
-                (seq_len as usize) * 4,
-                DType::U32,
-                vec![seq_len as usize],
-            )
+            .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
             .expect("alloc input_ids");
         {
             let slice: &mut [u32] = unsafe {
@@ -4969,25 +5030,20 @@ mod tests {
         let na: f32 = view.iter().map(|v| v * v).sum::<f32>().sqrt();
         let nb: f32 = truth.iter().map(|v| v * v).sum::<f32>().sqrt();
         let cosine = dot / (na * nb);
-        let max_abs_diff = view.iter().zip(truth.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+        let max_abs_diff = view
+            .iter()
+            .zip(truth.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
 
         eprintln!(
             "[mxbai parity] cosine={:.6}, ||hf2q||_2={:.6}, ||truth||_2={:.6}, max_abs_diff={:.4e}",
             cosine, na, nb, max_abs_diff
         );
-        eprintln!(
-            "  hf2q  first4 = {:?}",
-            &view[..4]
-        );
-        eprintln!(
-            "  truth first4 = {:?}",
-            &truth[..4]
-        );
+        eprintln!("  hf2q  first4 = {:?}", &view[..4]);
+        eprintln!("  truth first4 = {:?}", &truth[..4]);
 
-        assert!(
-            cosine >= 0.999,
-            "mxbai cosine {cosine:.6} below 0.999"
-        );
+        assert!(cosine >= 0.999, "mxbai cosine {cosine:.6} below 0.999");
     }
 
     /// **mxbai padding-invariance gate at production seq_lens** (iter-91).
@@ -4999,16 +5055,18 @@ mod tests {
     #[test]
     fn mxbai_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use std::path::Path;
-        use mlx_native::gguf::GgufFile;
         use super::super::config::BertConfig;
         use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
         use super::super::weights::LoadedBertWeights;
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/mxbai-embed-large-v1-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/mxbai-embed-large-v1-f16.gguf");
         if !model_path.exists() {
-            eprintln!("skipping: mxbai GGUF fixture not at {}", model_path.display());
+            eprintln!(
+                "skipping: mxbai GGUF fixture not at {}",
+                model_path.display()
+            );
             return;
         }
 
@@ -5023,8 +5081,8 @@ mod tests {
         let device = MlxDevice::new().expect("create device");
         let mut registry = KernelRegistry::new();
         register_bert_custom_shaders(&mut registry);
-        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
-            .expect("load mxbai weights");
+        let weights =
+            LoadedBertWeights::load_from_path(model_path, &cfg).expect("load mxbai weights");
 
         let seq_lens: &[u32] = &[32, 64, 128, 256, 512];
         let mut outputs: Vec<(u32, Vec<f32>)> = Vec::with_capacity(seq_lens.len());
@@ -5050,8 +5108,15 @@ mod tests {
 
             let mut encoder = device.command_encoder().expect("command_encoder");
             let pooled = apply_bert_full_forward_gpu(
-                &mut encoder, &mut registry, &device, &input_ids, None,
-                &weights, &cfg, seq_len, valid_token_count,
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input_ids,
+                None,
+                &weights,
+                &cfg,
+                seq_len,
+                valid_token_count,
             )
             .unwrap_or_else(|e| panic!("mxbai forward at seq_len={seq_len}: {e}"));
             encoder.commit_and_wait().expect("commit_and_wait");
@@ -5086,8 +5151,8 @@ mod tests {
         }
         eprintln!(
             "[mxbai pad-invariance] PASS — max drift across {} seq_lens = {:.2e}",
-            seq_lens.len(), max_drift
+            seq_lens.len(),
+            max_drift
         );
     }
-
 }

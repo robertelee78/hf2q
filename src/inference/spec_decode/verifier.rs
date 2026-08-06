@@ -148,7 +148,9 @@ pub fn accept_prefix(drafts: &[u32], logits_per_pos: &VerifyLogits) -> (usize, u
     // Iterate K positions checking draft[i] == argmax(logits[i]).
     let mut accept_count = 0;
     for i in 0..drafts.len() {
-        if i >= logits_per_pos.len() { break; }
+        if i >= logits_per_pos.len() {
+            break;
+        }
         let argmax = argmax_u32(&logits_per_pos[i]);
         if argmax == drafts[i] {
             accept_count += 1;
@@ -201,7 +203,9 @@ pub fn accept_prefix_argmax(drafts: &[u32], model_argmaxes: &[u32]) -> (usize, u
     }
     let mut accept_count = 0;
     for i in 0..drafts.len() {
-        if i >= model_argmaxes.len() { break; }
+        if i >= model_argmaxes.len() {
+            break;
+        }
         if model_argmaxes[i] == drafts[i] {
             accept_count += 1;
         } else {
@@ -357,10 +361,16 @@ mod tests {
 
     impl Verifier for MockVerifier {
         fn verify(&mut self, tokens: &[u32]) -> Result<VerifyLogits, VerifierError> {
-            if tokens.is_empty() { return Err(VerifierError::EmptyInput); }
+            if tokens.is_empty() {
+                return Err(VerifierError::EmptyInput);
+            }
             if let Some(n) = self.expected_input_len {
-                assert_eq!(tokens.len(), n,
-                    "MockVerifier: expected {n} input tokens, got {}", tokens.len());
+                assert_eq!(
+                    tokens.len(),
+                    n,
+                    "MockVerifier: expected {n} input tokens, got {}",
+                    tokens.len()
+                );
             }
             self.verify_inputs.push(tokens.to_vec());
             Ok(self.scripted.clone())
@@ -395,7 +405,11 @@ mod tests {
 
     impl GroundTruthVerifier {
         fn new(vocab: u32, initial_prefix: Vec<u32>) -> Self {
-            Self { vocab, prefix: initial_prefix, rollbacks: Vec::new() }
+            Self {
+                vocab,
+                prefix: initial_prefix,
+                rollbacks: Vec::new(),
+            }
         }
     }
 
@@ -411,7 +425,9 @@ mod tests {
                 // in prefix conceptually for the first call); for i=0
                 // we predict what follows it. For i>0 we extend with
                 // the speculative drafts.
-                if i > 0 { seq.extend_from_slice(&tokens[1..=i]); }
+                if i > 0 {
+                    seq.extend_from_slice(&tokens[1..=i]);
+                }
                 let next = ground_truth_next(&seq, self.vocab);
                 logits.push(one_hot(self.vocab as usize, next));
             }
@@ -493,7 +509,10 @@ mod tests {
         let vocab = 256u32;
         let n_tokens = 30;
         let cfg = super::super::ngram_proposer::NgramConfig {
-            min_ngram: 1, max_ngram: 3, k: 3, max_model_len: 4096,
+            min_ngram: 1,
+            max_ngram: 3,
+            k: 3,
+            max_model_len: 4096,
         };
 
         let default_out = default_decode(&prompt, vocab, n_tokens);
@@ -515,7 +534,10 @@ mod tests {
         let prompt = vec![5u32, 6, 7];
         let vocab = 100u32;
         let cfg = super::super::ngram_proposer::NgramConfig {
-            min_ngram: 1, max_ngram: 3, k: 0, max_model_len: 4096,
+            min_ngram: 1,
+            max_ngram: 3,
+            k: 0,
+            max_model_len: 4096,
         };
 
         let mut verifier = GroundTruthVerifier::new(vocab, prompt.clone());
@@ -552,7 +574,9 @@ mod tests {
         let vocab = 50usize;
         let mut state: u64 = 0xCAFE_BEEF;
         let next_rand = |s: &mut u64| -> u64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *s >> 33
         };
 
@@ -560,19 +584,24 @@ mod tests {
             let n_drafts = (next_rand(&mut state) % 6) as usize;
             let n_logits = (next_rand(&mut state) % 8) as usize;
             let drafts: Vec<u32> = (0..n_drafts)
-                .map(|_| (next_rand(&mut state) % vocab as u64) as u32).collect();
+                .map(|_| (next_rand(&mut state) % vocab as u64) as u32)
+                .collect();
             let logits: VerifyLogits = (0..n_logits)
                 .map(|_| {
                     let target = (next_rand(&mut state) % vocab as u64) as u32;
                     one_hot(vocab, target)
-                }).collect();
+                })
+                .collect();
 
             let (accept, tok) = accept_prefix(&drafts, &logits);
 
             // Invariant 1, 2.
             assert!(accept <= drafts.len(), "accept_count > drafts.len()");
-            assert!(accept <= logits.len() || logits.is_empty(),
-                "accept_count > logits.len() (got {accept} vs {})", logits.len());
+            assert!(
+                accept <= logits.len() || logits.is_empty(),
+                "accept_count > logits.len() (got {accept} vs {})",
+                logits.len()
+            );
 
             // Invariant 3.
             for i in 0..accept {
@@ -583,13 +612,18 @@ mod tests {
 
             // Invariant 4.
             if accept < drafts.len() && accept < logits.len() {
-                assert_ne!(drafts[accept], argmax_u32(&logits[accept]),
-                    "first rejected draft equals model argmax — should have been accepted");
+                assert_ne!(
+                    drafts[accept],
+                    argmax_u32(&logits[accept]),
+                    "first rejected draft equals model argmax — should have been accepted"
+                );
             }
 
             // Invariant 5.
-            assert!((tok as usize) < vocab,
-                "model_token {tok} out of vocab range {vocab}");
+            assert!(
+                (tok as usize) < vocab,
+                "model_token {tok} out of vocab range {vocab}"
+            );
         }
     }
 
@@ -604,8 +638,7 @@ mod tests {
             one_hot(100, 30),
             one_hot(100, 40),
         ];
-        let mut mock = MockVerifier::new(scripted)
-            .with_expected_input_len(4); // [last] ++ drafts = 1 + 3 = 4
+        let mut mock = MockVerifier::new(scripted).with_expected_input_len(4); // [last] ++ drafts = 1 + 3 = 4
 
         let seq_pos_before: usize = 7;
         let last = 5u32;
@@ -618,8 +651,11 @@ mod tests {
         assert_eq!(accept, 3);
         assert_eq!(tok, 40);
         assert_eq!(seq_pos_after, 11);
-        assert_eq!(mock.verify_inputs, vec![vec![5u32, 10, 20, 30]],
-            "verifier saw [last] ++ drafts in correct order");
+        assert_eq!(
+            mock.verify_inputs,
+            vec![vec![5u32, 10, 20, 30]],
+            "verifier saw [last] ++ drafts in correct order"
+        );
         mock.rollback_kv_to(seq_pos_after).unwrap();
         assert_eq!(mock.rollbacks, vec![11]);
     }
@@ -636,8 +672,7 @@ mod tests {
             one_hot(100, 99),
             one_hot(100, 40),
         ];
-        let mut mock = MockVerifier::new(scripted)
-            .with_expected_input_len(4); // [last] ++ K=3 drafts
+        let mut mock = MockVerifier::new(scripted).with_expected_input_len(4); // [last] ++ K=3 drafts
 
         let seq_pos_before: usize = 7;
         let logits = mock.verify(&[5u32, 10, 20, 30]).unwrap();
@@ -650,8 +685,11 @@ mod tests {
         assert_eq!(mock.verify_inputs, vec![vec![5u32, 10, 20, 30]]);
 
         mock.rollback_kv_to(seq_pos_after).unwrap();
-        assert_eq!(mock.rollbacks, vec![10],
-                  "rollback to seq_pos_after = before + accept + 1");
+        assert_eq!(
+            mock.rollbacks,
+            vec![10],
+            "rollback to seq_pos_after = before + accept + 1"
+        );
     }
 
     #[test]
@@ -667,14 +705,15 @@ mod tests {
     fn mock_verifier_input_len_validation_catches_caller_bug() {
         // Set expected_input_len=4 (K=3 + last). Then call with wrong
         // number of tokens — should panic, catching the caller bug.
-        let mut mock = MockVerifier::new(vec![one_hot(100, 0)])
-            .with_expected_input_len(4);
+        let mut mock = MockVerifier::new(vec![one_hot(100, 0)]).with_expected_input_len(4);
         // Calling with 3 tokens (K=2 + last) violates the expectation.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = mock.verify(&[1u32, 2, 3]);
         }));
-        assert!(result.is_err(),
-            "MockVerifier with expected_input_len=4 should panic on 3 tokens");
+        assert!(
+            result.is_err(),
+            "MockVerifier with expected_input_len=4 should panic on 3 tokens"
+        );
     }
 
     #[test]
@@ -797,10 +836,13 @@ mod tests {
             for sl in 0..=cap {
                 for wp in 0..=cap.saturating_sub(1).max(0) {
                     for is_sliding in [false, true] {
-                        for trim in [0usize, 1, sl, sl/2, sl+1] {
+                        for trim in [0usize, 1, sl, sl / 2, sl + 1] {
                             let (_nwp, nsl) = rollback_kv_state(wp, sl, cap, is_sliding, trim);
                             assert!(nsl <= cap, "seq_len > cap: cap={cap} wp={wp} sl={sl} sliding={is_sliding} trim={trim} → nsl={nsl}");
-                            assert!(nsl <= sl, "seq_len grew: cap={cap} wp={wp} sl={sl} trim={trim} → nsl={nsl}");
+                            assert!(
+                                nsl <= sl,
+                                "seq_len grew: cap={cap} wp={wp} sl={sl} trim={trim} → nsl={nsl}"
+                            );
                         }
                     }
                 }

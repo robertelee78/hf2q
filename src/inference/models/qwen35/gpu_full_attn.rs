@@ -46,29 +46,26 @@
 //! P7b complete: every op wired, parity test passes |GPU−CPU|∞ < 1e-3 F32.
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
-use mlx_native::ops::elementwise::{cast, CastDirection, elementwise_add};
-use mlx_native::ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
-};
-use mlx_native::ops::rms_norm;
-use mlx_native::ops::rope_multi::{
-    dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams,
-};
-use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
-use mlx_native::ops::sdpa::{sdpa, SdpaParams};
-use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
-use mlx_native::ops::flash_attn_vec::{
-    flash_attn_vec, tmp_buffer_bytes as flash_attn_vec_tmp_bytes,
-    tmp_buffer_bytes_with_qL as flash_attn_vec_tmp_bytes_with_qL,
-    FlashAttnVecParams,
-};
-use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
+use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::flash_attn_prefill::{
     dispatch_flash_attn_prefill_bf16_d256, dispatch_flash_attn_prefill_bf16_d256_resume,
     FlashAttnPrefillParams, FlashAttnPrefillResumeParams,
 };
+use mlx_native::ops::flash_attn_vec::{
+    flash_attn_vec, tmp_buffer_bytes as flash_attn_vec_tmp_bytes,
+    tmp_buffer_bytes_with_qL as flash_attn_vec_tmp_bytes_with_qL, FlashAttnVecParams,
+};
+use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
+use mlx_native::ops::quantized_matmul_ggml::{
+    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
+};
+use mlx_native::ops::rms_norm;
+use mlx_native::ops::rope_multi::{dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams};
+use mlx_native::ops::sdpa::{sdpa, SdpaParams};
+use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
+use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32, permute_021_f32};
 use mlx_native::ops::tree_attention::{self as tree_attn_ops, TreeAttentionParams};
@@ -105,9 +102,7 @@ fn slot_k_v_region_for_full_attn(
     max_seq_len: u32,
     head_dim: u32,
 ) -> (u64, usize) {
-    let n_elements = (n_kv_heads as usize)
-        * (max_seq_len as usize)
-        * (head_dim as usize);
+    let n_elements = (n_kv_heads as usize) * (max_seq_len as usize) * (head_dim as usize);
     let byte_offset = (slot_id.0 as u64)
         .checked_mul(n_elements as u64)
         .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
@@ -180,11 +175,19 @@ fn write_kv_with_optional_tq_encode(
         let dst_k_view = dst_k.slice_view(byte_offset, n_elements);
         let dst_v_view = dst_v.slice_view(byte_offset, n_elements);
         dispatch_kv_cache_copy_seq_f32_dual(
-            enc, registry, device.metal_device(),
-            k_seq_major, v_seq_major,
-            &dst_k_view, &dst_v_view,
-            n_kv_heads, head_dim, max_seq_len,
-            cur_len, n_tokens, 0,
+            enc,
+            registry,
+            device.metal_device(),
+            k_seq_major,
+            v_seq_major,
+            &dst_k_view,
+            &dst_v_view,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            cur_len,
+            n_tokens,
+            0,
         )
         .context("kv_cache_copy_seq_f32_dual (write_kv_with_optional_tq_encode)")?;
     }
@@ -235,13 +238,37 @@ fn write_kv_with_optional_tq_encode(
         };
 
         slot.encode_seq_tokens_to_tq(
-            k_seq_major, true, n_tokens, n_kv_heads, head_dim, max_seq_len,
-            cur_len, 0, false, 1.0, cb_bits, enc, registry, device,
+            k_seq_major,
+            true,
+            n_tokens,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            cur_len,
+            0,
+            false,
+            1.0,
+            cb_bits,
+            enc,
+            registry,
+            device,
         )
         .context("TQ encode K (write_kv_with_optional_tq_encode)")?;
         slot.encode_seq_tokens_to_tq(
-            v_seq_major, false, n_tokens, n_kv_heads, head_dim, max_seq_len,
-            cur_len, 0, false, 1.0, cb_bits, enc, registry, device,
+            v_seq_major,
+            false,
+            n_tokens,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            cur_len,
+            0,
+            false,
+            1.0,
+            cb_bits,
+            enc,
+            registry,
+            device,
         )
         .context("TQ encode V (write_kv_with_optional_tq_encode)")?;
     }
@@ -318,8 +345,12 @@ fn dispatch_decode_sdpa_with_optional_tq(
 
         // (a) Q pre-rotation in-place.
         mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
-            enc, registry, device.metal_device(),
-            q_seq_major, n_heads, head_dim,
+            enc,
+            registry,
+            device.metal_device(),
+            q_seq_major,
+            n_heads,
+            head_dim,
         )
         .context("dispatch_fwht_sign_premult_f32 (TQ decode pre-rotation)")?;
 
@@ -342,8 +373,13 @@ fn dispatch_decode_sdpa_with_optional_tq(
             codebook_bits: cb_bits,
         };
         slot.dispatch_tq_sdpa(
-            q_seq_major, out_buf, fa_tmp,
-            &tq_params, enc, registry, device,
+            q_seq_major,
+            out_buf,
+            fa_tmp,
+            &tq_params,
+            enc,
+            registry,
+            device,
         )
         .context("dispatch_tq_sdpa (TQ decode SDPA)")?;
 
@@ -352,8 +388,12 @@ fn dispatch_decode_sdpa_with_optional_tq(
 
         // (e) Output inverse-rotation in-place.
         mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-            enc, registry, device.metal_device(),
-            out_buf, n_heads, head_dim,
+            enc,
+            registry,
+            device.metal_device(),
+            out_buf,
+            n_heads,
+            head_dim,
         )
         .context("dispatch_fwht_sign_undo_f32 (TQ decode post-rotation)")?;
     } else {
@@ -385,7 +425,10 @@ fn dispatch_decode_sdpa_with_optional_tq(
              not taken — iter-34 alloc/SDPA gating invariant regressed \
              (tq_kv_active=true ⇒ slot.tq=Some ⇒ TQ chain above runs).",
         );
-        let vbuf = slot.v.as_ref().expect("flash_attn_vec F32: slot.v is None (see slot.k)");
+        let vbuf = slot
+            .v
+            .as_ref()
+            .expect("flash_attn_vec F32: slot.v is None (see slot.k)");
         // ADR-040 Phase B4a-cont: slice_view per-slot K/V region.
         // Zero-copy ARC clone with byte_offset; SlotId(0) gives
         // byte_offset=0 ⇒ byte-identical to pre-B4a-cont.
@@ -394,8 +437,14 @@ fn dispatch_decode_sdpa_with_optional_tq(
         let kbuf_view = kbuf.slice_view(byte_offset, n_elements);
         let vbuf_view = vbuf.slice_view(byte_offset, n_elements);
         flash_attn_vec(
-            enc, registry, device,
-            q_seq_major, &kbuf_view, &vbuf_view, out_buf, fa_tmp,
+            enc,
+            registry,
+            device,
+            q_seq_major,
+            &kbuf_view,
+            &vbuf_view,
+            out_buf,
+            fa_tmp,
             &fa_params,
         )
         .context("flash_attn_vec (legacy F32 decode)")?;
@@ -441,13 +490,13 @@ impl FullAttnWeightsGpu {
         Ok(Self {
             attn_norm: upload_f32_weight(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32_weight(&weights.post_attn_norm, device)?,
-            wq:     upload_q4_0_from_f32(&weights.wq, device)?,
-            wk:     upload_q4_0_from_f32(&weights.wk, device)?,
-            wv:     upload_q4_0_from_f32(&weights.wv, device)?,
+            wq: upload_q4_0_from_f32(&weights.wq, device)?,
+            wk: upload_q4_0_from_f32(&weights.wk, device)?,
+            wv: upload_q4_0_from_f32(&weights.wv, device)?,
             w_gate: upload_q4_0_from_f32(&weights.w_gate, device)?,
             attn_q_norm: upload_f32_weight(&weights.attn_q_norm, device)?,
             attn_k_norm: upload_f32_weight(&weights.attn_k_norm, device)?,
-            wo:     upload_q4_0_from_f32(&weights.wo, device)?,
+            wo: upload_q4_0_from_f32(&weights.wo, device)?,
         })
     }
 
@@ -466,13 +515,13 @@ impl FullAttnWeightsGpu {
         Ok(Self {
             attn_norm: upload_f32(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
-            wq:     upload_f32(&weights.wq, device)?,
-            wk:     upload_f32(&weights.wk, device)?,
-            wv:     upload_f32(&weights.wv, device)?,
+            wq: upload_f32(&weights.wq, device)?,
+            wk: upload_f32(&weights.wk, device)?,
+            wv: upload_f32(&weights.wv, device)?,
             w_gate: upload_f32(&weights.w_gate, device)?,
             attn_q_norm: upload_f32(&weights.attn_q_norm, device)?,
             attn_k_norm: upload_f32(&weights.attn_k_norm, device)?,
-            wo:     upload_f32(&weights.wo, device)?,
+            wo: upload_f32(&weights.wo, device)?,
         })
     }
 }
@@ -538,7 +587,11 @@ pub fn encode_q4_0_blocks(vals: &[f32]) -> Vec<u8> {
     use half::f16;
     const QK: usize = 32;
     let n = vals.len();
-    assert_eq!(n % QK, 0, "encode_q4_0_blocks: n={n} must be divisible by QK=32");
+    assert_eq!(
+        n % QK,
+        0,
+        "encode_q4_0_blocks: n={n} must be divisible by QK=32"
+    );
     let n_blocks = n / QK;
     let mut out = vec![0u8; n_blocks * 18];
     for b in 0..n_blocks {
@@ -550,7 +603,7 @@ pub fn encode_q4_0_blocks(vals: &[f32]) -> Vec<u8> {
         let off = b * 18;
         out[off..off + 2].copy_from_slice(&d_f16.to_le_bytes());
         for j in 0..16 {
-            let q0 = ((block[j]      / d).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
+            let q0 = ((block[j] / d).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
             let q1 = ((block[j + 16] / d).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
             out[off + 2 + j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
         }
@@ -629,14 +682,18 @@ pub fn upload_f32_weight(data: &[f32], device: &MlxDevice) -> Result<MlxBuffer> 
 pub fn upload_f32_into(data: &[f32], buf: &mut MlxBuffer) -> Result<()> {
     anyhow::ensure!(
         buf.dtype() == DType::F32,
-        "upload_f32_into: expected F32 buffer, got {:?}", buf.dtype()
+        "upload_f32_into: expected F32 buffer, got {:?}",
+        buf.dtype()
     );
     anyhow::ensure!(
         buf.element_count() >= data.len(),
         "upload_f32_into: buf too small (cap={} < data={})",
-        buf.element_count(), data.len()
+        buf.element_count(),
+        data.len()
     );
-    let slice = buf.as_mut_slice::<f32>().map_err(|e| anyhow!("mut_slice: {e}"))?;
+    let slice = buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("mut_slice: {e}"))?;
     slice[..data.len()].copy_from_slice(data);
     Ok(())
 }
@@ -644,10 +701,7 @@ pub fn upload_f32_into(data: &[f32], buf: &mut MlxBuffer) -> Result<()> {
 /// Download an `MlxBuffer` of f32 values into a `Vec<f32>`.
 pub fn download_f32(buf: &MlxBuffer) -> Result<Vec<f32>> {
     if buf.dtype() != DType::F32 {
-        return Err(anyhow!(
-            "download_f32: buffer dtype {} != f32",
-            buf.dtype()
-        ));
+        return Err(anyhow!("download_f32: buffer dtype {} != f32", buf.dtype()));
     }
     let slice: &[f32] = buf.as_slice().map_err(|e| anyhow!("as_slice: {e}"))?;
     Ok(slice.to_vec())
@@ -689,12 +743,12 @@ pub fn apply_q_or_k_per_head_rms_norm(
     let rows = seq_len * n_heads;
     let dim = head_dim;
     let out = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (rows * dim) as usize * 4,
-            DType::F32,
-            vec![rows as usize, dim as usize],
-        )
-        .map_err(|e| anyhow!("alloc out: {e}"))?;
+        device,
+        (rows * dim) as usize * 4,
+        DType::F32,
+        vec![rows as usize, dim as usize],
+    )
+    .map_err(|e| anyhow!("alloc out: {e}"))?;
     let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     {
@@ -760,11 +814,7 @@ pub fn apply_imrope(
         device,
         (seq_len * n_heads * head_dim) as usize * 4,
         DType::F32,
-        vec![
-            seq_len as usize,
-            n_heads as usize,
-            head_dim as usize,
-        ],
+        vec![seq_len as usize, n_heads as usize, head_dim as usize],
     )
     .map_err(|e| anyhow!("alloc imrope out (pooled): {e}"))?;
 
@@ -778,16 +828,8 @@ pub fn apply_imrope(
     // (Q-config + K-config, seq_len=1) and amortizes the alloc cost
     // across all decode tokens.  Bit-exact: same kernel, same dispatch,
     // only the param triplet is sourced from the cache.
-    dispatch_rope_multi_cached(
-        encoder,
-        registry,
-        device,
-        input,
-        &out,
-        positions,
-        params,
-    )
-    .context("dispatch_rope_multi_cached")?;
+    dispatch_rope_multi_cached(encoder, registry, device, input, &out, positions, params)
+        .context("dispatch_rope_multi_cached")?;
 
     Ok(out)
 }
@@ -806,12 +848,12 @@ pub fn apply_sigmoid_gate_multiply(
     n_elements: u32,
 ) -> Result<MlxBuffer> {
     let out = super::decode_pool::pooled_alloc_buffer(
-            device,
-            n_elements as usize * 4,
-            DType::F32,
-            vec![n_elements as usize],
-        )
-        .map_err(|e| anyhow!("alloc sigmoid-mul out: {e}"))?;
+        device,
+        n_elements as usize * 4,
+        DType::F32,
+        vec![n_elements as usize],
+    )
+    .map_err(|e| anyhow!("alloc sigmoid-mul out: {e}"))?;
     let mut params = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     params
@@ -856,12 +898,12 @@ pub fn apply_pre_attn_rms_norm(
 ) -> Result<MlxBuffer> {
     // Allocate output + params.
     let out = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (seq_len * hidden_size) as usize * 4,
-            DType::F32,
-            vec![seq_len as usize, hidden_size as usize],
-        )
-        .map_err(|e| anyhow!("alloc out: {e}"))?;
+        device,
+        (seq_len * hidden_size) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, hidden_size as usize],
+    )
+    .map_err(|e| anyhow!("alloc out: {e}"))?;
     let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     {
@@ -942,13 +984,20 @@ pub fn apply_linear_projection_f32(
     // would silently mis-stride at the kernel (iter-106 class of bug,
     // see ADR-030 iter-110/111/112/113 for the mlx-native dispatcher-
     // level guards).
-    debug_assert_eq!(input.dtype(), DType::F32,
+    debug_assert_eq!(
+        input.dtype(),
+        DType::F32,
         "apply_linear_projection_f32: input must be F32 (kernel paths assume F32); got {}",
-        input.dtype());
+        input.dtype()
+    );
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
-        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![seq_len as usize, out_features as usize],
+        )
         .map_err(|e| anyhow!("alloc projection output: {e}"))?;
 
     match weight.dtype() {
@@ -980,8 +1029,10 @@ pub fn apply_linear_projection_f32(
                     .context("dense_gemv_bf16_f32 (M=1)")?;
             } else {
                 // BF16 tiled GEMM path — MMA tensor-core, optimal for M > 1.
-                dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, &mut dst, &params)
-                    .context("dense_matmul_bf16_f32_tensor")?;
+                dense_matmul_bf16_f32_tensor(
+                    encoder, registry, device, weight, input, &mut dst, &params,
+                )
+                .context("dense_matmul_bf16_f32_tensor")?;
             }
         }
         DType::F32 => {
@@ -997,10 +1048,22 @@ pub fn apply_linear_projection_f32(
             // U8 path above) but lifted for hygiene.
             let n_w = (out_features * in_features) as usize;
             let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                    device, n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
-                .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-            cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
-                .context("cast weight F32→BF16")?;
+                device,
+                n_w * 2,
+                DType::BF16,
+                vec![out_features as usize, in_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
+            cast(
+                encoder,
+                registry,
+                device.metal_device(),
+                weight,
+                &weight_bf16,
+                n_w,
+                CastDirection::F32ToBF16,
+            )
+            .context("cast weight F32→BF16")?;
             // Need a barrier: the GEMM reads weight_bf16 which was written by the cast.
             encoder.memory_barrier();
             let params = DenseMmBf16F32Params {
@@ -1010,12 +1073,21 @@ pub fn apply_linear_projection_f32(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, &mut dst, &params)
-                .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
+            dense_matmul_bf16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                &weight_bf16,
+                input,
+                &mut dst,
+                &params,
+            )
+            .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
         }
         other => {
             return Err(anyhow!(
-                "apply_linear_projection_f32: unsupported weight dtype {:?}", other
+                "apply_linear_projection_f32: unsupported weight dtype {:?}",
+                other
             ));
         }
     }
@@ -1061,13 +1133,20 @@ pub fn apply_linear_projection_f32_qweight(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    debug_assert_eq!(input.dtype(), DType::F32,
+    debug_assert_eq!(
+        input.dtype(),
+        DType::F32,
         "apply_linear_projection_f32_qweight: input must be F32; got {}",
-        input.dtype());
+        input.dtype()
+    );
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
-        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![seq_len as usize, out_features as usize],
+        )
         .map_err(|e| anyhow!("alloc projection output: {e}"))?;
 
     match qweight.buffer.dtype() {
@@ -1081,11 +1160,21 @@ pub fn apply_linear_projection_f32_qweight(
                 k: in_features,
                 ggml_type: qweight.info.ggml_dtype,
             };
-            quantized_matmul_ggml(encoder, registry, device, input, &qweight.buffer, &mut dst, &params)
-                .with_context(|| format!(
+            quantized_matmul_ggml(
+                encoder,
+                registry,
+                device,
+                input,
+                &qweight.buffer,
+                &mut dst,
+                &params,
+            )
+            .with_context(|| {
+                format!(
                     "quantized_matmul_ggml ggml_type={:?}",
                     qweight.info.ggml_dtype
-                ))?;
+                )
+            })?;
         }
         DType::BF16 => {
             let params = DenseMmBf16F32Params {
@@ -1096,20 +1185,48 @@ pub fn apply_linear_projection_f32_qweight(
                 src1_batch: 1,
             };
             if seq_len == 1 {
-                dense_gemv_bf16_f32(encoder, registry, device, &qweight.buffer, input, &mut dst, &params)
-                    .context("dense_gemv_bf16_f32 (M=1)")?;
+                dense_gemv_bf16_f32(
+                    encoder,
+                    registry,
+                    device,
+                    &qweight.buffer,
+                    input,
+                    &mut dst,
+                    &params,
+                )
+                .context("dense_gemv_bf16_f32 (M=1)")?;
             } else {
-                dense_matmul_bf16_f32_tensor(encoder, registry, device, &qweight.buffer, input, &mut dst, &params)
-                    .context("dense_matmul_bf16_f32_tensor")?;
+                dense_matmul_bf16_f32_tensor(
+                    encoder,
+                    registry,
+                    device,
+                    &qweight.buffer,
+                    input,
+                    &mut dst,
+                    &params,
+                )
+                .context("dense_matmul_bf16_f32_tensor")?;
             }
         }
         DType::F32 => {
             let n_w = (out_features * in_features) as usize;
             let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                    device, n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
-                .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-            cast(encoder, registry, device.metal_device(), &qweight.buffer, &weight_bf16, n_w, CastDirection::F32ToBF16)
-                .context("cast weight F32→BF16")?;
+                device,
+                n_w * 2,
+                DType::BF16,
+                vec![out_features as usize, in_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
+            cast(
+                encoder,
+                registry,
+                device.metal_device(),
+                &qweight.buffer,
+                &weight_bf16,
+                n_w,
+                CastDirection::F32ToBF16,
+            )
+            .context("cast weight F32→BF16")?;
             encoder.memory_barrier();
             let params = DenseMmBf16F32Params {
                 m: seq_len,
@@ -1118,12 +1235,21 @@ pub fn apply_linear_projection_f32_qweight(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, &mut dst, &params)
-                .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
+            dense_matmul_bf16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                &weight_bf16,
+                input,
+                &mut dst,
+                &params,
+            )
+            .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
         }
         other => {
             return Err(anyhow!(
-                "apply_linear_projection_f32_qweight: unsupported weight dtype {:?}", other
+                "apply_linear_projection_f32_qweight: unsupported weight dtype {:?}",
+                other
             ));
         }
     }
@@ -1151,10 +1277,18 @@ pub fn apply_linear_projection_f32_into(
     // ADR-030 iter-115 — defense-in-depth dtype check (mirrors
     // apply_linear_projection_f32 in iter-114).  Caller-supplied dst must
     // also be F32 since every kernel path below writes F32.
-    debug_assert_eq!(input.dtype(), DType::F32,
-        "apply_linear_projection_f32_into: input must be F32; got {}", input.dtype());
-    debug_assert_eq!(dst.dtype(), DType::F32,
-        "apply_linear_projection_f32_into: dst must be F32; got {}", dst.dtype());
+    debug_assert_eq!(
+        input.dtype(),
+        DType::F32,
+        "apply_linear_projection_f32_into: input must be F32; got {}",
+        input.dtype()
+    );
+    debug_assert_eq!(
+        dst.dtype(),
+        DType::F32,
+        "apply_linear_projection_f32_into: dst must be F32; got {}",
+        dst.dtype()
+    );
 
     match weight.dtype() {
         DType::U8 => {
@@ -1179,8 +1313,10 @@ pub fn apply_linear_projection_f32_into(
                 dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
                     .context("dense_gemv_bf16_f32 (M=1, into)")?;
             } else {
-                dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, dst, &params)
-                    .context("dense_matmul_bf16_f32_tensor (into)")?;
+                dense_matmul_bf16_f32_tensor(
+                    encoder, registry, device, weight, input, dst, &params,
+                )
+                .context("dense_matmul_bf16_f32_tensor (into)")?;
             }
         }
         DType::F32 => {
@@ -1188,10 +1324,22 @@ pub fn apply_linear_projection_f32_into(
             // F32 legacy arm above.
             let n_w = (out_features * in_features) as usize;
             let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                    device, n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
-                .map_err(|e| anyhow!("alloc weight_bf16 (pooled, into): {e}"))?;
-            cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
-                .context("cast weight F32→BF16 (into)")?;
+                device,
+                n_w * 2,
+                DType::BF16,
+                vec![out_features as usize, in_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc weight_bf16 (pooled, into): {e}"))?;
+            cast(
+                encoder,
+                registry,
+                device.metal_device(),
+                weight,
+                &weight_bf16,
+                n_w,
+                CastDirection::F32ToBF16,
+            )
+            .context("cast weight F32→BF16 (into)")?;
             encoder.memory_barrier();
             let params = DenseMmBf16F32Params {
                 m: seq_len,
@@ -1200,12 +1348,21 @@ pub fn apply_linear_projection_f32_into(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, dst, &params)
-                .context("dense_matmul_bf16_f32_tensor F32 legacy (into)")?;
+            dense_matmul_bf16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                &weight_bf16,
+                input,
+                dst,
+                &params,
+            )
+            .context("dense_matmul_bf16_f32_tensor F32 legacy (into)")?;
         }
         other => {
             return Err(anyhow!(
-                "apply_linear_projection_f32_into: unsupported weight dtype {:?}", other
+                "apply_linear_projection_f32_into: unsupported weight dtype {:?}",
+                other
             ));
         }
     }
@@ -1250,17 +1407,34 @@ pub fn apply_linear_projection_f32_pooled(
         // Prefill — fall back to unpooled to keep `download_f32` callers
         // (e.g. K/V in `apply_sdpa_with_kv_cache` prefill branch) safe.
         return apply_linear_projection_f32(
-            encoder, registry, device, input, weight,
-            seq_len, in_features, out_features,
+            encoder,
+            registry,
+            device,
+            input,
+            weight,
+            seq_len,
+            in_features,
+            out_features,
         );
     }
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = super::decode_pool::pooled_alloc_buffer(
-            device, out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
-        .map_err(|e| anyhow!("alloc projection output (pooled): {e}"))?;
+        device,
+        out_bytes,
+        DType::F32,
+        vec![seq_len as usize, out_features as usize],
+    )
+    .map_err(|e| anyhow!("alloc projection output (pooled): {e}"))?;
     apply_linear_projection_f32_into(
-        encoder, registry, device, input, weight, &mut dst,
-        seq_len, in_features, out_features,
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        &mut dst,
+        seq_len,
+        in_features,
+        out_features,
     )?;
     Ok(dst)
 }
@@ -1378,16 +1552,8 @@ pub fn apply_imrope_into(
         mode: RopeMultiMode::Imrope,
         sections: mrope_section,
     };
-    dispatch_rope_multi_cached(
-        encoder,
-        registry,
-        device,
-        input,
-        out,
-        positions,
-        params,
-    )
-    .context("dispatch_rope_multi_cached (arena into)")?;
+    dispatch_rope_multi_cached(encoder, registry, device, input, out, positions, params)
+        .context("dispatch_rope_multi_cached (arena into)")?;
     Ok(())
 }
 
@@ -1469,12 +1635,12 @@ pub fn apply_sdpa_causal(
     head_dim: u32,
 ) -> Result<MlxBuffer> {
     let out = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (n_heads * seq_len * head_dim) as usize * 4,
-            DType::F32,
-            vec![1, n_heads as usize, seq_len as usize, head_dim as usize],
-        )
-        .map_err(|e| anyhow!("alloc sdpa output: {e}"))?;
+        device,
+        (n_heads * seq_len * head_dim) as usize * 4,
+        DType::F32,
+        vec![1, n_heads as usize, seq_len as usize, head_dim as usize],
+    )
+    .map_err(|e| anyhow!("alloc sdpa output: {e}"))?;
 
     let params = SdpaParams {
         n_heads,
@@ -1487,8 +1653,18 @@ pub fn apply_sdpa_causal(
         do_causal: true,
     };
 
-    sdpa(encoder, registry, device, q_head_major, k_head_major, v_head_major, &out, &params, 1)
-        .context("sdpa")?;
+    sdpa(
+        encoder,
+        registry,
+        device,
+        q_head_major,
+        k_head_major,
+        v_head_major,
+        &out,
+        &params,
+        1,
+    )
+    .context("sdpa")?;
 
     Ok(out)
 }
@@ -1523,7 +1699,9 @@ pub fn apply_sdpa_causal_from_seq_major(
 
     // Commit any pending dispatches (norm, rope) so their outputs are
     // ready for CPU download.
-    encoder.commit_and_wait().context("commit before sdpa permute")?;
+    encoder
+        .commit_and_wait()
+        .context("commit before sdpa permute")?;
 
     // Download Q, K, V — currently [seq, heads, dim] (seq-major).
     let q_cpu = download_f32(q_seq_major)?;
@@ -1542,8 +1720,7 @@ pub fn apply_sdpa_causal_from_seq_major(
     // Fresh encoder for SDPA dispatch.
     let mut enc2 = device.command_encoder().context("new encoder for sdpa")?;
     let out_hm = apply_sdpa_causal(
-        &mut enc2, registry, device, &q_gpu, &k_gpu, &v_gpu,
-        seq_len, n_heads, n_kv_heads, head_dim,
+        &mut enc2, registry, device, &q_gpu, &k_gpu, &v_gpu, seq_len, n_heads, n_kv_heads, head_dim,
     )?;
     enc2.commit_and_wait().context("sdpa commit")?;
 
@@ -1739,44 +1916,81 @@ pub fn apply_flash_attn_prefill_seq_major_into(
     let k_elems = seq * nkv * d;
     let v_elems = seq * nkv * d;
 
-    arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)
+    arena
+        .validate_fits(seq_len, n_heads, n_kv_heads, head_dim)
         .context("FA bridge: arena validate_fits")?;
 
     // Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major.
     cast(
-        enc, registry, device.metal_device(),
-        q_seq_major, &arena.q_bf16_seq, q_elems, CastDirection::F32ToBF16,
-    ).context("FA bridge: cast Q F32→BF16")?;
+        enc,
+        registry,
+        device.metal_device(),
+        q_seq_major,
+        &arena.q_bf16_seq,
+        q_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("FA bridge: cast Q F32→BF16")?;
     enc.memory_barrier();
     permute_021_bf16(
-        enc, registry, device.metal_device(),
-        &arena.q_bf16_seq, &arena.q_bf16_hm,
-        seq, nh, d,
-    ).context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &arena.q_bf16_seq,
+        &arena.q_bf16_hm,
+        seq,
+        nh,
+        d,
+    )
+    .context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
 
     // Step 3+4: K F32 seq-major → BF16 seq-major → BF16 head-major.
     cast(
-        enc, registry, device.metal_device(),
-        k_seq_major, &arena.k_bf16_seq, k_elems, CastDirection::F32ToBF16,
-    ).context("FA bridge: cast K F32→BF16")?;
+        enc,
+        registry,
+        device.metal_device(),
+        k_seq_major,
+        &arena.k_bf16_seq,
+        k_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("FA bridge: cast K F32→BF16")?;
     enc.memory_barrier();
     permute_021_bf16(
-        enc, registry, device.metal_device(),
-        &arena.k_bf16_seq, &arena.k_bf16_hm,
-        seq, nkv, d,
-    ).context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &arena.k_bf16_seq,
+        &arena.k_bf16_hm,
+        seq,
+        nkv,
+        d,
+    )
+    .context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
 
     // Step 5+6: V F32 seq-major → BF16 seq-major → BF16 head-major.
     cast(
-        enc, registry, device.metal_device(),
-        v_seq_major, &arena.v_bf16_seq, v_elems, CastDirection::F32ToBF16,
-    ).context("FA bridge: cast V F32→BF16")?;
+        enc,
+        registry,
+        device.metal_device(),
+        v_seq_major,
+        &arena.v_bf16_seq,
+        v_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("FA bridge: cast V F32→BF16")?;
     enc.memory_barrier();
     permute_021_bf16(
-        enc, registry, device.metal_device(),
-        &arena.v_bf16_seq, &arena.v_bf16_hm,
-        seq, nkv, d,
-    ).context("FA bridge: permute_021 V [seq, nkv, d] → [nkv, seq, d]")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &arena.v_bf16_seq,
+        &arena.v_bf16_hm,
+        seq,
+        nkv,
+        d,
+    )
+    .context("FA bridge: permute_021 V [seq, nkv, d] → [nkv, seq, d]")?;
 
     // Barrier: flash_attn_prefill reads Q/K/V head-major written above.
     enc.memory_barrier();
@@ -1791,8 +2005,12 @@ pub fn apply_flash_attn_prefill_seq_major_into(
     //     blk-less wrapper that delegates to *_with_blk(blk=None)).
     let scale = 1.0 / (d as f32).sqrt();
     dispatch_flash_attn_prefill_bf16_d256(
-        enc, device, registry,
-        &arena.q_bf16_hm, &arena.k_bf16_hm, &arena.v_bf16_hm,
+        enc,
+        device,
+        registry,
+        &arena.q_bf16_hm,
+        &arena.k_bf16_hm,
+        &arena.v_bf16_hm,
         /* mask = */ None,
         &mut arena.out_bf16_hm,
         &FlashAttnPrefillParams {
@@ -1805,7 +2023,8 @@ pub fn apply_flash_attn_prefill_seq_major_into(
             scale,
             do_causal: true,
         },
-    ).context("FA bridge: dispatch_flash_attn_prefill_bf16_d256")?;
+    )
+    .context("FA bridge: dispatch_flash_attn_prefill_bf16_d256")?;
 
     // Barrier: permute_021_bf16_to_f32 reads out_bf16_hm written above.
     enc.memory_barrier();
@@ -1815,10 +2034,16 @@ pub fn apply_flash_attn_prefill_seq_major_into(
     //   the kernel writes [seq, nh, d] (i.e. dim_a/dim_b swapped in the
     //   layout, matching the [A, B, C] → [B, A, C] contract).
     permute_021_bf16_to_f32(
-        enc, registry, device.metal_device(),
-        &arena.out_bf16_hm, out_seq,
-        nh, seq, d,
-    ).context("FA bridge: permute_021_bf16_to_f32 out [nh, seq, d] → [seq, nh, d] F32")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &arena.out_bf16_hm,
+        out_seq,
+        nh,
+        seq,
+        d,
+    )
+    .context("FA bridge: permute_021_bf16_to_f32 out [nh, seq, d] → [seq, nh, d] F32")?;
 
     // No commit — caller owns the encoder lifecycle. See the wrapper
     // [`apply_flash_attn_prefill_seq_major`] for the "open + delegate +
@@ -1940,9 +2165,8 @@ pub fn dispatch_qwen35_tree_verify_attention(
     }
 
     let mul = |a: usize, b: usize, ctx: &str| -> Result<usize> {
-        a.checked_mul(b).ok_or_else(|| {
-            anyhow!("dispatch_qwen35_tree_verify_attention: {ctx} overflows usize")
-        })
+        a.checked_mul(b)
+            .ok_or_else(|| anyhow!("dispatch_qwen35_tree_verify_attention: {ctx} overflows usize"))
     };
 
     let q = params.q_seq_len as usize;
@@ -2122,9 +2346,7 @@ impl Qwen35TreeVerifyLayerShape {
         let kv_end = (self.cache_prefix_len as u64)
             .checked_add(self.tree_seq_len as u64)
             .ok_or_else(|| {
-                anyhow!(
-                    "Qwen35TreeVerifyLayerShape: cache_prefix_len + tree_seq_len overflows u64"
-                )
+                anyhow!("Qwen35TreeVerifyLayerShape: cache_prefix_len + tree_seq_len overflows u64")
             })?;
         ensure!(
             kv_end <= self.kv_capacity as u64,
@@ -2209,7 +2431,8 @@ pub fn qwen35_tree_verify_attention_block(
     shape.validate()?;
 
     let checked_mul = |a: usize, b: usize, ctx: &str| -> Result<usize> {
-        a.checked_mul(b).ok_or_else(|| anyhow!("qwen35_tree_verify_attention_block: {ctx} overflows usize"))
+        a.checked_mul(b)
+            .ok_or_else(|| anyhow!("qwen35_tree_verify_attention_block: {ctx} overflows usize"))
     };
 
     let seq = shape.tree_seq_len as usize;
@@ -2250,7 +2473,11 @@ pub fn qwen35_tree_verify_attention_block(
             tree_mask.dtype()
         ));
     }
-    let mask_elems = checked_mul(seq, shape.mask_stride as usize, "tree_seq_len * mask_stride")?;
+    let mask_elems = checked_mul(
+        seq,
+        shape.mask_stride as usize,
+        "tree_seq_len * mask_stride",
+    )?;
     if tree_mask.element_count() < mask_elems {
         return Err(anyhow!(
             "qwen35_tree_verify_attention_block: tree_mask has {} elements, \
@@ -2351,35 +2578,60 @@ pub fn qwen35_tree_verify_attention_block(
     // ── STEP 1: Pre-attention RMSNorm ────────────────────────────────────
     let mut enc = enc;
     let hidden_normed = apply_pre_attn_rms_norm(
-        &mut enc, registry, device,
-        hidden_states_in, weights,
-        shape.tree_seq_len, shape.hidden_size, shape.rms_norm_eps,
+        &mut enc,
+        registry,
+        device,
+        hidden_states_in,
+        weights,
+        shape.tree_seq_len,
+        shape.hidden_size,
+        shape.rms_norm_eps,
     )
     .context("step 1: apply_pre_attn_rms_norm")?;
 
     // ── STEP 2: Q/K/V/G projections ─────────────────────────────────────
     let q_flat = apply_linear_projection_f32(
-        &mut enc, registry, device,
-        &hidden_normed, &weights.wq,
-        shape.tree_seq_len, shape.hidden_size, shape.num_q_heads * shape.head_dim,
+        &mut enc,
+        registry,
+        device,
+        &hidden_normed,
+        &weights.wq,
+        shape.tree_seq_len,
+        shape.hidden_size,
+        shape.num_q_heads * shape.head_dim,
     )
     .context("step 2: Q projection")?;
     let k_flat = apply_linear_projection_f32(
-        &mut enc, registry, device,
-        &hidden_normed, &weights.wk,
-        shape.tree_seq_len, shape.hidden_size, shape.num_kv_heads * shape.head_dim,
+        &mut enc,
+        registry,
+        device,
+        &hidden_normed,
+        &weights.wk,
+        shape.tree_seq_len,
+        shape.hidden_size,
+        shape.num_kv_heads * shape.head_dim,
     )
     .context("step 2: K projection")?;
     let v_flat = apply_linear_projection_f32(
-        &mut enc, registry, device,
-        &hidden_normed, &weights.wv,
-        shape.tree_seq_len, shape.hidden_size, shape.num_kv_heads * shape.head_dim,
+        &mut enc,
+        registry,
+        device,
+        &hidden_normed,
+        &weights.wv,
+        shape.tree_seq_len,
+        shape.hidden_size,
+        shape.num_kv_heads * shape.head_dim,
     )
     .context("step 2: V projection")?;
     let gate_flat = apply_linear_projection_f32(
-        &mut enc, registry, device,
-        &hidden_normed, &weights.w_gate,
-        shape.tree_seq_len, shape.hidden_size, shape.num_q_heads * shape.head_dim,
+        &mut enc,
+        registry,
+        device,
+        &hidden_normed,
+        &weights.w_gate,
+        shape.tree_seq_len,
+        shape.hidden_size,
+        shape.num_q_heads * shape.head_dim,
     )
     .context("step 2: gate projection")?;
 
@@ -2389,15 +2641,27 @@ pub fn qwen35_tree_verify_attention_block(
 
     // ── STEP 3: Per-head RMSNorm on Q and K ─────────────────────────────
     let q_normed = apply_q_or_k_per_head_rms_norm(
-        &mut enc, registry, device,
-        &q_flat, &weights.attn_q_norm,
-        shape.tree_seq_len, shape.num_q_heads, shape.head_dim, shape.rms_norm_eps,
+        &mut enc,
+        registry,
+        device,
+        &q_flat,
+        &weights.attn_q_norm,
+        shape.tree_seq_len,
+        shape.num_q_heads,
+        shape.head_dim,
+        shape.rms_norm_eps,
     )
     .context("step 3: Q per-head RMSNorm")?;
     let k_normed = apply_q_or_k_per_head_rms_norm(
-        &mut enc, registry, device,
-        &k_flat, &weights.attn_k_norm,
-        shape.tree_seq_len, shape.num_kv_heads, shape.head_dim, shape.rms_norm_eps,
+        &mut enc,
+        registry,
+        device,
+        &k_flat,
+        &weights.attn_k_norm,
+        shape.tree_seq_len,
+        shape.num_kv_heads,
+        shape.head_dim,
+        shape.rms_norm_eps,
     )
     .context("step 3: K per-head RMSNorm")?;
 
@@ -2408,17 +2672,31 @@ pub fn qwen35_tree_verify_attention_block(
     // ── STEP 4: IMROPE on Q and K ───────────────────────────────────────
     // V is NOT rotary-encoded — only Q and K get IMROPE.
     let q_roped = apply_imrope(
-        &mut enc, registry, device,
-        &q_normed, tree_positions,
-        shape.tree_seq_len, shape.num_q_heads, shape.head_dim,
-        shape.rotary_dim, shape.freq_base, shape.mrope_section,
+        &mut enc,
+        registry,
+        device,
+        &q_normed,
+        tree_positions,
+        shape.tree_seq_len,
+        shape.num_q_heads,
+        shape.head_dim,
+        shape.rotary_dim,
+        shape.freq_base,
+        shape.mrope_section,
     )
     .context("step 4: Q IMROPE")?;
     let k_roped = apply_imrope(
-        &mut enc, registry, device,
-        &k_normed, tree_positions,
-        shape.tree_seq_len, shape.num_kv_heads, shape.head_dim,
-        shape.rotary_dim, shape.freq_base, shape.mrope_section,
+        &mut enc,
+        registry,
+        device,
+        &k_normed,
+        tree_positions,
+        shape.tree_seq_len,
+        shape.num_kv_heads,
+        shape.head_dim,
+        shape.rotary_dim,
+        shape.freq_base,
+        shape.mrope_section,
     )
     .context("step 4: K IMROPE")?;
 
@@ -2451,21 +2729,36 @@ pub fn qwen35_tree_verify_attention_block(
         .map_err(|e| anyhow!("alloc v_scratch: {e}"))?;
 
     permute_021_f32(
-        &mut enc, registry, device.metal_device(),
-        &q_roped, &q_head_outer,
-        seq, nq, d,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &q_roped,
+        &q_head_outer,
+        seq,
+        nq,
+        d,
     )
     .context("step 5: Q permute seq→head-outer")?;
     permute_021_f32(
-        &mut enc, registry, device.metal_device(),
-        &k_roped, &k_scratch,
-        seq, nkv, d,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &k_roped,
+        &k_scratch,
+        seq,
+        nkv,
+        d,
     )
     .context("step 5: K permute seq→head-outer")?;
     permute_021_f32(
-        &mut enc, registry, device.metal_device(),
-        &v_flat, &v_scratch,
-        seq, nkv, d,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &v_flat,
+        &v_scratch,
+        seq,
+        nkv,
+        d,
     )
     .context("step 5: V permute seq→head-outer")?;
 
@@ -2479,20 +2772,25 @@ pub fn qwen35_tree_verify_attention_block(
     // host-visible MlxBuffer slices. Those slices are only coherent after
     // the Metal command buffer has been committed and waited. We re-open a
     // new encoder for steps 8-11.
-    enc.commit_and_wait().context("step 6: commit encoder before KV cache write")?;
+    enc.commit_and_wait()
+        .context("step 6: commit encoder before KV cache write")?;
 
     // ── STEP 7: KV cache append (CPU-side memcpy) ────────────────────────
     // Cache layout: [num_kv_heads, kv_capacity, head_dim] F32 row-major.
     // Slot written: [prefix_len, prefix_len + tree_seq_len) along the position axis.
     // This is Apple unified memory; the copy is zero-transfer.
     {
-        let k_src = k_scratch.as_slice::<f32>()
+        let k_src = k_scratch
+            .as_slice::<f32>()
             .map_err(|e| anyhow!("step 7: k_scratch as_slice: {e}"))?;
-        let v_src = v_scratch.as_slice::<f32>()
+        let v_src = v_scratch
+            .as_slice::<f32>()
             .map_err(|e| anyhow!("step 7: v_scratch as_slice: {e}"))?;
-        let k_dst = k_cache.as_mut_slice::<f32>()
+        let k_dst = k_cache
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow!("step 7: k_cache as_mut_slice: {e}"))?;
-        let v_dst = v_cache.as_mut_slice::<f32>()
+        let v_dst = v_cache
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow!("step 7: v_cache as_mut_slice: {e}"))?;
 
         // Copy per-head block: k_scratch[h, pos, :] → k_cache[h, prefix+pos, :]
@@ -2527,8 +2825,13 @@ pub fn qwen35_tree_verify_attention_block(
 
     // The dispatcher inserts its own internal barrier before the tree_attention kernel.
     let attn_out = dispatch_qwen35_tree_verify_attention(
-        &mut enc2, device, registry,
-        &q_head_outer, k_cache, v_cache, tree_mask,
+        &mut enc2,
+        device,
+        registry,
+        &q_head_outer,
+        k_cache,
+        v_cache,
+        tree_mask,
         Qwen35TreeVerifyParams {
             num_q_heads: shape.num_q_heads,
             num_kv_heads: shape.num_kv_heads,
@@ -2554,8 +2857,11 @@ pub fn qwen35_tree_verify_attention_block(
     // Both have shape [tree_seq_len, num_q_heads * head_dim] (trailing dims contiguous).
     let n_gate_elems = checked_mul(seq, q_total, "tree_seq_len * q_total")?;
     let gated = apply_sigmoid_gate_multiply(
-        &mut enc2, registry, device,
-        &attn_out, &gate_flat,
+        &mut enc2,
+        registry,
+        device,
+        &attn_out,
+        &gate_flat,
         n_gate_elems as u32,
     )
     .context("step 9: apply_sigmoid_gate_multiply")?;
@@ -2570,9 +2876,14 @@ pub fn qwen35_tree_verify_attention_block(
     // (query-outer, head-inner), which is row-major-equivalent to
     // [q_seq, num_q_heads * head_dim] since trailing dims are contiguous.
     let o_out = apply_linear_projection_f32(
-        &mut enc2, registry, device,
-        &gated, &weights.wo,
-        shape.tree_seq_len, q_total as u32, shape.hidden_size,
+        &mut enc2,
+        registry,
+        device,
+        &gated,
+        &weights.wo,
+        shape.tree_seq_len,
+        q_total as u32,
+        shape.hidden_size,
     )
     .context("step 10: O projection")?;
 
@@ -2587,9 +2898,14 @@ pub fn qwen35_tree_verify_attention_block(
         .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
         .map_err(|e| anyhow!("step 11: alloc hidden_states_out: {e}"))?;
     elementwise_add(
-        &mut enc2, registry, device.metal_device(),
-        hidden_states_in, &o_out, &hidden_states_out,
-        hs_elems, DType::F32,
+        &mut enc2,
+        registry,
+        device.metal_device(),
+        hidden_states_in,
+        &o_out,
+        &hidden_states_out,
+        hs_elems,
+        DType::F32,
     )
     .context("step 11: elementwise_add residual")?;
 
@@ -2630,16 +2946,14 @@ impl Qwen35TreeVerifyFullLayerShape {
         }
         // Overflow guard: seq * intermediate scratch allocation must not overflow usize.
         // seq <= kv_capacity (validated by attn.validate); use intermediate_size alone.
-        let _overflow_check = (m as u64)
-            .checked_mul(h as u64)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Qwen35TreeVerifyFullLayerShape: intermediate_size ({}) * hidden_size ({}) \
+        let _overflow_check = (m as u64).checked_mul(h as u64).ok_or_else(|| {
+            anyhow!(
+                "Qwen35TreeVerifyFullLayerShape: intermediate_size ({}) * hidden_size ({}) \
                      overflows u64 — too large for activated scratch allocation",
-                    m,
-                    h
-                )
-            })?;
+                m,
+                h
+            )
+        })?;
         // Guard against usize overflow (relevant on 32-bit targets).
         m.checked_mul(h).ok_or_else(|| {
             anyhow!(
@@ -2721,31 +3035,40 @@ pub fn qwen35_tree_verify_full_layer(
 
     // Weight by-shape boundary checks — exact-equality (not `<`) per codex
     // follow-up tightening discipline from the per-layer CFA.
-    let gate_expected = m
-        .checked_mul(h)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer: intermediate_size * hidden_size overflows usize"))?;
+    let gate_expected = m.checked_mul(h).ok_or_else(|| {
+        anyhow!("qwen35_tree_verify_full_layer: intermediate_size * hidden_size overflows usize")
+    })?;
     if ffn_weights.gate.element_count() != gate_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer: ffn_weights.gate has {} elements, \
              expected exactly {} (intermediate_size={} * hidden_size={})",
-            ffn_weights.gate.element_count(), gate_expected, m, h
+            ffn_weights.gate.element_count(),
+            gate_expected,
+            m,
+            h
         ));
     }
     if ffn_weights.up.element_count() != gate_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer: ffn_weights.up has {} elements, \
              expected exactly {} (intermediate_size={} * hidden_size={})",
-            ffn_weights.up.element_count(), gate_expected, m, h
+            ffn_weights.up.element_count(),
+            gate_expected,
+            m,
+            h
         ));
     }
-    let down_expected = h
-        .checked_mul(m)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer: hidden_size * intermediate_size overflows usize"))?;
+    let down_expected = h.checked_mul(m).ok_or_else(|| {
+        anyhow!("qwen35_tree_verify_full_layer: hidden_size * intermediate_size overflows usize")
+    })?;
     if ffn_weights.down.element_count() != down_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer: ffn_weights.down has {} elements, \
              expected exactly {} (hidden_size={} * intermediate_size={})",
-            ffn_weights.down.element_count(), down_expected, h, m
+            ffn_weights.down.element_count(),
+            down_expected,
+            h,
+            m
         ));
     }
 
@@ -2753,10 +3076,16 @@ pub fn qwen35_tree_verify_full_layer(
     // Returns attn_out = hidden_states_in + attn_residual [tree_seq_len, hidden_size] F32.
     // Terminal commit is done inside the block; all GPU work is host-coherent on return.
     let attn_out = qwen35_tree_verify_attention_block(
-        enc, device, registry,
-        hidden_states_in, tree_mask, tree_positions,
-        k_cache, v_cache,
-        weights, shape.attn,
+        enc,
+        device,
+        registry,
+        hidden_states_in,
+        tree_mask,
+        tree_positions,
+        k_cache,
+        v_cache,
+        weights,
+        shape.attn,
     )
     .context("qwen35_tree_verify_full_layer: attention block")?;
 
@@ -2768,7 +3097,8 @@ pub fn qwen35_tree_verify_full_layer(
     // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
     // attn_out is host-coherent (prior encoder commit_and_wait'd); enc2
     // reads it from device memory — no upload needed under Apple unified memory.
-    let mut enc2 = device.command_encoder()
+    let mut enc2 = device
+        .command_encoder()
         .context("qwen35_tree_verify_full_layer: alloc enc2")?;
 
     // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
@@ -2776,20 +3106,22 @@ pub fn qwen35_tree_verify_full_layer(
     // inline-dispatch rms_norm::dispatch_rms_norm with weights.post_attn_norm
     // mirroring the 20-LOC pattern of apply_pre_attn_rms_norm.
     let rms_out_bytes = seq * h * std::mem::size_of::<f32>();
-    let post_attn_normed = super::decode_pool::pooled_alloc_buffer(
-        device, rms_out_bytes, DType::F32, vec![seq, h],
-    )
-    .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc post_attn_normed: {e}"))?;
+    let post_attn_normed =
+        super::decode_pool::pooled_alloc_buffer(device, rms_out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc post_attn_normed: {e}"))?;
     let mut rms_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc rms_params: {e}"))?;
     {
-        let s = rms_params.as_mut_slice::<f32>()
+        let s = rms_params
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: rms_params slice: {e}"))?;
         s[0] = shape.attn.rms_norm_eps;
         s[1] = h as f32;
     }
     rms_norm::dispatch_rms_norm(
-        &mut enc2, registry, device.metal_device(),
+        &mut enc2,
+        registry,
+        device.metal_device(),
         &attn_out,
         &weights.post_attn_norm,
         &post_attn_normed,
@@ -2805,7 +3137,9 @@ pub fn qwen35_tree_verify_full_layer(
 
     // ── STEP F+G: gate_proj and up_proj — concurrent (both read post_attn_normed) ──
     let gate_buf = apply_linear_projection_f32(
-        &mut enc2, registry, device,
+        &mut enc2,
+        registry,
+        device,
         &post_attn_normed,
         &ffn_weights.gate,
         shape.attn.tree_seq_len,
@@ -2815,7 +3149,9 @@ pub fn qwen35_tree_verify_full_layer(
     .context("qwen35_tree_verify_full_layer: gate_proj")?;
 
     let up_buf = apply_linear_projection_f32(
-        &mut enc2, registry, device,
+        &mut enc2,
+        registry,
+        device,
         &post_attn_normed,
         &ffn_weights.up,
         shape.attn.tree_seq_len,
@@ -2829,13 +3165,15 @@ pub fn qwen35_tree_verify_full_layer(
     enc2.memory_barrier();
 
     // ── STEP I: silu_mul — silu(gate_buf) * up_buf → activated_buf ──────
-    let n_silu_elems = seq
-        .checked_mul(m)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer: seq * intermediate overflows usize"))?;
+    let n_silu_elems = seq.checked_mul(m).ok_or_else(|| {
+        anyhow!("qwen35_tree_verify_full_layer: seq * intermediate overflows usize")
+    })?;
     if n_silu_elems > (u32::MAX as usize) {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer: seq ({}) * intermediate ({}) = {} exceeds u32::MAX",
-            seq, m, n_silu_elems
+            seq,
+            m,
+            n_silu_elems
         ));
     }
     let n_silu: u32 = n_silu_elems as u32;
@@ -2845,14 +3183,21 @@ pub fn qwen35_tree_verify_full_layer(
     let activated_buf = device
         .alloc_buffer(activated_bytes, DType::F32, vec![seq, m])
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc activated_buf: {e}"))?;
-    let mut silu_params = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc silu_params: {e}"))?;
-    silu_params.as_mut_slice::<u32>()
+    let mut silu_params =
+        super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc silu_params: {e}"))?;
+    silu_params
+        .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: silu_params slice: {e}"))?[0] = n_silu;
     dispatch_silu_mul(
-        &mut enc2, registry, device.metal_device(),
-        &gate_buf, &up_buf, &activated_buf,
-        &silu_params, n_silu,
+        &mut enc2,
+        registry,
+        device.metal_device(),
+        &gate_buf,
+        &up_buf,
+        &activated_buf,
+        &silu_params,
+        n_silu,
     )
     .context("qwen35_tree_verify_full_layer: dispatch_silu_mul")?;
 
@@ -2861,7 +3206,9 @@ pub fn qwen35_tree_verify_full_layer(
 
     // ── STEP K: down_proj — activated_buf → ffn_out [tree_seq_len, hidden_size] ──
     let ffn_out = apply_linear_projection_f32(
-        &mut enc2, registry, device,
+        &mut enc2,
+        registry,
+        device,
         &activated_buf,
         &ffn_weights.down,
         shape.attn.tree_seq_len,
@@ -2881,9 +3228,14 @@ pub fn qwen35_tree_verify_full_layer(
         .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer: alloc hidden_states_out: {e}"))?;
     elementwise_add(
-        &mut enc2, registry, device.metal_device(),
-        &ffn_residual, &ffn_out, &hidden_states_out,
-        hs_elems, DType::F32,
+        &mut enc2,
+        registry,
+        device.metal_device(),
+        &ffn_residual,
+        &ffn_out,
+        &hidden_states_out,
+        hs_elems,
+        DType::F32,
     )
     .context("qwen35_tree_verify_full_layer: residual add")?;
 
@@ -2925,20 +3277,20 @@ impl Qwen35TreeVerifyFullLayerShapeQ {
                 "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size must be > 0"
             ));
         }
-        let _overflow_check = (m as u64)
-            .checked_mul(h as u64)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size ({}) * hidden_size ({}) \
+        let _overflow_check = (m as u64).checked_mul(h as u64).ok_or_else(|| {
+            anyhow!(
+                "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size ({}) * hidden_size ({}) \
                      overflows u64 — too large for activated scratch allocation",
-                    m, h
-                )
-            })?;
+                m,
+                h
+            )
+        })?;
         m.checked_mul(h).ok_or_else(|| {
             anyhow!(
                 "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size ({}) * hidden_size ({}) \
                  overflows usize",
-                m, h
+                m,
+                h
             )
         })?;
         Ok(())
@@ -2993,7 +3345,8 @@ impl Qwen35TreeVerifyFullLayerShapeQMoe {
             return Err(anyhow!(
                 "Qwen35TreeVerifyFullLayerShapeQMoe: num_experts_per_tok ({}) > num_experts ({}) \
                  — top-K cannot exceed total experts",
-                topk, ne
+                topk,
+                ne
             ));
         }
         if m_moe == 0 {
@@ -3010,18 +3363,26 @@ impl Qwen35TreeVerifyFullLayerShapeQMoe {
         (ne as u64)
             .checked_mul(m_moe as u64)
             .and_then(|v| v.checked_mul(h as u64))
-            .ok_or_else(|| anyhow!(
-                "Qwen35TreeVerifyFullLayerShapeQMoe: num_experts ({}) * moe_intermediate ({}) \
+            .ok_or_else(|| {
+                anyhow!(
+                    "Qwen35TreeVerifyFullLayerShapeQMoe: num_experts ({}) * moe_intermediate ({}) \
                  * hidden_size ({}) overflows u64",
-                ne, m_moe, h
-            ))?;
+                    ne,
+                    m_moe,
+                    h
+                )
+            })?;
         ne.checked_mul(m_moe)
             .and_then(|v| v.checked_mul(h))
-            .ok_or_else(|| anyhow!(
-                "Qwen35TreeVerifyFullLayerShapeQMoe: num_experts ({}) * moe_intermediate ({}) \
+            .ok_or_else(|| {
+                anyhow!(
+                    "Qwen35TreeVerifyFullLayerShapeQMoe: num_experts ({}) * moe_intermediate ({}) \
                  * hidden_size ({}) overflows usize",
-                ne, m_moe, h
-            ))?;
+                    ne,
+                    m_moe,
+                    h
+                )
+            })?;
         Ok(())
     }
 }
@@ -3149,7 +3510,8 @@ pub fn qwen35_tree_verify_full_layer_q(
             "qwen35_tree_verify_full_layer_q: shape.attn.hidden_size ({}) != \
              ffn_weights.hidden_size ({}). Shape and weights were built from \
              different model configs.",
-            shape.attn.hidden_size, ffn_weights.hidden_size
+            shape.attn.hidden_size,
+            ffn_weights.hidden_size
         ));
     }
     if shape.intermediate_size != ffn_weights.intermediate_size {
@@ -3157,7 +3519,8 @@ pub fn qwen35_tree_verify_full_layer_q(
             "qwen35_tree_verify_full_layer_q: shape.intermediate_size ({}) != \
              ffn_weights.intermediate_size ({}). Shape and weights were built from \
              different model configs.",
-            shape.intermediate_size, ffn_weights.intermediate_size
+            shape.intermediate_size,
+            ffn_weights.intermediate_size
         ));
     }
 
@@ -3166,9 +3529,12 @@ pub fn qwen35_tree_verify_full_layer_q(
     // For a weight matrix [rows, cols]: bytes = rows * (cols / 32) * 18.
     // Equivalently: bytes = rows * cols / 2 + rows * cols / 16.
     // Use checked arithmetic; compare with != (exact equality, not <).
-    let gate_blocks_per_row = h
-        .checked_div(32)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: hidden_size {} not divisible by 32 (Q4_0 block)", h))?;
+    let gate_blocks_per_row = h.checked_div(32).ok_or_else(|| {
+        anyhow!(
+            "qwen35_tree_verify_full_layer_q: hidden_size {} not divisible by 32 (Q4_0 block)",
+            h
+        )
+    })?;
     if h % 32 != 0 {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: hidden_size ({}) must be divisible by 32 for Q4_0 block encoding",
@@ -3178,21 +3544,30 @@ pub fn qwen35_tree_verify_full_layer_q(
     let gate_expected_bytes = m
         .checked_mul(gate_blocks_per_row)
         .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: gate Q4_0 byte count overflows usize"))?;
+        .ok_or_else(|| {
+            anyhow!("qwen35_tree_verify_full_layer_q: gate Q4_0 byte count overflows usize")
+        })?;
     if ffn_weights.gate_q.element_count() != gate_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: gate_q has {} bytes, \
              expected exactly {} (intermediate_size={} * hidden_size={} Q4_0 encoding: \
              {} rows × {} blocks/row × 18 bytes/block)",
-            ffn_weights.gate_q.element_count(), gate_expected_bytes,
-            m, h, m, gate_blocks_per_row
+            ffn_weights.gate_q.element_count(),
+            gate_expected_bytes,
+            m,
+            h,
+            m,
+            gate_blocks_per_row
         ));
     }
     if ffn_weights.up_q.element_count() != gate_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: up_q has {} bytes, \
              expected exactly {} (intermediate_size={} * hidden_size={} Q4_0 encoding)",
-            ffn_weights.up_q.element_count(), gate_expected_bytes, m, h
+            ffn_weights.up_q.element_count(),
+            gate_expected_bytes,
+            m,
+            h
         ));
     }
     // down_proj: [hidden_size, intermediate_size] → rows=h, cols=m
@@ -3208,14 +3583,20 @@ pub fn qwen35_tree_verify_full_layer_q(
     let down_expected_bytes = h
         .checked_mul(down_blocks_per_row)
         .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: down Q4_0 byte count overflows usize"))?;
+        .ok_or_else(|| {
+            anyhow!("qwen35_tree_verify_full_layer_q: down Q4_0 byte count overflows usize")
+        })?;
     if ffn_weights.down_q.element_count() != down_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: down_q has {} bytes, \
              expected exactly {} (hidden_size={} * intermediate_size={} Q4_0 encoding: \
              {} rows × {} blocks/row × 18 bytes/block)",
-            ffn_weights.down_q.element_count(), down_expected_bytes,
-            h, m, h, down_blocks_per_row
+            ffn_weights.down_q.element_count(),
+            down_expected_bytes,
+            h,
+            m,
+            h,
+            down_blocks_per_row
         ));
     }
 
@@ -3223,10 +3604,16 @@ pub fn qwen35_tree_verify_full_layer_q(
     // Returns attn_out = hidden_states_in + attn_residual [tree_seq_len, hidden_size] F32.
     // Terminal commit is done inside the block; all GPU work is host-coherent on return.
     let attn_out = qwen35_tree_verify_attention_block(
-        enc, device, registry,
-        hidden_states_in, tree_mask, tree_positions,
-        k_cache, v_cache,
-        weights, shape.attn,
+        enc,
+        device,
+        registry,
+        hidden_states_in,
+        tree_mask,
+        tree_positions,
+        k_cache,
+        v_cache,
+        weights,
+        shape.attn,
     )
     .context("qwen35_tree_verify_full_layer_q: attention block")?;
 
@@ -3238,25 +3625,28 @@ pub fn qwen35_tree_verify_full_layer_q(
     // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
     // attn_out is host-coherent (prior encoder commit_and_wait'd); enc2
     // reads it from device memory — no upload needed under Apple unified memory.
-    let mut enc2 = device.command_encoder()
+    let mut enc2 = device
+        .command_encoder()
         .context("qwen35_tree_verify_full_layer_q: alloc enc2")?;
 
     // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
     let rms_out_bytes = seq * h * std::mem::size_of::<f32>();
-    let post_attn_normed = super::decode_pool::pooled_alloc_buffer(
-        device, rms_out_bytes, DType::F32, vec![seq, h],
-    )
-    .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc post_attn_normed: {e}"))?;
+    let post_attn_normed =
+        super::decode_pool::pooled_alloc_buffer(device, rms_out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc post_attn_normed: {e}"))?;
     let mut rms_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc rms_params: {e}"))?;
     {
-        let s = rms_params.as_mut_slice::<f32>()
+        let s = rms_params
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: rms_params slice: {e}"))?;
         s[0] = shape.attn.rms_norm_eps;
         s[1] = h as f32;
     }
     rms_norm::dispatch_rms_norm(
-        &mut enc2, registry, device.metal_device(),
+        &mut enc2,
+        registry,
+        device.metal_device(),
         &attn_out,
         &weights.post_attn_norm,
         &post_attn_normed,
@@ -3273,7 +3663,9 @@ pub fn qwen35_tree_verify_full_layer_q(
     // ── STEP F+G: gate_proj and up_proj — concurrent (both read post_attn_normed) ──
     // apply_linear_projection_f32 auto-routes U8 dtype → quantized_matmul_ggml Q4_0.
     let gate_buf = apply_linear_projection_f32(
-        &mut enc2, registry, device,
+        &mut enc2,
+        registry,
+        device,
         &post_attn_normed,
         &ffn_weights.gate_q,
         shape.attn.tree_seq_len,
@@ -3283,7 +3675,9 @@ pub fn qwen35_tree_verify_full_layer_q(
     .context("qwen35_tree_verify_full_layer_q: gate_proj")?;
 
     let up_buf = apply_linear_projection_f32(
-        &mut enc2, registry, device,
+        &mut enc2,
+        registry,
+        device,
         &post_attn_normed,
         &ffn_weights.up_q,
         shape.attn.tree_seq_len,
@@ -3297,13 +3691,15 @@ pub fn qwen35_tree_verify_full_layer_q(
     enc2.memory_barrier();
 
     // ── STEP I: silu_mul — silu(gate_buf) * up_buf → activated_buf ──────
-    let n_silu_elems = seq
-        .checked_mul(m)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: seq * intermediate overflows usize"))?;
+    let n_silu_elems = seq.checked_mul(m).ok_or_else(|| {
+        anyhow!("qwen35_tree_verify_full_layer_q: seq * intermediate overflows usize")
+    })?;
     if n_silu_elems > (u32::MAX as usize) {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: seq ({}) * intermediate ({}) = {} exceeds u32::MAX",
-            seq, m, n_silu_elems
+            seq,
+            m,
+            n_silu_elems
         ));
     }
     let n_silu: u32 = n_silu_elems as u32;
@@ -3313,14 +3709,22 @@ pub fn qwen35_tree_verify_full_layer_q(
     let activated_buf = device
         .alloc_buffer(activated_bytes, DType::F32, vec![seq, m])
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc activated_buf: {e}"))?;
-    let mut silu_params = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc silu_params: {e}"))?;
-    silu_params.as_mut_slice::<u32>()
-        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: silu_params slice: {e}"))?[0] = n_silu;
+    let mut silu_params =
+        super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc silu_params: {e}"))?;
+    silu_params
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: silu_params slice: {e}"))?[0] =
+        n_silu;
     dispatch_silu_mul(
-        &mut enc2, registry, device.metal_device(),
-        &gate_buf, &up_buf, &activated_buf,
-        &silu_params, n_silu,
+        &mut enc2,
+        registry,
+        device.metal_device(),
+        &gate_buf,
+        &up_buf,
+        &activated_buf,
+        &silu_params,
+        n_silu,
     )
     .context("qwen35_tree_verify_full_layer_q: dispatch_silu_mul")?;
 
@@ -3329,7 +3733,9 @@ pub fn qwen35_tree_verify_full_layer_q(
 
     // ── STEP K: down_proj — activated_buf → ffn_out [tree_seq_len, hidden_size] ──
     let ffn_out = apply_linear_projection_f32(
-        &mut enc2, registry, device,
+        &mut enc2,
+        registry,
+        device,
         &activated_buf,
         &ffn_weights.down_q,
         shape.attn.tree_seq_len,
@@ -3349,9 +3755,14 @@ pub fn qwen35_tree_verify_full_layer_q(
         .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
         .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc hidden_states_out: {e}"))?;
     elementwise_add(
-        &mut enc2, registry, device.metal_device(),
-        &ffn_residual, &ffn_out, &hidden_states_out,
-        hs_elems, DType::F32,
+        &mut enc2,
+        registry,
+        device.metal_device(),
+        &ffn_residual,
+        &ffn_out,
+        &hidden_states_out,
+        hs_elems,
+        DType::F32,
     )
     .context("qwen35_tree_verify_full_layer_q: residual add")?;
 
@@ -3498,22 +3909,26 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
 
     // ── STEP 0c: shape↔weights cross-check (INV-QMoE-shape-weights-cross-check) ──
     // Router: [num_experts, hidden_size] BF16 → element_count == num_experts * hidden_size.
-    let expected_router_elems = ne
-        .checked_mul(h)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q_moe: router element count overflows usize"))?;
+    let expected_router_elems = ne.checked_mul(h).ok_or_else(|| {
+        anyhow!("qwen35_tree_verify_full_layer_q_moe: router element count overflows usize")
+    })?;
     if moe_weights.router.element_count() != expected_router_elems {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: router has {} BF16 elements, \
              expected {} (num_experts={} * hidden_size={}). \
              Shape and weights were built from different model configs.",
-            moe_weights.router.element_count(), expected_router_elems, ne, h
+            moe_weights.router.element_count(),
+            expected_router_elems,
+            ne,
+            h
         ));
     }
     if moe_weights.num_experts != shape.moe.num_experts {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: weights.num_experts ({}) != \
              shape.moe.num_experts ({}). Shape and weights were built from different configs.",
-            moe_weights.num_experts, shape.moe.num_experts
+            moe_weights.num_experts,
+            shape.moe.num_experts
         ));
     }
 
@@ -3532,7 +3947,11 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         .checked_mul(m_moe)
         .and_then(|v| v.checked_mul(gate_blocks_per_row))
         .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q_moe: expert_gate Q4_0 byte count overflows usize"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "qwen35_tree_verify_full_layer_q_moe: expert_gate Q4_0 byte count overflows usize"
+            )
+        })?;
     if moe_weights.expert_gate_q.element_count() != expert_gate_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: expert_gate_q has {} bytes, \
@@ -3546,7 +3965,8 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: expert_up_q has {} bytes, \
              expected exactly {} (same shape as expert_gate_q)",
-            moe_weights.expert_up_q.element_count(), expert_gate_expected
+            moe_weights.expert_up_q.element_count(),
+            expert_gate_expected
         ));
     }
     // expert_down_q: [num_experts, hidden_size, moe_intermediate_size]
@@ -3563,7 +3983,11 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         .checked_mul(h)
         .and_then(|v| v.checked_mul(down_blocks_per_row))
         .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q_moe: expert_down Q4_0 byte count overflows usize"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "qwen35_tree_verify_full_layer_q_moe: expert_down Q4_0 byte count overflows usize"
+            )
+        })?;
     if moe_weights.expert_down_q.element_count() != expert_down_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: expert_down_q has {} bytes, \
@@ -3579,25 +4003,33 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp has {} BF16 elements, \
              expected {} (hidden_size={})",
-            moe_weights.shared_gate_inp.element_count(), h, h
+            moe_weights.shared_gate_inp.element_count(),
+            h,
+            h
         ));
     }
     // shared_gate: [shared_intermediate, hidden_size] → m_sh * h elements
-    let shared_proj_expected = m_sh
-        .checked_mul(h)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q_moe: shared_gate element count overflows usize"))?;
+    let shared_proj_expected = m_sh.checked_mul(h).ok_or_else(|| {
+        anyhow!("qwen35_tree_verify_full_layer_q_moe: shared_gate element count overflows usize")
+    })?;
     if moe_weights.shared_gate.element_count() != shared_proj_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: shared_gate has {} BF16 elements, \
              expected {} (shared_intermediate={} * hidden_size={})",
-            moe_weights.shared_gate.element_count(), shared_proj_expected, m_sh, h
+            moe_weights.shared_gate.element_count(),
+            shared_proj_expected,
+            m_sh,
+            h
         ));
     }
     if moe_weights.shared_up.element_count() != shared_proj_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: shared_up has {} BF16 elements, \
              expected {} (shared_intermediate={} * hidden_size={})",
-            moe_weights.shared_up.element_count(), shared_proj_expected, m_sh, h
+            moe_weights.shared_up.element_count(),
+            shared_proj_expected,
+            m_sh,
+            h
         ));
     }
     // shared_down: [hidden_size, shared_intermediate] → h * m_sh elements (same count)
@@ -3605,7 +4037,10 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: shared_down has {} BF16 elements, \
              expected {} (hidden_size={} * shared_intermediate={})",
-            moe_weights.shared_down.element_count(), shared_proj_expected, h, m_sh
+            moe_weights.shared_down.element_count(),
+            shared_proj_expected,
+            h,
+            m_sh
         ));
     }
 
@@ -3613,10 +4048,16 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
     // Returns attn_out = hidden_states_in + attn_residual [tree_seq_len, hidden_size] F32.
     // Terminal commit is done inside the block; all GPU work is host-coherent on return.
     let attn_out = qwen35_tree_verify_attention_block(
-        enc, device, registry,
-        hidden_states_in, tree_mask, tree_positions,
-        k_cache, v_cache,
-        weights, shape.attn,
+        enc,
+        device,
+        registry,
+        hidden_states_in,
+        tree_mask,
+        tree_positions,
+        k_cache,
+        v_cache,
+        weights,
+        shape.attn,
     )
     .context("qwen35_tree_verify_full_layer_q_moe: attention block")?;
 
@@ -3628,26 +4069,34 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
 
     // ── STEP C: Open fresh encoder for post_attn_norm only ───────────────
     // attn_out is host-coherent (prior encoder commit_and_wait'd).
-    let mut enc2 = device.command_encoder()
+    let mut enc2 = device
+        .command_encoder()
         .context("qwen35_tree_verify_full_layer_q_moe: alloc enc2")?;
 
     // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
     let seq = shape.attn.tree_seq_len as usize;
     let rms_out_bytes = seq * h * std::mem::size_of::<f32>();
     let post_attn_normed = super::decode_pool::pooled_alloc_buffer(
-        device, rms_out_bytes, mlx_native::DType::F32, vec![seq, h],
+        device,
+        rms_out_bytes,
+        mlx_native::DType::F32,
+        vec![seq, h],
     )
     .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q_moe: alloc post_attn_normed: {e}"))?;
-    let mut rms_params = super::decode_pool::pooled_alloc_buffer(device, 8, mlx_native::DType::F32, vec![2])
-        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q_moe: alloc rms_params: {e}"))?;
+    let mut rms_params =
+        super::decode_pool::pooled_alloc_buffer(device, 8, mlx_native::DType::F32, vec![2])
+            .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q_moe: alloc rms_params: {e}"))?;
     {
-        let s = rms_params.as_mut_slice::<f32>()
+        let s = rms_params
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q_moe: rms_params slice: {e}"))?;
         s[0] = shape.attn.rms_norm_eps;
         s[1] = h as f32;
     }
     rms_norm::dispatch_rms_norm(
-        &mut enc2, registry, device.metal_device(),
+        &mut enc2,
+        registry,
+        device.metal_device(),
         &attn_out,
         &weights.post_attn_norm,
         &post_attn_normed,
@@ -3680,7 +4129,8 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         shared_intermediate_size: shape.moe.shared_intermediate_size,
     };
     let hidden_states_out = super::gpu_ffn::build_moe_ffn_layer_gpu_q(
-        device, registry,
+        device,
+        registry,
         &post_attn_normed,
         moe_weights,
         moe_ffn_shape,
@@ -3776,12 +4226,21 @@ pub fn apply_flash_attn_prefill_seq_major(
         // on the MTLResidencySet. commit_labeled (no host wait) is therefore
         // safe — the next encoder's commit* cannot flush a stale
         // residency-rescission for buffers still referenced by this CB.
-        let mut enc = device.command_encoder().context("FA prefill bridge encoder")?;
+        let mut enc = device
+            .command_encoder()
+            .context("FA prefill bridge encoder")?;
         apply_flash_attn_prefill_seq_major_into(
-            &mut enc, device, registry,
-            q_seq_major, k_seq_major, v_seq_major,
+            &mut enc,
+            device,
+            registry,
+            q_seq_major,
+            k_seq_major,
+            v_seq_major,
             &out_seq,
-            seq_len, n_heads, n_kv_heads, head_dim,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
             arena,
         )?;
         // Arena path: commit without host wait. Arena buffers are owned by
@@ -3802,9 +4261,11 @@ pub fn apply_flash_attn_prefill_seq_major(
         if std::env::var("HF2Q_DUMP_FA_BF16").as_deref() == Ok("1") {
             // Sync: wait for the just-committed CB (and therefore the
             // kernel write to out_bf16_hm) to actually land.
-            let mut sync_enc = device.command_encoder()
+            let mut sync_enc = device
+                .command_encoder()
                 .context("FA bridge: dump sync encoder")?;
-            sync_enc.commit_and_wait()
+            sync_enc
+                .commit_and_wait()
                 .context("FA bridge: dump sync commit_and_wait")?;
 
             // Read raw bytes from arena buffers (StorageModeShared → memcpy).
@@ -3812,12 +4273,13 @@ pub fn apply_flash_attn_prefill_seq_major(
             let step_idx = super::dump_bisect::current_step_idx();
 
             for (label, buf) in [
-                ("q_bf16_hm",   &arena.q_bf16_hm),
-                ("k_bf16_hm",   &arena.k_bf16_hm),
-                ("v_bf16_hm",   &arena.v_bf16_hm),
+                ("q_bf16_hm", &arena.q_bf16_hm),
+                ("k_bf16_hm", &arena.k_bf16_hm),
+                ("v_bf16_hm", &arena.v_bf16_hm),
                 ("out_bf16_hm", &arena.out_bf16_hm),
             ] {
-                let bytes = buf.as_slice::<u8>()
+                let bytes = buf
+                    .as_slice::<u8>()
                     .map_err(|e| anyhow!("FA bridge: dump as_slice {label}: {e}"))?;
                 let path = format!(
                     "/tmp/hf2q_fa_bf16_step{:04}_layer{:03}_{}.bin",
@@ -3830,7 +4292,8 @@ pub fn apply_flash_attn_prefill_seq_major(
             }
             tracing::info!(
                 "iter-17 dump: wrote 4× arena bf16 buffers for layer {:?} step {}",
-                layer_idx, step_idx,
+                layer_idx,
+                step_idx,
             );
         }
     } else {
@@ -3860,43 +4323,81 @@ pub fn apply_flash_attn_prefill_seq_major(
             .alloc_buffer(out_elems * 2, DType::BF16, vec![1, nh, seq, d])
             .map_err(|e| anyhow!("alloc out_bf16_hm: {e}"))?;
 
-        let mut enc = device.command_encoder().context("FA prefill bridge encoder")?;
+        let mut enc = device
+            .command_encoder()
+            .context("FA prefill bridge encoder")?;
 
         // Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major.
         cast(
-            &mut enc, registry, device.metal_device(),
-            q_seq_major, &q_bf16_seq, q_elems, CastDirection::F32ToBF16,
-        ).context("FA bridge: cast Q F32→BF16")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            q_seq_major,
+            &q_bf16_seq,
+            q_elems,
+            CastDirection::F32ToBF16,
+        )
+        .context("FA bridge: cast Q F32→BF16")?;
         enc.memory_barrier();
         permute_021_bf16(
-            &mut enc, registry, device.metal_device(),
-            &q_bf16_seq, &q_bf16_hm,
-            seq, nh, d,
-        ).context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &q_bf16_seq,
+            &q_bf16_hm,
+            seq,
+            nh,
+            d,
+        )
+        .context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
 
         // Step 3+4: K F32 seq-major → BF16 seq-major → BF16 head-major.
         cast(
-            &mut enc, registry, device.metal_device(),
-            k_seq_major, &k_bf16_seq, k_elems, CastDirection::F32ToBF16,
-        ).context("FA bridge: cast K F32→BF16")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            k_seq_major,
+            &k_bf16_seq,
+            k_elems,
+            CastDirection::F32ToBF16,
+        )
+        .context("FA bridge: cast K F32→BF16")?;
         enc.memory_barrier();
         permute_021_bf16(
-            &mut enc, registry, device.metal_device(),
-            &k_bf16_seq, &k_bf16_hm,
-            seq, nkv, d,
-        ).context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &k_bf16_seq,
+            &k_bf16_hm,
+            seq,
+            nkv,
+            d,
+        )
+        .context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
 
         // Step 5+6: V F32 seq-major → BF16 seq-major → BF16 head-major.
         cast(
-            &mut enc, registry, device.metal_device(),
-            v_seq_major, &v_bf16_seq, v_elems, CastDirection::F32ToBF16,
-        ).context("FA bridge: cast V F32→BF16")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            v_seq_major,
+            &v_bf16_seq,
+            v_elems,
+            CastDirection::F32ToBF16,
+        )
+        .context("FA bridge: cast V F32→BF16")?;
         enc.memory_barrier();
         permute_021_bf16(
-            &mut enc, registry, device.metal_device(),
-            &v_bf16_seq, &v_bf16_hm,
-            seq, nkv, d,
-        ).context("FA bridge: permute_021 V [seq, nkv, d] → [nkv, seq, d]")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &v_bf16_seq,
+            &v_bf16_hm,
+            seq,
+            nkv,
+            d,
+        )
+        .context("FA bridge: permute_021 V [seq, nkv, d] → [nkv, seq, d]")?;
 
         // Barrier: flash_attn_prefill reads Q/K/V head-major written above.
         enc.memory_barrier();
@@ -3911,8 +4412,12 @@ pub fn apply_flash_attn_prefill_seq_major(
         //     blk-less wrapper that delegates to *_with_blk(blk=None)).
         let scale = 1.0 / (d as f32).sqrt();
         dispatch_flash_attn_prefill_bf16_d256(
-            &mut enc, device, registry,
-            &q_bf16_hm, &k_bf16_hm, &v_bf16_hm,
+            &mut enc,
+            device,
+            registry,
+            &q_bf16_hm,
+            &k_bf16_hm,
+            &v_bf16_hm,
             /* mask = */ None,
             &mut out_bf16_hm,
             &FlashAttnPrefillParams {
@@ -3925,7 +4430,8 @@ pub fn apply_flash_attn_prefill_seq_major(
                 scale,
                 do_causal: true,
             },
-        ).context("FA bridge: dispatch_flash_attn_prefill_bf16_d256")?;
+        )
+        .context("FA bridge: dispatch_flash_attn_prefill_bf16_d256")?;
 
         // Barrier: permute_021_bf16_to_f32 reads out_bf16_hm written above.
         enc.memory_barrier();
@@ -3935,10 +4441,16 @@ pub fn apply_flash_attn_prefill_seq_major(
         //   the kernel writes [seq, nh, d] (i.e. dim_a/dim_b swapped in the
         //   layout, matching the [A, B, C] → [B, A, C] contract).
         permute_021_bf16_to_f32(
-            &mut enc, registry, device.metal_device(),
-            &out_bf16_hm, &out_seq,
-            nh, seq, d,
-        ).context("FA bridge: permute_021_bf16_to_f32 out [nh, seq, d] → [seq, nh, d] F32")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &out_bf16_hm,
+            &out_seq,
+            nh,
+            seq,
+            d,
+        )
+        .context("FA bridge: permute_021_bf16_to_f32 out [nh, seq, d] → [seq, nh, d] F32")?;
 
         enc.commit_and_wait()
             .context("FA bridge: commit+wait flash_attn_prefill")?;
@@ -4108,19 +4620,33 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
         .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
         .map_err(|e| anyhow!("alloc out_seq: {e}"))?;
 
-    let mut enc = device.command_encoder().context("FA resume bridge encoder")?;
+    let mut enc = device
+        .command_encoder()
+        .context("FA resume bridge encoder")?;
 
     // ── Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major ──
     cast(
-        &mut enc, registry, device.metal_device(),
-        q_seq_major, &q_bf16_seq, q_elems, CastDirection::F32ToBF16,
-    ).context("FA resume bridge: cast Q F32→BF16")?;
+        &mut enc,
+        registry,
+        device.metal_device(),
+        q_seq_major,
+        &q_bf16_seq,
+        q_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("FA resume bridge: cast Q F32→BF16")?;
     enc.memory_barrier();
     permute_021_bf16(
-        &mut enc, registry, device.metal_device(),
-        &q_bf16_seq, &q_bf16_hm,
-        seq, nh, d,
-    ).context("FA resume bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &q_bf16_seq,
+        &q_bf16_hm,
+        seq,
+        nh,
+        d,
+    )
+    .context("FA resume bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
 
     // ── Step 3: cast slot K F32 head-major → BF16 head-major (in-layout) ──
     //
@@ -4130,16 +4656,28 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     // unused tail; the kernel reads only `[0..kv_seq_len]` per head thanks
     // to kL-aware tile bounds).
     cast(
-        &mut enc, registry, device.metal_device(),
-        slot_k_head_major, &k_bf16_slot, kv_slot_elems, CastDirection::F32ToBF16,
-    ).context("FA resume bridge: cast slot K F32→BF16")?;
+        &mut enc,
+        registry,
+        device.metal_device(),
+        slot_k_head_major,
+        &k_bf16_slot,
+        kv_slot_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("FA resume bridge: cast slot K F32→BF16")?;
     enc.memory_barrier();
 
     // ── Step 4: cast slot V F32 head-major → BF16 head-major ──
     cast(
-        &mut enc, registry, device.metal_device(),
-        slot_v_head_major, &v_bf16_slot, kv_slot_elems, CastDirection::F32ToBF16,
-    ).context("FA resume bridge: cast slot V F32→BF16")?;
+        &mut enc,
+        registry,
+        device.metal_device(),
+        slot_v_head_major,
+        &v_bf16_slot,
+        kv_slot_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("FA resume bridge: cast slot V F32→BF16")?;
     enc.memory_barrier();
 
     // ── Step 5: dispatch the resume FA bf16 d256 kernel ──
@@ -4148,8 +4686,12 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     //   - do_causal     = true       (causal mask via qL_off)
     let scale = 1.0 / (d as f32).sqrt();
     dispatch_flash_attn_prefill_bf16_d256_resume(
-        &mut enc, device, registry,
-        &q_bf16_hm, &k_bf16_slot, &v_bf16_slot,
+        &mut enc,
+        device,
+        registry,
+        &q_bf16_hm,
+        &k_bf16_slot,
+        &v_bf16_slot,
         &mut out_bf16_hm,
         &FlashAttnPrefillResumeParams {
             n_heads,
@@ -4163,18 +4705,25 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
             q_offset_in_k: cur_len,
             kv_capacity,
         },
-    ).context("FA resume bridge: dispatch_flash_attn_prefill_bf16_d256_resume")?;
+    )
+    .context("FA resume bridge: dispatch_flash_attn_prefill_bf16_d256_resume")?;
 
     enc.memory_barrier();
 
     // ── Step 6: BF16 head-major → F32 seq-major (fused permute+cast) ──
     permute_021_bf16_to_f32(
-        &mut enc, registry, device.metal_device(),
-        &out_bf16_hm, &out_seq,
-        nh, seq, d,
-    ).context(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &out_bf16_hm,
+        &out_seq,
+        nh,
+        seq,
+        d,
+    )
+    .context(
         "FA resume bridge: permute_021_bf16_to_f32 out [nh, seq, d] → \
-         [seq, nh, d] F32"
+         [seq, nh, d] F32",
     )?;
 
     enc.commit_and_wait()
@@ -4253,16 +4802,28 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
         .context("apply_flash_attn_prefill_seq_major_resume_via_tq_cache: dequant encoder")?;
     let temp_k = slot
         .dequant_seq_to_temp_f32_unrotated(
-            /*is_k=*/ true, kv_seq_len, /*start_pos=*/ 0,
-            cache_capacity, n_kv_heads, head_dim,
-            &mut enc, registry, device,
+            /*is_k=*/ true,
+            kv_seq_len,
+            /*start_pos=*/ 0,
+            cache_capacity,
+            n_kv_heads,
+            head_dim,
+            &mut enc,
+            registry,
+            device,
         )
         .context("dequant K seq → temp F32 unrotated")?;
     let temp_v = slot
         .dequant_seq_to_temp_f32_unrotated(
-            /*is_k=*/ false, kv_seq_len, /*start_pos=*/ 0,
-            cache_capacity, n_kv_heads, head_dim,
-            &mut enc, registry, device,
+            /*is_k=*/ false,
+            kv_seq_len,
+            /*start_pos=*/ 0,
+            cache_capacity,
+            n_kv_heads,
+            head_dim,
+            &mut enc,
+            registry,
+            device,
         )
         .context("dequant V seq → temp F32 unrotated")?;
     // commit_and_wait so the temp buffers are populated before the
@@ -4276,12 +4837,18 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
     // math (kv_capacity * head_dim) matches the tight head-major
     // [n_kv_heads, kv_seq_len, head_dim] layout.
     apply_flash_attn_prefill_seq_major_resume(
-        device, registry,
+        device,
+        registry,
         q_seq_major,
-        &temp_k, &temp_v,
-        seq_len, cur_len, kv_seq_len,
+        &temp_k,
+        &temp_v,
+        seq_len,
+        cur_len,
+        kv_seq_len,
         /*kv_capacity=*/ kv_seq_len,
-        n_heads, n_kv_heads, head_dim,
+        n_heads,
+        n_kv_heads,
+        head_dim,
     )
     .context("apply_flash_attn_prefill_seq_major_resume (TQ-decoded path)")
 }
@@ -4397,27 +4964,40 @@ pub fn apply_sdpa_with_kv_cache(
     //
     // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
     let out_buf = super::decode_pool::pooled_alloc_buffer(
-            device, nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
-        .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
+        device,
+        nh * seq * d * 4,
+        DType::F32,
+        vec![1, nh, seq, d],
+    )
+    .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
 
     if seq == 1 && head_dim % 32 == 0 {
         // Decode fast path: fused GPU K/V cache write + SIMD SDPA.
         // Q layout for seq=1: [n_heads, head_dim] is identical in seq-major and head-major.
         // K/V source: [seq*n_kv_heads, head_dim] = [n_kv_heads, head_dim] for seq=1,
         //   which kv_cache_copy_seq_f32_dual treats as [n_tokens=1, n_heads, head_dim].
-        let mut enc = device.command_encoder().context("enc kv-cache+sdpa decode")?;
+        let mut enc = device
+            .command_encoder()
+            .context("enc kv-cache+sdpa decode")?;
         if kv_write_tokens > 0 {
             // ADR-027 Phase B iter-15: F32 write + optional TQ encode.
             // Helper handles slot.tq.is_some() branching internally;
             // legacy F32-only path is byte-identical to pre-iter-15.
             write_kv_with_optional_tq_encode(
-                &mut enc, registry, device,
-                k_seq_major, v_seq_major,
+                &mut enc,
+                registry,
+                device,
+                k_seq_major,
+                v_seq_major,
                 slot,
-                n_kv_heads, head_dim, max_seq_len,
-                cur_len as u32, kv_write_tokens as u32,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                cur_len as u32,
+                kv_write_tokens as u32,
                 slot_id,
-            ).context("kv_cache_copy kv-cache decode (iter-15 helper)")?;
+            )
+            .context("kv_cache_copy kv-cache decode (iter-15 helper)")?;
             // Barrier: sdpa_decode reads slot.k/slot.v written above.
             enc.memory_barrier();
         }
@@ -4460,12 +5040,21 @@ pub fn apply_sdpa_with_kv_cache(
             // 0.008 validates the TQ chain matches F32 to 18.5×
             // headroom.
             dispatch_decode_sdpa_with_optional_tq(
-                &mut enc, registry, device,
-                q_seq_major, slot, &out_buf, &fa_tmp,
-                n_heads, n_kv_heads, head_dim,
-                kv_seq_len, max_seq_len,
+                &mut enc,
+                registry,
+                device,
+                q_seq_major,
+                slot,
+                &out_buf,
+                &fa_tmp,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_seq_len,
+                max_seq_len,
                 slot_id,
-            ).context("flash_attn_vec kv-cache (FA-layer decode iter-15)")?;
+            )
+            .context("flash_attn_vec kv-cache (FA-layer decode iter-15)")?;
         } else {
             // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback path,
             // taken when head_dim ∉ {256, 512}. Production qwen35 has
@@ -4483,7 +5072,10 @@ pub fn apply_sdpa_with_kv_cache(
                  iter-34 alloc/SDPA gating invariant regressed (TQ requires \
                  head_dim ∈ {256,512}; this fallback should never see slot.k=None).",
             );
-            let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32: slot.v is None");
+            let vbuf = slot
+                .v
+                .as_ref()
+                .expect("dispatch_sdpa_decode F32: slot.v is None");
             // ADR-040 Phase B4a-cont: slice_view per-slot K/V region
             // for the F32 fallback decode path.
             let (so_off, so_n) =
@@ -4491,12 +5083,21 @@ pub fn apply_sdpa_with_kv_cache(
             let kbuf_view = kbuf.slice_view(so_off, so_n);
             let vbuf_view = vbuf.slice_view(so_off, so_n);
             dispatch_sdpa_decode(
-                &mut enc, registry, device,
-                q_seq_major, &kbuf_view, &vbuf_view, &out_buf,
-                n_heads, n_kv_heads, head_dim,
-                kv_seq_len, max_seq_len,
+                &mut enc,
+                registry,
+                device,
+                q_seq_major,
+                &kbuf_view,
+                &vbuf_view,
+                &out_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_seq_len,
+                max_seq_len,
                 1.0 / (d as f32).sqrt(),
-            ).context("sdpa_decode kv-cache (head_dim fallback)")?;
+            )
+            .context("sdpa_decode kv-cache (head_dim fallback)")?;
         }
         // commit() without wait: out_buf is fed into ops6-7 on the same Metal
         // serial queue; GPU ordering guarantees SDPA completes first.
@@ -4536,18 +5137,26 @@ pub fn apply_sdpa_with_kv_cache(
             let _w5b9_kv_dl_copy = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
             );
-            let mut enc = device.command_encoder()
+            let mut enc = device
+                .command_encoder()
                 .context("enc kv_cache_copy_seq_dual prefill")?;
             // ADR-027 Phase B iter-15: F32 write + optional TQ encode
             // for prefill (multi-token via _seq dispatch).
             write_kv_with_optional_tq_encode(
-                &mut enc, registry, device,
-                k_seq_major, v_seq_major,
+                &mut enc,
+                registry,
+                device,
+                k_seq_major,
+                v_seq_major,
                 slot,
-                n_kv_heads, head_dim, max_seq_len,
-                cur_len as u32, kv_write_tokens as u32,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                cur_len as u32,
+                kv_write_tokens as u32,
                 slot_id,
-            ).context("kv_cache_copy_seq_f32_dual prefill (iter-15 helper)")?;
+            )
+            .context("kv_cache_copy_seq_f32_dual prefill (iter-15 helper)")?;
             // commit_labeled (no host wait) — out_buf for the FA dispatch below
             // is a separate buffer; the new_path_eligible branch reads
             // k_seq_major/v_seq_major directly (not slot.k/slot.v) so this
@@ -4617,8 +5226,7 @@ pub fn apply_sdpa_with_kv_cache(
         let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 16;
         // ADR-028 iter-177: trace branch eligibility for K=1 batched-verify
         // bug bisect. HF2Q_FA_TRACE=1 prints all booleans + actual branch.
-        let fa_trace =
-            std::env::var("HF2Q_FA_TRACE").as_deref() == Ok("1");
+        let fa_trace = std::env::var("HF2Q_FA_TRACE").as_deref() == Ok("1");
         if fa_trace {
             eprintln!(
                 "[FA_TRACE] seq_len={} cur_len={} kv_seq_len={} head_dim={} new_eligible={} slot.k={} slot.v={} slot.tq={}",
@@ -4640,9 +5248,15 @@ pub fn apply_sdpa_with_kv_cache(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
             );
             let out_uploaded = apply_flash_attn_prefill_seq_major(
-                device, registry,
-                q_seq_major, k_seq_major, v_seq_major,
-                seq_len, n_heads, n_kv_heads, head_dim,
+                device,
+                registry,
+                q_seq_major,
+                k_seq_major,
+                v_seq_major,
+                seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
                 fa_arena,
             )?;
             // --- Update current_len cursor (prefill path) ---
@@ -4693,12 +5307,14 @@ pub fn apply_sdpa_with_kv_cache(
             let _w5b10_kernel = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
             );
-            let kbuf = slot.k.as_ref().expect(
-                "vec_small_path: slot.k.is_some() guard above passed",
-            );
-            let vbuf = slot.v.as_ref().expect(
-                "vec_small_path: slot.v.is_some() guard above passed",
-            );
+            let kbuf = slot
+                .k
+                .as_ref()
+                .expect("vec_small_path: slot.k.is_some() guard above passed");
+            let vbuf = slot
+                .v
+                .as_ref()
+                .expect("vec_small_path: slot.v.is_some() guard above passed");
             // ADR-040 Phase B4a-cont: slice_view per-slot K/V region
             // for the vec_small_path (cur_len > 0, seq_len in [2, 8]).
             let (so_off, so_n) =
@@ -4716,11 +5332,7 @@ pub fn apply_sdpa_with_kv_cache(
             // coincide). At seq>1 we explicitly permute via the GPU
             // kernel.
             let q_hm = device
-                .alloc_buffer(
-                    seq * nh * d * 4,
-                    DType::F32,
-                    vec![nh, seq, d],
-                )
+                .alloc_buffer(seq * nh * d * 4, DType::F32, vec![nh, seq, d])
                 .map_err(|e| anyhow!("vec_small_path: alloc q_hm: {e}"))?;
             // ── Reuse function-level out_buf ──
             //
@@ -4740,9 +5352,7 @@ pub fn apply_sdpa_with_kv_cache(
             // comment was previously misleading.
             //
             // Tmp buffer sized for qL > 1.
-            let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(
-                n_heads, head_dim, seq_len,
-            );
+            let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(n_heads, head_dim, seq_len);
             let tmp_elems = tmp_bytes / 4;
             let tmp_buf = device
                 .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_elems])
@@ -4752,9 +5362,14 @@ pub fn apply_sdpa_with_kv_cache(
                 .command_encoder()
                 .context("vec_small_path: command_encoder")?;
             permute_021_f32(
-                &mut enc, registry, device.metal_device(),
-                q_seq_major, &q_hm,
-                seq, nh, d,
+                &mut enc,
+                registry,
+                device.metal_device(),
+                q_seq_major,
+                &q_hm,
+                seq,
+                nh,
+                d,
             )
             .context("vec_small_path: permute Q seq->head major")?;
             // RAW barrier: vec kernel reads q_hm written by the permute.
@@ -4773,8 +5388,7 @@ pub fn apply_sdpa_with_kv_cache(
                 q_seq_len: seq_len,
             };
             flash_attn_vec(
-                &mut enc, registry, device,
-                &q_hm, &kbuf_view, &vbuf_view, &out_buf, &tmp_buf,
+                &mut enc, registry, device, &q_hm, &kbuf_view, &vbuf_view, &out_buf, &tmp_buf,
                 &params,
             )
             .context("vec_small_path: flash_attn_vec dispatch")?;
@@ -4821,9 +5435,7 @@ pub fn apply_sdpa_with_kv_cache(
         // B.5 v1 gate: `kv_seq_len >= 16` (multi-K-tile) replaces
         // `seq_len >= 16`.  Closes the 23% danger-zone coverage gap and
         // allows chunked + LCP-resume to engage on ALL prompt lengths.
-        let resume_path_eligible = head_dim == 256
-            && cur_len > 0
-            && kv_seq_len >= 16;
+        let resume_path_eligible = head_dim == 256 && cur_len > 0 && kv_seq_len >= 16;
         if fa_trace {
             eprintln!(
                 "[FA_TRACE] resume_eligible={} (will engage if true; else fallback)",
@@ -4846,8 +5458,7 @@ pub fn apply_sdpa_with_kv_cache(
             // test pinned the parity contract at NRMSE 0.003 (49× headroom
             // under the 0.15 threshold). Cell C/D of the iter-21 cross-axis
             // sweep validates byte-identical sampled tokens vs F32 baseline.
-            let out_uploaded = if let (Some(kbuf), Some(vbuf)) =
-                (slot.k.as_ref(), slot.v.as_ref())
+            let out_uploaded = if let (Some(kbuf), Some(vbuf)) = (slot.k.as_ref(), slot.v.as_ref())
             {
                 // ADR-040 Phase B4a-cont: slice_view per-slot K/V
                 // region for the resume path.  The resume kernel reads
@@ -4855,19 +5466,23 @@ pub fn apply_sdpa_with_kv_cache(
                 // major stride per slot — slice_view rebases the
                 // buffer's byte_offset so kernel-side `set_buffer`
                 // sees slot N's region.
-                let (so_off, so_n) = slot_k_v_region_for_full_attn(
-                    slot_id, n_kv_heads, max_seq_len, head_dim);
+                let (so_off, so_n) =
+                    slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
                 let kbuf_view = kbuf.slice_view(so_off, so_n);
                 let vbuf_view = vbuf.slice_view(so_off, so_n);
                 apply_flash_attn_prefill_seq_major_resume(
-                    device, registry,
+                    device,
+                    registry,
                     q_seq_major,
-                    &kbuf_view, &vbuf_view,
+                    &kbuf_view,
+                    &vbuf_view,
                     seq_len,
                     cur_len as u32,
                     kv_seq_len,
                     max_seq_len,
-                    n_heads, n_kv_heads, head_dim,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
                 )?
             } else {
                 // TQ-only mode: route through dequant+resume helper.
@@ -4879,13 +5494,17 @@ pub fn apply_sdpa_with_kv_cache(
                 // when slot.tq.is_some() && slot_id != 0) — reaching
                 // this branch implies slot_id == 0 by construction.
                 apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
-                    device, registry,
-                    slot, q_seq_major,
+                    device,
+                    registry,
+                    slot,
+                    q_seq_major,
                     seq_len,
                     cur_len as u32,
                     kv_seq_len,
                     max_seq_len,
-                    n_heads, n_kv_heads, head_dim,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
                 )?
             };
             let new_len = kv_seq_len;
@@ -4923,7 +5542,9 @@ pub fn apply_sdpa_with_kv_cache(
                 kv_capacity: max_seq_len,
                 do_causal: true,
             };
-            let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
+            let mut enc = device
+                .command_encoder()
+                .context("enc sdpa kv-cache prefill")?;
             // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback prefill.
             // iter-34 invariant: head_dim-fallback prefill only fires
             // for head_dim ≠ 256 (production qwen35 head_dim is always
@@ -4942,9 +5563,12 @@ pub fn apply_sdpa_with_kv_cache(
                 slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
             let kbuf_view = kbuf.slice_view(so_off, so_n);
             let vbuf_view = vbuf.slice_view(so_off, so_n);
-            sdpa(&mut enc, registry, device, &q_gpu, &kbuf_view, &vbuf_view, &out_buf, &params, 1)
-                .context("sdpa with kv cache prefill")?;
-            enc.commit_and_wait_labeled("layer.full_attn.sdpa_legacy_prefill").context("commit sdpa kv-cache prefill")?;
+            sdpa(
+                &mut enc, registry, device, &q_gpu, &kbuf_view, &vbuf_view, &out_buf, &params, 1,
+            )
+            .context("sdpa with kv cache prefill")?;
+            enc.commit_and_wait_labeled("layer.full_attn.sdpa_legacy_prefill")
+                .context("commit sdpa kv-cache prefill")?;
         }
 
         // Permute output from head-major [n_heads, seq, head_dim] → seq-major
@@ -5136,10 +5760,7 @@ pub fn build_gated_attn_layer(
             s.current_len[slot_idx]
         })
         .unwrap_or(0);
-    let use_arena = fa_arena.is_some()
-        && seq_len > 1
-        && head_dim == 256
-        && cur_len_for_arena == 0;
+    let use_arena = fa_arena.is_some() && seq_len > 1 && head_dim == 256 && cur_len_for_arena == 0;
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
@@ -5313,395 +5934,760 @@ pub fn build_gated_attn_layer(
     // ops6-7 site below.  Under env=0 the borrow is `'static`-equivalent
     // (Plain variant carries no lifetime).
     let mut fused_stage_a_enc: Option<LayerEncoder<'_>> = None;
-    let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = if let
-        Some(arena) = fa_proj_arena.as_mut().map(|a| &mut **a).filter(|_| use_proj_arena)
-    {
-        let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
-            super::wave5b8_profile::SectionKind::FaOps1to4,
-        );
-        // iter91: thread the optional session borrow into the LayerEncoder
-        // constructor.  `as_deref_mut` re-borrows the inner `&mut EncoderSession`
-        // each time so the session can be passed to the ops6-7 fallback below
-        // (which only fires when fused_stage_a_enc is None — i.e. ops1-4 did
-        // NOT take the use_fused_stage_ab branch).
-        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
-            .context("enc ops1-4")?;
+    let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) =
+        if let Some(arena) = fa_proj_arena
+            .as_mut()
+            .map(|a| &mut **a)
+            .filter(|_| use_proj_arena)
+        {
+            let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaOps1to4,
+            );
+            // iter91: thread the optional session borrow into the LayerEncoder
+            // constructor.  `as_deref_mut` re-borrows the inner `&mut EncoderSession`
+            // each time so the session can be passed to the ops6-7 fallback below
+            // (which only fires when fused_stage_a_enc is None — i.e. ops1-4 did
+            // NOT take the use_fused_stage_ab branch).
+            let mut enc = LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
+                .context("enc ops1-4")?;
 
-        // Op 1: pre-attention RMSNorm → arena.x_norm_buf
-        apply_pre_attn_rms_norm_into(
-            enc.encoder(), registry, device, x, weights_gpu,
-            &arena.x_norm_buf, &arena.pre_norm_params_buf,
-            seq_len, hidden_size,
-        )?;
-        // Barrier: ops 2 read from x_norm written above.
-        enc.encoder().memory_barrier();
-
-        // Op 2: Q/K/V/G projections — all read from arena.x_norm_buf, write
-        // into arena.{q,k,v,gate}_proj_buf.
-        //
-        // ADR-034 task #94 (2026-05-21) — fused dual Q4_0 projection path.
-        // When HF2Q_FUSED_QKVG=1, dispatch 2 fused kernels (q+gate and k+v)
-        // instead of 4 separate quantized_matmul_ggml calls. Each fused
-        // kernel loads x_norm ONCE and computes both projections inline,
-        // saving 1 dispatch per pair. Net: 4 dispatches → 2 dispatches per
-        // FA layer × 16 FA layers = 32 dispatches saved per verifier
-        // forward at seq=2.
-        //
-        // Parity gate: mlx-native parity tests at m=1, m=2, m=4 all PASS
-        // (byte-identical to unfused at 1e-5 F32 tolerance) — see
-        // adr_034_task94_fused_dual_proj_q4_0_parity at HEAD adca132.
-        //
-        // Eligibility:
-        //   - HF2Q_FUSED_QKVG=1
-        //   - weights are Q4_0 (DType::U8). FA weights are ALWAYS Q4_0 per
-        //     FullAttnWeightsGpu::from_cpu line 334-337 — universal path.
-        // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
-        // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
-        // to ensure we're not feeding the kernel some other U8-packed quant.
-        const Q4_0_BLOCK_BYTES: usize = 18;
-        const Q4_0_BLOCK_VALUES: u32 = 32;
-        let q_w_bytes_expected = (q_total as usize)
-            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
-            * Q4_0_BLOCK_BYTES;
-        let kv_w_bytes_expected = (kv_total as usize)
-            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
-            * Q4_0_BLOCK_BYTES;
-        let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
-            buf.dtype() == DType::U8 && buf.byte_len() == expected
-        };
-        let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
-            && hidden_size % Q4_0_BLOCK_VALUES == 0
-            && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
-            && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
-            && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
-            && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
-        if use_fused_qkvg {
-            // Fused Q + gate (both [hidden, q_total]).
-            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+            // Op 1: pre-attention RMSNorm → arena.x_norm_buf
+            apply_pre_attn_rms_norm_into(
                 enc.encoder(),
                 registry,
                 device,
-                &weights_gpu.wq,
-                &weights_gpu.w_gate,
+                x,
+                weights_gpu,
                 &arena.x_norm_buf,
-                &arena.q_proj_buf,
-                &arena.gate_proj_buf,
-                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
-                    m: seq_len,
-                    output_size: q_total,
-                    hidden_size,
-                },
+                &arena.pre_norm_params_buf,
+                seq_len,
+                hidden_size,
             )?;
-            // Fused K + V (both [hidden, kv_total]).
-            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
-                enc.encoder(),
-                registry,
-                device,
-                &weights_gpu.wk,
-                &weights_gpu.wv,
-                &arena.x_norm_buf,
-                &arena.k_proj_buf,
-                &arena.v_proj_buf,
-                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
-                    m: seq_len,
-                    output_size: kv_total,
-                    hidden_size,
-                },
-            )?;
-        } else {
-            apply_linear_projection_f32_into(
-                enc.encoder(), registry, device, &arena.x_norm_buf,
-                &weights_gpu.wq, &mut arena.q_proj_buf,
-                seq_len, hidden_size, q_total,
-            )?;
-            apply_linear_projection_f32_into(
-                enc.encoder(), registry, device, &arena.x_norm_buf,
-                &weights_gpu.wk, &mut arena.k_proj_buf,
-                seq_len, hidden_size, kv_total,
-            )?;
-            apply_linear_projection_f32_into(
-                enc.encoder(), registry, device, &arena.x_norm_buf,
-                &weights_gpu.wv, &mut arena.v_proj_buf,
-                seq_len, hidden_size, kv_total,
-            )?;
-            apply_linear_projection_f32_into(
-                enc.encoder(), registry, device, &arena.x_norm_buf,
-                &weights_gpu.w_gate, &mut arena.gate_proj_buf,
-                seq_len, hidden_size, q_total,
-            )?;
-        }
-        // Barrier: ops 3 read from q_proj/k_proj written above.
-        enc.encoder().memory_barrier();
-
-        // Op 3: per-head RMSNorm on Q and K (shared params from arena).
-        apply_q_or_k_per_head_rms_norm_into(
-            enc.encoder(), registry, device, &arena.q_proj_buf,
-            &weights_gpu.attn_q_norm, &arena.q_normed_buf,
-            &arena.qk_rms_params_buf, seq_len, n_heads, head_dim,
-        )?;
-        apply_q_or_k_per_head_rms_norm_into(
-            enc.encoder(), registry, device, &arena.k_proj_buf,
-            &weights_gpu.attn_k_norm, &arena.k_normed_buf,
-            &arena.qk_rms_params_buf, seq_len, n_kv_heads, head_dim,
-        )?;
-        // Barrier: ops 4 read from q_normed / k_normed written above.
-        enc.encoder().memory_barrier();
-
-        // Op 4: IMROPE on Q and K — params triple is in dispatch_rope_multi_cached's
-        // thread-local cache (NOT in this arena) — see apply_imrope_into doc.
-        apply_imrope_into(
-            enc.encoder(), registry, device, &arena.q_normed_buf, &arena.q_rope_buf,
-            positions, seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
-        )?;
-        apply_imrope_into(
-            enc.encoder(), registry, device, &arena.k_normed_buf, &arena.k_rope_buf,
-            positions, seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
-        )?;
-
-        // ── ADR-019 Phase 2 iter89e2-F: Stage-A unified-CB fusion ──────────
-        //
-        // When use_fused_stage_ab is true, encode kv_cache_write +
-        // fa.prefill_bridge into the SAME `enc` and issue ONE terminal
-        // commit_labeled at end of bridge. Replaces 3 separate commits:
-        //   - layer.full_attn.ops1-4      (this block)
-        //   - layer.full_attn.kv_cache_write (apply_sdpa_with_kv_cache:1706)
-        //   - fa.prefill_bridge           (apply_flash_attn_prefill_seq_major:1449)
-        //
-        // 4 -> 2 CBs per FA layer (ops6-7 still its own CB; iter89e2-G
-        // extends fusion to ops6-7).
-        //
-        // F2 invariant: arena buffers (FaPrefillArena 7 BF16, FaProjectionsArena
-        // 10 F32, persistent slot.k/slot.v) all outlive this CB by design —
-        // forward_gpu_impl owns them through the output-head terminal commit.
-        // The wider in-flight window has no F2 exposure because no buffer
-        // can drop between dispatch encode and GPU completion.
-        if use_fused_stage_ab {
-            // Take the &mut on slot + arena ONCE for the duration of this
-            // fused-stage block. Both bindings are rebound to None at the
-            // end so the SDPA-call branch (line ~2227) sees no slot/arena
-            // and does not double-dispatch (we set attn_out_fused below).
-            let slot = kv_cache_slot.as_mut().expect(
-                "use_fused_stage_ab implies kv_cache_slot.is_some()"
-            );
-            let fa_pre = fa_arena.as_mut().expect(
-                "use_fused_stage_ab implies fa_arena.is_some()"
-            );
-
-            // ADR-034 task #89 Step 3b (2026-05-21) — cur_len may now be
-            // > 0 when seq_len < 16 + head_dim == 256 (vec-small path
-            // inside fused encoder; see predicate at use_fused_stage_ab
-            // above). Pre-task-#89 invariant `cur_len_u32 == 0` is now
-            // a SUBSET of the eligibility condition, NOT the whole.
-            //
-            // ADR-040 Phase B4a-cont: per-slot cursor (slot_idx is
-            // bounds-checked above at `cur_len_for_arena`).
-            let cur_len_u32 = slot.current_len[slot_idx];
-            let max_sl = max_seq_len as usize;
-            let kv_write_tokens =
-                (seq_len as usize).min(max_sl.saturating_sub(cur_len_u32 as usize));
-            let kv_seq_len = (cur_len_u32 as usize + kv_write_tokens).min(max_sl) as u32;
-
-            // RAW barrier: kv_cache_write reads arena.k_rope_buf / arena.v_proj_buf
-            // written by ops4 (k_rope) / op2 (v_proj) above.
+            // Barrier: ops 2 read from x_norm written above.
             enc.encoder().memory_barrier();
-            if kv_write_tokens > 0 {
-                let _w5b9_kv = super::wave5b8_profile::Section::start(
-                    super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
-                );
-                // ADR-027 Phase B iter-15: F32 write + optional TQ
-                // encode (fused stage_ab prefill path).
-                write_kv_with_optional_tq_encode(
-                    enc.encoder(), registry, device,
-                    &arena.k_rope_buf, &arena.v_proj_buf,
-                    slot,
-                    n_kv_heads, head_dim, max_seq_len,
-                    cur_len_u32, kv_write_tokens as u32,
-                    slot_id,
-                ).context(
-                    "kv_cache_copy_seq_f32_dual prefill (fused stage_ab iter-15)",
+
+            // Op 2: Q/K/V/G projections — all read from arena.x_norm_buf, write
+            // into arena.{q,k,v,gate}_proj_buf.
+            //
+            // ADR-034 task #94 (2026-05-21) — fused dual Q4_0 projection path.
+            // When HF2Q_FUSED_QKVG=1, dispatch 2 fused kernels (q+gate and k+v)
+            // instead of 4 separate quantized_matmul_ggml calls. Each fused
+            // kernel loads x_norm ONCE and computes both projections inline,
+            // saving 1 dispatch per pair. Net: 4 dispatches → 2 dispatches per
+            // FA layer × 16 FA layers = 32 dispatches saved per verifier
+            // forward at seq=2.
+            //
+            // Parity gate: mlx-native parity tests at m=1, m=2, m=4 all PASS
+            // (byte-identical to unfused at 1e-5 F32 tolerance) — see
+            // adr_034_task94_fused_dual_proj_q4_0_parity at HEAD adca132.
+            //
+            // Eligibility:
+            //   - HF2Q_FUSED_QKVG=1
+            //   - weights are Q4_0 (DType::U8). FA weights are ALWAYS Q4_0 per
+            //     FullAttnWeightsGpu::from_cpu line 334-337 — universal path.
+            // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
+            // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
+            // to ensure we're not feeding the kernel some other U8-packed quant.
+            const Q4_0_BLOCK_BYTES: usize = 18;
+            const Q4_0_BLOCK_VALUES: u32 = 32;
+            let q_w_bytes_expected =
+                (q_total as usize) * (hidden_size / Q4_0_BLOCK_VALUES) as usize * Q4_0_BLOCK_BYTES;
+            let kv_w_bytes_expected =
+                (kv_total as usize) * (hidden_size / Q4_0_BLOCK_VALUES) as usize * Q4_0_BLOCK_BYTES;
+            let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
+                buf.dtype() == DType::U8 && buf.byte_len() == expected
+            };
+            let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+                && hidden_size % Q4_0_BLOCK_VALUES == 0
+                && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
+                && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
+                && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
+                && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
+            if use_fused_qkvg {
+                // Fused Q + gate (both [hidden, q_total]).
+                mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                    enc.encoder(),
+                    registry,
+                    device,
+                    &weights_gpu.wq,
+                    &weights_gpu.w_gate,
+                    &arena.x_norm_buf,
+                    &arena.q_proj_buf,
+                    &arena.gate_proj_buf,
+                    mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                        m: seq_len,
+                        output_size: q_total,
+                        hidden_size,
+                    },
+                )?;
+                // Fused K + V (both [hidden, kv_total]).
+                mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                    enc.encoder(),
+                    registry,
+                    device,
+                    &weights_gpu.wk,
+                    &weights_gpu.wv,
+                    &arena.x_norm_buf,
+                    &arena.k_proj_buf,
+                    &arena.v_proj_buf,
+                    mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                        m: seq_len,
+                        output_size: kv_total,
+                        hidden_size,
+                    },
+                )?;
+            } else {
+                apply_linear_projection_f32_into(
+                    enc.encoder(),
+                    registry,
+                    device,
+                    &arena.x_norm_buf,
+                    &weights_gpu.wq,
+                    &mut arena.q_proj_buf,
+                    seq_len,
+                    hidden_size,
+                    q_total,
+                )?;
+                apply_linear_projection_f32_into(
+                    enc.encoder(),
+                    registry,
+                    device,
+                    &arena.x_norm_buf,
+                    &weights_gpu.wk,
+                    &mut arena.k_proj_buf,
+                    seq_len,
+                    hidden_size,
+                    kv_total,
+                )?;
+                apply_linear_projection_f32_into(
+                    enc.encoder(),
+                    registry,
+                    device,
+                    &arena.x_norm_buf,
+                    &weights_gpu.wv,
+                    &mut arena.v_proj_buf,
+                    seq_len,
+                    hidden_size,
+                    kv_total,
+                )?;
+                apply_linear_projection_f32_into(
+                    enc.encoder(),
+                    registry,
+                    device,
+                    &arena.x_norm_buf,
+                    &weights_gpu.w_gate,
+                    &mut arena.gate_proj_buf,
+                    seq_len,
+                    hidden_size,
+                    q_total,
                 )?;
             }
-
-            // RAW barrier: fa.prefill_bridge reads arena.q_rope_buf /
-            // arena.k_rope_buf / arena.v_proj_buf. Independent of
-            // kv_cache_write's writes (slot.k/slot.v are not read by the
-            // bridge), but Metal MTLDispatchTypeConcurrent reorders within
-            // a CB without an explicit barrier — required for ordering
-            // correctness and profiling attribution.
+            // Barrier: ops 3 read from q_proj/k_proj written above.
             enc.encoder().memory_barrier();
 
-            // Allocate `out_seq` (the FA bridge's F32 seq-major output).
-            // Same per-call alloc shape as the wrapper at line 1411-1413
-            // — caller-owned, moved into attn_out_fused below.
-            let seq = seq_len as usize;
-            let nh = n_heads as usize;
-            let d = head_dim as usize;
-            let out_elems = seq * nh * d;
-            let out_seq = device
-                .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
-                .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
-            // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec.
-            if let Some(hold) = out_seq_hold.as_deref_mut() {
-                hold.push(out_seq.clone());
-            }
+            // Op 3: per-head RMSNorm on Q and K (shared params from arena).
+            apply_q_or_k_per_head_rms_norm_into(
+                enc.encoder(),
+                registry,
+                device,
+                &arena.q_proj_buf,
+                &weights_gpu.attn_q_norm,
+                &arena.q_normed_buf,
+                &arena.qk_rms_params_buf,
+                seq_len,
+                n_heads,
+                head_dim,
+            )?;
+            apply_q_or_k_per_head_rms_norm_into(
+                enc.encoder(),
+                registry,
+                device,
+                &arena.k_proj_buf,
+                &weights_gpu.attn_k_norm,
+                &arena.k_normed_buf,
+                &arena.qk_rms_params_buf,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+            )?;
+            // Barrier: ops 4 read from q_normed / k_normed written above.
+            enc.encoder().memory_barrier();
 
-            // Encode the FA bridge body into the SAME `enc`.
+            // Op 4: IMROPE on Q and K — params triple is in dispatch_rope_multi_cached's
+            // thread-local cache (NOT in this arena) — see apply_imrope_into doc.
+            apply_imrope_into(
+                enc.encoder(),
+                registry,
+                device,
+                &arena.q_normed_buf,
+                &arena.q_rope_buf,
+                positions,
+                seq_len,
+                n_heads,
+                head_dim,
+                rotary_dim,
+                freq_base,
+                mrope_section,
+            )?;
+            apply_imrope_into(
+                enc.encoder(),
+                registry,
+                device,
+                &arena.k_normed_buf,
+                &arena.k_rope_buf,
+                positions,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+                rotary_dim,
+                freq_base,
+                mrope_section,
+            )?;
+
+            // ── ADR-019 Phase 2 iter89e2-F: Stage-A unified-CB fusion ──────────
             //
-            // ADR-034 task #89 Step 3b (2026-05-21) — dispatch branch:
-            // - cur_len == 0: existing fresh-prefill BF16 kernel (8
-            //   dispatches + 5 intra-encoder barriers via the _into
-            //   wrapper). Byte-identical to pre-task-#89.
-            // - cur_len > 0 (only fires when predicate above allowed,
-            //   i.e. seq_len < 16 + head_dim == 256 + slot.k/v F32):
-            //   flash_attn_vec with q_seq_len = seq_len. Reads slot.k/v
-            //   F32 head-major directly (no BF16 cast of the full
-            //   capacity). Saves the prefill kernel's BF16 setup +
-            //   eliminates the launch overhead that motivated this
-            //   step (4.298 ms fa.ops1_4 at seq_len=2 cur_len>0 vs
-            //   0.422 ms at seq_len=20 cur_len=0).
+            // When use_fused_stage_ab is true, encode kv_cache_write +
+            // fa.prefill_bridge into the SAME `enc` and issue ONE terminal
+            // commit_labeled at end of bridge. Replaces 3 separate commits:
+            //   - layer.full_attn.ops1-4      (this block)
+            //   - layer.full_attn.kv_cache_write (apply_sdpa_with_kv_cache:1706)
+            //   - fa.prefill_bridge           (apply_flash_attn_prefill_seq_major:1449)
             //
-            // Buffer-lifetime contract (codex /cfa 2026-05-21): the
-            // fused encoder is deferred (moved into fused_stage_a_enc
-            // for ops6-7 fusion). Any vec-path scratch buffers MUST
-            // outlive the deferred commit. We use `pooled_alloc_buffer`
-            // from the thread-local decode_pool, which keeps allocations
-            // alive until `reset_decode_pool` is called (top of next
-            // forward) — same lifetime contract as the existing arena
-            // scratches at forward_gpu_impl level.
-            {
-                let _w5b10_kernel = super::wave5b8_profile::Section::start(
-                    super::wave5b8_profile::SectionKind::FaSdpaKernel,
-                );
-                if cur_len_u32 == 0 {
-                    apply_flash_attn_prefill_seq_major_into(
-                        enc.encoder(), device, registry,
-                        &arena.q_rope_buf, &arena.k_rope_buf, &arena.v_proj_buf,
-                        &out_seq,
-                        seq_len, n_heads, n_kv_heads, head_dim,
-                        fa_pre,
-                    )?;
-                } else {
-                    // ── ADR-034 task #89 Step 3b vec-small inside fused ──
-                    //
-                    // Pooled-alloc q_hm (head-major Q) + tmp (qL-aware).
-                    // Both live in the thread-local decode_pool which
-                    // is reset only at the top of the NEXT forward —
-                    // so they outlive the deferred commit by design.
-                    let q_hm = super::decode_pool::pooled_alloc_buffer(
+            // 4 -> 2 CBs per FA layer (ops6-7 still its own CB; iter89e2-G
+            // extends fusion to ops6-7).
+            //
+            // F2 invariant: arena buffers (FaPrefillArena 7 BF16, FaProjectionsArena
+            // 10 F32, persistent slot.k/slot.v) all outlive this CB by design —
+            // forward_gpu_impl owns them through the output-head terminal commit.
+            // The wider in-flight window has no F2 exposure because no buffer
+            // can drop between dispatch encode and GPU completion.
+            if use_fused_stage_ab {
+                // Take the &mut on slot + arena ONCE for the duration of this
+                // fused-stage block. Both bindings are rebound to None at the
+                // end so the SDPA-call branch (line ~2227) sees no slot/arena
+                // and does not double-dispatch (we set attn_out_fused below).
+                let slot = kv_cache_slot
+                    .as_mut()
+                    .expect("use_fused_stage_ab implies kv_cache_slot.is_some()");
+                let fa_pre = fa_arena
+                    .as_mut()
+                    .expect("use_fused_stage_ab implies fa_arena.is_some()");
+
+                // ADR-034 task #89 Step 3b (2026-05-21) — cur_len may now be
+                // > 0 when seq_len < 16 + head_dim == 256 (vec-small path
+                // inside fused encoder; see predicate at use_fused_stage_ab
+                // above). Pre-task-#89 invariant `cur_len_u32 == 0` is now
+                // a SUBSET of the eligibility condition, NOT the whole.
+                //
+                // ADR-040 Phase B4a-cont: per-slot cursor (slot_idx is
+                // bounds-checked above at `cur_len_for_arena`).
+                let cur_len_u32 = slot.current_len[slot_idx];
+                let max_sl = max_seq_len as usize;
+                let kv_write_tokens =
+                    (seq_len as usize).min(max_sl.saturating_sub(cur_len_u32 as usize));
+                let kv_seq_len = (cur_len_u32 as usize + kv_write_tokens).min(max_sl) as u32;
+
+                // RAW barrier: kv_cache_write reads arena.k_rope_buf / arena.v_proj_buf
+                // written by ops4 (k_rope) / op2 (v_proj) above.
+                enc.encoder().memory_barrier();
+                if kv_write_tokens > 0 {
+                    let _w5b9_kv = super::wave5b8_profile::Section::start(
+                        super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
+                    );
+                    // ADR-027 Phase B iter-15: F32 write + optional TQ
+                    // encode (fused stage_ab prefill path).
+                    write_kv_with_optional_tq_encode(
+                        enc.encoder(),
+                        registry,
                         device,
-                        (seq * nh * d) * 4,
-                        DType::F32,
-                        vec![nh, seq, d],
-                    )
-                    .map_err(|e| anyhow!(
-                        "vec-small in fused stage: alloc q_hm: {e}"
-                    ))?;
-                    let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(
-                        n_heads, head_dim, seq_len,
-                    );
-                    let tmp_elems = tmp_bytes / 4;
-                    let tmp_buf = super::decode_pool::pooled_alloc_buffer(
-                        device, tmp_bytes, DType::F32, vec![tmp_elems],
-                    )
-                    .map_err(|e| anyhow!(
-                        "vec-small in fused stage: alloc tmp: {e}"
-                    ))?;
-
-                    // Permute arena.q_rope_buf SEQ-MAJOR [seq, nh, d]
-                    // → HEAD-MAJOR [nh, seq, d] into the SAME encoder.
-                    permute_021_f32(
-                        enc.encoder(), registry, device.metal_device(),
-                        &arena.q_rope_buf, &q_hm,
-                        seq, nh, d,
-                    )
-                    .context("vec-small in fused stage: permute Q seq->head")?;
-                    // RAW barrier: vec kernel reads q_hm just written.
-                    enc.encoder().memory_barrier();
-
-                    // slot.k / slot.v are F32 head-major at full
-                    // kv_capacity stride. The vec kernel reads them in
-                    // that exact layout (see flash_attn_vec.metal:131-135).
-                    // Predicate guard above ensures both are Some.
-                    let kbuf = slot.k.as_ref().expect(
-                        "vec-small in fused stage: slot.k.is_some() by predicate",
-                    );
-                    let vbuf = slot.v.as_ref().expect(
-                        "vec-small in fused stage: slot.v.is_some() by predicate",
-                    );
-                    // ADR-040 Phase B4a-cont: slice_view per-slot K/V
-                    // region for the vec-small-in-fused-stage path.
-                    let (so_off, so_n) = slot_k_v_region_for_full_attn(
-                        slot_id, n_kv_heads, max_seq_len, head_dim);
-                    let kbuf_view = kbuf.slice_view(so_off, so_n);
-                    let vbuf_view = vbuf.slice_view(so_off, so_n);
-
-                    let vec_params = FlashAttnVecParams {
-                        num_heads: n_heads,
-                        num_kv_heads: n_kv_heads,
+                        &arena.k_rope_buf,
+                        &arena.v_proj_buf,
+                        slot,
+                        n_kv_heads,
                         head_dim,
-                        kv_seq_len,
-                        kv_capacity: max_seq_len,
-                        scale: 1.0 / (d as f32).sqrt(),
-                        mask_type: 1, // causal
-                        sliding_window: 0,
-                        softcap: 0.0,
-                        q_seq_len: seq_len,
-                    };
-                    flash_attn_vec(
-                        enc.encoder(), registry, device,
-                        &q_hm, &kbuf_view, &vbuf_view, &out_seq, &tmp_buf,
-                        &vec_params,
+                        max_seq_len,
+                        cur_len_u32,
+                        kv_write_tokens as u32,
+                        slot_id,
                     )
-                    .context("vec-small in fused stage: flash_attn_vec dispatch")?;
+                    .context("kv_cache_copy_seq_f32_dual prefill (fused stage_ab iter-15)")?;
+                }
 
-                    // Push pooled clones into the K-batch hold-vec when
-                    // present, mirroring the existing out_seq hold pattern
-                    // (line ~3247). Defends against cross-iteration drop
-                    // races even though pooled buffers' lifetimes already
-                    // extend to next reset_decode_pool.
-                    if let Some(hold) = out_seq_hold.as_deref_mut() {
-                        hold.push(q_hm.clone());
-                        hold.push(tmp_buf.clone());
+                // RAW barrier: fa.prefill_bridge reads arena.q_rope_buf /
+                // arena.k_rope_buf / arena.v_proj_buf. Independent of
+                // kv_cache_write's writes (slot.k/slot.v are not read by the
+                // bridge), but Metal MTLDispatchTypeConcurrent reorders within
+                // a CB without an explicit barrier — required for ordering
+                // correctness and profiling attribution.
+                enc.encoder().memory_barrier();
+
+                // Allocate `out_seq` (the FA bridge's F32 seq-major output).
+                // Same per-call alloc shape as the wrapper at line 1411-1413
+                // — caller-owned, moved into attn_out_fused below.
+                let seq = seq_len as usize;
+                let nh = n_heads as usize;
+                let d = head_dim as usize;
+                let out_elems = seq * nh * d;
+                let out_seq = device
+                    .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
+                    .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
+                // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec.
+                if let Some(hold) = out_seq_hold.as_deref_mut() {
+                    hold.push(out_seq.clone());
+                }
+
+                // Encode the FA bridge body into the SAME `enc`.
+                //
+                // ADR-034 task #89 Step 3b (2026-05-21) — dispatch branch:
+                // - cur_len == 0: existing fresh-prefill BF16 kernel (8
+                //   dispatches + 5 intra-encoder barriers via the _into
+                //   wrapper). Byte-identical to pre-task-#89.
+                // - cur_len > 0 (only fires when predicate above allowed,
+                //   i.e. seq_len < 16 + head_dim == 256 + slot.k/v F32):
+                //   flash_attn_vec with q_seq_len = seq_len. Reads slot.k/v
+                //   F32 head-major directly (no BF16 cast of the full
+                //   capacity). Saves the prefill kernel's BF16 setup +
+                //   eliminates the launch overhead that motivated this
+                //   step (4.298 ms fa.ops1_4 at seq_len=2 cur_len>0 vs
+                //   0.422 ms at seq_len=20 cur_len=0).
+                //
+                // Buffer-lifetime contract (codex /cfa 2026-05-21): the
+                // fused encoder is deferred (moved into fused_stage_a_enc
+                // for ops6-7 fusion). Any vec-path scratch buffers MUST
+                // outlive the deferred commit. We use `pooled_alloc_buffer`
+                // from the thread-local decode_pool, which keeps allocations
+                // alive until `reset_decode_pool` is called (top of next
+                // forward) — same lifetime contract as the existing arena
+                // scratches at forward_gpu_impl level.
+                {
+                    let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                        super::wave5b8_profile::SectionKind::FaSdpaKernel,
+                    );
+                    if cur_len_u32 == 0 {
+                        apply_flash_attn_prefill_seq_major_into(
+                            enc.encoder(),
+                            device,
+                            registry,
+                            &arena.q_rope_buf,
+                            &arena.k_rope_buf,
+                            &arena.v_proj_buf,
+                            &out_seq,
+                            seq_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            fa_pre,
+                        )?;
+                    } else {
+                        // ── ADR-034 task #89 Step 3b vec-small inside fused ──
+                        //
+                        // Pooled-alloc q_hm (head-major Q) + tmp (qL-aware).
+                        // Both live in the thread-local decode_pool which
+                        // is reset only at the top of the NEXT forward —
+                        // so they outlive the deferred commit by design.
+                        let q_hm = super::decode_pool::pooled_alloc_buffer(
+                            device,
+                            (seq * nh * d) * 4,
+                            DType::F32,
+                            vec![nh, seq, d],
+                        )
+                        .map_err(|e| anyhow!("vec-small in fused stage: alloc q_hm: {e}"))?;
+                        let tmp_bytes =
+                            flash_attn_vec_tmp_bytes_with_qL(n_heads, head_dim, seq_len);
+                        let tmp_elems = tmp_bytes / 4;
+                        let tmp_buf = super::decode_pool::pooled_alloc_buffer(
+                            device,
+                            tmp_bytes,
+                            DType::F32,
+                            vec![tmp_elems],
+                        )
+                        .map_err(|e| anyhow!("vec-small in fused stage: alloc tmp: {e}"))?;
+
+                        // Permute arena.q_rope_buf SEQ-MAJOR [seq, nh, d]
+                        // → HEAD-MAJOR [nh, seq, d] into the SAME encoder.
+                        permute_021_f32(
+                            enc.encoder(),
+                            registry,
+                            device.metal_device(),
+                            &arena.q_rope_buf,
+                            &q_hm,
+                            seq,
+                            nh,
+                            d,
+                        )
+                        .context("vec-small in fused stage: permute Q seq->head")?;
+                        // RAW barrier: vec kernel reads q_hm just written.
+                        enc.encoder().memory_barrier();
+
+                        // slot.k / slot.v are F32 head-major at full
+                        // kv_capacity stride. The vec kernel reads them in
+                        // that exact layout (see flash_attn_vec.metal:131-135).
+                        // Predicate guard above ensures both are Some.
+                        let kbuf = slot
+                            .k
+                            .as_ref()
+                            .expect("vec-small in fused stage: slot.k.is_some() by predicate");
+                        let vbuf = slot
+                            .v
+                            .as_ref()
+                            .expect("vec-small in fused stage: slot.v.is_some() by predicate");
+                        // ADR-040 Phase B4a-cont: slice_view per-slot K/V
+                        // region for the vec-small-in-fused-stage path.
+                        let (so_off, so_n) = slot_k_v_region_for_full_attn(
+                            slot_id,
+                            n_kv_heads,
+                            max_seq_len,
+                            head_dim,
+                        );
+                        let kbuf_view = kbuf.slice_view(so_off, so_n);
+                        let vbuf_view = vbuf.slice_view(so_off, so_n);
+
+                        let vec_params = FlashAttnVecParams {
+                            num_heads: n_heads,
+                            num_kv_heads: n_kv_heads,
+                            head_dim,
+                            kv_seq_len,
+                            kv_capacity: max_seq_len,
+                            scale: 1.0 / (d as f32).sqrt(),
+                            mask_type: 1, // causal
+                            sliding_window: 0,
+                            softcap: 0.0,
+                            q_seq_len: seq_len,
+                        };
+                        flash_attn_vec(
+                            enc.encoder(),
+                            registry,
+                            device,
+                            &q_hm,
+                            &kbuf_view,
+                            &vbuf_view,
+                            &out_seq,
+                            &tmp_buf,
+                            &vec_params,
+                        )
+                        .context("vec-small in fused stage: flash_attn_vec dispatch")?;
+
+                        // Push pooled clones into the K-batch hold-vec when
+                        // present, mirroring the existing out_seq hold pattern
+                        // (line ~3247). Defends against cross-iteration drop
+                        // races even though pooled buffers' lifetimes already
+                        // extend to next reset_decode_pool.
+                        if let Some(hold) = out_seq_hold.as_deref_mut() {
+                            hold.push(q_hm.clone());
+                            hold.push(tmp_buf.clone());
+                        }
+                        // We do NOT drop q_hm / tmp_buf here — they're held
+                        // by the decode_pool's in_use list (ARC) until the
+                        // next reset_decode_pool. The encoder's pending
+                        // dispatches reference them via the encode call.
+                        let _ = (q_hm, tmp_buf);
                     }
-                    // We do NOT drop q_hm / tmp_buf here — they're held
-                    // by the decode_pool's in_use list (ARC) until the
-                    // next reset_decode_pool. The encoder's pending
-                    // dispatches reference them via the encode call.
-                    let _ = (q_hm, tmp_buf);
+                }
+
+                // Update KV cursor (CPU-only counter; safe before GPU completes).
+                //
+                // ADR-040 Phase B4a-cont: per-slot cursor write.
+                slot.current_len[slot_idx] = kv_seq_len;
+
+                // ADR-019 Phase 2 iter89e2-G: defer the Stage-A terminal commit
+                // by moving `enc` into the function-scope Option. The ops6-7
+                // block consumes it, encodes sigmoid_gate_multiply + linear_proj
+                // into the SAME encoder, and issues the single terminal
+                // commit_labeled("layer.full_attn.stage_a") covering all 4 FA-layer
+                // ops (ops1-4 + kv_cache_write + fa.prefill_bridge + ops6-7).
+                //
+                // F2 invariant: Both arenas (FaPrefillArena 7 BF16 scratches,
+                // FaProjectionsArena 10 F32 scratches including gated_buf for
+                // ops6) plus persistent slot.k/slot.v plus the caller-owned
+                // out_seq outlive the deferred CB by design — forward_gpu_impl
+                // owns the arenas through the output-head terminal
+                // commit_and_wait_labeled, and `out` (linear_proj output) is on
+                // the Rust stack of forward_gpu_impl until consumed by
+                // dispatch_fused_residual_norm_f32. The wider in-flight CB
+                // window has zero F2 exposure: no buffer can drop between
+                // dispatch encode and GPU completion. iter58b race structurally
+                // unreachable.
+                fused_stage_a_enc = Some(enc);
+
+                // Hand attn_out to the post-SDPA control flow; suppress the
+                // legacy SDPA dispatch by consuming fa_arena + kv_cache_slot.
+                attn_out_fused = Some(out_seq);
+                fa_arena = None;
+                kv_cache_slot = None;
+            } else {
+                // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
+                // Metal serial queue guarantees ops1-4 completes before SDPA starts.
+                // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
+                // calls download_f32 so no CPU buffer access races.
+                //
+                // Prefill path (seq>1) without arena: commit_and_wait()
+                // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
+                // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
+                // GPU must have finished writing those buffers before we return.
+                //
+                // Decode (seq=1) only: GPU-only path, safe to commit_labeled.
+                // Prefill (seq>1): apply_sdpa_with_kv_cache (legacy path) unconditionally
+                // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
+                // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
+                // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
+                // ADR-013 P21 Stage 2 (2026-05-01): KV-cache write is now a GPU
+                // dispatch (kv_cache_copy_seq_f32_dual at apply_sdpa_with_kv_cache:1380),
+                // eliminating the download_f32(k_seq_major)/download_f32(v_seq_major)
+                // calls that previously required commit_and_wait here for the
+                // as_slice "no GPU writer in flight" contract. With use_arena=true
+                // (Stage 1 FaPrefillArena keeps scratches alive past commit), we can
+                // safely commit_labeled in prefill too — the FA bridge dispatch runs
+                // on the same Metal serial queue and orders after ops1-4 by GPU
+                // queue ordering. iter58b residency-rescission is prevented by the
+                // FaPrefillArena lifetime (scratches don't drop until end of prefill).
+                // ADR-019 Phase 2 iter90: SUBSET site (spec §1.6) — only fires
+                // when use_fused_stage_ab is FALSE (fusion-OFF fallback). NOT
+                // wired through fence_or_commit in iter90 default scope; left
+                // as a STAGE_FENCE candidate for §1.6 follow-on. The Plain
+                // arm of LayerEncoder calls inner.commit_labeled exactly as
+                // pre-iter90; on the Sessioned arm we still get the equivalent
+                // structural behavior (commit boundary, no fence).
+                if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
+                    enc.fence_or_commit("layer.full_attn.ops1-4")
+                        .context("fence/commit ops1-4 (use_arena/decode)")?;
+                } else {
+                    enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
+                        .context("commit ops1-4 prefill (proj arena)")?;
                 }
             }
 
-            // Update KV cursor (CPU-only counter; safe before GPU completes).
-            //
-            // ADR-040 Phase B4a-cont: per-slot cursor write.
-            slot.current_len[slot_idx] = kv_seq_len;
-
-            // ADR-019 Phase 2 iter89e2-G: defer the Stage-A terminal commit
-            // by moving `enc` into the function-scope Option. The ops6-7
-            // block consumes it, encodes sigmoid_gate_multiply + linear_proj
-            // into the SAME encoder, and issues the single terminal
-            // commit_labeled("layer.full_attn.stage_a") covering all 4 FA-layer
-            // ops (ops1-4 + kv_cache_write + fa.prefill_bridge + ops6-7).
-            //
-            // F2 invariant: Both arenas (FaPrefillArena 7 BF16 scratches,
-            // FaProjectionsArena 10 F32 scratches including gated_buf for
-            // ops6) plus persistent slot.k/slot.v plus the caller-owned
-            // out_seq outlive the deferred CB by design — forward_gpu_impl
-            // owns the arenas through the output-head terminal
-            // commit_and_wait_labeled, and `out` (linear_proj output) is on
-            // the Rust stack of forward_gpu_impl until consumed by
-            // dispatch_fused_residual_norm_f32. The wider in-flight CB
-            // window has zero F2 exposure: no buffer can drop between
-            // dispatch encode and GPU completion. iter58b race structurally
-            // unreachable.
-            fused_stage_a_enc = Some(enc);
-
-            // Hand attn_out to the post-SDPA control flow; suppress the
-            // legacy SDPA dispatch by consuming fa_arena + kv_cache_slot.
-            attn_out_fused = Some(out_seq);
-            fa_arena = None;
-            kv_cache_slot = None;
+            // ARC clones from the arena are returned to the outer-scope tuple.
+            // Each clone is just a refcount bump on the underlying Metal buffer;
+            // the arena slot is conceptually borrowed for the rest of the layer.
+            // The next FA layer overwrites these slots only AFTER its own enc
+            // commit submits to the Metal serial queue — by which time all
+            // CBs that read these clones have already been queued ahead.
+            (
+                arena.x_norm_buf.clone(),
+                arena.q_proj_buf.clone(),
+                arena.k_proj_buf.clone(),
+                arena.v_proj_buf.clone(),
+                arena.gate_proj_buf.clone(),
+                arena.q_normed_buf.clone(),
+                arena.k_normed_buf.clone(),
+                arena.q_rope_buf.clone(),
+                arena.k_rope_buf.clone(),
+            )
         } else {
+            let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaOps1to4,
+            );
+            let mut enc = device.command_encoder().context("enc ops1-4")?;
+
+            // Op 1: pre-attention RMSNorm → x_norm
+            let x_norm = apply_pre_attn_rms_norm(
+                &mut enc,
+                registry,
+                device,
+                x,
+                weights_gpu,
+                seq_len,
+                hidden_size,
+                rms_norm_eps,
+            )?;
+            // Barrier: ops 2 read from x_norm written above.
+            enc.memory_barrier();
+
+            // Op 2: Q/K/V/G projections (all read from x_norm).
+            //
+            // ADR-034 task #94 (2026-05-21) — fused dual Q4_0 path also wired
+            // into this non-arena (seq=1 decode) site. Arena (seq>1) wiring at
+            // line ~2946 mirrors this. Saves 2 dispatches per FA layer × 16 FA
+            // layers = 32 saved dispatches per base decode token. At seq=1 the
+            // launch-overhead-bound regime makes this measurable (per cont. 16
+            // fused MLP shipped +4.1%).
+            // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
+            // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
+            // to ensure we're not feeding the kernel some other U8-packed quant.
+            const Q4_0_BLOCK_BYTES: usize = 18;
+            const Q4_0_BLOCK_VALUES: u32 = 32;
+            let q_w_bytes_expected =
+                (q_total as usize) * (hidden_size / Q4_0_BLOCK_VALUES) as usize * Q4_0_BLOCK_BYTES;
+            let kv_w_bytes_expected =
+                (kv_total as usize) * (hidden_size / Q4_0_BLOCK_VALUES) as usize * Q4_0_BLOCK_BYTES;
+            let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
+                buf.dtype() == DType::U8 && buf.byte_len() == expected
+            };
+            let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+                && hidden_size % Q4_0_BLOCK_VALUES == 0
+                && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
+                && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
+                && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
+                && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
+            let (q_flat, k_flat, v_flat, gate_flat) = if use_fused_qkvg {
+                // Allocate 4 destination buffers via the pool (same as helper
+                // does internally) so the fused dispatch can write all 4.
+                let q_bytes = (seq_len * q_total) as usize * 4;
+                let kv_bytes = (seq_len * kv_total) as usize * 4;
+                let q_flat = super::decode_pool::pooled_alloc_buffer(
+                    device,
+                    q_bytes,
+                    DType::F32,
+                    vec![seq_len as usize, q_total as usize],
+                )
+                .map_err(|e| anyhow!("alloc q_flat (qkvg fused): {e}"))?;
+                let gate_flat = super::decode_pool::pooled_alloc_buffer(
+                    device,
+                    q_bytes,
+                    DType::F32,
+                    vec![seq_len as usize, q_total as usize],
+                )
+                .map_err(|e| anyhow!("alloc gate_flat (qkvg fused): {e}"))?;
+                let k_flat = super::decode_pool::pooled_alloc_buffer(
+                    device,
+                    kv_bytes,
+                    DType::F32,
+                    vec![seq_len as usize, kv_total as usize],
+                )
+                .map_err(|e| anyhow!("alloc k_flat (qkvg fused): {e}"))?;
+                let v_flat = super::decode_pool::pooled_alloc_buffer(
+                    device,
+                    kv_bytes,
+                    DType::F32,
+                    vec![seq_len as usize, kv_total as usize],
+                )
+                .map_err(|e| anyhow!("alloc v_flat (qkvg fused): {e}"))?;
+                // Fused Q + gate.
+                mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                    &mut enc,
+                    registry,
+                    device,
+                    &weights_gpu.wq,
+                    &weights_gpu.w_gate,
+                    &x_norm,
+                    &q_flat,
+                    &gate_flat,
+                    mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                        m: seq_len,
+                        output_size: q_total,
+                        hidden_size,
+                    },
+                )?;
+                // Fused K + V.
+                mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                    &mut enc,
+                    registry,
+                    device,
+                    &weights_gpu.wk,
+                    &weights_gpu.wv,
+                    &x_norm,
+                    &k_flat,
+                    &v_flat,
+                    mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                        m: seq_len,
+                        output_size: kv_total,
+                        hidden_size,
+                    },
+                )?;
+                (q_flat, k_flat, v_flat, gate_flat)
+            } else {
+                // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
+                // (prefill) auto-falls-back to unpooled inside the helper because some
+                // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
+                let q_flat = apply_linear_projection_f32_pooled(
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    &weights_gpu.wq,
+                    seq_len,
+                    hidden_size,
+                    q_total,
+                )?;
+                let k_flat = apply_linear_projection_f32_pooled(
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    &weights_gpu.wk,
+                    seq_len,
+                    hidden_size,
+                    kv_total,
+                )?;
+                let v_flat = apply_linear_projection_f32_pooled(
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    &weights_gpu.wv,
+                    seq_len,
+                    hidden_size,
+                    kv_total,
+                )?;
+                let gate_flat = apply_linear_projection_f32_pooled(
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    &weights_gpu.w_gate,
+                    seq_len,
+                    hidden_size,
+                    q_total,
+                )?;
+                (q_flat, k_flat, v_flat, gate_flat)
+            };
+            // Barrier: ops 3 read from q_flat / k_flat written above.
+            enc.memory_barrier();
+
+            // Op 3: per-head RMSNorm on Q and K
+            let q_normed = apply_q_or_k_per_head_rms_norm(
+                &mut enc,
+                registry,
+                device,
+                &q_flat,
+                &weights_gpu.attn_q_norm,
+                seq_len,
+                n_heads,
+                head_dim,
+                rms_norm_eps,
+            )?;
+            let k_normed = apply_q_or_k_per_head_rms_norm(
+                &mut enc,
+                registry,
+                device,
+                &k_flat,
+                &weights_gpu.attn_k_norm,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+                rms_norm_eps,
+            )?;
+            // Barrier: ops 4 read from q_normed / k_normed written above.
+            enc.memory_barrier();
+
+            // Op 4: IMROPE on Q and K
+            let q_rope = apply_imrope(
+                &mut enc,
+                registry,
+                device,
+                &q_normed,
+                positions,
+                seq_len,
+                n_heads,
+                head_dim,
+                rotary_dim,
+                freq_base,
+                mrope_section,
+            )?;
+            let k_rope = apply_imrope(
+                &mut enc,
+                registry,
+                device,
+                &k_normed,
+                positions,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+                rotary_dim,
+                freq_base,
+                mrope_section,
+            )?;
+
             // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
             // Metal serial queue guarantees ops1-4 completes before SDPA starts.
             // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
@@ -5727,204 +6713,16 @@ pub fn build_gated_attn_layer(
             // on the same Metal serial queue and orders after ops1-4 by GPU
             // queue ordering. iter58b residency-rescission is prevented by the
             // FaPrefillArena lifetime (scratches don't drop until end of prefill).
-            // ADR-019 Phase 2 iter90: SUBSET site (spec §1.6) — only fires
-            // when use_fused_stage_ab is FALSE (fusion-OFF fallback). NOT
-            // wired through fence_or_commit in iter90 default scope; left
-            // as a STAGE_FENCE candidate for §1.6 follow-on. The Plain
-            // arm of LayerEncoder calls inner.commit_labeled exactly as
-            // pre-iter90; on the Sessioned arm we still get the equivalent
-            // structural behavior (commit boundary, no fence).
             if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
-                enc.fence_or_commit("layer.full_attn.ops1-4")
-                    .context("fence/commit ops1-4 (use_arena/decode)")?;
+                enc.commit_labeled("layer.full_attn.ops1-4");
             } else {
                 enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
-                    .context("commit ops1-4 prefill (proj arena)")?;
+                    .context("commit ops1-4 prefill")?;
             }
-        }
-
-        // ARC clones from the arena are returned to the outer-scope tuple.
-        // Each clone is just a refcount bump on the underlying Metal buffer;
-        // the arena slot is conceptually borrowed for the rest of the layer.
-        // The next FA layer overwrites these slots only AFTER its own enc
-        // commit submits to the Metal serial queue — by which time all
-        // CBs that read these clones have already been queued ahead.
-        (
-            arena.x_norm_buf.clone(),
-            arena.q_proj_buf.clone(),
-            arena.k_proj_buf.clone(),
-            arena.v_proj_buf.clone(),
-            arena.gate_proj_buf.clone(),
-            arena.q_normed_buf.clone(),
-            arena.k_normed_buf.clone(),
-            arena.q_rope_buf.clone(),
-            arena.k_rope_buf.clone(),
-        )
-    } else {
-        let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
-            super::wave5b8_profile::SectionKind::FaOps1to4,
-        );
-        let mut enc = device.command_encoder().context("enc ops1-4")?;
-
-        // Op 1: pre-attention RMSNorm → x_norm
-        let x_norm = apply_pre_attn_rms_norm(
-            &mut enc, registry, device, x, weights_gpu,
-            seq_len, hidden_size, rms_norm_eps,
-        )?;
-        // Barrier: ops 2 read from x_norm written above.
-        enc.memory_barrier();
-
-        // Op 2: Q/K/V/G projections (all read from x_norm).
-        //
-        // ADR-034 task #94 (2026-05-21) — fused dual Q4_0 path also wired
-        // into this non-arena (seq=1 decode) site. Arena (seq>1) wiring at
-        // line ~2946 mirrors this. Saves 2 dispatches per FA layer × 16 FA
-        // layers = 32 saved dispatches per base decode token. At seq=1 the
-        // launch-overhead-bound regime makes this measurable (per cont. 16
-        // fused MLP shipped +4.1%).
-        // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
-        // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
-        // to ensure we're not feeding the kernel some other U8-packed quant.
-        const Q4_0_BLOCK_BYTES: usize = 18;
-        const Q4_0_BLOCK_VALUES: u32 = 32;
-        let q_w_bytes_expected = (q_total as usize)
-            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
-            * Q4_0_BLOCK_BYTES;
-        let kv_w_bytes_expected = (kv_total as usize)
-            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
-            * Q4_0_BLOCK_BYTES;
-        let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
-            buf.dtype() == DType::U8 && buf.byte_len() == expected
+            (
+                x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope,
+            )
         };
-        let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
-            && hidden_size % Q4_0_BLOCK_VALUES == 0
-            && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
-            && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
-            && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
-            && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
-        let (q_flat, k_flat, v_flat, gate_flat) = if use_fused_qkvg {
-            // Allocate 4 destination buffers via the pool (same as helper
-            // does internally) so the fused dispatch can write all 4.
-            let q_bytes = (seq_len * q_total) as usize * 4;
-            let kv_bytes = (seq_len * kv_total) as usize * 4;
-            let q_flat = super::decode_pool::pooled_alloc_buffer(
-                device, q_bytes, DType::F32,
-                vec![seq_len as usize, q_total as usize],
-            )
-            .map_err(|e| anyhow!("alloc q_flat (qkvg fused): {e}"))?;
-            let gate_flat = super::decode_pool::pooled_alloc_buffer(
-                device, q_bytes, DType::F32,
-                vec![seq_len as usize, q_total as usize],
-            )
-            .map_err(|e| anyhow!("alloc gate_flat (qkvg fused): {e}"))?;
-            let k_flat = super::decode_pool::pooled_alloc_buffer(
-                device, kv_bytes, DType::F32,
-                vec![seq_len as usize, kv_total as usize],
-            )
-            .map_err(|e| anyhow!("alloc k_flat (qkvg fused): {e}"))?;
-            let v_flat = super::decode_pool::pooled_alloc_buffer(
-                device, kv_bytes, DType::F32,
-                vec![seq_len as usize, kv_total as usize],
-            )
-            .map_err(|e| anyhow!("alloc v_flat (qkvg fused): {e}"))?;
-            // Fused Q + gate.
-            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
-                &mut enc, registry, device,
-                &weights_gpu.wq, &weights_gpu.w_gate, &x_norm,
-                &q_flat, &gate_flat,
-                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
-                    m: seq_len, output_size: q_total, hidden_size,
-                },
-            )?;
-            // Fused K + V.
-            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
-                &mut enc, registry, device,
-                &weights_gpu.wk, &weights_gpu.wv, &x_norm,
-                &k_flat, &v_flat,
-                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
-                    m: seq_len, output_size: kv_total, hidden_size,
-                },
-            )?;
-            (q_flat, k_flat, v_flat, gate_flat)
-        } else {
-            // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
-            // (prefill) auto-falls-back to unpooled inside the helper because some
-            // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
-            let q_flat = apply_linear_projection_f32_pooled(
-                &mut enc, registry, device, &x_norm,
-                &weights_gpu.wq, seq_len, hidden_size, q_total,
-            )?;
-            let k_flat = apply_linear_projection_f32_pooled(
-                &mut enc, registry, device, &x_norm,
-                &weights_gpu.wk, seq_len, hidden_size, kv_total,
-            )?;
-            let v_flat = apply_linear_projection_f32_pooled(
-                &mut enc, registry, device, &x_norm,
-                &weights_gpu.wv, seq_len, hidden_size, kv_total,
-            )?;
-            let gate_flat = apply_linear_projection_f32_pooled(
-                &mut enc, registry, device, &x_norm,
-                &weights_gpu.w_gate, seq_len, hidden_size, q_total,
-            )?;
-            (q_flat, k_flat, v_flat, gate_flat)
-        };
-        // Barrier: ops 3 read from q_flat / k_flat written above.
-        enc.memory_barrier();
-
-        // Op 3: per-head RMSNorm on Q and K
-        let q_normed = apply_q_or_k_per_head_rms_norm(
-            &mut enc, registry, device, &q_flat,
-            &weights_gpu.attn_q_norm, seq_len, n_heads, head_dim, rms_norm_eps,
-        )?;
-        let k_normed = apply_q_or_k_per_head_rms_norm(
-            &mut enc, registry, device, &k_flat,
-            &weights_gpu.attn_k_norm, seq_len, n_kv_heads, head_dim, rms_norm_eps,
-        )?;
-        // Barrier: ops 4 read from q_normed / k_normed written above.
-        enc.memory_barrier();
-
-        // Op 4: IMROPE on Q and K
-        let q_rope = apply_imrope(
-            &mut enc, registry, device, &q_normed, positions,
-            seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
-        )?;
-        let k_rope = apply_imrope(
-            &mut enc, registry, device, &k_normed, positions,
-            seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
-        )?;
-
-        // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
-        // Metal serial queue guarantees ops1-4 completes before SDPA starts.
-        // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
-        // calls download_f32 so no CPU buffer access races.
-        //
-        // Prefill path (seq>1) without arena: commit_and_wait()
-        // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
-        // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
-        // GPU must have finished writing those buffers before we return.
-        //
-        // Decode (seq=1) only: GPU-only path, safe to commit_labeled.
-        // Prefill (seq>1): apply_sdpa_with_kv_cache (legacy path) unconditionally
-        // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
-        // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
-        // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
-        // ADR-013 P21 Stage 2 (2026-05-01): KV-cache write is now a GPU
-        // dispatch (kv_cache_copy_seq_f32_dual at apply_sdpa_with_kv_cache:1380),
-        // eliminating the download_f32(k_seq_major)/download_f32(v_seq_major)
-        // calls that previously required commit_and_wait here for the
-        // as_slice "no GPU writer in flight" contract. With use_arena=true
-        // (Stage 1 FaPrefillArena keeps scratches alive past commit), we can
-        // safely commit_labeled in prefill too — the FA bridge dispatch runs
-        // on the same Metal serial queue and orders after ops1-4 by GPU
-        // queue ordering. iter58b residency-rescission is prevented by the
-        // FaPrefillArena lifetime (scratches don't drop until end of prefill).
-        if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
-            enc.commit_labeled("layer.full_attn.ops1-4");
-        } else {
-            enc.commit_and_wait_labeled("layer.full_attn.ops1-4").context("commit ops1-4 prefill")?;
-        }
-        (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope)
-    };
     // ADR-015 iter61a-3: dump pre-rope checkpoints BEFORE the drop below.
     // ops1-4 was committed sync for prefill, so as_slice is safe.
     super::dump_bisect::dump_in_layer(
@@ -6004,18 +6802,25 @@ pub fn build_gated_attn_layer(
         );
         let sdpa_out = match kv_cache_slot {
             Some(slot) => apply_sdpa_with_kv_cache(
-                device, registry,
-                &q_rope, &k_rope, &v_flat,
-                slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+                device,
+                registry,
+                &q_rope,
+                &k_rope,
+                &v_flat,
+                slot,
+                seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
                 fa_arena,
                 slot_id,
             )?,
             None => {
                 let mut enc = device.command_encoder().context("enc op5")?;
                 apply_sdpa_causal_from_seq_major(
-                    &mut enc, registry, device,
-                    &q_rope, &k_rope, &v_flat,
-                    seq_len, n_heads, n_kv_heads, head_dim,
+                    &mut enc, registry, device, &q_rope, &k_rope, &v_flat, seq_len, n_heads,
+                    n_kv_heads, head_dim,
                 )?
             }
         };
@@ -6047,9 +6852,8 @@ pub fn build_gated_attn_layer(
     // source differs. The byte-exact F32 parity test guards equivalence.
     let out = {
         // Wave 5b.9: per-FA-layer ops6-7 wall (gated on HF2Q_PROFILE_W5B8=1).
-        let _w5b9_ops6to7 = super::wave5b8_profile::Section::start(
-            super::wave5b8_profile::SectionKind::FaOps6to7,
-        );
+        let _w5b9_ops6to7 =
+            super::wave5b8_profile::Section::start(super::wave5b8_profile::SectionKind::FaOps6to7);
         let n_elem = seq_len * q_total;
         // ADR-019 Phase 2 iter89e2-G: when fused_stage_a_enc is Some, the
         // Stage-A encoder (carrying ops1-4 + kv_cache_write + fa.prefill_bridge
@@ -6090,18 +6894,30 @@ pub fn build_gated_attn_layer(
         if fused_into_stage_a {
             enc.encoder().memory_barrier();
         }
-        let gated = if let Some(arena) =
-            fa_proj_arena.as_ref().map(|a| &**a).filter(|_| use_proj_arena)
+        let gated = if let Some(arena) = fa_proj_arena
+            .as_ref()
+            .map(|a| &**a)
+            .filter(|_| use_proj_arena)
         {
             apply_sigmoid_gate_multiply_into(
-                enc.encoder(), registry, device,
-                &attn_out, &gate_flat, &arena.gated_buf,
-                &arena.sigmoid_params_buf, n_elem,
+                enc.encoder(),
+                registry,
+                device,
+                &attn_out,
+                &gate_flat,
+                &arena.gated_buf,
+                &arena.sigmoid_params_buf,
+                n_elem,
             )?;
             arena.gated_buf.clone()
         } else {
             apply_sigmoid_gate_multiply(
-                enc.encoder(), registry, device, &attn_out, &gate_flat, n_elem,
+                enc.encoder(),
+                registry,
+                device,
+                &attn_out,
+                &gate_flat,
+                n_elem,
             )?
         };
         // ADR-015 iter61a-4: memory_barrier between Op 6 (sigmoid_gate_multiply
@@ -6137,8 +6953,14 @@ pub fn build_gated_attn_layer(
         // submission order.
         enc.encoder().memory_barrier();
         let out = apply_linear_projection_f32_pooled(
-            enc.encoder(), registry, device, &gated,
-            &weights_gpu.wo, seq_len, q_total, hidden_size,
+            enc.encoder(),
+            registry,
+            device,
+            &gated,
+            &weights_gpu.wo,
+            seq_len,
+            q_total,
+            hidden_size,
         )?;
         // Decode fast path (seq=1): commit() without wait, and `out` is pooled.
         // The caller (forward_gpu) feeds `out` into dispatch_fused_residual_norm_f32
@@ -6185,7 +7007,8 @@ pub fn build_gated_attn_layer(
             enc.fence_or_commit("layer.full_attn.ops6-7")
                 .context("fence/commit FA ops6-7 (non-fused fallback)")?;
         } else {
-            enc.commit_and_wait_labeled("layer.full_attn.ops6-7").context("commit ops6-7")?;
+            enc.commit_and_wait_labeled("layer.full_attn.ops6-7")
+                .context("commit ops6-7")?;
         }
         out
     };
@@ -6239,8 +7062,15 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     // multi-CB sibling.
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
-    debug_assert_eq!(seq_len, 1, "apply_sdpa_with_kv_cache_decode_into: seq_len must be 1");
-    debug_assert_eq!(head_dim % 32, 0, "apply_sdpa_with_kv_cache_decode_into: head_dim must be %32==0");
+    debug_assert_eq!(
+        seq_len, 1,
+        "apply_sdpa_with_kv_cache_decode_into: seq_len must be 1"
+    );
+    debug_assert_eq!(
+        head_dim % 32,
+        0,
+        "apply_sdpa_with_kv_cache_decode_into: head_dim must be %32==0"
+    );
 
     let seq = seq_len as usize;
     let nh = n_heads as usize;
@@ -6270,20 +7100,31 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     let _ = nkv; // currently unused; retained for shape doc parity with legacy path.
 
     let out_buf = super::decode_pool::pooled_alloc_buffer(
-            device, nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
-        .map_err(|e| anyhow!("alloc sdpa kv-cache output (decode_into): {e}"))?;
+        device,
+        nh * seq * d * 4,
+        DType::F32,
+        vec![1, nh, seq, d],
+    )
+    .map_err(|e| anyhow!("alloc sdpa kv-cache output (decode_into): {e}"))?;
 
     if kv_write_tokens > 0 {
         // ADR-027 Phase B iter-15: F32 write + optional TQ encode
         // (decode_into path; sister site at gpu_full_attn.rs:1646).
         write_kv_with_optional_tq_encode(
-            enc, registry, device,
-            k_seq_major, v_seq_major,
+            enc,
+            registry,
+            device,
+            k_seq_major,
+            v_seq_major,
             slot,
-            n_kv_heads, head_dim, max_seq_len,
-            cur_len as u32, kv_write_tokens as u32,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            cur_len as u32,
+            kv_write_tokens as u32,
             slot_id,
-        ).context("kv_cache_copy kv-cache decode_into (iter-15 helper)")?;
+        )
+        .context("kv_cache_copy kv-cache decode_into (iter-15 helper)")?;
         // Barrier: sdpa_decode reads slot.k/slot.v written above.  Same
         // RAW barrier position as the legacy gpu_full_attn.rs:1231.
         enc.memory_barrier();
@@ -6302,12 +7143,21 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
         // Helper branches on slot.tq.is_some(): TQ chain when set,
         // legacy flash_attn_vec when None. Iter-13 GPU litmus PASS.
         dispatch_decode_sdpa_with_optional_tq(
-            enc, registry, device,
-            q_seq_major, slot, &out_buf, &fa_tmp,
-            n_heads, n_kv_heads, head_dim,
-            kv_seq_len, max_seq_len,
+            enc,
+            registry,
+            device,
+            q_seq_major,
+            slot,
+            &out_buf,
+            &fa_tmp,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_seq_len,
+            max_seq_len,
             slot_id,
-        ).context("flash_attn_vec kv-cache decode_into (FA-layer decode iter-15)")?;
+        )
+        .context("flash_attn_vec kv-cache decode_into (FA-layer decode iter-15)")?;
     } else {
         // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback decode_into.
         // iter-34 invariant: head_dim-fallback decode_into only fires
@@ -6318,19 +7168,31 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
             "dispatch_sdpa_decode F32 head_dim fallback (decode_into): \
              slot.k is None — iter-34 alloc/SDPA gating invariant regressed.",
         );
-        let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32 decode_into: slot.v is None");
+        let vbuf = slot
+            .v
+            .as_ref()
+            .expect("dispatch_sdpa_decode F32 decode_into: slot.v is None");
         // ADR-040 Phase B4a-cont: slice_view per-slot K/V region.
         let (so_off, so_n) =
             slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
         let kbuf_view = kbuf.slice_view(so_off, so_n);
         let vbuf_view = vbuf.slice_view(so_off, so_n);
         dispatch_sdpa_decode(
-            enc, registry, device,
-            q_seq_major, &kbuf_view, &vbuf_view, &out_buf,
-            n_heads, n_kv_heads, head_dim,
-            kv_seq_len, max_seq_len,
+            enc,
+            registry,
+            device,
+            q_seq_major,
+            &kbuf_view,
+            &vbuf_view,
+            &out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_seq_len,
+            max_seq_len,
             1.0 / (d as f32).sqrt(),
-        ).context("sdpa_decode kv-cache decode_into (head_dim fallback)")?;
+        )
+        .context("sdpa_decode kv-cache decode_into (head_dim fallback)")?;
     }
 
     // Update current_len cursor (CPU-only counter — safe to update before
@@ -6391,8 +7253,15 @@ pub fn apply_gated_attn_layer_decode_into(
     // slot cursor + K/V slice_view routing.
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
-    debug_assert_eq!(seq_len, 1, "apply_gated_attn_layer_decode_into: seq_len must be 1");
-    debug_assert_eq!(head_dim % 32, 0, "apply_gated_attn_layer_decode_into: head_dim must be %32==0");
+    debug_assert_eq!(
+        seq_len, 1,
+        "apply_gated_attn_layer_decode_into: seq_len must be 1"
+    );
+    debug_assert_eq!(
+        head_dim % 32,
+        0,
+        "apply_gated_attn_layer_decode_into: head_dim must be %32==0"
+    );
 
     // ADR-040 Phase B4a-cont.1 M2 (cfa-finding-B4a-cont.1-M2): canonical
     // TQ-active multi-slot gate at the decode-into entry.  Mirrors the
@@ -6421,8 +7290,14 @@ pub fn apply_gated_attn_layer_decode_into(
     // ---- Ops 1-4 (pre-attn norm + Q/K/V/G proj + Q/K norm + IMROPE) ----
     // Op 1: pre-attention RMSNorm → x_norm
     let x_norm = apply_pre_attn_rms_norm(
-        enc, registry, device, x, weights_gpu,
-        seq_len, hidden_size, rms_norm_eps,
+        enc,
+        registry,
+        device,
+        x,
+        weights_gpu,
+        seq_len,
+        hidden_size,
+        rms_norm_eps,
     )?;
     // Barrier: ops 2 read from x_norm written above.
     // Preserved at the same call-site position as the legacy
@@ -6431,20 +7306,44 @@ pub fn apply_gated_attn_layer_decode_into(
 
     // Op 2: Q/K/V/G projections (all read from x_norm).  Pool-aware path.
     let q_flat = apply_linear_projection_f32_pooled(
-        enc, registry, device, &x_norm,
-        &weights_gpu.wq, seq_len, hidden_size, q_total,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wq,
+        seq_len,
+        hidden_size,
+        q_total,
     )?;
     let k_flat = apply_linear_projection_f32_pooled(
-        enc, registry, device, &x_norm,
-        &weights_gpu.wk, seq_len, hidden_size, kv_total,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wk,
+        seq_len,
+        hidden_size,
+        kv_total,
     )?;
     let v_flat = apply_linear_projection_f32_pooled(
-        enc, registry, device, &x_norm,
-        &weights_gpu.wv, seq_len, hidden_size, kv_total,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wv,
+        seq_len,
+        hidden_size,
+        kv_total,
     )?;
     let gate_flat = apply_linear_projection_f32_pooled(
-        enc, registry, device, &x_norm,
-        &weights_gpu.w_gate, seq_len, hidden_size, q_total,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.w_gate,
+        seq_len,
+        hidden_size,
+        q_total,
     )?;
     // Barrier: ops 3 read from q_flat / k_flat written above.  Preserved
     // at the same call-site position as the legacy gpu_full_attn.rs:1503.
@@ -6452,12 +7351,26 @@ pub fn apply_gated_attn_layer_decode_into(
 
     // Op 3: per-head RMSNorm on Q and K.
     let q_normed = apply_q_or_k_per_head_rms_norm(
-        enc, registry, device, &q_flat,
-        &weights_gpu.attn_q_norm, seq_len, n_heads, head_dim, rms_norm_eps,
+        enc,
+        registry,
+        device,
+        &q_flat,
+        &weights_gpu.attn_q_norm,
+        seq_len,
+        n_heads,
+        head_dim,
+        rms_norm_eps,
     )?;
     let k_normed = apply_q_or_k_per_head_rms_norm(
-        enc, registry, device, &k_flat,
-        &weights_gpu.attn_k_norm, seq_len, n_kv_heads, head_dim, rms_norm_eps,
+        enc,
+        registry,
+        device,
+        &k_flat,
+        &weights_gpu.attn_k_norm,
+        seq_len,
+        n_kv_heads,
+        head_dim,
+        rms_norm_eps,
     )?;
     // Barrier: ops 4 read from q_normed / k_normed written above.  Preserved
     // at the same call-site position as the legacy gpu_full_attn.rs:1515.
@@ -6465,12 +7378,30 @@ pub fn apply_gated_attn_layer_decode_into(
 
     // Op 4: IMROPE on Q and K.
     let q_rope = apply_imrope(
-        enc, registry, device, &q_normed, positions,
-        seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
+        enc,
+        registry,
+        device,
+        &q_normed,
+        positions,
+        seq_len,
+        n_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
     )?;
     let k_rope = apply_imrope(
-        enc, registry, device, &k_normed, positions,
-        seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
+        enc,
+        registry,
+        device,
+        &k_normed,
+        positions,
+        seq_len,
+        n_kv_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
     )?;
 
     // INTER-STAGE BARRIER (NEW): ops4 → sdpa_kv (replaces the former
@@ -6483,9 +7414,18 @@ pub fn apply_gated_attn_layer_decode_into(
 
     // ---- Op 5: SDPA decode-fast-path (kv-cache write + sdpa_decode) ----
     let attn_out = apply_sdpa_with_kv_cache_decode_into(
-        enc, device, registry,
-        &q_rope, &k_rope, &v_flat,
-        slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+        enc,
+        device,
+        registry,
+        &q_rope,
+        &k_rope,
+        &v_flat,
+        slot,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
         slot_id,
     )?;
 
@@ -6496,9 +7436,7 @@ pub fn apply_gated_attn_layer_decode_into(
 
     // ---- Ops 6-7: sigmoid-gate multiply + output projection ----
     let n_elem = seq_len * q_total;
-    let gated = apply_sigmoid_gate_multiply(
-        enc, registry, device, &attn_out, &gate_flat, n_elem,
-    )?;
+    let gated = apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n_elem)?;
     // ADR-015 iter21: memory_barrier between Op 6 (sigmoid_gate_multiply
     // writes `gated`) and Op 7 (linear_projection reads `gated`).
     //
@@ -6522,8 +7460,14 @@ pub fn apply_gated_attn_layer_decode_into(
     // in iter21.
     enc.memory_barrier();
     let out = apply_linear_projection_f32_pooled(
-        enc, registry, device, &gated,
-        &weights_gpu.wo, seq_len, q_total, hidden_size,
+        enc,
+        registry,
+        device,
+        &gated,
+        &weights_gpu.wo,
+        seq_len,
+        q_total,
+        hidden_size,
     )?;
 
     // No commit here — the caller owns the shared encoder.
@@ -6536,8 +7480,8 @@ pub fn apply_gated_attn_layer_decode_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::full_attn::{FullAttnLayerWeights, FullAttnShape};
+    use super::*;
     use crate::inference::spec_decode::eagle3::config::Eagle3DrafterConfig;
     use crate::inference::spec_decode::eagle3::forward::dispatch_eagle3_tree_attention;
     use mlx_native::ops::tree_attention::{TREE_MASK_ATTENDED, TREE_MASK_MASKED};
@@ -6561,46 +7505,163 @@ mod tests {
         let test_attr = format!("#[{}]", "test");
         let lock_call = format!("{}();", "hf2q_gpu_test_lock");
         let modules: [(&str, &str); 40] = [
-            ("inference/models/bert/bert_gpu.rs", include_str!("../bert/bert_gpu.rs")),
-            ("inference/models/bert/weights.rs", include_str!("../bert/weights.rs")),
-            ("inference/models/gemma4/forward_gpu.rs", include_str!("../gemma4/forward_gpu.rs")),
-            ("inference/models/gemma4/gpu_full_attn.rs", include_str!("../gemma4/gpu_full_attn.rs")),
-            ("inference/models/gemma4/kv_cache.rs", include_str!("../gemma4/kv_cache.rs")),
-            ("inference/models/gemma4/model.rs", include_str!("../gemma4/model.rs")),
-            ("inference/models/nomic_bert/forward.rs", include_str!("../nomic_bert/forward.rs")),
-            ("inference/models/nomic_bert/weights.rs", include_str!("../nomic_bert/weights.rs")),
-            ("inference/models/qwen35/chunk_allocs_arena.rs", include_str!("chunk_allocs_arena.rs")),
-            ("inference/models/qwen35/dense_ffn_arena.rs", include_str!("dense_ffn_arena.rs")),
-            ("inference/models/qwen35/dn_prefill_arena.rs", include_str!("dn_prefill_arena.rs")),
-            ("inference/models/qwen35/dump_bisect.rs", include_str!("dump_bisect.rs")),
-            ("inference/models/qwen35/fa_prefill_arena.rs", include_str!("fa_prefill_arena.rs")),
-            ("inference/models/qwen35/fa_projections_arena.rs", include_str!("fa_projections_arena.rs")),
-            ("inference/models/qwen35/forward_gpu.rs", include_str!("forward_gpu.rs")),
-            ("inference/models/qwen35/gpu_delta_net.rs", include_str!("gpu_delta_net.rs")),
-            ("inference/models/qwen35/gpu_ffn.rs", include_str!("gpu_ffn.rs")),
-            ("inference/models/qwen35/gpu_full_attn.rs", include_str!("gpu_full_attn.rs")),
-            ("inference/models/qwen35/in_memory_loader.rs", include_str!("in_memory_loader.rs")),
-            ("inference/models/qwen35/kv_cache.rs", include_str!("kv_cache.rs")),
+            (
+                "inference/models/bert/bert_gpu.rs",
+                include_str!("../bert/bert_gpu.rs"),
+            ),
+            (
+                "inference/models/bert/weights.rs",
+                include_str!("../bert/weights.rs"),
+            ),
+            (
+                "inference/models/gemma4/forward_gpu.rs",
+                include_str!("../gemma4/forward_gpu.rs"),
+            ),
+            (
+                "inference/models/gemma4/gpu_full_attn.rs",
+                include_str!("../gemma4/gpu_full_attn.rs"),
+            ),
+            (
+                "inference/models/gemma4/kv_cache.rs",
+                include_str!("../gemma4/kv_cache.rs"),
+            ),
+            (
+                "inference/models/gemma4/model.rs",
+                include_str!("../gemma4/model.rs"),
+            ),
+            (
+                "inference/models/nomic_bert/forward.rs",
+                include_str!("../nomic_bert/forward.rs"),
+            ),
+            (
+                "inference/models/nomic_bert/weights.rs",
+                include_str!("../nomic_bert/weights.rs"),
+            ),
+            (
+                "inference/models/qwen35/chunk_allocs_arena.rs",
+                include_str!("chunk_allocs_arena.rs"),
+            ),
+            (
+                "inference/models/qwen35/dense_ffn_arena.rs",
+                include_str!("dense_ffn_arena.rs"),
+            ),
+            (
+                "inference/models/qwen35/dn_prefill_arena.rs",
+                include_str!("dn_prefill_arena.rs"),
+            ),
+            (
+                "inference/models/qwen35/dump_bisect.rs",
+                include_str!("dump_bisect.rs"),
+            ),
+            (
+                "inference/models/qwen35/fa_prefill_arena.rs",
+                include_str!("fa_prefill_arena.rs"),
+            ),
+            (
+                "inference/models/qwen35/fa_projections_arena.rs",
+                include_str!("fa_projections_arena.rs"),
+            ),
+            (
+                "inference/models/qwen35/forward_gpu.rs",
+                include_str!("forward_gpu.rs"),
+            ),
+            (
+                "inference/models/qwen35/gpu_delta_net.rs",
+                include_str!("gpu_delta_net.rs"),
+            ),
+            (
+                "inference/models/qwen35/gpu_ffn.rs",
+                include_str!("gpu_ffn.rs"),
+            ),
+            (
+                "inference/models/qwen35/gpu_full_attn.rs",
+                include_str!("gpu_full_attn.rs"),
+            ),
+            (
+                "inference/models/qwen35/in_memory_loader.rs",
+                include_str!("in_memory_loader.rs"),
+            ),
+            (
+                "inference/models/qwen35/kv_cache.rs",
+                include_str!("kv_cache.rs"),
+            ),
             ("inference/models/qwen35/model.rs", include_str!("model.rs")),
-            ("inference/models/qwen35/weight_loader.rs", include_str!("weight_loader.rs")),
-            ("inference/models/qwen35/weight_pool.rs", include_str!("weight_pool.rs")),
-            ("inference/models/qwen3vl_text/forward.rs", include_str!("../qwen3vl_text/forward.rs")),
-            ("inference/models/qwen3vl_text/mod.rs", include_str!("../qwen3vl_text/mod.rs")),
-            ("inference/spec_decode/dflash/forward.rs", include_str!("../../spec_decode/dflash/forward.rs")),
-            ("inference/spec_decode/dflash/hidden_capture.rs", include_str!("../../spec_decode/dflash/hidden_capture.rs")),
-            ("inference/spec_decode/dflash/kv_cache.rs", include_str!("../../spec_decode/dflash/kv_cache.rs")),
-            ("inference/spec_decode/dflash/orchestrator.rs", include_str!("../../spec_decode/dflash/orchestrator.rs")),
-            ("inference/spec_decode/eagle3/drafter_gpu.rs", include_str!("../../spec_decode/eagle3/drafter_gpu.rs")),
-            ("inference/spec_decode/eagle3/forward.rs", include_str!("../../spec_decode/eagle3/forward.rs")),
-            ("inference/spec_decode/eagle3/tensors.rs", include_str!("../../spec_decode/eagle3/tensors.rs")),
-            ("inference/spec_decode/eagle3_orchestrator.rs", include_str!("../../spec_decode/eagle3_orchestrator.rs")),
-            ("inference/vision/image_token_residual_add.rs", include_str!("../../vision/image_token_residual_add.rs")),
-            ("inference/vision/mmproj_weights.rs", include_str!("../../vision/mmproj_weights.rs")),
-            ("inference/vision/vit.rs", include_str!("../../vision/vit.rs")),
-            ("inference/vision/vit_dump.rs", include_str!("../../vision/vit_dump.rs")),
-            ("inference/vision/vit_gpu.rs", include_str!("../../vision/vit_gpu.rs")),
-            ("inference/vision/vit_gpu_qwen3vl.rs", include_str!("../../vision/vit_gpu_qwen3vl.rs")),
-            ("serve/forward_mlx_shared.rs", include_str!("../../../serve/forward_mlx_shared.rs")),
+            (
+                "inference/models/qwen35/weight_loader.rs",
+                include_str!("weight_loader.rs"),
+            ),
+            (
+                "inference/models/qwen35/weight_pool.rs",
+                include_str!("weight_pool.rs"),
+            ),
+            (
+                "inference/models/qwen3vl_text/forward.rs",
+                include_str!("../qwen3vl_text/forward.rs"),
+            ),
+            (
+                "inference/models/qwen3vl_text/mod.rs",
+                include_str!("../qwen3vl_text/mod.rs"),
+            ),
+            (
+                "inference/spec_decode/dflash/forward.rs",
+                include_str!("../../spec_decode/dflash/forward.rs"),
+            ),
+            (
+                "inference/spec_decode/dflash/hidden_capture.rs",
+                include_str!("../../spec_decode/dflash/hidden_capture.rs"),
+            ),
+            (
+                "inference/spec_decode/dflash/kv_cache.rs",
+                include_str!("../../spec_decode/dflash/kv_cache.rs"),
+            ),
+            (
+                "inference/spec_decode/dflash/orchestrator.rs",
+                include_str!("../../spec_decode/dflash/orchestrator.rs"),
+            ),
+            (
+                "inference/spec_decode/eagle3/drafter_gpu.rs",
+                include_str!("../../spec_decode/eagle3/drafter_gpu.rs"),
+            ),
+            (
+                "inference/spec_decode/eagle3/forward.rs",
+                include_str!("../../spec_decode/eagle3/forward.rs"),
+            ),
+            (
+                "inference/spec_decode/eagle3/tensors.rs",
+                include_str!("../../spec_decode/eagle3/tensors.rs"),
+            ),
+            (
+                "inference/spec_decode/eagle3_orchestrator.rs",
+                include_str!("../../spec_decode/eagle3_orchestrator.rs"),
+            ),
+            (
+                "inference/vision/image_token_residual_add.rs",
+                include_str!("../../vision/image_token_residual_add.rs"),
+            ),
+            (
+                "inference/vision/mmproj_weights.rs",
+                include_str!("../../vision/mmproj_weights.rs"),
+            ),
+            (
+                "inference/vision/vit.rs",
+                include_str!("../../vision/vit.rs"),
+            ),
+            (
+                "inference/vision/vit_dump.rs",
+                include_str!("../../vision/vit_dump.rs"),
+            ),
+            (
+                "inference/vision/vit_gpu.rs",
+                include_str!("../../vision/vit_gpu.rs"),
+            ),
+            (
+                "inference/vision/vit_gpu_qwen3vl.rs",
+                include_str!("../../vision/vit_gpu_qwen3vl.rs"),
+            ),
+            (
+                "serve/forward_mlx_shared.rs",
+                include_str!("../../../serve/forward_mlx_shared.rs"),
+            ),
         ];
         for (name, src) in modules {
             let n_tests = src.matches(&test_attr).count();
@@ -6667,8 +7728,14 @@ mod tests {
             wk: mk_rand(&mut seed, kv_total * h, 0.1),
             wv: mk_rand(&mut seed, kv_total * h, 0.1),
             w_gate: mk_rand(&mut seed, q_total * h, 0.1),
-            attn_q_norm: mk_rand(&mut seed, d, 0.05).into_iter().map(|v| 1.0 + v).collect(),
-            attn_k_norm: mk_rand(&mut seed, d, 0.05).into_iter().map(|v| 1.0 + v).collect(),
+            attn_q_norm: mk_rand(&mut seed, d, 0.05)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect(),
+            attn_k_norm: mk_rand(&mut seed, d, 0.05)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect(),
             wo: mk_rand(&mut seed, h * q_total, 0.1),
         };
         let seq_len = 4u32;
@@ -6752,7 +7819,14 @@ mod tests {
         let mut enc = device.command_encoder().expect("encoder");
 
         let out = dispatch_qwen35_tree_verify_attention(
-            &mut enc, &device, &mut registry, &q, &k, &v, &mask, params,
+            &mut enc,
+            &device,
+            &mut registry,
+            &q,
+            &k,
+            &v,
+            &mask,
+            params,
         )
         .expect("dispatch");
         enc.commit_and_wait().expect("commit");
@@ -6775,7 +7849,14 @@ mod tests {
         let mut params = qwen35_tree_verify_params(40, 8, 4, 8);
         params.head_dim = 256;
         let err = dispatch_qwen35_tree_verify_attention(
-            &mut enc, &device, &mut registry, &dummy, &dummy, &dummy, &dummy, params,
+            &mut enc,
+            &device,
+            &mut registry,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            params,
         )
         .unwrap_err();
         assert!(err.to_string().contains("head_dim"), "got: {err}");
@@ -6801,7 +7882,14 @@ mod tests {
         let mut enc = device.command_encoder().expect("encoder");
 
         let qwen_out = dispatch_qwen35_tree_verify_attention(
-            &mut enc, &device, &mut registry, &q, &k, &v, &mask, params,
+            &mut enc,
+            &device,
+            &mut registry,
+            &q,
+            &k,
+            &v,
+            &mask,
+            params,
         )
         .expect("qwen dispatch");
         let eagle_out = dispatch_eagle3_tree_attention(
@@ -6842,7 +7930,14 @@ mod tests {
         let mut enc = device.command_encoder().expect("encoder");
         let params = qwen35_tree_verify_params(40, 8, 0, 8);
         let err = dispatch_qwen35_tree_verify_attention(
-            &mut enc, &device, &mut registry, &dummy, &dummy, &dummy, &dummy, params,
+            &mut enc,
+            &device,
+            &mut registry,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            params,
         )
         .unwrap_err();
         assert!(err.to_string().contains("q_seq_len"), "got: {err}");
@@ -6861,7 +7956,14 @@ mod tests {
         let mut params = qwen35_tree_verify_params(40, 8, 4, 8);
         params.mask_stride = 7;
         let err = dispatch_qwen35_tree_verify_attention(
-            &mut enc, &device, &mut registry, &dummy, &dummy, &dummy, &dummy, params,
+            &mut enc,
+            &device,
+            &mut registry,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            params,
         )
         .unwrap_err();
         assert!(err.to_string().contains("mask_stride"), "got: {err}");
@@ -6906,7 +8008,11 @@ mod tests {
         // F32 norms: bit-exact round-trip.
         for (name, expected, buf) in [
             ("attn_norm", &weights_cpu.attn_norm, &gpu.attn_norm),
-            ("post_attn_norm", &weights_cpu.post_attn_norm, &gpu.post_attn_norm),
+            (
+                "post_attn_norm",
+                &weights_cpu.post_attn_norm,
+                &gpu.post_attn_norm,
+            ),
             ("attn_q_norm", &weights_cpu.attn_q_norm, &gpu.attn_q_norm),
             ("attn_k_norm", &weights_cpu.attn_k_norm, &gpu.attn_k_norm),
         ] {
@@ -6950,10 +8056,22 @@ mod tests {
         }
 
         // post_attn_norm is also F32 (uploaded by upload_f32 in from_cpu).
-        assert_eq!(gpu.post_attn_norm.dtype(), DType::F32, "post_attn_norm dtype");
+        assert_eq!(
+            gpu.post_attn_norm.dtype(),
+            DType::F32,
+            "post_attn_norm dtype"
+        );
         let got_post = download_f32(&gpu.post_attn_norm).expect("download post_attn_norm");
-        assert_eq!(got_post.len(), weights_cpu.post_attn_norm.len(), "post_attn_norm length");
-        for (i, (&g, &e)) in got_post.iter().zip(weights_cpu.post_attn_norm.iter()).enumerate() {
+        assert_eq!(
+            got_post.len(),
+            weights_cpu.post_attn_norm.len(),
+            "post_attn_norm length"
+        );
+        for (i, (&g, &e)) in got_post
+            .iter()
+            .zip(weights_cpu.post_attn_norm.iter())
+            .enumerate()
+        {
             assert_eq!(g.to_bits(), e.to_bits(), "post_attn_norm[{i}]");
         }
 
@@ -6961,15 +8079,17 @@ mod tests {
         // verify by re-encoding with the same canonical CPU encoder and
         // comparing the byte stream.
         for (name, expected, buf) in [
-            ("wq",     &weights_cpu.wq,     &gpu.wq),
-            ("wk",     &weights_cpu.wk,     &gpu.wk),
-            ("wv",     &weights_cpu.wv,     &gpu.wv),
+            ("wq", &weights_cpu.wq, &gpu.wq),
+            ("wk", &weights_cpu.wk, &gpu.wk),
+            ("wv", &weights_cpu.wv, &gpu.wv),
             ("w_gate", &weights_cpu.w_gate, &gpu.w_gate),
-            ("wo",     &weights_cpu.wo,     &gpu.wo),
+            ("wo", &weights_cpu.wo, &gpu.wo),
         ] {
             assert_eq!(
-                buf.dtype(), DType::U8,
-                "{name}: expected U8 storage for Q4_0 blocks, got {:?}", buf.dtype()
+                buf.dtype(),
+                DType::U8,
+                "{name}: expected U8 storage for Q4_0 blocks, got {:?}",
+                buf.dtype()
             );
             let expected_blocks = encode_q4_0_blocks(expected);
             let got_bytes: &[u8] = buf.as_slice().expect("as_slice u8");
@@ -6978,7 +8098,11 @@ mod tests {
                 expected_blocks.len(),
                 "{name}: Q4_0 byte length mismatch"
             );
-            assert_eq!(got_bytes, expected_blocks.as_slice(), "{name}: Q4_0 byte mismatch");
+            assert_eq!(
+                got_bytes,
+                expected_blocks.as_slice(),
+                "{name}: Q4_0 byte mismatch"
+            );
         }
 
         // Suppress unused warnings for shape dims used in the fixture.
@@ -7045,7 +8169,10 @@ mod tests {
             assert!(
                 d < 1e-5,
                 "pre_attn_rms_norm mismatch at {}: gpu={}, cpu={}, diff={}",
-                i, g, e, d
+                i,
+                g,
+                e,
+                d
             );
         }
     }
@@ -7124,7 +8251,10 @@ mod tests {
             assert!(
                 d < 1e-5,
                 "q per-head norm mismatch at {}: gpu={}, cpu={}, diff={}",
-                i, g, e, d
+                i,
+                g,
+                e,
+                d
             );
         }
     }
@@ -7184,7 +8314,10 @@ mod tests {
             assert!(
                 d < 1e-5,
                 "k per-head norm mismatch at {}: gpu={}, cpu={}, diff={}",
-                i, g, e, d
+                i,
+                g,
+                e,
+                d
             );
         }
     }
@@ -7289,7 +8422,10 @@ mod tests {
             assert!(
                 d_err < 1e-5,
                 "imrope mismatch at {}: gpu={}, cpu={}, diff={}",
-                i, g, e, d_err
+                i,
+                g,
+                e,
+                d_err
             );
         }
     }
@@ -7331,7 +8467,12 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("enc");
         let out = apply_sigmoid_gate_multiply(
-            &mut enc, &mut registry, &device, &attn_buf, &gate_buf, n as u32,
+            &mut enc,
+            &mut registry,
+            &device,
+            &attn_buf,
+            &gate_buf,
+            n as u32,
         )
         .expect("apply");
         enc.commit_and_wait().expect("commit");
@@ -7342,7 +8483,10 @@ mod tests {
             assert!(
                 d < 1e-6,
                 "sigmoid_mul mismatch at {}: gpu={}, cpu={}, diff={}",
-                i, g, e, d
+                i,
+                g,
+                e,
+                d
             );
         }
     }
@@ -7385,13 +8529,10 @@ mod tests {
             })
             .collect();
         // Text-only positions: all 4 axes = token index.
-        let positions_cpu: Vec<[i32; 4]> =
-            (0..seq as i32).map(|i| [i, i, i, i]).collect();
+        let positions_cpu: Vec<[i32; 4]> = (0..seq as i32).map(|i| [i, i, i, i]).collect();
 
         // CPU reference (authoritative spec).
-        let cpu_out = gated_full_attention_cpu_ref(
-            &x_cpu, &positions_cpu, &weights_cpu, shape,
-        );
+        let cpu_out = gated_full_attention_cpu_ref(&x_cpu, &positions_cpu, &weights_cpu, shape);
         assert_eq!(cpu_out.len(), seq * h, "cpu_out shape");
         assert!(
             cpu_out.iter().all(|v| v.is_finite()),
@@ -7405,8 +8546,8 @@ mod tests {
         // correctness regressions at the 1e-3 tolerance this gate enforces.
         // Q4_0-vs-F32 numerical equivalence is covered separately by the
         // sourdough end-to-end token gate.
-        let gpu_weights = FullAttnWeightsGpu::from_cpu_f32(&weights_cpu, &device)
-            .expect("upload weights");
+        let gpu_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&weights_cpu, &device).expect("upload weights");
 
         // Upload x.
         let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
@@ -7420,7 +8561,11 @@ mod tests {
             .flat_map(|_| (0..seq_len as i32).collect::<Vec<_>>())
             .collect();
         let mut pos_buf = device
-            .alloc_buffer(positions_flat.len() * 4, DType::I32, vec![positions_flat.len()])
+            .alloc_buffer(
+                positions_flat.len() * 4,
+                DType::I32,
+                vec![positions_flat.len()],
+            )
             .expect("alloc positions");
         pos_buf
             .as_mut_slice::<i32>()
@@ -7510,7 +8655,10 @@ mod tests {
             max_err < Q4_0_PARITY_TOLERANCE,
             "full GPU layer parity FAIL: max_abs_err={:.2e} (> {:.2e} \
              Q4_0 budget), n_fail={}/{}",
-            max_err, Q4_0_PARITY_TOLERANCE, n_fail, gpu_out.len()
+            max_err,
+            Q4_0_PARITY_TOLERANCE,
+            n_fail,
+            gpu_out.len()
         );
 
         eprintln!(
@@ -7561,9 +8709,14 @@ mod tests {
 
         let mut enc = device.command_encoder().expect("enc");
         let out_gpu = apply_linear_projection_f32(
-            &mut enc, &mut registry, &device,
-            &x_gpu, &wq_gpu,
-            seq_len, shape.hidden_size, (nh * d) as u32,
+            &mut enc,
+            &mut registry,
+            &device,
+            &x_gpu,
+            &wq_gpu,
+            seq_len,
+            shape.hidden_size,
+            (nh * d) as u32,
         )
         .expect("projection");
         enc.commit_and_wait().expect("commit");
@@ -7577,14 +8730,12 @@ mod tests {
             eprintln!("linear_projection_matches_cpu_ref: GPU output all-zero under parallel test contention — skipping");
             return;
         }
-        let max_err = got.iter().zip(expected.iter())
+        let max_err = got
+            .iter()
+            .zip(expected.iter())
             .map(|(&g, &e)| (g - e).abs())
             .fold(0.0f32, f32::max);
-        assert!(
-            max_err < 1e-3,
-            "projection max_err={:.2e} >= 1e-3",
-            max_err
-        );
+        assert!(max_err < 1e-3, "projection max_err={:.2e} >= 1e-3", max_err);
     }
 
     /// **ADR-019 Phase 2 iter89e2-E kernel-equivalence parity test**: the
@@ -7663,13 +8814,18 @@ mod tests {
         let q_wrap = upload(&device, &q_cpu);
         let k_wrap = upload(&device, &k_cpu);
         let v_wrap = upload(&device, &v_cpu);
-        let mut arena_wrap = FaPrefillArena::new(
-            &device, seq_len, n_heads, n_kv_heads, head_dim,
-        ).expect("FaPrefillArena wrap");
+        let mut arena_wrap = FaPrefillArena::new(&device, seq_len, n_heads, n_kv_heads, head_dim)
+            .expect("FaPrefillArena wrap");
         let out_wrap_buf = apply_flash_attn_prefill_seq_major(
-            &device, &mut registry,
-            &q_wrap, &k_wrap, &v_wrap,
-            seq_len, n_heads, n_kv_heads, head_dim,
+            &device,
+            &mut registry,
+            &q_wrap,
+            &k_wrap,
+            &v_wrap,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
             Some(&mut arena_wrap),
         )
         .expect("wrapper apply_flash_attn_prefill_seq_major");
@@ -7692,9 +8848,8 @@ mod tests {
         let q_into = upload(&device, &q_cpu);
         let k_into = upload(&device, &k_cpu);
         let v_into = upload(&device, &v_cpu);
-        let mut arena_into = FaPrefillArena::new(
-            &device, seq_len, n_heads, n_kv_heads, head_dim,
-        ).expect("FaPrefillArena into");
+        let mut arena_into = FaPrefillArena::new(&device, seq_len, n_heads, n_kv_heads, head_dim)
+            .expect("FaPrefillArena into");
         let out_into_buf = device
             .alloc_buffer(seq * nh * d * 4, DType::F32, vec![seq, nh, d])
             .expect("alloc out_seq into");
@@ -7703,10 +8858,17 @@ mod tests {
                 .command_encoder()
                 .expect("FA prefill bridge encoder (into test)");
             apply_flash_attn_prefill_seq_major_into(
-                &mut enc, &device, &mut registry,
-                &q_into, &k_into, &v_into,
+                &mut enc,
+                &device,
+                &mut registry,
+                &q_into,
+                &k_into,
+                &v_into,
                 &out_into_buf,
-                seq_len, n_heads, n_kv_heads, head_dim,
+                seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
                 &mut arena_into,
             )
             .expect("_into apply_flash_attn_prefill_seq_major_into");
@@ -7903,10 +9065,8 @@ mod tests {
         let q_full_buf = upload_f32(&q_full_cpu, &device).expect("upload q_full");
         let k_full_buf = upload_f32(&k_full_cpu, &device).expect("upload k_full");
         let v_full_buf = upload_f32(&v_full_cpu, &device).expect("upload v_full");
-        let mut arena_a = FaPrefillArena::new(
-            &device, seq_full, n_heads, n_kv_heads, head_dim,
-        )
-        .expect("FaPrefillArena A");
+        let mut arena_a = FaPrefillArena::new(&device, seq_full, n_heads, n_kv_heads, head_dim)
+            .expect("FaPrefillArena A");
         let out_a_buf = device
             .alloc_buffer(
                 seq_full as usize * nh * d * 4,
@@ -7917,10 +9077,17 @@ mod tests {
         {
             let mut enc = device.command_encoder().expect("enc A");
             apply_flash_attn_prefill_seq_major_into(
-                &mut enc, &device, &mut registry,
-                &q_full_buf, &k_full_buf, &v_full_buf,
+                &mut enc,
+                &device,
+                &mut registry,
+                &q_full_buf,
+                &k_full_buf,
+                &v_full_buf,
                 &out_a_buf,
-                seq_full, n_heads, n_kv_heads, head_dim,
+                seq_full,
+                n_heads,
+                n_kv_heads,
+                head_dim,
                 &mut arena_a,
             )
             .expect("Path A FA fast path");
@@ -7935,10 +9102,8 @@ mod tests {
         let q_b1_buf = upload_f32(&q_chunk1_cpu, &device).expect("upload q_b1");
         let k_b1_buf = upload_f32(&k_chunk1_cpu, &device).expect("upload k_b1");
         let v_b1_buf = upload_f32(&v_chunk1_cpu, &device).expect("upload v_b1");
-        let mut arena_b1 = FaPrefillArena::new(
-            &device, seq_chunk, n_heads, n_kv_heads, head_dim,
-        )
-        .expect("FaPrefillArena B1");
+        let mut arena_b1 = FaPrefillArena::new(&device, seq_chunk, n_heads, n_kv_heads, head_dim)
+            .expect("FaPrefillArena B1");
         let out_b1_buf = device
             .alloc_buffer(
                 seq_chunk as usize * nh * d * 4,
@@ -7949,10 +9114,17 @@ mod tests {
         {
             let mut enc = device.command_encoder().expect("enc B1");
             apply_flash_attn_prefill_seq_major_into(
-                &mut enc, &device, &mut registry,
-                &q_b1_buf, &k_b1_buf, &v_b1_buf,
+                &mut enc,
+                &device,
+                &mut registry,
+                &q_b1_buf,
+                &k_b1_buf,
+                &v_b1_buf,
                 &out_b1_buf,
-                seq_chunk, n_heads, n_kv_heads, head_dim,
+                seq_chunk,
+                n_heads,
+                n_kv_heads,
+                head_dim,
                 &mut arena_b1,
             )
             .expect("Path B1 FA fast path");
@@ -7980,10 +9152,16 @@ mod tests {
         {
             let mut enc = device.command_encoder().expect("enc kv copy");
             dispatch_kv_cache_copy_seq_f32_dual(
-                &mut enc, &mut registry, device.metal_device(),
-                &k_full_buf, &v_full_buf,
-                &slot_k, &slot_v,
-                n_kv_heads, head_dim, kv_capacity,
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &k_full_buf,
+                &v_full_buf,
+                &slot_k,
+                &slot_v,
+                n_kv_heads,
+                head_dim,
+                kv_capacity,
                 0,        // seq_pos_start
                 seq_full, // n_tokens (write all 64)
                 0,        // src_tok_offset
@@ -7994,8 +9172,7 @@ mod tests {
 
         // Build chunk-2 head-major Q from chunk-2 seq-major slice.
         // q_full_cpu is seq-major [seq_full, nh, d]; chunk-2 = rows [32..64].
-        let q_chunk2_seq_major: Vec<f32> =
-            q_full_cpu[seq_chunk as usize * nh * d..].to_vec();
+        let q_chunk2_seq_major: Vec<f32> = q_full_cpu[seq_chunk as usize * nh * d..].to_vec();
         let mut q_chunk2_hm = vec![0.0f32; seq_chunk as usize * nh * d];
         for t in 0..seq_chunk as usize {
             for h in 0..nh {
@@ -8027,9 +9204,15 @@ mod tests {
             };
             let mut enc = device.command_encoder().expect("enc sdpa C");
             sdpa(
-                &mut enc, &mut registry, &device,
-                &q_c_hm_buf, &slot_k, &slot_v, &out_c_hm_buf,
-                &params, 1,
+                &mut enc,
+                &mut registry,
+                &device,
+                &q_c_hm_buf,
+                &slot_k,
+                &slot_v,
+                &out_c_hm_buf,
+                &params,
+                1,
             )
             .expect("Path C legacy sdpa");
             enc.commit_and_wait().expect("commit C");
@@ -8042,8 +9225,7 @@ mod tests {
             for t in 0..seq_chunk as usize {
                 let src_off = (h * seq_chunk as usize + t) * d;
                 let dst_off = (t * nh + h) * d;
-                out_c_sm[dst_off..dst_off + d]
-                    .copy_from_slice(&out_c_hm[src_off..src_off + d]);
+                out_c_sm[dst_off..dst_off + d].copy_from_slice(&out_c_hm[src_off..src_off + d]);
             }
         }
 
@@ -8163,14 +9345,18 @@ mod tests {
         // tokens, capacity=128).  Reuse the same slot_k / slot_v buffers —
         // the resume wrapper consumes them directly via cast + qL_off.
         let out_d_buf = apply_flash_attn_prefill_seq_major_resume(
-            &device, &mut registry,
+            &device,
+            &mut registry,
             &q_d_sm_buf,
-            &slot_k, &slot_v,
-            seq_chunk,            // qL = chunk-2 length
-            seq_chunk,            // cur_len = previous tokens (chunk-1 length)
-            seq_full,             // kv_seq_len = cur_len + qL
+            &slot_k,
+            &slot_v,
+            seq_chunk, // qL = chunk-2 length
+            seq_chunk, // cur_len = previous tokens (chunk-1 length)
+            seq_full,  // kv_seq_len = cur_len + qL
             kv_capacity,
-            n_heads, n_kv_heads, head_dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
         )
         .expect("Path D apply_flash_attn_prefill_seq_major_resume");
         let out_d = download_f32(&out_d_buf).expect("download D");
@@ -8309,7 +9495,11 @@ mod tests {
 
         let upload_pos = |dev: &MlxDevice| -> MlxBuffer {
             let mut b = dev
-                .alloc_buffer(positions_flat.len() * 4, DType::I32, vec![positions_flat.len()])
+                .alloc_buffer(
+                    positions_flat.len() * 4,
+                    DType::I32,
+                    vec![positions_flat.len()],
+                )
                 .expect("alloc positions");
             b.as_mut_slice::<i32>()
                 .expect("mut")
@@ -8349,10 +9539,10 @@ mod tests {
             shape.rope_theta,
             shape.mrope_section,
             shape.rms_norm_eps,
-            None, // fa_arena
-            None, // fa_proj_arena (LEGACY)
-            None, // iter92: K-batch hold-vec — synthetic test
-            None, // iter91: layer_session — synthetic parity test, Plain shape.
+            None,      // fa_arena
+            None,      // fa_proj_arena (LEGACY)
+            None,      // iter92: K-batch hold-vec — synthetic test
+            None,      // iter91: layer_session — synthetic parity test, Plain shape.
             SlotId(0), // ADR-040 Phase B4a-cont: stateless test
         )
         .expect("legacy build_gated_attn_layer");
@@ -8400,11 +9590,11 @@ mod tests {
             shape.rope_theta,
             shape.mrope_section,
             shape.rms_norm_eps,
-            None,                       // fa_arena
-            Some(&mut fa_proj_arena),   // fa_proj_arena (NEW)
-            None,                       // iter92: K-batch hold-vec — synthetic test
-            None,                       // iter91: layer_session — Plain shape.
-            SlotId(0),                  // ADR-040 Phase B4a-cont: stateless test
+            None,                     // fa_arena
+            Some(&mut fa_proj_arena), // fa_proj_arena (NEW)
+            None,                     // iter92: K-batch hold-vec — synthetic test
+            None,                     // iter91: layer_session — Plain shape.
+            SlotId(0),                // ADR-040 Phase B4a-cont: stateless test
         )
         .expect("arena build_gated_attn_layer");
         // Same sync rationale as the legacy-path barrier above.
@@ -8530,16 +9720,11 @@ mod tests {
             attn_k_norm: vec![1.0f32; head_dim],
             wo: mk_rand(seed, hidden_size * q_total, 0.05),
         };
-        FullAttnWeightsGpu::from_cpu_f32(&weights, device)
-            .expect("upload layer weights F32")
+        FullAttnWeightsGpu::from_cpu_f32(&weights, device).expect("upload layer weights F32")
     }
 
     /// Upload i32 positions buffer: each position is `prefix_len + depth[i]`.
-    fn upload_positions(
-        tree_seq_len: usize,
-        base_pos: u32,
-        device: &MlxDevice,
-    ) -> MlxBuffer {
+    fn upload_positions(tree_seq_len: usize, base_pos: u32, device: &MlxDevice) -> MlxBuffer {
         // Simple chain: positions are base_pos, base_pos+1, ..., base_pos+tree_seq_len-1
         // replicated across all 4 IMROPE axes.
         let n = 4 * tree_seq_len;
@@ -8583,7 +9768,12 @@ mod tests {
     }
 
     /// Allocate a zero-filled KV cache [nkv, capacity, head_dim] F32.
-    fn alloc_kv_cache(nkv: usize, capacity: usize, head_dim: usize, device: &MlxDevice) -> MlxBuffer {
+    fn alloc_kv_cache(
+        nkv: usize,
+        capacity: usize,
+        head_dim: usize,
+        device: &MlxDevice,
+    ) -> MlxBuffer {
         let n = nkv * capacity * head_dim;
         let mut buf = device
             .alloc_buffer(n * 4, DType::F32, vec![nkv, capacity, head_dim])
@@ -8637,14 +9827,19 @@ mod tests {
 
         let mut seed = 0xA001_u32;
         let weights = layer_weights_f32(
-            hidden_size, num_q_heads, num_kv_heads, head_dim,
-            &mut seed, &device,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            &mut seed,
+            &device,
         );
 
         let hidden_in = upload_f32(
             &mk_rand(&mut seed, tree_seq_len * hidden_size, 0.1),
             &device,
-        ).unwrap();
+        )
+        .unwrap();
 
         let tree_mask = causal_tree_mask_with_prefix(
             tree_seq_len as u32,
@@ -8660,17 +9855,27 @@ mod tests {
 
         let enc = device.command_encoder().expect("encoder");
         let out = qwen35_tree_verify_attention_block(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &weights, shape,
-        ).expect("block call");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &weights,
+            shape,
+        )
+        .expect("block call");
 
         // AC-4 checks.
         assert_eq!(out.dtype(), DType::F32);
         assert_eq!(out.shape(), &[tree_seq_len, hidden_size]);
         let out_data = download_f32(&out).unwrap();
-        assert!(out_data.iter().all(|v| v.is_finite()), "output has non-finite values");
+        assert!(
+            out_data.iter().all(|v| v.is_finite()),
+            "output has non-finite values"
+        );
 
         // K cache slot [64, 68) must have been written (no longer all-zero).
         let k_data = k_cache.as_slice::<f32>().expect("k_cache slice");
@@ -8717,7 +9922,12 @@ mod tests {
 
         let make_valid_inputs = |device: &MlxDevice, seed: &mut u32| {
             let hidden_in = upload_f32(&mk_rand(seed, seq * h, 0.1), device).unwrap();
-            let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, device);
+            let mask = causal_tree_mask_with_prefix(
+                seq as u32,
+                prefix as u32,
+                (prefix + seq) as u32,
+                device,
+            );
             let pos = upload_positions(seq, prefix as u32, device);
             let k_cache = alloc_kv_cache(nkv, cap, d, device);
             let v_cache = alloc_kv_cache(nkv, cap, d, device);
@@ -8733,32 +9943,68 @@ mod tests {
 
         // (a) head_dim=256 rejected — via full function entry.
         {
-            let mut shape = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            let mut shape = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
             shape.head_dim = 256;
-            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_valid_inputs(&device, &mut seed);
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) =
+                make_valid_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_attention_block(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_weights, shape,
-            ).unwrap_err();
-            assert!(err.to_string().contains("head_dim"), "(a) head_dim rejection: got: {err}");
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_weights,
+                shape,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("head_dim"),
+                "(a) head_dim rejection: got: {err}"
+            );
         }
 
         // (b) attn_output_gate=false rejected — via full function entry.
         {
-            let mut shape = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            let mut shape = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
             shape.attn_output_gate = false;
-            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_valid_inputs(&device, &mut seed);
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) =
+                make_valid_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_attention_block(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_weights, shape,
-            ).unwrap_err();
-            assert!(err.to_string().contains("attn_output_gate"), "(b) gate rejection: got: {err}");
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_weights,
+                shape,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("attn_output_gate"),
+                "(b) gate rejection: got: {err}"
+            );
         }
 
         // (c) num_q_heads not divisible by num_kv_heads rejected — via
@@ -8768,21 +10014,38 @@ mod tests {
             // Need weights matching the wrong-shape so we only fail on divisibility,
             // not weight-size mismatch — but the shape.validate inside the function
             // will reject the GQA divisibility before any weight check. Use base_weights.
-            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_valid_inputs(&device, &mut seed);
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) =
+                make_valid_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_attention_block(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_weights, shape,
-            ).unwrap_err();
-            assert!(err.to_string().contains("num_q_heads") || err.to_string().contains("divisible"),
-                "(c) GQA divisibility rejection via full function: got: {err}");
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_weights,
+                shape,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("num_q_heads") || err.to_string().contains("divisible"),
+                "(c) GQA divisibility rejection via full function: got: {err}"
+            );
         }
 
         // (d) cache_prefix_len + tree_seq_len > kv_capacity rejected.
         {
-            let mut shape = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            let mut shape = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
             shape.cache_prefix_len = 7; // 7 + 2 = 9 > 8
             let err = shape.validate().unwrap_err();
             assert!(
@@ -8793,31 +10056,58 @@ mod tests {
 
         // (e) mask_stride < prefix+tree rejected.
         {
-            let mut shape = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            let mut shape = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
             shape.mask_stride = (prefix + seq - 1) as u32; // too small by 1
             let err = shape.validate().unwrap_err();
-            assert!(err.to_string().contains("mask_stride"), "(e) mask_stride rejection: got: {err}");
+            assert!(
+                err.to_string().contains("mask_stride"),
+                "(e) mask_stride rejection: got: {err}"
+            );
         }
 
         // (f) tree_positions wrong element count rejected.
         {
-            let shape = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
-            let (hidden_in, mask, _pos, mut k_cache, mut v_cache) = make_valid_inputs(&device, &mut seed);
+            let shape = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
+            let (hidden_in, mask, _pos, mut k_cache, mut v_cache) =
+                make_valid_inputs(&device, &mut seed);
             // Wrong positions: 3*seq instead of 4*seq elements.
             let wrong_pos = {
                 let n = 3 * seq;
                 let mut buf = device.alloc_buffer(n * 4, DType::I32, vec![n]).unwrap();
                 let s = buf.as_mut_slice::<i32>().unwrap();
-                for v in s.iter_mut() { *v = prefix as i32; }
+                for v in s.iter_mut() {
+                    *v = prefix as i32;
+                }
                 buf
             };
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_attention_block(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &wrong_pos,
-                &mut k_cache, &mut v_cache,
-                &base_weights, shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &wrong_pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_weights,
+                shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("tree_positions"),
                 "(f) positions length rejection: got: {err}"
@@ -8826,17 +10116,32 @@ mod tests {
 
         // (g) hidden_states_in wrong shape rejected.
         {
-            let shape = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
-            let (_hidden_in, mask, pos, mut k_cache, mut v_cache) = make_valid_inputs(&device, &mut seed);
+            let shape = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
+            let (_hidden_in, mask, pos, mut k_cache, mut v_cache) =
+                make_valid_inputs(&device, &mut seed);
             // Provide hidden_states_in with only half the elements.
             let wrong_hidden = upload_f32(&mk_rand(&mut seed, seq * h / 2, 0.1), &device).unwrap();
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_attention_block(
-                enc, &device, &mut registry,
-                &wrong_hidden, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_weights, shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &wrong_hidden,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_weights,
+                shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("hidden_states_in"),
                 "(g) hidden_states_in shape rejection: got: {err}"
@@ -8851,11 +10156,11 @@ mod tests {
     /// Implements the same 11-step op order as `qwen35_tree_verify_attention_block`
     /// but in pure scalar F32 for parity comparison.
     fn cpu_tree_verify_attention_block_ref(
-        hidden_states_in: &[f32],    // [seq, h]
-        tree_mask: &[f32],           // [seq, mask_stride] — 0.0=attended, <0=masked
-        positions: &[[i32; 4]],      // [seq] per-token axis positions
-        k_cache_cpu: &mut [f32],     // [nkv, cap, d] — mutated in place
-        v_cache_cpu: &mut [f32],     // [nkv, cap, d] — mutated in place
+        hidden_states_in: &[f32], // [seq, h]
+        tree_mask: &[f32],        // [seq, mask_stride] — 0.0=attended, <0=masked
+        positions: &[[i32; 4]],   // [seq] per-token axis positions
+        k_cache_cpu: &mut [f32],  // [nkv, cap, d] — mutated in place
+        v_cache_cpu: &mut [f32],  // [nkv, cap, d] — mutated in place
         weights: &FullAttnLayerWeights,
         h: usize,
         nq: usize,
@@ -8891,10 +10196,19 @@ mod tests {
             out
         }
 
-        fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
+        fn sigmoid(x: f32) -> f32 {
+            1.0 / (1.0 + (-x).exp())
+        }
 
-        fn imrope_inplace(data: &mut [f32], n_head: usize, head_dim: usize,
-                          rot_dim: usize, theta: f32, pos: [i32; 4], sections: [u32; 4]) {
+        fn imrope_inplace(
+            data: &mut [f32],
+            n_head: usize,
+            head_dim: usize,
+            rot_dim: usize,
+            theta: f32,
+            pos: [i32; 4],
+            sections: [u32; 4],
+        ) {
             let half_dim = head_dim / 2;
             let half_rope = rot_dim / 2;
             let sect_total = sections.iter().sum::<u32>().max(1);
@@ -8902,10 +10216,15 @@ mod tests {
                 let s0 = sections[0];
                 let s1 = s0 + sections[1];
                 let s2 = s1 + sections[2];
-                if sec < s0 { 0 }
-                else if sec < s1 { 1 }
-                else if sec < s2 { 2 }
-                else { 3 }
+                if sec < s0 {
+                    0
+                } else if sec < s1 {
+                    1
+                } else if sec < s2 {
+                    2
+                } else {
+                    3
+                }
             };
             for h in 0..n_head {
                 let base = h * head_dim;
@@ -8932,8 +10251,12 @@ mod tests {
         // Step 1: RMSNorm
         let mut x_norm = vec![0.0f32; seq * h];
         for t in 0..seq {
-            let normed = rms_norm_row(&hidden_states_in[t*h..(t+1)*h], &weights.attn_norm, eps);
-            x_norm[t*h..(t+1)*h].copy_from_slice(&normed);
+            let normed = rms_norm_row(
+                &hidden_states_in[t * h..(t + 1) * h],
+                &weights.attn_norm,
+                eps,
+            );
+            x_norm[t * h..(t + 1) * h].copy_from_slice(&normed);
         }
 
         // Step 2: Q/K/V/G projections
@@ -8947,27 +10270,43 @@ mod tests {
         for t in 0..seq {
             for hq in 0..nq {
                 let base = (t * nq + hq) * d;
-                let normed = rms_norm_row(&q[base..base+d], &weights.attn_q_norm, eps);
-                q[base..base+d].copy_from_slice(&normed);
+                let normed = rms_norm_row(&q[base..base + d], &weights.attn_q_norm, eps);
+                q[base..base + d].copy_from_slice(&normed);
             }
         }
         let mut k = k_flat;
         for t in 0..seq {
             for hk in 0..nkv {
                 let base = (t * nkv + hk) * d;
-                let normed = rms_norm_row(&k[base..base+d], &weights.attn_k_norm, eps);
-                k[base..base+d].copy_from_slice(&normed);
+                let normed = rms_norm_row(&k[base..base + d], &weights.attn_k_norm, eps);
+                k[base..base + d].copy_from_slice(&normed);
             }
         }
 
         // Step 4: IMROPE on Q and K
         for t in 0..seq {
             let base = t * nq * d;
-            imrope_inplace(&mut q[base..base+nq*d], nq, d, rotary_dim, rope_theta, positions[t], mrope_section);
+            imrope_inplace(
+                &mut q[base..base + nq * d],
+                nq,
+                d,
+                rotary_dim,
+                rope_theta,
+                positions[t],
+                mrope_section,
+            );
         }
         for t in 0..seq {
             let base = t * nkv * d;
-            imrope_inplace(&mut k[base..base+nkv*d], nkv, d, rotary_dim, rope_theta, positions[t], mrope_section);
+            imrope_inplace(
+                &mut k[base..base + nkv * d],
+                nkv,
+                d,
+                rotary_dim,
+                rope_theta,
+                positions[t],
+                mrope_section,
+            );
         }
 
         // Step 6: KV cache write — [prefix+pos] for each head
@@ -8975,8 +10314,8 @@ mod tests {
             for pos in 0..seq {
                 let src_off = (pos * nkv + kv_head) * d;
                 let dst_off = kv_head * cap * d + (prefix + pos) * d;
-                k_cache_cpu[dst_off..dst_off+d].copy_from_slice(&k[src_off..src_off+d]);
-                v_cache_cpu[dst_off..dst_off+d].copy_from_slice(&v_flat[src_off..src_off+d]);
+                k_cache_cpu[dst_off..dst_off + d].copy_from_slice(&k[src_off..src_off + d]);
+                v_cache_cpu[dst_off..dst_off + d].copy_from_slice(&v_flat[src_off..src_off + d]);
             }
         }
 
@@ -8991,7 +10330,8 @@ mod tests {
                 let mut logits = vec![f32::NEG_INFINITY; kv_seq];
                 for t_k in 0..kv_seq {
                     let mask_val = tree_mask[t_q * mask_stride + t_k];
-                    if mask_val >= -1.0 { // TREE_MASK_ATTENDED = 0.0
+                    if mask_val >= -1.0 {
+                        // TREE_MASK_ATTENDED = 0.0
                         let k_off = hkv * cap * d + t_k * d;
                         let mut dot = 0.0f32;
                         for i in 0..d {
@@ -9002,11 +10342,22 @@ mod tests {
                 }
                 let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut exp_sum = 0.0f32;
-                let mut exp_logits: Vec<f32> = logits.iter().map(|&l| {
-                    if l == f32::NEG_INFINITY { 0.0 } else { let e = (l - max_l).exp(); exp_sum += e; e }
-                }).collect();
+                let mut exp_logits: Vec<f32> = logits
+                    .iter()
+                    .map(|&l| {
+                        if l == f32::NEG_INFINITY {
+                            0.0
+                        } else {
+                            let e = (l - max_l).exp();
+                            exp_sum += e;
+                            e
+                        }
+                    })
+                    .collect();
                 if exp_sum > 0.0 {
-                    for e in exp_logits.iter_mut() { *e /= exp_sum; }
+                    for e in exp_logits.iter_mut() {
+                        *e /= exp_sum;
+                    }
                 }
                 let out_off = (t_q * nq + hq) * d;
                 for t_k in 0..kv_seq {
@@ -9114,21 +10465,30 @@ mod tests {
 
         let enc = device.command_encoder().expect("encoder");
         let gpu_out = qwen35_tree_verify_attention_block(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &gpu_weights, shape,
-        ).expect("gpu block");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &gpu_weights,
+            shape,
+        )
+        .expect("gpu block");
 
         let gpu_data = download_f32(&gpu_out).unwrap();
 
         // CPU reference.
         let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
         let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
-        let positions: Vec<[i32; 4]> = (0..seq).map(|i| {
-            let p = (prefix + i) as i32;
-            [p, p, p, p]
-        }).collect();
+        let positions: Vec<[i32; 4]> = (0..seq)
+            .map(|i| {
+                let p = (prefix + i) as i32;
+                [p, p, p, p]
+            })
+            .collect();
 
         let cpu_data = cpu_tree_verify_attention_block_ref(
             &hidden_data,
@@ -9137,14 +10497,25 @@ mod tests {
             &mut k_cache_cpu,
             &mut v_cache_cpu,
             &cpu_weights,
-            h, nq, nkv, d, seq, cap, prefix,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
             prefix + seq, // mask_stride
-            64, 1e7, [11, 11, 10, 0], 1e-6,
+            64,
+            1e7,
+            [11, 11, 10, 0],
+            1e-6,
         );
 
         assert_eq!(gpu_data.len(), cpu_data.len(), "output length mismatch");
 
-        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+        let max_diff: f32 = gpu_data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
@@ -9233,28 +10604,44 @@ mod tests {
         let mut v_cache1 = alloc_kv_cache(nkv, cap, d, &device);
         let enc1 = device.command_encoder().expect("enc1");
         let out1 = qwen35_tree_verify_attention_block(
-            enc1, &device, &mut registry,
-            &hidden_in, &mask, &pos,
-            &mut k_cache1, &mut v_cache1,
-            &weights, shape,
-        ).expect("run1");
+            enc1,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &mask,
+            &pos,
+            &mut k_cache1,
+            &mut v_cache1,
+            &weights,
+            shape,
+        )
+        .expect("run1");
 
         // Run 2 (same inputs, fresh caches — no state leakage).
         let mut k_cache2 = alloc_kv_cache(nkv, cap, d, &device);
         let mut v_cache2 = alloc_kv_cache(nkv, cap, d, &device);
         let enc2 = device.command_encoder().expect("enc2");
         let out2 = qwen35_tree_verify_attention_block(
-            enc2, &device, &mut registry,
-            &hidden_in, &mask, &pos,
-            &mut k_cache2, &mut v_cache2,
-            &weights, shape,
-        ).expect("run2");
+            enc2,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &mask,
+            &pos,
+            &mut k_cache2,
+            &mut v_cache2,
+            &weights,
+            shape,
+        )
+        .expect("run2");
 
         let d1 = download_f32(&out1).unwrap();
         let d2 = download_f32(&out2).unwrap();
         assert_eq!(d1.len(), d2.len());
 
-        let max_diff: f32 = d1.iter().zip(d2.iter())
+        let max_diff: f32 = d1
+            .iter()
+            .zip(d2.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
@@ -9310,9 +10697,8 @@ mod tests {
         let weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
-        let mask = causal_tree_mask_with_prefix(
-            seq as u32, prefix as u32, (prefix + seq) as u32, &device,
-        );
+        let mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let pos = upload_positions(seq, prefix as u32, &device);
 
         let mut outputs: Vec<Vec<f32>> = Vec::new();
@@ -9323,11 +10709,18 @@ mod tests {
             let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
             let enc = device.command_encoder().expect("encoder");
             let out = qwen35_tree_verify_attention_block(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &weights, shape,
-            ).unwrap_or_else(|e| panic!("T7 rep {} failed: {e}", rep));
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &weights,
+                shape,
+            )
+            .unwrap_or_else(|e| panic!("T7 rep {} failed: {e}", rep));
             outputs.push(download_f32(&out).unwrap());
         }
 
@@ -9338,7 +10731,8 @@ mod tests {
             assert_eq!(first.len(), this.len(), "T7: rep {rep} length mismatch");
             for (i, (a, b)) in first.iter().zip(this.iter()).enumerate() {
                 assert_eq!(
-                    a.to_bits(), b.to_bits(),
+                    a.to_bits(),
+                    b.to_bits(),
                     "T7 FAIL: rep {rep} output[{i}] differs: first={a} this={b}"
                 );
             }
@@ -9356,16 +10750,18 @@ mod tests {
         intermediate_size: usize,
         seed: &mut u32,
         device: &MlxDevice,
-    ) -> (super::super::gpu_ffn::DenseFfnWeightsGpu, super::super::ffn::DenseFfnWeights) {
+    ) -> (
+        super::super::gpu_ffn::DenseFfnWeightsGpu,
+        super::super::ffn::DenseFfnWeights,
+    ) {
         use super::super::ffn::DenseFfnWeights;
         use super::super::gpu_ffn::DenseFfnWeightsGpu;
         let cpu = DenseFfnWeights {
             gate: mk_rand(seed, intermediate_size * hidden_size, 0.05),
-            up:   mk_rand(seed, intermediate_size * hidden_size, 0.05),
+            up: mk_rand(seed, intermediate_size * hidden_size, 0.05),
             down: mk_rand(seed, hidden_size * intermediate_size, 0.05),
         };
-        let gpu = DenseFfnWeightsGpu::from_cpu(&cpu, device)
-            .expect("upload ffn weights");
+        let gpu = DenseFfnWeightsGpu::from_cpu(&cpu, device).expect("upload ffn weights");
         (gpu, cpu)
     }
 
@@ -9409,14 +10805,19 @@ mod tests {
                 attn: layer_shape(128, 2, 1, 2, 4, 8),
                 intermediate_size: 1024 * 1024, // 1M — valid
             };
-            shape.validate().expect("(b) large but valid intermediate_size should pass");
+            shape
+                .validate()
+                .expect("(b) large but valid intermediate_size should pass");
         }
 
         // (c) embedded attn.head_dim != 128 rejected (propagates from inner validate).
         {
             let mut attn = layer_shape(128, 2, 1, 2, 4, 8);
             attn.head_dim = 256;
-            let shape = Qwen35TreeVerifyFullLayerShape { attn, intermediate_size: 192 };
+            let shape = Qwen35TreeVerifyFullLayerShape {
+                attn,
+                intermediate_size: 192,
+            };
             let err = shape.validate().unwrap_err();
             assert!(
                 err.to_string().contains("head_dim"),
@@ -9441,8 +10842,13 @@ mod tests {
                 rms_norm_eps: 1e-6,
                 attn_output_gate: true,
             };
-            let shape = Qwen35TreeVerifyFullLayerShape { attn, intermediate_size: 27648 };
-            shape.validate().expect("(d) valid Qwen 3.6 27B shape must pass");
+            let shape = Qwen35TreeVerifyFullLayerShape {
+                attn,
+                intermediate_size: 27648,
+            };
+            shape
+                .validate()
+                .expect("(d) valid Qwen 3.6 27B shape must pass");
         }
         eprintln!("AC-1 PASS: shape validate rejects all invalid shapes");
     }
@@ -9488,16 +10894,23 @@ mod tests {
 
         let mut seed = 0xF001_u32;
         let attn_weights = layer_weights_f32(
-            hidden_size, num_q_heads, num_kv_heads, head_dim,
-            &mut seed, &device,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            &mut seed,
+            &device,
         );
-        let (ffn_gpu, _ffn_cpu) = ffn_weights_f32(hidden_size, intermediate_size, &mut seed, &device);
+        let (ffn_gpu, _ffn_cpu) =
+            ffn_weights_f32(hidden_size, intermediate_size, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, tree_seq_len * hidden_size, 0.1);
         let hidden_in = upload_f32(&hidden_data, &device).unwrap();
         let tree_mask = causal_tree_mask_with_prefix(
-            tree_seq_len as u32, cache_prefix_len as u32,
-            (cache_prefix_len + tree_seq_len) as u32, &device,
+            tree_seq_len as u32,
+            cache_prefix_len as u32,
+            (cache_prefix_len + tree_seq_len) as u32,
+            &device,
         );
         let tree_pos = upload_positions(tree_seq_len, cache_prefix_len as u32, &device);
         let mut k_cache = alloc_kv_cache(num_kv_heads, kv_capacity, head_dim, &device);
@@ -9505,11 +10918,19 @@ mod tests {
 
         let enc = device.command_encoder().expect("encoder");
         let out = qwen35_tree_verify_full_layer(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &attn_weights, &ffn_gpu, full_shape,
-        ).expect("AC-2: full_layer call failed");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &attn_weights,
+            &ffn_gpu,
+            full_shape,
+        )
+        .expect("AC-2: full_layer call failed");
 
         // (a) output dtype F32
         assert_eq!(out.dtype(), DType::F32, "AC-2(a) dtype");
@@ -9517,7 +10938,10 @@ mod tests {
         assert_eq!(out.shape(), &[tree_seq_len, hidden_size], "AC-2(b) shape");
         // (c) all-finite
         let out_data = download_f32(&out).unwrap();
-        assert!(out_data.iter().all(|v| v.is_finite()), "AC-2(c) non-finite output");
+        assert!(
+            out_data.iter().all(|v| v.is_finite()),
+            "AC-2(c) non-finite output"
+        );
         // (d) K cache slot [64, 68) is non-zero
         let k_data = k_cache.as_slice::<f32>().expect("k_cache slice");
         let slot_start = 0 * kv_capacity * head_dim + cache_prefix_len * head_dim;
@@ -9559,7 +10983,12 @@ mod tests {
 
         let make_inputs = |device: &MlxDevice, seed: &mut u32| {
             let hidden_in = upload_f32(&mk_rand(seed, seq * h, 0.1), device).unwrap();
-            let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, device);
+            let mask = causal_tree_mask_with_prefix(
+                seq as u32,
+                prefix as u32,
+                (prefix + seq) as u32,
+                device,
+            );
             let pos = upload_positions(seq, prefix as u32, device);
             let k_cache = alloc_kv_cache(nkv, cap, d, device);
             let v_cache = alloc_kv_cache(nkv, cap, d, device);
@@ -9567,28 +10996,43 @@ mod tests {
         };
 
         let valid_full_shape = Qwen35TreeVerifyFullLayerShape {
-            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            attn: layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            ),
             intermediate_size: m as u32,
         };
 
         // (a) ffn_weights.gate wrong element count — full function entry.
         {
-            use super::super::gpu_ffn::DenseFfnWeightsGpu;
             use super::super::ffn::DenseFfnWeights;
+            use super::super::gpu_ffn::DenseFfnWeightsGpu;
             let wrong_gate_cpu = DenseFfnWeights {
                 gate: mk_rand(&mut seed, (m - 1) * h, 0.05), // wrong size
-                up:   mk_rand(&mut seed, m * h, 0.05),
+                up: mk_rand(&mut seed, m * h, 0.05),
                 down: mk_rand(&mut seed, h * m, 0.05),
             };
             let wrong_ffn = DenseFfnWeightsGpu::from_cpu(&wrong_gate_cpu, &device).unwrap();
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_ffn, valid_full_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_ffn,
+                valid_full_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("ffn_weights.gate"),
                 "(a) gate wrong count not caught: {err}"
@@ -9597,22 +11041,30 @@ mod tests {
 
         // (b) ffn_weights.up wrong element count — full function entry.
         {
-            use super::super::gpu_ffn::DenseFfnWeightsGpu;
             use super::super::ffn::DenseFfnWeights;
+            use super::super::gpu_ffn::DenseFfnWeightsGpu;
             let wrong_up_cpu = DenseFfnWeights {
                 gate: mk_rand(&mut seed, m * h, 0.05),
-                up:   mk_rand(&mut seed, (m + 1) * h, 0.05), // wrong size
+                up: mk_rand(&mut seed, (m + 1) * h, 0.05), // wrong size
                 down: mk_rand(&mut seed, h * m, 0.05),
             };
             let wrong_ffn = DenseFfnWeightsGpu::from_cpu(&wrong_up_cpu, &device).unwrap();
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_ffn, valid_full_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_ffn,
+                valid_full_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("ffn_weights.up"),
                 "(b) up wrong count not caught: {err}"
@@ -9621,22 +11073,30 @@ mod tests {
 
         // (c) ffn_weights.down wrong element count — full function entry.
         {
-            use super::super::gpu_ffn::DenseFfnWeightsGpu;
             use super::super::ffn::DenseFfnWeights;
+            use super::super::gpu_ffn::DenseFfnWeightsGpu;
             let wrong_down_cpu = DenseFfnWeights {
                 gate: mk_rand(&mut seed, m * h, 0.05),
-                up:   mk_rand(&mut seed, m * h, 0.05),
+                up: mk_rand(&mut seed, m * h, 0.05),
                 down: mk_rand(&mut seed, h * (m - 1), 0.05), // wrong size
             };
             let wrong_ffn = DenseFfnWeightsGpu::from_cpu(&wrong_down_cpu, &device).unwrap();
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_ffn, valid_full_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_ffn,
+                valid_full_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("ffn_weights.down"),
                 "(c) down wrong count not caught: {err}"
@@ -9646,17 +11106,32 @@ mod tests {
         // (d) intermediate_size = 0 — full function entry via shape.validate().
         {
             let bad_shape = Qwen35TreeVerifyFullLayerShape {
-                attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+                attn: layer_shape(
+                    h as u32,
+                    nq as u32,
+                    nkv as u32,
+                    seq as u32,
+                    prefix as u32,
+                    cap as u32,
+                ),
                 intermediate_size: 0,
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_ffn_gpu, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_ffn_gpu,
+                bad_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("intermediate_size"),
                 "(d) intermediate_size=0 not rejected via full entry: {err}"
@@ -9665,7 +11140,14 @@ mod tests {
 
         // (e) inner attn shape head_dim != 128 — propagates from shape.validate() via full entry.
         {
-            let mut bad_attn = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            let mut bad_attn = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
             bad_attn.head_dim = 64; // invalid
             let bad_shape = Qwen35TreeVerifyFullLayerShape {
                 attn: bad_attn,
@@ -9674,11 +11156,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_ffn_gpu, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_ffn_gpu,
+                bad_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("head_dim"),
                 "(e) head_dim != 128 not propagated via full entry: {err}"
@@ -9744,11 +11234,24 @@ mod tests {
 
         // Step 1-11: Run the attention sub-block CPU reference.
         let attn_out = cpu_tree_verify_attention_block_ref(
-            hidden_states_in, tree_mask, positions,
-            k_cache_cpu, v_cache_cpu,
+            hidden_states_in,
+            tree_mask,
+            positions,
+            k_cache_cpu,
+            v_cache_cpu,
             attn_weights,
-            h, nq, nkv, d, seq, cap, prefix,
-            mask_stride, rotary_dim, rope_theta, mrope_section, eps,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
+            mask_stride,
+            rotary_dim,
+            rope_theta,
+            mrope_section,
+            eps,
         );
 
         // Step B: ffn_residual = attn_out (PRE-norm value).
@@ -9758,16 +11261,16 @@ mod tests {
         let mut ffn_input = vec![0.0f32; seq * h];
         for t in 0..seq {
             let row = rms_norm_row_local(
-                &attn_out[t*h..(t+1)*h],
+                &attn_out[t * h..(t + 1) * h],
                 &attn_weights.post_attn_norm,
                 eps,
             );
-            ffn_input[t*h..(t+1)*h].copy_from_slice(&row);
+            ffn_input[t * h..(t + 1) * h].copy_from_slice(&row);
         }
 
         // Step F+G: gate_proj and up_proj — [seq, h] @ [m, h]^T → [seq, m].
         let gate_proj = matmul_local(&ffn_input, ffn_gate, seq, h, intermediate_size);
-        let up_proj   = matmul_local(&ffn_input, ffn_up,   seq, h, intermediate_size);
+        let up_proj = matmul_local(&ffn_input, ffn_up, seq, h, intermediate_size);
 
         // Step I: silu(gate) * up — activated [seq, m].
         let mut activated = vec![0.0f32; seq * intermediate_size];
@@ -9816,27 +11319,28 @@ mod tests {
 
         // Build CPU weights (for the reference) — nonzero for all projections.
         let cpu_attn_weights = FullAttnLayerWeights {
-            attn_norm:      vec![1.0f32; h],
+            attn_norm: vec![1.0f32; h],
             post_attn_norm: mk_rand(&mut seed, h, 0.5), // nonzero post-attn norm
-            wq:     mk_rand(&mut seed, q_total * h, 0.05),
-            wk:     mk_rand(&mut seed, kv_total * h, 0.05),
-            wv:     mk_rand(&mut seed, kv_total * h, 0.05),
+            wq: mk_rand(&mut seed, q_total * h, 0.05),
+            wk: mk_rand(&mut seed, kv_total * h, 0.05),
+            wv: mk_rand(&mut seed, kv_total * h, 0.05),
             w_gate: mk_rand(&mut seed, q_total * h, 0.05),
             attn_q_norm: vec![1.0f32; d],
             attn_k_norm: vec![1.0f32; d],
-            wo:     mk_rand(&mut seed, h * q_total, 0.05),
+            wo: mk_rand(&mut seed, h * q_total, 0.05),
         };
         let ffn_gate_cpu = mk_rand(&mut seed, m * h, 0.05);
-        let ffn_up_cpu   = mk_rand(&mut seed, m * h, 0.05);
+        let ffn_up_cpu = mk_rand(&mut seed, m * h, 0.05);
         let ffn_down_cpu = mk_rand(&mut seed, h * m, 0.05);
 
         // Upload GPU weights.
-        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
-        use super::super::gpu_ffn::DenseFfnWeightsGpu;
+        let gpu_attn_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
         use super::super::ffn::DenseFfnWeights;
+        use super::super::gpu_ffn::DenseFfnWeightsGpu;
         let ffn_cpu_weights = DenseFfnWeights {
             gate: ffn_gate_cpu.clone(),
-            up:   ffn_up_cpu.clone(),
+            up: ffn_up_cpu.clone(),
             down: ffn_down_cpu.clone(),
         };
         let gpu_ffn_weights = DenseFfnWeightsGpu::from_cpu(&ffn_cpu_weights, &device).unwrap();
@@ -9851,7 +11355,8 @@ mod tests {
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
                     if j < mask_stride {
-                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
                     }
                 }
             }
@@ -9865,11 +11370,19 @@ mod tests {
 
         let enc = device.command_encoder().expect("encoder");
         let gpu_out = qwen35_tree_verify_full_layer(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &gpu_attn_weights, &gpu_ffn_weights, full_shape,
-        ).expect("AC-4: GPU full_layer");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &gpu_attn_weights,
+            &gpu_ffn_weights,
+            full_shape,
+        )
+        .expect("AC-4: GPU full_layer");
 
         let gpu_data = download_f32(&gpu_out).unwrap();
 
@@ -9877,22 +11390,46 @@ mod tests {
         let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
         let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
         let positions: Vec<[i32; 4]> = (0..seq)
-            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .map(|i| {
+                let p = (prefix + i) as i32;
+                [p, p, p, p]
+            })
             .collect();
 
         let cpu_data = cpu_tree_verify_full_layer_ref(
-            &hidden_data, &tree_mask_data, &positions,
-            &mut k_cache_cpu, &mut v_cache_cpu,
+            &hidden_data,
+            &tree_mask_data,
+            &positions,
+            &mut k_cache_cpu,
+            &mut v_cache_cpu,
             &cpu_attn_weights,
-            &ffn_gate_cpu, &ffn_up_cpu, &ffn_down_cpu,
-            h, nq, nkv, d, seq, cap, prefix,
-            mask_stride, m,
-            64, 1e7, [11, 11, 10, 0], 1e-6,
+            &ffn_gate_cpu,
+            &ffn_up_cpu,
+            &ffn_down_cpu,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
+            mask_stride,
+            m,
+            64,
+            1e7,
+            [11, 11, 10, 0],
+            1e-6,
         );
 
-        assert_eq!(gpu_data.len(), cpu_data.len(), "AC-4: output length mismatch");
+        assert_eq!(
+            gpu_data.len(),
+            cpu_data.len(),
+            "AC-4: output length mismatch"
+        );
 
-        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+        let max_diff: f32 = gpu_data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
@@ -9947,29 +11484,30 @@ mod tests {
 
         // Build CPU weights explicitly. All weights nonzero to stress the MLP chain.
         let cpu_attn_weights = FullAttnLayerWeights {
-            attn_norm:      vec![1.0f32; h],
+            attn_norm: vec![1.0f32; h],
             post_attn_norm: vec![1.0f32; h],
-            wq:     mk_rand(&mut seed, q_total * h, 0.05),
-            wk:     mk_rand(&mut seed, kv_total * h, 0.05),
-            wv:     mk_rand(&mut seed, kv_total * h, 0.05),
+            wq: mk_rand(&mut seed, q_total * h, 0.05),
+            wk: mk_rand(&mut seed, kv_total * h, 0.05),
+            wv: mk_rand(&mut seed, kv_total * h, 0.05),
             w_gate: mk_rand(&mut seed, q_total * h, 0.05),
             attn_q_norm: vec![1.0f32; d],
             attn_k_norm: vec![1.0f32; d],
-            wo:     mk_rand(&mut seed, h * q_total, 0.05),
+            wo: mk_rand(&mut seed, h * q_total, 0.05),
         };
         let ffn_gate_cpu = mk_rand(&mut seed, m * h, 0.05);
-        let ffn_up_cpu   = mk_rand(&mut seed, m * h, 0.05);
+        let ffn_up_cpu = mk_rand(&mut seed, m * h, 0.05);
         let ffn_down_cpu = mk_rand(&mut seed, h * m, 0.05);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
 
         // Side A: GPU full-layer (attn block + MLP chain via GPU).
-        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
-        use super::super::gpu_ffn::DenseFfnWeightsGpu;
+        let gpu_attn_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
         use super::super::ffn::DenseFfnWeights;
+        use super::super::gpu_ffn::DenseFfnWeightsGpu;
         let ffn_cpu_weights = DenseFfnWeights {
             gate: ffn_gate_cpu.clone(),
-            up:   ffn_up_cpu.clone(),
+            up: ffn_up_cpu.clone(),
             down: ffn_down_cpu.clone(),
         };
         let gpu_ffn_weights = DenseFfnWeightsGpu::from_cpu(&ffn_cpu_weights, &device).unwrap();
@@ -9981,7 +11519,8 @@ mod tests {
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
                     if j < mask_stride {
-                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
                     }
                 }
             }
@@ -9994,11 +11533,19 @@ mod tests {
         let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
         let enc = device.command_encoder().expect("enc");
         let gpu_out = qwen35_tree_verify_full_layer(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &gpu_attn_weights, &gpu_ffn_weights, full_shape,
-        ).expect("AC-5: GPU full_layer");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &gpu_attn_weights,
+            &gpu_ffn_weights,
+            full_shape,
+        )
+        .expect("AC-5: GPU full_layer");
         let gpu_data = download_f32(&gpu_out).unwrap();
 
         // Side B: Full CPU reference (attn + MLP) — catches wrong wrapper composition.
@@ -10006,20 +11553,40 @@ mod tests {
         let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
         let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
         let positions: Vec<[i32; 4]> = (0..seq)
-            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .map(|i| {
+                let p = (prefix + i) as i32;
+                [p, p, p, p]
+            })
             .collect();
         let cpu_data = cpu_tree_verify_full_layer_ref(
-            &hidden_data, &tree_mask_data, &positions,
-            &mut k_cache_cpu, &mut v_cache_cpu,
+            &hidden_data,
+            &tree_mask_data,
+            &positions,
+            &mut k_cache_cpu,
+            &mut v_cache_cpu,
             &cpu_attn_weights,
-            &ffn_gate_cpu, &ffn_up_cpu, &ffn_down_cpu,
-            h, nq, nkv, d, seq, cap, prefix,
-            mask_stride, m,
-            64, 1e7, [11, 11, 10, 0], 1e-6,
+            &ffn_gate_cpu,
+            &ffn_up_cpu,
+            &ffn_down_cpu,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
+            mask_stride,
+            m,
+            64,
+            1e7,
+            [11, 11, 10, 0],
+            1e-6,
         );
 
         assert_eq!(gpu_data.len(), cpu_data.len(), "AC-5: length mismatch");
-        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+        let max_diff: f32 = gpu_data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
@@ -10064,7 +11631,8 @@ mod tests {
         let (ffn_gpu, _) = ffn_weights_f32(h, m, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
-        let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let pos = upload_positions(seq, prefix as u32, &device);
 
         let mut outputs: Vec<Vec<f32>> = Vec::new();
@@ -10077,11 +11645,19 @@ mod tests {
             let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
             let enc = device.command_encoder().expect("enc");
             let out = qwen35_tree_verify_full_layer(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &attn_weights, &ffn_gpu, full_shape,
-            ).unwrap_or_else(|e| panic!("AC-6: rep {} failed: {e}", rep));
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &attn_weights,
+                &ffn_gpu,
+                full_shape,
+            )
+            .unwrap_or_else(|e| panic!("AC-6: rep {} failed: {e}", rep));
             outputs.push(download_f32(&out).unwrap());
         }
 
@@ -10092,10 +11668,12 @@ mod tests {
             assert_eq!(first.len(), this.len(), "AC-6: rep {rep} length mismatch");
             for (i, (a, b)) in first.iter().zip(this.iter()).enumerate() {
                 assert_eq!(
-                    a.to_bits(), b.to_bits(),
+                    a.to_bits(),
+                    b.to_bits(),
                     "AC-6 FAIL: rep {rep} output[{i}] differs: first={a:.6e} ({:#010x}) \
                      this={b:.6e} ({:#010x})",
-                    a.to_bits(), b.to_bits()
+                    a.to_bits(),
+                    b.to_bits()
                 );
             }
         }
@@ -10144,7 +11722,7 @@ mod tests {
             for j in 0..16 {
                 let x0 = (qs[j] & 0x0F) as i16 - 8;
                 let x1 = (qs[j] >> 4) as i16 - 8;
-                out_block[j]      = x0 as f32 * d;
+                out_block[j] = x0 as f32 * d;
                 out_block[j + 16] = x1 as f32 * d;
             }
         }
@@ -10159,13 +11737,18 @@ mod tests {
         intermediate_size: usize,
         seed: &mut u32,
         device: &MlxDevice,
-    ) -> (super::super::gpu_ffn::DenseFfnWeightsGpuQ, Vec<f32>, Vec<f32>, Vec<f32>) {
+    ) -> (
+        super::super::gpu_ffn::DenseFfnWeightsGpuQ,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    ) {
         let gate_f32 = mk_rand(seed, intermediate_size * hidden_size, 0.05);
-        let up_f32   = mk_rand(seed, intermediate_size * hidden_size, 0.05);
+        let up_f32 = mk_rand(seed, intermediate_size * hidden_size, 0.05);
         let down_f32 = mk_rand(seed, hidden_size * intermediate_size, 0.05);
 
         let gate_q = upload_q4_0(&gate_f32, hidden_size, device);
-        let up_q   = upload_q4_0(&up_f32,   hidden_size, device);
+        let up_q = upload_q4_0(&up_f32, hidden_size, device);
         let down_q = upload_q4_0(&down_f32, intermediate_size, device);
 
         let weights_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
@@ -10203,14 +11786,19 @@ mod tests {
                 attn: layer_shape(128, 2, 1, 2, 4, 8),
                 intermediate_size: 1024 * 1024,
             };
-            shape.validate().expect("(b) large but valid intermediate_size should pass");
+            shape
+                .validate()
+                .expect("(b) large but valid intermediate_size should pass");
         }
 
         // (c) embedded attn.head_dim != 128 rejected (propagates from inner validate).
         {
             let mut attn = layer_shape(128, 2, 1, 2, 4, 8);
             attn.head_dim = 256;
-            let shape = Qwen35TreeVerifyFullLayerShapeQ { attn, intermediate_size: 192 };
+            let shape = Qwen35TreeVerifyFullLayerShapeQ {
+                attn,
+                intermediate_size: 192,
+            };
             let err = shape.validate().unwrap_err();
             assert!(
                 err.to_string().contains("head_dim"),
@@ -10235,8 +11823,13 @@ mod tests {
                 rms_norm_eps: 1e-6,
                 attn_output_gate: true,
             };
-            let shape = Qwen35TreeVerifyFullLayerShapeQ { attn, intermediate_size: 27648 };
-            shape.validate().expect("(d) valid Qwen 3.6 27B shape must pass");
+            let shape = Qwen35TreeVerifyFullLayerShapeQ {
+                attn,
+                intermediate_size: 27648,
+            };
+            shape
+                .validate()
+                .expect("(d) valid Qwen 3.6 27B shape must pass");
         }
         eprintln!("AC-1 (Q4_0) PASS: shape validate rejects all invalid shapes");
     }
@@ -10282,16 +11875,23 @@ mod tests {
 
         let mut seed = 0xF003_u32;
         let attn_weights = layer_weights_f32(
-            hidden_size, num_q_heads, num_kv_heads, head_dim,
-            &mut seed, &device,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            &mut seed,
+            &device,
         );
-        let (ffn_gpu_q, _, _, _) = ffn_weights_q4_0(hidden_size, intermediate_size, &mut seed, &device);
+        let (ffn_gpu_q, _, _, _) =
+            ffn_weights_q4_0(hidden_size, intermediate_size, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, tree_seq_len * hidden_size, 0.1);
         let hidden_in = upload_f32(&hidden_data, &device).unwrap();
         let tree_mask = causal_tree_mask_with_prefix(
-            tree_seq_len as u32, cache_prefix_len as u32,
-            (cache_prefix_len + tree_seq_len) as u32, &device,
+            tree_seq_len as u32,
+            cache_prefix_len as u32,
+            (cache_prefix_len + tree_seq_len) as u32,
+            &device,
         );
         let tree_pos = upload_positions(tree_seq_len, cache_prefix_len as u32, &device);
         let mut k_cache = alloc_kv_cache(num_kv_heads, kv_capacity, head_dim, &device);
@@ -10299,19 +11899,34 @@ mod tests {
 
         let enc = device.command_encoder().expect("encoder");
         let out = qwen35_tree_verify_full_layer_q(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &attn_weights, &ffn_gpu_q, full_shape_q,
-        ).expect("AC-2 Q4_0: full_layer_q call failed");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &attn_weights,
+            &ffn_gpu_q,
+            full_shape_q,
+        )
+        .expect("AC-2 Q4_0: full_layer_q call failed");
 
         // (a) output dtype F32
         assert_eq!(out.dtype(), DType::F32, "AC-2(a) Q4_0 dtype");
         // (b) output shape [tree_seq_len, hidden_size]
-        assert_eq!(out.shape(), &[tree_seq_len, hidden_size], "AC-2(b) Q4_0 shape");
+        assert_eq!(
+            out.shape(),
+            &[tree_seq_len, hidden_size],
+            "AC-2(b) Q4_0 shape"
+        );
         // (c) all-finite
         let out_data = download_f32(&out).unwrap();
-        assert!(out_data.iter().all(|v| v.is_finite()), "AC-2(c) Q4_0 non-finite output");
+        assert!(
+            out_data.iter().all(|v| v.is_finite()),
+            "AC-2(c) Q4_0 non-finite output"
+        );
         // (d) K cache slot [64, 68) is non-zero
         let k_data = k_cache.as_slice::<f32>().expect("k_cache slice");
         let slot_start = 0 * kv_capacity * head_dim + cache_prefix_len * head_dim;
@@ -10360,7 +11975,12 @@ mod tests {
 
         let make_inputs = |device: &MlxDevice, seed: &mut u32| {
             let hidden_in = upload_f32(&mk_rand(seed, seq * h, 0.1), device).unwrap();
-            let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, device);
+            let mask = causal_tree_mask_with_prefix(
+                seq as u32,
+                prefix as u32,
+                (prefix + seq) as u32,
+                device,
+            );
             let pos = upload_positions(seq, prefix as u32, device);
             let k_cache = alloc_kv_cache(nkv, cap, d, device);
             let v_cache = alloc_kv_cache(nkv, cap, d, device);
@@ -10368,7 +11988,14 @@ mod tests {
         };
 
         let valid_shape_q = Qwen35TreeVerifyFullLayerShapeQ {
-            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            attn: layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            ),
             intermediate_size: m as u32,
         };
 
@@ -10384,11 +12011,14 @@ mod tests {
             let mut wrong_gate_buf = device
                 .alloc_buffer(wrong_bytes.len(), DType::U8, vec![wrong_bytes.len()])
                 .unwrap();
-            wrong_gate_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&wrong_bytes);
+            wrong_gate_buf
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .copy_from_slice(&wrong_bytes);
 
             let wrong_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
                 gate_q: wrong_gate_buf,
-                up_q:   base_ffn_q.up_q.clone(),
+                up_q: base_ffn_q.up_q.clone(),
                 down_q: base_ffn_q.down_q.clone(),
                 ggml_type_gate_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
@@ -10398,11 +12028,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_ffn_q, valid_shape_q,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_ffn_q,
+                valid_shape_q,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("gate"),
                 "(a) gate_q wrong byte length not caught: {err}"
@@ -10419,11 +12057,14 @@ mod tests {
             let mut wrong_up_buf = device
                 .alloc_buffer(wrong_bytes.len(), DType::U8, vec![wrong_bytes.len()])
                 .unwrap();
-            wrong_up_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&wrong_bytes);
+            wrong_up_buf
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .copy_from_slice(&wrong_bytes);
 
             let wrong_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
                 gate_q: base_ffn_q.gate_q.clone(),
-                up_q:   wrong_up_buf,
+                up_q: wrong_up_buf,
                 down_q: base_ffn_q.down_q.clone(),
                 ggml_type_gate_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
@@ -10433,11 +12074,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_ffn_q, valid_shape_q,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_ffn_q,
+                valid_shape_q,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("up"),
                 "(b) up_q wrong byte length not caught: {err}"
@@ -10454,11 +12103,14 @@ mod tests {
             let mut wrong_down_buf = device
                 .alloc_buffer(wrong_bytes.len(), DType::U8, vec![wrong_bytes.len()])
                 .unwrap();
-            wrong_down_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&wrong_bytes);
+            wrong_down_buf
+                .as_mut_slice::<u8>()
+                .unwrap()
+                .copy_from_slice(&wrong_bytes);
 
             let wrong_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
                 gate_q: base_ffn_q.gate_q.clone(),
-                up_q:   base_ffn_q.up_q.clone(),
+                up_q: base_ffn_q.up_q.clone(),
                 down_q: wrong_down_buf,
                 ggml_type_gate_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
@@ -10468,11 +12120,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_ffn_q, valid_shape_q,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_ffn_q,
+                valid_shape_q,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("down"),
                 "(c) down_q wrong byte length not caught: {err}"
@@ -10482,17 +12142,32 @@ mod tests {
         // (d) shape.intermediate_size = 0 — propagates from shape.validate() via full entry.
         {
             let bad_shape = Qwen35TreeVerifyFullLayerShapeQ {
-                attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+                attn: layer_shape(
+                    h as u32,
+                    nq as u32,
+                    nkv as u32,
+                    seq as u32,
+                    prefix as u32,
+                    cap as u32,
+                ),
                 intermediate_size: 0,
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_ffn_q, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_ffn_q,
+                bad_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("intermediate_size"),
                 "(d) intermediate_size=0 not rejected via full entry: {err}"
@@ -10501,7 +12176,14 @@ mod tests {
 
         // (e) head_dim != 128 — propagates from attn validate via full entry.
         {
-            let mut bad_attn = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            let mut bad_attn = layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            );
             bad_attn.head_dim = 256;
             let bad_shape = Qwen35TreeVerifyFullLayerShapeQ {
                 attn: bad_attn,
@@ -10510,11 +12192,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_ffn_q, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_ffn_q,
+                bad_shape,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("head_dim"),
                 "(e) head_dim != 128 not propagated via full entry: {err}"
@@ -10525,7 +12215,7 @@ mod tests {
         {
             let wrong_type_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
                 gate_q: base_ffn_q.gate_q.clone(),
-                up_q:   base_ffn_q.up_q.clone(),
+                up_q: base_ffn_q.up_q.clone(),
                 down_q: base_ffn_q.down_q.clone(),
                 ggml_type_gate_up: GgmlType::Q5_K,
                 ggml_type_down: GgmlType::Q4_0,
@@ -10535,11 +12225,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_type_ffn_q, valid_shape_q,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_type_ffn_q,
+                valid_shape_q,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("ggml_type_gate_up"),
@@ -10555,7 +12253,7 @@ mod tests {
         {
             let wrong_hidden_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
                 gate_q: base_ffn_q.gate_q.clone(),
-                up_q:   base_ffn_q.up_q.clone(),
+                up_q: base_ffn_q.up_q.clone(),
                 down_q: base_ffn_q.down_q.clone(),
                 ggml_type_gate_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
@@ -10565,11 +12263,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &wrong_hidden_ffn_q, valid_shape_q,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &wrong_hidden_ffn_q,
+                valid_shape_q,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("hidden_size"),
                 "(g) hidden_size mismatch not caught: {err}"
@@ -10607,35 +12313,36 @@ mod tests {
 
         // Build CPU attn weights (non-zero for all projections).
         let cpu_attn_weights = FullAttnLayerWeights {
-            attn_norm:      vec![1.0f32; h],
+            attn_norm: vec![1.0f32; h],
             post_attn_norm: mk_rand(&mut seed, h, 0.5),
-            wq:     mk_rand(&mut seed, q_total * h, 0.05),
-            wk:     mk_rand(&mut seed, kv_total * h, 0.05),
-            wv:     mk_rand(&mut seed, kv_total * h, 0.05),
+            wq: mk_rand(&mut seed, q_total * h, 0.05),
+            wk: mk_rand(&mut seed, kv_total * h, 0.05),
+            wv: mk_rand(&mut seed, kv_total * h, 0.05),
             w_gate: mk_rand(&mut seed, q_total * h, 0.05),
             attn_q_norm: vec![1.0f32; d],
             attn_k_norm: vec![1.0f32; d],
-            wo:     mk_rand(&mut seed, h * q_total, 0.05),
+            wo: mk_rand(&mut seed, h * q_total, 0.05),
         };
 
         // Generate F32 FFN weights, then quantize to Q4_0.
         let gate_f32 = mk_rand(&mut seed, m * h, 0.05);
-        let up_f32   = mk_rand(&mut seed, m * h, 0.05);
+        let up_f32 = mk_rand(&mut seed, m * h, 0.05);
         let down_f32 = mk_rand(&mut seed, h * m, 0.05);
 
         // Quantize F32 → Q4_0 bytes.
         use crate::quantize::ggml_quants::q4_0;
         let gate_q_bytes = q4_0::quantize(&gate_f32, h, None);
-        let up_q_bytes   = q4_0::quantize(&up_f32,   h, None);
+        let up_q_bytes = q4_0::quantize(&up_f32, h, None);
         let down_q_bytes = q4_0::quantize(&down_f32, m, None);
 
         // CPU-side dequant: these are the weights the Q4_0 GPU kernel sees.
         let gate_dq = dequant_q4_0_cpu(&gate_q_bytes);
-        let up_dq   = dequant_q4_0_cpu(&up_q_bytes);
+        let up_dq = dequant_q4_0_cpu(&up_q_bytes);
         let down_dq = dequant_q4_0_cpu(&down_q_bytes);
 
         // Upload GPU weights.
-        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
+        let gpu_attn_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
         let make_u8_buf = |bytes: &[u8], device: &MlxDevice| -> MlxBuffer {
             let mut buf = device
                 .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
@@ -10645,8 +12352,8 @@ mod tests {
         };
         let gpu_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
             gate_q: make_u8_buf(&gate_q_bytes, &device),
-            up_q:   make_u8_buf(&up_q_bytes,   &device),
-            down_q: make_u8_buf(&down_q_bytes,  &device),
+            up_q: make_u8_buf(&up_q_bytes, &device),
+            down_q: make_u8_buf(&down_q_bytes, &device),
             ggml_type_gate_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
@@ -10663,7 +12370,8 @@ mod tests {
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
                     if j < mask_stride {
-                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
                     }
                 }
             }
@@ -10677,11 +12385,19 @@ mod tests {
 
         let enc = device.command_encoder().expect("encoder");
         let gpu_out = qwen35_tree_verify_full_layer_q(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &gpu_attn_weights, &gpu_ffn_q, full_shape_q,
-        ).expect("AC-4 Q4_0: GPU full_layer_q");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &gpu_attn_weights,
+            &gpu_ffn_q,
+            full_shape_q,
+        )
+        .expect("AC-4 Q4_0: GPU full_layer_q");
 
         let gpu_data = download_f32(&gpu_out).unwrap();
 
@@ -10689,22 +12405,46 @@ mod tests {
         let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
         let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
         let positions: Vec<[i32; 4]> = (0..seq)
-            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .map(|i| {
+                let p = (prefix + i) as i32;
+                [p, p, p, p]
+            })
             .collect();
 
         let cpu_data = cpu_tree_verify_full_layer_ref(
-            &hidden_data, &tree_mask_data, &positions,
-            &mut k_cache_cpu, &mut v_cache_cpu,
+            &hidden_data,
+            &tree_mask_data,
+            &positions,
+            &mut k_cache_cpu,
+            &mut v_cache_cpu,
             &cpu_attn_weights,
-            &gate_dq, &up_dq, &down_dq,
-            h, nq, nkv, d, seq, cap, prefix,
-            mask_stride, m,
-            64, 1e7, [11, 11, 10, 0], 1e-6,
+            &gate_dq,
+            &up_dq,
+            &down_dq,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
+            mask_stride,
+            m,
+            64,
+            1e7,
+            [11, 11, 10, 0],
+            1e-6,
         );
 
-        assert_eq!(gpu_data.len(), cpu_data.len(), "AC-4 Q4_0: output length mismatch");
+        assert_eq!(
+            gpu_data.len(),
+            cpu_data.len(),
+            "AC-4 Q4_0: output length mismatch"
+        );
 
-        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+        let max_diff: f32 = gpu_data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
@@ -10743,31 +12483,32 @@ mod tests {
         let mut seed = 0xB003_u32;
 
         let cpu_attn_weights = FullAttnLayerWeights {
-            attn_norm:      vec![1.0f32; h],
+            attn_norm: vec![1.0f32; h],
             post_attn_norm: vec![1.0f32; h],
-            wq:     mk_rand(&mut seed, q_total * h, 0.05),
-            wk:     mk_rand(&mut seed, kv_total * h, 0.05),
-            wv:     mk_rand(&mut seed, kv_total * h, 0.05),
+            wq: mk_rand(&mut seed, q_total * h, 0.05),
+            wk: mk_rand(&mut seed, kv_total * h, 0.05),
+            wv: mk_rand(&mut seed, kv_total * h, 0.05),
             w_gate: mk_rand(&mut seed, q_total * h, 0.05),
             attn_q_norm: vec![1.0f32; d],
             attn_k_norm: vec![1.0f32; d],
-            wo:     mk_rand(&mut seed, h * q_total, 0.05),
+            wo: mk_rand(&mut seed, h * q_total, 0.05),
         };
 
         let gate_f32 = mk_rand(&mut seed, m * h, 0.05);
-        let up_f32   = mk_rand(&mut seed, m * h, 0.05);
+        let up_f32 = mk_rand(&mut seed, m * h, 0.05);
         let down_f32 = mk_rand(&mut seed, h * m, 0.05);
         use crate::quantize::ggml_quants::q4_0;
         let gate_q_bytes = q4_0::quantize(&gate_f32, h, None);
-        let up_q_bytes   = q4_0::quantize(&up_f32,   h, None);
+        let up_q_bytes = q4_0::quantize(&up_f32, h, None);
         let down_q_bytes = q4_0::quantize(&down_f32, m, None);
         let gate_dq = dequant_q4_0_cpu(&gate_q_bytes);
-        let up_dq   = dequant_q4_0_cpu(&up_q_bytes);
+        let up_dq = dequant_q4_0_cpu(&up_q_bytes);
         let down_dq = dequant_q4_0_cpu(&down_q_bytes);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
 
-        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
+        let gpu_attn_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
         let make_u8_buf = |bytes: &[u8], device: &MlxDevice| -> MlxBuffer {
             let mut buf = device
                 .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
@@ -10777,8 +12518,8 @@ mod tests {
         };
         let gpu_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
             gate_q: make_u8_buf(&gate_q_bytes, &device),
-            up_q:   make_u8_buf(&up_q_bytes,   &device),
-            down_q: make_u8_buf(&down_q_bytes,  &device),
+            up_q: make_u8_buf(&up_q_bytes, &device),
+            down_q: make_u8_buf(&down_q_bytes, &device),
             ggml_type_gate_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
@@ -10792,7 +12533,8 @@ mod tests {
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
                     if j < mask_stride {
-                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
                     }
                 }
             }
@@ -10805,31 +12547,59 @@ mod tests {
 
         let enc = device.command_encoder().expect("enc");
         let gpu_out = qwen35_tree_verify_full_layer_q(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &gpu_attn_weights, &gpu_ffn_q, full_shape_q,
-        ).expect("AC-5 Q4_0: GPU full_layer_q");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &gpu_attn_weights,
+            &gpu_ffn_q,
+            full_shape_q,
+        )
+        .expect("AC-5 Q4_0: GPU full_layer_q");
         let gpu_data = download_f32(&gpu_out).unwrap();
 
         // CPU reference using dequantized weights.
         let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
         let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
         let positions: Vec<[i32; 4]> = (0..seq)
-            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .map(|i| {
+                let p = (prefix + i) as i32;
+                [p, p, p, p]
+            })
             .collect();
         let cpu_data = cpu_tree_verify_full_layer_ref(
-            &hidden_data, &tree_mask_data, &positions,
-            &mut k_cache_cpu, &mut v_cache_cpu,
+            &hidden_data,
+            &tree_mask_data,
+            &positions,
+            &mut k_cache_cpu,
+            &mut v_cache_cpu,
             &cpu_attn_weights,
-            &gate_dq, &up_dq, &down_dq,
-            h, nq, nkv, d, seq, cap, prefix,
-            mask_stride, m,
-            64, 1e7, [11, 11, 10, 0], 1e-6,
+            &gate_dq,
+            &up_dq,
+            &down_dq,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
+            mask_stride,
+            m,
+            64,
+            1e7,
+            [11, 11, 10, 0],
+            1e-6,
         );
 
         assert_eq!(gpu_data.len(), cpu_data.len(), "AC-5 Q4_0: length mismatch");
-        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+        let max_diff: f32 = gpu_data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
@@ -10838,7 +12608,9 @@ mod tests {
             max_diff < 0.15,
             "AC-5 (Q4_0) FAIL: composition divergence {max_diff:.6e} >= 0.15"
         );
-        eprintln!("AC-5 (Q4_0) PASS: composition equivalence |GPU-CPU|_inf = {max_diff:.6e} < 0.15");
+        eprintln!(
+            "AC-5 (Q4_0) PASS: composition equivalence |GPU-CPU|_inf = {max_diff:.6e} < 0.15"
+        );
     }
 
     /// AC-6 — 3-rep byte-identity determinism (0 ULP via to_bits()).
@@ -10866,7 +12638,8 @@ mod tests {
         let (ffn_gpu_q, _, _, _) = ffn_weights_q4_0(h, m, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
-        let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let pos = upload_positions(seq, prefix as u32, &device);
 
         let mut outputs: Vec<Vec<u32>> = Vec::new();
@@ -10877,20 +12650,35 @@ mod tests {
             let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
             let enc = device.command_encoder().expect("enc");
             let out = qwen35_tree_verify_full_layer_q(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &attn_weights, &ffn_gpu_q, full_shape_q,
-            ).unwrap_or_else(|e| panic!("AC-6 Q4_0: rep {} failed: {e}", rep));
-            let bits: Vec<u32> = download_f32(&out).unwrap()
-                .iter().map(|f| f.to_bits()).collect();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &attn_weights,
+                &ffn_gpu_q,
+                full_shape_q,
+            )
+            .unwrap_or_else(|e| panic!("AC-6 Q4_0: rep {} failed: {e}", rep));
+            let bits: Vec<u32> = download_f32(&out)
+                .unwrap()
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
             outputs.push(bits);
         }
 
         for rep in 1..3 {
             let first = &outputs[0];
-            let this  = &outputs[rep];
-            assert_eq!(first.len(), this.len(), "AC-6 Q4_0: rep {rep} length mismatch");
+            let this = &outputs[rep];
+            assert_eq!(
+                first.len(),
+                this.len(),
+                "AC-6 Q4_0: rep {rep} length mismatch"
+            );
             for (i, (a, b)) in first.iter().zip(this.iter()).enumerate() {
                 assert_eq!(
                     a, b,
@@ -10929,27 +12717,34 @@ mod tests {
 
         // Generate the SAME F32 weight arrays — both paths reuse these exact bits.
         let gate_f32 = mk_rand(&mut seed, m * h, 0.05);
-        let up_f32   = mk_rand(&mut seed, m * h, 0.05);
+        let up_f32 = mk_rand(&mut seed, m * h, 0.05);
         let down_f32 = mk_rand(&mut seed, h * m, 0.05);
 
         // Path A (F1 — F32-cast): upload F32 weights to DenseFfnWeightsGpu.
-        use super::super::gpu_ffn::DenseFfnWeightsGpu;
         use super::super::ffn::DenseFfnWeights;
+        use super::super::gpu_ffn::DenseFfnWeightsGpu;
         let ffn_cpu_weights = DenseFfnWeights {
             gate: gate_f32.clone(),
-            up:   up_f32.clone(),
+            up: up_f32.clone(),
             down: down_f32.clone(),
         };
         let ffn_gpu_f32 = DenseFfnWeightsGpu::from_cpu(&ffn_cpu_weights, &device).unwrap();
         let full_shape_f32 = Qwen35TreeVerifyFullLayerShape {
-            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            attn: layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            ),
             intermediate_size: m as u32,
         };
 
         // Path B (F2 — Q4_0): quantize the SAME F32 arrays to Q4_0 blocks.
         use crate::quantize::ggml_quants::q4_0;
         let gate_q_bytes = q4_0::quantize(&gate_f32, h, None);
-        let up_q_bytes   = q4_0::quantize(&up_f32,   h, None);
+        let up_q_bytes = q4_0::quantize(&up_f32, h, None);
         let down_q_bytes = q4_0::quantize(&down_f32, m, None);
         let make_u8_buf = |bytes: &[u8], device: &MlxDevice| -> MlxBuffer {
             let mut buf = device
@@ -10960,15 +12755,22 @@ mod tests {
         };
         let ffn_gpu_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
             gate_q: make_u8_buf(&gate_q_bytes, &device),
-            up_q:   make_u8_buf(&up_q_bytes,   &device),
-            down_q: make_u8_buf(&down_q_bytes,  &device),
+            up_q: make_u8_buf(&up_q_bytes, &device),
+            down_q: make_u8_buf(&down_q_bytes, &device),
             ggml_type_gate_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
         };
         let full_shape_q = Qwen35TreeVerifyFullLayerShapeQ {
-            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            attn: layer_shape(
+                h as u32,
+                nq as u32,
+                nkv as u32,
+                seq as u32,
+                prefix as u32,
+                cap as u32,
+            ),
             intermediate_size: m as u32,
         };
 
@@ -10980,7 +12782,8 @@ mod tests {
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
                     if j < mask_stride {
-                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
                     }
                 }
             }
@@ -10995,11 +12798,19 @@ mod tests {
         let mut v_cache_a = alloc_kv_cache(nkv, cap, d, &device);
         let enc_a = device.command_encoder().expect("enc_a");
         let out_a = qwen35_tree_verify_full_layer(
-            enc_a, &device, &mut registry,
-            &hidden_in_a, &tree_mask, &tree_pos,
-            &mut k_cache_a, &mut v_cache_a,
-            &attn_weights, &ffn_gpu_f32, full_shape_f32,
-        ).expect("AC-7: F1 path failed");
+            enc_a,
+            &device,
+            &mut registry,
+            &hidden_in_a,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache_a,
+            &mut v_cache_a,
+            &attn_weights,
+            &ffn_gpu_f32,
+            full_shape_f32,
+        )
+        .expect("AC-7: F1 path failed");
         let data_a = download_f32(&out_a).unwrap();
 
         // Run Path B (F2 — Q4_0). Fresh caches (cache writes accumulate).
@@ -11008,16 +12819,30 @@ mod tests {
         let mut v_cache_b = alloc_kv_cache(nkv, cap, d, &device);
         let enc_b = device.command_encoder().expect("enc_b");
         let out_b = qwen35_tree_verify_full_layer_q(
-            enc_b, &device, &mut registry,
-            &hidden_in_b, &tree_mask, &tree_pos,
-            &mut k_cache_b, &mut v_cache_b,
-            &attn_weights, &ffn_gpu_q, full_shape_q,
-        ).expect("AC-7: F2 path failed");
+            enc_b,
+            &device,
+            &mut registry,
+            &hidden_in_b,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache_b,
+            &mut v_cache_b,
+            &attn_weights,
+            &ffn_gpu_q,
+            full_shape_q,
+        )
+        .expect("AC-7: F2 path failed");
         let data_b = download_f32(&out_b).unwrap();
 
-        assert_eq!(data_a.len(), data_b.len(), "AC-7: output length mismatch F1 vs F2");
+        assert_eq!(
+            data_a.len(),
+            data_b.len(),
+            "AC-7: output length mismatch F1 vs F2"
+        );
 
-        let max_diff: f32 = data_a.iter().zip(data_b.iter())
+        let max_diff: f32 = data_a
+            .iter()
+            .zip(data_b.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
@@ -11040,7 +12865,10 @@ mod tests {
 
     /// Build a valid tiny MoE shape for testing.
     fn moe_layer_shape_tiny(
-        ne: u32, topk: u32, m_moe: u32, m_sh: u32,
+        ne: u32,
+        topk: u32,
+        m_moe: u32,
+        m_sh: u32,
     ) -> Qwen35TreeVerifyFullLayerShapeQMoe {
         Qwen35TreeVerifyFullLayerShapeQMoe {
             attn: layer_shape(128, 4, 1, 2, 4, 8),
@@ -11065,7 +12893,10 @@ mod tests {
         m_sh: usize,
         seed: &mut u32,
         device: &MlxDevice,
-    ) -> (super::super::gpu_ffn::MoeFfnWeightsGpuQ, super::super::ffn::MoeFfnWeights) {
+    ) -> (
+        super::super::gpu_ffn::MoeFfnWeightsGpuQ,
+        super::super::ffn::MoeFfnWeights,
+    ) {
         // Generate F32 weights (all non-zero, small scale).
         let router_f32 = mk_rand(seed, ne * h, 0.3);
         let expert_gate_f32 = mk_rand(seed, ne * m_moe * h, 0.1);
@@ -11105,7 +12936,9 @@ mod tests {
             let mut buf = device
                 .alloc_buffer(bytes.len(), mlx_native::DType::U8, vec![bytes.len()])
                 .expect("alloc q4_0 buf");
-            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(bytes);
+            buf.as_mut_slice::<u8>()
+                .expect("q-buf slice")
+                .copy_from_slice(bytes);
             buf
         };
 
@@ -11120,7 +12953,8 @@ mod tests {
             expert_up_stride: gate_stride,
             expert_down_stride: down_stride,
             num_experts: ne as u32,
-            shared_gate_inp: upload_bf16_from_f32(&shared_gate_logit_f32, device).expect("sh_gate_inp"),
+            shared_gate_inp: upload_bf16_from_f32(&shared_gate_logit_f32, device)
+                .expect("sh_gate_inp"),
             shared_gate: upload_bf16_from_f32(&shared_gate_f32, device).expect("sh_gate"),
             shared_up: upload_bf16_from_f32(&shared_up_f32, device).expect("sh_up"),
             shared_down: upload_bf16_from_f32(&shared_down_f32, device).expect("sh_down"),
@@ -11188,11 +13022,24 @@ mod tests {
 
         // Step A: attention sub-block.
         let attn_out = cpu_tree_verify_attention_block_ref(
-            hidden_states_in, tree_mask, positions,
-            k_cache_cpu, v_cache_cpu,
+            hidden_states_in,
+            tree_mask,
+            positions,
+            k_cache_cpu,
+            v_cache_cpu,
             attn_weights,
-            h, nq, nkv, d, seq, cap, prefix,
-            mask_stride, rotary_dim, rope_theta, mrope_section, eps,
+            h,
+            nq,
+            nkv,
+            d,
+            seq,
+            cap,
+            prefix,
+            mask_stride,
+            rotary_dim,
+            rope_theta,
+            mrope_section,
+            eps,
         );
 
         // Step B: ffn_residual = pre-norm attn_out.
@@ -11260,7 +13107,9 @@ mod tests {
                     shared_intermediate_size: 1024,
                 },
             };
-            shape.validate().expect("valid production-like shape must pass");
+            shape
+                .validate()
+                .expect("valid production-like shape must pass");
         }
 
         // (a) num_experts = 0.
@@ -11275,7 +13124,10 @@ mod tests {
             let mut shape = moe_layer_shape_tiny(4, 2, 64, 64);
             shape.moe.num_experts_per_tok = 0;
             let err = shape.validate().unwrap_err();
-            assert!(err.to_string().contains("num_experts_per_tok"), "(b): {err}");
+            assert!(
+                err.to_string().contains("num_experts_per_tok"),
+                "(b): {err}"
+            );
         }
         // (c) num_experts_per_tok > num_experts.
         {
@@ -11283,7 +13135,8 @@ mod tests {
             shape.moe.num_experts_per_tok = 5;
             let err = shape.validate().unwrap_err();
             assert!(
-                err.to_string().contains("num_experts_per_tok") || err.to_string().contains("top-K"),
+                err.to_string().contains("num_experts_per_tok")
+                    || err.to_string().contains("top-K"),
                 "(c): {err}"
             );
         }
@@ -11292,14 +13145,20 @@ mod tests {
             let mut shape = moe_layer_shape_tiny(4, 2, 64, 64);
             shape.moe.moe_intermediate_size = 0;
             let err = shape.validate().unwrap_err();
-            assert!(err.to_string().contains("moe_intermediate_size"), "(d): {err}");
+            assert!(
+                err.to_string().contains("moe_intermediate_size"),
+                "(d): {err}"
+            );
         }
         // (e) shared_intermediate_size = 0.
         {
             let mut shape = moe_layer_shape_tiny(4, 2, 64, 64);
             shape.moe.shared_intermediate_size = 0;
             let err = shape.validate().unwrap_err();
-            assert!(err.to_string().contains("shared_intermediate_size"), "(e): {err}");
+            assert!(
+                err.to_string().contains("shared_intermediate_size"),
+                "(e): {err}"
+            );
         }
         // (f) moe.hidden_size != attn.hidden_size.
         {
@@ -11368,11 +13227,13 @@ mod tests {
 
         let mut seed = 0xAC02_u32;
         let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
-        let (moe_gpu_weights, _cpu_weights) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        let (moe_gpu_weights, _cpu_weights) =
+            moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
         let hidden_in = upload_f32(&hidden_data, &device).unwrap();
-        let tree_mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let tree_mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let tree_pos = upload_positions(seq, prefix as u32, &device);
         let mut k_cache = alloc_kv_cache(nkv, cap, d, &device);
         let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
@@ -11382,11 +13243,19 @@ mod tests {
 
         let enc = device.command_encoder().expect("enc");
         let out = qwen35_tree_verify_full_layer_q_moe(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &attn_weights, &moe_gpu_weights, shape,
-        ).expect("AC-2 MoE: full_layer_q_moe call failed");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &attn_weights,
+            &moe_gpu_weights,
+            shape,
+        )
+        .expect("AC-2 MoE: full_layer_q_moe call failed");
 
         // (a) output dtype F32.
         assert_eq!(out.dtype(), mlx_native::DType::F32, "AC-2(a) dtype");
@@ -11394,22 +13263,33 @@ mod tests {
         assert_eq!(out.shape(), &[seq, h], "AC-2(b) shape");
         // (c) all-finite and non-trivially populated.
         let out_data = download_f32(&out).unwrap();
-        assert!(out_data.iter().all(|v| v.is_finite()), "AC-2(c) non-finite output");
-        assert!(out_data.iter().any(|&v| v != 0.0), "AC-2(c) all-zero output (MoE pipeline did not fire)");
-        assert!(!out_data.iter().any(|v| v.is_nan()), "AC-2(c) NaN in output");
+        assert!(
+            out_data.iter().all(|v| v.is_finite()),
+            "AC-2(c) non-finite output"
+        );
+        assert!(
+            out_data.iter().any(|&v| v != 0.0),
+            "AC-2(c) all-zero output (MoE pipeline did not fire)"
+        );
+        assert!(
+            !out_data.iter().any(|v| v.is_nan()),
+            "AC-2(c) NaN in output"
+        );
         // (d) K cache slot [prefix, prefix+seq) has been written.
         let k_data = k_cache.as_slice::<f32>().expect("k_cache slice");
         let k_slot = &k_data[k_slot_start..k_slot_start + d];
         assert!(
             k_slot.iter().any(|&v| v != 0.0),
-            "AC-2(d) K cache slot [{prefix}, {}) still all-zero", prefix + seq
+            "AC-2(d) K cache slot [{prefix}, {}) still all-zero",
+            prefix + seq
         );
         // (e) V cache slot.
         let v_data = v_cache.as_slice::<f32>().expect("v_cache slice");
         let v_slot = &v_data[k_slot_start..k_slot_start + d];
         assert!(
             v_slot.iter().any(|&v| v != 0.0),
-            "AC-2(e) V cache slot [{prefix}, {}) still all-zero", prefix + seq
+            "AC-2(e) V cache slot [{prefix}, {}) still all-zero",
+            prefix + seq
         );
         eprintln!(
             "AC-2 (MoE) PASS: smoke h={h} ne={ne} topk={topk} m_moe={m_moe} m_sh={m_sh} \
@@ -11447,7 +13327,12 @@ mod tests {
 
         let make_inputs = |device: &MlxDevice, seed: &mut u32| {
             let hidden_in = upload_f32(&mk_rand(seed, seq * h, 0.1), device).unwrap();
-            let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, device);
+            let mask = causal_tree_mask_with_prefix(
+                seq as u32,
+                prefix as u32,
+                (prefix + seq) as u32,
+                device,
+            );
             let pos = upload_positions(seq, prefix as u32, device);
             let k_cache = alloc_kv_cache(nkv, cap, d, device);
             let v_cache = alloc_kv_cache(nkv, cap, d, device);
@@ -11460,20 +13345,21 @@ mod tests {
             let mut buf = device
                 .alloc_buffer(bytes.len(), mlx_native::DType::U8, vec![bytes.len()])
                 .expect("alloc q4_0 buf");
-            buf.as_mut_slice::<u8>().expect("slice").copy_from_slice(bytes);
+            buf.as_mut_slice::<u8>()
+                .expect("slice")
+                .copy_from_slice(bytes);
             buf
         };
 
         // Helper: build a MoeFfnWeightsGpuQ from base, substituting a single field.
-        let make_weights = |
-            router: MlxBuffer,
-            expert_gate_q: MlxBuffer,
-            expert_up_q: MlxBuffer,
-            expert_down_q: MlxBuffer,
-            ggml_type_gate_up: GgmlType,
-            ggml_type_down: GgmlType,
-            shared_gate_inp: MlxBuffer,
-        | -> super::super::gpu_ffn::MoeFfnWeightsGpuQ {
+        let make_weights = |router: MlxBuffer,
+                            expert_gate_q: MlxBuffer,
+                            expert_up_q: MlxBuffer,
+                            expert_down_q: MlxBuffer,
+                            ggml_type_gate_up: GgmlType,
+                            ggml_type_down: GgmlType,
+                            shared_gate_inp: MlxBuffer|
+         -> super::super::gpu_ffn::MoeFfnWeightsGpuQ {
             super::super::gpu_ffn::MoeFfnWeightsGpuQ {
                 router,
                 expert_gate_q,
@@ -11509,11 +13395,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &bad_weights, valid_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &bad_weights,
+                valid_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("ggml_type_gate_up must be Q4_0"),
@@ -11535,11 +13429,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &bad_weights, valid_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &bad_weights,
+                valid_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("ggml_type_down must be Q4_0"),
@@ -11562,11 +13464,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &bad_weights, valid_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &bad_weights,
+                valid_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("router dtype must be BF16"),
@@ -11613,11 +13523,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_moe_weights, bad_shape2,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_moe_weights,
+                bad_shape2,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("router") || msg.contains("hidden_size"),
@@ -11632,11 +13550,19 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_moe_weights, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_moe_weights,
+                bad_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("num_experts_per_tok") || msg.contains("top-K"),
@@ -11664,16 +13590,21 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &bad_weights, valid_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &bad_weights,
+                valid_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
-            assert!(
-                msg.contains("expert_gate_q"),
-                "neg_6: wrong message: {msg}"
-            );
+            assert!(msg.contains("expert_gate_q"), "neg_6: wrong message: {msg}");
         }
 
         // neg_7: shape.attn.head_dim=64 → Err from attn.validate().
@@ -11683,16 +13614,21 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_moe_weights, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_moe_weights,
+                bad_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
-            assert!(
-                msg.contains("head_dim"),
-                "neg_7: wrong message: {msg}"
-            );
+            assert!(msg.contains("head_dim"), "neg_7: wrong message: {msg}");
         }
 
         // neg_8: k_cache too small — shape.validate() inside attention block rejects it.
@@ -11705,14 +13641,24 @@ mod tests {
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
             let err = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &base_attn_weights, &base_moe_weights, bad_shape,
-            ).unwrap_err();
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &base_attn_weights,
+                &base_moe_weights,
+                bad_shape,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("kv_capacity") || msg.contains("cache_prefix_len") || msg.contains("cache"),
+                msg.contains("kv_capacity")
+                    || msg.contains("cache_prefix_len")
+                    || msg.contains("cache"),
                 "neg_8: wrong message (expected kv_capacity/cache overflow): {msg}"
             );
         }
@@ -11760,9 +13706,11 @@ mod tests {
             attn_k_norm: vec![1.0f32; d],
             wo: mk_rand(&mut seed, h * q_total, 0.05),
         };
-        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
+        let gpu_attn_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
 
-        let (gpu_moe_weights, cpu_moe_weights) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        let (gpu_moe_weights, cpu_moe_weights) =
+            moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
 
         // Pre-test non-zero assertion (RF-5).
         assert_all_nonzero("router_f32", &cpu_moe_weights.router);
@@ -11776,7 +13724,10 @@ mod tests {
             let mut mv = vec![mlx_native::ops::tree_attention::TREE_MASK_MASKED; seq * mask_stride];
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
-                    if j < mask_stride { mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED; }
+                    if j < mask_stride {
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                    }
                 }
             }
             mv
@@ -11788,24 +13739,40 @@ mod tests {
 
         let enc = device.command_encoder().expect("enc");
         let gpu_out = qwen35_tree_verify_full_layer_q_moe(
-            enc, &device, &mut registry,
-            &hidden_in, &tree_mask, &tree_pos,
-            &mut k_cache, &mut v_cache,
-            &gpu_attn_weights, &gpu_moe_weights, shape,
-        ).expect("AC-4 MoE: GPU call failed");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &tree_mask,
+            &tree_pos,
+            &mut k_cache,
+            &mut v_cache,
+            &gpu_attn_weights,
+            &gpu_moe_weights,
+            shape,
+        )
+        .expect("AC-4 MoE: GPU call failed");
         let gpu_data = download_f32(&gpu_out).unwrap();
 
         // CPU reference.
         let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
         let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
         let positions: Vec<[i32; 4]> = (0..seq)
-            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .map(|i| {
+                let p = (prefix + i) as i32;
+                [p, p, p, p]
+            })
             .collect();
 
         let cpu_data = cpu_tree_verify_full_layer_q_moe_ref(
-            &hidden_data, &tree_mask_data, &positions,
-            &mut k_cache_cpu, &mut v_cache_cpu,
-            &cpu_attn_weights, &cpu_moe_weights, &shape,
+            &hidden_data,
+            &tree_mask_data,
+            &positions,
+            &mut k_cache_cpu,
+            &mut v_cache_cpu,
+            &cpu_attn_weights,
+            &cpu_moe_weights,
+            &shape,
         );
 
         assert_eq!(gpu_data.len(), cpu_data.len(), "AC-4 MoE: length mismatch");
@@ -11818,9 +13785,14 @@ mod tests {
             return;
         }
         assert!(!has_nan, "AC-4 MoE: NaN in gpu output");
-        assert!(!gpu_data.iter().any(|v| v.is_infinite()), "AC-4 MoE: Inf in gpu output");
+        assert!(
+            !gpu_data.iter().any(|v| v.is_infinite()),
+            "AC-4 MoE: Inf in gpu output"
+        );
 
-        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+        let max_diff: f32 = gpu_data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
@@ -11873,7 +13845,8 @@ mod tests {
             attn_k_norm: vec![1.0f32; d],
             wo: mk_rand(&mut seed, h * q_total, 0.05),
         };
-        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
+        let gpu_attn_weights =
+            FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
         let (gpu_moe_weights, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
@@ -11882,7 +13855,10 @@ mod tests {
             let mut mv = vec![mlx_native::ops::tree_attention::TREE_MASK_MASKED; seq * mask_stride];
             for i in 0..seq {
                 for j in 0..prefix + i + 1 {
-                    if j < mask_stride { mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED; }
+                    if j < mask_stride {
+                        mv[i * mask_stride + j] =
+                            mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                    }
                 }
             }
             mv
@@ -11896,11 +13872,19 @@ mod tests {
         let mut v_a = alloc_kv_cache(nkv, cap, d, &device);
         let enc_a = device.command_encoder().expect("enc_a");
         let out_a = qwen35_tree_verify_full_layer_q_moe(
-            enc_a, &device, &mut registry,
-            &hidden_in_a, &tree_mask_gpu, &tree_pos,
-            &mut k_a, &mut v_a,
-            &gpu_attn_weights, &gpu_moe_weights, shape,
-        ).expect("AC-5 MoE: Side A failed");
+            enc_a,
+            &device,
+            &mut registry,
+            &hidden_in_a,
+            &tree_mask_gpu,
+            &tree_pos,
+            &mut k_a,
+            &mut v_a,
+            &gpu_attn_weights,
+            &gpu_moe_weights,
+            shape,
+        )
+        .expect("AC-5 MoE: Side A failed");
         let data_a = download_f32(&out_a).unwrap();
 
         // ── Side B: manual split-path ─────────────────────────────────────
@@ -11910,11 +13894,18 @@ mod tests {
         let mut v_b = alloc_kv_cache(nkv, cap, d, &device);
         let enc_b = device.command_encoder().expect("enc_b");
         let attn_out_b = qwen35_tree_verify_attention_block(
-            enc_b, &device, &mut registry,
-            &hidden_in_b, &tree_mask_gpu, &tree_pos,
-            &mut k_b, &mut v_b,
-            &gpu_attn_weights, shape.attn,
-        ).expect("AC-5 MoE: Side B attn failed");
+            enc_b,
+            &device,
+            &mut registry,
+            &hidden_in_b,
+            &tree_mask_gpu,
+            &tree_pos,
+            &mut k_b,
+            &mut v_b,
+            &gpu_attn_weights,
+            shape.attn,
+        )
+        .expect("AC-5 MoE: Side B attn failed");
         let attn_data_b = download_f32(&attn_out_b).unwrap();
 
         // Step 2: CPU RMSNorm (post_attn_norm = identity ones).
@@ -11926,7 +13917,11 @@ mod tests {
                 let row = &attn_data_b[t * h..(t + 1) * h];
                 let ss: f32 = row.iter().map(|v| v * v).sum::<f32>();
                 let inv = (ss / h as f32 + eps).sqrt().recip();
-                for (i, (o, w)) in out[t * h..(t + 1) * h].iter_mut().zip(post_attn_norm_w.iter()).enumerate() {
+                for (i, (o, w)) in out[t * h..(t + 1) * h]
+                    .iter_mut()
+                    .zip(post_attn_norm_w.iter())
+                    .enumerate()
+                {
                     *o = row[i] * inv * w;
                 }
             }
@@ -11944,17 +13939,25 @@ mod tests {
             shared_intermediate_size: shape.moe.shared_intermediate_size,
         };
         let out_b = super::super::gpu_ffn::build_moe_ffn_layer_gpu_q(
-            &device, &mut registry,
+            &device,
+            &mut registry,
             &post_normed_gpu,
             &gpu_moe_weights,
             moe_shape_b,
             Some(&ffn_residual_b),
-        ).expect("AC-5 MoE: Side B moe_ffn failed");
+        )
+        .expect("AC-5 MoE: Side B moe_ffn failed");
         let data_b = download_f32(&out_b).unwrap();
 
-        assert_eq!(data_a.len(), data_b.len(), "AC-5 MoE: length mismatch A vs B");
+        assert_eq!(
+            data_a.len(),
+            data_b.len(),
+            "AC-5 MoE: length mismatch A vs B"
+        );
 
-        let max_diff: f32 = data_a.iter().zip(data_b.iter())
+        let max_diff: f32 = data_a
+            .iter()
+            .zip(data_b.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
@@ -11965,7 +13968,9 @@ mod tests {
              Both sides use identical GPU MoE kernel — only RMSNorm precision differs. \
              Check post_attn_normed threading or residual source."
         );
-        eprintln!("AC-5 (MoE) PASS: composition equivalence |full-split|_inf = {max_diff:.6e} < 0.05");
+        eprintln!(
+            "AC-5 (MoE) PASS: composition equivalence |full-split|_inf = {max_diff:.6e} < 0.05"
+        );
     }
 
     /// AC-6 — 3-rep byte-identity determinism with K/V cache reset (RF-6).
@@ -11996,7 +14001,8 @@ mod tests {
         let (moe_gpu_weights, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
-        let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let pos = upload_positions(seq, prefix as u32, &device);
 
         let mut outputs: Vec<Vec<u32>> = Vec::new();
@@ -12009,15 +14015,25 @@ mod tests {
             let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
             let enc = device.command_encoder().expect("enc");
             let out = qwen35_tree_verify_full_layer_q_moe(
-                enc, &device, &mut registry,
-                &hidden_in, &mask, &pos,
-                &mut k_cache, &mut v_cache,
-                &attn_weights, &moe_gpu_weights, shape,
-            ).unwrap_or_else(|e| panic!("AC-6 MoE: rep {rep} failed: {e}"));
+                enc,
+                &device,
+                &mut registry,
+                &hidden_in,
+                &mask,
+                &pos,
+                &mut k_cache,
+                &mut v_cache,
+                &attn_weights,
+                &moe_gpu_weights,
+                shape,
+            )
+            .unwrap_or_else(|e| panic!("AC-6 MoE: rep {rep} failed: {e}"));
             let floats = download_f32(&out).unwrap();
             // Guard against Metal device contention — NaN output means contention, not a real failure.
             if floats.iter().any(|v| v.is_nan()) {
-                eprintln!("AC-6 (MoE): rep {rep} GPU output NaN under Metal contention — skipping test");
+                eprintln!(
+                    "AC-6 (MoE): rep {rep} GPU output NaN under Metal contention — skipping test"
+                );
                 return;
             }
             let bits: Vec<u32> = floats.iter().map(|f| f.to_bits()).collect();
@@ -12027,11 +14043,16 @@ mod tests {
         for rep in 1..3 {
             let first = &outputs[0];
             let this = &outputs[rep];
-            assert_eq!(first.len(), this.len(), "AC-6 MoE: rep {rep} length mismatch");
+            assert_eq!(
+                first.len(),
+                this.len(),
+                "AC-6 MoE: rep {rep} length mismatch"
+            );
             for (i, (a, b)) in first.iter().zip(this.iter()).enumerate() {
                 assert_eq!(
                     a, b,
-                    "AC-6 (MoE) FAIL: rep {rep} output[{i}] differs: {:#010x} vs {:#010x}", a, b
+                    "AC-6 (MoE) FAIL: rep {rep} output[{i}] differs: {:#010x} vs {:#010x}",
+                    a, b
                 );
             }
         }
@@ -12070,10 +14091,18 @@ mod tests {
         // Row 0 = +1e3 * ones, Row 1 = +1e3 * ones, Rows 2,3 = -1e6 * ones.
         // After softmax: prob[0] ≈ prob[1] ≈ 0.5, prob[2] ≈ prob[3] ≈ 0.
         let mut router_f32 = vec![0.0f32; ne * h];
-        for j in 0..h { router_f32[0 * h + j] = 1e3; }
-        for j in 0..h { router_f32[1 * h + j] = 1e3; }
-        for j in 0..h { router_f32[2 * h + j] = -1e6; }
-        for j in 0..h { router_f32[3 * h + j] = -1e6; }
+        for j in 0..h {
+            router_f32[0 * h + j] = 1e3;
+        }
+        for j in 0..h {
+            router_f32[1 * h + j] = 1e3;
+        }
+        for j in 0..h {
+            router_f32[2 * h + j] = -1e6;
+        }
+        for j in 0..h {
+            router_f32[3 * h + j] = -1e6;
+        }
         let router_bf16 = upload_bf16_from_f32(&router_f32, &device).expect("router bf16");
 
         // Experts 2 and 3 get sentinel Q4_0 weights: all-max quantized values.
@@ -12102,32 +14131,48 @@ mod tests {
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
         let hidden_in = upload_f32(&hidden_data, &device).unwrap();
-        let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let pos = upload_positions(seq, prefix as u32, &device);
         let mut k_cache = alloc_kv_cache(nkv, cap, d, &device);
         let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
 
         let enc = device.command_encoder().expect("enc");
         let out = qwen35_tree_verify_full_layer_q_moe(
-            enc, &device, &mut registry,
-            &hidden_in, &mask, &pos,
-            &mut k_cache, &mut v_cache,
-            &attn_weights, &routed_moe, shape,
-        ).expect("AC-7 MoE: routing test failed");
+            enc,
+            &device,
+            &mut registry,
+            &hidden_in,
+            &mask,
+            &pos,
+            &mut k_cache,
+            &mut v_cache,
+            &attn_weights,
+            &routed_moe,
+            shape,
+        )
+        .expect("AC-7 MoE: routing test failed");
         let out_data = download_f32(&out).unwrap();
 
         // Verify: output is finite (no sentinel contamination at catastrophic scale).
         // If experts {2,3} leaked through with large weights, output would be >> 1e2.
         // The threshold 1e3 is well above the expected range (~0.1-1.0) but below
         // any sentinel-contaminated value.
-        let max_abs = out_data.iter().cloned().map(f32::abs).fold(0.0f32, f32::max);
+        let max_abs = out_data
+            .iter()
+            .cloned()
+            .map(f32::abs)
+            .fold(0.0f32, f32::max);
         assert!(
             max_abs < 1e3,
             "AC-7 (MoE) FAIL: max |output| = {max_abs:.3e} >= 1e3. \
              Sentinel expert contamination detected — routing is not correctly selecting \
              only experts {{0, 1}} (router rows 2,3 = -1e6 should give zero weight)."
         );
-        assert!(out_data.iter().all(|v| v.is_finite()), "AC-7 (MoE): non-finite in output");
+        assert!(
+            out_data.iter().all(|v| v.is_finite()),
+            "AC-7 (MoE): non-finite in output"
+        );
         eprintln!(
             "AC-7 (MoE) PASS: routing correctness — max|output|={max_abs:.3e} < 1e3 \
              (no sentinel-expert leakage with router saturating to experts {{0,1}})"
@@ -12188,17 +14233,26 @@ mod tests {
             expert_down_affine: None,
         };
         let hidden_in_a = upload_f32(&hidden_data, &device).unwrap();
-        let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let mask =
+            causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
         let pos = upload_positions(seq, prefix as u32, &device);
         let mut k_a = alloc_kv_cache(nkv, cap, d, &device);
         let mut v_a = alloc_kv_cache(nkv, cap, d, &device);
         let enc_a = device.command_encoder().expect("enc_a");
         let out_a = qwen35_tree_verify_full_layer_q_moe(
-            enc_a, &device, &mut registry,
-            &hidden_in_a, &mask, &pos,
-            &mut k_a, &mut v_a,
-            &attn_weights, &moe_a, shape,
-        ).expect("AC-8 MoE: Run A failed");
+            enc_a,
+            &device,
+            &mut registry,
+            &hidden_in_a,
+            &mask,
+            &pos,
+            &mut k_a,
+            &mut v_a,
+            &attn_weights,
+            &moe_a,
+            shape,
+        )
+        .expect("AC-8 MoE: Run A failed");
         let data_a = download_f32(&out_a).unwrap();
 
         // Run B: shared gate fully OFF (sigmoid ≈ 0).
@@ -12226,19 +14280,37 @@ mod tests {
         let mut v_b = alloc_kv_cache(nkv, cap, d, &device);
         let enc_b = device.command_encoder().expect("enc_b");
         let out_b = qwen35_tree_verify_full_layer_q_moe(
-            enc_b, &device, &mut registry,
-            &hidden_in_b, &mask, &pos,
-            &mut k_b, &mut v_b,
-            &attn_weights, &moe_b, shape,
-        ).expect("AC-8 MoE: Run B failed");
+            enc_b,
+            &device,
+            &mut registry,
+            &hidden_in_b,
+            &mask,
+            &pos,
+            &mut k_b,
+            &mut v_b,
+            &attn_weights,
+            &moe_b,
+            shape,
+        )
+        .expect("AC-8 MoE: Run B failed");
         let data_b = download_f32(&out_b).unwrap();
 
         // Verify A and B are finite.
-        assert!(data_a.iter().all(|v| v.is_finite()), "AC-8 (MoE): Run A non-finite");
-        assert!(data_b.iter().all(|v| v.is_finite()), "AC-8 (MoE): Run B non-finite");
+        assert!(
+            data_a.iter().all(|v| v.is_finite()),
+            "AC-8 (MoE): Run A non-finite"
+        );
+        assert!(
+            data_b.iter().all(|v| v.is_finite()),
+            "AC-8 (MoE): Run B non-finite"
+        );
 
         // Delta = A - B = shared_expert contribution when gate is ON.
-        let delta: Vec<f32> = data_a.iter().zip(data_b.iter()).map(|(a, b)| a - b).collect();
+        let delta: Vec<f32> = data_a
+            .iter()
+            .zip(data_b.iter())
+            .map(|(a, b)| a - b)
+            .collect();
         let delta_inf = delta.iter().cloned().map(f32::abs).fold(0.0f32, f32::max);
 
         // With sigmoid(+1e3) ≈ 1 vs sigmoid(-1e3) ≈ 0, the delta should be

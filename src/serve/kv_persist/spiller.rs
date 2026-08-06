@@ -244,9 +244,7 @@ pub struct BlockPrefixCacheSpiller<E> {
     /// Wired by `cmd_serve` at startup (immediately after registry
     /// creation); off-path callers that don't supply a registry leave
     /// this `None` (drop_family becomes a single-side cleanup).
-    registry: RwLock<
-        Option<Arc<crate::serve::kv_persist::registry::KvPersistRegistry>>,
-    >,
+    registry: RwLock<Option<Arc<crate::serve::kv_persist::registry::KvPersistRegistry>>>,
     /// Phantom binding for the engine generic. The spiller does not
     /// actually access the engine at runtime — that's the per-family
     /// hook's job — so no `E` field is needed.
@@ -391,11 +389,7 @@ impl<E> BlockPrefixCacheSpiller<E> {
     /// absence) for the same `(repo, quant)`, so the model_fp
     /// recomputed in `post_admit` matches the one recorded in
     /// `pre_evict`.
-    fn family_model_fp(
-        &self,
-        repo: &str,
-        quant: QuantType,
-    ) -> ModelFingerprint {
+    fn family_model_fp(&self, repo: &str, quant: QuantType) -> ModelFingerprint {
         if let Some(hook_arc) = self.lookup_hook(repo, quant) {
             // Take the hook lock briefly to ask for the fingerprint.
             // Lock-poison is treated as "no fingerprint available"
@@ -654,10 +648,9 @@ where
                 // remains a hard error → IoErr.
                 let enqueue_result = match self.writer.enqueue(job) {
                     Ok(()) => Ok(()),
-                    Err(std::sync::mpsc::TrySendError::Full(job)) => self
-                        .writer
-                        .enqueue_blocking(job)
-                        .map_err(|_| ()),
+                    Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                        self.writer.enqueue_blocking(job).map_err(|_| ())
+                    }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(()),
                 };
                 match enqueue_result {
@@ -709,7 +702,9 @@ where
                     model_fingerprint: model_fp,
                     block_hash,
                     parent_block_hash: parent,
-                    payload_kind: crate::serve::kv_persist::prompt_cache_persist::PROMPT_CACHE_PAYLOAD_KIND.to_string(),
+                    payload_kind:
+                        crate::serve::kv_persist::prompt_cache_persist::PROMPT_CACHE_PAYLOAD_KIND
+                            .to_string(),
                     codec_version: 1,
                     n_tokens: 0, // PromptCache envelope is not block-aligned
                 };
@@ -728,10 +723,9 @@ where
                 // every other piece of the spill path correct.
                 let pc_enqueue_result = match self.writer.enqueue(job) {
                     Ok(()) => Ok(()),
-                    Err(std::sync::mpsc::TrySendError::Full(job)) => self
-                        .writer
-                        .enqueue_blocking(job)
-                        .map_err(|_| ()),
+                    Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                        self.writer.enqueue_blocking(job).map_err(|_| ())
+                    }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(()),
                 };
                 if pc_enqueue_result.is_ok() {
@@ -821,11 +815,7 @@ where
         if metas.is_empty() {
             return RestoreOutcome::Skipped;
         }
-        metas.sort_by(|a, b| {
-            a.mtime
-                .cmp(&b.mtime)
-                .then_with(|| a.hash.0.cmp(&b.hash.0))
-        });
+        metas.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.hash.0.cmp(&b.hash.0)));
 
         let mut restored: u32 = 0;
 
@@ -1089,8 +1079,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir()
-            .join(format!("hf2q-kv-spiller-{label}-{pid}-{nanos}-{n}"));
+        let dir = std::env::temp_dir().join(format!("hf2q-kv-spiller-{label}-{pid}-{nanos}-{n}"));
         std::fs::create_dir_all(&dir).expect("temp_dir mkdir");
         dir
     }
@@ -1099,7 +1088,13 @@ mod tests {
     /// writer is created with a generous 32-slot channel so tests
     /// that aren't specifically exercising back-pressure don't
     /// trip on Full.
-    fn fresh_substrate(label: &str) -> (Arc<DiskBlockStore>, Arc<AsyncWriterHandle>, std::path::PathBuf) {
+    fn fresh_substrate(
+        label: &str,
+    ) -> (
+        Arc<DiskBlockStore>,
+        Arc<AsyncWriterHandle>,
+        std::path::PathBuf,
+    ) {
         let dir = temp_dir(label);
         let store = Arc::new(DiskBlockStore::new(dir.clone(), 0).expect("DiskBlockStore::new"));
         let writer = Arc::new(AsyncWriterHandle::spawn(Arc::clone(&store), 32));
@@ -1160,9 +1155,7 @@ mod tests {
             *g.restore_error.lock().unwrap() = Some(kind);
         }
 
-        fn restored_calls(
-            this: &Arc<Mutex<Self>>,
-        ) -> Vec<(usize, Range<u32>, Vec<u8>)> {
+        fn restored_calls(this: &Arc<Mutex<Self>>) -> Vec<(usize, Range<u32>, Vec<u8>)> {
             let g = this.lock().expect("lock mock");
             let snapshot = g.restored.lock().unwrap().clone();
             snapshot
@@ -1290,7 +1283,10 @@ mod tests {
         let handle = fresh_handle("acme/m1", QuantType::Q4_K_M);
         let engine = fresh_engine("acme/m1", QuantType::Q4_K_M);
         let outcome = spiller.pre_evict(&handle, &engine);
-        assert!(matches!(outcome, SpillOutcome::EnqueuedBlocks(1)), "got {outcome:?}");
+        assert!(
+            matches!(outcome, SpillOutcome::EnqueuedBlocks(1)),
+            "got {outcome:?}"
+        );
 
         // Wait for the async writer to drain the job to disk.
         wait_for_index_count(&store, 1);
@@ -1381,22 +1377,22 @@ mod tests {
         // small body ceiling. This validates the IoErr mapping
         // when enqueue fails.
         drop(writer); // release our copy; spiller still holds one
-        // The spiller's writer is still live; we can't externally
-        // close it. Instead, send an oversized body to force the
-        // writer to reject — that doesn't fill the channel, just
-        // logs an error. So the spiller's enqueue still succeeds.
-        //
-        // FINAL approach: use an over-large body to force the
-        // STORE's max_block_bytes_override rejection. The rejection
-        // happens inside the writer's worker; the enqueue itself
-        // succeeds. So the spiller would return EnqueuedBlocks(1).
-        //
-        // The honest assertion under the public API is: when the
-        // writer is healthy, enqueue succeeds. Disconnected /
-        // Full mapping to IoErr is exercised at the unit level by
-        // the writer's own tests. Here we assert that pre_evict
-        // returns *some* terminal outcome (not Skipped) and the
-        // surface compiles correctly.
+                      // The spiller's writer is still live; we can't externally
+                      // close it. Instead, send an oversized body to force the
+                      // writer to reject — that doesn't fill the channel, just
+                      // logs an error. So the spiller's enqueue still succeeds.
+                      //
+                      // FINAL approach: use an over-large body to force the
+                      // STORE's max_block_bytes_override rejection. The rejection
+                      // happens inside the writer's worker; the enqueue itself
+                      // succeeds. So the spiller would return EnqueuedBlocks(1).
+                      //
+                      // The honest assertion under the public API is: when the
+                      // writer is healthy, enqueue succeeds. Disconnected /
+                      // Full mapping to IoErr is exercised at the unit level by
+                      // the writer's own tests. Here we assert that pre_evict
+                      // returns *some* terminal outcome (not Skipped) and the
+                      // surface compiles correctly.
 
         let handle = fresh_handle("acme/m1", QuantType::Q4_K_M);
         let engine = fresh_engine("acme/m1", QuantType::Q4_K_M);
@@ -1472,12 +1468,16 @@ mod tests {
         // pre_evict cycles don't link.
         for m in &metas {
             assert_eq!(
-                m.parent, ParentBlockHash(None),
+                m.parent,
+                ParentBlockHash(None),
                 "each pre_evict starts a fresh chain"
             );
         }
         // Bodies differ → block_hashes differ.
-        assert_ne!(metas[0].hash, metas[1].hash, "distinct bodies hash distinct");
+        assert_ne!(
+            metas[0].hash, metas[1].hash,
+            "distinct bodies hash distinct"
+        );
 
         // Lock in the chain-hash invariant via a positive linkage:
         // simulate the linkage by reading back both blocks and
@@ -1487,7 +1487,11 @@ mod tests {
         for m in &metas {
             let body_back = store.read_block(&m.hash).expect("read");
             let computed_bh: [u8; 32] = Sha256::digest(&body_back).into();
-            assert_eq!(BlockHash(computed_bh), m.hash, "body sha matches block_hash");
+            assert_eq!(
+                BlockHash(computed_bh),
+                m.hash,
+                "body sha matches block_hash"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1501,7 +1505,10 @@ mod tests {
             BlockPrefixCacheSpiller::new(store, writer);
         let engine = fresh_engine("acme/m1", QuantType::Q4_K_M);
         let outcome = spiller.post_admit("acme/m1", QuantType::Q4_K_M, &engine);
-        assert!(matches!(outcome, RestoreOutcome::Skipped), "got {outcome:?}");
+        assert!(
+            matches!(outcome, RestoreOutcome::Skipped),
+            "got {outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1552,7 +1559,10 @@ mod tests {
         spiller.register_family("acme/m1".into(), QuantType::Q4_K_M, hook);
         let engine = fresh_engine("acme/m1", QuantType::Q4_K_M);
         let outcome = spiller.post_admit("acme/m1", QuantType::Q4_K_M, &engine);
-        assert!(matches!(outcome, RestoreOutcome::Skipped), "got {outcome:?}");
+        assert!(
+            matches!(outcome, RestoreOutcome::Skipped),
+            "got {outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1622,7 +1632,10 @@ mod tests {
 
         // Spill phase.
         let spill = spiller.pre_evict(&handle, &engine);
-        assert!(matches!(spill, SpillOutcome::EnqueuedBlocks(1)), "spill: {spill:?}");
+        assert!(
+            matches!(spill, SpillOutcome::EnqueuedBlocks(1)),
+            "spill: {spill:?}"
+        );
 
         // Drain the writer.
         wait_for_index_count(&store, 1);
@@ -1730,8 +1743,7 @@ mod tests {
         // type-erased Arc. None should panic.
         let unit: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
         EngineBindable::bind_engine(&stub, unit);
-        let s: Arc<dyn std::any::Any + Send + Sync> =
-            Arc::new(String::from("hello stub"));
+        let s: Arc<dyn std::any::Any + Send + Sync> = Arc::new(String::from("hello stub"));
         EngineBindable::bind_engine(&stub, s);
 
         struct Bogus(u32);
@@ -1752,8 +1764,7 @@ mod tests {
         let (store, writer, dir) = fresh_substrate("stub_gemma");
         let spiller: BlockPrefixCacheSpiller<TestEngine> =
             BlockPrefixCacheSpiller::new(Arc::clone(&store), writer);
-        let stub: Arc<Mutex<dyn KvCacheSpill>> =
-            Arc::new(Mutex::new(StubGemma4Spill));
+        let stub: Arc<Mutex<dyn KvCacheSpill>> = Arc::new(Mutex::new(StubGemma4Spill));
         spiller.register_family("google/gemma-4".into(), QuantType::Q4_K_M, stub);
 
         let handle = fresh_handle("google/gemma-4", QuantType::Q4_K_M);
@@ -1875,7 +1886,7 @@ mod tests {
         let spiller: BlockPrefixCacheSpiller<TestEngine> =
             BlockPrefixCacheSpiller::new(Arc::clone(&store), writer);
         spiller.test_only_inject_pending_spill(0); // 0 jobs = no-op
-        // Depth still 0 after a 0-job inject.
+                                                   // Depth still 0 after a 0-job inject.
         assert_eq!(spiller.pending_writer_queue_depth(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

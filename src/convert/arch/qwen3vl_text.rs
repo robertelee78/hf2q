@@ -288,7 +288,8 @@ pub fn build_metadata(
         .expect("config.json missing required key `num_attention_heads`") as u32;
     let ctx_len = config["max_position_embeddings"]
         .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+        .expect("config.json missing required key `max_position_embeddings`")
+        as u32;
     let rms_eps = config["rms_norm_eps"]
         .as_f64()
         .expect("config.json missing required key `rms_norm_eps`") as f32;
@@ -533,7 +534,10 @@ mod tests {
         // MTP head (Qwen3-VL multi-token-prediction; out of v1 scope)
         assert_eq!(map_tensor_name("mtp.embed_tokens.weight"), None);
         // Audio tower (Qwen3-Omni)
-        assert_eq!(map_tensor_name("audio_tower.encoder.layer.0.conv1.weight"), None);
+        assert_eq!(
+            map_tensor_name("audio_tower.encoder.layer.0.conv1.weight"),
+            None
+        );
     }
 
     /// Sibling — unknown / malformed names must surface as `None`.
@@ -644,7 +648,10 @@ mod tests {
         assert_eq!(by_key["qwen3vl.attention.head_count"], MetaValue::U32(16));
         assert_eq!(by_key["qwen3vl.attention.head_count_kv"], MetaValue::U32(8));
         assert_eq!(by_key["qwen3vl.attention.key_length"], MetaValue::U32(128));
-        assert_eq!(by_key["qwen3vl.attention.value_length"], MetaValue::U32(128));
+        assert_eq!(
+            by_key["qwen3vl.attention.value_length"],
+            MetaValue::U32(128)
+        );
         assert_eq!(
             by_key["qwen3vl.attention.layer_norm_rms_epsilon"],
             MetaValue::F32(1.0e-6)

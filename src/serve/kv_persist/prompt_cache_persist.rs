@@ -59,9 +59,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::serve::api::engine::{
-    GrammarKind, PromptCache, PromptCacheKey, ToolCallPolicy,
-};
+use crate::serve::api::engine::{GrammarKind, PromptCache, PromptCacheKey, ToolCallPolicy};
 
 /// On-disk schema version for prompt-cache snapshots. Bump on any
 /// breaking schema change.
@@ -258,7 +256,10 @@ mod tests {
         original.finish_reason = leaked;
         let bytes = try_serialize(&original).expect("serialize");
         let restored = try_deserialize(&bytes);
-        assert!(restored.is_none(), "unknown finish_reason should yield None");
+        assert!(
+            restored.is_none(),
+            "unknown finish_reason should yield None"
+        );
     }
 
     #[test]

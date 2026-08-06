@@ -214,6 +214,11 @@ fn qwen3vl_text_real_gguf_serve_startup_smoke() {
         readyz_ok,
         "hf2q serve did not reach /readyz=200 within 90s ({iter} polls); \
          stderr tail:\n{}",
-        stderr_str.lines().rev().take(20).collect::<Vec<_>>().join("\n")
+        stderr_str
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

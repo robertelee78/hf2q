@@ -250,8 +250,7 @@ impl<W: Write + Seek> GgufWriter<W> {
         // name (length-prefixed)
         write_gguf_string(&mut self.writer, name)?;
         // n_dims u32
-        self.writer
-            .write_all(&(dims.len() as u32).to_le_bytes())?;
+        self.writer.write_all(&(dims.len() as u32).to_le_bytes())?;
         // dims[n_dims] u64
         for &d in dims {
             self.writer.write_all(&d.to_le_bytes())?;
@@ -525,11 +524,8 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut w = GgufWriter::new(buf);
         w.write_header(1, 1).unwrap();
-        w.write_metadata_kv(
-            "general.architecture",
-            &MetaValue::String("test".into()),
-        )
-        .unwrap();
+        w.write_metadata_kv("general.architecture", &MetaValue::String("test".into()))
+            .unwrap();
         // Q4_0 row of 32 f32 → 1 block of 18 bytes. dims = [32] (1-D).
         let idx = w
             .reserve_tensor_info("test.weight", &[32], GgmlType::Q4_0)
@@ -560,15 +556,9 @@ mod tests {
             GGUF_VERSION
         );
         // tensor_count = 1
-        assert_eq!(
-            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            1
-        );
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 1);
         // kv_count = 1
-        assert_eq!(
-            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            1
-        );
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 1);
 
         // After the KV pair + tensor-info entry there is exactly ONE
         // u64 LE offset field. It MUST have been seek-back-written to
@@ -608,10 +598,7 @@ mod tests {
 
         // Metadata round-trip
         assert_eq!(gguf.metadata_count(), 1);
-        assert_eq!(
-            gguf.metadata_string("general.architecture"),
-            Some("test")
-        );
+        assert_eq!(gguf.metadata_string("general.architecture"), Some("test"));
 
         // Tensor info round-trip
         assert_eq!(gguf.tensor_count(), 1);
@@ -664,7 +651,9 @@ mod tests {
         let bad_payload = vec![0u8; 17];
         let err = w.stream_tensor_payload(0, &bad_payload).unwrap_err();
         match err {
-            WriterError::PayloadSizeMismatch { expected, actual, .. } => {
+            WriterError::PayloadSizeMismatch {
+                expected, actual, ..
+            } => {
                 assert_eq!(expected, 18);
                 assert_eq!(actual, 17);
             }
@@ -767,7 +756,10 @@ mod tests {
         w.pad_to_alignment().unwrap();
         let err = w.stream_tensor_payload(0, &[]).unwrap_err();
         match err {
-            WriterError::UnknownTensorIndex { tensor_idx, reserved } => {
+            WriterError::UnknownTensorIndex {
+                tensor_idx,
+                reserved,
+            } => {
                 assert_eq!(tensor_idx, 0);
                 assert_eq!(reserved, 0);
             }
@@ -783,8 +775,10 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut w = GgufWriter::new(buf);
         w.write_header(2, 0).unwrap();
-        w.reserve_tensor_info("a.weight", &[32], GgmlType::Q4_0).unwrap();
-        w.reserve_tensor_info("b.weight", &[32], GgmlType::Q4_0).unwrap();
+        w.reserve_tensor_info("a.weight", &[32], GgmlType::Q4_0)
+            .unwrap();
+        w.reserve_tensor_info("b.weight", &[32], GgmlType::Q4_0)
+            .unwrap();
         w.pad_to_alignment().unwrap();
         let payload_a: Vec<u8> = (0u8..18).collect();
         let payload_b: Vec<u8> = (100u8..118).collect();

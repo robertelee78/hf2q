@@ -36,9 +36,7 @@
 //! plumbing is out of scope for this iteration.
 
 use super::config::Eagle3DrafterConfig;
-use super::drafter::{
-    extract_top_k_from_row_logits, DraftCandidate, Drafter, TreeContextView,
-};
+use super::drafter::{extract_top_k_from_row_logits, DraftCandidate, Drafter, TreeContextView};
 use super::kv_cache::DrafterKvCache;
 use super::tensors::Eagle3DrafterTensors;
 use anyhow::{anyhow, ensure, Result};
@@ -241,9 +239,10 @@ impl<'a> GpuDrafter<'a> {
     /// produces the accepted-node list, to compact the cache for the
     /// next spec-decode step.
     pub fn rollback_kv_cache(&mut self, accepted: &[usize]) -> Result<()> {
-        let cache = self.kv_cache.as_mut().ok_or_else(|| {
-            anyhow!("GpuDrafter::rollback_kv_cache: no cache attached")
-        })?;
+        let cache = self
+            .kv_cache
+            .as_mut()
+            .ok_or_else(|| anyhow!("GpuDrafter::rollback_kv_cache: no cache attached"))?;
         cache.rollback_to_accepted(accepted)
     }
 
@@ -281,16 +280,12 @@ impl<'a> GpuDrafter<'a> {
             tree.parents.len(),
         );
         let new_kv_len = pre_len + 1;
-        let mut mask: Vec<f32> = vec![
-            super::forward::EAGLE3_TREE_MASK_MASKED;
-            new_kv_len
-        ];
+        let mut mask: Vec<f32> = vec![super::forward::EAGLE3_TREE_MASK_MASKED; new_kv_len];
         mask[pre_len] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
         let mut cursor = tree.parents[node_to_expand];
         while let Some(idx) = cursor {
             ensure!(
-                idx < self.tree_node_cache_slot.len()
-                    && self.tree_node_cache_slot[idx].is_some(),
+                idx < self.tree_node_cache_slot.len() && self.tree_node_cache_slot[idx].is_some(),
                 "GpuDrafter::build_tree_mask_for: ancestor {} of node_to_expand {} \
                  has no recorded cache slot",
                 idx,
@@ -301,7 +296,9 @@ impl<'a> GpuDrafter<'a> {
                 slot < pre_len,
                 "GpuDrafter::build_tree_mask_for: ancestor {} slot {} >= pre_len {} \
                  (orchestrator violated monotonic-cache invariant)",
-                idx, slot, pre_len
+                idx,
+                slot,
+                pre_len
             );
             mask[slot] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
             cursor = tree.parents[idx];
@@ -325,9 +322,9 @@ impl<'a> GpuDrafter<'a> {
                 token
             )
         })?;
-        let end = start.checked_add(self.cfg.hidden_size).ok_or_else(|| {
-            anyhow!("GpuDrafter::lookup_embedding: end offset overflows usize")
-        })?;
+        let end = start
+            .checked_add(self.cfg.hidden_size)
+            .ok_or_else(|| anyhow!("GpuDrafter::lookup_embedding: end offset overflows usize"))?;
         ensure!(
             end <= self.embed_table.len(),
             "GpuDrafter::lookup_embedding: embed_table too small (end {} > len {})",
@@ -473,8 +470,7 @@ impl<'a> Drafter for GpuDrafter<'a> {
             // Record node_to_expand's cache slot (= pre_len, since
             // cache.append wrote at slot pre_len). Grow vec if needed.
             if node_to_expand >= self.tree_node_cache_slot.len() {
-                self.tree_node_cache_slot
-                    .resize(node_to_expand + 1, None);
+                self.tree_node_cache_slot.resize(node_to_expand + 1, None);
             }
             self.tree_node_cache_slot[node_to_expand] = Some(pre_len);
             result
@@ -591,11 +587,7 @@ mod tests {
                     let seed = name_hash.wrapping_add(i as u64);
                     let pr = pseudo_random(seed);
                     let is_norm = tensor.name.contains("norm");
-                    *v = if is_norm {
-                        1.0 + pr * 0.1
-                    } else {
-                        pr * 0.044
-                    };
+                    *v = if is_norm { 1.0 + pr * 0.1 } else { pr * 0.044 };
                 }
                 let mut bytes = Vec::with_capacity(vals.len() * 2);
                 for v in &vals {
@@ -610,9 +602,8 @@ mod tests {
         }
         let mut tensors_map: BTreeMap<String, TensorView> = BTreeMap::new();
         for (i, exp) in manifest.iter().enumerate() {
-            let view =
-                TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
-                    .expect("synthetic view");
+            let view = TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
+                .expect("synthetic view");
             tensors_map.insert(exp.name.clone(), view);
         }
         safetensors::serialize(
@@ -667,8 +658,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_test_blob(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         // target_aux: 1 row of fc_input_size
         let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
         let mut target_aux_buf = device
@@ -686,8 +676,13 @@ mod tests {
         // pass 100 to trigger error)
         let bad_embed = vec![0.0f32; 100];
         let err = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &bad_embed, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &bad_embed,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -712,8 +707,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_test_blob(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
 
         // Target aux: synthetic [1, num_aux*hidden].
         let mut target_aux_data = vec![0.0f32; cfg.fc_input_size()];
@@ -805,7 +799,11 @@ mod tests {
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
         let mut target_aux_buf = device
-            .alloc_buffer(cfg.fc_input_size() * 4, DType::F32, vec![1, cfg.fc_input_size()])
+            .alloc_buffer(
+                cfg.fc_input_size() * 4,
+                DType::F32,
+                vec![1, cfg.fc_input_size()],
+            )
             .expect("alloc");
         target_aux_buf
             .as_mut_slice::<f32>()
@@ -814,8 +812,13 @@ mod tests {
         let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
 
         let err = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -843,7 +846,11 @@ mod tests {
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
         let mut target_aux_buf = device
-            .alloc_buffer(cfg.fc_input_size() * 4, DType::F32, vec![1, cfg.fc_input_size()])
+            .alloc_buffer(
+                cfg.fc_input_size() * 4,
+                DType::F32,
+                vec![1, cfg.fc_input_size()],
+            )
             .expect("alloc");
         target_aux_buf
             .as_mut_slice::<f32>()
@@ -851,8 +858,13 @@ mod tests {
             .copy_from_slice(&target_aux_data);
         let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("construct");
         // Depth-2 tree: root → child → grandchild.
@@ -861,10 +873,7 @@ mod tests {
             parents: &[None, Some(0), Some(1)],
         };
         let err = drafter.predict_topk(view, 2, 3).unwrap_err();
-        assert!(
-            err.to_string().contains("path length 3 != 1"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("path length 3 != 1"), "got: {err}");
     }
 
     #[test]
@@ -886,13 +895,25 @@ mod tests {
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
         let mut target_aux_buf = device
-            .alloc_buffer(cfg.fc_input_size() * 4, DType::F32, vec![1, cfg.fc_input_size()])
+            .alloc_buffer(
+                cfg.fc_input_size() * 4,
+                DType::F32,
+                vec![1, cfg.fc_input_size()],
+            )
             .expect("alloc");
-        target_aux_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&target_aux_data);
+        target_aux_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&target_aux_data);
         let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("construct");
         // Depth-1 tree: root → child.
@@ -901,10 +922,7 @@ mod tests {
             parents: &[None, Some(0)],
         };
         let err = drafter.predict_topk(view, 1, 3).unwrap_err();
-        assert!(
-            err.to_string().contains("path length 2 != 1"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("path length 2 != 1"), "got: {err}");
     }
 
     // ----------------------------------------------------------------
@@ -962,15 +980,18 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         // Wrong num_kv_heads.
-        let bad_cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads + 1, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let bad_cache = DrafterKvCache::new(&device, cfg.num_kv_heads + 1, 4, cfg.head_dim)
+            .expect("alloc cache");
         let err = drafter.attach_kv_cache(bad_cache).unwrap_err();
         assert!(
             err.to_string().contains("num_kv_heads"),
@@ -992,14 +1013,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let bad_cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim + 1,
-        )
-        .expect("alloc cache");
+        let bad_cache = DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim + 1)
+            .expect("alloc cache");
         let err = drafter.attach_kv_cache(bad_cache).unwrap_err();
         assert!(
             err.to_string().contains("head_dim"),
@@ -1021,14 +1045,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let mut cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let mut cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         // Append one row to make it non-empty.
         let dummy_row = vec![0.0_f32; cfg.num_kv_heads * cfg.head_dim];
         cache.append(&dummy_row, &dummy_row).expect("append");
@@ -1053,14 +1080,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         drafter.attach_kv_cache(cache).expect("attach");
         assert_eq!(drafter.kv_cache_len(), 0);
         // Root expansion.
@@ -1091,14 +1121,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         drafter.attach_kv_cache(cache).expect("attach");
 
         // Step 1: expand root → cache.len() goes 0 → 1.
@@ -1143,14 +1176,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         drafter.attach_kv_cache(cache).expect("attach");
         let view = TreeContextView {
             tokens: &[10_u32, 20],
@@ -1177,14 +1213,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         drafter.attach_kv_cache(cache).expect("attach");
         // Populate via one predict_topk.
         let view = TreeContextView {
@@ -1211,14 +1250,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 4, cfg.head_dim,
-        )
-        .expect("alloc cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 4, cfg.head_dim).expect("alloc cache");
         drafter.attach_kv_cache(cache).expect("attach");
         // Populate to depth 2 via two predict_topk calls.
         let view_root = TreeContextView {
@@ -1263,14 +1305,17 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 16, cfg.head_dim,
-        )
-        .expect("cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 16, cfg.head_dim).expect("cache");
         drafter.attach_kv_cache(cache).expect("attach");
 
         // Budget=8, max_depth=2, top_k=3. Best-first will switch
@@ -1300,7 +1345,14 @@ mod tests {
     // Phase E6 unit tests — tree mask construction (no GPU needed).
     // ----------------------------------------------------------------
 
-    fn drafter_for_mask_test() -> Option<(MlxDevice, KernelRegistry, Eagle3DrafterConfig, Eagle3DrafterTensors, MlxBuffer, Vec<f32>)> {
+    fn drafter_for_mask_test() -> Option<(
+        MlxDevice,
+        KernelRegistry,
+        Eagle3DrafterConfig,
+        Eagle3DrafterTensors,
+        MlxBuffer,
+        Vec<f32>,
+    )> {
         let device = MlxDevice::new().ok()?;
         let registry = KernelRegistry::new();
         let (cfg, tensors, target_aux_buf, embed_table) = step3_build_drafter_scaffolding(&device)?;
@@ -1318,17 +1370,20 @@ mod tests {
                 None => return,
             };
         let drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         let view = TreeContextView {
             tokens: &[10_u32],
             parents: &[None],
         };
-        let mask = drafter
-            .build_tree_mask_for(&view, 0, 0)
-            .expect("root mask");
+        let mask = drafter.build_tree_mask_for(&view, 0, 0).expect("root mask");
         assert_eq!(mask.len(), 1);
         assert_eq!(
             mask[0],
@@ -1348,8 +1403,13 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         // Manually populate tree_node_cache_slot — simulate that root
@@ -1395,8 +1455,13 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         // Cache layout: slot 0 = root, slot 1 = A, slot 2 = B.
@@ -1414,7 +1479,10 @@ mod tests {
         };
         assert_eq!(mask.len(), 4);
         assert_eq!(mask[0], EAGLE3_TREE_MASK_ATTENDED, "root attended");
-        assert_eq!(mask[1], EAGLE3_TREE_MASK_ATTENDED, "A (parent of 3) attended");
+        assert_eq!(
+            mask[1], EAGLE3_TREE_MASK_ATTENDED,
+            "A (parent of 3) attended"
+        );
         assert_eq!(
             mask[2], EAGLE3_TREE_MASK_MASKED,
             "B (sibling of A — NOT ancestor of 3) must be MASKED — this is the bug-fix invariant"
@@ -1435,8 +1503,13 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         drafter.tree_node_cache_slot = vec![Some(0), Some(1), Some(2), Some(3)];
@@ -1450,7 +1523,11 @@ mod tests {
         use crate::inference::spec_decode::eagle3::forward::EAGLE3_TREE_MASK_ATTENDED;
         assert_eq!(mask.len(), 5);
         for (i, &v) in mask.iter().enumerate() {
-            assert_eq!(v, EAGLE3_TREE_MASK_ATTENDED, "slot {} should be attended", i);
+            assert_eq!(
+                v, EAGLE3_TREE_MASK_ATTENDED,
+                "slot {} should be attended",
+                i
+            );
         }
     }
 
@@ -1464,17 +1541,20 @@ mod tests {
                 None => return,
             };
         let drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         let view = TreeContextView {
             tokens: &[10_u32],
             parents: &[None],
         };
-        let err = drafter
-            .build_tree_mask_for(&view, 5, 0)
-            .unwrap_err();
+        let err = drafter.build_tree_mask_for(&view, 5, 0).unwrap_err();
         assert!(
             err.to_string().contains("node_to_expand 5"),
             "expected OOB error, got: {err}"
@@ -1492,8 +1572,13 @@ mod tests {
                 None => return,
             };
         let drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         // tree_node_cache_slot is empty.
@@ -1530,15 +1615,18 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         // Cache capacity must >= number of internal nodes admitted.
-        let cache = DrafterKvCache::new(
-            &device, cfg.num_kv_heads, 64, cfg.head_dim,
-        )
-        .expect("cache");
+        let cache =
+            DrafterKvCache::new(&device, cfg.num_kv_heads, 64, cfg.head_dim).expect("cache");
         drafter.attach_kv_cache(cache).expect("attach");
         let tree_cfg = DynamicTreeConfig {
             budget: 16,
@@ -1551,7 +1639,11 @@ mod tests {
         assert!(tree.len() <= tree_cfg.budget);
         tree.validate().expect("ExpandedTree::validate");
         // Cache should now hold one slot per internal (expanded) node.
-        let internal_count = tree.depths.iter().filter(|&&d| d < tree_cfg.max_depth).count();
+        let internal_count = tree
+            .depths
+            .iter()
+            .filter(|&&d| d < tree_cfg.max_depth)
+            .count();
         assert!(
             drafter.kv_cache_len() <= internal_count,
             "cache slots {} should match internal nodes {}",
@@ -1574,8 +1666,13 @@ mod tests {
                 None => return,
             };
         let mut drafter = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry,
-            &target_aux_buf, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux_buf,
+            &embed_table,
+            0,
         )
         .expect("drafter");
         let err = drafter.rollback_kv_cache(&[0]).unwrap_err();
@@ -1597,8 +1694,7 @@ mod tests {
         let manifest = expected_manifest(&cfg);
         let blob = build_test_blob(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
-        let tensors =
-            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
         // target_aux with wrong element count.
         let mut bad = device
             .alloc_buffer(40, DType::F32, vec![10])
@@ -1608,7 +1704,13 @@ mod tests {
             .copy_from_slice(&vec![0.0f32; 10]);
         let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
         let err = GpuDrafter::new(
-            &cfg, &tensors, &device, &mut registry, &bad, &embed_table, 0,
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &bad,
+            &embed_table,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -1648,8 +1750,8 @@ mod tests {
         let blob = build_test_blob(&manifest);
 
         let weights_false = Eagle3Weights::load(&blob, &cfg_false).expect("load false");
-        let tensors_false =
-            Eagle3DrafterTensors::upload(&device, &cfg_false, &weights_false).expect("upload false");
+        let tensors_false = Eagle3DrafterTensors::upload(&device, &cfg_false, &weights_false)
+            .expect("upload false");
 
         let weights_true = Eagle3Weights::load(&blob, &cfg_true).expect("load true");
         let tensors_true =
@@ -1677,13 +1779,23 @@ mod tests {
         }
 
         let mut drafter_false = GpuDrafter::new(
-            &cfg_false, &tensors_false, &device, &mut registry_false,
-            &target_aux_false, &embed_table, 0,
+            &cfg_false,
+            &tensors_false,
+            &device,
+            &mut registry_false,
+            &target_aux_false,
+            &embed_table,
+            0,
         )
         .expect("construct false");
         let mut drafter_true = GpuDrafter::new(
-            &cfg_true, &tensors_true, &device, &mut registry_true,
-            &target_aux_true, &embed_table, 0,
+            &cfg_true,
+            &tensors_true,
+            &device,
+            &mut registry_true,
+            &target_aux_true,
+            &embed_table,
+            0,
         )
         .expect("construct true");
 
@@ -1706,8 +1818,14 @@ mod tests {
         let lp_false = cands_false[0].log_prob;
         let lp_true = cands_true[0].log_prob;
         // Both paths produce finite outputs.
-        assert!(lp_false.is_finite(), "norm_before_residual=false log_prob not finite");
-        assert!(lp_true.is_finite(), "norm_before_residual=true log_prob not finite");
+        assert!(
+            lp_false.is_finite(),
+            "norm_before_residual=false log_prob not finite"
+        );
+        assert!(
+            lp_true.is_finite(),
+            "norm_before_residual=true log_prob not finite"
+        );
         // The two branches must NOT produce bit-identical top-1 log-probs —
         // if they do, the norm_before_residual knob is not wired.
         assert_ne!(

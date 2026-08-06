@@ -79,7 +79,10 @@ impl ImatrixProvenance {
     pub fn label(&self) -> String {
         match self {
             ImatrixProvenance::LoadedFromFile(path) => format!("file:{}", path.display()),
-            ImatrixProvenance::Computed { corpus_label, n_ctx } => {
+            ImatrixProvenance::Computed {
+                corpus_label,
+                n_ctx,
+            } => {
                 format!("computed[{}@n_ctx={}]", corpus_label, n_ctx)
             }
         }
@@ -164,7 +167,8 @@ mod tests {
         let a = std::fs::read(tmp.path()).unwrap();
         let b = std::fs::read(tmp2.path()).unwrap();
         assert_eq!(
-            a, b,
+            a,
+            b,
             "imatrix file double-round-trip should be byte-identical \
              (a.len={}, b.len={})",
             a.len(),

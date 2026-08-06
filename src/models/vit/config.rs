@@ -121,16 +121,18 @@ impl VisionConfig {
         }
 
         let u32_req = |k: &'static str| -> Result<u32, VisionConfigError> {
-            vc.get(k)
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32)
-                .ok_or(VisionConfigError::MissingField {
+            vc.get(k).and_then(|v| v.as_u64()).map(|n| n as u32).ok_or(
+                VisionConfigError::MissingField {
                     field: k,
                     expected_type: "u32",
-                })
+                },
+            )
         };
         let f32_def = |k: &str, default: f32| -> f32 {
-            vc.get(k).and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(default)
+            vc.get(k)
+                .and_then(|v| v.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(default)
         };
         let str_def = |k: &str, default: &str| -> String {
             vc.get(k)
@@ -161,20 +163,19 @@ impl VisionConfig {
         //   num_hidden_layers depth
         //   num_attention_heads  num_heads
         //   image_size       (derived from num_position_embeddings)
-        let u32_req_alt = |primary: &'static str, fallback: &'static str|
-            -> Result<u32, VisionConfigError>
-        {
-            if let Some(v) = vc.get(primary).and_then(|v| v.as_u64()) {
-                return Ok(v as u32);
-            }
-            if let Some(v) = vc.get(fallback).and_then(|v| v.as_u64()) {
-                return Ok(v as u32);
-            }
-            Err(VisionConfigError::MissingField {
-                field: primary,
-                expected_type: "u32",
-            })
-        };
+        let u32_req_alt =
+            |primary: &'static str, fallback: &'static str| -> Result<u32, VisionConfigError> {
+                if let Some(v) = vc.get(primary).and_then(|v| v.as_u64()) {
+                    return Ok(v as u32);
+                }
+                if let Some(v) = vc.get(fallback).and_then(|v| v.as_u64()) {
+                    return Ok(v as u32);
+                }
+                Err(VisionConfigError::MissingField {
+                    field: primary,
+                    expected_type: "u32",
+                })
+            };
 
         let hidden_size = u32_req("hidden_size")?;
         let num_hidden_layers = u32_req_alt("num_hidden_layers", "depth")?;
@@ -231,12 +232,12 @@ impl VisionConfig {
                 Some(arr) => {
                     let mut indexes: Vec<u32> = Vec::with_capacity(arr.len());
                     for entry in arr {
-                        let idx = entry.as_u64().ok_or_else(|| {
-                            VisionConfigError::InvalidField {
+                        let idx = entry
+                            .as_u64()
+                            .ok_or_else(|| VisionConfigError::InvalidField {
                                 field: "deepstack_visual_indexes",
                                 value: format!("non-u64 entry {}", entry),
-                            }
-                        })? as u32;
+                            })? as u32;
                         if idx >= num_hidden_layers {
                             return Err(VisionConfigError::InvalidField {
                                 field: "deepstack_visual_indexes",
@@ -263,10 +264,14 @@ impl VisionConfig {
             },
         };
 
-        let spatial_merge_size: Option<u32> =
-            vc.get("spatial_merge_size").and_then(|v| v.as_u64()).map(|n| n as u32);
-        let temporal_patch_size: Option<u32> =
-            vc.get("temporal_patch_size").and_then(|v| v.as_u64()).map(|n| n as u32);
+        let spatial_merge_size: Option<u32> = vc
+            .get("spatial_merge_size")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let temporal_patch_size: Option<u32> = vc
+            .get("temporal_patch_size")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
 
         // Wedge-4f Phase-2c (Codex review of 9e9e262, finding #1, BLOCKER):
         // Real Qwen3-VL HF configs do NOT carry vision_config.projector_type
@@ -361,8 +366,7 @@ impl VisionConfig {
     /// carry the deepstack marker (verified for the 2026-04 snapshot of
     /// `Qwen/Qwen3-VL-2B-Instruct/config.json`'s `vision_config`).
     pub fn is_qwen3vl(&self) -> bool {
-        self.projector_type == "qwen3vl_merger"
-            || self.deepstack_visual_indexes.is_some()
+        self.projector_type == "qwen3vl_merger" || self.deepstack_visual_indexes.is_some()
     }
 
     /// Build the length-`num_hidden_layers` `Vec<bool>` for emission as
@@ -438,7 +442,10 @@ mod tests {
         let err = VisionConfig::from_hf_config(&root).unwrap_err();
         assert!(matches!(
             err,
-            VisionConfigError::MissingField { field: "vision_config", .. }
+            VisionConfigError::MissingField {
+                field: "vision_config",
+                ..
+            }
         ));
     }
 
@@ -475,7 +482,10 @@ mod tests {
         let err = VisionConfig::from_hf_config(&cfg).unwrap_err();
         assert!(matches!(
             err,
-            VisionConfigError::InvalidField { field: "patch_size", .. }
+            VisionConfigError::InvalidField {
+                field: "patch_size",
+                ..
+            }
         ));
     }
 
@@ -642,7 +652,8 @@ mod tests {
         };
         let bools = vc.build_is_deepstack_layers().expect("Some(bools)");
         assert_eq!(bools.len(), 24);
-        let true_positions: Vec<usize> = bools.iter()
+        let true_positions: Vec<usize> = bools
+            .iter()
             .enumerate()
             .filter_map(|(i, &b)| if b { Some(i) } else { None })
             .collect();

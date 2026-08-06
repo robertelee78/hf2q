@@ -2,8 +2,8 @@
 //!
 //! Moved from `src/serve/forward_mlx.rs` by ADR-038 Step 3.
 
-use crate::debug::INVESTIGATION_ENV;
 use super::model::MlxModelWeights;
+use crate::debug::INVESTIGATION_ENV;
 
 // ---------------------------------------------------------------------------
 // Profiling support (HF2Q_MLX_PROFILE=1)
@@ -54,16 +54,16 @@ pub struct KernelTypeProfile {
 #[derive(Default, Clone)]
 pub struct TokenProfile {
     /// Per-layer session timings (wall-clock, includes GPU wait).
-    pub layer_s1_us: Vec<f64>,    // QKV projections
-    pub layer_cpu1_us: Vec<f64>,  // head norms, RoPE, KV cache
-    pub layer_s2_us: Vec<f64>,    // SDPA + MLP
-    pub layer_cpu2_us: Vec<f64>,  // post-FF norm, MoE routing prep
-    pub layer_s3_us: Vec<f64>,    // router proj
-    pub layer_cpu3_us: Vec<f64>,  // softmax + top-k
-    pub layer_s4_us: Vec<f64>,    // MoE experts
-    pub layer_cpu4_us: Vec<f64>,  // post-MoE norms, combine, scalar
-    pub head_session_us: f64,     // lm_head session
-    pub head_cpu_us: f64,         // softcap + argmax CPU
+    pub layer_s1_us: Vec<f64>, // QKV projections
+    pub layer_cpu1_us: Vec<f64>, // head norms, RoPE, KV cache
+    pub layer_s2_us: Vec<f64>,   // SDPA + MLP
+    pub layer_cpu2_us: Vec<f64>, // post-FF norm, MoE routing prep
+    pub layer_s3_us: Vec<f64>,   // router proj
+    pub layer_cpu3_us: Vec<f64>, // softmax + top-k
+    pub layer_s4_us: Vec<f64>,   // MoE experts
+    pub layer_cpu4_us: Vec<f64>, // post-MoE norms, combine, scalar
+    pub head_session_us: f64,    // lm_head session
+    pub head_cpu_us: f64,        // softcap + argmax CPU
     pub total_us: f64,
     /// Dispatch counts per session type.
     pub s1_dispatches: Vec<usize>,
@@ -163,9 +163,7 @@ impl ProfileAccumulator {
 
         // Per-session-type averages across all layers and tokens
         let avg = |getter: &dyn Fn(&TokenProfile) -> &Vec<f64>| -> f64 {
-            let total: f64 = measured.iter()
-                .map(|t| getter(t).iter().sum::<f64>())
-                .sum();
+            let total: f64 = measured.iter().map(|t| getter(t).iter().sum::<f64>()).sum();
             total / n as f64
         };
 
@@ -186,30 +184,89 @@ impl ProfileAccumulator {
 
         // Count actual sessions used (non-zero timings indicate a session was used)
         let actual_sessions = if s2_avg + s3_avg + s4_avg + head_gpu_avg < 1.0 {
-            1  // Single session for entire forward pass
+            1 // Single session for entire forward pass
         } else {
             num_layers * 2 + 1
         };
-        eprintln!("║ {} session(s)/token (single-session mode)", actual_sessions);
+        eprintln!(
+            "║ {} session(s)/token (single-session mode)",
+            actual_sessions
+        );
         eprintln!("║");
         eprintln!("║ Session breakdown (avg across {num_layers} layers, {n} tokens):");
-        eprintln!("║   S1 (QKV+attn+MLP):  {:8.1} us ({:5.2} ms total)", s1_avg / num_layers as f64, s1_avg / 1000.0);
-        eprintln!("║   CPU1 (eliminated):   {:8.1} us ({:5.2} ms total)", cpu1_avg / num_layers as f64, cpu1_avg / 1000.0);
-        eprintln!("║   S2 (SDPA+MLP):      {:8.1} us ({:5.2} ms total)", s2_avg / num_layers as f64, s2_avg / 1000.0);
-        eprintln!("║   CPU2 (post-FF):      {:8.1} us ({:5.2} ms total)", cpu2_avg / num_layers as f64, cpu2_avg / 1000.0);
-        eprintln!("║   S3 (router proj):   {:8.1} us ({:5.2} ms total)", s3_avg / num_layers as f64, s3_avg / 1000.0);
-        eprintln!("║   CPU3 (softmax+topk): {:8.1} us ({:5.2} ms total)", cpu3_avg / num_layers as f64, cpu3_avg / 1000.0);
-        eprintln!("║   S4 (MoE experts):   {:8.1} us ({:5.2} ms total)", s4_avg / num_layers as f64, s4_avg / 1000.0);
-        eprintln!("║   CPU4 (post-MoE):     {:8.1} us ({:5.2} ms total)", cpu4_avg / num_layers as f64, cpu4_avg / 1000.0);
-        eprintln!("║   Head GPU:            {:8.1} us ({:5.2} ms)", head_gpu_avg, head_gpu_avg / 1000.0);
-        eprintln!("║   Head CPU:            {:8.1} us ({:5.2} ms)", head_cpu_avg, head_cpu_avg / 1000.0);
+        eprintln!(
+            "║   S1 (QKV+attn+MLP):  {:8.1} us ({:5.2} ms total)",
+            s1_avg / num_layers as f64,
+            s1_avg / 1000.0
+        );
+        eprintln!(
+            "║   CPU1 (eliminated):   {:8.1} us ({:5.2} ms total)",
+            cpu1_avg / num_layers as f64,
+            cpu1_avg / 1000.0
+        );
+        eprintln!(
+            "║   S2 (SDPA+MLP):      {:8.1} us ({:5.2} ms total)",
+            s2_avg / num_layers as f64,
+            s2_avg / 1000.0
+        );
+        eprintln!(
+            "║   CPU2 (post-FF):      {:8.1} us ({:5.2} ms total)",
+            cpu2_avg / num_layers as f64,
+            cpu2_avg / 1000.0
+        );
+        eprintln!(
+            "║   S3 (router proj):   {:8.1} us ({:5.2} ms total)",
+            s3_avg / num_layers as f64,
+            s3_avg / 1000.0
+        );
+        eprintln!(
+            "║   CPU3 (softmax+topk): {:8.1} us ({:5.2} ms total)",
+            cpu3_avg / num_layers as f64,
+            cpu3_avg / 1000.0
+        );
+        eprintln!(
+            "║   S4 (MoE experts):   {:8.1} us ({:5.2} ms total)",
+            s4_avg / num_layers as f64,
+            s4_avg / 1000.0
+        );
+        eprintln!(
+            "║   CPU4 (post-MoE):     {:8.1} us ({:5.2} ms total)",
+            cpu4_avg / num_layers as f64,
+            cpu4_avg / 1000.0
+        );
+        eprintln!(
+            "║   Head GPU:            {:8.1} us ({:5.2} ms)",
+            head_gpu_avg,
+            head_gpu_avg / 1000.0
+        );
+        eprintln!(
+            "║   Head CPU:            {:8.1} us ({:5.2} ms)",
+            head_cpu_avg,
+            head_cpu_avg / 1000.0
+        );
         eprintln!("║");
-        eprintln!("║ Total: {:8.1} us ({:5.2} ms)", total_avg, total_avg / 1000.0);
-        eprintln!("║   GPU sessions: {:8.1} us ({:5.1}%)", gpu_total, gpu_total / total_avg * 100.0);
-        eprintln!("║   CPU ops:      {:8.1} us ({:5.1}%)", cpu_total, cpu_total / total_avg * 100.0);
+        eprintln!(
+            "║ Total: {:8.1} us ({:5.2} ms)",
+            total_avg,
+            total_avg / 1000.0
+        );
+        eprintln!(
+            "║   GPU sessions: {:8.1} us ({:5.1}%)",
+            gpu_total,
+            gpu_total / total_avg * 100.0
+        );
+        eprintln!(
+            "║   CPU ops:      {:8.1} us ({:5.1}%)",
+            cpu_total,
+            cpu_total / total_avg * 100.0
+        );
         let overhead = total_avg - gpu_total - cpu_total;
         if overhead.abs() > 10.0 {
-            eprintln!("║   Unaccounted:  {:8.1} us ({:5.1}%)", overhead, overhead / total_avg * 100.0);
+            eprintln!(
+                "║   Unaccounted:  {:8.1} us ({:5.1}%)",
+                overhead,
+                overhead / total_avg * 100.0
+            );
         }
 
         // Dispatch counts.
@@ -227,7 +284,8 @@ impl ProfileAccumulator {
         // report body == s1_dispatches[last_layer], head == head_dispatches
         // - s1_dispatches[last_layer], total == head_dispatches.
         let last_layer_dispatch_avg = |getter: &dyn Fn(&TokenProfile) -> &Vec<usize>| -> f64 {
-            let total: usize = measured.iter()
+            let total: usize = measured
+                .iter()
                 .map(|t| getter(t).last().copied().unwrap_or(0))
                 .sum();
             total as f64 / n as f64
@@ -236,8 +294,11 @@ impl ProfileAccumulator {
         let s2_disp = last_layer_dispatch_avg(&|t| &t.s2_dispatches);
         let s3_disp = last_layer_dispatch_avg(&|t| &t.s3_dispatches);
         let s4_disp = last_layer_dispatch_avg(&|t| &t.s4_dispatches);
-        let total_token_disp: f64 = measured.iter()
-            .map(|t| t.head_dispatches as f64).sum::<f64>() / n as f64;
+        let total_token_disp: f64 = measured
+            .iter()
+            .map(|t| t.head_dispatches as f64)
+            .sum::<f64>()
+            / n as f64;
         // Head-only count is the delta between final cumulative and the body cumulative.
         let body_cum = s1_disp + s2_disp + s3_disp + s4_disp;
         let head_disp = (total_token_disp - body_cum).max(0.0);
@@ -257,7 +318,9 @@ impl ProfileAccumulator {
         eprintln!("║   ------|--------|--------|--------|--------|--------|--------|--------|--------|------");
         let detail_layers: Vec<usize> = {
             let mut v: Vec<usize> = (0..3.min(num_layers)).collect();
-            if num_layers > 3 { v.push(num_layers - 1); }
+            if num_layers > 3 {
+                v.push(num_layers - 1);
+            }
             v
         };
         for &li in &detail_layers {
@@ -309,7 +372,8 @@ impl MlxModelWeights {
 
         // Compute median per-layer averages across tokens
         let median_sum = |getter: &dyn Fn(&KernelTypeProfile) -> &Vec<f64>| -> f64 {
-            let mut sums: Vec<f64> = profiles.iter()
+            let mut sums: Vec<f64> = profiles
+                .iter()
                 .map(|p| getter(p).iter().sum::<f64>())
                 .collect();
             sums.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -329,8 +393,15 @@ impl MlxModelWeights {
         head_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let head_total = head_vals[head_vals.len() / 2];
 
-        let gpu_total = qkv_total + norms_rope_total + kv_cache_total + sdpa_total
-            + o_proj_total + mlp_total + moe_total + norms_adds_total + head_total;
+        let gpu_total = qkv_total
+            + norms_rope_total
+            + kv_cache_total
+            + sdpa_total
+            + o_proj_total
+            + mlp_total
+            + moe_total
+            + norms_adds_total
+            + head_total;
 
         // Per-layer averages (divide total by num_layers, except head)
         let qkv_per_layer = qkv_total / num_layers as f64;
@@ -402,41 +473,91 @@ impl MlxModelWeights {
         let candle_norms_adds_per_layer = 20.0; // post-layer norms/adds
         let candle_lm_head = 185.0; // 1 F16 GEMM call
 
-        let candle_per_layer_total = candle_qkv_per_layer + candle_norms_rope_per_layer
-            + candle_kv_cache_per_layer + candle_sdpa_per_layer + candle_o_proj_per_layer
-            + candle_mlp_per_layer + candle_moe_per_layer + candle_norms_adds_per_layer;
+        let candle_per_layer_total = candle_qkv_per_layer
+            + candle_norms_rope_per_layer
+            + candle_kv_cache_per_layer
+            + candle_sdpa_per_layer
+            + candle_o_proj_per_layer
+            + candle_mlp_per_layer
+            + candle_moe_per_layer
+            + candle_norms_adds_per_layer;
         let candle_layers_total = candle_per_layer_total * num_layers as f64;
         let candle_total_reconstructed = candle_layers_total + candle_lm_head;
 
         eprintln!("\n=== PER-KERNEL-TYPE PROFILING (median over {n} tokens) ===");
         eprintln!("Per layer ({num_layers} layers):");
-        eprintln!("  QKV matmuls (norm+3 proj):       {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            qkv_per_layer, candle_qkv_per_layer, qkv_per_layer / candle_qkv_per_layer);
-        eprintln!("  Head norms + RoPE (3 dispatches): {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            norms_rope_per_layer, candle_norms_rope_per_layer, norms_rope_per_layer / candle_norms_rope_per_layer);
-        eprintln!("  KV cache copy (2 dispatches):    {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            kv_cache_per_layer, candle_kv_cache_per_layer, kv_cache_per_layer / candle_kv_cache_per_layer);
-        eprintln!("  SDPA (1 dispatch):               {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            sdpa_per_layer, candle_sdpa_per_layer, sdpa_per_layer / candle_sdpa_per_layer);
-        eprintln!("  O-proj matmul (1 dispatch):      {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            o_proj_per_layer, candle_o_proj_per_layer, o_proj_per_layer / candle_o_proj_per_layer);
-        eprintln!("  MLP matmuls (norm+3proj+gelu):   {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            mlp_per_layer, candle_mlp_per_layer, mlp_per_layer / candle_mlp_per_layer);
-        eprintln!("  MoE (routing+4 expert):          {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            moe_per_layer, candle_moe_per_layer, moe_per_layer / candle_moe_per_layer);
-        eprintln!("  Fused norms/adds (2 dispatches): {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            norms_adds_per_layer, candle_norms_adds_per_layer, norms_adds_per_layer / candle_norms_adds_per_layer);
+        eprintln!(
+            "  QKV matmuls (norm+3 proj):       {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            qkv_per_layer,
+            candle_qkv_per_layer,
+            qkv_per_layer / candle_qkv_per_layer
+        );
+        eprintln!(
+            "  Head norms + RoPE (3 dispatches): {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            norms_rope_per_layer,
+            candle_norms_rope_per_layer,
+            norms_rope_per_layer / candle_norms_rope_per_layer
+        );
+        eprintln!(
+            "  KV cache copy (2 dispatches):    {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            kv_cache_per_layer,
+            candle_kv_cache_per_layer,
+            kv_cache_per_layer / candle_kv_cache_per_layer
+        );
+        eprintln!(
+            "  SDPA (1 dispatch):               {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            sdpa_per_layer,
+            candle_sdpa_per_layer,
+            sdpa_per_layer / candle_sdpa_per_layer
+        );
+        eprintln!(
+            "  O-proj matmul (1 dispatch):      {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            o_proj_per_layer,
+            candle_o_proj_per_layer,
+            o_proj_per_layer / candle_o_proj_per_layer
+        );
+        eprintln!(
+            "  MLP matmuls (norm+3proj+gelu):   {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            mlp_per_layer,
+            candle_mlp_per_layer,
+            mlp_per_layer / candle_mlp_per_layer
+        );
+        eprintln!(
+            "  MoE (routing+4 expert):          {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            moe_per_layer,
+            candle_moe_per_layer,
+            moe_per_layer / candle_moe_per_layer
+        );
+        eprintln!(
+            "  Fused norms/adds (2 dispatches): {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            norms_adds_per_layer,
+            candle_norms_adds_per_layer,
+            norms_adds_per_layer / candle_norms_adds_per_layer
+        );
         eprintln!();
         eprintln!("Head:");
-        eprintln!("  lm_head GEMM (F16):              {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            head_total, candle_lm_head, head_total / candle_lm_head);
+        eprintln!(
+            "  lm_head GEMM (F16):              {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            head_total,
+            candle_lm_head,
+            head_total / candle_lm_head
+        );
         eprintln!();
-        eprintln!("Total GPU per token:               {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
-            gpu_total, candle_total_reconstructed, gpu_total / candle_total_reconstructed);
-        eprintln!("  Layers total:                    {:7.0} us  [candle: ~{:.0} us]",
-            gpu_total - head_total, candle_layers_total);
-        eprintln!("  Head total:                      {:7.0} us  [candle: ~{:.0} us]",
-            head_total, candle_lm_head);
+        eprintln!(
+            "Total GPU per token:               {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            gpu_total,
+            candle_total_reconstructed,
+            gpu_total / candle_total_reconstructed
+        );
+        eprintln!(
+            "  Layers total:                    {:7.0} us  [candle: ~{:.0} us]",
+            gpu_total - head_total,
+            candle_layers_total
+        );
+        eprintln!(
+            "  Head total:                      {:7.0} us  [candle: ~{:.0} us]",
+            head_total, candle_lm_head
+        );
 
         // Per-layer detail for sliding vs global
         eprintln!();
@@ -447,10 +568,14 @@ impl MlxModelWeights {
         let median_p = &profiles[mid]; // approximate median token
         for li in 0..num_layers {
             let lt = if (li + 1) % 6 == 0 { "G" } else { "S" };
-            let layer_total = median_p.qkv_matmuls_us[li] + median_p.head_norms_rope_us[li]
-                + median_p.kv_cache_copy_us[li] + median_p.sdpa_us[li]
-                + median_p.o_proj_us[li] + median_p.mlp_matmuls_us[li]
-                + median_p.moe_us[li] + median_p.norms_adds_us[li];
+            let layer_total = median_p.qkv_matmuls_us[li]
+                + median_p.head_norms_rope_us[li]
+                + median_p.kv_cache_copy_us[li]
+                + median_p.sdpa_us[li]
+                + median_p.o_proj_us[li]
+                + median_p.mlp_matmuls_us[li]
+                + median_p.moe_us[li]
+                + median_p.norms_adds_us[li];
             eprintln!("  {:>2}    |  {}   | {:6.0} |    {:5.0} | {:4.0} | {:5.0} |  {:5.0} |  {:5.0} |  {:5.0} | {:5.0} | {:5.0}",
                 li, lt,
                 median_p.qkv_matmuls_us[li], median_p.head_norms_rope_us[li],
@@ -462,29 +587,88 @@ impl MlxModelWeights {
 
         // Find top 3 slowest kernel types (by ratio vs candle)
         let mut ratios = vec![
-            ("QKV matmuls", qkv_per_layer, candle_qkv_per_layer, qkv_per_layer / candle_qkv_per_layer),
-            ("Head norms + RoPE", norms_rope_per_layer, candle_norms_rope_per_layer, norms_rope_per_layer / candle_norms_rope_per_layer),
-            ("KV cache copy", kv_cache_per_layer, candle_kv_cache_per_layer, kv_cache_per_layer / candle_kv_cache_per_layer),
-            ("SDPA", sdpa_per_layer, candle_sdpa_per_layer, sdpa_per_layer / candle_sdpa_per_layer),
-            ("O-proj matmul", o_proj_per_layer, candle_o_proj_per_layer, o_proj_per_layer / candle_o_proj_per_layer),
-            ("MLP matmuls", mlp_per_layer, candle_mlp_per_layer, mlp_per_layer / candle_mlp_per_layer),
-            ("MoE", moe_per_layer, candle_moe_per_layer, moe_per_layer / candle_moe_per_layer),
-            ("Fused norms/adds", norms_adds_per_layer, candle_norms_adds_per_layer, norms_adds_per_layer / candle_norms_adds_per_layer),
-            ("lm_head GEMM", head_total, candle_lm_head, head_total / candle_lm_head),
+            (
+                "QKV matmuls",
+                qkv_per_layer,
+                candle_qkv_per_layer,
+                qkv_per_layer / candle_qkv_per_layer,
+            ),
+            (
+                "Head norms + RoPE",
+                norms_rope_per_layer,
+                candle_norms_rope_per_layer,
+                norms_rope_per_layer / candle_norms_rope_per_layer,
+            ),
+            (
+                "KV cache copy",
+                kv_cache_per_layer,
+                candle_kv_cache_per_layer,
+                kv_cache_per_layer / candle_kv_cache_per_layer,
+            ),
+            (
+                "SDPA",
+                sdpa_per_layer,
+                candle_sdpa_per_layer,
+                sdpa_per_layer / candle_sdpa_per_layer,
+            ),
+            (
+                "O-proj matmul",
+                o_proj_per_layer,
+                candle_o_proj_per_layer,
+                o_proj_per_layer / candle_o_proj_per_layer,
+            ),
+            (
+                "MLP matmuls",
+                mlp_per_layer,
+                candle_mlp_per_layer,
+                mlp_per_layer / candle_mlp_per_layer,
+            ),
+            (
+                "MoE",
+                moe_per_layer,
+                candle_moe_per_layer,
+                moe_per_layer / candle_moe_per_layer,
+            ),
+            (
+                "Fused norms/adds",
+                norms_adds_per_layer,
+                candle_norms_adds_per_layer,
+                norms_adds_per_layer / candle_norms_adds_per_layer,
+            ),
+            (
+                "lm_head GEMM",
+                head_total,
+                candle_lm_head,
+                head_total / candle_lm_head,
+            ),
         ];
         ratios.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
         eprintln!();
         eprintln!("TOP 3 SLOWEST (highest mlx-native/candle ratio):");
         for (i, (name, mlx_us, candle_us, ratio)) in ratios.iter().take(3).enumerate() {
-            let overhead_per_token = (mlx_us - candle_us) * if *name != "lm_head GEMM" { num_layers as f64 } else { 1.0 };
-            eprintln!("  {}. {} — {:.1}x slower ({:.0} vs {:.0} us/layer) — {:.0} us/token overhead",
-                i + 1, name, ratio, mlx_us, candle_us, overhead_per_token);
+            let overhead_per_token = (mlx_us - candle_us)
+                * if *name != "lm_head GEMM" {
+                    num_layers as f64
+                } else {
+                    1.0
+                };
+            eprintln!(
+                "  {}. {} — {:.1}x slower ({:.0} vs {:.0} us/layer) — {:.0} us/token overhead",
+                i + 1,
+                name,
+                ratio,
+                mlx_us,
+                candle_us,
+                overhead_per_token
+            );
         }
 
         eprintln!();
         eprintln!("NOTE: Per-session overhead (~30-50 us/session) inflates all groups.");
         eprintln!("      The ratio shows relative slowness, not absolute kernel time.");
-        eprintln!("      {} sessions/token vs 1 in production mode.", 8 * num_layers + 2);
+        eprintln!(
+            "      {} sessions/token vs 1 in production mode.",
+            8 * num_layers + 2
+        );
     }
-
 }

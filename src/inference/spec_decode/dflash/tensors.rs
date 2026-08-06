@@ -162,7 +162,10 @@ pub(super) fn decode_bf16_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>, Tensors
 ///
 /// Bit decoding factored into [`decode_bf16_bytes_to_f32`] for
 /// device-free unit testability (ADR-030 iter-108).
-fn upload_bf16_as_f32(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, TensorsError> {
+fn upload_bf16_as_f32(
+    device: &MlxDevice,
+    view: &TensorView<'_>,
+) -> Result<MlxBuffer, TensorsError> {
     let f32_values = decode_bf16_bytes_to_f32(view.data())?;
     let n_elem = f32_values.len();
     let shape: Vec<usize> = view.shape().to_vec();
@@ -239,10 +242,7 @@ impl DFlashModelTensors {
                     device,
                     fetch(weights, &format!("{p}.mlp.gate_proj.weight"))?,
                 )?,
-                mlp_up: upload_bf16(
-                    device,
-                    fetch(weights, &format!("{p}.mlp.up_proj.weight"))?,
-                )?,
+                mlp_up: upload_bf16(device, fetch(weights, &format!("{p}.mlp.up_proj.weight"))?)?,
                 mlp_down: upload_bf16(
                     device,
                     fetch(weights, &format!("{p}.mlp.down_proj.weight"))?,
@@ -257,25 +257,77 @@ impl DFlashModelTensors {
         // produced corrupted hidden states.  These asserts catch future
         // regressions at upload time instead of letting them surface
         // as opaque drafter-clustering symptoms downstream.
-        debug_assert_eq!(fc.dtype(), DType::BF16, "fc weight must stay BF16 for dense_matmul");
-        debug_assert_eq!(hidden_norm.dtype(), DType::F32, "hidden_norm weight must be F32 for rms_norm_f32 kernel");
-        debug_assert_eq!(final_norm.dtype(), DType::F32, "final_norm weight must be F32 for rms_norm_f32 kernel");
+        debug_assert_eq!(
+            fc.dtype(),
+            DType::BF16,
+            "fc weight must stay BF16 for dense_matmul"
+        );
+        debug_assert_eq!(
+            hidden_norm.dtype(),
+            DType::F32,
+            "hidden_norm weight must be F32 for rms_norm_f32 kernel"
+        );
+        debug_assert_eq!(
+            final_norm.dtype(),
+            DType::F32,
+            "final_norm weight must be F32 for rms_norm_f32 kernel"
+        );
         for (idx, l) in layers.iter().enumerate() {
-            debug_assert_eq!(l.input_layernorm.dtype(), DType::F32,
-                "layer {idx}: input_layernorm weight must be F32 for rms_norm_f32 kernel");
-            debug_assert_eq!(l.post_attention_layernorm.dtype(), DType::F32,
-                "layer {idx}: post_attention_layernorm weight must be F32 for rms_norm_f32 kernel");
-            debug_assert_eq!(l.q_norm.dtype(), DType::F32,
-                "layer {idx}: q_norm weight must be F32 for rms_norm_f32 head_norm kernel");
-            debug_assert_eq!(l.k_norm.dtype(), DType::F32,
-                "layer {idx}: k_norm weight must be F32 for rms_norm_f32 head_norm kernel");
-            debug_assert_eq!(l.q_proj.dtype(), DType::BF16, "layer {idx}: q_proj must stay BF16 for dense_matmul");
-            debug_assert_eq!(l.k_proj.dtype(), DType::BF16, "layer {idx}: k_proj must stay BF16 for dense_matmul");
-            debug_assert_eq!(l.v_proj.dtype(), DType::BF16, "layer {idx}: v_proj must stay BF16 for dense_matmul");
-            debug_assert_eq!(l.o_proj.dtype(), DType::BF16, "layer {idx}: o_proj must stay BF16 for dense_matmul");
-            debug_assert_eq!(l.mlp_gate.dtype(), DType::BF16, "layer {idx}: mlp_gate must stay BF16 for dense_matmul");
-            debug_assert_eq!(l.mlp_up.dtype(), DType::BF16, "layer {idx}: mlp_up must stay BF16 for dense_matmul");
-            debug_assert_eq!(l.mlp_down.dtype(), DType::BF16, "layer {idx}: mlp_down must stay BF16 for dense_matmul");
+            debug_assert_eq!(
+                l.input_layernorm.dtype(),
+                DType::F32,
+                "layer {idx}: input_layernorm weight must be F32 for rms_norm_f32 kernel"
+            );
+            debug_assert_eq!(
+                l.post_attention_layernorm.dtype(),
+                DType::F32,
+                "layer {idx}: post_attention_layernorm weight must be F32 for rms_norm_f32 kernel"
+            );
+            debug_assert_eq!(
+                l.q_norm.dtype(),
+                DType::F32,
+                "layer {idx}: q_norm weight must be F32 for rms_norm_f32 head_norm kernel"
+            );
+            debug_assert_eq!(
+                l.k_norm.dtype(),
+                DType::F32,
+                "layer {idx}: k_norm weight must be F32 for rms_norm_f32 head_norm kernel"
+            );
+            debug_assert_eq!(
+                l.q_proj.dtype(),
+                DType::BF16,
+                "layer {idx}: q_proj must stay BF16 for dense_matmul"
+            );
+            debug_assert_eq!(
+                l.k_proj.dtype(),
+                DType::BF16,
+                "layer {idx}: k_proj must stay BF16 for dense_matmul"
+            );
+            debug_assert_eq!(
+                l.v_proj.dtype(),
+                DType::BF16,
+                "layer {idx}: v_proj must stay BF16 for dense_matmul"
+            );
+            debug_assert_eq!(
+                l.o_proj.dtype(),
+                DType::BF16,
+                "layer {idx}: o_proj must stay BF16 for dense_matmul"
+            );
+            debug_assert_eq!(
+                l.mlp_gate.dtype(),
+                DType::BF16,
+                "layer {idx}: mlp_gate must stay BF16 for dense_matmul"
+            );
+            debug_assert_eq!(
+                l.mlp_up.dtype(),
+                DType::BF16,
+                "layer {idx}: mlp_up must stay BF16 for dense_matmul"
+            );
+            debug_assert_eq!(
+                l.mlp_down.dtype(),
+                DType::BF16,
+                "layer {idx}: mlp_down must stay BF16 for dense_matmul"
+            );
         }
 
         Ok(DFlashModelTensors {
@@ -326,10 +378,8 @@ mod tests {
     use crate::inference::spec_decode::dflash::weights::{DFlashWeights, DFlashWeightsFile};
 
     fn gemma4_26b_a4b_dflash_config() -> DFlashConfig {
-        DFlashConfig::from_json_str(
-            super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
-        )
-        .expect("test fixture must parse")
+        DFlashConfig::from_json_str(super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG)
+            .expect("test fixture must parse")
     }
 
     /// Build a BF16 byte buffer (little-endian) from a F32 value by
@@ -365,8 +415,11 @@ mod tests {
         let decoded = decode_bf16_bytes_to_f32(&bytes).expect("decode");
         assert_eq!(decoded.len(), canonical.len());
         for (i, (got, want)) in decoded.iter().zip(canonical.iter()).enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(),
-                "canonical[{i}] = {want} round-trip got {got}");
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "canonical[{i}] = {want} round-trip got {got}"
+            );
         }
     }
 
@@ -395,11 +448,16 @@ mod tests {
         // (mantissa contains the second BF16's bits).
         assert_eq!(misread.len(), 4);
         let bug_value = f32::from_bits(0x3f803f80);
-        assert_eq!(misread[0].to_bits(), bug_value.to_bits(),
+        assert_eq!(
+            misread[0].to_bits(),
+            bug_value.to_bits(),
             "pre-iter-106 bug: reads BF16 1.0 + 1.0 as F32 ≈ {} (NOT 1.0)",
-            bug_value);
-        assert_ne!(misread[0], 1.0,
-            "this is the silent-corruption signature iter-106 fixed");
+            bug_value
+        );
+        assert_ne!(
+            misread[0], 1.0,
+            "this is the silent-corruption signature iter-106 fixed"
+        );
     }
 
     #[test]
@@ -446,7 +504,10 @@ mod tests {
             safetensors_data_bytes + cast_expansion_bytes,
             "GPU resident bytes must equal safetensors data + F32 cast expansion \
              (cfg.num_hidden_layers={}, head_dim={}, hidden_size={}, expansion={})",
-            cfg.num_hidden_layers, cfg.head_dim, cfg.hidden_size, cast_expansion_bytes,
+            cfg.num_hidden_layers,
+            cfg.head_dim,
+            cfg.hidden_size,
+            cast_expansion_bytes,
         );
         assert_eq!(tensors.layers.len(), cfg.num_hidden_layers);
     }

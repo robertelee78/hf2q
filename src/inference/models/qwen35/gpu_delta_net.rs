@@ -93,9 +93,7 @@ use mlx_native::ops::quantized_matmul_ggml::{
 };
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::ops::rms_norm;
-use mlx_native::ops::ssm_conv::{
-    dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams,
-};
+use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams};
 // ADR-015 iter14: `build_ssm_norm_gate_params` lifted inline to
 // `pooled_alloc_buffer` at every call site for unretained-refs ARC anchoring.
 use mlx_native::ops::ssm_norm_gate::dispatch_ssm_norm_gate;
@@ -139,7 +137,8 @@ fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
         && seq_len > CHUNK_THRESHOLD
         && seq_len % mlx_native::ops::chunk_gated_delta_rule::FIXED_BT == 0
         && (d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K // 128
-            || d_k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K) // 256
+            || d_k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K)
+    // 256
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -206,12 +205,7 @@ fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
 /// with byte_offset 0 is byte-equivalent to passing the underlying
 /// buffer directly when the kernel reads only single-seq sized state.
 #[inline]
-fn slot_recurrent_region(
-    slot_id: SlotId,
-    d_k: u32,
-    d_v: u32,
-    n_v_heads: u32,
-) -> (u64, usize) {
+fn slot_recurrent_region(slot_id: SlotId, d_k: u32, d_v: u32, n_v_heads: u32) -> (u64, usize) {
     let n_elements = (d_k as usize) * (d_v as usize) * (n_v_heads as usize);
     let byte_offset = (slot_id.0 as u64)
         .checked_mul(n_elements as u64)
@@ -223,11 +217,7 @@ fn slot_recurrent_region(
 /// Per-slot byte offset + element count for the linear-attn `conv_state`
 /// buffer of shape `[channels, K-1, n_seqs]` F32 (col-major).
 #[inline]
-fn slot_conv_state_region(
-    slot_id: SlotId,
-    conv_channels: u32,
-    k_minus_one: u32,
-) -> (u64, usize) {
+fn slot_conv_state_region(slot_id: SlotId, conv_channels: u32, k_minus_one: u32) -> (u64, usize) {
     let n_elements = (conv_channels as usize) * (k_minus_one as usize);
     let byte_offset = (slot_id.0 as u64)
         .checked_mul(n_elements as u64)
@@ -257,10 +247,8 @@ fn slot_capture_states_region(
     n_v_heads: u32,
     n_tokens_max: u32,
 ) -> (u64, usize) {
-    let per_seq_elems = (d_k as usize)
-        * (d_v as usize)
-        * (n_v_heads as usize)
-        * (n_tokens_max as usize);
+    let per_seq_elems =
+        (d_k as usize) * (d_v as usize) * (n_v_heads as usize) * (n_tokens_max as usize);
     let byte_offset = (slot_id.0 as u64)
         .checked_mul(per_seq_elems as u64)
         .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
@@ -280,9 +268,7 @@ fn slot_conv_capture_region(
     k_minus_one: u32,
     n_tokens_max: u32,
 ) -> (u64, usize) {
-    let per_seq_elems = (n_tokens_max as usize)
-        * (k_minus_one as usize)
-        * (conv_channels as usize);
+    let per_seq_elems = (n_tokens_max as usize) * (k_minus_one as usize) * (conv_channels as usize);
     let byte_offset = (slot_id.0 as u64)
         .checked_mul(per_seq_elems as u64)
         .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
@@ -357,13 +343,7 @@ fn narrow_capture_states_to_slot(
     } else {
         per_seq_elems / state_elems
     };
-    let (off, n) = slot_capture_states_region(
-        slot_id,
-        d_k,
-        d_v,
-        n_v_heads,
-        n_tokens_max as u32,
-    );
+    let (off, n) = slot_capture_states_region(slot_id, d_k, d_v, n_v_heads, n_tokens_max as u32);
     capture.slice_view(off, n)
 }
 
@@ -390,12 +370,8 @@ fn narrow_conv_capture_to_slot(
     } else {
         per_seq_elems / per_token_elems
     };
-    let (off, n) = slot_conv_capture_region(
-        slot_id,
-        conv_channels,
-        k_minus_one,
-        n_tokens_max as u32,
-    );
+    let (off, n) =
+        slot_conv_capture_region(slot_id, conv_channels, k_minus_one, n_tokens_max as u32);
     conv_capture.slice_view(off, n)
 }
 
@@ -474,11 +450,8 @@ impl DeltaNetWeightsGpu {
         qkv_channels: usize,
     ) -> Result<Self> {
         // Transpose ssm_conv1d: [K, channels] → [channels, K].
-        let conv1d_t = transpose_k_channels_to_channels_k(
-            &weights.ssm_conv1d,
-            k_width,
-            qkv_channels,
-        );
+        let conv1d_t =
+            transpose_k_channels_to_channels_k(&weights.ssm_conv1d, k_width, qkv_channels);
         Ok(Self {
             // Small F32 weights: consumed by custom kernels (rms_norm, ssm_conv,
             // compute_g_beta, ssm_norm_gate) that require F32 input.  W-5b.7
@@ -496,11 +469,11 @@ impl DeltaNetWeightsGpu {
             // Large projection weights: quantized to Q4_0 GGML blocks for 3.56×
             // bandwidth reduction vs BF16.  Uses quantized_matmul_ggml dispatch_mv
             // (decode) / dispatch_mm (prefill) — same deterministic kernel as FFN.
-            attn_qkv:  upload_q4_0_from_f32(&weights.attn_qkv,  device)?,
+            attn_qkv: upload_q4_0_from_f32(&weights.attn_qkv, device)?,
             attn_gate: upload_q4_0_from_f32(&weights.attn_gate, device)?,
             ssm_alpha: upload_q4_0_from_f32(&weights.ssm_alpha, device)?,
-            ssm_beta:  upload_q4_0_from_f32(&weights.ssm_beta,  device)?,
-            ssm_out:   upload_q4_0_from_f32(&weights.ssm_out,   device)?,
+            ssm_beta: upload_q4_0_from_f32(&weights.ssm_beta, device)?,
+            ssm_out: upload_q4_0_from_f32(&weights.ssm_out, device)?,
         })
     }
 
@@ -523,11 +496,8 @@ impl DeltaNetWeightsGpu {
         k_width: usize,
         qkv_channels: usize,
     ) -> Result<Self> {
-        let conv1d_t = transpose_k_channels_to_channels_k(
-            &weights.ssm_conv1d,
-            k_width,
-            qkv_channels,
-        );
+        let conv1d_t =
+            transpose_k_channels_to_channels_k(&weights.ssm_conv1d, k_width, qkv_channels);
         Ok(Self {
             attn_norm: upload_f32(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
@@ -538,11 +508,11 @@ impl DeltaNetWeightsGpu {
             ssm_a_cpu: weights.ssm_a.clone(),
             ssm_norm: upload_f32(&weights.ssm_norm, device)?,
             ssm_norm_cpu: weights.ssm_norm.clone(),
-            attn_qkv:  upload_f32(&weights.attn_qkv,  device)?,
+            attn_qkv: upload_f32(&weights.attn_qkv, device)?,
             attn_gate: upload_f32(&weights.attn_gate, device)?,
             ssm_alpha: upload_f32(&weights.ssm_alpha, device)?,
-            ssm_beta:  upload_f32(&weights.ssm_beta,  device)?,
-            ssm_out:   upload_f32(&weights.ssm_out,   device)?,
+            ssm_beta: upload_f32(&weights.ssm_beta, device)?,
+            ssm_out: upload_f32(&weights.ssm_out, device)?,
         })
     }
 }
@@ -618,12 +588,12 @@ pub fn apply_pre_norm(
     // ADR-012 §Optimize / Task #15: route per-decode-token scratch allocations
     // through the thread-local arena pool to amortize Metal `newBuffer` overhead.
     let out = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (seq_len * hidden_size) as usize * 4,
-            DType::F32,
-            vec![seq_len as usize, hidden_size as usize],
-        )
-        .map_err(|e| anyhow!("alloc pre_norm out: {e}"))?;
+        device,
+        (seq_len * hidden_size) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, hidden_size as usize],
+    )
+    .map_err(|e| anyhow!("alloc pre_norm out: {e}"))?;
     let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     {
@@ -667,12 +637,12 @@ pub fn apply_proj(
 ) -> Result<MlxBuffer> {
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = super::decode_pool::pooled_alloc_buffer(
-            device,
-            out_bytes,
-            DType::F32,
-            vec![seq_len as usize, out_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc proj out: {e}"))?;
+        device,
+        out_bytes,
+        DType::F32,
+        vec![seq_len as usize, out_features as usize],
+    )
+    .map_err(|e| anyhow!("alloc proj out: {e}"))?;
 
     match weight.dtype() {
         DType::U8 => {
@@ -711,14 +681,22 @@ pub fn apply_proj(
             // lifted for hygiene.
             let n_w = (out_features * in_features) as usize;
             let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    n_w * 2,
-                    DType::BF16,
-                    vec![out_features as usize, in_features as usize],
-                )
-                .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-            cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
-                .context("cast weight F32→BF16")?;
+                device,
+                n_w * 2,
+                DType::BF16,
+                vec![out_features as usize, in_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
+            cast(
+                encoder,
+                registry,
+                device.metal_device(),
+                weight,
+                &weight_bf16,
+                n_w,
+                CastDirection::F32ToBF16,
+            )
+            .context("cast weight F32→BF16")?;
             encoder.memory_barrier();
             let params = DenseMmBf16F32Params {
                 m: seq_len,
@@ -728,7 +706,13 @@ pub fn apply_proj(
                 src1_batch: 1,
             };
             dense_matmul_bf16_f32_tensor(
-                encoder, registry, device, &weight_bf16, input, &mut dst, &params,
+                encoder,
+                registry,
+                device,
+                &weight_bf16,
+                input,
+                &mut dst,
+                &params,
             )
             .context("dense_matmul_bf16_f32_tensor proj (F32 legacy)")?;
         }
@@ -776,7 +760,9 @@ pub fn prepare_ssm_conv_buffers(
         .alloc_buffer(4 * 4, DType::U32, vec![4])
         .map_err(|e| anyhow!("alloc ssm_conv params: {e}"))?;
     {
-        let s = params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        let s = params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = qkv_channels;
         s[1] = seq_len;
         // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
@@ -875,12 +861,12 @@ pub fn apply_l2_norm_per_head(
     let rows = seq_len * n_heads;
     let dim = head_dim;
     let out = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (rows * dim) as usize * 4,
-            DType::F32,
-            vec![rows as usize, dim as usize],
-        )
-        .map_err(|e| anyhow!("alloc l2_norm out: {e}"))?;
+        device,
+        (rows * dim) as usize * 4,
+        DType::F32,
+        vec![rows as usize, dim as usize],
+    )
+    .map_err(|e| anyhow!("alloc l2_norm out: {e}"))?;
     let mut params_buf = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc l2_norm params: {e}"))?;
     {
@@ -1057,7 +1043,10 @@ pub fn apply_proj_into(
             .context("dense_matmul_bf16_f32_tensor proj (arena F32 fallback)")?;
         }
         other => {
-            return Err(anyhow!("apply_proj_into: unsupported weight dtype {:?}", other));
+            return Err(anyhow!(
+                "apply_proj_into: unsupported weight dtype {:?}",
+                other
+            ));
         }
     }
     Ok(())
@@ -1121,10 +1110,10 @@ pub fn apply_l2_norm_per_head_into(
 /// shape. Done CPU-side because nv is small (32 for MoE, 48 for dense) and the
 /// op is not on the GPU hot-path for the parity test.
 pub fn compute_g_and_beta_cpu(
-    alpha_logit_cpu: &[f32],  // [seq, nv]
-    beta_logit_cpu: &[f32],   // [seq, nv]
-    dt_bias: &[f32],          // [nv]
-    ssm_a: &[f32],            // [nv]: pre-computed -A_log.exp() values, used directly
+    alpha_logit_cpu: &[f32], // [seq, nv]
+    beta_logit_cpu: &[f32],  // [seq, nv]
+    dt_bias: &[f32],         // [nv]
+    ssm_a: &[f32],           // [nv]: pre-computed -A_log.exp() values, used directly
     seq_len: usize,
     nv: usize,
 ) -> (Vec<f32>, Vec<f32>) {
@@ -2128,9 +2117,9 @@ pub fn apply_ssm_norm_and_gate(
     device: &MlxDevice,
     attn_out: &MlxBuffer,
     z_flat: &MlxBuffer,
-    ssm_norm_w_cpu: &[f32],  // CPU weight copy — no download needed
+    ssm_norm_w_cpu: &[f32], // CPU weight copy — no download needed
     seq_len: u32,
-    z_channels: u32,  // = n_v_heads * d_v
+    z_channels: u32, // = n_v_heads * d_v
     eps: f32,
 ) -> Result<MlxBuffer> {
     // Download attn_out and z from GPU (results of prior GPU kernels).
@@ -2140,7 +2129,7 @@ pub fn apply_ssm_norm_and_gate(
 
     let n_total = (seq_len * z_channels) as usize;
     let dv = ssm_norm_w_cpu.len(); // actual D_v from the norm weight shape
-    // z_channels should be n_v_heads * dv, but we infer nv from the two:
+                                   // z_channels should be n_v_heads * dv, but we infer nv from the two:
     let nv = if dv > 0 { z_channels as usize / dv } else { 1 };
 
     let mut gated = vec![0.0f32; n_total];
@@ -2211,10 +2200,10 @@ pub fn build_delta_net_layer(
     registry: &mut KernelRegistry,
     x: &MlxBuffer,
     weights: &DeltaNetWeightsGpu,
-    conv_state_in: &MlxBuffer,  // [conv_channels, K-1, n_seqs] GPU ping-pong (read)
+    conv_state_in: &MlxBuffer, // [conv_channels, K-1, n_seqs] GPU ping-pong (read)
     conv_state_out: &MlxBuffer, // [conv_channels, K-1, n_seqs] GPU ping-pong (write)
-    state_in: &MlxBuffer,       // [D_k, D_v, n_v_heads, n_seqs] current recurrent state (read-only)
-    state_out: &MlxBuffer,      // [D_k, D_v, n_v_heads, n_seqs] next recurrent state (write-only, must != state_in)
+    state_in: &MlxBuffer,      // [D_k, D_v, n_v_heads, n_seqs] current recurrent state (read-only)
+    state_out: &MlxBuffer, // [D_k, D_v, n_v_heads, n_seqs] next recurrent state (write-only, must != state_in)
     seq_len: u32,
     hidden_size: u32,
     n_k_heads: u32,
@@ -2295,16 +2284,8 @@ pub fn build_delta_net_layer(
     let state_in = &la_view.recurrent_in;
     let state_out = &la_view.recurrent_out;
     // Narrow capture buffers to the per-slot region when active.
-    let state_capture_view = state_capture.map(|b| {
-        narrow_capture_states_to_slot(
-            b,
-            slot_id,
-            d_k,
-            d_v,
-            n_v_heads,
-            n_seqs_alloc,
-        )
-    });
+    let state_capture_view = state_capture
+        .map(|b| narrow_capture_states_to_slot(b, slot_id, d_k, d_v, n_v_heads, n_seqs_alloc));
     let conv_state_capture_view = conv_state_capture.map(|b| {
         narrow_conv_capture_to_slot(
             b,
@@ -2359,18 +2340,24 @@ pub fn build_delta_net_layer(
     // forward pass `reset_decode_pool` at the top of `forward_gpu_greedy`
     // recycles them on the next token.
     let qkv_conv = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (seq_len * qkv_channels) as usize * 4,
-            DType::F32,
-            vec![seq as usize, qkv_ch],
-        )
-        .map_err(|e| anyhow!("alloc qkv_conv: {e}"))?;
-    let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4 * 4, DType::U32, vec![4])
-        .map_err(|e| anyhow!("alloc ssm params: {e}"))?;
+        device,
+        (seq_len * qkv_channels) as usize * 4,
+        DType::F32,
+        vec![seq as usize, qkv_ch],
+    )
+    .map_err(|e| anyhow!("alloc qkv_conv: {e}"))?;
+    let mut ssm_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 4 * 4, DType::U32, vec![4])
+            .map_err(|e| anyhow!("alloc ssm params: {e}"))?;
     {
         // ADR-040 §6.1.40 per-slot per-step dispatch: ssm_params n_seqs = 1.
-        let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
-        s[0] = qkv_channels; s[1] = seq_len; s[2] = FORWARD_DISPATCH_N_SEQS; s[3] = k_width;
+        let s = ssm_params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
+        s[0] = qkv_channels;
+        s[1] = seq_len;
+        s[2] = FORWARD_DISPATCH_N_SEQS;
+        s[3] = k_width;
     }
     let ssm_conv_params = SsmConvParams {
         channels: qkv_channels,
@@ -2378,8 +2365,9 @@ pub fn build_delta_net_layer(
         n_seqs: FORWARD_DISPATCH_N_SEQS,
         k_width,
     };
-    let q_scaled = super::decode_pool::pooled_alloc_buffer(device, n_q_elems * 4, DType::F32, vec![n_q_elems])
-        .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
+    let q_scaled =
+        super::decode_pool::pooled_alloc_buffer(device, n_q_elems * 4, DType::F32, vec![n_q_elems])
+            .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
     let g_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
         .map_err(|e| anyhow!("alloc g_buf: {e}"))?;
     let beta_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
@@ -2387,12 +2375,19 @@ pub fn build_delta_net_layer(
     let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(device, 8, DType::U32, vec![2])
         .map_err(|e| anyhow!("alloc g_params: {e}"))?;
     {
-        let s = g_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        let s = g_params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = n_v_heads;
         s[1] = seq_len;
     }
-    let gated_buf = super::decode_pool::pooled_alloc_buffer(device, gated_elems * 4, DType::F32, vec![gated_elems])
-        .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
+    let gated_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        gated_elems * 4,
+        DType::F32,
+        vec![gated_elems],
+    )
+    .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
     // ADR-015 iter14: lift mlx-native `build_ssm_norm_gate_params` /
     // `build_gated_delta_net_params` results to the per-decode-token
     // pool inline.  Both helpers internally do `device.alloc_buffer` and
@@ -2407,26 +2402,36 @@ pub fn build_delta_net_layer(
     let mut op8_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc op8 params (pooled): {e}"))?;
     {
-        let s = op8_params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        let s = op8_params
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = rms_norm_eps;
         s[1] = d_v as f32;
     }
-    let attn_out_buf = super::decode_pool::pooled_alloc_buffer(device, out_elems * 4, DType::F32, vec![out_elems])
-        .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
+    let attn_out_buf =
+        super::decode_pool::pooled_alloc_buffer(device, out_elems * 4, DType::F32, vec![out_elems])
+            .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
     // state_in and state_out are caller-provided buffers (ping-pong).
     // Metal requires distinct buffers for read and write bindings.
     let gdn_params = GatedDeltaNetParams {
-        d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
+        d_k,
+        d_v,
+        n_k_heads,
+        n_v_heads,
+        n_tokens: seq_len,
+        n_seqs,
     };
     // 9 u32 per the mlx-native ADR-033 §Pi iter-25 params contract
     // (index 8 = q_scale_bits; 0 = legacy contract, caller pre-scales q).
     // Pooled alloc, so hand-built instead of build_gated_delta_net_params;
     // layout must mirror it exactly.
-    let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 9 * 4, DType::U32, vec![9])
-        .map_err(|e| anyhow!("alloc gdn params (pooled): {e}"))?;
+    let mut gdn_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 9 * 4, DType::U32, vec![9])
+            .map_err(|e| anyhow!("alloc gdn params (pooled): {e}"))?;
     {
-        let s = gdn_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        let s = gdn_params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = gdn_params.d_k;
         s[1] = gdn_params.d_v;
         s[2] = gdn_params.n_k_heads;
@@ -2459,25 +2464,43 @@ pub fn build_delta_net_layer(
         //   → BARRIER → op9 (out_proj)
 
         // Pre-create slice views into qkv_conv (CPU-side only, no GPU op).
-        let q_gpu = qkv_conv.slice_view(0,                           q_sp);
-        let k_gpu = qkv_conv.slice_view((q_sp * 4) as u64,          k_sp);
+        let q_gpu = qkv_conv.slice_view(0, q_sp);
+        let k_gpu = qkv_conv.slice_view((q_sp * 4) as u64, k_sp);
         let v_gpu = qkv_conv.slice_view(((q_sp + k_sp) * 4) as u64, nv * dv);
 
         let mut enc = device.command_encoder().context("enc ops1-9 decode")?;
         // Op 1: pre_norm
         let x_norm = apply_pre_norm(
-            &mut enc, registry, device, x, &weights.attn_norm,
-            seq_len, hidden_size, rms_norm_eps,
+            &mut enc,
+            registry,
+            device,
+            x,
+            &weights.attn_norm,
+            seq_len,
+            hidden_size,
+            rms_norm_eps,
         )?;
         enc.memory_barrier();
         // Ops 2a+2b+2c: qkv_proj, z_proj (concurrent)
         let qkv_raw = apply_proj(
-            &mut enc, registry, device, &x_norm,
-            &weights.attn_qkv, seq_len, hidden_size, qkv_channels,
+            &mut enc,
+            registry,
+            device,
+            &x_norm,
+            &weights.attn_qkv,
+            seq_len,
+            hidden_size,
+            qkv_channels,
         )?;
         let z = apply_proj(
-            &mut enc, registry, device, &x_norm,
-            &weights.attn_gate, seq_len, hidden_size, z_channels,
+            &mut enc,
+            registry,
+            device,
+            &x_norm,
+            &weights.attn_gate,
+            seq_len,
+            hidden_size,
+            z_channels,
         )?;
         enc.memory_barrier();
         // Op 3: ssm_conv — reads conv_state_in (GPU ping-pong), writes qkv_conv + conv_state_out.
@@ -2487,53 +2510,110 @@ pub fn build_delta_net_layer(
         // path otherwise (byte-identical to pre-Step-4c).
         if let Some(conv_capture_buf) = conv_state_capture {
             dispatch_ssm_conv_with_capture(
-                &mut enc, registry, device.metal_device(),
-                &qkv_raw, &weights.ssm_conv1d, conv_state_in,
-                &qkv_conv, conv_capture_buf, &ssm_params_buf, ssm_conv_params,
-            ).context("dispatch_ssm_conv_with_capture ops3 decode (K=N spec)")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &qkv_raw,
+                &weights.ssm_conv1d,
+                conv_state_in,
+                &qkv_conv,
+                conv_capture_buf,
+                &ssm_params_buf,
+                ssm_conv_params,
+            )
+            .context("dispatch_ssm_conv_with_capture ops3 decode (K=N spec)")?;
         } else {
             dispatch_ssm_conv(
-                &mut enc, registry, device.metal_device(),
-                &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
-                &qkv_conv, &ssm_params_buf, ssm_conv_params,
-            ).context("dispatch_ssm_conv ops3")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &qkv_raw,
+                &weights.ssm_conv1d,
+                conv_state_in,
+                conv_state_out,
+                &qkv_conv,
+                &ssm_params_buf,
+                ssm_conv_params,
+            )
+            .context("dispatch_ssm_conv ops3")?;
         }
         enc.memory_barrier();
         // Ops 5+6a+6b: l2_norm_q, l2_norm_k, alpha, beta (concurrent)
         let q_l2 = apply_l2_norm_per_head(
-            &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+            &mut enc,
+            registry,
+            device,
+            &q_gpu,
+            seq_len,
+            n_k_heads,
+            d_k,
+            rms_norm_eps,
         )?;
         let k_normed = apply_l2_norm_per_head(
-            &mut enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+            &mut enc,
+            registry,
+            device,
+            &k_gpu,
+            seq_len,
+            n_k_heads,
+            d_k,
+            rms_norm_eps,
         )?;
         let alpha_logit_buf = apply_proj(
-            &mut enc, registry, device, &x_norm,
-            &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+            &mut enc,
+            registry,
+            device,
+            &x_norm,
+            &weights.ssm_alpha,
+            seq_len,
+            hidden_size,
+            n_v_heads,
         )?;
         let beta_logit_buf = apply_proj(
-            &mut enc, registry, device, &x_norm,
-            &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+            &mut enc,
+            registry,
+            device,
+            &x_norm,
+            &weights.ssm_beta,
+            seq_len,
+            hidden_size,
+            n_v_heads,
         )?;
         enc.memory_barrier();
         // q_scale + g_beta
         scalar_mul_f32(
-            &mut enc, registry, device.metal_device(),
-            &q_l2, &q_scaled, n_q_elems, q_scale_val,
-        ).context("scalar_mul_f32 q_scale")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &q_l2,
+            &q_scaled,
+            n_q_elems,
+            q_scale_val,
+        )
+        .context("scalar_mul_f32 q_scale")?;
         dispatch_compute_g_beta(
-            &mut enc, registry, device.metal_device(),
-            &alpha_logit_buf, &beta_logit_buf,
-            &weights.ssm_dt_bias, &weights.ssm_a,
-            &g_buf, &beta_buf, &g_params_buf,
-            seq_len, n_v_heads,
-        ).context("dispatch_compute_g_beta")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &alpha_logit_buf,
+            &beta_logit_buf,
+            &weights.ssm_dt_bias,
+            &weights.ssm_a,
+            &g_buf,
+            &beta_buf,
+            &g_params_buf,
+            seq_len,
+            n_v_heads,
+        )
+        .context("dispatch_compute_g_beta")?;
         enc.memory_barrier();
         // Op 7: GDN — reads state_in, writes state_out (ping-pong buffers).
         // ADR-015 iter59: decode path (seq==1 → n_tokens=1) uses the NSG
         // `simd_sum` kernel when D_k is NSG-compatible (multiple of 32, ≤128)
         // — byte-identical to legacy kernel, barrier-free. Falls back to the
         // legacy 128-thread kernel for non-NSG shapes (e.g. test-only D_k=8).
-        let nsg_compatible = d_k % 32 == 0 && d_k / 32 <= mlx_native::ops::gated_delta_net_decode::MAX_NSG;
+        let nsg_compatible =
+            d_k % 32 == 0 && d_k / 32 <= mlx_native::ops::gated_delta_net_decode::MAX_NSG;
         if nsg_compatible {
             // ADR-034 task #90 Step 3 (2026-05-21) — capture variant when
             // K=N spec-decode active. Captures per-position recurrent
@@ -2541,19 +2621,41 @@ pub fn build_delta_net_layer(
             if let Some(capture_buf) = state_capture {
                 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture;
                 dispatch_gated_delta_net_decode_with_capture(
-                    &mut enc, registry, device.metal_device(),
-                    &q_scaled, &k_normed, &v_gpu,
-                    &g_buf, &beta_buf, state_in,
-                    &attn_out_buf, state_out, &gdn_params_buf, capture_buf,
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &q_scaled,
+                    &k_normed,
+                    &v_gpu,
+                    &g_buf,
+                    &beta_buf,
+                    state_in,
+                    &attn_out_buf,
+                    state_out,
+                    &gdn_params_buf,
+                    capture_buf,
                     gdn_params,
-                ).context("dispatch_gated_delta_net_decode_with_capture (build_delta_net_layer K=N spec)")?;
+                )
+                .context(
+                    "dispatch_gated_delta_net_decode_with_capture (build_delta_net_layer K=N spec)",
+                )?;
             } else {
                 dispatch_gated_delta_net_decode(
-                    &mut enc, registry, device.metal_device(),
-                    &q_scaled, &k_normed, &v_gpu,
-                    &g_buf, &beta_buf, state_in,
-                    &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-                ).context("dispatch_gated_delta_net_decode (build_delta_net_layer decode)")?;
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &q_scaled,
+                    &k_normed,
+                    &v_gpu,
+                    &g_buf,
+                    &beta_buf,
+                    state_in,
+                    &attn_out_buf,
+                    state_out,
+                    &gdn_params_buf,
+                    gdn_params,
+                )
+                .context("dispatch_gated_delta_net_decode (build_delta_net_layer decode)")?;
             }
         } else {
             // Non-NSG-compatible shape: capture not supported on the
@@ -2577,25 +2679,48 @@ pub fn build_delta_net_layer(
                 ));
             }
             dispatch_gated_delta_net(
-                &mut enc, registry, device.metal_device(),
-                &q_scaled, &k_normed, &v_gpu,
-                &g_buf, &beta_buf, state_in,
-                &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-            ).context("dispatch_gated_delta_net (build_delta_net_layer decode, non-NSG shape)")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &q_scaled,
+                &k_normed,
+                &v_gpu,
+                &g_buf,
+                &beta_buf,
+                state_in,
+                &attn_out_buf,
+                state_out,
+                &gdn_params_buf,
+                gdn_params,
+            )
+            .context("dispatch_gated_delta_net (build_delta_net_layer decode, non-NSG shape)")?;
         }
         enc.memory_barrier();
         // Op 8: ssm_norm_gate
         dispatch_ssm_norm_gate(
-            &mut enc, registry, device.metal_device(),
-            &attn_out_buf, &weights.ssm_norm, &z,
-            &gated_buf, &op8_params,
-            rows_op8, d_v,
-        ).context("dispatch_ssm_norm_gate")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &attn_out_buf,
+            &weights.ssm_norm,
+            &z,
+            &gated_buf,
+            &op8_params,
+            rows_op8,
+            d_v,
+        )
+        .context("dispatch_ssm_norm_gate")?;
         enc.memory_barrier();
         // Op 9: out_proj
         let output = apply_proj(
-            &mut enc, registry, device, &gated_buf,
-            &weights.ssm_out, seq_len, z_channels, hidden_size,
+            &mut enc,
+            registry,
+            device,
+            &gated_buf,
+            &weights.ssm_out,
+            seq_len,
+            z_channels,
+            hidden_size,
         )?;
         // commit() without wait: output is fed into fused_residual_norm
         // on the same Metal serial queue; GPU ordering is guaranteed.
@@ -2614,17 +2739,35 @@ pub fn build_delta_net_layer(
             );
             let mut enc = device.command_encoder().context("enc ops1-3 prefill")?;
             let x_norm = apply_pre_norm(
-                &mut enc, registry, device, x, &weights.attn_norm,
-                seq_len, hidden_size, rms_norm_eps,
+                &mut enc,
+                registry,
+                device,
+                x,
+                &weights.attn_norm,
+                seq_len,
+                hidden_size,
+                rms_norm_eps,
             )?;
             enc.memory_barrier();
             let qkv_raw = apply_proj(
-                &mut enc, registry, device, &x_norm,
-                &weights.attn_qkv, seq_len, hidden_size, qkv_channels,
+                &mut enc,
+                registry,
+                device,
+                &x_norm,
+                &weights.attn_qkv,
+                seq_len,
+                hidden_size,
+                qkv_channels,
             )?;
             let z = apply_proj(
-                &mut enc, registry, device, &x_norm,
-                &weights.attn_gate, seq_len, hidden_size, z_channels,
+                &mut enc,
+                registry,
+                device,
+                &x_norm,
+                &weights.attn_gate,
+                seq_len,
+                hidden_size,
+                z_channels,
             )?;
             enc.memory_barrier();
             // ADR-034 task #90 Step 4c (2026-05-21) — prefill ssm_conv
@@ -2632,16 +2775,32 @@ pub fn build_delta_net_layer(
             // is engaged (K=N spec-decode batched verify path).
             if let Some(conv_capture_buf) = conv_state_capture {
                 dispatch_ssm_conv_with_capture(
-                    &mut enc, registry, device.metal_device(),
-                    &qkv_raw, &weights.ssm_conv1d, conv_state_in,
-                    &qkv_conv, conv_capture_buf, &ssm_params_buf, ssm_conv_params,
-                ).context("dispatch_ssm_conv_with_capture ops3 prefill (K=N spec)")?;
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &qkv_raw,
+                    &weights.ssm_conv1d,
+                    conv_state_in,
+                    &qkv_conv,
+                    conv_capture_buf,
+                    &ssm_params_buf,
+                    ssm_conv_params,
+                )
+                .context("dispatch_ssm_conv_with_capture ops3 prefill (K=N spec)")?;
             } else {
                 dispatch_ssm_conv(
-                    &mut enc, registry, device.metal_device(),
-                    &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
-                    &qkv_conv, &ssm_params_buf, ssm_conv_params,
-                ).context("dispatch_ssm_conv ops3 prefill")?;
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &qkv_raw,
+                    &weights.ssm_conv1d,
+                    conv_state_in,
+                    conv_state_out,
+                    &qkv_conv,
+                    &ssm_params_buf,
+                    ssm_conv_params,
+                )
+                .context("dispatch_ssm_conv ops3 prefill")?;
             }
             // P21 Stage 3 hypothesis test: pooled scratches (qkv_raw/qkv_conv from
             // pooled_alloc_buffer), no CPU read between this and ops5-9. Downgrade
@@ -2786,33 +2945,72 @@ pub fn build_delta_net_layer(
                 );
                 let mut enc = device.command_encoder().context("enc chunk-prep prefill")?;
                 let q_l2 = apply_l2_norm_per_head(
-                    &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+                    &mut enc,
+                    registry,
+                    device,
+                    &q_gpu,
+                    seq_len,
+                    n_k_heads,
+                    d_k,
+                    rms_norm_eps,
                 )?;
                 let k_normed = apply_l2_norm_per_head(
-                    &mut enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+                    &mut enc,
+                    registry,
+                    device,
+                    &k_gpu,
+                    seq_len,
+                    n_k_heads,
+                    d_k,
+                    rms_norm_eps,
                 )?;
                 let alpha_logit_buf = apply_proj(
-                    &mut enc, registry, device, &x_norm,
-                    &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    &weights.ssm_alpha,
+                    seq_len,
+                    hidden_size,
+                    n_v_heads,
                 )?;
                 let beta_logit_buf = apply_proj(
-                    &mut enc, registry, device, &x_norm,
-                    &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    &weights.ssm_beta,
+                    seq_len,
+                    hidden_size,
+                    n_v_heads,
                 )?;
                 enc.memory_barrier();
                 scalar_mul_f32(
-                    &mut enc, registry, device.metal_device(),
-                    &q_l2, &q_scaled, n_q_elems, q_scale_val,
-                ).context("scalar_mul_f32 q_scale chunk prefill")?;
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &q_l2,
+                    &q_scaled,
+                    n_q_elems,
+                    q_scale_val,
+                )
+                .context("scalar_mul_f32 q_scale chunk prefill")?;
                 dispatch_compute_g_beta(
-                    &mut enc, registry, device.metal_device(),
-                    &alpha_logit_buf, &beta_logit_buf,
-                    &weights.ssm_dt_bias, &weights.ssm_a,
-                    &g_buf, &beta_buf, &g_params_buf,
-                    seq_len, n_v_heads,
-                ).context("dispatch_compute_g_beta chunk prefill")?;
-                enc.commit_and_wait()
-                    .context("commit chunk-prep prefill")?;
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &alpha_logit_buf,
+                    &beta_logit_buf,
+                    &weights.ssm_dt_bias,
+                    &weights.ssm_a,
+                    &g_buf,
+                    &beta_buf,
+                    &g_params_buf,
+                    seq_len,
+                    n_v_heads,
+                )
+                .context("dispatch_compute_g_beta chunk prefill")?;
+                enc.commit_and_wait().context("commit chunk-prep prefill")?;
                 // q_scaled is the outer-scope pooled buffer (already populated
                 // by `scalar_mul_f32` above); k_normed is the local l2-norm
                 // output we just produced.
@@ -2870,17 +3068,31 @@ pub fn build_delta_net_layer(
                 .command_encoder()
                 .context("enc chunk ops8-9 prefill")?;
             dispatch_ssm_norm_gate(
-                &mut enc, registry, device.metal_device(),
-                &attn_out_buf, &weights.ssm_norm, &z,
-                &gated_buf, &op8_params,
-                rows_op8, d_v,
-            ).context("dispatch_ssm_norm_gate chunk prefill")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &attn_out_buf,
+                &weights.ssm_norm,
+                &z,
+                &gated_buf,
+                &op8_params,
+                rows_op8,
+                d_v,
+            )
+            .context("dispatch_ssm_norm_gate chunk prefill")?;
             enc.memory_barrier();
             let output = apply_proj(
-                &mut enc, registry, device, &gated_buf,
-                &weights.ssm_out, seq_len, z_channels, hidden_size,
+                &mut enc,
+                registry,
+                device,
+                &gated_buf,
+                &weights.ssm_out,
+                seq_len,
+                z_channels,
+                hidden_size,
             )?;
-            enc.commit_and_wait_labeled("layer.gdn.ops8-9").context("commit chunk ops8-9 prefill")?;
+            enc.commit_and_wait_labeled("layer.gdn.ops8-9")
+                .context("commit chunk ops8-9 prefill")?;
             output
         } else {
             // ---- AUTOREGRESSIVE PREFILL (iter-4 unchanged path) ----
@@ -2889,31 +3101,71 @@ pub fn build_delta_net_layer(
             );
             let mut enc = device.command_encoder().context("enc ops5-9 prefill")?;
             let q_l2 = apply_l2_norm_per_head(
-                &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+                &mut enc,
+                registry,
+                device,
+                &q_gpu,
+                seq_len,
+                n_k_heads,
+                d_k,
+                rms_norm_eps,
             )?;
             let k_normed = apply_l2_norm_per_head(
-                &mut enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+                &mut enc,
+                registry,
+                device,
+                &k_gpu,
+                seq_len,
+                n_k_heads,
+                d_k,
+                rms_norm_eps,
             )?;
             let alpha_logit_buf = apply_proj(
-                &mut enc, registry, device, &x_norm,
-                &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+                &mut enc,
+                registry,
+                device,
+                &x_norm,
+                &weights.ssm_alpha,
+                seq_len,
+                hidden_size,
+                n_v_heads,
             )?;
             let beta_logit_buf = apply_proj(
-                &mut enc, registry, device, &x_norm,
-                &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+                &mut enc,
+                registry,
+                device,
+                &x_norm,
+                &weights.ssm_beta,
+                seq_len,
+                hidden_size,
+                n_v_heads,
             )?;
             enc.memory_barrier();
             scalar_mul_f32(
-                &mut enc, registry, device.metal_device(),
-                &q_l2, &q_scaled, n_q_elems, q_scale_val,
-            ).context("scalar_mul_f32 q_scale prefill")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &q_l2,
+                &q_scaled,
+                n_q_elems,
+                q_scale_val,
+            )
+            .context("scalar_mul_f32 q_scale prefill")?;
             dispatch_compute_g_beta(
-                &mut enc, registry, device.metal_device(),
-                &alpha_logit_buf, &beta_logit_buf,
-                &weights.ssm_dt_bias, &weights.ssm_a,
-                &g_buf, &beta_buf, &g_params_buf,
-                seq_len, n_v_heads,
-            ).context("dispatch_compute_g_beta prefill")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &alpha_logit_buf,
+                &beta_logit_buf,
+                &weights.ssm_dt_bias,
+                &weights.ssm_a,
+                &g_buf,
+                &beta_buf,
+                &g_params_buf,
+                seq_len,
+                n_v_heads,
+            )
+            .context("dispatch_compute_g_beta prefill")?;
             enc.memory_barrier();
             // ADR-013 P21 stage-4 (2026-05-01) + ADR-015 iter59 / iter66a
             // rebase reconciliation: autoregressive prefill GDN uses the
@@ -2946,19 +3198,39 @@ pub fn build_delta_net_layer(
                 if let Some(capture_buf) = state_capture {
                     use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture;
                     dispatch_gated_delta_net_decode_with_capture(
-                        &mut enc, registry, device.metal_device(),
-                        &q_scaled, &k_normed, &v_gpu,
-                        &g_buf, &beta_buf, state_in,
-                        &attn_out_buf, state_out, &gdn_params_buf, capture_buf,
+                        &mut enc,
+                        registry,
+                        device.metal_device(),
+                        &q_scaled,
+                        &k_normed,
+                        &v_gpu,
+                        &g_buf,
+                        &beta_buf,
+                        state_in,
+                        &attn_out_buf,
+                        state_out,
+                        &gdn_params_buf,
+                        capture_buf,
                         gdn_params,
-                    ).context("dispatch_gated_delta_net_decode_with_capture prefill (K=N spec)")?;
+                    )
+                    .context("dispatch_gated_delta_net_decode_with_capture prefill (K=N spec)")?;
                 } else {
                     dispatch_gated_delta_net_decode(
-                        &mut enc, registry, device.metal_device(),
-                        &q_scaled, &k_normed, &v_gpu,
-                        &g_buf, &beta_buf, state_in,
-                        &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-                    ).context("dispatch_gated_delta_net_decode prefill")?;
+                        &mut enc,
+                        registry,
+                        device.metal_device(),
+                        &q_scaled,
+                        &k_normed,
+                        &v_gpu,
+                        &g_buf,
+                        &beta_buf,
+                        state_in,
+                        &attn_out_buf,
+                        state_out,
+                        &gdn_params_buf,
+                        gdn_params,
+                    )
+                    .context("dispatch_gated_delta_net_decode prefill")?;
                 }
             } else {
                 if state_capture.is_some() {
@@ -2970,23 +3242,46 @@ pub fn build_delta_net_layer(
                     ));
                 }
                 dispatch_gated_delta_net(
-                    &mut enc, registry, device.metal_device(),
-                    &q_scaled, &k_normed, &v_gpu,
-                    &g_buf, &beta_buf, state_in,
-                    &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-                ).context("dispatch_gated_delta_net prefill (fallback)")?;
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &q_scaled,
+                    &k_normed,
+                    &v_gpu,
+                    &g_buf,
+                    &beta_buf,
+                    state_in,
+                    &attn_out_buf,
+                    state_out,
+                    &gdn_params_buf,
+                    gdn_params,
+                )
+                .context("dispatch_gated_delta_net prefill (fallback)")?;
             }
             enc.memory_barrier();
             dispatch_ssm_norm_gate(
-                &mut enc, registry, device.metal_device(),
-                &attn_out_buf, &weights.ssm_norm, &z,
-                &gated_buf, &op8_params,
-                rows_op8, d_v,
-            ).context("dispatch_ssm_norm_gate prefill")?;
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &attn_out_buf,
+                &weights.ssm_norm,
+                &z,
+                &gated_buf,
+                &op8_params,
+                rows_op8,
+                d_v,
+            )
+            .context("dispatch_ssm_norm_gate prefill")?;
             enc.memory_barrier();
             let output = apply_proj(
-                &mut enc, registry, device, &gated_buf,
-                &weights.ssm_out, seq_len, z_channels, hidden_size,
+                &mut enc,
+                registry,
+                device,
+                &gated_buf,
+                &weights.ssm_out,
+                seq_len,
+                z_channels,
+                hidden_size,
             )?;
             // P21 Stage 3 hypothesis test: pooled scratches throughout ops5-9, no CPU read.
             // Output is fed into next encoder (FFN) on same Metal serial queue.
@@ -3805,7 +4100,10 @@ pub fn build_delta_net_layer_decode_into(
     // pre-A2b-cont. Pinned by H137-H143.
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
-    debug_assert_eq!(seq_len, 1, "build_delta_net_layer_decode_into: seq_len must be 1");
+    debug_assert_eq!(
+        seq_len, 1,
+        "build_delta_net_layer_decode_into: seq_len must be 1"
+    );
 
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
@@ -3871,19 +4169,24 @@ pub fn build_delta_net_layer_decode_into(
 
     // ---- Pool-allocated scratch buffers (same layout as legacy decode) ----
     let qkv_conv = super::decode_pool::pooled_alloc_buffer(
-            device,
-            (seq_len * qkv_channels) as usize * 4,
-            DType::F32,
-            vec![seq_len as usize, qkv_ch],
-        )
-        .map_err(|e| anyhow!("alloc qkv_conv (decode_into): {e}"))?;
-    let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 4 * 4, DType::U32, vec![4])
-        .map_err(|e| anyhow!("alloc ssm params (decode_into): {e}"))?;
+        device,
+        (seq_len * qkv_channels) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, qkv_ch],
+    )
+    .map_err(|e| anyhow!("alloc qkv_conv (decode_into): {e}"))?;
+    let mut ssm_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 4 * 4, DType::U32, vec![4])
+            .map_err(|e| anyhow!("alloc ssm params (decode_into): {e}"))?;
     {
         // ADR-040 §6.1.40 per-slot per-step dispatch.
-        let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
-        s[0] = qkv_channels; s[1] = seq_len; s[2] = FORWARD_DISPATCH_N_SEQS; s[3] = k_width;
+        let s = ssm_params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
+        s[0] = qkv_channels;
+        s[1] = seq_len;
+        s[2] = FORWARD_DISPATCH_N_SEQS;
+        s[3] = k_width;
     }
     let ssm_conv_params = SsmConvParams {
         channels: qkv_channels,
@@ -3891,26 +4194,29 @@ pub fn build_delta_net_layer_decode_into(
         n_seqs: FORWARD_DISPATCH_N_SEQS,
         k_width,
     };
-    let q_scaled = super::decode_pool::pooled_alloc_buffer(
-            device, n_q_elems * 4, DType::F32, vec![n_q_elems])
-        .map_err(|e| anyhow!("alloc q_scaled (decode_into): {e}"))?;
-    let g_buf = super::decode_pool::pooled_alloc_buffer(
-            device, g_n * 4, DType::F32, vec![g_n])
+    let q_scaled =
+        super::decode_pool::pooled_alloc_buffer(device, n_q_elems * 4, DType::F32, vec![n_q_elems])
+            .map_err(|e| anyhow!("alloc q_scaled (decode_into): {e}"))?;
+    let g_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
         .map_err(|e| anyhow!("alloc g_buf (decode_into): {e}"))?;
-    let beta_buf = super::decode_pool::pooled_alloc_buffer(
-            device, g_n * 4, DType::F32, vec![g_n])
+    let beta_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
         .map_err(|e| anyhow!("alloc beta_buf (decode_into): {e}"))?;
-    let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 8, DType::U32, vec![2])
+    let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(device, 8, DType::U32, vec![2])
         .map_err(|e| anyhow!("alloc g_params (decode_into): {e}"))?;
     {
-        let s = g_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        let s = g_params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = n_v_heads;
         s[1] = seq_len;
     }
     let gated_buf = super::decode_pool::pooled_alloc_buffer(
-            device, gated_elems * 4, DType::F32, vec![gated_elems])
-        .map_err(|e| anyhow!("alloc op8 gated (decode_into): {e}"))?;
+        device,
+        gated_elems * 4,
+        DType::F32,
+        vec![gated_elems],
+    )
+    .map_err(|e| anyhow!("alloc op8 gated (decode_into): {e}"))?;
     // ADR-015 iter14: same lift as `build_delta_net_layer` decode arm —
     // mlx-native's `build_*_params` allocators hand out `device.alloc_buffer`
     // results that drop ARC at function return; under unretained refs the
@@ -3919,23 +4225,32 @@ pub fn build_delta_net_layer_decode_into(
     let mut op8_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc op8 params (decode_into, pooled): {e}"))?;
     {
-        let s = op8_params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        let s = op8_params
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = rms_norm_eps;
         s[1] = d_v as f32;
     }
-    let attn_out_buf = super::decode_pool::pooled_alloc_buffer(
-            device, out_elems * 4, DType::F32, vec![out_elems])
-        .map_err(|e| anyhow!("alloc gdn output (decode_into): {e}"))?;
+    let attn_out_buf =
+        super::decode_pool::pooled_alloc_buffer(device, out_elems * 4, DType::F32, vec![out_elems])
+            .map_err(|e| anyhow!("alloc gdn output (decode_into): {e}"))?;
     let gdn_params = GatedDeltaNetParams {
-        d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
+        d_k,
+        d_v,
+        n_k_heads,
+        n_v_heads,
+        n_tokens: seq_len,
+        n_seqs,
     };
     // 9 u32 per the mlx-native ADR-033 §Pi iter-25 params contract
     // (index 8 = q_scale_bits; 0 = legacy contract, caller pre-scales q).
-    let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 9 * 4, DType::U32, vec![9])
-        .map_err(|e| anyhow!("alloc gdn params (decode_into, pooled): {e}"))?;
+    let mut gdn_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 9 * 4, DType::U32, vec![9])
+            .map_err(|e| anyhow!("alloc gdn params (decode_into, pooled): {e}"))?;
     {
-        let s = gdn_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        let s = gdn_params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
         s[0] = gdn_params.d_k;
         s[1] = gdn_params.d_v;
         s[2] = gdn_params.n_k_heads;
@@ -3954,63 +4269,129 @@ pub fn build_delta_net_layer_decode_into(
 
     // ---- Op 1: pre_norm ----
     let x_norm = apply_pre_norm(
-        enc, registry, device, x, &weights.attn_norm,
-        seq_len, hidden_size, rms_norm_eps,
+        enc,
+        registry,
+        device,
+        x,
+        &weights.attn_norm,
+        seq_len,
+        hidden_size,
+        rms_norm_eps,
     )?;
     // Barrier preserved at legacy gpu_delta_net.rs:899 position.
     enc.memory_barrier();
 
     // ---- Ops 2a+2b+2c: qkv_proj, z_proj (concurrent) ----
     let qkv_raw = apply_proj(
-        enc, registry, device, &x_norm,
-        &weights.attn_qkv, seq_len, hidden_size, qkv_channels,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.attn_qkv,
+        seq_len,
+        hidden_size,
+        qkv_channels,
     )?;
     let z = apply_proj(
-        enc, registry, device, &x_norm,
-        &weights.attn_gate, seq_len, hidden_size, z_channels,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.attn_gate,
+        seq_len,
+        hidden_size,
+        z_channels,
     )?;
     // Barrier preserved at legacy gpu_delta_net.rs:909 position.
     enc.memory_barrier();
 
     // ---- Op 3: ssm_conv ----
     dispatch_ssm_conv(
-        enc, registry, device.metal_device(),
-        &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
-        &qkv_conv, &ssm_params_buf, ssm_conv_params,
-    ).context("dispatch_ssm_conv ops3 (decode_into)")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &qkv_raw,
+        &weights.ssm_conv1d,
+        conv_state_in,
+        conv_state_out,
+        &qkv_conv,
+        &ssm_params_buf,
+        ssm_conv_params,
+    )
+    .context("dispatch_ssm_conv ops3 (decode_into)")?;
     // Barrier preserved at legacy gpu_delta_net.rs:916 position.
     enc.memory_barrier();
 
     // ---- Ops 5+6a+6b: l2_norm_q, l2_norm_k, alpha, beta (concurrent) ----
     let q_l2 = apply_l2_norm_per_head(
-        enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+        enc,
+        registry,
+        device,
+        &q_gpu,
+        seq_len,
+        n_k_heads,
+        d_k,
+        rms_norm_eps,
     )?;
     let k_normed = apply_l2_norm_per_head(
-        enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+        enc,
+        registry,
+        device,
+        &k_gpu,
+        seq_len,
+        n_k_heads,
+        d_k,
+        rms_norm_eps,
     )?;
     let alpha_logit_buf = apply_proj(
-        enc, registry, device, &x_norm,
-        &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.ssm_alpha,
+        seq_len,
+        hidden_size,
+        n_v_heads,
     )?;
     let beta_logit_buf = apply_proj(
-        enc, registry, device, &x_norm,
-        &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.ssm_beta,
+        seq_len,
+        hidden_size,
+        n_v_heads,
     )?;
     // Barrier preserved at legacy gpu_delta_net.rs:932 position.
     enc.memory_barrier();
 
     // ---- q_scale + g_beta ----
     scalar_mul_f32(
-        enc, registry, device.metal_device(),
-        &q_l2, &q_scaled, n_q_elems, q_scale_val,
-    ).context("scalar_mul_f32 q_scale (decode_into)")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &q_l2,
+        &q_scaled,
+        n_q_elems,
+        q_scale_val,
+    )
+    .context("scalar_mul_f32 q_scale (decode_into)")?;
     dispatch_compute_g_beta(
-        enc, registry, device.metal_device(),
-        &alpha_logit_buf, &beta_logit_buf,
-        &weights.ssm_dt_bias, &weights.ssm_a,
-        &g_buf, &beta_buf, &g_params_buf,
-        seq_len, n_v_heads,
-    ).context("dispatch_compute_g_beta (decode_into)")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &alpha_logit_buf,
+        &beta_logit_buf,
+        &weights.ssm_dt_bias,
+        &weights.ssm_a,
+        &g_buf,
+        &beta_buf,
+        &g_params_buf,
+        seq_len,
+        n_v_heads,
+    )
+    .context("dispatch_compute_g_beta (decode_into)")?;
     // Barrier preserved at legacy gpu_delta_net.rs:945 position.
     enc.memory_barrier();
 
@@ -4023,28 +4404,51 @@ pub fn build_delta_net_layer_decode_into(
     // q4_0-flat 4-prompt × 32-token greedy generation) but without the
     // threadgroup_barrier+shared-memory stalls of the 128-thread variant.
     dispatch_gated_delta_net_decode(
-        enc, registry, device.metal_device(),
-        &q_scaled, &k_normed, &v_gpu,
-        &g_buf, &beta_buf, state_in,
-        &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-    ).context("dispatch_gated_delta_net_decode (decode_into)")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &q_scaled,
+        &k_normed,
+        &v_gpu,
+        &g_buf,
+        &beta_buf,
+        state_in,
+        &attn_out_buf,
+        state_out,
+        &gdn_params_buf,
+        gdn_params,
+    )
+    .context("dispatch_gated_delta_net_decode (decode_into)")?;
     // Barrier preserved at legacy gpu_delta_net.rs:953 position.
     enc.memory_barrier();
 
     // ---- Op 8: ssm_norm_gate ----
     dispatch_ssm_norm_gate(
-        enc, registry, device.metal_device(),
-        &attn_out_buf, &weights.ssm_norm, &z,
-        &gated_buf, &op8_params,
-        rows_op8, d_v,
-    ).context("dispatch_ssm_norm_gate (decode_into)")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &attn_out_buf,
+        &weights.ssm_norm,
+        &z,
+        &gated_buf,
+        &op8_params,
+        rows_op8,
+        d_v,
+    )
+    .context("dispatch_ssm_norm_gate (decode_into)")?;
     // Barrier preserved at legacy gpu_delta_net.rs:961 position.
     enc.memory_barrier();
 
     // ---- Op 9: out_proj ----
     let output = apply_proj(
-        enc, registry, device, &gated_buf,
-        &weights.ssm_out, seq_len, z_channels, hidden_size,
+        enc,
+        registry,
+        device,
+        &gated_buf,
+        &weights.ssm_out,
+        seq_len,
+        z_channels,
+        hidden_size,
     )?;
 
     // No commit here — the caller owns the shared encoder.
@@ -4057,10 +4461,10 @@ pub fn build_delta_net_layer_decode_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::delta_net::{
         delta_net_layer_cpu_ref, DeltaNetLayerShape, DeltaNetLayerWeights,
     };
+    use super::*;
 
     fn mk_rand(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
         (0..n)
@@ -4155,13 +4559,8 @@ mod tests {
         let conv_state = vec![0.0f32; km1 * qkv_channels];
 
         // CPU reference (authoritative).
-        let (cpu_out, _, _) = delta_net_layer_cpu_ref(
-            &x_cpu,
-            &weights_cpu,
-            shape,
-            &state_in,
-            &conv_state,
-        );
+        let (cpu_out, _, _) =
+            delta_net_layer_cpu_ref(&x_cpu, &weights_cpu, shape, &state_in, &conv_state);
         assert!(cpu_out.iter().all(|v| v.is_finite()), "CPU ref non-finite");
         assert_eq!(cpu_out.len(), seq * h);
 
@@ -4202,8 +4601,8 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
-            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            None,      // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None,      // ADR-034 task #90 Step 4c — conv capture (test: no capture)
             SlotId(0), // ADR-040 §6.1.40 A2b-cont — single-seq test (SlotId(0)).
         )
         .expect("build_delta_net_layer");
@@ -4267,7 +4666,10 @@ mod tests {
             max_err < Q4_0_PARITY_TOLERANCE,
             "DeltaNet GPU parity FAIL: max_abs_err={:.2e} (> {:.2e} \
              Q4_0 budget), n_fail={}/{}",
-            max_err, Q4_0_PARITY_TOLERANCE, n_fail, gpu_out.len()
+            max_err,
+            Q4_0_PARITY_TOLERANCE,
+            n_fail,
+            gpu_out.len()
         );
 
         eprintln!(
@@ -4322,13 +4724,8 @@ mod tests {
             .collect();
 
         // CPU reference (authoritative).
-        let (cpu_out, _, _) = delta_net_layer_cpu_ref(
-            &x_cpu,
-            &weights_cpu,
-            shape,
-            &state_in,
-            &conv_state,
-        );
+        let (cpu_out, _, _) =
+            delta_net_layer_cpu_ref(&x_cpu, &weights_cpu, shape, &state_in, &conv_state);
         assert!(cpu_out.iter().all(|v| v.is_finite()), "CPU ref non-finite");
         assert_eq!(cpu_out.len(), seq * h);
 
@@ -4363,8 +4760,8 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
-            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            None,      // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None,      // ADR-034 task #90 Step 4c — conv capture (test: no capture)
             SlotId(0), // ADR-040 §6.1.40 A2b-cont — single-seq test (SlotId(0)).
         )
         .expect("build_delta_net_layer");
@@ -4423,7 +4820,10 @@ mod tests {
              build_delta_net_layer's prefill path setup at seq_len>1 + \
              non-zero state_in.  Per iter-273 test plan, bisect within \
              op1 (norm), op2 (qkv proj), op3 (ssm_conv), op5+ chain.",
-            max_err, Q4_0_PARITY_TOLERANCE, n_fail, gpu_out.len()
+            max_err,
+            Q4_0_PARITY_TOLERANCE,
+            n_fail,
+            gpu_out.len()
         );
     }
 
@@ -4473,18 +4873,20 @@ mod tests {
 
         // CPU reference for both paths (authoritative).
         // Path A: seq=1+1 sequential.
-        let (cpu_out_a1, cpu_state_a1, cpu_conv_a1) = delta_net_layer_cpu_ref(
-            &x_cpu[0..h], &weights_cpu, shape, &state_in0, &conv_state0,
-        );
+        let (cpu_out_a1, cpu_state_a1, cpu_conv_a1) =
+            delta_net_layer_cpu_ref(&x_cpu[0..h], &weights_cpu, shape, &state_in0, &conv_state0);
         let (cpu_out_a2, cpu_state_a2, cpu_conv_a2) = delta_net_layer_cpu_ref(
-            &x_cpu[h..2 * h], &weights_cpu, shape, &cpu_state_a1, &cpu_conv_a1,
+            &x_cpu[h..2 * h],
+            &weights_cpu,
+            shape,
+            &cpu_state_a1,
+            &cpu_conv_a1,
         );
         let mut cpu_seq_concat = cpu_out_a1.clone();
         cpu_seq_concat.extend_from_slice(&cpu_out_a2);
         // Path B: seq=2 batched.
-        let (cpu_out_b, cpu_state_b, cpu_conv_b) = delta_net_layer_cpu_ref(
-            &x_cpu, &weights_cpu, shape, &state_in0, &conv_state0,
-        );
+        let (cpu_out_b, cpu_state_b, cpu_conv_b) =
+            delta_net_layer_cpu_ref(&x_cpu, &weights_cpu, shape, &state_in0, &conv_state0);
         // CPU sanity: recurrence is associative — seq=1+1 must equal seq=2.
         let cpu_max_diff = cpu_seq_concat
             .iter()
@@ -4513,36 +4915,61 @@ mod tests {
 
         // GPU path B: seq=2 batched.
         let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
-            &weights_cpu, &device, shape.conv_kernel as usize, qkv_channels,
-        ).expect("from_cpu_f32");
+            &weights_cpu,
+            &device,
+            shape.conv_kernel as usize,
+            qkv_channels,
+        )
+        .expect("from_cpu_f32");
         let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
         let state_in_gpu = upload_f32(&state_in0, &device).expect("upload state_in");
         let state_out_gpu = upload_f32(&state_in0, &device).expect("alloc state_out");
         let conv_in_gpu = upload_f32(&conv_state0, &device).expect("upload conv");
         let conv_out_gpu = upload_f32(&conv_state0, &device).expect("alloc conv_out");
         let gpu_out_b_buf = build_delta_net_layer(
-            &device, &mut registry, &x_gpu, &gpu_weights,
-            &conv_in_gpu, &conv_out_gpu, &state_in_gpu, &state_out_gpu,
-            2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
-            shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
-            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            &device,
+            &mut registry,
+            &x_gpu,
+            &gpu_weights,
+            &conv_in_gpu,
+            &conv_out_gpu,
+            &state_in_gpu,
+            &state_out_gpu,
+            2,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+            None,      // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None,      // ADR-034 task #90 Step 4c — conv capture (test: no capture)
             SlotId(0), // ADR-040 §6.1.40 A2b-cont
-        ).expect("build_delta_net_layer seq=2");
-        device.command_encoder().expect("sync").commit_and_wait().expect("wait");
+        )
+        .expect("build_delta_net_layer seq=2");
+        device
+            .command_encoder()
+            .expect("sync")
+            .commit_and_wait()
+            .expect("wait");
         let gpu_out_b = download_f32(&gpu_out_b_buf).expect("download");
 
         // Compare GPU seq=2 to CPU seq=2.
         const Q4_0_TOL: f32 = 5e-2;
-        let max_err_b = gpu_out_b.iter().zip(cpu_out_b.iter())
-            .map(|(&g, &c)| (g - c).abs()).fold(0.0f32, f32::max);
+        let max_err_b = gpu_out_b
+            .iter()
+            .zip(cpu_out_b.iter())
+            .map(|(&g, &c)| (g - c).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             max_err_b < Q4_0_TOL,
             "GPU seq=2 vs CPU seq=2 PARITY FAIL: max_err={:.2e} > {:.2e}. \
              This indicates DeltaNet GPU+seq=2 is BROKEN at the layer level. \
              (Should match iter-273 result; if iter-273 passed and this fails, \
              investigate weight upload differences.)",
-            max_err_b, Q4_0_TOL
+            max_err_b,
+            Q4_0_TOL
         );
 
         eprintln!(
@@ -4662,7 +5089,10 @@ mod tests {
         // noise (~1e-2 per projection; the ping-pong correctness check below
         // tolerates only 1e-3).  See `from_cpu_f32` docstring.
         let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
-            &weights_cpu, &device, shape.conv_kernel as usize, qkv_channels,
+            &weights_cpu,
+            &device,
+            shape.conv_kernel as usize,
+            qkv_channels,
         )
         .expect("from_cpu_f32");
 
@@ -4689,15 +5119,27 @@ mod tests {
         let conv_zeros_gpu_mono = upload_f32(&conv_zeros, &device).expect("upload conv mono in");
         let conv_scratch_mono = upload_f32(&conv_zeros, &device).expect("alloc conv mono out");
         let mono_buf = build_delta_net_layer(
-            &device, &mut registry, &x_full_gpu, &gpu_weights,
-            &conv_zeros_gpu_mono, &conv_scratch_mono,
-            &state_zeros_gpu, &state_scratch_mono,
-            2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
-            shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
-            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            &device,
+            &mut registry,
+            &x_full_gpu,
+            &gpu_weights,
+            &conv_zeros_gpu_mono,
+            &conv_scratch_mono,
+            &state_zeros_gpu,
+            &state_scratch_mono,
+            2,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+            None,      // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None,      // ADR-034 task #90 Step 4c — conv capture (test: no capture)
             SlotId(0), // ADR-040 §6.1.40 A2b-cont
-        ).expect("mono");
+        )
+        .expect("mono");
         flush(&device);
         let mono_out = download_f32(&mono_buf).expect("dl mono");
 
@@ -4713,15 +5155,27 @@ mod tests {
         let conv_t0_in = upload_f32(&conv_zeros, &device).expect("upload conv t0 in");
         let conv_t0_out = upload_f32(&conv_zeros, &device).expect("alloc conv t0 out");
         let t0_buf = build_delta_net_layer(
-            &device, &mut registry, &x_t0_gpu, &gpu_weights,
-            &conv_t0_in, &conv_t0_out,
-            &state_t0_in, &state_t0_out,
-            1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
-            shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
-            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            &device,
+            &mut registry,
+            &x_t0_gpu,
+            &gpu_weights,
+            &conv_t0_in,
+            &conv_t0_out,
+            &state_t0_in,
+            &state_t0_out,
+            1,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+            None,      // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None,      // ADR-034 task #90 Step 4c — conv capture (test: no capture)
             SlotId(0), // ADR-040 §6.1.40 A2b-cont
-        ).expect("chunk t0");
+        )
+        .expect("chunk t0");
         // Required: decode path commit() without wait — flush before reading.
         flush(&device);
         let t0_out = download_f32(&t0_buf).expect("dl t0");
@@ -4732,15 +5186,27 @@ mod tests {
         let state_t1_out = upload_f32(&state_zeros, &device).expect("alloc state t1 out");
         let conv_t1_out = upload_f32(&conv_zeros, &device).expect("alloc conv t1 out");
         let t1_buf = build_delta_net_layer(
-            &device, &mut registry, &x_t1_gpu, &gpu_weights,
-            &conv_t0_out, &conv_t1_out,
-            &state_t0_out, &state_t1_out,
-            1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
-            shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
-            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            &device,
+            &mut registry,
+            &x_t1_gpu,
+            &gpu_weights,
+            &conv_t0_out,
+            &conv_t1_out,
+            &state_t0_out,
+            &state_t1_out,
+            1,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+            None,      // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None,      // ADR-034 task #90 Step 4c — conv capture (test: no capture)
             SlotId(0), // ADR-040 §6.1.40 A2b-cont
-        ).expect("chunk t1");
+        )
+        .expect("chunk t1");
         flush(&device);
         let t1_out = download_f32(&t1_buf).expect("dl t1");
 
@@ -4750,7 +5216,9 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "t0 mismatch[{i}]: mono={:.6}, chunk={:.6}, diff={:.2e}",
-                mono_out[i], t0_out[i], diff
+                mono_out[i],
+                t0_out[i],
+                diff
             );
         }
         // Token 1 outputs must match.
@@ -4759,7 +5227,9 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "t1 mismatch[{i}]: mono={:.6}, chunk={:.6}, diff={:.2e}",
-                mono_out[h + i], t1_out[i], diff
+                mono_out[h + i],
+                t1_out[i],
+                diff
             );
         }
 
@@ -4994,12 +5464,7 @@ mod tests {
             "chunk_path_full_buffer_matches_autoregressive_at_seq128: \
              max_diff={:.4e} at (t={}, h={}, v={}), tol={:.0e}, \
              total_elements_compared={}",
-            max_diff,
-            argmax_t,
-            argmax_h,
-            argmax_v,
-            FIRST_TOKEN_TOL,
-            n_out
+            max_diff, argmax_t, argmax_h, argmax_v, FIRST_TOKEN_TOL, n_out
         );
 
         assert!(
@@ -5357,18 +5822,11 @@ mod tests {
             &device, seq_len, n_v_heads, d_k, d_v,
         )
         .expect("ChunkAllocsArena::new (ia)");
-        let mut internal_arena =
-            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena::new(
-                &device,
-                /* b  */ 1,
-                /* t  */ seq_len,
-                /* hg */ n_v_heads,
-                /* h  */ n_v_heads,
-                /* k  */ d_k,
-                /* v  */ d_v,
-                /* bt */ 64,
-            )
-            .expect("ChunkInternalArena::new");
+        let mut internal_arena = mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena::new(
+            &device, /* b  */ 1, /* t  */ seq_len, /* hg */ n_v_heads,
+            /* h  */ n_v_heads, /* k  */ d_k, /* v  */ d_v, /* bt */ 64,
+        )
+        .expect("ChunkInternalArena::new");
         apply_gated_delta_net_chunk_with_arena(
             &device,
             &mut registry,
@@ -5729,8 +6187,19 @@ mod tests {
         let b_a = upload_f32(&beta_cpu, &device).expect("upload");
         let s_a = upload_f32(&state_zeros, &device).expect("upload");
         let (auto_out, _) = apply_gated_delta_net(
-            &device, &mut registry, &q_a, &k_a, &v_a, &g_a, &b_a, &s_a,
-            seq_len, n_k_heads, n_v_heads, d_k, d_v,
+            &device,
+            &mut registry,
+            &q_a,
+            &k_a,
+            &v_a,
+            &g_a,
+            &b_a,
+            &s_a,
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
         )
         .expect("auto");
         let auto_cpu = download_f32(&auto_out).expect("dl auto");
@@ -5751,13 +6220,26 @@ mod tests {
             .alloc_buffer(n_state * 4, DType::F32, vec![n_state])
             .expect("alloc chunk_state");
         apply_gated_delta_net_chunk(
-            &device, &mut registry, &q_c, &k_c, &v_c, &g_c, &b_c, &s_c,
-            &chunk_out, &chunk_state,
-            seq_len, n_k_heads, n_v_heads, d_k, d_v, false,
+            &device,
+            &mut registry,
+            &q_c,
+            &k_c,
+            &v_c,
+            &g_c,
+            &b_c,
+            &s_c,
+            &chunk_out,
+            &chunk_state,
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            false,
         )
         .expect("chunk");
         let _ = &chunk_state; // keep-alive (wrapper writes via &MlxBuffer)
-        // iter58b: wrapper commits without waiting; sync queue before CPU read.
+                              // iter58b: wrapper commits without waiting; sync queue before CPU read.
         device
             .command_encoder()
             .expect("sync enc")
@@ -5767,13 +6249,31 @@ mod tests {
 
         // CPU reference (post-decay-err — llama.cpp / FLA fused_recurrent form).
         let cpu_post = cpu_ref_recurrence(
-            &q_cpu, &k_cpu, &v_cpu, &g_cpu, &beta_cpu, &state_zeros,
-            seq_len, n_k_heads, n_v_heads, d_k, d_v,
+            &q_cpu,
+            &k_cpu,
+            &v_cpu,
+            &g_cpu,
+            &beta_cpu,
+            &state_zeros,
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
         );
         // CPU reference (pre-decay-err — FLA chunk_gated_delta_rule_fwd_oracle form).
         let cpu_pre = cpu_ref_recurrence_pre_decay(
-            &q_cpu, &k_cpu, &v_cpu, &g_cpu, &beta_cpu, &state_zeros,
-            seq_len, n_k_heads, n_v_heads, d_k, d_v,
+            &q_cpu,
+            &k_cpu,
+            &v_cpu,
+            &g_cpu,
+            &beta_cpu,
+            &state_zeros,
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
         );
 
         let mut max_ac: f32 = 0.0;
@@ -5817,10 +6317,22 @@ mod tests {
              max|auto|={:.4e}  max|chunk|={:.4e}  \
              rel_drift={:.4e}  rms_drift={:.4e}  rms_auto={:.4e}  \
              argmax(t={},h={},v={})  auto_at={:.6}  chunk_at={:.6}",
-            seq_len, max_ac, max_a_cpost, max_c_cpost, max_a_cpre, max_c_cpre,
-            max_abs_auto, max_abs_chunk, max_c_cpost / max_abs_auto.max(1e-9),
-            rms_diff, rms_auto, argmax_t, argmax_h, argmax_v,
-            auto_cpu[argmax_idx], chunk_cpu[argmax_idx]
+            seq_len,
+            max_ac,
+            max_a_cpost,
+            max_c_cpost,
+            max_a_cpre,
+            max_c_cpre,
+            max_abs_auto,
+            max_abs_chunk,
+            max_c_cpost / max_abs_auto.max(1e-9),
+            rms_diff,
+            rms_auto,
+            argmax_t,
+            argmax_h,
+            argmax_v,
+            auto_cpu[argmax_idx],
+            chunk_cpu[argmax_idx]
         );
         (max_ac, max_a_cpost, max_c_cpost, max_a_cpre, max_c_cpre)
     }
@@ -5963,7 +6475,9 @@ mod tests {
         // Flush before download (mirrors pattern at gpu_state_propagation_*).
         {
             let mut flush_enc = device.command_encoder().expect("flush prod");
-            flush_enc.commit_and_wait().expect("flush commit_and_wait prod");
+            flush_enc
+                .commit_and_wait()
+                .expect("flush commit_and_wait prod");
         }
         let prod_out = download_f32(&prod_out_buf).expect("download prod");
 
@@ -6001,7 +6515,10 @@ mod tests {
 
         // Populate small param buffers (verbatim).
         {
-            let s = arena_ref.ssm_params_buf.as_mut_slice::<u32>().expect("ssm_params");
+            let s = arena_ref
+                .ssm_params_buf
+                .as_mut_slice::<u32>()
+                .expect("ssm_params");
             s[0] = qkv_channels;
             s[1] = seq_len;
             // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
@@ -6010,12 +6527,18 @@ mod tests {
             s[3] = shape.conv_kernel;
         }
         {
-            let s = arena_ref.g_params_buf.as_mut_slice::<u32>().expect("g_params");
+            let s = arena_ref
+                .g_params_buf
+                .as_mut_slice::<u32>()
+                .expect("g_params");
             s[0] = shape.n_v_heads;
             s[1] = seq_len;
         }
         {
-            let s = arena_ref.op8_params_buf.as_mut_slice::<f32>().expect("op8_params");
+            let s = arena_ref
+                .op8_params_buf
+                .as_mut_slice::<f32>()
+                .expect("op8_params");
             s[0] = shape.rms_norm_eps;
             s[1] = shape.d_v as f32;
         }
@@ -6030,7 +6553,10 @@ mod tests {
             n_seqs: FORWARD_DISPATCH_N_SEQS,
         };
         {
-            let s = arena_ref.gdn_params_buf.as_mut_slice::<u32>().expect("gdn_params");
+            let s = arena_ref
+                .gdn_params_buf
+                .as_mut_slice::<u32>()
+                .expect("gdn_params");
             s[0] = gdn_params.d_k;
             s[1] = gdn_params.d_v;
             s[2] = gdn_params.n_k_heads;
@@ -6052,36 +6578,59 @@ mod tests {
 
         // ---- pre-iter89e2-I: separate ops1-3 CB ----
         {
-            let mut enc = device
-                .command_encoder()
-                .expect("ref enc ops1-3");
+            let mut enc = device.command_encoder().expect("ref enc ops1-3");
             apply_pre_norm_into(
-                &mut enc, &mut registry, &device,
-                &x_ref, &gpu_weights.attn_norm,
-                &arena_ref.x_norm_buf, &mut arena_ref.pre_norm_params_buf,
-                seq_len, shape.hidden_size, shape.rms_norm_eps,
-            ).expect("ref pre_norm");
+                &mut enc,
+                &mut registry,
+                &device,
+                &x_ref,
+                &gpu_weights.attn_norm,
+                &arena_ref.x_norm_buf,
+                &mut arena_ref.pre_norm_params_buf,
+                seq_len,
+                shape.hidden_size,
+                shape.rms_norm_eps,
+            )
+            .expect("ref pre_norm");
             enc.memory_barrier();
             apply_proj_into(
-                &mut enc, &mut registry, &device,
-                &arena_ref.x_norm_buf, &gpu_weights.attn_qkv,
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.x_norm_buf,
+                &gpu_weights.attn_qkv,
                 &mut arena_ref.qkv_raw_buf,
-                seq_len, shape.hidden_size, qkv_channels,
-            ).expect("ref proj_qkv");
+                seq_len,
+                shape.hidden_size,
+                qkv_channels,
+            )
+            .expect("ref proj_qkv");
             apply_proj_into(
-                &mut enc, &mut registry, &device,
-                &arena_ref.x_norm_buf, &gpu_weights.attn_gate,
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.x_norm_buf,
+                &gpu_weights.attn_gate,
                 &mut arena_ref.z_buf,
-                seq_len, shape.hidden_size, z_channels,
-            ).expect("ref proj_z");
+                seq_len,
+                shape.hidden_size,
+                z_channels,
+            )
+            .expect("ref proj_z");
             enc.memory_barrier();
             dispatch_ssm_conv(
-                &mut enc, &mut registry, device.metal_device(),
-                &arena_ref.qkv_raw_buf, &gpu_weights.ssm_conv1d,
-                &conv_in_ref, &conv_out_ref,
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &arena_ref.qkv_raw_buf,
+                &gpu_weights.ssm_conv1d,
+                &conv_in_ref,
+                &conv_out_ref,
                 &arena_ref.qkv_conv_buf,
-                &arena_ref.ssm_params_buf, ssm_conv_params,
-            ).expect("ref ssm_conv");
+                &arena_ref.ssm_params_buf,
+                ssm_conv_params,
+            )
+            .expect("ref ssm_conv");
             enc.commit_labeled("ref.layer.gdn.ops1-3");
         }
 
@@ -6093,90 +6642,152 @@ mod tests {
                 k_sp: k_sp as u32,
                 v_sp: v_sp as u32,
             };
-            let mut enc = device
-                .command_encoder()
-                .expect("ref enc qkv_split");
+            let mut enc = device.command_encoder().expect("ref enc qkv_split");
             dispatch_qkv_split_f32(
-                &mut enc, &mut registry, device.metal_device(),
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
                 &arena_ref.qkv_conv_buf,
                 &arena_ref.q_split_buf,
                 &arena_ref.k_split_buf,
                 &arena_ref.v_split_buf,
                 &params,
-            ).expect("ref qkv_split");
+            )
+            .expect("ref qkv_split");
             enc.commit_labeled("ref.layer.gdn.qkv_split");
         }
 
         // ---- autoreg ops5-9: same as production (verbatim) ----
         let ref_out_buf = {
-            let mut enc = device
-                .command_encoder()
-                .expect("ref enc ops5-9");
+            let mut enc = device.command_encoder().expect("ref enc ops5-9");
             apply_l2_norm_per_head_into(
-                &mut enc, &mut registry, &device,
-                &arena_ref.q_split_buf, &arena_ref.q_l2_buf,
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.q_split_buf,
+                &arena_ref.q_l2_buf,
                 &mut arena_ref.l2_params_q_buf,
-                seq_len, shape.n_k_heads, shape.d_k, shape.rms_norm_eps,
-            ).expect("ref l2_q");
+                seq_len,
+                shape.n_k_heads,
+                shape.d_k,
+                shape.rms_norm_eps,
+            )
+            .expect("ref l2_q");
             apply_l2_norm_per_head_into(
-                &mut enc, &mut registry, &device,
-                &arena_ref.k_split_buf, &arena_ref.k_normed_buf,
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.k_split_buf,
+                &arena_ref.k_normed_buf,
                 &mut arena_ref.l2_params_k_buf,
-                seq_len, shape.n_k_heads, shape.d_k, shape.rms_norm_eps,
-            ).expect("ref l2_k");
+                seq_len,
+                shape.n_k_heads,
+                shape.d_k,
+                shape.rms_norm_eps,
+            )
+            .expect("ref l2_k");
             apply_proj_into(
-                &mut enc, &mut registry, &device,
-                &arena_ref.x_norm_buf, &gpu_weights.ssm_alpha,
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.x_norm_buf,
+                &gpu_weights.ssm_alpha,
                 &mut arena_ref.alpha_logit_buf,
-                seq_len, shape.hidden_size, shape.n_v_heads,
-            ).expect("ref alpha");
+                seq_len,
+                shape.hidden_size,
+                shape.n_v_heads,
+            )
+            .expect("ref alpha");
             apply_proj_into(
-                &mut enc, &mut registry, &device,
-                &arena_ref.x_norm_buf, &gpu_weights.ssm_beta,
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.x_norm_buf,
+                &gpu_weights.ssm_beta,
                 &mut arena_ref.beta_logit_buf,
-                seq_len, shape.hidden_size, shape.n_v_heads,
-            ).expect("ref beta");
+                seq_len,
+                shape.hidden_size,
+                shape.n_v_heads,
+            )
+            .expect("ref beta");
             enc.memory_barrier();
             scalar_mul_f32(
-                &mut enc, &mut registry, device.metal_device(),
-                &arena_ref.q_l2_buf, &arena_ref.q_scaled_buf,
-                n_q_elems, q_scale_val,
-            ).expect("ref scalar_mul");
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &arena_ref.q_l2_buf,
+                &arena_ref.q_scaled_buf,
+                n_q_elems,
+                q_scale_val,
+            )
+            .expect("ref scalar_mul");
             dispatch_compute_g_beta(
-                &mut enc, &mut registry, device.metal_device(),
-                &arena_ref.alpha_logit_buf, &arena_ref.beta_logit_buf,
-                &gpu_weights.ssm_dt_bias, &gpu_weights.ssm_a,
-                &arena_ref.g_buf, &arena_ref.beta_buf,
-                &arena_ref.g_params_buf, seq_len, shape.n_v_heads,
-            ).expect("ref compute_g_beta");
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &arena_ref.alpha_logit_buf,
+                &arena_ref.beta_logit_buf,
+                &gpu_weights.ssm_dt_bias,
+                &gpu_weights.ssm_a,
+                &arena_ref.g_buf,
+                &arena_ref.beta_buf,
+                &arena_ref.g_params_buf,
+                seq_len,
+                shape.n_v_heads,
+            )
+            .expect("ref compute_g_beta");
             enc.memory_barrier();
             // d_k=32 satisfies decode-kernel-eligible gate.
             dispatch_gated_delta_net_decode(
-                &mut enc, &mut registry, device.metal_device(),
-                &arena_ref.q_scaled_buf, &arena_ref.k_normed_buf,
-                &arena_ref.v_split_buf, &arena_ref.g_buf, &arena_ref.beta_buf,
-                &state_in_ref, &arena_ref.attn_out_buf, &state_out_ref,
-                &arena_ref.gdn_params_buf, gdn_params,
-            ).expect("ref gdn_decode");
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &arena_ref.q_scaled_buf,
+                &arena_ref.k_normed_buf,
+                &arena_ref.v_split_buf,
+                &arena_ref.g_buf,
+                &arena_ref.beta_buf,
+                &state_in_ref,
+                &arena_ref.attn_out_buf,
+                &state_out_ref,
+                &arena_ref.gdn_params_buf,
+                gdn_params,
+            )
+            .expect("ref gdn_decode");
             enc.memory_barrier();
             dispatch_ssm_norm_gate(
-                &mut enc, &mut registry, device.metal_device(),
-                &arena_ref.attn_out_buf, &gpu_weights.ssm_norm,
-                &arena_ref.z_buf, &arena_ref.gated_buf,
-                &arena_ref.op8_params_buf, rows_op8, shape.d_v,
-            ).expect("ref ssm_norm_gate");
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &arena_ref.attn_out_buf,
+                &gpu_weights.ssm_norm,
+                &arena_ref.z_buf,
+                &arena_ref.gated_buf,
+                &arena_ref.op8_params_buf,
+                rows_op8,
+                shape.d_v,
+            )
+            .expect("ref ssm_norm_gate");
             enc.memory_barrier();
             let out = apply_proj(
-                &mut enc, &mut registry, &device,
-                &arena_ref.gated_buf, &gpu_weights.ssm_out,
-                seq_len, z_channels, shape.hidden_size,
-            ).expect("ref out_proj");
+                &mut enc,
+                &mut registry,
+                &device,
+                &arena_ref.gated_buf,
+                &gpu_weights.ssm_out,
+                seq_len,
+                z_channels,
+                shape.hidden_size,
+            )
+            .expect("ref out_proj");
             enc.commit_labeled("ref.layer.gdn.ops5-9");
             out
         };
         {
             let mut flush_enc = device.command_encoder().expect("flush ref");
-            flush_enc.commit_and_wait().expect("flush commit_and_wait ref");
+            flush_enc
+                .commit_and_wait()
+                .expect("flush commit_and_wait ref");
         }
         let ref_out = download_f32(&ref_out_buf).expect("download ref");
 
@@ -6225,7 +6836,8 @@ mod tests {
             }
         }
         assert_eq!(
-            n_diff, 0,
+            n_diff,
+            0,
             "dn_stage_a_byte_exact_parity_with_pre_phase3a FAIL: \
              {n_diff}/{} F32 elements differ — Stage-A consolidation is NOT \
              byte-identical to the legacy 2-CB structure. The new intra-CB \
@@ -6238,8 +6850,11 @@ mod tests {
              0/{} elements differ (byte-exact) seq_len={seq_len}, \
              hidden={}, n_k={}, n_v={}, d_k={}, d_v={}",
             prod_out.len(),
-            shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
-            shape.d_k, shape.d_v,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
         );
     }
 }

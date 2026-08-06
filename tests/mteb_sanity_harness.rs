@@ -64,11 +64,11 @@ use std::time::{Duration, Instant};
 /// Order is the canonical wire order — every cell in the report is
 /// keyed on (`model_idx`, `task_idx`) which indexes into these arrays.
 const MTEB_TASKS: &[&str] = &[
-    "BIOSSES",                       // STS — 100 sentence pairs
-    "Banking77Classification",       // Classification — 13,083 / 77 intents
-    "NFCorpus",                      // Retrieval — 3,237 q × 3,633 docs (BEIR)
-    "TwentyNewsgroupsClustering",    // Clustering — 20,000 docs / 20 clusters
-    "SciDocsRR",                     // Reranking — 19,394 q-doc pairs
+    "BIOSSES",                    // STS — 100 sentence pairs
+    "Banking77Classification",    // Classification — 13,083 / 77 intents
+    "NFCorpus",                   // Retrieval — 3,237 q × 3,633 docs (BEIR)
+    "TwentyNewsgroupsClustering", // Clustering — 20,000 docs / 20 clusters
+    "SciDocsRR",                  // Reranking — 19,394 q-doc pairs
 ];
 
 /// 3 day-one BERT-family embedding models supported by the server
@@ -232,10 +232,7 @@ fn runner_py_exists_and_imports_required_modules() {
     // requests modules (any drift will surface here before a live run
     // wastes operator time on a slow venv install).
     for needle in &["import mteb", "import numpy", "import requests"] {
-        assert!(
-            text.contains(needle),
-            "runner.py is missing `{needle}`"
-        );
+        assert!(text.contains(needle), "runner.py is missing `{needle}`");
     }
     // The Encoder adapter must POST to /v1/embeddings.
     assert!(
@@ -246,7 +243,8 @@ fn runner_py_exists_and_imports_required_modules() {
 
 #[test]
 fn parse_runner_output_round_trips_well_formed_json() {
-    let raw = r#"{"model": "BAAI/bge-small-en-v1.5", "tasks": {"BIOSSES": 87.4, "NFCorpus": 31.1}}"#;
+    let raw =
+        r#"{"model": "BAAI/bge-small-en-v1.5", "tasks": {"BIOSSES": 87.4, "NFCorpus": 31.1}}"#;
     let parsed = parse_runner_output(raw).expect("well-formed runner JSON");
     assert_eq!(parsed.model, "BAAI/bge-small-en-v1.5");
     assert!((parsed.tasks["BIOSSES"] - 87.4).abs() < 1e-6);
@@ -292,8 +290,7 @@ fn mteb_sanity_matrix_5_tasks_3_models() {
     // in.
     let mut gguf_paths: Vec<PathBuf> = Vec::with_capacity(DAY_ONE_MODELS.len());
     for m in DAY_ONE_MODELS {
-        let p =
-            std::env::var(m.gguf_env).unwrap_or_else(|_| m.gguf_default.to_string());
+        let p = std::env::var(m.gguf_env).unwrap_or_else(|_| m.gguf_default.to_string());
         let path = PathBuf::from(&p);
         assert!(
             path.exists(),
@@ -360,10 +357,7 @@ fn mteb_sanity_matrix_5_tasks_3_models() {
                 // A spawn / readyz / runner failure for one model is
                 // surfaced loud-and-clear in the report so the operator
                 // can triage; the other models still run for context.
-                eprintln!(
-                    "mteb harness: model {} ARM FAILED: {e}",
-                    m.model_id
-                );
+                eprintln!("mteb harness: model {} ARM FAILED: {e}", m.model_id);
                 MTEB_TASKS
                     .iter()
                     .map(|t| MeasuredCell {
@@ -579,15 +573,22 @@ fn run_one_model_arm(arm: RunArm) -> Result<Vec<MeasuredCell>, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let out_path = std::env::temp_dir()
-        .join(format!("mteb-runner-{}-{ts}.json", sanitize_for_filename(arm.model_id)));
+    let out_path = std::env::temp_dir().join(format!(
+        "mteb-runner-{}-{ts}.json",
+        sanitize_for_filename(arm.model_id)
+    ));
     let tasks_csv = arm.tasks.join(",");
     let runner_status = std::process::Command::new(arm.python)
         .arg(arm.runner_py)
         .args(["--model-id", arm.model_id])
         .args(["--server", &base])
         .args(["--tasks", &tasks_csv])
-        .args(["--out", out_path.to_str().unwrap_or("/tmp/mteb-runner-fallback.json")])
+        .args([
+            "--out",
+            out_path
+                .to_str()
+                .unwrap_or("/tmp/mteb-runner-fallback.json"),
+        ])
         .args(["--results-folder", arm.results_folder])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -604,11 +605,8 @@ fn run_one_model_arm(arm: RunArm) -> Result<Vec<MeasuredCell>, String> {
         Err(e) => format!("(stderr drain failed: {e})"),
     };
 
-    let runner_out = runner_status.map_err(|e| {
-        format!(
-            "spawn runner.py: {e}; hf2q stderr tail: {server_stderr_tail}"
-        )
-    })?;
+    let runner_out = runner_status
+        .map_err(|e| format!("spawn runner.py: {e}; hf2q stderr tail: {server_stderr_tail}"))?;
     if !runner_out.status.success() {
         let stdout = String::from_utf8_lossy(&runner_out.stdout);
         let stderr = String::from_utf8_lossy(&runner_out.stderr);
@@ -618,12 +616,8 @@ fn run_one_model_arm(arm: RunArm) -> Result<Vec<MeasuredCell>, String> {
         ));
     }
 
-    let body = std::fs::read_to_string(&out_path).map_err(|e| {
-        format!(
-            "read runner.py output {}: {e}",
-            out_path.display()
-        )
-    })?;
+    let body = std::fs::read_to_string(&out_path)
+        .map_err(|e| format!("read runner.py output {}: {e}", out_path.display()))?;
     let parsed = parse_runner_output(&body)
         .map_err(|e| format!("parse runner.py output: {e}; raw body: {body}"))?;
 
@@ -669,8 +663,7 @@ struct RunnerOutput {
 }
 
 fn parse_runner_output(raw: &str) -> Result<RunnerOutput, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("not JSON: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| format!("not JSON: {e}"))?;
     let obj = v
         .as_object()
         .ok_or_else(|| "top level is not an object".to_string())?;
@@ -701,10 +694,10 @@ fn parse_runner_output(raw: &str) -> Result<RunnerOutput, String> {
 fn load_expected_scores(
     path: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<String, Option<f64>>>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let obj = v
         .as_object()
         .ok_or_else(|| "expected_scores top level is not a JSON object".to_string())?;
@@ -800,10 +793,7 @@ fn tail_bytes_returns_full_when_n_exceeds_len() {
 #[test]
 fn load_expected_scores_handles_metadata_keys_and_null_placeholders() {
     let dir = std::env::temp_dir();
-    let p = dir.join(format!(
-        "expected_scores_test_{}.json",
-        std::process::id()
-    ));
+    let p = dir.join(format!("expected_scores_test_{}.json", std::process::id()));
     let body = r#"{
       "_source": "MTEB leaderboard snapshot 2026-05-01",
       "_re_pin_policy": "Drift = re-pin via PR.",
@@ -828,7 +818,9 @@ fn load_expected_scores_handles_metadata_keys_and_null_placeholders() {
     assert!(!m.contains_key("_re_pin_policy"));
     let bge = m.get("BAAI/bge-small-en-v1.5").expect("bge entry");
     assert_eq!(bge["BIOSSES"], Some(87.4));
-    let nomic = m.get("nomic-ai/nomic-embed-text-v1.5").expect("nomic entry");
+    let nomic = m
+        .get("nomic-ai/nomic-embed-text-v1.5")
+        .expect("nomic entry");
     assert_eq!(nomic["BIOSSES"], None);
     let _ = std::fs::remove_file(&p);
 }

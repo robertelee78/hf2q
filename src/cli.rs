@@ -183,7 +183,12 @@ pub struct ConvertCliArgs {
     /// Exact immutable HuggingFace commit for `--repo` conversion.
     /// Branches, tags, and abbreviated SHAs are rejected so integrity
     /// verification and the success receipt bind one stable source.
-    #[arg(long, requires = "repo", conflicts_with = "hf_dir", value_name = "REVISION")]
+    #[arg(
+        long,
+        requires = "repo",
+        conflicts_with = "hf_dir",
+        value_name = "REVISION"
+    )]
     pub revision: Option<String>,
 
     /// File-type to quantize to. Accepts:
@@ -341,7 +346,6 @@ pub struct CacheArgs {
     #[command(subcommand)]
     pub action: CacheAction,
 }
-
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
 ///
@@ -501,7 +505,6 @@ pub struct SmokeArgs {
     pub llama_cli_override: Option<PathBuf>,
 }
 
-
 #[derive(clap::Args, Debug)]
 pub struct InfoArgs {
     /// Local safetensors directory
@@ -519,7 +522,6 @@ pub struct CompletionsArgs {
     #[arg(long, value_enum)]
     pub shell: Shell,
 }
-
 
 #[derive(clap::Args, Debug)]
 pub struct GenerateArgs {
@@ -679,7 +681,6 @@ pub struct GenerateArgs {
     /// Mutually exclusive with `--enable-thinking`.
     #[arg(long, conflicts_with = "enable_thinking")]
     pub no_thinking: bool,
-
     // ADR-008: candle-era kernel mode flags removed.
     // The mlx-native backend handles all dispatch internally.
 }
@@ -998,8 +999,6 @@ pub struct ParityArgs {
     #[command(subcommand)]
     pub command: ParityCommand,
 }
-
-
 
 #[cfg(test)]
 mod tests {

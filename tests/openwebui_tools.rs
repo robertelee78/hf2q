@@ -218,9 +218,7 @@ async fn streaming_chat_with_tools(
                             if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
                                 cap.accumulated_content.push_str(text);
                             }
-                            if let Some(fr) =
-                                v["choices"][0]["finish_reason"].as_str()
-                            {
+                            if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
                                 cap.finish_reason = Some(fr.to_string());
                             }
                             // Iter B-2 W66: extract structured tool-call
@@ -229,9 +227,7 @@ async fn streaming_chat_with_tools(
                             // `index`. First-seen `id`/`type`/`name`
                             // win; `function.arguments` fragments are
                             // concatenated.
-                            if let Some(arr) =
-                                v["choices"][0]["delta"]["tool_calls"].as_array()
-                            {
+                            if let Some(arr) = v["choices"][0]["delta"]["tool_calls"].as_array() {
                                 for entry in arr {
                                     let idx = entry["index"].as_u64().unwrap_or(0) as usize;
                                     while cap.tool_calls.len() <= idx {
@@ -253,9 +249,7 @@ async fn streaming_chat_with_tools(
                                             slot.name = Some(n.to_string());
                                         }
                                     }
-                                    if let Some(a) =
-                                        entry["function"]["arguments"].as_str()
-                                    {
+                                    if let Some(a) = entry["function"]["arguments"].as_str() {
                                         slot.arguments.push_str(a);
                                     }
                                 }
@@ -359,10 +353,7 @@ fn openwebui_tools_streaming_scenario_2() {
     ));
 
     // Standard SSE protocol invariants (same as scenario 1).
-    assert!(
-        !turn1.frames.is_empty(),
-        "turn1 produced zero SSE chunks"
-    );
+    assert!(!turn1.frames.is_empty(), "turn1 produced zero SSE chunks");
     assert_eq!(
         turn1.frames.last().expect("non-empty"),
         "[DONE]",
@@ -379,7 +370,10 @@ fn openwebui_tools_streaming_scenario_2() {
         "turn1 finish_reason must be a known OpenAI value; got {fr:?}"
     );
     eprintln!("openwebui_tools: turn1_finish={fr:?}");
-    eprintln!("openwebui_tools: turn1_text={:?}", turn1.accumulated_content);
+    eprintln!(
+        "openwebui_tools: turn1_text={:?}",
+        turn1.accumulated_content
+    );
     eprintln!("openwebui_tools: turn1_tool_calls={:?}", turn1.tool_calls);
 
     // -----------------------------------------------------------------
@@ -435,14 +429,13 @@ fn openwebui_tools_streaming_scenario_2() {
             );
             // Arguments string MUST round-trip through `serde_json::from_str`
             // — OpenAI clients do exactly this to reach the args object.
-            let _: serde_json::Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "tool_calls[{i}].function.arguments not valid JSON \
+            let _: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                panic!(
+                    "tool_calls[{i}].function.arguments not valid JSON \
                          (clients can't parse): err={e}, args={:?}",
-                        tc.arguments
-                    )
-                });
+                    tc.arguments
+                )
+            });
         }
         // finish_reason must be "tool_calls" per OpenAI spec when at
         // least one tool call was emitted.
@@ -471,7 +464,11 @@ fn openwebui_tools_streaming_scenario_2() {
         );
         eprintln!(
             "openwebui_tools: turn1_text first 600 chars: {:?}",
-            turn1.accumulated_content.chars().take(600).collect::<String>()
+            turn1
+                .accumulated_content
+                .chars()
+                .take(600)
+                .collect::<String>()
         );
     }
 
@@ -518,7 +515,8 @@ fn openwebui_tools_streaming_scenario_2() {
         strip_id(&turn1.tool_calls),
         strip_id(&rerun.tool_calls),
         "tool_calls determinism violation at T=0 (modulo id):\n  first: {:?}\n  rerun: {:?}",
-        turn1.tool_calls, rerun.tool_calls
+        turn1.tool_calls,
+        rerun.tool_calls
     );
     eprintln!("openwebui_tools: determinism PASS");
 
@@ -607,7 +605,10 @@ fn openwebui_tools_streaming_scenario_2() {
             "openwebui_tools: turn2_finish={:?}",
             turn2.finish_reason.as_deref()
         );
-        eprintln!("openwebui_tools: turn2_text={:?}", turn2.accumulated_content);
+        eprintln!(
+            "openwebui_tools: turn2_text={:?}",
+            turn2.accumulated_content
+        );
 
         // SOFT assertion: when the chat template renders the tool
         // result, the model's natural-language reply should reference
@@ -685,9 +686,7 @@ fn openwebui_tools_streaming_scenario_2() {
 #[test]
 fn openwebui_tools_streaming_tool_choice_none_companion() {
     if std::env::var(ENV_GATE).as_deref() != Ok("1") {
-        eprintln!(
-            "{ENV_GATE} != \"1\" — skipping (companion test, same gate)."
-        );
+        eprintln!("{ENV_GATE} != \"1\" — skipping (companion test, same gate).");
         return;
     }
 
@@ -738,7 +737,10 @@ fn openwebui_tools_streaming_tool_choice_none_companion() {
         256,
     ));
 
-    assert!(!cap.frames.is_empty(), "tool_choice=none produced zero chunks");
+    assert!(
+        !cap.frames.is_empty(),
+        "tool_choice=none produced zero chunks"
+    );
     assert_eq!(
         cap.frames.last().expect("non-empty"),
         "[DONE]",
@@ -777,6 +779,9 @@ fn openwebui_tools_streaming_tool_choice_none_companion() {
         "openwebui_tools_none: tool_choice=none → no tool-call marker, no structured \
          tool_calls, finish_reason={:?}, text first 200 chars: {:?}",
         cap.finish_reason.as_deref(),
-        cap.accumulated_content.chars().take(200).collect::<String>()
+        cap.accumulated_content
+            .chars()
+            .take(200)
+            .collect::<String>()
     );
 }

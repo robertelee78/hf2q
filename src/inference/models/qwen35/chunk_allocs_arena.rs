@@ -207,13 +207,7 @@ impl ChunkAllocsArena {
     ///
     /// Returns `Err` if `seq_len > self.seq_capacity` or any shape field
     /// differs from the recorded values.
-    pub fn validate_fits(
-        &self,
-        seq_len: u32,
-        n_v_heads: u32,
-        d_k: u32,
-        d_v: u32,
-    ) -> Result<()> {
+    pub fn validate_fits(&self, seq_len: u32, n_v_heads: u32, d_k: u32, d_v: u32) -> Result<()> {
         if seq_len > self.seq_capacity {
             return Err(anyhow!(
                 "ChunkAllocsArena::validate_fits: seq_len {} exceeds capacity {}",
@@ -275,12 +269,24 @@ mod tests {
         let v_elems = (seq as usize) * (nv as usize) * (dv as usize);
         let g_elems = (seq as usize) * (nv as usize);
 
-        assert_eq!(arena.q_expanded_buf.byte_len(), q_elems_exp * 4, "q_expanded_buf");
-        assert_eq!(arena.k_expanded_buf.byte_len(), q_elems_exp * 4, "k_expanded_buf");
+        assert_eq!(
+            arena.q_expanded_buf.byte_len(),
+            q_elems_exp * 4,
+            "q_expanded_buf"
+        );
+        assert_eq!(
+            arena.k_expanded_buf.byte_len(),
+            q_elems_exp * 4,
+            "k_expanded_buf"
+        );
         assert_eq!(arena.q_bf16_buf.byte_len(), q_elems_exp * 2, "q_bf16_buf");
         assert_eq!(arena.k_bf16_buf.byte_len(), q_elems_exp * 2, "k_bf16_buf");
         assert_eq!(arena.v_bf16_buf.byte_len(), v_elems * 2, "v_bf16_buf");
-        assert_eq!(arena.g_log_decay_buf.byte_len(), g_elems * 4, "g_log_decay_buf");
+        assert_eq!(
+            arena.g_log_decay_buf.byte_len(),
+            g_elems * 4,
+            "g_log_decay_buf"
+        );
         assert_eq!(arena.o_bf16_buf.byte_len(), v_elems * 2, "o_bf16_buf");
     }
 
@@ -291,9 +297,7 @@ mod tests {
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "test_chunk_allocs_arena_new_small_shape: skipping — no Metal device"
-                );
+                eprintln!("test_chunk_allocs_arena_new_small_shape: skipping — no Metal device");
                 return;
             }
         };
@@ -338,8 +342,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
+        let arena = ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
         assert!(arena.validate_fits(256, 8, 32, 32).is_ok());
         // seq_len < capacity also Ok.
         assert!(arena.validate_fits(128, 8, 32, 32).is_ok());
@@ -358,8 +361,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
+        let arena = ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
         assert!(arena.validate_fits(512, 8, 32, 32).is_err());
     }
 
@@ -376,8 +378,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
+        let arena = ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
         assert!(arena.validate_fits(256, 4, 32, 32).is_err()); // nv
         assert!(arena.validate_fits(256, 8, 16, 32).is_err()); // dk
         assert!(arena.validate_fits(256, 8, 32, 16).is_err()); // dv
@@ -399,8 +400,7 @@ mod tests {
                 return;
             }
         };
-        let arena =
-            ChunkAllocsArena::new(&device, 64, 4, 16, 16).expect("chunk allocs arena new");
+        let arena = ChunkAllocsArena::new(&device, 64, 4, 16, 16).expect("chunk allocs arena new");
 
         // F32 buffers
         let f32_bufs: [(&MlxBuffer, &str); 3] = [
@@ -452,14 +452,11 @@ mod tests {
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
-                eprintln!(
-                    "test_chunk_allocs_q_k_expanded_same_size: skipping — no Metal device"
-                );
+                eprintln!("test_chunk_allocs_q_k_expanded_same_size: skipping — no Metal device");
                 return;
             }
         };
-        let arena =
-            ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
+        let arena = ChunkAllocsArena::new(&device, 256, 8, 32, 32).expect("chunk allocs arena new");
         assert_eq!(
             arena.q_expanded_buf.byte_len(),
             arena.k_expanded_buf.byte_len(),

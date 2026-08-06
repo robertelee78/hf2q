@@ -47,15 +47,11 @@ fn test_model_path() -> Option<PathBuf> {
 
 fn skip_if_disabled(test_name: &str) -> Option<PathBuf> {
     if !e2e_enabled() {
-        eprintln!(
-            "[{test_name}] skipping: set {E2E_GATE}=1 to run Wedge-3 e2e tests"
-        );
+        eprintln!("[{test_name}] skipping: set {E2E_GATE}=1 to run Wedge-3 e2e tests");
         return None;
     }
     test_model_path().or_else(|| {
-        eprintln!(
-            "[{test_name}] skipping: set {MODEL_ENV} to a Qwen3.5/3.6 GGUF path"
-        );
+        eprintln!("[{test_name}] skipping: set {MODEL_ENV} to a Qwen3.5/3.6 GGUF path");
         None
     })
 }
@@ -213,8 +209,7 @@ fn e2e_qwen35_chat_completion_returns_real_tokens() {
 #[test]
 #[ignore = "Wedge-3 e2e — requires HF2Q_WEDGE3_E2E=1 + HF2Q_TEST_QWEN35_MODEL"]
 fn e2e_qwen35_chat_completion_streams_tokens_via_sse() {
-    let Some(model_path) =
-        skip_if_disabled("e2e_qwen35_chat_completion_streams_tokens_via_sse")
+    let Some(model_path) = skip_if_disabled("e2e_qwen35_chat_completion_streams_tokens_via_sse")
     else {
         return;
     };
@@ -239,8 +234,7 @@ fn e2e_qwen35_chat_completion_streams_tokens_via_sse() {
         len = body.len(),
         body = body,
     );
-    let mut sock = std::net::TcpStream::connect(("127.0.0.1", serve.port))
-        .expect("tcp connect");
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", serve.port)).expect("tcp connect");
     sock.set_read_timeout(Some(Duration::from_secs(180))).ok();
     sock.write_all(req.as_bytes()).expect("write request");
     let mut reader = BufReader::new(sock);
@@ -300,8 +294,7 @@ fn e2e_qwen35_chat_completion_streams_tokens_via_sse() {
 #[test]
 #[ignore = "Wedge-3 e2e — requires HF2Q_WEDGE3_E2E=1 + HF2Q_TEST_QWEN35_MODEL"]
 fn e2e_qwen35_embed_returns_hidden_state_vector() {
-    let Some(model_path) = skip_if_disabled("e2e_qwen35_embed_returns_hidden_state_vector")
-    else {
+    let Some(model_path) = skip_if_disabled("e2e_qwen35_embed_returns_hidden_state_vector") else {
         return;
     };
     let mut serve = ServeProcess::spawn(&model_path).expect("spawn serve");
@@ -347,11 +340,7 @@ fn e2e_qwen35_embed_returns_hidden_state_vector() {
         (l2 - 1.0).abs() < 1e-2 || l2 < 1e-6,
         "embedding not L2-normalized: ||v||_2 = {l2}"
     );
-    eprintln!(
-        "[wedge3-e2e] embed: len={} l2={:.6}",
-        vec.len(),
-        l2
-    );
+    eprintln!("[wedge3-e2e] embed: len={} l2={:.6}", vec.len(), l2);
 }
 
 /// Wedge-3 / iter-216 Phase G AC-4 (bonus): two consecutive identical-prompt
@@ -360,9 +349,7 @@ fn e2e_qwen35_embed_returns_hidden_state_vector() {
 #[test]
 #[ignore = "Wedge-3 e2e — requires HF2Q_WEDGE3_E2E=1 + HF2Q_TEST_QWEN35_MODEL"]
 fn e2e_qwen35_prompt_cache_second_request_faster() {
-    let Some(model_path) =
-        skip_if_disabled("e2e_qwen35_prompt_cache_second_request_faster")
-    else {
+    let Some(model_path) = skip_if_disabled("e2e_qwen35_prompt_cache_second_request_faster") else {
         return;
     };
     let mut serve = ServeProcess::spawn(&model_path).expect("spawn serve");

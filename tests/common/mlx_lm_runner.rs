@@ -296,7 +296,11 @@ mod tests {
     fn module_missing_returns_sentinel() {
         let python = Path::new("/nonexistent/python3-test-stub");
         let (m, _stdout) = run_python_script_for_test(python, "print('hi')");
-        assert!(m.is_missing_binary(), "missing python must produce sentinel; got {:?}", m);
+        assert!(
+            m.is_missing_binary(),
+            "missing python must produce sentinel; got {:?}",
+            m
+        );
         assert_eq!(m.exit_code, -1);
         assert!(
             m.stderr_tail.contains("python3"),

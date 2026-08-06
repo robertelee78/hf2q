@@ -86,11 +86,7 @@ pub fn sample_greedy(logits: &[f32]) -> u32 {
 /// (repetition penalty, temperature scaling, softmax).  This avoids any
 /// allocation for the common greedy fast-path and keeps allocation minimal for
 /// the non-greedy path (one `Vec<(usize, f32)>` for sort + top-k/p).
-pub fn sample_token(
-    logits: &mut [f32],
-    params: &SamplingParams,
-    previous_tokens: &[u32],
-) -> u32 {
+pub fn sample_token(logits: &mut [f32], params: &SamplingParams, previous_tokens: &[u32]) -> u32 {
     // ------------------------------------------------------------------
     // Repetition penalty (in-place on raw logits).
     // ------------------------------------------------------------------
@@ -312,11 +308,7 @@ pub fn sample_token_from_topk(
     }
 }
 
-fn sample_token_indexed(
-    indexed: &mut Vec<(usize, f32)>,
-    params: &SamplingParams,
-) -> Option<u32> {
-
+fn sample_token_indexed(indexed: &mut Vec<(usize, f32)>, params: &SamplingParams) -> Option<u32> {
     // ------------------------------------------------------------------
     // Top-k truncation on raw logits (llama-sampler.cpp:317).
     //
@@ -446,11 +438,7 @@ fn softmax_logits_to_probs(indexed: &[(usize, f32)]) -> Vec<f32> {
 /// - If `logits[id] < 0.0`:  multiply by `penalty`         (reduce probability)
 ///
 /// This matches the candle-based implementation exactly.
-pub fn apply_repetition_penalty(
-    logits: &mut [f32],
-    previous_tokens: &[u32],
-    penalty: f64,
-) {
+pub fn apply_repetition_penalty(logits: &mut [f32], previous_tokens: &[u32], penalty: f64) {
     let vocab = logits.len();
     let penalty_f = penalty as f32;
     let inv_penalty = 1.0f32 / penalty_f;
@@ -575,11 +563,7 @@ mod tests {
     }
 
     /// Drive the sampler `n` times and return frequency-of-each-index.
-    fn sample_frequencies(
-        base_logits: &[f32],
-        params: &SamplingParams,
-        n: usize,
-    ) -> Vec<f64> {
+    fn sample_frequencies(base_logits: &[f32], params: &SamplingParams, n: usize) -> Vec<f64> {
         let mut counts = vec![0usize; base_logits.len()];
         for _ in 0..n {
             let mut buf = base_logits.to_vec();
@@ -610,7 +594,9 @@ mod tests {
                 diff < 0.02,
                 "all-pass sampler diverges from softmax at idx {i}: \
                  expected={:.4} got={:.4} diff={:.4}",
-                expected[i], freq[i], diff,
+                expected[i],
+                freq[i],
+                diff,
             );
         }
     }
@@ -640,7 +626,9 @@ mod tests {
             cold_freq[0] - hot_freq[0] > 0.20,
             "temperature does not concentrate winner: cold={:.3} hot={:.3} \
              diff={:.3}",
-            cold_freq[0], hot_freq[0], cold_freq[0] - hot_freq[0],
+            cold_freq[0],
+            hot_freq[0],
+            cold_freq[0] - hot_freq[0],
         );
         // Cold winner-rate at temp=0.3 should be ≥ 0.85 (analytic ~0.96).
         assert!(
@@ -690,18 +678,9 @@ mod tests {
         };
         let freq = sample_frequencies(&logits, &params, 5_000);
         // idx 2 (logit=3.0) and idx 1 (logit=2.0) are the top 2.
-        assert_eq!(
-            freq[3], 0.0,
-            "top-k=2 leaked to idx 3 (logit=0.0)"
-        );
-        assert_eq!(
-            freq[4], 0.0,
-            "top-k=2 leaked to idx 4 (logit=-1.0)"
-        );
-        assert_eq!(
-            freq[0], 0.0,
-            "top-k=2 leaked to idx 0 (logit=1.0)"
-        );
+        assert_eq!(freq[3], 0.0, "top-k=2 leaked to idx 3 (logit=0.0)");
+        assert_eq!(freq[4], 0.0, "top-k=2 leaked to idx 4 (logit=-1.0)");
+        assert_eq!(freq[0], 0.0, "top-k=2 leaked to idx 0 (logit=1.0)");
     }
 
     #[test]
@@ -765,7 +744,8 @@ mod tests {
                     sample_token_from_topk(&top_indices, &top_values, &params),
                     42,
                     "K=1 must always return the single index (temp={}, top_p={})",
-                    temp, top_p,
+                    temp,
+                    top_p,
                 );
             }
         }
@@ -850,7 +830,10 @@ mod tests {
                 (f_full - f_topk).abs() < 0.05,
                 "top-K path diverges from full-V path at idx {}: \
                  full={:.4} topk={:.4} diff={:.4}",
-                pos, f_full, f_topk, (f_full - f_topk).abs(),
+                pos,
+                f_full,
+                f_topk,
+                (f_full - f_topk).abs(),
             );
         }
         // Tail (everything outside the top 8) must be ~0 in both paths.

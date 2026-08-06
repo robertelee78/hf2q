@@ -30,9 +30,7 @@ fn test_model() -> Option<PathBuf> {
     let raw = std::env::var(MODEL_ENV).ok()?;
     let p = PathBuf::from(&raw);
     if !p.exists() {
-        eprintln!(
-            "{MODEL_ENV}={raw} does not exist on disk — skipping test"
-        );
+        eprintln!("{MODEL_ENV}={raw} does not exist on disk — skipping test");
         return None;
     }
     Some(p)
@@ -82,10 +80,7 @@ fn default_stdout_has_three_header_lines_and_generation() {
     };
     let out = Command::cargo_bin("hf2q")
         .unwrap()
-        .args([
-            "generate",
-            "--model",
-        ])
+        .args(["generate", "--model"])
         .arg(&model)
         .args([
             "--prompt",
@@ -98,7 +93,11 @@ fn default_stdout_has_three_header_lines_and_generation() {
         .output()
         .expect("run hf2q generate");
 
-    assert!(out.status.success(), "hf2q generate failed: {:?}", out.status);
+    assert!(
+        out.status.success(),
+        "hf2q generate failed: {:?}",
+        out.status
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     // ADR-018 C3 — banner shape updated.
@@ -153,7 +152,10 @@ fn default_stdout_has_three_header_lines_and_generation() {
 
     // Blank line between prefill and generation.
     let blank_line = lines[14].trim_end();
-    assert!(blank_line.is_empty(), "expected blank line at index 14, got {blank_line:?}");
+    assert!(
+        blank_line.is_empty(),
+        "expected blank line at index 14, got {blank_line:?}"
+    );
 
     // Generation: remaining bytes are non-empty.
     let gen: String = lines[15..].concat();
@@ -202,8 +204,7 @@ fn default_stderr_is_only_dim_or_plain_trailer() {
         non_empty.len()
     );
     assert!(
-        non_empty[0].starts_with("--- mlx-native: ")
-            && non_empty[0].ends_with(" ---"),
+        non_empty[0].starts_with("--- mlx-native: ") && non_empty[0].ends_with(" ---"),
         "expected trailer; got {:?}",
         non_empty[0]
     );
@@ -216,9 +217,12 @@ fn vv_boot_log_matches_fixture() {
         eprintln!("skipping: set {MODEL_ENV} to run");
         return;
     };
-    let fixture_path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests/fixtures/generate_boot_log.golden.txt"]
-        .iter()
-        .collect();
+    let fixture_path: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "tests/fixtures/generate_boot_log.golden.txt",
+    ]
+    .iter()
+    .collect();
     let fixture = std::fs::read_to_string(&fixture_path)
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", fixture_path.display()));
 
@@ -292,14 +296,15 @@ mod unit {
 
     #[test]
     fn normalize_leaves_plain_lines() {
-        assert_eq!(normalize("Prefill: KV cache dtype = F32"), "Prefill: KV cache dtype = F32");
+        assert_eq!(
+            normalize("Prefill: KV cache dtype = F32"),
+            "Prefill: KV cache dtype = F32"
+        );
     }
 
     #[test]
     fn normalize_replaces_ms_tok_per_s_seconds() {
-        let got = normalize(
-            " INFO hf2q::serve: mlx-native weights loaded (30 layers) in 2.4s",
-        );
+        let got = normalize(" INFO hf2q::serve: mlx-native weights loaded (30 layers) in 2.4s");
         assert_eq!(got, "mlx-native weights loaded (30 layers) in <T>");
 
         let got = normalize(

@@ -94,8 +94,7 @@ const PROMPT_P: &str =
 const MAX_TOKENS: u32 = 64;
 
 fn hf2q_binary_path() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(manifest_dir).join("target/release/hf2q")
 }
 
@@ -141,12 +140,7 @@ impl ServerGuard {
     }
 }
 
-fn spawn_server(
-    bin: &Path,
-    model: &Path,
-    port: u16,
-    extra_envs: &[(&str, &str)],
-) -> ServerGuard {
+fn spawn_server(bin: &Path, model: &Path, port: u16, extra_envs: &[(&str, &str)]) -> ServerGuard {
     spawn_server_with_base(bin, model, port, &[("HF2Q_USE_DENSE", "1")], extra_envs)
 }
 
@@ -218,15 +212,18 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
     use std::io::Write;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {HOST}:{port}\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: {HOST}:{port}\r\nConnection: close\r\n\r\n"
+    )?;
     let mut reader = BufReader::new(s);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()
@@ -910,8 +907,7 @@ fn iter7_prefill_wrap_guard_long_prompt_byte_identity() {
     );
 
     let prompt_q = iter7_build_prompt("Question Q ending here distinctively.");
-    let prompt_p =
-        iter7_build_prompt("Question P with different ending text continuing onward.");
+    let prompt_p = iter7_build_prompt("Question P with different ending text continuing onward.");
     eprintln!(
         "[iter-7 wrap-guard] prompts built: Q={} chars, P={} chars (shared prefix \
          {} reps × {} chars = {} chars; both prompts target prompt_len > \
@@ -1021,7 +1017,8 @@ fn iter7_prefill_wrap_guard_long_prompt_byte_identity() {
     // the guard failed to skip a store, and the iter-3.6 lift cannot
     // safely happen.
     assert_eq!(
-        detected_delta, 0,
+        detected_delta,
+        0,
         "[iter-7 wrap-guard] FALSIFIED — detected_delta={} (expected 0). \
          The prefill-wrap guard FAILED to skip the LCP store on a \
          long-prompt request (prompt_len > sliding_window). Either:\n\
@@ -1597,8 +1594,7 @@ fn iter3_6_long_prompt_resume_byte_identity() {
     );
 
     let prompt_q = iter36_build_prompt("Question Q ending here distinctively.");
-    let prompt_p =
-        iter36_build_prompt("Question P with different ending text continuing onward.");
+    let prompt_p = iter36_build_prompt("Question P with different ending text continuing onward.");
     eprintln!(
         "[iter-3.6 long-resume] prompts built: Q={} chars, P={} chars (shared prefix \
          {} reps × {} chars; both prompts target prompt_len > sliding_window=1024)",
@@ -1879,9 +1875,7 @@ fn gemma_hybrid_long_resume_byte_identity() {
     let model_path = match resolve_model_path_or_skip() {
         Some(p) => p,
         None => {
-            eprintln!(
-                "[gemma-hybrid-long-resume] {ENV_PHASE_D_GATE}=1 not set — short-circuit."
-            );
+            eprintln!("[gemma-hybrid-long-resume] {ENV_PHASE_D_GATE}=1 not set — short-circuit.");
             return;
         }
     };
@@ -1889,8 +1883,7 @@ fn gemma_hybrid_long_resume_byte_identity() {
     assert!(bin.exists(), "hf2q binary not found at {}", bin.display());
 
     let prompt_q = iter36_build_prompt("Question Q ending here distinctively.");
-    let prompt_p =
-        iter36_build_prompt("Question P with different ending text continuing onward.");
+    let prompt_p = iter36_build_prompt("Question P with different ending text continuing onward.");
 
     let server_a = spawn_server_with_base(
         &bin,
@@ -1949,7 +1942,10 @@ fn gemma_hybrid_long_resume_byte_identity() {
     wait_for_readyz(&server_b);
     let canonical_b = fetch_canonical_model_id(&server_b);
     let p_decoded_b = chat_decode(&server_b, &canonical_b, &prompt_p, ITER36_MAX_TOKENS);
-    assert!(!p_decoded_b.is_empty(), "P decoded empty on server B (control)");
+    assert!(
+        !p_decoded_b.is_empty(),
+        "P decoded empty on server B (control)"
+    );
 
     assert_eq!(
         p_decoded_a, p_decoded_b,

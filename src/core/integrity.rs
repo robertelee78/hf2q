@@ -328,8 +328,7 @@ mod tests {
             bytes: contents.len() as u64,
             ..expected
         };
-        let err = verify_shard("org/repo", "main", &path, &expected)
-            .expect_err("should mismatch");
+        let err = verify_shard("org/repo", "main", &path, &expected).expect_err("should mismatch");
         let msg = format!("{err}");
         assert!(msg.contains("model.safetensors"), "msg: {msg}");
         assert!(msg.contains("expected SHA-256"), "msg: {msg}");
@@ -349,8 +348,7 @@ mod tests {
             hf_etag: "0".repeat(64),
             is_lfs: true,
         };
-        let err = verify_shard("org/repo", "main", &path, &expected)
-            .expect_err("size mismatch");
+        let err = verify_shard("org/repo", "main", &path, &expected).expect_err("size mismatch");
         assert!(matches!(err, IntegrityError::SizeMismatch { .. }));
         let msg = format!("{err}");
         assert!(msg.contains("9999"), "msg: {msg}");
@@ -368,8 +366,7 @@ mod tests {
             hf_etag: "0".repeat(64),
             is_lfs: true,
         };
-        let err = verify_shard("org/repo", "main", &path, &expected)
-            .expect_err("missing");
+        let err = verify_shard("org/repo", "main", &path, &expected).expect_err("missing");
         assert!(matches!(err, IntegrityError::LocalFileMissing { .. }));
         let msg = format!("{err}");
         assert!(msg.contains("nope.safetensors"), "msg: {msg}");

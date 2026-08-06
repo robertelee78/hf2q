@@ -561,7 +561,10 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
         kv_capacity: usize,
     ) -> Result<Self> {
         cfg.validate(drafter_cfg)?;
-        ensure!(kv_capacity > 0, "Gemma4Eagle3Orchestrator::new: kv_capacity must be > 0");
+        ensure!(
+            kv_capacity > 0,
+            "Gemma4Eagle3Orchestrator::new: kv_capacity must be > 0"
+        );
         Ok(Self {
             cfg,
             drafter_cfg,
@@ -680,7 +683,9 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
         ensure!(
             logits.len() == n * vocab,
             "Gemma4Eagle3Orchestrator::prefill: logits len {} != n({}) * vocab({})",
-            logits.len(), n, vocab
+            logits.len(),
+            n,
+            vocab
         );
         let last_row = &logits[(n - 1) * vocab..n * vocab];
         let mut best_idx = 0usize;
@@ -709,7 +714,10 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
         model: &crate::inference::models::gemma4::model::MlxModelWeights,
         gpu: &mut crate::serve::gpu::GpuContext,
     ) -> Result<Eagle3IterationOutput> {
-        ensure!(self.prefix_len > 0, "Gemma4Eagle3Orchestrator::run_iteration: called before prefill");
+        ensure!(
+            self.prefix_len > 0,
+            "Gemma4Eagle3Orchestrator::run_iteration: called before prefill"
+        );
         ensure!(!self.kv_caches_f32.is_empty(), "Gemma4Eagle3Orchestrator::run_iteration: kv_caches_f32 uninitialized (called before prefill)");
         ensure!(
             self.prefix_len + self.cfg.dynamic_tree.budget <= self.kv_capacity,
@@ -733,7 +741,9 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
             let target_aux =
                 upload_f32_device(device, &target_aux_host, vec![1, target_aux_host.len()])
                     .context("Gemma4Eagle3Orchestrator: upload target_aux")?;
-            let embed_table: &[f32] = model.embed_weight.as_slice::<f32>()
+            let embed_table: &[f32] = model
+                .embed_weight
+                .as_slice::<f32>()
                 .map_err(|e| anyhow!("Gemma4Eagle3Orchestrator: embed_weight slice: {e}"))?;
             let mut drafter = GpuDrafter::new(
                 self.drafter_cfg,
@@ -753,11 +763,7 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
             )
             .context("Gemma4Eagle3Orchestrator: allocate drafter KV cache")?;
             drafter.attach_kv_cache(cache)?;
-            expand_dynamic_tree_with_cache(
-                self.last_token,
-                &mut drafter,
-                &self.cfg.dynamic_tree,
-            )?
+            expand_dynamic_tree_with_cache(self.last_token, &mut drafter, &self.cfg.dynamic_tree)?
         };
 
         let tree_mask = tree.build_tree_mask(self.prefix_len)?;
@@ -893,9 +899,7 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
 /// checkpoint (ADR-038 §3.4.2). All 16 knob values match the published schema.
 ///
 /// Caller must supply `target_vocab_size` (262144 for gemma-4-31B-it).
-pub fn default_gemma4_eagle3_drafter_config(
-    target_vocab_size: usize,
-) -> Eagle3DrafterConfig {
+pub fn default_gemma4_eagle3_drafter_config(target_vocab_size: usize) -> Eagle3DrafterConfig {
     Eagle3DrafterConfig {
         // RedHatAI drafter shape (ADR-038 §3.4.2)
         hidden_size: 5376,
@@ -925,12 +929,12 @@ pub fn default_gemma4_eagle3_drafter_config(
         // Gemma4/RedHatAI schema knobs (all differ from Qwen35 defaults)
         norm_before_fc: false,
         fc_norm: false,
-        use_qk_norm: false,    // Llama-style model_type — no per-head norms
+        use_qk_norm: false, // Llama-style model_type — no per-head norms
         attention_bias: false,
         tie_lm_head: false,
         include_draft_id_mapping: true,
         has_own_embed_tokens: true,
-        rope_theta: 10000.0,   // drafter RoPE base (not target's 1M global theta)
+        rope_theta: 10000.0, // drafter RoPE base (not target's 1M global theta)
         rope_dim: 256,
         norm_before_residual: true, // RedHatAI checkpoint sets this
     }
@@ -1237,7 +1241,10 @@ mod tests {
         let mut c = cfg();
         c.ffn_topology = FfnTopology::Dense;
         let d = drafter_cfg();
-        assert!(c.validate(&d).is_ok(), "dense topology should pass validation");
+        assert!(
+            c.validate(&d).is_ok(),
+            "dense topology should pass validation"
+        );
         assert_eq!(c.ffn_topology, FfnTopology::Dense);
     }
 
@@ -1248,7 +1255,10 @@ mod tests {
         let mut c = cfg();
         c.ffn_topology = FfnTopology::Moe;
         let d = drafter_cfg();
-        assert!(c.validate(&d).is_ok(), "moe topology should pass validation");
+        assert!(
+            c.validate(&d).is_ok(),
+            "moe topology should pass validation"
+        );
         assert_eq!(c.ffn_topology, FfnTopology::Moe);
     }
 
@@ -1295,8 +1305,9 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let d = drafter_cfg();
         let c = cfg(); // Dense by default in helper
-        // All existing validation paths must still work unchanged.
-        c.validate(&d).expect("dense regression: validate must pass");
+                       // All existing validation paths must still work unchanged.
+        c.validate(&d)
+            .expect("dense regression: validate must pass");
     }
 
     /// AC-8 — MoE topology does not interfere with orchestrator validate (no moe-specific fields).
@@ -1383,8 +1394,7 @@ mod g4_cfa5_redhatai_smoke {
     use crate::serve::gpu::GpuContext;
     use crate::serve::header::LoadProgress;
 
-    const DEFAULT_GGUF: &str =
-        "/Volumes/Extreme Pro/hf2q-models/google_gemma-4-31B-it-GGUF/\
+    const DEFAULT_GGUF: &str = "/Volumes/Extreme Pro/hf2q-models/google_gemma-4-31B-it-GGUF/\
          google_gemma-4-31B-it-Q4_K_M.gguf";
     const DEFAULT_DRAFTER: &str =
         "/Volumes/Extreme Pro/hf2q-models/RedHatAI-gemma-4-31B-it-speculator.eagle3/\
@@ -1393,7 +1403,11 @@ mod g4_cfa5_redhatai_smoke {
     fn resolve_path(env_var: &str, default: &str) -> Option<PathBuf> {
         let s = std::env::var(env_var).unwrap_or_else(|_| default.to_string());
         let p = PathBuf::from(s);
-        if p.is_file() { Some(p) } else { None }
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     /// AC-G4-5.1 — Layer A: drafter checkpoint load + GPU upload.
@@ -1445,7 +1459,10 @@ mod g4_cfa5_redhatai_smoke {
             4096,
             "drafter kv_proj_out must match RedHatAI's [4096, 10752] k/v_proj.weight first-dim"
         );
-        assert_eq!(drafter_cfg.hidden_size, 5376, "hidden_size matches o_proj.dim0");
+        assert_eq!(
+            drafter_cfg.hidden_size, 5376,
+            "hidden_size matches o_proj.dim0"
+        );
         assert_eq!(drafter_cfg.intermediate_size, 21504);
         assert_eq!(drafter_cfg.head_dim, 256);
         assert!(
@@ -1568,21 +1585,17 @@ mod g4_cfa5_redhatai_smoke {
             target_cfg.num_key_value_heads,
         );
         let mut progress = LoadProgress::new(false, 0, 0);
-        let target = match MlxModelWeights::load_from_gguf(
-            &gguf,
-            &target_cfg,
-            &mut gpu,
-            &mut progress,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "[g4_cfa5 LayerB SKIP] MlxModelWeights::load_from_gguf failed — this is \
+        let target =
+            match MlxModelWeights::load_from_gguf(&gguf, &target_cfg, &mut gpu, &mut progress) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "[g4_cfa5 LayerB SKIP] MlxModelWeights::load_from_gguf failed — this is \
                      the known dense-Gemma-4 loader gap blocking CFA-5b. Error: {e}"
-                );
-                return;
-            }
-        };
+                    );
+                    return;
+                }
+            };
         eprintln!(
             "[g4_cfa5 LayerB] target loaded: {} layers in {:.2}s",
             target.layers.len(),
@@ -1591,7 +1604,9 @@ mod g4_cfa5_redhatai_smoke {
 
         // ---- Drafter load (re-runs the Layer A path; cheap relative to target) ----
         let drafter_cfg = default_gemma4_eagle3_drafter_config(target_cfg.vocab_size as usize);
-        drafter_cfg.validate().expect("[g4_cfa5 LayerB] drafter cfg validate");
+        drafter_cfg
+            .validate()
+            .expect("[g4_cfa5 LayerB] drafter cfg validate");
         let drafter_file = Eagle3WeightsFile::open(&drafter_path)
             .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] open drafter safetensors: {e}"));
         let drafter_weights = Eagle3Weights::load(drafter_file.bytes(), &drafter_cfg)
@@ -1606,12 +1621,17 @@ mod g4_cfa5_redhatai_smoke {
         let tokenizer_path = {
             let dir = gguf_path.parent().expect("gguf_path has parent dir");
             let t = dir.join("tokenizer.json");
-            if t.is_file() { Some(t) } else { None }
+            if t.is_file() {
+                Some(t)
+            } else {
+                None
+            }
         };
         let (prompt_text, prompt_tokens): (String, Vec<u32>) = if let Some(ref tk) = tokenizer_path
         {
-            let tokenizer = tokenizers::Tokenizer::from_file(tk)
-                .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] load tokenizer {}: {e}", tk.display()));
+            let tokenizer = tokenizers::Tokenizer::from_file(tk).unwrap_or_else(|e| {
+                panic!("[g4_cfa5 LayerB] load tokenizer {}: {e}", tk.display())
+            });
             let text = "The capital city of France is".to_string();
             // ADR-038 G4-CFA-5e: route through the shared adapter that mirrors
             // llama.cpp's `common_tokenize` (auto-prepends BOS when GGUF declares
@@ -1619,7 +1639,9 @@ mod g4_cfa5_redhatai_smoke {
             // legacy post_processor template silently drops BOS → 240017 "額"
             // saturation. See src/core/tokenizer_adapter.rs.
             let tokens = crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
-                &gguf, &tokenizer, text.as_str(),
+                &gguf,
+                &tokenizer,
+                text.as_str(),
             )
             .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] tokenize_with_bos_eos: {e}"));
             (text, tokens)
@@ -1651,13 +1673,9 @@ mod g4_cfa5_redhatai_smoke {
             &eos,
             true,
         );
-        let mut orch = Gemma4Eagle3Orchestrator::new(
-            orch_cfg,
-            &drafter_cfg,
-            &drafter_tensors,
-            kv_capacity,
-        )
-        .expect("[g4_cfa5 LayerB] construct Gemma4Eagle3Orchestrator");
+        let mut orch =
+            Gemma4Eagle3Orchestrator::new(orch_cfg, &drafter_cfg, &drafter_tensors, kv_capacity)
+                .expect("[g4_cfa5 LayerB] construct Gemma4Eagle3Orchestrator");
 
         // ---- Prefill ----
         let t_prefill = Instant::now();
@@ -1910,13 +1928,8 @@ mod g4_cfa5_redhatai_smoke {
         let mut progress = LoadProgress::new(false, 0, 0);
 
         let t_load = Instant::now();
-        let weights = MlxModelWeights::load_from_gguf(
-            &gguf,
-            &cfg,
-            &mut gpu,
-            &mut progress,
-        )
-        .unwrap_or_else(|e| panic!("[g4_cfa5b] MlxModelWeights::load_from_gguf FAILED: {e}"));
+        let weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
+            .unwrap_or_else(|e| panic!("[g4_cfa5b] MlxModelWeights::load_from_gguf FAILED: {e}"));
         let load_secs = t_load.elapsed().as_secs_f64();
         eprintln!(
             "[g4_cfa5b] loader returned Ok: {} layers in {:.2}s",
@@ -1940,9 +1953,18 @@ mod g4_cfa5_redhatai_smoke {
             // The 4 always-present norms must have full hidden_size element count.
             for (name, buf) in &[
                 ("input_layernorm", &layer.norms.input_layernorm),
-                ("post_attention_layernorm", &layer.norms.post_attention_layernorm),
-                ("pre_feedforward_layernorm", &layer.norms.pre_feedforward_layernorm),
-                ("post_feedforward_layernorm", &layer.norms.post_feedforward_layernorm),
+                (
+                    "post_attention_layernorm",
+                    &layer.norms.post_attention_layernorm,
+                ),
+                (
+                    "pre_feedforward_layernorm",
+                    &layer.norms.pre_feedforward_layernorm,
+                ),
+                (
+                    "post_feedforward_layernorm",
+                    &layer.norms.post_feedforward_layernorm,
+                ),
             ] {
                 assert_eq!(
                     buf.element_count(),
@@ -1953,9 +1975,18 @@ mod g4_cfa5_redhatai_smoke {
             }
             // The 3 MoE-only norms must be 1-element placeholders.
             for (name, buf) in &[
-                ("pre_feedforward_layernorm_2", &layer.norms.pre_feedforward_layernorm_2),
-                ("post_feedforward_layernorm_1", &layer.norms.post_feedforward_layernorm_1),
-                ("post_feedforward_layernorm_2", &layer.norms.post_feedforward_layernorm_2),
+                (
+                    "pre_feedforward_layernorm_2",
+                    &layer.norms.pre_feedforward_layernorm_2,
+                ),
+                (
+                    "post_feedforward_layernorm_1",
+                    &layer.norms.post_feedforward_layernorm_1,
+                ),
+                (
+                    "post_feedforward_layernorm_2",
+                    &layer.norms.post_feedforward_layernorm_2,
+                ),
             ] {
                 assert_eq!(
                     buf.element_count(),
@@ -2024,13 +2055,21 @@ mod g4_cfa5_redhatai_smoke {
         let gguf = mlx_native::gguf::GgufFile::open(&gguf_path)
             .unwrap_or_else(|e| panic!("[g4_cfa5d] open: {e}"));
         let names = [
-            "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
             "blk.0.attn_output.weight",
-            "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
-            "blk.0.attn_norm.weight", "blk.0.ffn_norm.weight",
-            "blk.0.layer_output_scale.weight", "blk.5.layer_output_scale.weight",
-            "blk.0.post_attention_norm.weight", "blk.0.post_ffw_norm.weight",
-            "output.weight", "token_embd.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.attn_norm.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.layer_output_scale.weight",
+            "blk.5.layer_output_scale.weight",
+            "blk.0.post_attention_norm.weight",
+            "blk.0.post_ffw_norm.weight",
+            "output.weight",
+            "token_embd.weight",
         ];
         for name in names {
             match gguf.tensor_info(name) {
@@ -2056,7 +2095,11 @@ mod g4_cfa5_redhatai_smoke {
             match gguf.load_tensor_f32(&name, &dev) {
                 Ok(buf) => {
                     let s = buf.as_slice::<f32>().expect("as_slice");
-                    eprintln!("[g4_cfa5d] {name}: value={:?} (element_count={})", &s[..s.len().min(4)], s.len());
+                    eprintln!(
+                        "[g4_cfa5d] {name}: value={:?} (element_count={})",
+                        &s[..s.len().min(4)],
+                        s.len()
+                    );
                 }
                 Err(e) => eprintln!("[g4_cfa5d] {name}: load failed: {e}"),
             }
@@ -2080,16 +2123,22 @@ mod g4_cfa5_redhatai_smoke {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
             Some(p) => p,
-            None => { eprintln!("[g4_cfa5e-m SKIP] no GGUF"); return; }
+            None => {
+                eprintln!("[g4_cfa5e-m SKIP] no GGUF");
+                return;
+            }
         };
         let mut gpu = match GpuContext::new() {
             Ok(g) => g,
-            Err(e) => { eprintln!("[g4_cfa5e-m SKIP] no Metal: {e}"); return; }
+            Err(e) => {
+                eprintln!("[g4_cfa5e-m SKIP] no Metal: {e}");
+                return;
+            }
         };
         let gguf = mlx_native::gguf::GgufFile::open(&gguf_path)
             .unwrap_or_else(|e| panic!("[g4_cfa5e-m] open: {e}"));
-        let cfg = Gemma4Config::from_gguf(&gguf)
-            .unwrap_or_else(|e| panic!("[g4_cfa5e-m] cfg: {e}"));
+        let cfg =
+            Gemma4Config::from_gguf(&gguf).unwrap_or_else(|e| panic!("[g4_cfa5e-m] cfg: {e}"));
         let mut progress = LoadProgress::new(false, 0, 0);
         let weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
             .unwrap_or_else(|e| panic!("[g4_cfa5e-m] load: {e}"));
@@ -2129,8 +2178,14 @@ mod g4_cfa5_redhatai_smoke {
             ).expect("collector");
             let logits = weights
                 .forward_tree_verify_gpu_with_cache(
-                    &tokens, &mask, &positions, 0, kv_capacity,
-                    &mut gpu, &mut kv_caches, &mut collector,
+                    &tokens,
+                    &mask,
+                    &positions,
+                    0,
+                    kv_capacity,
+                    &mut gpu,
+                    &mut kv_caches,
+                    &mut collector,
                 )
                 .unwrap_or_else(|e| panic!("[g4_cfa5e-m] forward N={n}: {e}"));
             // Argmax of EVERY position (not just last) — if position 0
@@ -2140,13 +2195,19 @@ mod g4_cfa5_redhatai_smoke {
             eprintln!("[g4_cfa5e-m] N={n} per-position argmax:");
             for pos in 0..n {
                 let row = &logits[pos * vocab..(pos + 1) * vocab];
-                let (best_idx, best_val) = row
-                    .iter()
-                    .enumerate()
-                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                        if v > bv { (i, v) } else { (bi, bv) }
-                    });
-                let decoded = tokenizer.decode(&[best_idx as u32], true).unwrap_or_else(|_| "?".to_string());
+                let (best_idx, best_val) = row.iter().enumerate().fold(
+                    (0usize, f32::NEG_INFINITY),
+                    |(bi, bv), (i, &v)| {
+                        if v > bv {
+                            (i, v)
+                        } else {
+                            (bi, bv)
+                        }
+                    },
+                );
+                let decoded = tokenizer
+                    .decode(&[best_idx as u32], true)
+                    .unwrap_or_else(|_| "?".to_string());
                 eprintln!(
                     "[g4_cfa5e-m]   pos={pos} argmax={best_idx} val={best_val:.3} decoded={decoded:?}"
                 );
@@ -2185,8 +2246,7 @@ mod g4_cfa5_redhatai_smoke {
         };
         let gguf = mlx_native::gguf::GgufFile::open(&gguf_path)
             .unwrap_or_else(|e| panic!("[g4_cfa5e] open: {e}"));
-        let cfg = Gemma4Config::from_gguf(&gguf)
-            .unwrap_or_else(|e| panic!("[g4_cfa5e] cfg: {e}"));
+        let cfg = Gemma4Config::from_gguf(&gguf).unwrap_or_else(|e| panic!("[g4_cfa5e] cfg: {e}"));
         let mut progress = LoadProgress::new(false, 0, 0);
         let mut weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
             .unwrap_or_else(|e| panic!("[g4_cfa5e] load: {e}"));
@@ -2207,7 +2267,8 @@ mod g4_cfa5_redhatai_smoke {
         // Production prefill (forward_prefill, NOT forward_tree_verify_gpu_with_cache).
         let max_decode_tokens = 1usize;
         let t_prefill = std::time::Instant::now();
-        let last_token = match weights.forward_prefill(&prompt_tokens, max_decode_tokens, &mut gpu) {
+        let last_token = match weights.forward_prefill(&prompt_tokens, max_decode_tokens, &mut gpu)
+        {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();

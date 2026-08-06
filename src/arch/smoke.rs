@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use super::conformance::{
     EXIT_HF2Q_BINARY_NOT_RELEASE, EXIT_HF_REPO_UNRESOLVABLE, EXIT_HF_TOKEN_MISSING,
-    EXIT_INSUFFICIENT_DISK, EXIT_LLAMA_CLI_MISSING, EXIT_OK,
-    EXIT_SMOKE_ASSERTION_FAILED, EXIT_UNKNOWN_ARCH,
+    EXIT_INSUFFICIENT_DISK, EXIT_LLAMA_CLI_MISSING, EXIT_OK, EXIT_SMOKE_ASSERTION_FAILED,
+    EXIT_UNKNOWN_ARCH,
 };
 use super::registry::{ArchEntry, ArchRegistry};
 
@@ -202,14 +202,15 @@ pub fn preflight_full(
             Path::new("/opt/llama.cpp/build/bin/llama-cli"),
             Path::new("/usr/local/bin/llama-cli"),
         ];
-        let has_llama_cli = llama_cli_candidates.iter().any(|p| p.is_file())
-            || env.which("llama-cli").is_some();
+        let has_llama_cli =
+            llama_cli_candidates.iter().any(|p| p.is_file()) || env.which("llama-cli").is_some();
         if !has_llama_cli {
             return Err((
                 EXIT_LLAMA_CLI_MISSING,
                 "llama-cli not found (looked in /opt/llama.cpp/build/bin/, PATH). \
                  Build llama.cpp or install to /usr/local/bin/, or pass \
-                 --llama-cli-override <path>.".into(),
+                 --llama-cli-override <path>."
+                    .into(),
             ));
         }
     }
@@ -219,7 +220,8 @@ pub fn preflight_full(
         return Err((
             EXIT_HF2Q_BINARY_NOT_RELEASE,
             "hf2q smoke requires a release build. Run via `cargo run --release -- smoke ...` \
-             or install the release binary.".into(),
+             or install the release binary."
+                .into(),
         ));
     }
 
@@ -229,7 +231,10 @@ pub fn preflight_full(
             if !env.resolve_hf_repo(repo) {
                 return Err((
                     EXIT_HF_REPO_UNRESOLVABLE,
-                    format!("HF repo {:?} unresolvable (no access or does not exist)", repo),
+                    format!(
+                        "HF repo {:?} unresolvable (no access or does not exist)",
+                        repo
+                    ),
                 ));
             }
         }
@@ -258,10 +263,20 @@ pub fn preflight_with_local(
 /// smoke --json` can render them without string-parsing.
 #[derive(Debug, Clone)]
 pub enum SmokeOutcome {
-    Pass { transcript_path: PathBuf },
-    PreflightFailed { exit_code: u8, reason: String },
-    UnknownArch { requested: String, known: Vec<&'static str> },
-    Skipped { reason: String },
+    Pass {
+        transcript_path: PathBuf,
+    },
+    PreflightFailed {
+        exit_code: u8,
+        reason: String,
+    },
+    UnknownArch {
+        requested: String,
+        known: Vec<&'static str>,
+    },
+    Skipped {
+        reason: String,
+    },
 }
 
 impl SmokeOutcome {
@@ -419,23 +434,17 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
 /// looking at empty stderr. The transcript itself is bounded
 /// (`-n 8`) so the log volume stays small without requiring
 /// suppression.
-fn run_q4_0_pipeline(
-    entry: &ArchEntry,
-    args: &SmokeArgs,
-) -> Result<PathBuf, String> {
+fn run_q4_0_pipeline(entry: &ArchEntry, args: &SmokeArgs) -> Result<PathBuf, String> {
     use std::process::Command;
 
-    let input_dir = args
-        .local_dir
-        .clone()
-        .ok_or_else(|| {
-            format!(
-                "non-local smoke path (HF download) is not shipped in this commit; \
+    let input_dir = args.local_dir.clone().ok_or_else(|| {
+        format!(
+            "non-local smoke path (HF download) is not shipped in this commit; \
                  pass --local-dir <path> to convert a pre-downloaded safetensors dir \
                  for arch {}.",
-                entry.arch
-            )
-        })?;
+            entry.arch
+        )
+    })?;
     if !input_dir.exists() {
         return Err(format!("--local-dir {:?} does not exist", input_dir));
     }
@@ -450,8 +459,7 @@ fn run_q4_0_pipeline(
     let gguf_path = keep_dir.join(format!("{}-{}.gguf", entry.arch, args.quant));
 
     if !args.skip_convert {
-        let hf2q_exe = std::env::current_exe()
-            .map_err(|e| format!("locate hf2q binary: {}", e))?;
+        let hf2q_exe = std::env::current_exe().map_err(|e| format!("locate hf2q binary: {}", e))?;
         let convert_args = build_convert_args(args, entry, &input_dir, &gguf_path)?;
         let convert_out = Command::new(&hf2q_exe)
             .args(&convert_args)
@@ -580,10 +588,7 @@ fn run_q4_0_pipeline(
     // n_eval check.
     if let Some(n_eval) = super::conformance::extract_n_eval(&combined_stderr) {
         if n_eval != 8 {
-            return Err(format!(
-                "llama-cli produced {} tokens, expected 8",
-                n_eval
-            ));
+            return Err(format!("llama-cli produced {} tokens, expected 8", n_eval));
         }
     } else {
         // Not every llama-cli build prints the timings block; treat
@@ -671,9 +676,8 @@ fn sanitize_timestamps(s: &str) -> String {
             // If followed by `.<digit>`, swallow the decimal part,
             // remove any whitespace already pushed onto out (the
             // width-padding leading spaces), and emit the placeholder.
-            let has_decimal = i + 1 < bytes.len()
-                && bytes[i] == b'.'
-                && bytes[i + 1].is_ascii_digit();
+            let has_decimal =
+                i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit();
             if has_decimal {
                 i += 1; // dot
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -807,10 +811,7 @@ pub fn print_dry_run_report(entry: &ArchEntry, args: &SmokeArgs) {
         entry.disk_floor_gb,
         entry.disk_floor_gb + 10
     );
-    println!(
-        "  hf_architectures:  {}",
-        entry.hf_architectures.join(", ")
-    );
+    println!("  hf_architectures:  {}", entry.hf_architectures.join(", "));
     println!("  hf_repos:          {}", entry.hf_repos.join(", "));
     println!(
         "  tensor_catalog:    {} template entries",
@@ -862,7 +863,10 @@ pub fn render_outcome(outcome: &SmokeOutcome) -> String {
             format!("hf2q smoke: pass → {}", transcript_path.display())
         }
         SmokeOutcome::PreflightFailed { exit_code, reason } => {
-            format!("hf2q smoke: preflight failed (exit {}): {}", exit_code, reason)
+            format!(
+                "hf2q smoke: preflight failed (exit {}): {}",
+                exit_code, reason
+            )
         }
         SmokeOutcome::UnknownArch { requested, known } => format!(
             "hf2q smoke: unknown arch {:?}; known arches: {}",
@@ -904,13 +908,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cache_dir = tmp.path().join(".cache/huggingface");
         std::fs::create_dir_all(&cache_dir).expect("mkdir");
-        std::fs::write(cache_dir.join("token"), "hf_cached_token_xyz\n")
-            .expect("write token");
+        std::fs::write(cache_dir.join("token"), "hf_cached_token_xyz\n").expect("write token");
 
         std::env::remove_var("HF_TOKEN");
         std::env::set_var("HOME", tmp.path());
 
-        let env = RealSmokeEnv { convert_dir: tmp.path().to_path_buf() };
+        let env = RealSmokeEnv {
+            convert_dir: tmp.path().to_path_buf(),
+        };
         let resolved = env.hf_token();
         assert_eq!(resolved.as_deref(), Some("hf_cached_token_xyz"));
 
@@ -948,7 +953,9 @@ mod tests {
         std::env::remove_var("HF_TOKEN");
         std::env::set_var("HOME", tmp.path());
 
-        let env = RealSmokeEnv { convert_dir: tmp.path().to_path_buf() };
+        let env = RealSmokeEnv {
+            convert_dir: tmp.path().to_path_buf(),
+        };
         assert_eq!(env.hf_token(), None);
 
         match prev_token {
@@ -1049,9 +1056,9 @@ mod tests {
                     "error must explain the missing-dir condition, got: {reason}"
                 );
             }
-            other => panic!(
-                "expected PreflightFailed with EXIT_SMOKE_ASSERTION_FAILED, got: {other:?}"
-            ),
+            other => {
+                panic!("expected PreflightFailed with EXIT_SMOKE_ASSERTION_FAILED, got: {other:?}")
+            }
         }
     }
 
@@ -1357,7 +1364,10 @@ mod tests {
         // load-bearing property for Decision 16's byte-identical AC.
         let stderr_a = "eval time =     58.90 ms /     8 runs   (    8.41 ms per token,   118.85 tokens per second)\n";
         let stderr_b = "eval time =     67.12 ms /     8 runs   (    9.55 ms per token,   119.20 tokens per second)\n";
-        assert_ne!(stderr_a, stderr_b, "raw inputs must differ for the test to be meaningful");
+        assert_ne!(
+            stderr_a, stderr_b,
+            "raw inputs must differ for the test to be meaningful"
+        );
         assert_eq!(
             sanitize_timestamps(stderr_a),
             sanitize_timestamps(stderr_b),
@@ -1377,13 +1387,8 @@ mod tests {
     fn build_convert_args_uses_convert_surface() {
         let args = args_for("qwen35", "q4_0");
         let entry = ArchRegistry::global().get("qwen35").unwrap();
-        let convert_args = build_convert_args(
-            &args,
-            entry,
-            Path::new("/in"),
-            Path::new("/out.gguf"),
-        )
-        .unwrap();
+        let convert_args =
+            build_convert_args(&args, entry, Path::new("/in"), Path::new("/out.gguf")).unwrap();
         assert_eq!(
             convert_args.first().map(|s| s.as_str()),
             Some("convert"),
@@ -1429,13 +1434,8 @@ mod tests {
         let mut args = args_for("qwen35", "q4_0");
         args.with_vision = true;
         let entry = ArchRegistry::global().get("qwen35").unwrap();
-        let convert_args = build_convert_args(
-            &args,
-            entry,
-            Path::new("/in"),
-            Path::new("/out.gguf"),
-        )
-        .unwrap();
+        let convert_args =
+            build_convert_args(&args, entry, Path::new("/in"), Path::new("/out.gguf")).unwrap();
         assert!(
             !convert_args.iter().any(|a| a == "--emit-vision-tower"),
             "convert has no --emit-vision-tower flag; got {:?}",

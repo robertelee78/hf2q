@@ -68,8 +68,7 @@ const READYZ_BUDGET: Duration = Duration::from_secs(180);
 /// the prompt length out of the danger zone (e.g., into the safe zone
 /// where tail ≥ 16), the test will report `chunked engaged` and fail
 /// — that's a legitimate signal to update the prompt.
-const PROMPT: &str =
-    "Write a detailed essay describing the four seasons in temperate climates. \
+const PROMPT: &str = "Write a detailed essay describing the four seasons in temperate climates. \
      Cover spring with its blossoming flowers and warming temperatures, summer \
      with long sunny days and outdoor activities, autumn with falling leaves \
      and harvest festivals, and winter with snow and shorter daylight hours. \
@@ -121,16 +120,14 @@ impl Drop for ServerGuard {
 
 impl ServerGuard {
     fn log_tail(&self) -> Vec<String> {
-        self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
-fn spawn_server(
-    bin: &Path,
-    model: &Path,
-    port: u16,
-    extra_envs: &[(&str, &str)],
-) -> ServerGuard {
+fn spawn_server(bin: &Path, model: &Path, port: u16, extra_envs: &[(&str, &str)]) -> ServerGuard {
     let mut cmd = Command::new(bin);
     cmd.args([
         "serve",
@@ -192,9 +189,9 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()
@@ -374,9 +371,7 @@ fn phase_b4_danger_zone_bypass_byte_identity() {
         .find(|l| l.contains("chunked prefill"))
         .cloned()
         .unwrap_or_default();
-    eprintln!(
-        "[Phase B.4→B.5] post-B.5 engagement: {chunked_line}"
-    );
+    eprintln!("[Phase B.4→B.5] post-B.5 engagement: {chunked_line}");
 
     drop(server_a);
 

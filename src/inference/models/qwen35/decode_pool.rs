@@ -83,9 +83,7 @@ pub fn pooled_alloc_buffer(
     dtype: DType,
     shape: Vec<usize>,
 ) -> std::result::Result<MlxBuffer, mlx_native::MlxError> {
-    DECODE_POOL.with(|cell| {
-        cell.borrow_mut().alloc(device, byte_len, dtype, shape)
-    })
+    DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))
 }
 
 /// Reset the thread-local decode pool — moves every buffer handed out
@@ -259,8 +257,8 @@ mod tests {
 
         // Cycle 1: alloc, locals drop, reset.
         let ptr_a = {
-            let buf = pooled_alloc_buffer(&device, 1024, DType::F32, vec![256])
-                .expect("cycle 1 alloc");
+            let buf =
+                pooled_alloc_buffer(&device, 1024, DType::F32, vec![256]).expect("cycle 1 alloc");
             buf.contents_ptr()
         };
         assert!(decode_pool_in_use_count() >= 1);
@@ -269,10 +267,12 @@ mod tests {
         assert_eq!(decode_pool_in_use_count(), 0);
 
         // Cycle 2: same bucket size must reuse the cycle-1 metal buffer.
-        let buf = pooled_alloc_buffer(&device, 1024, DType::F32, vec![256])
-            .expect("cycle 2 alloc");
+        let buf = pooled_alloc_buffer(&device, 1024, DType::F32, vec![256]).expect("cycle 2 alloc");
         let ptr_b = buf.contents_ptr();
-        assert_eq!(ptr_b, ptr_a, "thread-local pool must reuse Metal buffer across reset");
+        assert_eq!(
+            ptr_b, ptr_a,
+            "thread-local pool must reuse Metal buffer across reset"
+        );
 
         reset_decode_pool();
     }

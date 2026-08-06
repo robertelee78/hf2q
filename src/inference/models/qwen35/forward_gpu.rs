@@ -42,14 +42,13 @@ use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use std::sync::OnceLock;
 
-use crate::core::traits::activation_capture::LayerActivations;
 use super::delta_net::DeltaNetLayerShape;
 use super::encoder_stage::LayerEncoder;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
-    build_delta_net_layer, build_delta_net_layer_decode_into,
-    build_delta_net_layer_with_arena, DeltaNetWeightsGpu,
+    build_delta_net_layer, build_delta_net_layer_decode_into, build_delta_net_layer_with_arena,
+    DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
@@ -67,6 +66,7 @@ use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use super::Qwen35Config;
+use crate::core::traits::activation_capture::LayerActivations;
 // ADR-040 Phase B4a (2026-05-23) — multi-seq slot identity threaded
 // through the public prefill surface. `SlotId(0)` preserves byte-
 // equivalence with the pre-ADR-040 single-seq path; `SlotId(N>0)`
@@ -257,7 +257,9 @@ enum OutputHeadMode {
     /// the actual (indices, values) pair is stashed via the
     /// `topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>` out
     /// parameter that the caller threads in.
-    TopK { k: u32 },
+    TopK {
+        k: u32,
+    },
 }
 
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
@@ -580,12 +582,12 @@ fn embed_tokens_gpu_with_soft_tokens(
 
     // Overwrite per-position rows for every soft-token range.
     for st in soft_tokens.iter() {
-        let src: &[f32] = st.embeddings
-            .as_slice::<f32>()
-            .map_err(|e| anyhow!(
+        let src: &[f32] = st.embeddings.as_slice::<f32>().map_err(|e| {
+            anyhow!(
                 "embed_tokens_gpu_with_soft_tokens: override slice (range {:?}): {e}",
                 st.range
-            ))?;
+            )
+        })?;
         for (row_idx, p) in st.range.clone().enumerate() {
             let src_off = row_idx * h;
             let dst_off = p * h;
@@ -1031,13 +1033,9 @@ fn apply_output_head_gpu_into_topk(
         vec![top_k as usize],
     )
     .map_err(|e| anyhow!("alloc top_k out_values: {e}"))?;
-    let mut params_buf = super::decode_pool::pooled_alloc_buffer(
-        device,
-        8,
-        DType::U32,
-        vec![2usize],
-    )
-    .map_err(|e| anyhow!("alloc top_k params: {e}"))?;
+    let mut params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 8, DType::U32, vec![2usize])
+            .map_err(|e| anyhow!("alloc top_k params: {e}"))?;
     {
         let s = params_buf
             .as_mut_slice::<u32>()
@@ -1998,7 +1996,9 @@ impl Qwen35Model {
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
-        dflash_capture: Option<&mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
+        dflash_capture: Option<
+            &mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+        >,
         // ADR-040 Phase B4d (2026-05-30, this iter): dflash variant
         // now accepts `slot_id` (was hard-coded SlotId(0) per B4a /
         // B4d deferral).  `SlotId(0)` is byte-identical to pre-B4d
@@ -2012,12 +2012,7 @@ impl Qwen35Model {
             // ADR-040 Phase B4d (2026-05-30): dflash variant now
             // routes `slot_id` verbatim through the dflash-None
             // fallthrough (was hard-coded SlotId(0) per B4a deferral).
-            return self.forward_gpu_with_hidden(
-                tokens,
-                positions_flat,
-                kv_cache,
-                slot_id,
-            );
+            return self.forward_gpu_with_hidden(tokens, positions_flat, kv_cache, slot_id);
         };
         // Validate session layout matches this forward call before
         // running the (expensive) forward — fail fast.
@@ -2139,9 +2134,7 @@ impl Qwen35Model {
         // observe panics.
         let h = cfg.hidden_size as usize;
         if h == 0 {
-            return Err(anyhow!(
-                "embed_tokens_gpu: cfg.hidden_size must be > 0"
-            ));
+            return Err(anyhow!("embed_tokens_gpu: cfg.hidden_size must be > 0"));
         }
         if self.token_embd.len() % h != 0 {
             return Err(anyhow!(
@@ -2158,9 +2151,7 @@ impl Qwen35Model {
         // valid special tokens don't false-fail.
         let embed_vocab = self.token_embd.len() / h;
         if embed_vocab == 0 {
-            return Err(anyhow!(
-                "embed_tokens_gpu: token_embd is empty (vocab=0)"
-            ));
+            return Err(anyhow!("embed_tokens_gpu: token_embd is empty (vocab=0)"));
         }
         for (i, &tok) in tokens.iter().enumerate() {
             if (tok as usize) >= embed_vocab {
@@ -2174,7 +2165,13 @@ impl Qwen35Model {
         }
         self.ensure_gpu_cache_primed()?;
         self.with_gpu_cache_mut(|device, _reg| {
-            embed_tokens_gpu(tokens, &self.token_embd, cfg.vocab_size, cfg.hidden_size, device)
+            embed_tokens_gpu(
+                tokens,
+                &self.token_embd,
+                cfg.vocab_size,
+                cfg.hidden_size,
+                device,
+            )
         })
     }
 
@@ -2692,9 +2689,7 @@ impl Qwen35Model {
                 }
             }
             // Every chunk must carry n_image_tokens * hidden F32 bytes.
-            let chunk_bytes_required = n_image
-                .saturating_mul(h as usize)
-                .saturating_mul(4);
+            let chunk_bytes_required = n_image.saturating_mul(h as usize).saturating_mul(4);
             for (i, c) in ds.chunks.iter().enumerate() {
                 let span = c.byte_len().saturating_sub(c.byte_offset() as usize);
                 if span < chunk_bytes_required {
@@ -2778,7 +2773,12 @@ impl Qwen35Model {
                 .context("embed_tokens_gpu")?
         } else {
             embed_tokens_gpu_with_soft_tokens(
-                tokens, &self.token_embd, cfg.vocab_size, h, soft_tokens, &device,
+                tokens,
+                &self.token_embd,
+                cfg.vocab_size,
+                h,
+                soft_tokens,
+                &device,
             )
             .context("embed_tokens_gpu_with_soft_tokens")?
         };
@@ -2825,12 +2825,18 @@ impl Qwen35Model {
         // Skip when the model has no FullAttn layers: defensive — avoids a zero-
         // useful arena allocation when running DN-only models.
         let mut fa_arena: Option<super::FaPrefillArena> = if seq_len > 1
-            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
+            && layer_weights_gpu
+                .iter()
+                .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
         {
             let shape = FullAttnShape::from_config(cfg);
             Some(
                 super::FaPrefillArena::new(
-                    &device, seq_len, shape.n_head, shape.n_kv, shape.head_dim,
+                    &device,
+                    seq_len,
+                    shape.n_head,
+                    shape.n_kv,
+                    shape.head_dim,
                 )
                 .context("alloc FaPrefillArena")?,
             )
@@ -2862,7 +2868,9 @@ impl Qwen35Model {
         // Skip when the model has no FullAttn layers: defensive — avoids a
         // zero-useful arena allocation when running DN-only models.
         let mut fa_proj_arena: Option<super::FaProjectionsArena> = if seq_len > 1
-            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
+            && layer_weights_gpu
+                .iter()
+                .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
         {
             let shape = FullAttnShape::from_config(cfg);
             Some(
@@ -2983,7 +2991,9 @@ impl Qwen35Model {
             .any(|s| s.capture_states.is_some());
         let mut dn_prefill_arena: Option<super::DnPrefillArena> = if seq_len > 1
             && !la_capture_active
-            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
+            && layer_weights_gpu
+                .iter()
+                .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
         {
             let dn_shape = DeltaNetLayerShape::from_config(cfg);
             Some(
@@ -3025,26 +3035,24 @@ impl Qwen35Model {
         // Decode (`seq_len == 1`) keeps the existing per-call
         // `device.alloc_buffer` shape (decode never engages the
         // multi-layer race surface — each token is its own GPU sync).
-        let mut dense_ffn_output_ring: Option<super::DenseFfnOutputRingBuffer> = if seq_len > 1
-            && cfg.intermediate_size.is_some()
-        {
-            Some(
-                super::DenseFfnOutputRingBuffer::new(&device, seq_len, h)
-                    .context("alloc DenseFfnOutputRingBuffer")?,
-            )
-        } else {
-            None
-        };
-        let mut moe_ffn_output_ring: Option<super::MoeFfnOutputRingBuffer> = if seq_len > 1
-            && cfg.moe.is_some()
-        {
-            Some(
-                super::MoeFfnOutputRingBuffer::new(&device, seq_len, h)
-                    .context("alloc MoeFfnOutputRingBuffer")?,
-            )
-        } else {
-            None
-        };
+        let mut dense_ffn_output_ring: Option<super::DenseFfnOutputRingBuffer> =
+            if seq_len > 1 && cfg.intermediate_size.is_some() {
+                Some(
+                    super::DenseFfnOutputRingBuffer::new(&device, seq_len, h)
+                        .context("alloc DenseFfnOutputRingBuffer")?,
+                )
+            } else {
+                None
+            };
+        let mut moe_ffn_output_ring: Option<super::MoeFfnOutputRingBuffer> =
+            if seq_len > 1 && cfg.moe.is_some() {
+                Some(
+                    super::MoeFfnOutputRingBuffer::new(&device, seq_len, h)
+                        .context("alloc MoeFfnOutputRingBuffer")?,
+                )
+            } else {
+                None
+            };
 
         // ---- ADR-019 Phase 2 iter90b H4b: LayerBoundaryArena allocation ----
         //
@@ -3106,21 +3114,20 @@ impl Qwen35Model {
         // opens its own owned `CommandEncoder` (Plain variant) — byte-
         // identical to pre-iter91 behavior.  AC-1 regression test PASS
         // is the empirical guard.
-        let mut layer_session: Option<mlx_native::EncoderSession> = if seq_len > 1
-            && super::encoder_stage::LayerEncoder::env_enabled()
-        {
-            Some(
-                device
-                    .encoder_session()
-                    .context("alloc layer_session for borrowed-session multi-stage chain")?
-                    .expect(
-                        "LayerEncoder::env_enabled() == true ⇒ \
+        let mut layer_session: Option<mlx_native::EncoderSession> =
+            if seq_len > 1 && super::encoder_stage::LayerEncoder::env_enabled() {
+                Some(
+                    device
+                        .encoder_session()
+                        .context("alloc layer_session for borrowed-session multi-stage chain")?
+                        .expect(
+                            "LayerEncoder::env_enabled() == true ⇒ \
                          MlxDevice::encoder_session() returns Some(_)",
-                    ),
-            )
-        } else {
-            None
-        };
+                        ),
+                )
+            } else {
+                None
+            };
 
         // ---- ADR-015 iter78: ChunkAllocsArena allocation ----
         //
@@ -3149,7 +3156,9 @@ impl Qwen35Model {
         // config — sums to ~270 MB across the 7 slots, well within M5
         // Max 128 GB unified memory.
         let mut chunk_allocs_arena: Option<super::ChunkAllocsArena> = if seq_len > 1
-            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
+            && layer_weights_gpu
+                .iter()
+                .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
         {
             let dn_shape = DeltaNetLayerShape::from_config(cfg);
             Some(
@@ -3356,9 +3365,8 @@ impl Qwen35Model {
         // membership in the storage Arc) so pushing it into this Vec is
         // harmless but unnecessary — for code uniformity, both layer
         // kinds push.
-        let mut attn_out_holds: Vec<MlxBuffer> = Vec::with_capacity(
-            ffn_terminal_k_batch.max(1) as usize,
-        );
+        let mut attn_out_holds: Vec<MlxBuffer> =
+            Vec::with_capacity(ffn_terminal_k_batch.max(1) as usize);
 
         // ADR-015 iter95 — K-batch hold-vec for the per-layer `hidden`
         // ARC clone.
@@ -3413,9 +3421,8 @@ impl Qwen35Model {
         // — the Arc clone is sub-µs and the Vec drop on the env=0 path
         // happens at K-boundary like attn_out_holds.  Env=0 was already
         // byte-identical to baseline at all K values per iter93 K-ladder.
-        let mut hidden_holds: Vec<MlxBuffer> = Vec::with_capacity(
-            ffn_terminal_k_batch.max(1) as usize,
-        );
+        let mut hidden_holds: Vec<MlxBuffer> =
+            Vec::with_capacity(ffn_terminal_k_batch.max(1) as usize);
 
         // ADR-015 iter94 Task #3 — install layer_session as the
         // dump_bisect drainer so `flush_gpu` (called by every dump call
@@ -3488,8 +3495,7 @@ impl Qwen35Model {
             // case (typically 4 of 64 layers).
             if let Some(ref mut acts) = capture {
                 if acts.is_target_layer(layer_idx) {
-                    let f32_data = download_f32(&hidden)
-                        .context("capture layer_input download")?;
+                    let f32_data = download_f32(&hidden).context("capture layer_input download")?;
                     acts.layer_inputs.push(f32_data);
                 } else {
                     acts.layer_inputs.push(Vec::new());
@@ -3544,7 +3550,11 @@ impl Qwen35Model {
                         // `out_seq` Arc-clone into it before the
                         // function-local binding falls out of scope.
                         // See attn_out_holds doc above (~line 2640).
-                        if seq_len > 1 { Some(&mut attn_out_holds) } else { None },
+                        if seq_len > 1 {
+                            Some(&mut attn_out_holds)
+                        } else {
+                            None
+                        },
                         // iter91: thread the borrowed session into the
                         // FA helper.  `as_mut()` re-borrows the
                         // `Option<EncoderSession>` for this call's
@@ -3665,9 +3675,7 @@ impl Qwen35Model {
                             // per-slot region via the helper's slice_view.
                             slot_id,
                         )
-                        .with_context(|| {
-                            format!("delta_net_with_arena layer {layer_idx}")
-                        })?
+                        .with_context(|| format!("delta_net_with_arena layer {layer_idx}"))?
                     } else {
                         // ADR-034 task #90 Step 3 (2026-05-21) — when the
                         // current LA slot has capture_states allocated
@@ -3682,7 +3690,10 @@ impl Qwen35Model {
                             Option<&MlxBuffer>,
                         ) = if linear_slot_idx != usize::MAX {
                             let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (slot.capture_states.as_ref(), slot.conv_capture_states.as_ref())
+                            (
+                                slot.capture_states.as_ref(),
+                                slot.conv_capture_states.as_ref(),
+                            )
                         } else {
                             (None, None)
                         };
@@ -3863,11 +3874,9 @@ impl Qwen35Model {
             // / §5.2).
             let (ffn_input_buf, ffn_residual_buf) =
                 if let Some(arena) = layer_boundary_arena.as_ref() {
-                    arena
-                        .validate_fits(seq_len, h)
-                        .with_context(|| {
-                            format!("LayerBoundaryArena shape mismatch layer {layer_idx}")
-                        })?;
+                    arena.validate_fits(seq_len, h).with_context(|| {
+                        format!("LayerBoundaryArena shape mismatch layer {layer_idx}")
+                    })?;
                     (arena.ffn_input_buf.clone(), arena.ffn_residual_buf.clone())
                 } else {
                     let ffn_input_buf = device
@@ -3904,11 +3913,8 @@ impl Qwen35Model {
                 // (carry_into_next_stage / commit_and_wait_labeled /
                 // commit_unlabeled), allowing the next layer's FA helper
                 // to re-borrow `layer_session.as_mut()`.
-                let mut enc = LayerEncoder::from_session_or_plain(
-                    &device,
-                    layer_session.as_mut(),
-                )
-                .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
+                let mut enc = LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
+                    .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
                 dispatch_fused_residual_norm_f32(
                     enc.encoder(),
                     &mut registry,
@@ -4079,10 +4085,7 @@ impl Qwen35Model {
                         // in flight.  Both `dense_ffn_arena` and
                         // `dense_ffn_output_ring` are Some at prefill
                         // (`seq_len > 1`); both None at decode.
-                        let out = match (
-                            dense_ffn_arena.as_mut(),
-                            dense_ffn_output_ring.as_mut(),
-                        ) {
+                        let out = match (dense_ffn_arena.as_mut(), dense_ffn_output_ring.as_mut()) {
                             (Some(arena), Some(ring)) => {
                                 let out_slot = ring.slot_mut(layer_idx as u32);
                                 build_dense_ffn_layer_gpu_q_into_with_arena(
@@ -4107,9 +4110,7 @@ impl Qwen35Model {
                                 w,
                                 Some(&ffn_residual),
                             )
-                            .with_context(|| {
-                                format!("dense_ffn_q_into fused layer {layer_idx}")
-                            })?,
+                            .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?,
                         };
                         if seq_len == 1 {
                             // Decode path (DROP_SITE per spec §1.1).
@@ -4133,17 +4134,17 @@ impl Qwen35Model {
                             // so under env=1 the held branch is structurally
                             // unreachable. The assert keeps the invariant
                             // visible to future readers.
-                            if phase1_fusion_env_eligible
-                                && (layer_idx + 1) == n_layers
-                            {
+                            if phase1_fusion_env_eligible && (layer_idx + 1) == n_layers {
                                 debug_assert!(
                                     !LayerEncoder::env_enabled(),
                                     "phase1_fusion_env_eligible must be false under env=1 (iter90 OQ2)"
                                 );
-                                let plain_enc = enc.try_into_inner_command_encoder()
-                                    .unwrap_or_else(|_| unreachable!(
+                                let plain_enc =
+                                    enc.try_into_inner_command_encoder().unwrap_or_else(|_| {
+                                        unreachable!(
                                         "phase1_fusion_env_eligible ⇒ env=0 ⇒ LayerEncoder::Plain"
-                                    ));
+                                    )
+                                    });
                                 last_layer_held_enc = Some(plain_enc);
                             } else {
                                 // K-boundary TERMINAL — drain the GPU.
@@ -4171,9 +4172,10 @@ impl Qwen35Model {
                             //   that achieves factor-2x CB-count reduction
                             //   (proven structurally by
                             //   /opt/mlx-native/tests/encoder_session_cb_count_smoke.rs).
-                            enc.carry_into_next_stage("layer.dense_ffn").with_context(|| {
-                                format!("carry DenseQ intra-K layer {layer_idx}")
-                            })?;
+                            enc.carry_into_next_stage("layer.dense_ffn")
+                                .with_context(|| {
+                                    format!("carry DenseQ intra-K layer {layer_idx}")
+                                })?;
                         }
                         out
                     };
@@ -4273,9 +4275,7 @@ impl Qwen35Model {
                             Some(&ffn_residual),
                             layer_idx,
                         )
-                        .with_context(|| {
-                            format!("moe_ffn_q_into fused layer {layer_idx}")
-                        })?,
+                        .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?,
                     };
                     if seq_len == 1 {
                         // Decode path (DROP_SITE per spec §1.1).
@@ -4287,23 +4287,21 @@ impl Qwen35Model {
                         // ADR-019 Phase 2 iter90 OQ2: phase1_fusion_env_eligible
                         // is gated on !LayerEncoder::env_enabled(); held branch
                         // is structurally unreachable under env=1.
-                        if phase1_fusion_env_eligible
-                            && (layer_idx + 1) == n_layers
-                        {
+                        if phase1_fusion_env_eligible && (layer_idx + 1) == n_layers {
                             debug_assert!(
                                 !LayerEncoder::env_enabled(),
                                 "phase1_fusion_env_eligible must be false under env=1 (iter90 OQ2)"
                             );
-                            let plain_enc = enc.try_into_inner_command_encoder()
-                                .unwrap_or_else(|_| unreachable!(
-                                    "phase1_fusion_env_eligible ⇒ env=0 ⇒ LayerEncoder::Plain"
-                                ));
+                            let plain_enc =
+                                enc.try_into_inner_command_encoder().unwrap_or_else(|_| {
+                                    unreachable!(
+                                        "phase1_fusion_env_eligible ⇒ env=0 ⇒ LayerEncoder::Plain"
+                                    )
+                                });
                             last_layer_held_enc = Some(plain_enc);
                         } else {
                             enc.commit_and_wait_labeled("layer.moe_ffn")
-                                .with_context(|| {
-                                    format!("commit fused-MoeQ layer {layer_idx}")
-                                })?;
+                                .with_context(|| format!("commit fused-MoeQ layer {layer_idx}"))?;
                         }
                     } else {
                         // ADR-013 P20: K-batched FFN intra-K terminal — commit
@@ -4322,9 +4320,8 @@ impl Qwen35Model {
                         // keeping the CB open for the next layer's FA / DN
                         // helper to encode into the same persistent compute
                         // encoder.
-                        enc.carry_into_next_stage("layer.moe_ffn").with_context(|| {
-                            format!("carry MoeQ intra-K layer {layer_idx}")
-                        })?;
+                        enc.carry_into_next_stage("layer.moe_ffn")
+                            .with_context(|| format!("carry MoeQ intra-K layer {layer_idx}"))?;
                     }
                     out
                 }
@@ -4366,12 +4363,11 @@ impl Qwen35Model {
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             // Keep a clone for the optional layer dump below; only paid when dump is active.
-            let ffn_out_for_dump =
-                if dump_layer_n().is_some() || super::dump_bisect::is_enabled() {
-                    Some(ffn_out.clone())
-                } else {
-                    None
-                };
+            let ffn_out_for_dump = if dump_layer_n().is_some() || super::dump_bisect::is_enabled() {
+                Some(ffn_out.clone())
+            } else {
+                None
+            };
             hidden = match ffn_weights_gpu {
                 FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
                     // Residual already folded in build_moe_ffn_layer_gpu_q /
@@ -4413,11 +4409,7 @@ impl Qwen35Model {
                     // encoder).
                     let mut ds_enc = device
                         .command_encoder()
-                        .with_context(|| {
-                            format!(
-                                "wedge4c5 deepstack encoder layer {layer_idx}"
-                            )
-                        })?;
+                        .with_context(|| format!("wedge4c5 deepstack encoder layer {layer_idx}"))?;
                     crate::inference::vision::image_token_residual_add
                         ::image_token_residual_add_gpu(
                             &mut ds_enc,
@@ -4435,11 +4427,7 @@ impl Qwen35Model {
                         })?;
                     ds_enc
                         .commit_and_wait()
-                        .with_context(|| {
-                            format!(
-                                "wedge4c5 deepstack commit layer {layer_idx}"
-                            )
-                        })?;
+                        .with_context(|| format!("wedge4c5 deepstack commit layer {layer_idx}"))?;
                 }
                 // For layer_idx >= n_deepstack: NO injection. This is
                 // the byte-identity contract for layers past the
@@ -4467,8 +4455,8 @@ impl Qwen35Model {
             // the start of the layer loop for rationale.
             if let Some(ref mut acts) = capture {
                 if acts.is_target_layer(layer_idx) {
-                    let f32_data = download_f32(&hidden)
-                        .context("capture layer_output download")?;
+                    let f32_data =
+                        download_f32(&hidden).context("capture layer_output download")?;
                     acts.layer_outputs.push(f32_data);
                 } else {
                     acts.layer_outputs.push(Vec::new());
@@ -4675,8 +4663,7 @@ impl Qwen35Model {
         // the held encoder is always None for TopK. The defense below
         // does not list TopK as an "encoder consumer" for that reason.
         debug_assert!(
-            last_layer_held_enc.is_none()
-                || matches!(output_head_mode, OutputHeadMode::Last),
+            last_layer_held_enc.is_none() || matches!(output_head_mode, OutputHeadMode::Last),
             "ADR-019 Phase 1: held encoder requires OutputHeadMode::Last"
         );
         if !matches!(output_head_mode, OutputHeadMode::Last) {
@@ -4993,12 +4980,12 @@ impl Qwen35Model {
                 let pos_buf = {
                     let byte_len = positions_flat.len() * 4;
                     let mut buf = super::decode_pool::pooled_alloc_buffer(
-                            &c.device,
-                            byte_len,
-                            DType::I32,
-                            vec![positions_flat.len()],
-                        )
-                        .map_err(|e| anyhow!("alloc positions (pooled): {e}"))?;
+                        &c.device,
+                        byte_len,
+                        DType::I32,
+                        vec![positions_flat.len()],
+                    )
+                    .map_err(|e| anyhow!("alloc positions (pooled): {e}"))?;
                     buf.as_mut_slice::<i32>()
                         .map_err(|e| anyhow!("positions mut_slice: {e}"))?
                         .copy_from_slice(positions_flat);
@@ -5259,13 +5246,9 @@ impl Qwen35Model {
                 // partial_chain_enabled is false this branch never fires;
                 // the per-layer device.command_encoder() path below runs.
                 if partial_chain_enabled && chain_enc.is_none() {
-                    chain_enc = Some(
-                        device
-                            .command_encoder()
-                            .with_context(|| {
-                                format!("enc partial-chain group-start layer {layer_idx}")
-                            })?,
-                    );
+                    chain_enc = Some(device.command_encoder().with_context(|| {
+                        format!("enc partial-chain group-start layer {layer_idx}")
+                    })?);
                 }
                 // Per-layer fallback encoder (only allocated when NOT in chain mode).
                 let mut owned_enc: Option<mlx_native::CommandEncoder> = if partial_chain_enabled {
@@ -5727,7 +5710,10 @@ impl Qwen35Model {
                             Option<&MlxBuffer>,
                         ) = if linear_slot_idx != usize::MAX {
                             let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (slot.capture_states.as_ref(), slot.conv_capture_states.as_ref())
+                            (
+                                slot.capture_states.as_ref(),
+                                slot.conv_capture_states.as_ref(),
+                            )
                         } else {
                             (None, None)
                         };
@@ -6180,12 +6166,14 @@ impl Qwen35Model {
         hidden_collector: &mut crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector,
     ) -> Result<Vec<f32>> {
         if tree_tokens.is_empty() {
-            return Err(anyhow!("forward_tree_verify_gpu: tree_tokens must be non-empty"));
+            return Err(anyhow!(
+                "forward_tree_verify_gpu: tree_tokens must be non-empty"
+            ));
         }
         let tree_seq_len = tree_tokens.len();
-        let mask_stride = prefix_len
-            .checked_add(tree_seq_len)
-            .ok_or_else(|| anyhow!("forward_tree_verify_gpu: prefix_len + tree_seq_len overflow"))?;
+        let mask_stride = prefix_len.checked_add(tree_seq_len).ok_or_else(|| {
+            anyhow!("forward_tree_verify_gpu: prefix_len + tree_seq_len overflow")
+        })?;
         ensure!(
             tree_mask.len() == tree_seq_len * mask_stride,
             "forward_tree_verify_gpu: tree_mask len {} != tree_seq_len({}) * mask_stride({})",
@@ -6776,8 +6764,12 @@ mod tests {
         let mut kv1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv1");
         let mut kv2 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv2");
 
-        let l1 = m.forward_gpu(&tokens, &positions, &mut kv1, SlotId(0)).expect("run1");
-        let l2 = m.forward_gpu(&tokens, &positions, &mut kv2, SlotId(0)).expect("run2");
+        let l1 = m
+            .forward_gpu(&tokens, &positions, &mut kv1, SlotId(0))
+            .expect("run1");
+        let l2 = m
+            .forward_gpu(&tokens, &positions, &mut kv2, SlotId(0))
+            .expect("run2");
 
         assert_eq!(l1.len(), l2.len());
         let max_diff = l1
@@ -6926,10 +6918,7 @@ mod tests {
             "embed length must equal hidden_size"
         );
         for (i, v) in embed.iter().enumerate() {
-            assert!(
-                v.is_finite(),
-                "embed[{i}] = {v} is non-finite"
-            );
+            assert!(v.is_finite(), "embed[{i}] = {v} is non-finite");
         }
         // L2 norm should be ~1.0 (the only non-unit case is the all-zero
         // hidden state, where the 1e-12 floor produces a near-zero vector).
@@ -7129,8 +7118,7 @@ mod tests {
         let n_rows = range.len();
         let mut override_data = vec![0.0f32; n_rows * h];
         for (i, p) in range.clone().enumerate() {
-            override_data[i * h..(i + 1) * h]
-                .copy_from_slice(&full_cpu[p * h..(p + 1) * h]);
+            override_data[i * h..(i + 1) * h].copy_from_slice(&full_cpu[p * h..(p + 1) * h]);
         }
         let override_buf = upload_f32(&override_data, &device).expect("upload override");
 
@@ -7151,7 +7139,11 @@ mod tests {
             )
             .expect("soft-token forward");
 
-        assert_eq!(soft_logits.len(), text_logits.len(), "logits length mismatch");
+        assert_eq!(
+            soft_logits.len(),
+            text_logits.len(),
+            "logits length mismatch"
+        );
         // Match within the GPU determinism envelope (forward_gpu_deterministic
         // anchors this at < 5e-2 worst-case under parallel test execution).
         let max_diff = soft_logits
@@ -7317,13 +7309,22 @@ mod tests {
         let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
         let logits_a = m
             .forward_gpu_last_logits_with_soft_tokens(
-                &tokens, &positions, &[], &mut kv_a, SlotId(0),
+                &tokens,
+                &positions,
+                &[],
+                &mut kv_a,
+                SlotId(0),
             )
             .expect("baseline forward");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
         let logits_b = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], None, &mut kv_b, SlotId(0),
+                &tokens,
+                &positions,
+                &[],
+                None,
+                &mut kv_b,
+                SlotId(0),
             )
             .expect("deepstack=None forward");
         assert_eq!(
@@ -7426,13 +7427,23 @@ mod tests {
         let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
         let logits_a = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], None, &mut kv_a, SlotId(0),
+                &tokens,
+                &positions,
+                &[],
+                None,
+                &mut kv_a,
+                SlotId(0),
             )
             .expect("baseline");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
         let logits_b = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], Some(&ds), &mut kv_b, SlotId(0),
+                &tokens,
+                &positions,
+                &[],
+                Some(&ds),
+                &mut kv_b,
+                SlotId(0),
             )
             .expect("ds forward");
         let max_diff = logits_a
@@ -7511,13 +7522,23 @@ mod tests {
         let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
         let logits_one = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], Some(&ds_one), &mut kv_a, SlotId(0),
+                &tokens,
+                &positions,
+                &[],
+                Some(&ds_one),
+                &mut kv_a,
+                SlotId(0),
             )
             .expect("ds=one");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
         let logits_all = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], Some(&ds_all), &mut kv_b, SlotId(0),
+                &tokens,
+                &positions,
+                &[],
+                Some(&ds_all),
+                &mut kv_b,
+                SlotId(0),
             )
             .expect("ds=all");
         let max_diff = logits_one
@@ -7632,14 +7653,13 @@ mod tests {
     #[test]
     fn phase_b2a_chunked_kv_cache_divergence_diagnostic() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf;
         use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf;
         use crate::serve::header::LoadProgress;
         use mlx_native::gguf::GgufFile;
 
-        let path = std::path::PathBuf::from(
-            "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf",
-        );
+        let path =
+            std::path::PathBuf::from("/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf");
         if !path.exists() {
             eprintln!(
                 "[B.2a diagnostic] skipping: Qwen 3.6 27B-DWQ46 GGUF not at {}",
@@ -7688,8 +7708,7 @@ mod tests {
         }
 
         // ── Way A: monolithic ──
-        let mut kv_a = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
-            .expect("alloc kv_a");
+        let mut kv_a = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1).expect("alloc kv_a");
         let positions_a = build_positions(0, n);
         let _logits_a = model
             .forward_gpu_last_logits(&tokens, &positions_a, &mut kv_a, SlotId(0))
@@ -7697,8 +7716,7 @@ mod tests {
         let snap_a = kv_a.snapshot(&device).expect("snap_a");
 
         // ── Way B: chunked at K ──
-        let mut kv_b = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
-            .expect("alloc kv_b");
+        let mut kv_b = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1).expect("alloc kv_b");
         let positions_b1 = build_positions(0, k);
         let _logits_b1 = model
             .forward_gpu_last_logits(&tokens[..k], &positions_b1, &mut kv_b, SlotId(0))
@@ -7747,8 +7765,16 @@ mod tests {
                 any_divergence = true;
             }
             // V bytes — same Optional-aware extraction.
-            let a_v: &[u8] = snap_a.full_attn_v[i].as_ref().expect("a.v some").as_slice::<u8>().expect("v a");
-            let b_v: &[u8] = snap_b.full_attn_v[i].as_ref().expect("b.v some").as_slice::<u8>().expect("v b");
+            let a_v: &[u8] = snap_a.full_attn_v[i]
+                .as_ref()
+                .expect("a.v some")
+                .as_slice::<u8>()
+                .expect("v a");
+            let b_v: &[u8] = snap_b.full_attn_v[i]
+                .as_ref()
+                .expect("b.v some")
+                .as_slice::<u8>()
+                .expect("v b");
             if a_v != b_v {
                 let first_diff = a_v.iter().zip(b_v).position(|(a, b)| a != b).unwrap_or(0);
                 eprintln!(
@@ -7822,8 +7848,7 @@ mod tests {
         // chunked-call-1 is fine and the bug is in chunked-call-2's
         // input handling (state read, arena, or some forward_gpu_impl
         // setup step that misbehaves on a warm cache).
-        let mut kv_c = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
-            .expect("alloc kv_c");
+        let mut kv_c = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1).expect("alloc kv_c");
         let positions_c = build_positions(0, k);
         let _logits_c = model
             .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_c, SlotId(0))
@@ -7832,8 +7857,7 @@ mod tests {
 
         // Re-do the chunked-call-1 in isolation to capture its
         // end-state without the interference of call-2's writes.
-        let mut kv_d = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
-            .expect("alloc kv_d");
+        let mut kv_d = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1).expect("alloc kv_d");
         let _logits_d = model
             .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_d, SlotId(0))
             .expect("re-do chunked-call-1 in isolation");
@@ -7852,8 +7876,16 @@ mod tests {
                 sub_c_divergence = true;
             }
             // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V.
-            let c_k: &[u8] = snap_c.full_attn_k[i].as_ref().expect("c.k some").as_slice::<u8>().expect("k c");
-            let d_k: &[u8] = snap_d.full_attn_k[i].as_ref().expect("d.k some").as_slice::<u8>().expect("k d");
+            let c_k: &[u8] = snap_c.full_attn_k[i]
+                .as_ref()
+                .expect("c.k some")
+                .as_slice::<u8>()
+                .expect("k c");
+            let d_k: &[u8] = snap_d.full_attn_k[i]
+                .as_ref()
+                .expect("d.k some")
+                .as_slice::<u8>()
+                .expect("k d");
             if c_k != d_k {
                 let first = c_k.iter().zip(d_k).position(|(a, b)| a != b).unwrap_or(0);
                 eprintln!(
@@ -7875,12 +7907,8 @@ mod tests {
                 );
                 sub_c_divergence = true;
             }
-            let c_r: &[u8] = snap_c.linear_recurrent[i]
-                .as_slice::<u8>()
-                .expect("rec c");
-            let d_r: &[u8] = snap_d.linear_recurrent[i]
-                .as_slice::<u8>()
-                .expect("rec d");
+            let c_r: &[u8] = snap_c.linear_recurrent[i].as_slice::<u8>().expect("rec c");
+            let d_r: &[u8] = snap_d.linear_recurrent[i].as_slice::<u8>().expect("rec d");
             if c_r != d_r {
                 let first = c_r.iter().zip(d_r).position(|(a, b)| a != b).unwrap_or(0);
                 eprintln!(
@@ -8089,9 +8117,11 @@ mod tests {
             .expect("forward_gpu n_seqs=4");
 
         assert_eq!(
-            logits_1.len(), logits_4.len(),
+            logits_1.len(),
+            logits_4.len(),
             "B4a H2 sanity: logits length mismatch (n_seqs=1: {}, n_seqs=4: {})",
-            logits_1.len(), logits_4.len()
+            logits_1.len(),
+            logits_4.len()
         );
 
         // BYTE-identity over the full logits Vec.  This is stronger
@@ -8125,7 +8155,10 @@ mod tests {
                 .map(|(i, (a, b))| format!(
                     "logits[{i}] n_seqs=1={:.9} (bits {:#010x}) vs \
                      n_seqs=4={:.9} (bits {:#010x})",
-                    a, a.to_bits(), b, b.to_bits()
+                    a,
+                    a.to_bits(),
+                    b,
+                    b.to_bits()
                 ))
                 .unwrap_or_else(|| "<unreachable>".into())
         );
@@ -8161,8 +8194,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let max_seq_len = 64u32;
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
-            .expect("kv n_seqs=4");
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs).expect("kv n_seqs=4");
 
         // Snapshot slot 1's K and V bytes BEFORE the slot-0 forward.
         // Layout: full-attn K/V at `[n_seqs, n_kv_heads, max_seq_len,
@@ -8184,7 +8216,9 @@ mod tests {
             assert!(
                 slot_byte_offset + slot_byte_len <= all.len(),
                 "snapshot_slot_region: OOB (offset={} len={} buf={})",
-                slot_byte_offset, slot_byte_len, all.len()
+                slot_byte_offset,
+                slot_byte_len,
+                all.len()
             );
             all[slot_byte_offset..slot_byte_offset + slot_byte_len].to_vec()
         }
@@ -8357,8 +8391,7 @@ mod tests {
 
         let device = MlxDevice::new().expect("device");
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs)
-            .expect("kv n_seqs=4");
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv n_seqs=4");
 
         // Pre-sanity: all per-slot cursors must start at 0.
         for s in 0..(n_seqs as usize) {
@@ -8376,17 +8409,21 @@ mod tests {
                 "B4a-cont SHIP GATE: forward_gpu(SlotId(1)) must succeed end-to-end \
                  — the iter-B4a typed B4a-cont error has been removed and the five \
                  kernel-dispatch sites now route slot N>0 via MlxBuffer::slice_view. \
-                 ADR-040 §6.1.5 closure."
+                 ADR-040 §6.1.5 closure.",
             );
         // Logits shape: `Qwen35Model::forward_gpu` returns
         // OutputHeadMode::All by default — `seq_len * vocab_size`
         // logits (one row per token).  Sanity check the length.
         let expected_len = (seq as usize) * (cfg.vocab_size as usize);
         assert_eq!(
-            logits.len(), expected_len,
+            logits.len(),
+            expected_len,
             "B4a-cont sanity: forward_gpu must return [seq_len * vocab_size] \
              logits (got len={}, expected seq_len={} * vocab_size={} = {})",
-            logits.len(), seq, cfg.vocab_size, expected_len
+            logits.len(),
+            seq,
+            cfg.vocab_size,
+            expected_len
         );
 
         // Slot-1 cursor MUST have advanced by seq_len.  Slot-0/2/3
@@ -8483,8 +8520,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let max_seq_len = 64u32;
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
-            .expect("kv n_seqs=4");
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs).expect("kv n_seqs=4");
 
         // Layout: full-attn K/V at `[n_seqs, n_kv_heads, max_seq_len,
         // head_dim]` per ADR-040 §6.1.3 M5 (shape[0]=n_seqs row-major).
@@ -8506,7 +8542,9 @@ mod tests {
             assert!(
                 slot_byte_offset + slot_byte_len <= all.len(),
                 "snapshot_slot_region: OOB (offset={} len={} buf={})",
-                slot_byte_offset, slot_byte_len, all.len()
+                slot_byte_offset,
+                slot_byte_len,
+                all.len()
             );
             all[slot_byte_offset..slot_byte_offset + slot_byte_len].to_vec()
         }
@@ -8589,17 +8627,21 @@ mod tests {
             // NOT touch slot 0's cursor).  Slot 1's cursor MUST have
             // advanced to prompt_q.len() (the slot-1 forward DID write).
             assert_eq!(
-                slot.current_len[0], prompt_p.len() as u32,
+                slot.current_len[0],
+                prompt_p.len() as u32,
                 "B4a-cont.1 M1 cursor-side: full_attn[{idx}].current_len[0] \
                  must remain at prompt_p.len()={} after slot-1-only forward \
                  (sibling-slot cursor leaked into slot 1's forward) — got {}",
-                prompt_p.len(), slot.current_len[0]
+                prompt_p.len(),
+                slot.current_len[0]
             );
             assert_eq!(
-                slot.current_len[1], prompt_q.len() as u32,
+                slot.current_len[1],
+                prompt_q.len() as u32,
                 "B4a-cont.1 M1 cursor-side: full_attn[{idx}].current_len[1] \
                  must equal prompt_q.len()={} after slot-1 forward — got {}",
-                prompt_q.len(), slot.current_len[1]
+                prompt_q.len(),
+                slot.current_len[1]
             );
         }
     }
@@ -8635,8 +8677,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let max_seq_len = 64u32;
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
-            .expect("kv n_seqs=4");
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs).expect("kv n_seqs=4");
 
         // Slot 0 first, then slot 1 — each starts from cur_len=0 on
         // its OWN slot (sibling slots are independent), so the slot-1
@@ -8650,10 +8691,12 @@ mod tests {
             .expect("forward → slot 1");
 
         assert_eq!(
-            logits0.len(), logits1.len(),
+            logits0.len(),
+            logits1.len(),
             "B4a-cont.1 M1 positive pin: logit length mismatch \
              (slot 0={}, slot 1={}) — fixture bug?",
-            logits0.len(), logits1.len()
+            logits0.len(),
+            logits1.len()
         );
 
         // Per-element bit comparison: catches single-ULP / sign-bit /
@@ -8673,7 +8716,10 @@ mod tests {
                 .map(|(i, (a, b))| format!(
                     "logits[{i}] slot 0={:.9} (bits {:#010x}) vs \
                      slot 1={:.9} (bits {:#010x})",
-                    a, a.to_bits(), b, b.to_bits()
+                    a,
+                    a.to_bits(),
+                    b,
+                    b.to_bits()
                 ))
                 .unwrap_or_else(|| "<unreachable>".into())
         );
@@ -8770,7 +8816,7 @@ mod tests {
             .expect_err(
                 "B4a-cont.1 M2: forward_gpu(SlotId(1)) with TQ-active KV \
                  must error at the build_gated_attn_layer canonical entry \
-                 gate, not silently proceed to fused-stage-AB encode work."
+                 gate, not silently proceed to fused-stage-AB encode work.",
             );
         let msg = format!("{err:#}");
 
@@ -8867,17 +8913,21 @@ mod tests {
             .expect("forward_gpu_last_logits n_seqs=4");
 
         assert_eq!(
-            logits_1.len(), logits_4.len(),
+            logits_1.len(),
+            logits_4.len(),
             "B4b H17 sanity: logits length mismatch (n_seqs=1: {}, n_seqs=4: {})",
-            logits_1.len(), logits_4.len()
+            logits_1.len(),
+            logits_4.len()
         );
         // OutputHeadMode::Last returns only the last token's logits,
         // so length should equal vocab_size — sanity check.
         assert_eq!(
-            logits_1.len(), cfg.vocab_size as usize,
+            logits_1.len(),
+            cfg.vocab_size as usize,
             "B4b H17 sanity: forward_gpu_last_logits must return [vocab_size] \
              logits (got len={}, expected vocab_size={})",
-            logits_1.len(), cfg.vocab_size,
+            logits_1.len(),
+            cfg.vocab_size,
         );
 
         // Per-element bit comparison: catches single-ULP / sign-bit /
@@ -8899,7 +8949,10 @@ mod tests {
                 .map(|(i, (a, b))| format!(
                     "logits[{i}] n_seqs=1={:.9} (bits {:#010x}) vs \
                      n_seqs=4={:.9} (bits {:#010x})",
-                    a, a.to_bits(), b, b.to_bits()
+                    a,
+                    a.to_bits(),
+                    b,
+                    b.to_bits()
                 ))
                 .unwrap_or_else(|| "<unreachable>".into())
         );
@@ -8938,8 +8991,7 @@ mod tests {
 
         let device = MlxDevice::new().expect("device");
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs)
-            .expect("kv n_seqs=4");
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv n_seqs=4");
 
         // Pre-sanity: all per-slot cursors must start at 0.
         for s in 0..(n_seqs as usize) {
@@ -8954,15 +9006,17 @@ mod tests {
             .expect(
                 "B4b H18 SHIP GATE: forward_gpu_last_logits(SlotId(1)) must \
                  succeed end-to-end via forward_gpu_impl's existing slot N>0 \
-                 routing (B4a-cont + B4b signature lift)."
+                 routing (B4a-cont + B4b signature lift).",
             );
 
         // OutputHeadMode::Last returns one row of vocab_size logits.
         assert_eq!(
-            logits.len(), cfg.vocab_size as usize,
+            logits.len(),
+            cfg.vocab_size as usize,
             "B4b H18 sanity: forward_gpu_last_logits must return [vocab_size] \
              logits (got len={}, expected vocab_size={})",
-            logits.len(), cfg.vocab_size,
+            logits.len(),
+            cfg.vocab_size,
         );
 
         // Slot-1 cursor MUST have advanced by seq_len.  Slot-0/2/3
@@ -9030,8 +9084,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let max_seq_len = 64u32;
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
-            .expect("kv n_seqs=4");
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs).expect("kv n_seqs=4");
 
         // Layout: full-attn K/V at `[n_seqs, n_kv_heads, max_seq_len,
         // head_dim]` per ADR-040 §6.1.3 M5 (shape[0]=n_seqs row-major).
@@ -9053,7 +9106,9 @@ mod tests {
             assert!(
                 slot_byte_offset + slot_byte_len <= all.len(),
                 "snapshot_slot_region: OOB (offset={} len={} buf={})",
-                slot_byte_offset, slot_byte_len, all.len()
+                slot_byte_offset,
+                slot_byte_len,
+                all.len()
             );
             all[slot_byte_offset..slot_byte_offset + slot_byte_len].to_vec()
         }
@@ -9136,17 +9191,21 @@ mod tests {
             // (NOT 0 — set by step 1); slot 1's cursor advances to
             // prompt_q.len().
             assert_eq!(
-                slot.current_len[0], prompt_p.len() as u32,
+                slot.current_len[0],
+                prompt_p.len() as u32,
                 "B4b H19 cursor-side: full_attn[{idx}].current_len[0] must \
                  remain at prompt_p.len()={} after slot-1-only forward — \
                  got {}",
-                prompt_p.len(), slot.current_len[0]
+                prompt_p.len(),
+                slot.current_len[0]
             );
             assert_eq!(
-                slot.current_len[1], prompt_q.len() as u32,
+                slot.current_len[1],
+                prompt_q.len() as u32,
                 "B4b H19 cursor-side: full_attn[{idx}].current_len[1] must \
                  equal prompt_q.len()={} after slot-1 forward — got {}",
-                prompt_q.len(), slot.current_len[1]
+                prompt_q.len(),
+                slot.current_len[1]
             );
         }
     }
@@ -9273,7 +9332,11 @@ mod tests {
             let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv soft");
             let logits = m
                 .forward_gpu_last_logits_with_soft_tokens(
-                    &tokens, &positions, &[], &mut kv, SlotId(1),
+                    &tokens,
+                    &positions,
+                    &[],
+                    &mut kv,
+                    SlotId(1),
                 )
                 .expect("forward_gpu_last_logits_with_soft_tokens slot 1");
             assert_eq!(logits.len(), cfg.vocab_size as usize);
@@ -9286,7 +9349,12 @@ mod tests {
             let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv ds");
             let logits = m
                 .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                    &tokens, &positions, &[], None, &mut kv, SlotId(1),
+                    &tokens,
+                    &positions,
+                    &[],
+                    None,
+                    &mut kv,
+                    SlotId(1),
                 )
                 .expect("forward_gpu_last_logits_with_soft_tokens_and_deepstack slot 1");
             assert_eq!(logits.len(), cfg.vocab_size as usize);
@@ -9312,24 +9380,37 @@ mod tests {
         let oor = SlotId(n_seqs); // first out-of-range slot
 
         assert!(
-            m.forward_gpu_last_topk(&tokens, &positions, &mut kv_bounds, 4, oor).is_err(),
+            m.forward_gpu_last_topk(&tokens, &positions, &mut kv_bounds, 4, oor)
+                .is_err(),
             "B4b bounds: forward_gpu_last_topk must error on OOR slot"
         );
         assert!(
             m.forward_gpu_last_logits_with_soft_tokens(
-                &tokens, &positions, &[], &mut kv_bounds, oor,
-            ).is_err(),
+                &tokens,
+                &positions,
+                &[],
+                &mut kv_bounds,
+                oor,
+            )
+            .is_err(),
             "B4b bounds: forward_gpu_last_logits_with_soft_tokens must error on OOR slot"
         );
         assert!(
             m.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], None, &mut kv_bounds, oor,
-            ).is_err(),
+                &tokens,
+                &positions,
+                &[],
+                None,
+                &mut kv_bounds,
+                oor,
+            )
+            .is_err(),
             "B4b bounds: forward_gpu_last_logits_with_soft_tokens_and_deepstack \
              must error on OOR slot"
         );
         assert!(
-            m.forward_embed_last(&tokens, &positions, &mut kv_bounds, oor).is_err(),
+            m.forward_embed_last(&tokens, &positions, &mut kv_bounds, oor)
+                .is_err(),
             "B4b bounds: forward_embed_last must error on OOR slot"
         );
     }
@@ -9492,7 +9573,10 @@ mod tests {
                 .map(|(i, (a, b))| format!(
                     "logits[{i}] n=1={:.9} (bits {:#010x}) vs n=4={:.9} \
                      (bits {:#010x})",
-                    a, a.to_bits(), b, b.to_bits(),
+                    a,
+                    a.to_bits(),
+                    b,
+                    b.to_bits(),
                 ))
                 .unwrap_or_else(|| "<unreachable>".into())
         );
@@ -9728,7 +9812,10 @@ mod tests {
                 .map(|(i, (a, b))| format!(
                     "logits[{i}] n=1={:.9} (bits {:#010x}) vs n=4={:.9} \
                      (bits {:#010x})",
-                    a, a.to_bits(), b, b.to_bits(),
+                    a,
+                    a.to_bits(),
+                    b,
+                    b.to_bits(),
                 ))
                 .unwrap_or_else(|| "<unreachable>".into())
         );
@@ -10103,8 +10190,7 @@ mod tests {
                 let entry = entry.expect("dir entry");
                 let p = entry.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    let body = std::fs::read_to_string(&p)
-                        .unwrap_or_else(|_| String::new());
+                    let body = std::fs::read_to_string(&p).unwrap_or_else(|_| String::new());
                     assert!(
                         !body.contains("forward_gpu_greedy"),
                         "H173 FALSIFIED: qwen3vl_text/{:?} references \
@@ -10144,8 +10230,7 @@ mod tests {
                 let entry = entry.expect("dir entry");
                 let p = entry.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    let body = std::fs::read_to_string(&p)
-                        .unwrap_or_else(|_| String::new());
+                    let body = std::fs::read_to_string(&p).unwrap_or_else(|_| String::new());
                     assert!(
                         !body.contains("build_delta_net_layer"),
                         "H143 FALSIFIED: qwen3vl_text/{:?} references \
@@ -10335,8 +10420,8 @@ mod tests {
         let cfg = m.cfg.clone();
         let device = MlxDevice::new().expect("device");
         let n_seqs: u32 = 4;
-        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs)
-            .expect("H215: HybridKvCache n_seqs=4");
+        let mut kv =
+            HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("H215: HybridKvCache n_seqs=4");
 
         // Pre-state: all 4 slot cursors at 0.
         for s in 0..n_seqs as usize {
@@ -10355,11 +10440,13 @@ mod tests {
             let token = (slot + 1) as u32; // distinct token per slot
             let _arg = m
                 .forward_gpu_greedy(&[token], &positions_flat, &mut kv, SlotId(slot))
-                .unwrap_or_else(|e| panic!(
-                    "H215 FALSIFIED: forward_gpu_greedy(SlotId({})) at \
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "H215 FALSIFIED: forward_gpu_greedy(SlotId({})) at \
                      n_seqs=4 failed: {}",
-                    slot, e
-                ));
+                        slot, e
+                    )
+                });
 
             // The just-dispatched slot's cursor must be 1.
             assert_eq!(
@@ -10442,10 +10529,8 @@ mod tests {
         let positions_flat = vec![pos; 4];
 
         let device = MlxDevice::new().expect("device");
-        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1)
-            .expect("H216: kv n_seqs=1");
-        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4)
-            .expect("H216: kv n_seqs=4");
+        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("H216: kv n_seqs=1");
+        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("H216: kv n_seqs=4");
 
         let arg_1 = m
             .forward_gpu_greedy(&[token], &positions_flat, &mut kv_1, SlotId(0))
@@ -10530,10 +10615,8 @@ mod tests {
              constructor removed"
         );
 
-        let tgt = std::fs::read_to_string(
-            "src/inference/spec_decode/dflash/qwen35_target.rs",
-        )
-        .expect("read qwen35_target.rs");
+        let tgt = std::fs::read_to_string("src/inference/spec_decode/dflash/qwen35_target.rs")
+            .expect("read qwen35_target.rs");
         assert!(
             tgt.contains("pub fn new_with_slot("),
             "H217 FALSIFIED: Qwen35DFlashTarget `new_with_slot` constructor \

@@ -388,9 +388,11 @@ impl ApexPolicy {
     /// convert dispatcher is responsible for parsing `blk.<i>.` and
     /// setting `TensorRef::layer_index`; this errors if it forgot.
     fn require_layer_index(&self, tensor: &TensorRef) -> Result<usize, ApexError> {
-        let layer = tensor.layer_index.ok_or_else(|| ApexError::MissingLayerIndex {
-            name: tensor.name.to_string(),
-        })?;
+        let layer = tensor
+            .layer_index
+            .ok_or_else(|| ApexError::MissingLayerIndex {
+                name: tensor.name.to_string(),
+            })?;
         if (layer as u64) >= (self.n_layers as u64) {
             return Err(ApexError::LayerIndexOutOfRange {
                 name: tensor.name.to_string(),
@@ -494,16 +496,8 @@ mod tests {
             ApexTier::Mini,
         ] {
             let p = ApexPolicy::new(tier, ArchName::Qwen35Moe, 40, 128).unwrap();
-            let t = tref(
-                "blk.5.ffn_gate_inp.weight",
-                ArchName::Qwen35Moe,
-                Some(5),
-            );
-            assert_eq!(
-                p.target_for(&t).unwrap(),
-                GgmlType::Q5_0,
-                "tier {tier:?}"
-            );
+            let t = tref("blk.5.ffn_gate_inp.weight", ArchName::Qwen35Moe, Some(5));
+            assert_eq!(p.target_for(&t).unwrap(), GgmlType::Q5_0, "tier {tier:?}");
         }
     }
 
@@ -523,7 +517,11 @@ mod tests {
                 "blk.5.attn_q_norm.weight",
                 "output_norm.weight",
             ] {
-                let layer = if name.starts_with("blk.") { Some(5) } else { None };
+                let layer = if name.starts_with("blk.") {
+                    Some(5)
+                } else {
+                    None
+                };
                 let t = tref(name, ArchName::Qwen35Moe, layer);
                 assert_eq!(
                     p.target_for(&t).unwrap(),
@@ -622,8 +620,7 @@ mod tests {
         // `blk.0.ffn_gate_exps=Q6_K` at edge layers and
         // `blk.5.ffn_gate_exps=Q5_K` at the near band.
         let content =
-            vendor_config_content("vendor/apex-quant/configs/gemma4_26b_balanced.txt")
-                .unwrap();
+            vendor_config_content("vendor/apex-quant/configs/gemma4_26b_balanced.txt").unwrap();
         // The override leaks; that's intentional for the
         // process-wide cache. For this test we leak a fresh copy so
         // the `&'static` lifetime is satisfied without polluting the
@@ -688,9 +685,8 @@ mod tests {
         use super::super::fingerprint::vendor_config_content;
         use super::super::mudler_config::MudlerConfig;
 
-        let content =
-            vendor_config_content("vendor/apex-quant/configs/gemma4_26b_balanced.txt")
-                .expect("vendored balanced config must be baked in");
+        let content = vendor_config_content("vendor/apex-quant/configs/gemma4_26b_balanced.txt")
+            .expect("vendored balanced config must be baked in");
         let mudler: &'static MudlerConfig = Box::leak(Box::new(
             MudlerConfig::parse(content, "test/gemma4_26b_balanced.txt:p4b")
                 .expect("vendored config must parse"),
@@ -699,14 +695,9 @@ mod tests {
         let non_i = ApexPolicy::new(ApexTier::Balanced, ArchName::Gemma4, 30, 128)
             .expect("non-I policy must construct")
             .with_mudler_override(mudler);
-        let i = ApexPolicy::new_with_imatrix(
-            ApexTier::IBalanced,
-            ArchName::Gemma4,
-            30,
-            128,
-        )
-        .expect("I-tier policy must construct on Gemma4")
-        .with_mudler_override(mudler);
+        let i = ApexPolicy::new_with_imatrix(ApexTier::IBalanced, ArchName::Gemma4, 30, 128)
+            .expect("I-tier policy must construct on Gemma4")
+            .with_mudler_override(mudler);
 
         // Walk every tensor enumerated in the mudler config + a
         // representative structural-fall-through set. For each, the
@@ -793,9 +784,9 @@ mod tests {
         // same equivalence to discharge the §P4b proof for the
         // override-miss path.
         for name in [
-            "blk.99.ffn_gate_exps.weight",   // RoutedExpert
-            "blk.99.ffn_gate_shexp.weight",  // SharedExpert
-            "blk.99.attn_q.weight",          // Attention
+            "blk.99.ffn_gate_exps.weight",  // RoutedExpert
+            "blk.99.ffn_gate_shexp.weight", // SharedExpert
+            "blk.99.attn_q.weight",         // Attention
         ] {
             let shape = [4096usize, 1];
             let tref = TensorRef {
@@ -808,13 +799,16 @@ mod tests {
             let a_res = non_i.target_for(&tref);
             let b_res = i.target_for(&tref);
             match (&a_res, &b_res) {
-                (Err(ApexError::TensorNotInMudlerConfig {
-                    source_path: a_path,
-                    tensor_name: a_name,
-                }), Err(ApexError::TensorNotInMudlerConfig {
-                    source_path: b_path,
-                    tensor_name: b_name,
-                })) => {
+                (
+                    Err(ApexError::TensorNotInMudlerConfig {
+                        source_path: a_path,
+                        tensor_name: a_name,
+                    }),
+                    Err(ApexError::TensorNotInMudlerConfig {
+                        source_path: b_path,
+                        tensor_name: b_name,
+                    }),
+                ) => {
                     assert_eq!(
                         a_path, b_path,
                         "§P4b override-miss source_path drift: non-I={a_path}, I={b_path}",
@@ -840,11 +834,7 @@ mod tests {
     /// from `--imatrix <file>`.
     #[test]
     fn apex_policy_new_rejects_i_tier() {
-        for tier in [
-            ApexTier::IQuality,
-            ApexTier::IBalanced,
-            ApexTier::ICompact,
-        ] {
+        for tier in [ApexTier::IQuality, ApexTier::IBalanced, ApexTier::ICompact] {
             let err = ApexPolicy::new(tier, ArchName::Gemma4, 30, 128).unwrap_err();
             match err {
                 ApexError::ImatrixRequiresInference {
@@ -859,9 +849,7 @@ mod tests {
                     // arches can accept `--imatrix <file>`.
                     assert_eq!(supported_for_imatrix, &["qwen3moe", "qwen35moe", "gemma4"]);
                 }
-                other => panic!(
-                    "expected ImatrixRequiresInference for {tier:?}, got {other:?}"
-                ),
+                other => panic!("expected ImatrixRequiresInference for {tier:?}, got {other:?}"),
             }
         }
     }
@@ -870,13 +858,8 @@ mod tests {
     /// imatrix-supported arches (Gemma4, Qwen35Moe).
     #[test]
     fn apex_policy_new_with_imatrix_accepts_i_tier_for_supported_arches() {
-        for tier in [
-            ApexTier::IQuality,
-            ApexTier::IBalanced,
-            ApexTier::ICompact,
-        ] {
-            let p =
-                ApexPolicy::new_with_imatrix(tier, ArchName::Gemma4, 30, 128).unwrap();
+        for tier in [ApexTier::IQuality, ApexTier::IBalanced, ApexTier::ICompact] {
+            let p = ApexPolicy::new_with_imatrix(tier, ArchName::Gemma4, 30, 128).unwrap();
             assert_eq!(p.tier, tier);
             let p2 = ApexPolicy::new_with_imatrix(tier, ArchName::Qwen35Moe, 40, 128).unwrap();
             assert_eq!(p2.tier, tier);
@@ -888,13 +871,8 @@ mod tests {
     /// policy layer can't dispatch the request.
     #[test]
     fn apex_policy_new_with_imatrix_rejects_i_tier_for_unsupported_arch() {
-        let err = ApexPolicy::new_with_imatrix(
-            ApexTier::IBalanced,
-            ArchName::MiniMaxM2,
-            32,
-            128,
-        )
-        .unwrap_err();
+        let err = ApexPolicy::new_with_imatrix(ApexTier::IBalanced, ArchName::MiniMaxM2, 32, 128)
+            .unwrap_err();
         assert!(matches!(err, ApexError::ImatrixRequiresInference { .. }));
     }
 

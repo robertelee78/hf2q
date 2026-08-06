@@ -141,10 +141,7 @@ pub fn extract_top_k_from_row_logits(
     row_logits: &[f32],
     top_k: usize,
 ) -> Result<Vec<DraftCandidate>> {
-    ensure!(
-        !row_logits.is_empty(),
-        "extract_top_k: row_logits is empty"
-    );
+    ensure!(!row_logits.is_empty(), "extract_top_k: row_logits is empty");
     ensure!(top_k > 0, "extract_top_k: top_k must be > 0");
 
     // Validate finite logits (drafter contract).
@@ -167,10 +164,7 @@ pub fn extract_top_k_from_row_logits(
     let effective_k = top_k.min(row_logits.len());
 
     // Compute log_sumexp in f64 for stability.
-    let max_logit: f32 = row_logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_logit: f32 = row_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum_exp: f64 = 0.0;
     for &v in row_logits.iter() {
         sum_exp += ((v - max_logit) as f64).exp();
@@ -223,8 +217,7 @@ pub fn extract_top_k_from_row_logits(
         }
     }
 
-    let mut heap: BinaryHeap<Reverse<LogProbTokenF64>> =
-        BinaryHeap::with_capacity(effective_k + 1);
+    let mut heap: BinaryHeap<Reverse<LogProbTokenF64>> = BinaryHeap::with_capacity(effective_k + 1);
     for (i, &v) in row_logits.iter().enumerate() {
         let log_prob = (v as f64) - log_sumexp;
         let candidate = LogProbTokenF64 {
@@ -424,8 +417,14 @@ mod tests {
     #[test]
     fn adr_037_e4a_validate_rejects_duplicate_tokens_2026_05_22() {
         let bad = vec![
-            DraftCandidate { token: 10, log_prob: -0.5 },
-            DraftCandidate { token: 10, log_prob: -1.0 },
+            DraftCandidate {
+                token: 10,
+                log_prob: -0.5,
+            },
+            DraftCandidate {
+                token: 10,
+                log_prob: -1.0,
+            },
         ];
         let err = validate_candidates(&bad, 2).unwrap_err().to_string();
         assert!(err.contains("duplicated in top-K"), "got: {err}");
@@ -434,8 +433,14 @@ mod tests {
     #[test]
     fn adr_037_e4a_validate_rejects_unsorted_2026_05_22() {
         let bad = vec![
-            DraftCandidate { token: 10, log_prob: -1.0 },
-            DraftCandidate { token: 11, log_prob: -0.5 }, // higher prob after lower
+            DraftCandidate {
+                token: 10,
+                log_prob: -1.0,
+            },
+            DraftCandidate {
+                token: 11,
+                log_prob: -0.5,
+            }, // higher prob after lower
         ];
         let err = validate_candidates(&bad, 2).unwrap_err().to_string();
         assert!(err.contains("sorted descending"), "got: {err}");
@@ -444,9 +449,18 @@ mod tests {
     #[test]
     fn adr_037_e4a_validate_rejects_too_many_candidates_2026_05_22() {
         let bad = vec![
-            DraftCandidate { token: 10, log_prob: -0.5 },
-            DraftCandidate { token: 11, log_prob: -1.0 },
-            DraftCandidate { token: 12, log_prob: -1.5 },
+            DraftCandidate {
+                token: 10,
+                log_prob: -0.5,
+            },
+            DraftCandidate {
+                token: 11,
+                log_prob: -1.0,
+            },
+            DraftCandidate {
+                token: 12,
+                log_prob: -1.5,
+            },
         ];
         let err = validate_candidates(&bad, 2).unwrap_err().to_string();
         assert!(err.contains("exceeds top_k"), "got: {err}");

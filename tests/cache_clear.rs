@@ -177,7 +177,10 @@ fn e2e_list_and_size_on_empty_cache() {
 
     let (code, stdout, stderr) = run_cache(&cache_dir, &["size"]);
     assert_eq!(code, Some(0), "size must succeed; stderr: {stderr}");
-    assert!(stdout.contains("0 bytes"), "empty size must be 0; got:\n{stdout}");
+    assert!(
+        stdout.contains("0 bytes"),
+        "empty size must be 0; got:\n{stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -210,8 +213,7 @@ fn e2e_clear_specific_quant_removes_only_that_entry() {
     // Manifest must still parse and now have an empty `quantizations`
     // map for the repo (the model entry survives — only the quant
     // was removed).
-    let manifest =
-        std::fs::read_to_string(cache_dir.join("manifest.json")).unwrap();
+    let manifest = std::fs::read_to_string(cache_dir.join("manifest.json")).unwrap();
     assert!(manifest.contains(repo));
     assert!(!manifest.contains("\"Q8_0\""));
 }
@@ -242,8 +244,7 @@ fn e2e_clear_repo_removes_model_dir() {
 
     assert!(!gguf.exists());
     assert!(!model_dir.exists(), "model dir must be removed");
-    let manifest =
-        std::fs::read_to_string(cache_dir.join("manifest.json")).unwrap();
+    let manifest = std::fs::read_to_string(cache_dir.join("manifest.json")).unwrap();
     assert!(
         !manifest.contains(repo),
         "manifest must no longer reference the repo"
@@ -352,8 +353,7 @@ fn e2e_clear_all_with_yes_purges_everything() {
     );
     std::fs::write(cache_dir.join("manifest.json"), &multi).unwrap();
 
-    let (code, stdout, stderr) =
-        run_cache(&cache_dir, &["clear", "--all", "--yes"]);
+    let (code, stdout, stderr) = run_cache(&cache_dir, &["clear", "--all", "--yes"]);
     assert_eq!(code, Some(0), "purge must succeed; stderr: {stderr}");
     assert!(
         stdout.contains("purged"),
@@ -367,8 +367,7 @@ fn e2e_clear_all_with_yes_purges_everything() {
     let count = std::fs::read_dir(cache_dir.join("models")).unwrap().count();
     assert_eq!(count, 0, "models/ must be empty");
     // Manifest reset to schema-v2 empty.
-    let manifest =
-        std::fs::read_to_string(cache_dir.join("manifest.json")).unwrap();
+    let manifest = std::fs::read_to_string(cache_dir.join("manifest.json")).unwrap();
     assert!(manifest.contains("\"schema_version\""));
     assert!(!manifest.contains("smoke-fixture/repo-a"));
     assert!(!manifest.contains("smoke-fixture/repo-b"));

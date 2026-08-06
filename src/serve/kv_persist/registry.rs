@@ -227,12 +227,7 @@ impl KvPersistRegistry {
     /// hook (e.g. early Phase B before `B-hybrid.1` lands), in which
     /// case the pool falls through to the spiller's own `Skipped`
     /// short-circuit at `post_admit` time.
-    pub fn bind_for(
-        &self,
-        repo: &str,
-        quant: QuantType,
-        engine_dyn: Arc<dyn Any + Send + Sync>,
-    ) {
+    pub fn bind_for(&self, repo: &str, quant: QuantType, engine_dyn: Arc<dyn Any + Send + Sync>) {
         let g = self
             .hooks
             .read()

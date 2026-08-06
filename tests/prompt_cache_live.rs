@@ -145,10 +145,8 @@ fn wait_for_readyz() {
             )?;
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
             s.write_all(
-                format!(
-                    "GET /readyz HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nConnection: close\r\n\r\n"
-                )
-                .as_bytes(),
+                format!("GET /readyz HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
             )?;
             let mut head = [0u8; 64];
             let n = s.read(&mut head)?;
@@ -224,11 +222,7 @@ async fn fetch_model_id(client: &reqwest::Client) -> String {
 
 /// POST a non-streaming chat-completions request with a single user turn at
 /// temperature=0 (greedy — cache-eligible).  Returns the parsed JSON.
-async fn chat_once(
-    client: &reqwest::Client,
-    model_id: &str,
-    user_text: &str,
-) -> serde_json::Value {
+async fn chat_once(client: &reqwest::Client, model_id: &str, user_text: &str) -> serde_json::Value {
     let body = serde_json::json!({
         "model": model_id,
         "messages": [{"role": "user", "content": user_text}],
@@ -244,17 +238,12 @@ async fn chat_once(
         .await
         .expect("POST /v1/chat/completions failed");
     let status = resp.status().as_u16();
-    let text = resp
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable>".into());
+    let text = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "/v1/chat/completions status != 200: body={text}"
     );
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("response is not JSON ({e}): {text}"))
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("response is not JSON ({e}): {text}"))
 }
 
 /// POST a STREAMING chat-completions request with a single user turn at
@@ -265,11 +254,7 @@ async fn chat_once(
 /// final chunk omits the `usage` field and the cache-hit signal
 /// (`prompt_tokens_details.cached_tokens`) is unobservable.  See
 /// `src/serve/api/sse.rs:259-273`.
-async fn chat_stream(
-    client: &reqwest::Client,
-    model_id: &str,
-    user_text: &str,
-) -> String {
+async fn chat_stream(client: &reqwest::Client, model_id: &str, user_text: &str) -> String {
     let body = serde_json::json!({
         "model": model_id,
         "messages": [{"role": "user", "content": user_text}],
@@ -286,13 +271,9 @@ async fn chat_stream(
         .await
         .expect("POST /v1/chat/completions (stream) failed");
     let status = resp.status().as_u16();
-    let text = resp
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable>".into());
+    let text = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "/v1/chat/completions (stream) status != 200: body={text}"
     );
     text
@@ -407,9 +388,7 @@ fn prompt_cache_hit_miss_and_invalidation() {
         );
     }
 
-    eprintln!(
-        "prompt_cache_live: spawning hf2q serve at {HOST}:{PORT} model={gguf}"
-    );
+    eprintln!("prompt_cache_live: spawning hf2q serve at {HOST}:{PORT} model={gguf}");
     let _server = ServerGuard::spawn(&gguf).expect("spawn hf2q serve");
     wait_for_readyz();
 
@@ -577,9 +556,7 @@ fn prompt_cache_hit_miss_and_invalidation() {
 #[test]
 fn streaming_prompt_cache_hit_miss_and_invalidation() {
     if std::env::var(ENV_GATE).as_deref() != Ok("1") {
-        eprintln!(
-            "{ENV_GATE} != \"1\" — skipping streaming-cache test. Set {ENV_GATE}=1 to run."
-        );
+        eprintln!("{ENV_GATE} != \"1\" — skipping streaming-cache test. Set {ENV_GATE}=1 to run.");
         return;
     }
 
@@ -591,9 +568,7 @@ fn streaming_prompt_cache_hit_miss_and_invalidation() {
         );
     }
 
-    eprintln!(
-        "prompt_cache_live[streaming]: spawning hf2q serve at {HOST}:{PORT} model={gguf}"
-    );
+    eprintln!("prompt_cache_live[streaming]: spawning hf2q serve at {HOST}:{PORT} model={gguf}");
     let _server = ServerGuard::spawn(&gguf).expect("spawn hf2q serve");
     wait_for_readyz();
 
@@ -917,7 +892,10 @@ fn extract_deltas(chunks: &[serde_json::Value]) -> Vec<String> {
         // once on every stream, identical between miss and hit.
         if delta.get("role").is_some()
             && delta.get("content").map(|v| v.is_null()).unwrap_or(true)
-            && delta.get("reasoning_content").map(|v| v.is_null()).unwrap_or(true)
+            && delta
+                .get("reasoning_content")
+                .map(|v| v.is_null())
+                .unwrap_or(true)
             && delta.get("tool_calls").map(|v| v.is_null()).unwrap_or(true)
         {
             continue;
@@ -928,7 +906,10 @@ fn extract_deltas(chunks: &[serde_json::Value]) -> Vec<String> {
         let finish_reason = c["choices"][0]["finish_reason"].as_str();
         if finish_reason.is_some()
             && delta.get("content").map(|v| v.is_null()).unwrap_or(true)
-            && delta.get("reasoning_content").map(|v| v.is_null()).unwrap_or(true)
+            && delta
+                .get("reasoning_content")
+                .map(|v| v.is_null())
+                .unwrap_or(true)
             && delta.get("tool_calls").map(|v| v.is_null()).unwrap_or(true)
         {
             continue;

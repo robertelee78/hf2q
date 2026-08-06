@@ -78,11 +78,7 @@ impl QualityReport {
 }
 
 /// Smoke transcript output path — `tests/fixtures/smoke-transcripts/{arch}-{quant}.txt`
-pub fn smoke_transcript_path(
-    fixtures_root: &Path,
-    arch: &str,
-    quant: &str,
-) -> PathBuf {
+pub fn smoke_transcript_path(fixtures_root: &Path, arch: &str, quant: &str) -> PathBuf {
     fixtures_root
         .join("smoke-transcripts")
         .join(format!("{}-{}.txt", arch, quant))
@@ -140,11 +136,7 @@ pub fn extract_n_eval(stderr: &str) -> Option<u32> {
     // Synthetic-fixture format: `n_eval = N` (mock llama-cli).
     for line in stderr.lines() {
         if let Some(rest) = line.split_once("n_eval = ") {
-            let num: String = rest
-                .1
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let num: String = rest.1.chars().take_while(|c| c.is_ascii_digit()).collect();
             return num.parse().ok();
         }
     }
@@ -168,10 +160,7 @@ pub fn extract_loaded_tensor_count(stderr: &str) -> Option<u64> {
             continue;
         }
         if let Some((_, rest)) = line.split_once(" and ") {
-            let num: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(n) = num.parse() {
                 return Some(n);
             }
@@ -181,7 +170,10 @@ pub fn extract_loaded_tensor_count(stderr: &str) -> Option<u64> {
     for line in stderr.lines() {
         if let Some(rest) = line.split_once("loaded tensor ") {
             let token = rest.1.split_whitespace().next()?;
-            if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
+            if let Some(hex) = token
+                .strip_prefix("0x")
+                .or_else(|| token.strip_prefix("0X"))
+            {
                 return u64::from_str_radix(hex, 16).ok();
             }
             return token.parse().ok();
@@ -203,9 +195,8 @@ pub fn assert_smoke_transcript(
     expected_n_gen: u32,
 ) -> Result<(), String> {
     scan_llama_cli_stderr(stderr)?;
-    let n_eval = extract_n_eval(stderr).ok_or(
-        "missing `eval time =` (real llama-cli) or `n_eval =` (mock) line in stderr",
-    )?;
+    let n_eval = extract_n_eval(stderr)
+        .ok_or("missing `eval time =` (real llama-cli) or `n_eval =` (mock) line in stderr")?;
     if n_eval != expected_n_gen {
         return Err(format!(
             "generated tokens: expected {}, got {}",
@@ -308,8 +299,7 @@ mod tests {
         // Off by one — 736 when catalog expects 737 (0x2e0 vs 0x2e1).
         let stderr = "llama_model_load: loaded tensor 0x2e0\n\
                       llama_print_timings: n_eval = 8 runs\n";
-        let err =
-            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        let err = assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
         assert!(err.contains("737"), "err = {}", err);
         assert!(err.contains("736"), "err = {}", err);
     }
@@ -326,8 +316,7 @@ mod tests {
         };
         let stderr = "llama_model_load: loaded tensor 0x2ff\n\
                       llama_print_timings: n_eval = 4 runs\n";
-        let err =
-            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        let err = assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
         assert!(err.contains("expected 8"));
     }
 
@@ -347,8 +336,7 @@ mod tests {
             mtp_num_hidden_layers: 1,
         };
         let stderr = "llama_model_load: loaded tensor 0x2e1\n";
-        let err =
-            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        let err = assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
         assert!(
             err.contains("n_eval"),
             "missing-n_eval error must name the line, got: {err}"
@@ -368,7 +356,11 @@ mod tests {
                  llama_print_timings: prompt eval time =     109.91 ms /     7 tokens (   15.70 ms per token)\n\
                  llama_print_timings:        eval time =      58.90 ms /     8 runs   (    8.41 ms per token)\n\
                  llama_print_timings:       total time =     169.31 ms /    14 tokens\n";
-        assert_eq!(extract_n_eval(s), Some(8), "must skip `prompt eval time` and pick `eval time`");
+        assert_eq!(
+            extract_n_eval(s),
+            Some(8),
+            "must skip `prompt eval time` and pick `eval time`"
+        );
     }
 
     /// Real llama-cli's tensor count line:
@@ -376,7 +368,8 @@ mod tests {
     /// (`/opt/llama.cpp/src/llama-model-loader.cpp:704`)
     #[test]
     fn extract_loaded_tensor_count_parses_real_llama_cli_format() {
-        let s = "llama_model_loader: loaded meta data with 38 key-value pairs and 737 tensors from \
+        let s =
+            "llama_model_loader: loaded meta data with 38 key-value pairs and 737 tensors from \
                  /tmp/qwen35moe.gguf (version GGUF V3 (latest))\n";
         assert_eq!(extract_loaded_tensor_count(s), Some(737));
     }
@@ -411,8 +404,7 @@ mod tests {
             mtp_num_hidden_layers: 1,
         };
         let stderr = "llama_print_timings: n_eval = 8 runs\n";
-        let err =
-            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        let err = assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
         assert!(
             err.contains("loaded tensor"),
             "missing-loaded-tensor error must name the line, got: {err}"

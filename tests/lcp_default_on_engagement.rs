@@ -253,7 +253,12 @@ fn spawn_server(bin: &Path, model: &Path, port: u16, extra_envs: &[(&str, &str)]
         })
     });
 
-    ServerGuard { child, port, stderr_tail, _stderr_thread: stderr_thread }
+    ServerGuard {
+        child,
+        port,
+        stderr_tail,
+        _stderr_thread: stderr_thread,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,9 +279,9 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()
@@ -555,9 +560,7 @@ fn default_on_engagement_no_env() {
     // / :2148 only when restore_partial actually executes — the right
     // signal for whether default-on resume engaged.
     let hits = server.count_stride_aligned_hits();
-    eprintln!(
-        "[default_on_engagement_no_env] STRIDE-ALIGNED HIT count in stderr={hits}"
-    );
+    eprintln!("[default_on_engagement_no_env] STRIDE-ALIGNED HIT count in stderr={hits}");
     if hits < 1 {
         let tail = server.log_tail();
         let lcp_lines: Vec<&String> = tail

@@ -114,10 +114,7 @@ pub fn perplexity_delta(
 ///
 /// Uses the log-sum-exp trick: log(sum(exp(x_j))) = max(x) + log(sum(exp(x_j - max(x))))
 fn log_softmax_at(logits: &[f32], target_idx: usize) -> f64 {
-    let max_val = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max) as f64;
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
 
     let log_sum_exp: f64 = logits
         .iter()
@@ -144,16 +141,17 @@ mod tests {
         let targets = vec![1, 0];
 
         let ppl = compute_perplexity(&logits, &targets).unwrap();
-        assert!(ppl < 1.01, "Perfect prediction should give perplexity ~1, got {}", ppl);
+        assert!(
+            ppl < 1.01,
+            "Perfect prediction should give perplexity ~1, got {}",
+            ppl
+        );
     }
 
     #[test]
     fn test_perplexity_uniform_prediction() {
         // Uniform distribution over 3 tokens should give perplexity = 3
-        let logits = vec![
-            vec![0.0, 0.0, 0.0],
-            vec![0.0, 0.0, 0.0],
-        ];
+        let logits = vec![vec![0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0]];
         let targets = vec![0, 1];
 
         let ppl = compute_perplexity(&logits, &targets).unwrap();
@@ -166,14 +164,14 @@ mod tests {
 
     #[test]
     fn test_perplexity_delta_identical_models() {
-        let logits = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![3.0, 2.0, 1.0],
-        ];
+        let logits = vec![vec![1.0, 2.0, 3.0], vec![3.0, 2.0, 1.0]];
         let targets = vec![2, 0];
 
         let result = perplexity_delta(&logits, &logits, &targets).unwrap();
-        assert!((result.delta).abs() < 1e-10, "Identical models should have zero delta");
+        assert!(
+            (result.delta).abs() < 1e-10,
+            "Identical models should have zero delta"
+        );
         assert!((result.pre_quant - result.post_quant).abs() < 1e-10);
     }
 
@@ -184,13 +182,14 @@ mod tests {
             vec![-100.0, 100.0, -100.0], // Correct: token 1
         ];
         // Quantized model predicts poorly (uniform)
-        let quantized = vec![
-            vec![0.0, 0.0, 0.0],
-        ];
+        let quantized = vec![vec![0.0, 0.0, 0.0]];
         let targets = vec![1];
 
         let result = perplexity_delta(&original, &quantized, &targets).unwrap();
-        assert!(result.delta > 0.0, "Degraded model should have positive delta");
+        assert!(
+            result.delta > 0.0,
+            "Degraded model should have positive delta"
+        );
         assert!(result.post_quant > result.pre_quant);
     }
 
@@ -233,15 +232,15 @@ mod tests {
         // = 1002 - (1002 + log(exp(-2) + exp(-1) + 1))
         // = -log(exp(-2) + exp(-1) + 1) ≈ -log(1.503) ≈ -0.407
         assert!(log_prob < 0.0, "Log probability should be negative");
-        assert!(log_prob > -5.0, "Log probability should not be extremely negative");
+        assert!(
+            log_prob > -5.0,
+            "Log probability should not be extremely negative"
+        );
     }
 
     #[test]
     fn test_perplexity_always_positive() {
-        let logits = vec![
-            vec![0.5, 1.0, 0.3],
-            vec![1.0, 0.2, 0.8],
-        ];
+        let logits = vec![vec![0.5, 1.0, 0.3], vec![1.0, 0.2, 0.8]];
         let targets = vec![1, 2];
         let ppl = compute_perplexity(&logits, &targets).unwrap();
         assert!(ppl > 0.0, "Perplexity should always be positive");

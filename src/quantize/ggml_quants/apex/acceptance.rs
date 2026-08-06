@@ -42,10 +42,7 @@ mod tests {
     #[test]
     fn manifest_pins_at_21_entries() {
         let n = manifest_entries().len();
-        assert_eq!(
-            n, 21,
-            "ADR-033 §Pa ships 21 manifest entries; got {n}"
-        );
+        assert_eq!(n, 21, "ADR-033 §Pa ships 21 manifest entries; got {n}");
     }
 
     /// Every manifest entry must resolve to a parseable baked vendor
@@ -55,17 +52,16 @@ mod tests {
     #[test]
     fn every_manifest_entry_has_baked_config() {
         for entry in manifest_entries() {
-            let content = vendor_config_content(&entry.mudler_config_path)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "manifest entry {{family={f}, tier={t}, fp={fp}}} \
+            let content = vendor_config_content(&entry.mudler_config_path).unwrap_or_else(|| {
+                panic!(
+                    "manifest entry {{family={f}, tier={t}, fp={fp}}} \
                          references config path `{p}` that is NOT in VENDOR_CONFIGS",
-                        f = entry.model_id_pattern,
-                        t = entry.tier,
-                        fp = entry.fingerprint,
-                        p = entry.mudler_config_path,
-                    );
-                });
+                    f = entry.model_id_pattern,
+                    t = entry.tier,
+                    fp = entry.fingerprint,
+                    p = entry.mudler_config_path,
+                );
+            });
             assert!(
                 !content.is_empty(),
                 "vendor config {} is empty",
@@ -121,8 +117,9 @@ mod tests {
 
         for entry in manifest_entries() {
             let mismatches = check_entry_against_config(entry);
-            let is_known =
-                KNOWN_NON_CANONICAL.iter().any(|(p, _)| *p == entry.mudler_config_path);
+            let is_known = KNOWN_NON_CANONICAL
+                .iter()
+                .any(|(p, _)| *p == entry.mudler_config_path);
 
             if mismatches.is_empty() {
                 if is_known {
@@ -214,9 +211,7 @@ mod tests {
         {
             Some(n) => n as u32,
             None => {
-                return vec![
-                    "expected_hparams.num_hidden_layers missing or not u64".to_string(),
-                ]
+                return vec!["expected_hparams.num_hidden_layers missing or not u64".to_string()]
             }
         };
         let n_mtp = entry
@@ -231,9 +226,7 @@ mod tests {
             .and_then(|v| v.as_u64())
         {
             Some(n) => n as u32,
-            None => {
-                return vec!["expected_hparams.num_experts missing or not u64".to_string()]
-            }
+            None => return vec!["expected_hparams.num_experts missing or not u64".to_string()],
         };
 
         // I-tier policies need `new_with_imatrix`; non-I use `new`.
@@ -428,18 +421,17 @@ mod tests {
                     continue;
                 }
             };
-            let mudler =
-                match MudlerConfig::parse(content, "tests::acceptance:p4b_vendor_config") {
-                    Ok(m) => m,
-                    Err(e) => {
-                        divergences.push(format!(
-                            "── {family} (tier={tier}) MudlerConfig::parse failed: {e}",
-                            family = entry.model_id_pattern,
-                            tier = entry.tier,
-                        ));
-                        continue;
-                    }
-                };
+            let mudler = match MudlerConfig::parse(content, "tests::acceptance:p4b_vendor_config") {
+                Ok(m) => m,
+                Err(e) => {
+                    divergences.push(format!(
+                        "── {family} (tier={tier}) MudlerConfig::parse failed: {e}",
+                        family = entry.model_id_pattern,
+                        tier = entry.tier,
+                    ));
+                    continue;
+                }
+            };
 
             let n_hidden = match entry
                 .expected_hparams

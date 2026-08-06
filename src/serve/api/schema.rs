@@ -48,7 +48,13 @@ pub struct ApiErrorBody {
 }
 
 impl ApiError {
-    fn bare(status: StatusCode, message: impl Into<String>, error_type: &str, code: Option<&str>, param: Option<String>) -> Self {
+    fn bare(
+        status: StatusCode,
+        message: impl Into<String>,
+        error_type: &str,
+        code: Option<&str>,
+        param: Option<String>,
+    ) -> Self {
         Self {
             status,
             retry_after_seconds: None,
@@ -63,7 +69,13 @@ impl ApiError {
 
     /// Generic invalid request error (HTTP 400).
     pub fn invalid_request(message: impl Into<String>, param: Option<String>) -> Self {
-        Self::bare(StatusCode::BAD_REQUEST, message, "invalid_request_error", None, param)
+        Self::bare(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            None,
+            param,
+        )
     }
 
     /// Model not found error (HTTP 404).
@@ -284,7 +296,13 @@ impl ApiError {
 
     /// Not found error (HTTP 404) — used for unmatched routes.
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self::bare(StatusCode::NOT_FOUND, message, "invalid_request_error", None, None)
+        Self::bare(
+            StatusCode::NOT_FOUND,
+            message,
+            "invalid_request_error",
+            None,
+            None,
+        )
     }
 
     /// Not implemented (HTTP 501) — the request is structurally valid
@@ -365,12 +383,8 @@ impl IntoResponse for ApiError {
             r#"{"error":{"message":"Internal serialization error","type":"server_error","param":null,"code":null}}"#.into()
         });
 
-        let mut response = (
-            status,
-            [(header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response();
+        let mut response =
+            (status, [(header::CONTENT_TYPE, "application/json")], body).into_response();
 
         if let Some(secs) = retry_after {
             if let Ok(val) = HeaderValue::from_str(&secs.to_string()) {
@@ -572,7 +586,9 @@ impl MessageContent {
     pub fn has_images(&self) -> bool {
         match self {
             MessageContent::Text(_) => false,
-            MessageContent::Parts(parts) => parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
         }
     }
 
@@ -690,9 +706,7 @@ pub enum ResponseFormat {
     #[serde(rename = "json_object")]
     JsonObject,
     #[serde(rename = "json_schema")]
-    JsonSchema {
-        json_schema: JsonSchemaSpec,
-    },
+    JsonSchema { json_schema: JsonSchemaSpec },
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1186,7 +1200,10 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("1")
         );
     }
@@ -1197,7 +1214,10 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("1")
         );
     }
@@ -1216,7 +1236,10 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"]["code"], "grammar_error");
         assert_eq!(json["error"]["param"], "response_format");
-        assert!(json["error"]["message"].as_str().unwrap().contains("unclosed brace at pos 42"));
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unclosed brace at pos 42"));
     }
 
     #[test]
@@ -1224,7 +1247,10 @@ mod tests {
         let err = ApiError::generation_error("Metal command buffer error");
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["error"]["code"], "generation_error");
-        assert!(json["error"]["message"].as_str().unwrap().contains("Metal command buffer error"));
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Metal command buffer error"));
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -1281,7 +1307,10 @@ mod tests {
             entry.get("max_context_length").is_none(),
             "max_context_length must be skipped"
         );
-        assert!(entry.get("provenance").is_none(), "provenance must be skipped");
+        assert!(
+            entry.get("provenance").is_none(),
+            "provenance must be skipped"
+        );
         assert!(
             entry.get("moe_experts").is_none(),
             "moe_experts must be skipped"
@@ -1298,7 +1327,10 @@ mod tests {
             entry.get("kv_spill_active").is_none(),
             "kv_spill_active must be skipped"
         );
-        assert!(entry.get("quant_bpw").is_none(), "quant_bpw must be skipped");
+        assert!(
+            entry.get("quant_bpw").is_none(),
+            "quant_bpw must be skipped"
+        );
     }
 
     #[test]
@@ -1360,7 +1392,10 @@ mod tests {
 
     #[test]
     fn test_readyz_response_serialization() {
-        let resp = ReadyzResponse { ready: false, detail: "warming up" };
+        let resp = ReadyzResponse {
+            ready: false,
+            detail: "warming up",
+        };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["ready"], false);
         assert_eq!(json["detail"], "warming up");
@@ -1438,12 +1473,18 @@ mod tests {
         assert_eq!(req.max_tokens, Some(100));
         assert_eq!(req.max_completion_tokens, Some(200));
         assert_eq!(req.temperature, Some(0.7));
-        assert!(matches!(req.response_format, Some(ResponseFormat::JsonObject)));
+        assert!(matches!(
+            req.response_format,
+            Some(ResponseFormat::JsonObject)
+        ));
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.seed, Some(42));
         assert_eq!(req.frequency_penalty, Some(0.1));
         assert_eq!(req.presence_penalty, Some(0.2));
-        assert_eq!(req.stream_options.as_ref().unwrap().include_usage, Some(true));
+        assert_eq!(
+            req.stream_options.as_ref().unwrap().include_usage,
+            Some(true)
+        );
         assert_eq!(req.top_k, Some(40));
         assert_eq!(req.repetition_penalty, Some(1.05));
         assert_eq!(req.min_p, Some(0.05));
@@ -1508,8 +1549,7 @@ mod tests {
 
     #[test]
     fn test_stop_sequence_multiple() {
-        let json =
-            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stop":["A","B"]}"#;
+        let json = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stop":["A","B"]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         let stops = req.stop.unwrap().into_vec();
         assert_eq!(stops, vec!["A", "B"]);
@@ -1563,7 +1603,10 @@ mod tests {
     #[test]
     fn test_tool_choice_parse_required() {
         let val = serde_json::json!("required");
-        assert_eq!(ToolChoiceValue::parse(Some(&val)), ToolChoiceValue::Required);
+        assert_eq!(
+            ToolChoiceValue::parse(Some(&val)),
+            ToolChoiceValue::Required
+        );
     }
 
     #[test]
@@ -1599,7 +1642,10 @@ mod tests {
         let json = r#"{"role":"tool","content":"sunny","tool_call_id":"call_123"}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, "tool");
-        assert_eq!(msg.content.as_ref().map(|c| c.text()).as_deref(), Some("sunny"));
+        assert_eq!(
+            msg.content.as_ref().map(|c| c.text()).as_deref(),
+            Some("sunny")
+        );
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
     }
 
@@ -1674,7 +1720,10 @@ mod tests {
                 },
             ],
             model: "test".to_string(),
-            usage: EmbeddingUsage { prompt_tokens: 10, total_tokens: 10 },
+            usage: EmbeddingUsage {
+                prompt_tokens: 10,
+                total_tokens: 10,
+            },
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["object"], "list");
@@ -1840,9 +1889,14 @@ mod tests {
         let msg = ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "Look at this:".into() },
+                ContentPart::Text {
+                    text: "Look at this:".into(),
+                },
                 ContentPart::ImageUrl {
-                    image_url: ImageUrl { url: "data:image/png;base64,abc".into(), detail: None },
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,abc".into(),
+                        detail: None,
+                    },
                 },
             ])),
             reasoning_content: None,
@@ -1855,7 +1909,10 @@ mod tests {
         assert_eq!(json["content"][0]["type"], "text");
         assert_eq!(json["content"][0]["text"], "Look at this:");
         assert_eq!(json["content"][1]["type"], "image_url");
-        assert_eq!(json["content"][1]["image_url"]["url"], "data:image/png;base64,abc");
+        assert_eq!(
+            json["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc"
+        );
     }
 
     #[test]

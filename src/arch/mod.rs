@@ -26,6 +26,4 @@ pub mod smoke;
 #[allow(unused_imports)]
 pub use catalog::{TensorCatalog, TensorCatalogEntry, TensorDtype};
 #[allow(unused_imports)]
-pub use registry::{
-    ArchEntry, ArchError, ArchRegistry, EvalCorpus, QualityThresholds,
-};
+pub use registry::{ArchEntry, ArchError, ArchRegistry, EvalCorpus, QualityThresholds};

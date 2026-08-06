@@ -191,10 +191,7 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
             .and_then(|s| s.current_len.get(slot.0 as usize).copied())
             .unwrap_or(0);
         let new_len_mtp = cur_mtp.saturating_sub(trim_u32);
-        if let Err(e) = self
-            .kv_cache
-            .truncate_mtp_to_for_slot(slot, new_len_mtp)
-        {
+        if let Err(e) = self.kv_cache.truncate_mtp_to_for_slot(slot, new_len_mtp) {
             eprintln!(
                 "[Qwen35DFlashTarget] truncate_mtp_to_for_slot({:?}, {}) \
                  failed: {} — MTP cursor may be stale by {} positions",
@@ -212,8 +209,7 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
                     // Skip if trim exceeds the captured window — caller bug
                     // (would have to discard more than was just verified).
                     if (trim_u32 as usize) < n_tokens_max && n_tokens_max > 0 {
-                        let accepted_idx =
-                            (n_tokens_max as u32) - 1 - trim_u32;
+                        let accepted_idx = (n_tokens_max as u32) - 1 - trim_u32;
                         // Best-effort: log + skip on error rather than
                         // propagating (the trait method is infallible by
                         // signature; orchestrator already preserved
@@ -224,10 +220,7 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
                         // SlotId(0) is byte-identical to pre-B4d via
                         // A2b's per-slot rollback path that already
                         // routes through slot 0 at n_seqs==1.
-                        if let Err(e) = self.kv_cache.rollback_la_to(
-                            slot,
-                            accepted_idx,
-                        ) {
+                        if let Err(e) = self.kv_cache.rollback_la_to(slot, accepted_idx) {
                             eprintln!(
                                 "[Qwen35DFlashTarget] rollback_la_to({:?}, {}) failed: {} \
                                  — LA state may be stale by {} positions",
@@ -272,11 +265,10 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
         // `crate::inference::models::qwen35::spec_decode` to guarantee
         // the right layout (cont. — codex /cfa caught a previous
         // token-major layout bug in this wrapper).
-        let positions_flat =
-            crate::inference::models::qwen35::spec_decode::positions_for_range(
-                start_seq_pos as i32,
-                tokens.len(),
-            );
+        let positions_flat = crate::inference::models::qwen35::spec_decode::positions_for_range(
+            start_seq_pos as i32,
+            tokens.len(),
+        );
         let seq_len = tokens.len();
 
         // Forward call. `forward_gpu_with_hidden_dflash` returns

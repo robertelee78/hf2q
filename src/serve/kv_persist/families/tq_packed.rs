@@ -115,10 +115,7 @@ pub enum TqEnvelopeError {
     InvalidBitsPerCoord(u32),
     /// Payload byte length doesn't match `n_tokens × n_kv_heads ×
     /// head_dim × bits_per_coord / 8` plus the 40-byte header.
-    PayloadSizeMismatch {
-        expected: usize,
-        got: usize,
-    },
+    PayloadSizeMismatch { expected: usize, got: usize },
     /// Magic prefix didn't match `TQ_PACKED_V1_MAGIC`.
     BadMagic { got: u32 },
     /// Codec version != 1 at this iter.
@@ -164,10 +161,8 @@ impl TqPackedV1Header {
     /// head_dim × bits / 8)`.
     pub fn indices_bytes_len(&self) -> usize {
         let bits = self.bits_per_coord.0 as usize;
-        let total_bits = (self.n_kv_heads as usize)
-            * (self.n_tokens as usize)
-            * (self.head_dim as usize)
-            * bits;
+        let total_bits =
+            (self.n_kv_heads as usize) * (self.n_tokens as usize) * (self.head_dim as usize) * bits;
         // Ceil-div by 8 (safe — `total_bits` always fits a usize at
         // production scales: 2 × 4096 × 512 × 8 = 33 MiB max).
         total_bits.div_ceil(8)
@@ -233,9 +228,7 @@ pub fn pack_tq_v1_payload(
 /// * [`TqEnvelopeError::ReservedNonZero`] if the reserved field is non-zero.
 /// * [`TqEnvelopeError::PayloadSizeMismatch`] if the indices section is
 ///   shorter than the header's declared shape.
-pub fn unpack_tq_v1_payload(
-    payload: &[u8],
-) -> Result<(TqPackedV1Header, &[u8]), TqEnvelopeError> {
+pub fn unpack_tq_v1_payload(payload: &[u8]) -> Result<(TqPackedV1Header, &[u8]), TqEnvelopeError> {
     if payload.len() < TQ_PACKED_V1_HEADER_BYTES {
         return Err(TqEnvelopeError::Truncated { got: payload.len() });
     }
@@ -399,10 +392,8 @@ impl TqPackedV2Header {
     /// header AND the trailing norms stream).  Same formula as v1.
     pub fn indices_bytes_len(&self) -> usize {
         let bits = self.bits_per_coord.0 as usize;
-        let total_bits = (self.n_kv_heads as usize)
-            * (self.n_tokens as usize)
-            * (self.head_dim as usize)
-            * bits;
+        let total_bits =
+            (self.n_kv_heads as usize) * (self.n_tokens as usize) * (self.head_dim as usize) * bits;
         total_bits.div_ceil(8)
     }
 
@@ -425,10 +416,7 @@ impl TqPackedV2Header {
     /// (head_dim = 512) `norms_per_pos = 2` and the buffer holds two
     /// per-block norms per (head, position).
     pub fn norms_bytes_len(&self) -> usize {
-        (self.n_kv_heads as usize)
-            * (self.n_tokens as usize)
-            * self.norms_per_pos()
-            * 4
+        (self.n_kv_heads as usize) * (self.n_tokens as usize) * self.norms_per_pos() * 4
     }
 
     /// Total payload byte length (header + indices + norms).
@@ -568,7 +556,11 @@ pub fn unpack_tq_v2_payload(
     let idx_start = TQ_PACKED_V2_HEADER_BYTES;
     let idx_end = idx_start + expected_idx;
     let norms_end = idx_end + expected_norms;
-    Ok((header, &payload[idx_start..idx_end], &payload[idx_end..norms_end]))
+    Ok((
+        header,
+        &payload[idx_start..idx_end],
+        &payload[idx_end..norms_end],
+    ))
 }
 
 // ============================================================================
@@ -815,8 +807,7 @@ pub fn restore_tq_v2_payload_into_buffers(
 
 /// Magic bytes prefixing the K+V bundle.  ASCII `"TQK2"` stored
 /// little-endian as `0x32_4B_51_54`.
-pub const TQ_PACKED_KV_BUNDLE_MAGIC: u32 =
-    u32::from_le_bytes([b'T', b'Q', b'K', b'2']);
+pub const TQ_PACKED_KV_BUNDLE_MAGIC: u32 = u32::from_le_bytes([b'T', b'Q', b'K', b'2']);
 
 /// Wire-size of the bundle's fixed prefix (magic + k_len + 0 +
 /// v_len_offset is computed dynamically per-bundle).  This is the
@@ -836,26 +827,19 @@ pub fn pack_tq_v2_kv_bundle(
             got: k_payload.len().min(v_payload.len()),
         });
     }
-    let k_magic = u32::from_le_bytes([
-        k_payload[0],
-        k_payload[1],
-        k_payload[2],
-        k_payload[3],
-    ]);
-    let v_magic = u32::from_le_bytes([
-        v_payload[0],
-        v_payload[1],
-        v_payload[2],
-        v_payload[3],
-    ]);
+    let k_magic = u32::from_le_bytes([k_payload[0], k_payload[1], k_payload[2], k_payload[3]]);
+    let v_magic = u32::from_le_bytes([v_payload[0], v_payload[1], v_payload[2], v_payload[3]]);
     if k_magic != TQ_PACKED_V2_MAGIC || v_magic != TQ_PACKED_V2_MAGIC {
         return Err(TqEnvelopeError::BadMagic {
-            got: if k_magic != TQ_PACKED_V2_MAGIC { k_magic } else { v_magic },
+            got: if k_magic != TQ_PACKED_V2_MAGIC {
+                k_magic
+            } else {
+                v_magic
+            },
         });
     }
 
-    let total =
-        TQ_PACKED_KV_BUNDLE_HEADER_BYTES + k_payload.len() + 8 + v_payload.len();
+    let total = TQ_PACKED_KV_BUNDLE_HEADER_BYTES + k_payload.len() + 8 + v_payload.len();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&TQ_PACKED_KV_BUNDLE_MAGIC.to_le_bytes());
     out.extend_from_slice(&(k_payload.len() as u64).to_le_bytes());
@@ -868,9 +852,7 @@ pub fn pack_tq_v2_kv_bundle(
 
 /// Unpack a K+V bundle.  Returns `(k_payload, v_payload)` slices
 /// borrowing from the input bundle.
-pub fn unpack_tq_v2_kv_bundle(
-    bundle: &[u8],
-) -> Result<(&[u8], &[u8]), TqEnvelopeError> {
+pub fn unpack_tq_v2_kv_bundle(bundle: &[u8]) -> Result<(&[u8], &[u8]), TqEnvelopeError> {
     if bundle.len() < TQ_PACKED_KV_BUNDLE_HEADER_BYTES {
         return Err(TqEnvelopeError::Truncated { got: bundle.len() });
     }
@@ -879,8 +861,7 @@ pub fn unpack_tq_v2_kv_bundle(
         return Err(TqEnvelopeError::BadMagic { got: magic });
     }
     let k_len = u64::from_le_bytes([
-        bundle[4], bundle[5], bundle[6], bundle[7],
-        bundle[8], bundle[9], bundle[10], bundle[11],
+        bundle[4], bundle[5], bundle[6], bundle[7], bundle[8], bundle[9], bundle[10], bundle[11],
     ]) as usize;
     let k_start = TQ_PACKED_KV_BUNDLE_HEADER_BYTES;
     let k_end = k_start + k_len;
@@ -888,8 +869,14 @@ pub fn unpack_tq_v2_kv_bundle(
         return Err(TqEnvelopeError::Truncated { got: bundle.len() });
     }
     let v_len = u64::from_le_bytes([
-        bundle[k_end], bundle[k_end + 1], bundle[k_end + 2], bundle[k_end + 3],
-        bundle[k_end + 4], bundle[k_end + 5], bundle[k_end + 6], bundle[k_end + 7],
+        bundle[k_end],
+        bundle[k_end + 1],
+        bundle[k_end + 2],
+        bundle[k_end + 3],
+        bundle[k_end + 4],
+        bundle[k_end + 5],
+        bundle[k_end + 6],
+        bundle[k_end + 7],
     ]) as usize;
     let v_start = k_end + 8;
     let v_end = v_start + v_len;
@@ -1103,8 +1090,9 @@ impl TqPackedSpill {
         cfg: TqPackedConfig,
         engine_dyn: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Option<Self> {
-        let engine_arc =
-            engine_dyn.downcast::<crate::serve::api::engine::Engine>().ok()?;
+        let engine_arc = engine_dyn
+            .downcast::<crate::serve::api::engine::Engine>()
+            .ok()?;
         // Cheap-clone the inner Engine.  See `engine_arc` field doc
         // for why this doesn't break `LoaderWrapper::load`'s
         // `try_unwrap` — `Engine: Clone` over `inner: Arc<EngineInner>`,
@@ -1235,12 +1223,10 @@ impl TqPackedSpill {
         let magic = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         match magic {
             m if m == TQ_PACKED_V1_MAGIC => {
-                let _ = unpack_tq_v1_payload(&payload)
-                    .map_err(|_| SpillErrorKind::CodecErr)?;
+                let _ = unpack_tq_v1_payload(&payload).map_err(|_| SpillErrorKind::CodecErr)?;
             }
             m if m == TQ_PACKED_V2_MAGIC => {
-                let _ = unpack_tq_v2_payload(&payload)
-                    .map_err(|_| SpillErrorKind::CodecErr)?;
+                let _ = unpack_tq_v2_payload(&payload).map_err(|_| SpillErrorKind::CodecErr)?;
             }
             _ => return Err(SpillErrorKind::CodecErr),
         }
@@ -1354,23 +1340,22 @@ impl KvCacheSpill for TqPackedSpill {
 
         let (bits, hd, nkv, ntok) = match magic {
             m if m == TQ_PACKED_V1_MAGIC => {
-                let (h, idx) = unpack_tq_v1_payload(payload)
-                    .map_err(|_| SpillErrorKind::CodecErr)?;
+                let (h, idx) =
+                    unpack_tq_v1_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
                 // Defensive re-pack ⇒ byte equality (B-tq.1 D2 guard).
-                let repacked = pack_tq_v1_payload(&h, idx)
-                    .map_err(|_| SpillErrorKind::CodecErr)?;
+                let repacked = pack_tq_v1_payload(&h, idx).map_err(|_| SpillErrorKind::CodecErr)?;
                 if repacked != payload {
                     return Err(SpillErrorKind::ParityFail);
                 }
                 (h.bits_per_coord, h.head_dim, h.n_kv_heads, h.n_tokens)
             }
             m if m == TQ_PACKED_V2_MAGIC => {
-                let (h, idx, norms) = unpack_tq_v2_payload(payload)
-                    .map_err(|_| SpillErrorKind::CodecErr)?;
+                let (h, idx, norms) =
+                    unpack_tq_v2_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
                 // Defensive re-pack ⇒ byte equality (B-tq.3 D2 guard,
                 // mirrors v1's guard against silent tampering).
-                let repacked = pack_tq_v2_payload(&h, idx, norms)
-                    .map_err(|_| SpillErrorKind::CodecErr)?;
+                let repacked =
+                    pack_tq_v2_payload(&h, idx, norms).map_err(|_| SpillErrorKind::CodecErr)?;
                 if repacked != payload {
                     return Err(SpillErrorKind::ParityFail);
                 }
@@ -1400,11 +1385,7 @@ impl KvCacheSpill for TqPackedSpill {
         Ok(())
     }
 
-    fn model_fingerprint(
-        &self,
-        _repo: &str,
-        _quant: QuantType,
-    ) -> Option<ModelFingerprint> {
+    fn model_fingerprint(&self, _repo: &str, _quant: QuantType) -> Option<ModelFingerprint> {
         self.fingerprint.read().ok().and_then(|fp| fp.clone())
     }
 
@@ -1459,9 +1440,7 @@ impl crate::serve::kv_persist::EngineBindable for TqPackedSpill {
     fn bind_engine(&self, engine_dyn: Arc<dyn std::any::Any + Send + Sync>) {
         // Try `Arc<Engine>` (production LoaderWrapper path).  Silent
         // no-op on type mismatch per the EngineBindable contract.
-        if let Ok(engine_arc) =
-            engine_dyn.downcast::<crate::serve::api::engine::Engine>()
-        {
+        if let Ok(engine_arc) = engine_dyn.downcast::<crate::serve::api::engine::Engine>() {
             // Cheap-clone Engine (Arc<EngineInner>); see engine_arc
             // field doc for the P0-bench-fix rationale.
             let engine: crate::serve::api::engine::Engine = (*engine_arc).clone();
@@ -1563,8 +1542,7 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for TqPackedSpillFact
         //    TQ-packed engine_arc is the SOLE bridge — there's no
         //    EngineHandle backwards-compat path to maintain.
         let spill_arc = Arc::new(spill);
-        let bindable: Arc<dyn crate::serve::kv_persist::EngineBindable> =
-            spill_arc.clone();
+        let bindable: Arc<dyn crate::serve::kv_persist::EngineBindable> = spill_arc.clone();
 
         // 3. Build the spiller-side spill.  Different instance than
         //    the bindable-side because `KvCacheSpill::restore_block`
@@ -1584,11 +1562,9 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for TqPackedSpillFact
         // the bindable's cfg and caused `restore_block CodecErr` on
         // every layer >= 1 (because fallback cfg = [sliding, global]
         // pattern that doesn't match Gemma 4's actual layer mix).
-        let spiller_side =
-            TqPackedSpill::new_with_engine(cfg_for_spill, spiller_engine).ok()?;
-        let kv_hook: Arc<
-            std::sync::Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>,
-        > = Arc::new(std::sync::Mutex::new(spiller_side));
+        let spiller_side = TqPackedSpill::new_with_engine(cfg_for_spill, spiller_engine).ok()?;
+        let kv_hook: Arc<std::sync::Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+            Arc::new(std::sync::Mutex::new(spiller_side));
 
         Some((kv_hook, bindable))
     }
@@ -1630,7 +1606,9 @@ mod tests {
     /// vs pre-spill TQ state for the same input."
     #[test]
     fn tq_packed_v1_round_trip_byte_exact() {
-        let h = synthetic_header(/* bits = */ 4, /* n_kv = */ 8, /* n_tok = */ 256, /* hd = */ 256);
+        let h = synthetic_header(
+            /* bits = */ 4, /* n_kv = */ 8, /* n_tok = */ 256, /* hd = */ 256,
+        );
         let idx = synthetic_indices(h.indices_bytes_len());
 
         let pack_a = pack_tq_v1_payload(&h, &idx).expect("pack A");
@@ -1705,8 +1683,16 @@ mod tests {
             .zip(restored.iter())
             .map(|(&a, &b)| (a as f64) * (b as f64))
             .sum();
-        let norm_a: f64 = pre_spill.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
-        let norm_b: f64 = restored.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
+        let norm_a: f64 = pre_spill
+            .iter()
+            .map(|&v| (v as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let norm_b: f64 = restored
+            .iter()
+            .map(|&v| (v as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cosine = dot / (norm_a * norm_b);
         assert!(
             cosine >= 0.9998,
@@ -1907,7 +1893,10 @@ mod tests {
     fn tq_packed_spill_rejects_invalid_config() {
         let mut cfg = synthetic_cfg(4);
         cfg.nkv_heads = vec![2, 2]; // length mismatch
-        assert_eq!(TqPackedSpill::new(cfg).err(), Some(SpillErrorKind::CodecErr));
+        assert_eq!(
+            TqPackedSpill::new(cfg).err(),
+            Some(SpillErrorKind::CodecErr)
+        );
     }
 
     /// `block_alignment` returns `cfg.block_tokens`; `n_layers` returns
@@ -2031,7 +2020,7 @@ mod tests {
     fn tq_packed_spill_restore_rejects_range_mismatch() {
         let mut spill = TqPackedSpill::new(synthetic_cfg(2)).expect("new");
         let payload = spill.synthesize_block(0, 0..256).expect("synth"); // header says n_tokens=256
-        // Caller asks restore for 0..128 (128 tokens).
+                                                                         // Caller asks restore for 0..128 (128 tokens).
         assert_eq!(
             spill.restore_block(0, 0..128, &payload).err(),
             Some(SpillErrorKind::CodecErr)
@@ -2052,18 +2041,12 @@ mod tests {
         );
         // Default trait impl returns None; via the override (configured
         // fingerprint), it returns Some.
-        assert!(KvCacheSpill::model_fingerprint(
-            &spill,
-            "test-repo/tq-fixture",
-            QuantType::Q8_0,
-        )
-        .is_none());
-        spill.set_fingerprint(fp.clone());
-        let got = KvCacheSpill::model_fingerprint(
-            &spill,
-            "test-repo/tq-fixture",
-            QuantType::Q8_0,
+        assert!(
+            KvCacheSpill::model_fingerprint(&spill, "test-repo/tq-fixture", QuantType::Q8_0,)
+                .is_none()
         );
+        spill.set_fingerprint(fp.clone());
+        let got = KvCacheSpill::model_fingerprint(&spill, "test-repo/tq-fixture", QuantType::Q8_0);
         assert_eq!(got, Some(fp));
     }
 
@@ -2102,7 +2085,8 @@ mod tests {
         for h in 0..nkv {
             for t in 0..ntok {
                 // Deterministic non-trivial F32 per (h, t).
-                let v = ((seed.wrapping_mul(0x9E37) + (h as u32) * 0x1F0D + (t as u32) * 0x07) as f32)
+                let v = ((seed.wrapping_mul(0x9E37) + (h as u32) * 0x1F0D + (t as u32) * 0x07)
+                    as f32)
                     / 65536.0;
                 out.extend_from_slice(&v.to_le_bytes());
             }
@@ -2212,8 +2196,7 @@ mod tests {
         let range = 1024_u32..1280_u32; // 256-token block
 
         // --- Synth source buffers ----------------------------------------------------
-        let mut packed_src: Vec<u8> =
-            vec![0u8; (nkv as usize) * (capacity as usize) * hd_packed];
+        let mut packed_src: Vec<u8> = vec![0u8; (nkv as usize) * (capacity as usize) * hd_packed];
         for (i, b) in packed_src.iter_mut().enumerate() {
             *b = ((i.wrapping_mul(0x9E_37)) & 0xFF) as u8;
         }
@@ -2250,15 +2233,17 @@ mod tests {
         assert_eq!(h.head_dim, head_dim);
         assert_eq!(h.n_kv_heads, nkv);
         assert_eq!(h.n_tokens, range.end - range.start);
-        assert_eq!(idx.len(), (nkv as usize) * (range.end - range.start) as usize * hd_packed);
+        assert_eq!(
+            idx.len(),
+            (nkv as usize) * (range.end - range.start) as usize * hd_packed
+        );
         assert_eq!(
             norms.len(),
             (nkv as usize) * (range.end - range.start) as usize * 4
         );
 
         // --- Restore into freshly-zeroed buffers --------------------------------------
-        let mut packed_dst: Vec<u8> =
-            vec![0u8; (nkv as usize) * (capacity as usize) * hd_packed];
+        let mut packed_dst: Vec<u8> = vec![0u8; (nkv as usize) * (capacity as usize) * hd_packed];
         let mut norms_le_dst: Vec<u8> = vec![0u8; (nkv as usize) * (capacity as usize) * 4];
 
         let h_restored = restore_tq_v2_payload_into_buffers(
@@ -2291,7 +2276,9 @@ mod tests {
             let outside_start = head_base + 0;
             let outside_end = head_base + (range.start as usize) * hd_packed;
             assert!(
-                packed_dst[outside_start..outside_end].iter().all(|&b| b == 0),
+                packed_dst[outside_start..outside_end]
+                    .iter()
+                    .all(|&b| b == 0),
                 "dst leaked into [0, range.start) at head={}",
                 head
             );
@@ -2336,29 +2323,61 @@ mod tests {
 
         // empty range
         assert!(capture_tq_v2_payload_from_buffers(
-            &packed, &norms, capacity, nkv, head_dim, bits, 10..10,
-            flags::HADAMARD_ROTATED, 1.0
-        ).is_err());
+            &packed,
+            &norms,
+            capacity,
+            nkv,
+            head_dim,
+            bits,
+            10..10,
+            flags::HADAMARD_ROTATED,
+            1.0
+        )
+        .is_err());
 
         // range past capacity
         assert!(capture_tq_v2_payload_from_buffers(
-            &packed, &norms, capacity, nkv, head_dim, bits, 0..(capacity + 1),
-            flags::HADAMARD_ROTATED, 1.0
-        ).is_err());
+            &packed,
+            &norms,
+            capacity,
+            nkv,
+            head_dim,
+            bits,
+            0..(capacity + 1),
+            flags::HADAMARD_ROTATED,
+            1.0
+        )
+        .is_err());
 
         // packed buffer too short
         let bad_packed = vec![0u8; 10];
         assert!(capture_tq_v2_payload_from_buffers(
-            &bad_packed, &norms, capacity, nkv, head_dim, bits, 0..256,
-            flags::HADAMARD_ROTATED, 1.0
-        ).is_err());
+            &bad_packed,
+            &norms,
+            capacity,
+            nkv,
+            head_dim,
+            bits,
+            0..256,
+            flags::HADAMARD_ROTATED,
+            1.0
+        )
+        .is_err());
 
         // norms buffer too short
         let bad_norms = vec![0u8; 10];
         assert!(capture_tq_v2_payload_from_buffers(
-            &packed, &bad_norms, capacity, nkv, head_dim, bits, 0..256,
-            flags::HADAMARD_ROTATED, 1.0
-        ).is_err());
+            &packed,
+            &bad_norms,
+            capacity,
+            nkv,
+            head_dim,
+            bits,
+            0..256,
+            flags::HADAMARD_ROTATED,
+            1.0
+        )
+        .is_err());
     }
 
     /// **B-tq.3 restore rejects shape drift**: payload-vs-runtime
@@ -2382,38 +2401,69 @@ mod tests {
             norms_le.extend_from_slice(&v.to_le_bytes());
         }
         let payload = capture_tq_v2_payload_from_buffers(
-            &packed_src, &norms_le, capacity, nkv, head_dim, bits, 0..32,
-            flags::HADAMARD_ROTATED, 1.0,
-        ).expect("capture");
+            &packed_src,
+            &norms_le,
+            capacity,
+            nkv,
+            head_dim,
+            bits,
+            0..32,
+            flags::HADAMARD_ROTATED,
+            1.0,
+        )
+        .expect("capture");
 
         // Restore with WRONG bits → fail
         let mut p_dst = vec![0u8; (nkv as usize) * (capacity as usize) * hd_packed];
         let mut n_dst = vec![0u8; (nkv as usize) * (capacity as usize) * 4];
         let err = restore_tq_v2_payload_into_buffers(
-            &payload, &mut p_dst, &mut n_dst,
-            capacity, nkv, head_dim, TqBitsPerCoord::new(8).unwrap(),
+            &payload,
+            &mut p_dst,
+            &mut n_dst,
+            capacity,
+            nkv,
+            head_dim,
+            TqBitsPerCoord::new(8).unwrap(),
             0..32,
         );
         assert!(err.is_err(), "restore silently accepted bits drift");
 
         // Restore with WRONG head_dim → fail
         let err = restore_tq_v2_payload_into_buffers(
-            &payload, &mut p_dst, &mut n_dst,
-            capacity, nkv, 128, bits, 0..32,
+            &payload,
+            &mut p_dst,
+            &mut n_dst,
+            capacity,
+            nkv,
+            128,
+            bits,
+            0..32,
         );
         assert!(err.is_err(), "restore silently accepted head_dim drift");
 
         // Restore with WRONG nkv → fail
         let err = restore_tq_v2_payload_into_buffers(
-            &payload, &mut p_dst, &mut n_dst,
-            capacity, 8, head_dim, bits, 0..32,
+            &payload,
+            &mut p_dst,
+            &mut n_dst,
+            capacity,
+            8,
+            head_dim,
+            bits,
+            0..32,
         );
         assert!(err.is_err(), "restore silently accepted nkv drift");
 
         // Restore with WRONG range size → fail
         let err = restore_tq_v2_payload_into_buffers(
-            &payload, &mut p_dst, &mut n_dst,
-            capacity, nkv, head_dim, bits, 0..64,
+            &payload,
+            &mut p_dst,
+            &mut n_dst,
+            capacity,
+            nkv,
+            head_dim,
+            bits,
+            0..64,
         );
         assert!(err.is_err(), "restore silently accepted range drift");
     }
@@ -2485,8 +2535,7 @@ mod tests {
         let v_payload = pack_tq_v2_payload(&h, &idx_v, &norms_v).expect("pack v");
 
         let bundle = pack_tq_v2_kv_bundle(&k_payload, &v_payload).expect("bundle");
-        let (k_unpacked, v_unpacked) =
-            unpack_tq_v2_kv_bundle(&bundle).expect("unbundle");
+        let (k_unpacked, v_unpacked) = unpack_tq_v2_kv_bundle(&bundle).expect("unbundle");
         assert_eq!(k_unpacked, k_payload.as_slice());
         assert_eq!(v_unpacked, v_payload.as_slice());
 
@@ -2573,10 +2622,8 @@ mod tests {
         let h_bad = synthetic_v2_header(8, 8, 256, 256);
         let idx_bad = synthetic_indices(h_bad.indices_bytes_len());
         let bundle_bad = pack_tq_v2_kv_bundle(
-            &pack_tq_v2_payload(&h_bad, &idx_bad, &norms[..h_bad.norms_bytes_len()])
-                .unwrap(),
-            &pack_tq_v2_payload(&h_bad, &idx_bad, &norms[..h_bad.norms_bytes_len()])
-                .unwrap(),
+            &pack_tq_v2_payload(&h_bad, &idx_bad, &norms[..h_bad.norms_bytes_len()]).unwrap(),
+            &pack_tq_v2_payload(&h_bad, &idx_bad, &norms[..h_bad.norms_bytes_len()]).unwrap(),
         )
         .expect("bundle bad");
         assert!(KvCacheSpill::restore_block(&mut spill, 1, 0..256, &bundle_bad).is_err());
@@ -2625,8 +2672,7 @@ mod tests {
         };
         let factory = TqPackedSpillFactory::new(cfg);
         // Pass an Arc<String> — definitely not an Engine.
-        let bogus: Arc<dyn std::any::Any + Send + Sync> =
-            Arc::new(String::from("not an engine"));
+        let bogus: Arc<dyn std::any::Any + Send + Sync> = Arc::new(String::from("not an engine"));
         let result = factory.try_construct(bogus);
         assert!(
             result.is_none(),

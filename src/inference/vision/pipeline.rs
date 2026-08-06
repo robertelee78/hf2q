@@ -86,8 +86,7 @@ pub fn run_vit_forward(
         });
     }
 
-    let head_dim_f =
-        (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
+    let head_dim_f = (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
     let scale = 1.0f32 / head_dim_f.sqrt();
     let t0 = std::time::Instant::now();
     let embeddings = compute_vision_embeddings_gpu_dispatch(
@@ -209,24 +208,20 @@ pub fn expand_image_placeholders(
              per_row_floats ({per_row_floats})"
         ));
     }
-    let placeholder_literal = family
-        .placeholder_token_literal()
-        .ok_or_else(|| {
-            anyhow!(
-                "expand_image_placeholders: VisionFamily::{:?} has no placeholder \
+    let placeholder_literal = family.placeholder_token_literal().ok_or_else(|| {
+        anyhow!(
+            "expand_image_placeholders: VisionFamily::{:?} has no placeholder \
                  token literal — caller should have rejected this profile upstream",
-                family
-            )
-        })?;
-    let img_token_id: u32 = tokenizer
-        .token_to_id(placeholder_literal)
-        .ok_or_else(|| {
-            anyhow!(
-                "tokenizer has no `{placeholder_literal}` special-token id; the \
+            family
+        )
+    })?;
+    let img_token_id: u32 = tokenizer.token_to_id(placeholder_literal).ok_or_else(|| {
+        anyhow!(
+            "tokenizer has no `{placeholder_literal}` special-token id; the \
                  loaded chat model does not support vision input through hf2q's \
                  soft-token path"
-            )
-        })?;
+        )
+    })?;
     let placeholder_positions: Vec<usize> = prompt_tokens
         .iter()
         .enumerate()
@@ -252,8 +247,8 @@ pub fn expand_image_placeholders(
             ));
         }
     }
-    let mlx_dev = mlx_native::MlxDevice::new()
-        .map_err(|e| anyhow!("MlxDevice init failed: {e}"))?;
+    let mlx_dev =
+        mlx_native::MlxDevice::new().map_err(|e| anyhow!("MlxDevice init failed: {e}"))?;
     let total_extra: usize = embeddings
         .iter()
         .map(|e| e.len() / per_row_floats)

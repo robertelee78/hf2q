@@ -268,9 +268,7 @@ impl FullAttnKvSlot {
             scale_factor_d512,
             codebook_bits,
         )
-        .map_err(|e| {
-            anyhow!("encode_token_to_tq: dispatch_hadamard_quantize_kv_hb K: {e}")
-        })?;
+        .map_err(|e| anyhow!("encode_token_to_tq: dispatch_hadamard_quantize_kv_hb K: {e}"))?;
         // V side.
         mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
             encoder,
@@ -287,9 +285,7 @@ impl FullAttnKvSlot {
             scale_factor_d512,
             codebook_bits,
         )
-        .map_err(|e| {
-            anyhow!("encode_token_to_tq: dispatch_hadamard_quantize_kv_hb V: {e}")
-        })?;
+        .map_err(|e| anyhow!("encode_token_to_tq: dispatch_hadamard_quantize_kv_hb V: {e}"))?;
         Ok(())
     }
 
@@ -530,20 +526,24 @@ impl FullAttnKvSlot {
         // dispatch_decode_sdpa_with_optional_tq). Reading via LazyLock
         // avoids per-call env::var().
         let cb_env = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
-        let codebook_bits: u32 = if matches!(cb_env, 5 | 6 | 8) { cb_env } else { 8 };
+        let codebook_bits: u32 = if matches!(cb_env, 5 | 6 | 8) {
+            cb_env
+        } else {
+            8
+        };
 
-        let n_elems = (n_kv_heads as usize)
-            * (n_tokens as usize)
-            * (head_dim as usize);
+        let n_elems = (n_kv_heads as usize) * (n_tokens as usize) * (head_dim as usize);
         let dst = device
             .alloc_buffer(
                 n_elems * 4,
                 DType::F32,
                 vec![n_kv_heads as usize, n_tokens as usize, head_dim as usize],
             )
-            .map_err(|e| anyhow!(
+            .map_err(|e| {
+                anyhow!(
                 "dequant_seq_to_temp_f32: alloc temp [{n_kv_heads},{n_tokens},{head_dim}] f32: {e}"
-            ))?;
+            )
+            })?;
 
         let (packed, norms) = if is_k {
             (&tq.k_packed, &tq.k_norms)
@@ -624,8 +624,15 @@ impl FullAttnKvSlot {
     ) -> Result<MlxBuffer> {
         // (1) Dequant in the rotated domain.
         let dst = self.dequant_seq_to_temp_f32(
-            is_k, n_tokens, start_pos, cache_capacity,
-            n_kv_heads, head_dim, encoder, registry, device,
+            is_k,
+            n_tokens,
+            start_pos,
+            cache_capacity,
+            n_kv_heads,
+            head_dim,
+            encoder,
+            registry,
+            device,
         )?;
 
         // (2) RAW barrier: FWHT-undo kernel reads what dequant just wrote.
@@ -638,19 +645,23 @@ impl FullAttnKvSlot {
         // `[n_kv_heads, n_tokens, head_dim]` flattened — each (h, t) chunk
         // of `head_dim` elements is one rotation group at offset
         // `(h * n_tokens + t) * head_dim`.
-        let total_chunks = n_kv_heads
-            .checked_mul(n_tokens)
-            .ok_or_else(|| anyhow!(
+        let total_chunks = n_kv_heads.checked_mul(n_tokens).ok_or_else(|| {
+            anyhow!(
                 "dequant_seq_to_temp_f32_unrotated: n_kv_heads ({n_kv_heads}) × \
                  n_tokens ({n_tokens}) overflow u32"
-            ))?;
+            )
+        })?;
         mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-            encoder, registry, device.metal_device(),
-            &dst, total_chunks, head_dim,
+            encoder,
+            registry,
+            device.metal_device(),
+            &dst,
+            total_chunks,
+            head_dim,
         )
-        .map_err(|e| anyhow!(
-            "dequant_seq_to_temp_f32_unrotated: dispatch_fwht_sign_undo_f32: {e}"
-        ))?;
+        .map_err(|e| {
+            anyhow!("dequant_seq_to_temp_f32_unrotated: dispatch_fwht_sign_undo_f32: {e}")
+        })?;
 
         Ok(dst)
     }
@@ -697,7 +708,10 @@ impl LinearAttnStateSlot {
     /// the parity only decides which physical buffer plays which role for
     /// THIS slot.
     #[inline]
-    pub fn conv_bufs_for_slot(&self, slot: crate::serve::scheduler::SlotId) -> (&MlxBuffer, &MlxBuffer) {
+    pub fn conv_bufs_for_slot(
+        &self,
+        slot: crate::serve::scheduler::SlotId,
+    ) -> (&MlxBuffer, &MlxBuffer) {
         if self.pp_flipped[slot.0 as usize] {
             (&self.conv_state_scratch, &self.conv_state)
         } else {
@@ -709,7 +723,10 @@ impl LinearAttnStateSlot {
     /// slot, honoring that slot's ping-pong parity (see
     /// [`Self::conv_bufs_for_slot`]).
     #[inline]
-    pub fn recurrent_bufs_for_slot(&self, slot: crate::serve::scheduler::SlotId) -> (&MlxBuffer, &MlxBuffer) {
+    pub fn recurrent_bufs_for_slot(
+        &self,
+        slot: crate::serve::scheduler::SlotId,
+    ) -> (&MlxBuffer, &MlxBuffer) {
         if self.pp_flipped[slot.0 as usize] {
             (&self.recurrent_scratch, &self.recurrent)
         } else {
@@ -732,7 +749,10 @@ impl LinearAttnStateSlot {
     /// ADR-040 M-QWEN — mutable CURRENT recurrent-state buffer for one
     /// slot (parity-aware). See [`Self::conv_current_mut`].
     #[inline]
-    pub fn recurrent_current_mut(&mut self, slot: crate::serve::scheduler::SlotId) -> &mut MlxBuffer {
+    pub fn recurrent_current_mut(
+        &mut self,
+        slot: crate::serve::scheduler::SlotId,
+    ) -> &mut MlxBuffer {
         if self.pp_flipped[slot.0 as usize] {
             &mut self.recurrent_scratch
         } else {
@@ -1248,18 +1268,15 @@ impl HybridKvCache {
                 Qwen35LayerKind::FullAttention => {
                     let rank = full_attn.len() as u32;
                     per_layer_slot.push(LayerSlot::Full(rank));
-                    let mut slot = alloc_full_attn_slot(
-                        cfg, device, max_seq_len, n_seqs, tq_kv_active,
-                    )
-                    .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
+                    let mut slot =
+                        alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
+                            .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
                     if tq_kv_active {
                         slot.tq = Some(
-                            alloc_tq_full_attn_buffers(
-                                cfg, device, max_seq_len, n_seqs,
-                            )
-                            .with_context(|| {
-                                format!("alloc tq full-attn buffers (layer {layer_idx})")
-                            })?,
+                            alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
+                                .with_context(|| {
+                                    format!("alloc tq full-attn buffers (layer {layer_idx})")
+                                })?,
                         );
                     }
                     full_attn.push(slot);
@@ -1267,14 +1284,12 @@ impl HybridKvCache {
                 Qwen35LayerKind::LinearAttention => {
                     let rank = linear_attn.len() as u32;
                     per_layer_slot.push(LayerSlot::Linear(rank));
-                    linear_attn.push(alloc_linear_attn_slot(
-                        cfg,
-                        device,
-                        conv_channels,
-                        k_minus1,
-                        n_seqs,
-                    )
-                    .with_context(|| format!("alloc linear-attn slot (layer {layer_idx})"))?);
+                    linear_attn.push(
+                        alloc_linear_attn_slot(cfg, device, conv_channels, k_minus1, n_seqs)
+                            .with_context(|| {
+                                format!("alloc linear-attn slot (layer {layer_idx})")
+                            })?,
+                    );
                 }
             }
         }
@@ -1646,9 +1661,7 @@ impl HybridKvCache {
         n_tokens_max: u32,
     ) -> Result<()> {
         if n_tokens_max == 0 {
-            return Err(anyhow!(
-                "ensure_la_capture: n_tokens_max must be > 0"
-            ));
+            return Err(anyhow!("ensure_la_capture: n_tokens_max must be > 0"));
         }
         let d_k = cfg.linear_key_head_dim as usize;
         let d_v = cfg.linear_value_head_dim as usize;
@@ -1666,10 +1679,7 @@ impl HybridKvCache {
         let conv_channels = conv_channels_for(cfg) as usize;
         let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
         let conv_state_elems = conv_channels * k_minus1 * n_seqs;
-        let conv_capture_elems = (n_seqs)
-            * (n_tokens_max as usize)
-            * k_minus1
-            * conv_channels;
+        let conv_capture_elems = (n_seqs) * (n_tokens_max as usize) * k_minus1 * conv_channels;
         let conv_shape = vec![n_seqs, n_tokens_max as usize, k_minus1, conv_channels];
 
         for slot in self.linear_attn.iter_mut() {
@@ -1816,7 +1826,9 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}].recurrent elements {} \
                      not divisible by n_seqs {} (layout invariant broken)",
-                    i, recurrent_total, n_seqs
+                    i,
+                    recurrent_total,
+                    n_seqs
                 ));
             }
             let per_seq_elems = recurrent_total / n_seqs;
@@ -1843,46 +1855,61 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "rollback_la_to: accepted_idx {} >= n_tokens_max {} \
                      for linear_attn[{}]",
-                    accepted_idx, n_tokens_max, i
+                    accepted_idx,
+                    n_tokens_max,
+                    i
                 ));
             }
             // Copy capture[slot, accepted_idx, ...] → recurrent[slot, ...]
             // per the layout proof above.
-            let capture_slice = capture.as_slice::<f32>().map_err(|e| {
-                anyhow!("rollback_la_to: linear_attn[{}].capture as_slice: {e}", i)
-            })?;
+            let capture_slice = capture
+                .as_slice::<f32>()
+                .map_err(|e| anyhow!("rollback_la_to: linear_attn[{}].capture as_slice: {e}", i))?;
             let capture_seq_stride = n_tokens_max * per_seq_elems;
-            let src_offset = slot_idx * capture_seq_stride
-                + (accepted_idx as usize) * per_seq_elems;
+            let src_offset =
+                slot_idx * capture_seq_stride + (accepted_idx as usize) * per_seq_elems;
             let src_end = src_offset + per_seq_elems;
             if src_end > capture_slice.len() {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}] capture src range [{}..{}) \
                      exceeds buffer len {} (slot={} accepted_idx={} \
                      n_tokens_max={} per_seq_elems={})",
-                    i, src_offset, src_end, capture_slice.len(),
-                    slot_idx, accepted_idx, n_tokens_max, per_seq_elems
+                    i,
+                    src_offset,
+                    src_end,
+                    capture_slice.len(),
+                    slot_idx,
+                    accepted_idx,
+                    n_tokens_max,
+                    per_seq_elems
                 ));
             }
             // Copy into a temporary so we can drop the immutable borrow
             // before taking &mut on recurrent.
-            let src_owned: Vec<f32> =
-                capture_slice[src_offset..src_end].to_vec();
+            let src_owned: Vec<f32> = capture_slice[src_offset..src_end].to_vec();
             // ADR-040 M-QWEN: rollback must land in the slot's CURRENT
             // recurrent buffer (parity-aware), not the named field.
-            let dst = slot_data.recurrent_current_mut(slot).as_mut_slice::<f32>().map_err(|e| {
-                anyhow!(
-                    "rollback_la_to: linear_attn[{}].recurrent as_mut_slice: {e}",
-                    i
-                )
-            })?;
+            let dst = slot_data
+                .recurrent_current_mut(slot)
+                .as_mut_slice::<f32>()
+                .map_err(|e| {
+                    anyhow!(
+                        "rollback_la_to: linear_attn[{}].recurrent as_mut_slice: {e}",
+                        i
+                    )
+                })?;
             let dst_offset = slot_idx * per_seq_elems;
             let dst_end = dst_offset + per_seq_elems;
             if dst_end > dst.len() {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}] recurrent dst range \
                      [{}..{}) exceeds buffer len {} (slot={} per_seq_elems={})",
-                    i, dst_offset, dst_end, dst.len(), slot_idx, per_seq_elems
+                    i,
+                    dst_offset,
+                    dst_end,
+                    dst.len(),
+                    slot_idx,
+                    per_seq_elems
                 ));
             }
             dst[dst_offset..dst_end].copy_from_slice(&src_owned);
@@ -1913,7 +1940,9 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_state elements {} \
                      not divisible by n_seqs {} (layout invariant broken)",
-                    i, conv_state_total, n_seqs
+                    i,
+                    conv_state_total,
+                    n_seqs
                 ));
             }
             let conv_per_seq = conv_state_total / n_seqs;
@@ -1934,13 +1963,14 @@ impl HybridKvCache {
                     conv_per_seq * n_seqs
                 ));
             }
-            let conv_n_tokens_max =
-                conv_capture_total / (conv_per_seq * n_seqs);
+            let conv_n_tokens_max = conv_capture_total / (conv_per_seq * n_seqs);
             if (accepted_idx as usize) >= conv_n_tokens_max {
                 return Err(anyhow!(
                     "rollback_la_to: accepted_idx {} >= conv n_tokens_max {} \
                      for linear_attn[{}]",
-                    accepted_idx, conv_n_tokens_max, i
+                    accepted_idx,
+                    conv_n_tokens_max,
+                    i
                 ));
             }
             let conv_per_t = conv_per_seq;
@@ -1951,17 +1981,22 @@ impl HybridKvCache {
                 )
             })?;
             let conv_capture_seq_stride = conv_n_tokens_max * conv_per_t;
-            let conv_src_offset = slot_idx * conv_capture_seq_stride
-                + (accepted_idx as usize) * conv_per_t;
+            let conv_src_offset =
+                slot_idx * conv_capture_seq_stride + (accepted_idx as usize) * conv_per_t;
             let conv_src_end = conv_src_offset + conv_per_t;
             if conv_src_end > conv_capture_slice.len() {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}] conv_capture src range \
                      [{}..{}) exceeds buffer len {} (slot={} accepted_idx={} \
                      conv_n_tokens_max={} conv_per_t={})",
-                    i, conv_src_offset, conv_src_end,
-                    conv_capture_slice.len(), slot_idx, accepted_idx,
-                    conv_n_tokens_max, conv_per_t
+                    i,
+                    conv_src_offset,
+                    conv_src_end,
+                    conv_capture_slice.len(),
+                    slot_idx,
+                    accepted_idx,
+                    conv_n_tokens_max,
+                    conv_per_t
                 ));
             }
             let conv_src_owned: Vec<f32> =
@@ -1974,7 +2009,8 @@ impl HybridKvCache {
             if conv_shape.len() < 2 {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_state shape too short: {:?}",
-                    i, conv_shape
+                    i,
+                    conv_shape
                 ));
             }
             let channels = conv_shape[0];
@@ -1983,15 +2019,23 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}] conv_state channels*k_minus1 ({}*{}={}) != \
                      per_t ({})",
-                    i, channels, k_minus1, channels * k_minus1, conv_per_t
+                    i,
+                    channels,
+                    k_minus1,
+                    channels * k_minus1,
+                    conv_per_t
                 ));
             }
             // ADR-040 M-QWEN: parity-aware CURRENT conv buffer (see above).
-            let conv_dst = slot_data.conv_current_mut(slot).as_mut_slice::<f32>().map_err(|e| {
-                anyhow!(
-                    "rollback_la_to: linear_attn[{}].conv_state as_mut_slice: {e}", i
-                )
-            })?;
+            let conv_dst = slot_data
+                .conv_current_mut(slot)
+                .as_mut_slice::<f32>()
+                .map_err(|e| {
+                    anyhow!(
+                        "rollback_la_to: linear_attn[{}].conv_state as_mut_slice: {e}",
+                        i
+                    )
+                })?;
             // Slot offset into conv_dst: per the col-major layout above.
             let conv_dst_slot_offset = slot_idx * conv_per_seq;
             let conv_dst_slot_end = conv_dst_slot_offset + conv_per_seq;
@@ -1999,12 +2043,15 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}] conv_state dst slot range \
                      [{}..{}) exceeds buffer len {} (slot={} conv_per_seq={})",
-                    i, conv_dst_slot_offset, conv_dst_slot_end,
-                    conv_dst.len(), slot_idx, conv_per_seq
+                    i,
+                    conv_dst_slot_offset,
+                    conv_dst_slot_end,
+                    conv_dst.len(),
+                    slot_idx,
+                    conv_per_seq
                 ));
             }
-            let conv_dst_slot =
-                &mut conv_dst[conv_dst_slot_offset..conv_dst_slot_end];
+            let conv_dst_slot = &mut conv_dst[conv_dst_slot_offset..conv_dst_slot_end];
             // Capture layout: capture[i, c] at offset i*channels + c
             // (channels innermost). conv_state layout: state[c, i] at
             // offset c*k_minus1 + i (k_minus1 innermost). Re-index:
@@ -2077,10 +2124,7 @@ impl HybridKvCache {
     /// to [`Self::reset`] (the for-loop iterates exactly one slot,
     /// zeros exactly the same bytes). H53 pins this in the test
     /// module via element-count + slice-offset assertions.
-    pub fn reset_for_slot(
-        &mut self,
-        slot: crate::serve::multi_seq_kv::SlotId,
-    ) -> Result<()> {
+    pub fn reset_for_slot(&mut self, slot: crate::serve::multi_seq_kv::SlotId) -> Result<()> {
         // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
         if slot.0 >= self.n_seqs {
             return Err(anyhow!(
@@ -2120,7 +2164,9 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "reset_for_slot: linear_attn[{}].conv_state elements {} \
                      not divisible by n_seqs {} (layout invariant broken)",
-                    i, total_conv, n_seqs
+                    i,
+                    total_conv,
+                    n_seqs
                 ));
             }
             let per_seq_conv = total_conv / n_seqs;
@@ -2130,7 +2176,9 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "reset_for_slot: linear_attn[{}].recurrent elements {} \
                      not divisible by n_seqs {} (layout invariant broken)",
-                    i, total_rec, n_seqs
+                    i,
+                    total_rec,
+                    n_seqs
                 ));
             }
             let per_seq_rec = total_rec / n_seqs;
@@ -2141,20 +2189,27 @@ impl HybridKvCache {
                 return Err(anyhow!(
                     "reset_for_slot: linear_attn[{}] conv_state_scratch elements \
                      {} != conv_state elements {} (ping-pong shape broken)",
-                    i, total_conv_scratch, total_conv
+                    i,
+                    total_conv_scratch,
+                    total_conv
                 ));
             }
             if total_rec_scratch != total_rec {
                 return Err(anyhow!(
                     "reset_for_slot: linear_attn[{}] recurrent_scratch elements \
                      {} != recurrent elements {} (ping-pong shape broken)",
-                    i, total_rec_scratch, total_rec
+                    i,
+                    total_rec_scratch,
+                    total_rec
                 ));
             }
             // Zero per-slot slice in each of the 4 buffers.
             {
                 let s = la.conv_state.as_mut_slice::<f32>().map_err(|e| {
-                    anyhow!("reset_for_slot: linear_attn[{}].conv_state as_mut_slice: {e}", i)
+                    anyhow!(
+                        "reset_for_slot: linear_attn[{}].conv_state as_mut_slice: {e}",
+                        i
+                    )
                 })?;
                 let start = slot_idx * per_seq_conv;
                 let end = start + per_seq_conv;
@@ -2177,7 +2232,10 @@ impl HybridKvCache {
             }
             {
                 let s = la.recurrent.as_mut_slice::<f32>().map_err(|e| {
-                    anyhow!("reset_for_slot: linear_attn[{}].recurrent as_mut_slice: {e}", i)
+                    anyhow!(
+                        "reset_for_slot: linear_attn[{}].recurrent as_mut_slice: {e}",
+                        i
+                    )
                 })?;
                 let start = slot_idx * per_seq_rec;
                 let end = start + per_seq_rec;
@@ -2301,15 +2359,11 @@ impl HybridKvCache {
             // pushes None to mirror. iter-34 makes None the production
             // norm under tq_kv_active=true.
             full_attn_k.push(match slot.k.as_ref() {
-                Some(buf) => Some(
-                    deep_copy_buffer(device, buf).context("snapshot full_attn.k")?,
-                ),
+                Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot full_attn.k")?),
                 None => None,
             });
             full_attn_v.push(match slot.v.as_ref() {
-                Some(buf) => Some(
-                    deep_copy_buffer(device, buf).context("snapshot full_attn.v")?,
-                ),
+                Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot full_attn.v")?),
                 None => None,
             });
             // iter-35: capture slot.tq when present (deep-copy each of
@@ -2335,15 +2389,11 @@ impl HybridKvCache {
             Some(slot) => Some(MtpKvSnapshot {
                 // iter-23c-α: same Optional bridge as full_attn above.
                 k: match slot.k.as_ref() {
-                    Some(buf) => Some(
-                        deep_copy_buffer(device, buf).context("snapshot mtp.k")?,
-                    ),
+                    Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot mtp.k")?),
                     None => None,
                 },
                 v: match slot.v.as_ref() {
-                    Some(buf) => Some(
-                        deep_copy_buffer(device, buf).context("snapshot mtp.v")?,
-                    ),
+                    Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot mtp.v")?),
                     None => None,
                 },
                 current_len: slot.current_len.clone(),
@@ -2380,8 +2430,8 @@ impl HybridKvCache {
                             pp: &[bool],
                             what: &str|
          -> Result<MlxBuffer> {
-            let mut out = deep_copy_buffer(device, named)
-                .with_context(|| format!("snapshot {what}"))?;
+            let mut out =
+                deep_copy_buffer(device, named).with_context(|| format!("snapshot {what}"))?;
             if pp.iter().any(|&f| f) {
                 let s = scratch
                     .as_slice::<f32>()
@@ -2399,8 +2449,7 @@ impl HybridKvCache {
                 let per = d.len() / n;
                 for (i, &flipped) in pp.iter().enumerate() {
                     if flipped {
-                        d[i * per..(i + 1) * per]
-                            .copy_from_slice(&s[i * per..(i + 1) * per]);
+                        d[i * per..(i + 1) * per].copy_from_slice(&s[i * per..(i + 1) * per]);
                     }
                 }
             }
@@ -2469,17 +2518,14 @@ impl HybridKvCache {
             snapshot.full_attn_k.len()
         );
         for (slot, (k_snap, (v_snap, (tq_snap, len_snap)))) in self.full_attn.iter_mut().zip(
-            snapshot
-                .full_attn_k
-                .iter()
-                .zip(
-                    snapshot.full_attn_v.iter().zip(
-                        snapshot
-                            .full_attn_tq
-                            .iter()
-                            .zip(snapshot.full_attn_current_len.iter()),
-                    ),
+            snapshot.full_attn_k.iter().zip(
+                snapshot.full_attn_v.iter().zip(
+                    snapshot
+                        .full_attn_tq
+                        .iter()
+                        .zip(snapshot.full_attn_current_len.iter()),
                 ),
+            ),
         ) {
             // ADR-027 sub-sub-iter 23c-α: Optional full-attn K/V on
             // BOTH source (iter-23a-β) AND destination (iter-23c-α).
@@ -2543,14 +2589,17 @@ impl HybridKvCache {
             }
             (None, None) => {}
             (Some(_), None) | (None, Some(_)) => {
-                anyhow::bail!("restore_from: mtp_slot presence mismatch between snapshot and cache");
+                anyhow::bail!(
+                    "restore_from: mtp_slot presence mismatch between snapshot and cache"
+                );
             }
         }
-        for (slot, (conv_snap, rec_snap)) in self
-            .linear_attn
-            .iter_mut()
-            .zip(snapshot.linear_conv.iter().zip(snapshot.linear_recurrent.iter()))
-        {
+        for (slot, (conv_snap, rec_snap)) in self.linear_attn.iter_mut().zip(
+            snapshot
+                .linear_conv
+                .iter()
+                .zip(snapshot.linear_recurrent.iter()),
+        ) {
             copy_buffer_bytes(conv_snap, &mut slot.conv_state).context("restore conv_state")?;
             copy_buffer_bytes(rec_snap, &mut slot.recurrent).context("restore recurrent")?;
             // ADR-040 M-QWEN: snapshots are parity-canonical (current
@@ -2634,10 +2683,12 @@ impl HybridKvCache {
         // [n_kv_heads, max_seq_len, head_dim] with F32 elements.  Copy
         // first n_tokens positions per head.
         for (slot, (k_snap, (v_snap, tq_snap))) in self.full_attn.iter_mut().zip(
-            snapshot
-                .full_attn_k
-                .iter()
-                .zip(snapshot.full_attn_v.iter().zip(snapshot.full_attn_tq.iter())),
+            snapshot.full_attn_k.iter().zip(
+                snapshot
+                    .full_attn_v
+                    .iter()
+                    .zip(snapshot.full_attn_tq.iter()),
+            ),
         ) {
             // ADR-027 sub-sub-iter 23c-α: Optional full-attn K/V on
             // BOTH source AND destination. Restore is a no-op when
@@ -2759,11 +2810,12 @@ impl HybridKvCache {
         // (they're per-head/per-model dimensions only) — byte-copy
         // directly.  Snapshot taken at any prompt position has correct
         // recurrent state at THAT position; we want exactly that state.
-        for (slot, (conv_snap, rec_snap)) in self
-            .linear_attn
-            .iter_mut()
-            .zip(snapshot.linear_conv.iter().zip(snapshot.linear_recurrent.iter()))
-        {
+        for (slot, (conv_snap, rec_snap)) in self.linear_attn.iter_mut().zip(
+            snapshot
+                .linear_conv
+                .iter()
+                .zip(snapshot.linear_recurrent.iter()),
+        ) {
             copy_buffer_bytes(conv_snap, &mut slot.conv_state)
                 .context("restore_partial conv_state")?;
             copy_buffer_bytes(rec_snap, &mut slot.recurrent)
@@ -2913,8 +2965,7 @@ fn alloc_linear_attn_slot(
     // s*(K-1)*channels + c*(K-1) + i, which corresponds to column-major
     // [channels, K-1] per sequence — i.e. channels-major with K-1 stride-1.
     // Storing in this layout avoids per-token CPU transpose + upload/download.
-    let conv_elems =
-        (conv_channels as usize) * (k_minus1 as usize) * (n_seqs as usize);
+    let conv_elems = (conv_channels as usize) * (k_minus1 as usize) * (n_seqs as usize);
     let conv_shape = vec![conv_channels as usize, k_minus1 as usize, n_seqs as usize];
     let conv_state = device
         .alloc_buffer(conv_elems * 4, DType::F32, conv_shape.clone())
@@ -3055,9 +3106,7 @@ pub fn alloc_tq_full_attn_buffers(
         ));
     }
     if n_seqs == 0 {
-        return Err(anyhow!(
-            "alloc_tq_full_attn_buffers: n_seqs must be > 0"
-        ));
+        return Err(anyhow!("alloc_tq_full_attn_buffers: n_seqs must be > 0"));
     }
 
     let n_kv_heads = cfg.num_key_value_heads as usize;
@@ -3066,10 +3115,8 @@ pub fn alloc_tq_full_attn_buffers(
 
     // Packed: [n_seqs, n_kv_heads, max_seq_len, head_dim] U8.
     // 1 byte per element (8-bit Lloyd-Max index).
-    let packed_elems = (n_seqs as usize)
-        * n_kv_heads
-        * (max_seq_len as usize)
-        * (head_dim as usize);
+    let packed_elems =
+        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (head_dim as usize);
     let packed_bytes = packed_elems; // U8 → 1 byte/elem
     let packed_shape = vec![
         n_seqs as usize,
@@ -3082,10 +3129,8 @@ pub fn alloc_tq_full_attn_buffers(
     // norms_per_pos=1 collapses to a 3-D view at the kernel level,
     // but we keep the 4-D shape on the buffer so cfg-shape validation
     // is unambiguous (every dim is explicit).
-    let norms_elems = (n_seqs as usize)
-        * n_kv_heads
-        * (max_seq_len as usize)
-        * (norms_per_pos as usize);
+    let norms_elems =
+        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (norms_per_pos as usize);
     let norms_bytes = norms_elems * std::mem::size_of::<f32>();
     let norms_shape = vec![
         n_seqs as usize,
@@ -3162,11 +3207,7 @@ impl std::fmt::Debug for TqFullAttnKvBuffers {
 /// Compute the F32 K+V byte count for one full-attn slot at the given
 /// shape.  Matches the existing `alloc_full_attn_slot` formula.  Used
 /// by the iter-7 parity test to assert the TQ savings ratio.
-pub fn full_attn_slot_f32_bytes(
-    cfg: &Qwen35Config,
-    max_seq_len: u32,
-    n_seqs: u32,
-) -> usize {
+pub fn full_attn_slot_f32_bytes(cfg: &Qwen35Config, max_seq_len: u32, n_seqs: u32) -> usize {
     let elems = (n_seqs as usize)
         * (cfg.num_key_value_heads as usize)
         * (max_seq_len as usize)
@@ -3244,12 +3285,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         slot: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // Per dossier §4 iter-2a step 2: full-attn cursors are
         // homogeneous across full_attn slots in production (every
@@ -3308,12 +3347,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds (iter-1.5 cfa-finding-F5 ordering).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots is the only layout HybridKvCache supports
         //    — no LayoutNotSupported branch.
@@ -3343,12 +3380,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
     ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
         // 1. Bounds (iter-1.5 cfa-finding-F5 ordering).
         if slot.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Budget: drop is a pure release; SlotOom is unreachable here
@@ -3383,20 +3418,16 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         //    deterministically — pinned by the fixture-parity test in
         //    `serve::multi_seq_kv::tests`).
         if src.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: src,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: src,
+                max_slots: self.n_seqs,
+            });
         }
         if dst.0 >= self.n_seqs {
-            return Err(
-                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
-                    slot: dst,
-                    max_slots: self.n_seqs,
-                },
-            );
+            return Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                slot: dst,
+                max_slots: self.n_seqs,
+            });
         }
         // 2. Layout: SeparateSlots only — no LayoutNotSupported.
         // 3. Same-slot fork is a no-op per trait spec — every reader of
@@ -3456,59 +3487,53 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
             let cur_src = slot.current_len[src_idx];
             // F32 K/V: copy slot region bytes when Some.
             if let Some(ref mut k) = slot.k {
-                copy_buffer_slot_region(k, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: full-attn K copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(k, src_idx, dst_idx, n_seqs).map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: full-attn K copy failed ({e})"
+                        )),
+                    }
+                })?;
             }
             if let Some(ref mut v) = slot.v {
-                copy_buffer_slot_region(v, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: full-attn V copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(v, src_idx, dst_idx, n_seqs).map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: full-attn V copy failed ({e})"
+                        )),
+                    }
+                })?;
             }
             // TQ-active shadow buffers (packed U8 + norms F32).
             if let Some(ref mut tq) = slot.tq {
-                copy_buffer_slot_region(&mut tq.k_packed, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: TQ K packed copy failed ({e})"
-                            )),
-                        }
-                    })?;
-                copy_buffer_slot_region(&mut tq.v_packed, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: TQ V packed copy failed ({e})"
-                            )),
-                        }
-                    })?;
-                copy_buffer_slot_region(&mut tq.k_norms, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: TQ K norms copy failed ({e})"
-                            )),
-                        }
-                    })?;
-                copy_buffer_slot_region(&mut tq.v_norms, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: TQ V norms copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(&mut tq.k_packed, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: TQ K packed copy failed ({e})"
+                        )),
+                    },
+                )?;
+                copy_buffer_slot_region(&mut tq.v_packed, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: TQ V packed copy failed ({e})"
+                        )),
+                    },
+                )?;
+                copy_buffer_slot_region(&mut tq.k_norms, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: TQ K norms copy failed ({e})"
+                        )),
+                    },
+                )?;
+                copy_buffer_slot_region(&mut tq.v_norms, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: TQ V norms copy failed ({e})"
+                        )),
+                    },
+                )?;
             }
             // Cursor copy AFTER buffer copy.
             slot.current_len[dst_idx] = cur_src;
@@ -3518,58 +3543,48 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         if let Some(ref mut mtp) = self.mtp_slot {
             let cur_src = mtp.current_len[src_idx];
             if let Some(ref mut k) = mtp.k {
-                copy_buffer_slot_region(k, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: MTP K copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(k, src_idx, dst_idx, n_seqs).map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!("fork_seq: MTP K copy failed ({e})")),
+                    }
+                })?;
             }
             if let Some(ref mut v) = mtp.v {
-                copy_buffer_slot_region(v, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: MTP V copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(v, src_idx, dst_idx, n_seqs).map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!("fork_seq: MTP V copy failed ({e})")),
+                    }
+                })?;
             }
             if let Some(ref mut tq) = mtp.tq {
-                copy_buffer_slot_region(&mut tq.k_packed, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: MTP TQ K packed copy failed ({e})"
-                            )),
-                        }
-                    })?;
-                copy_buffer_slot_region(&mut tq.v_packed, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: MTP TQ V packed copy failed ({e})"
-                            )),
-                        }
-                    })?;
-                copy_buffer_slot_region(&mut tq.k_norms, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: MTP TQ K norms copy failed ({e})"
-                            )),
-                        }
-                    })?;
-                copy_buffer_slot_region(&mut tq.v_norms, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: MTP TQ V norms copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(&mut tq.k_packed, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: MTP TQ K packed copy failed ({e})"
+                        )),
+                    },
+                )?;
+                copy_buffer_slot_region(&mut tq.v_packed, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: MTP TQ V packed copy failed ({e})"
+                        )),
+                    },
+                )?;
+                copy_buffer_slot_region(&mut tq.k_norms, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: MTP TQ K norms copy failed ({e})"
+                        )),
+                    },
+                )?;
+                copy_buffer_slot_region(&mut tq.v_norms, src_idx, dst_idx, n_seqs).map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: MTP TQ V norms copy failed ({e})"
+                        )),
+                    },
+                )?;
             }
             mtp.current_len[dst_idx] = cur_src;
         }
@@ -3586,66 +3601,56 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // `kv_cache.rs:2575-2632`.
         for slot in self.linear_attn.iter_mut() {
             // recurrent + recurrent_scratch.
-            copy_buffer_slot_region(&mut slot.recurrent, src_idx, dst_idx, n_seqs)
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: LA recurrent copy failed ({e})"
-                        )),
-                    }
-                })?;
-            copy_buffer_slot_region(
-                &mut slot.recurrent_scratch, src_idx, dst_idx, n_seqs,
-            )
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+            copy_buffer_slot_region(&mut slot.recurrent, src_idx, dst_idx, n_seqs).map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                     capability: leak_static_str(format!(
-                        "fork_seq: LA recurrent_scratch copy failed ({e})"
+                        "fork_seq: LA recurrent copy failed ({e})"
                     )),
-                }
-            })?;
+                },
+            )?;
+            copy_buffer_slot_region(&mut slot.recurrent_scratch, src_idx, dst_idx, n_seqs)
+                .map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: LA recurrent_scratch copy failed ({e})"
+                        )),
+                    },
+                )?;
             // conv_state + conv_state_scratch.
-            copy_buffer_slot_region(
-                &mut slot.conv_state, src_idx, dst_idx, n_seqs,
-            )
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+            copy_buffer_slot_region(&mut slot.conv_state, src_idx, dst_idx, n_seqs).map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                     capability: leak_static_str(format!(
                         "fork_seq: LA conv_state copy failed ({e})"
                     )),
-                }
-            })?;
-            copy_buffer_slot_region(
-                &mut slot.conv_state_scratch, src_idx, dst_idx, n_seqs,
-            )
-            .map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                    capability: leak_static_str(format!(
-                        "fork_seq: LA conv_state_scratch copy failed ({e})"
-                    )),
-                }
-            })?;
+                },
+            )?;
+            copy_buffer_slot_region(&mut slot.conv_state_scratch, src_idx, dst_idx, n_seqs)
+                .map_err(
+                    |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: LA conv_state_scratch copy failed ({e})"
+                        )),
+                    },
+                )?;
             // Optional capture buffers (K=N spec-decode).  Same n_seqs
             // outermost discipline.
             if let Some(ref mut cap) = slot.capture_states {
-                copy_buffer_slot_region(cap, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: LA capture_states copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(cap, src_idx, dst_idx, n_seqs).map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: LA capture_states copy failed ({e})"
+                        )),
+                    }
+                })?;
             }
             if let Some(ref mut ccap) = slot.conv_capture_states {
-                copy_buffer_slot_region(ccap, src_idx, dst_idx, n_seqs)
-                    .map_err(|e| {
-                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                            capability: leak_static_str(format!(
-                                "fork_seq: LA conv_capture_states copy failed ({e})"
-                            )),
-                        }
-                    })?;
+                copy_buffer_slot_region(ccap, src_idx, dst_idx, n_seqs).map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: LA conv_capture_states copy failed ({e})"
+                        )),
+                    }
+                })?;
             }
             // ADR-040 M-QWEN: BOTH physical buffers' src regions were
             // copied to dst, so dst's (current, scratch) roles must match
@@ -4113,8 +4118,7 @@ mod tests {
                 "full_attn[{i}].v[0] not restored"
             );
             assert_eq!(
-                slot.current_len[0],
-                expect_full_lens[i],
+                slot.current_len[0], expect_full_lens[i],
                 "full_attn[{i}].current_len[0] not restored"
             );
         }
@@ -4162,11 +4166,14 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 16, 1, true)
-            .expect("kv tq-on");
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, 16, 1, true).expect("kv tq-on");
 
         // iter-34 invariant: slot.k/v are None, slot.tq is Some.
-        assert!(cache.full_attn[0].k.is_none(), "iter-34: slot.k must be None");
+        assert!(
+            cache.full_attn[0].k.is_none(),
+            "iter-34: slot.k must be None"
+        );
         assert!(cache.full_attn[0].tq.is_some(), "tq alloc must be Some");
 
         // Plant canary bytes in TQ buffers of slot 0.
@@ -4186,11 +4193,16 @@ mod tests {
         let snap = cache.snapshot(&device).expect("snapshot");
         // iter-35 contract: snapshot.full_attn_tq must have one entry per
         // slot, all Some(_) when source had tq.
-        assert_eq!(snap.full_attn_tq.len(), cache.full_attn.len(),
-            "snapshot.full_attn_tq must align with cache.full_attn");
+        assert_eq!(
+            snap.full_attn_tq.len(),
+            cache.full_attn.len(),
+            "snapshot.full_attn_tq must align with cache.full_attn"
+        );
         for (i, tq_snap) in snap.full_attn_tq.iter().enumerate() {
-            assert!(tq_snap.is_some(),
-                "snapshot.full_attn_tq[{i}] must be Some when slot.tq is Some");
+            assert!(
+                tq_snap.is_some(),
+                "snapshot.full_attn_tq[{i}] must be Some when slot.tq is Some"
+            );
         }
 
         // Mutate live cache: blow away the TQ canaries.
@@ -4208,22 +4220,34 @@ mod tests {
         // Assert canary bytes recovered.
         let tq_restored = cache.full_attn[0].tq.as_ref().expect("tq ref");
         assert_eq!(
-            tq_restored.k_packed.as_slice::<u8>().expect("k_packed slice")[0],
+            tq_restored
+                .k_packed
+                .as_slice::<u8>()
+                .expect("k_packed slice")[0],
             CANARY_K_BYTE,
             "tq.k_packed[0] not restored"
         );
         assert_eq!(
-            tq_restored.v_packed.as_slice::<u8>().expect("v_packed slice")[0],
+            tq_restored
+                .v_packed
+                .as_slice::<u8>()
+                .expect("v_packed slice")[0],
             CANARY_V_BYTE,
             "tq.v_packed[0] not restored"
         );
         assert_eq!(
-            tq_restored.k_norms.as_slice::<f32>().expect("k_norms slice")[0],
+            tq_restored
+                .k_norms
+                .as_slice::<f32>()
+                .expect("k_norms slice")[0],
             canary_k_norm,
             "tq.k_norms[0] not restored"
         );
         assert_eq!(
-            tq_restored.v_norms.as_slice::<f32>().expect("v_norms slice")[0],
+            tq_restored
+                .v_norms
+                .as_slice::<f32>()
+                .expect("v_norms slice")[0],
             canary_v_norm,
             "tq.v_norms[0] not restored"
         );
@@ -4253,18 +4277,35 @@ mod tests {
         // iter-35 contract: snapshot.full_attn_tq is all-None when source
         // has no TQ buffers.
         for (i, tq_snap) in snap.full_attn_tq.iter().enumerate() {
-            assert!(tq_snap.is_none(),
-                "snapshot.full_attn_tq[{i}] must be None when slot.tq is None (legacy mode)");
+            assert!(
+                tq_snap.is_none(),
+                "snapshot.full_attn_tq[{i}] must be None when slot.tq is None (legacy mode)"
+            );
         }
 
         // Plant + mutate + restore F32 K canary (legacy-style round-trip).
         let canary_value: f32 = 7.5;
-        cache.full_attn[0].k.as_mut().unwrap().as_mut_slice::<f32>().unwrap()[0] = canary_value;
+        cache.full_attn[0]
+            .k
+            .as_mut()
+            .unwrap()
+            .as_mut_slice::<f32>()
+            .unwrap()[0] = canary_value;
         let snap2 = cache.snapshot(&device).expect("snapshot2");
-        cache.full_attn[0].k.as_mut().unwrap().as_mut_slice::<f32>().unwrap()[0] = -1.0;
+        cache.full_attn[0]
+            .k
+            .as_mut()
+            .unwrap()
+            .as_mut_slice::<f32>()
+            .unwrap()[0] = -1.0;
         cache.restore_from(&snap2).expect("restore");
         assert_eq!(
-            cache.full_attn[0].k.as_ref().unwrap().as_slice::<f32>().unwrap()[0],
+            cache.full_attn[0]
+                .k
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()[0],
             canary_value,
             "legacy F32 round-trip MUST still work after iter-35 TQ field added"
         );
@@ -4281,23 +4322,47 @@ mod tests {
 
         // Plant a canary in slot 0.
         // iter-29 (sub-sub-iter 23c-α): legacy new()⇒Some K/V.
-        cache.full_attn[0].k.as_mut().expect("legacy new()⇒Some(k)").as_mut_slice::<f32>().unwrap()[0] = 7.5;
-        cache.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = 3.25;
+        cache.full_attn[0]
+            .k
+            .as_mut()
+            .expect("legacy new()⇒Some(k)")
+            .as_mut_slice::<f32>()
+            .unwrap()[0] = 7.5;
+        cache.linear_attn[0]
+            .recurrent
+            .as_mut_slice::<f32>()
+            .unwrap()[0] = 3.25;
 
         let snap = cache.snapshot(&device).expect("snapshot");
         // Canary values inside the snapshot.
-        let snap_full_k0 = snap.full_attn_k[0].as_ref().expect("snap.k[0] some").as_slice::<f32>().unwrap()[0];
+        let snap_full_k0 = snap.full_attn_k[0]
+            .as_ref()
+            .expect("snap.k[0] some")
+            .as_slice::<f32>()
+            .unwrap()[0];
         let snap_lin_rec0 = snap.linear_recurrent[0].as_slice::<f32>().unwrap()[0];
         assert_eq!(snap_full_k0, 7.5);
         assert_eq!(snap_lin_rec0, 3.25);
 
         // Mutate the live cache — snapshot must NOT see this.
-        cache.full_attn[0].k.as_mut().expect("legacy new()⇒Some(k)").as_mut_slice::<f32>().unwrap()[0] = -123.0;
-        cache.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = -456.0;
+        cache.full_attn[0]
+            .k
+            .as_mut()
+            .expect("legacy new()⇒Some(k)")
+            .as_mut_slice::<f32>()
+            .unwrap()[0] = -123.0;
+        cache.linear_attn[0]
+            .recurrent
+            .as_mut_slice::<f32>()
+            .unwrap()[0] = -456.0;
 
         // Snapshot still holds the original canaries (deep-copy, not Arc::clone).
         assert_eq!(
-            snap.full_attn_k[0].as_ref().expect("snap.k[0] some").as_slice::<f32>().unwrap()[0],
+            snap.full_attn_k[0]
+                .as_ref()
+                .expect("snap.k[0] some")
+                .as_slice::<f32>()
+                .unwrap()[0],
             7.5,
             "snapshot aliased live cache (full_attn.k)"
         );
@@ -4347,7 +4412,12 @@ mod tests {
         use mlx_native::ops::gated_delta_net::GatedDeltaNetParams;
 
         let p = GatedDeltaNetParams {
-            d_k: 4, d_v: 4, n_k_heads: 1, n_v_heads: 1, n_tokens: 1, n_seqs: 1,
+            d_k: 4,
+            d_v: 4,
+            n_k_heads: 1,
+            n_v_heads: 1,
+            n_tokens: 1,
+            n_seqs: 1,
         };
         let q = vec![0.0f32; 4];
         let k = vec![0.0f32; 4];
@@ -4392,9 +4462,7 @@ mod tests {
             for head in 0..n_kv_heads {
                 for pos in 0..src_max_seq {
                     for elem in 0..head_dim {
-                        let idx = ((seq * n_kv_heads + head) * src_max_seq + pos)
-                            * head_dim
-                            + elem;
+                        let idx = ((seq * n_kv_heads + head) * src_max_seq + pos) * head_dim + elem;
                         src_data[idx] = 1000.0
                             + 100.0 * seq as f32
                             + 10.0 * head as f32
@@ -4426,10 +4494,7 @@ mod tests {
             .expect("partial_copy_slot");
 
         // Verify dst contents.
-        let dst_after = dst_buf
-            .as_slice::<f32>()
-            .expect("dst as_slice")
-            .to_vec();
+        let dst_after = dst_buf.as_slice::<f32>().expect("dst as_slice").to_vec();
 
         // Per (seq, head, pos, elem):
         //   pos < n_tokens : MUST equal src's value.
@@ -4439,9 +4504,7 @@ mod tests {
                 for pos in 0..dst_max_seq {
                     for elem in 0..head_dim {
                         let dst_idx =
-                            ((seq * n_kv_heads + head) * dst_max_seq + pos)
-                                * head_dim
-                                + elem;
+                            ((seq * n_kv_heads + head) * dst_max_seq + pos) * head_dim + elem;
                         if pos < n_tokens {
                             // Compare to src[seq, head, pos, elem].
                             let expected = 1000.0
@@ -4565,10 +4628,8 @@ mod tests {
 
         let max_seq_len: u32 = 8192;
         let n_seqs: u32 = 1;
-        let buffers = alloc_tq_full_attn_buffers(
-            &cfg, &device, max_seq_len, n_seqs,
-        )
-        .expect("alloc_tq_full_attn_buffers");
+        let buffers = alloc_tq_full_attn_buffers(&cfg, &device, max_seq_len, n_seqs)
+            .expect("alloc_tq_full_attn_buffers");
 
         // Expected byte counts at qwen36 APEX shape:
         //   k_packed: 1 × 2 × 8192 × 256 × 1 byte  = 4_194_304 bytes
@@ -4613,10 +4674,8 @@ mod tests {
         let max_seq_len: u32 = 8192;
         let n_seqs: u32 = 1;
         let f32_bytes = full_attn_slot_f32_bytes(&cfg, max_seq_len, n_seqs);
-        let tq_buffers = alloc_tq_full_attn_buffers(
-            &cfg, &device, max_seq_len, n_seqs,
-        )
-        .expect("alloc_tq_full_attn_buffers");
+        let tq_buffers = alloc_tq_full_attn_buffers(&cfg, &device, max_seq_len, n_seqs)
+            .expect("alloc_tq_full_attn_buffers");
         let tq_bytes = tq_buffers.total_bytes();
 
         let ratio = f32_bytes as f64 / tq_bytes as f64;
@@ -4681,8 +4740,8 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let buffers = alloc_tq_full_attn_buffers(&cfg, &device, 32, 1)
-            .expect("alloc_tq_full_attn_buffers");
+        let buffers =
+            alloc_tq_full_attn_buffers(&cfg, &device, 32, 1).expect("alloc_tq_full_attn_buffers");
         // U8 packed buffers all-zero.
         for byte in buffers.k_packed.as_slice::<u8>().expect("k_packed slice") {
             assert_eq!(*byte, 0u8);
@@ -4718,9 +4777,11 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
-            .expect("kv");
-        assert!(!cache.full_attn.is_empty(), "test fixture has full-attn layers");
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false).expect("kv");
+        assert!(
+            !cache.full_attn.is_empty(),
+            "test fixture has full-attn layers"
+        );
         for (i, slot) in cache.full_attn.iter().enumerate() {
             assert!(
                 slot.tq.is_none(),
@@ -4749,8 +4810,7 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
-            .expect("kv tq-on");
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true).expect("kv tq-on");
         assert!(!cache.full_attn.is_empty());
         let n_full_attn = cache.full_attn.len();
         for (i, slot) in cache.full_attn.iter().enumerate() {
@@ -4764,10 +4824,14 @@ mod tests {
             // when tq_kv_active=true. The slot now carries ONLY the TQ
             // buffers + current_len cursor (no F32 K/V allocation).
             // This is the load-bearing memory-savings invariant.
-            assert!(slot.k.is_none(),
-                "iter-34: slot.k must be None when tq_kv_active=true (F32 alloc dropped)");
-            assert!(slot.v.is_none(),
-                "iter-34: slot.v must be None when tq_kv_active=true (F32 alloc dropped)");
+            assert!(
+                slot.k.is_none(),
+                "iter-34: slot.k must be None when tq_kv_active=true (F32 alloc dropped)"
+            );
+            assert!(
+                slot.v.is_none(),
+                "iter-34: slot.v must be None when tq_kv_active=true (F32 alloc dropped)"
+            );
         }
         // MTP slot: tq present iff cfg has MTP. moe_cfg_40layer() sets
         // mtp_num_hidden_layers=0 → mtp_slot is None entirely.
@@ -4803,18 +4867,20 @@ mod tests {
         let cfg = moe_cfg_40layer();
         let max_seq_len: u32 = 8192;
         let n_seqs: u32 = 1;
-        let cache = HybridKvCache::new_with_options(
-            &cfg, &device, max_seq_len, n_seqs, true,
-        )
-        .expect("kv tq-on");
+        let cache = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, n_seqs, true)
+            .expect("kv tq-on");
         let slot = &cache.full_attn[0];
         assert!(slot.tq.is_some());
         let tq = slot.tq.as_ref().unwrap();
         // iter-34: F32 K and V are dropped — slot.k and slot.v are None.
-        assert!(slot.k.is_none(),
-            "iter-34: slot.k must be None when tq_kv_active=true (was 16 MB F32 in shadow mode)");
-        assert!(slot.v.is_none(),
-            "iter-34: slot.v must be None when tq_kv_active=true (was 16 MB F32 in shadow mode)");
+        assert!(
+            slot.k.is_none(),
+            "iter-34: slot.k must be None when tq_kv_active=true (was 16 MB F32 in shadow mode)"
+        );
+        assert!(
+            slot.v.is_none(),
+            "iter-34: slot.v must be None when tq_kv_active=true (was 16 MB F32 in shadow mode)"
+        );
         // TQ K_packed + V_packed: 1×2×8192×256 each (U8) = 4 MB each.
         assert_eq!(tq.k_packed.byte_len(), 1 * 2 * 8192 * 256);
         assert_eq!(tq.v_packed.byte_len(), 1 * 2 * 8192 * 256);
@@ -4826,8 +4892,10 @@ mod tests {
         // Pre-iter-34 shadow mode: 2 × 16 MB F32 + 8.52 MB TQ = 42_074_112.
         // Post-iter-34: 8_519_680 (3.94× smaller; 33.55 MB saved per slot).
         let per_slot_total = tq.total_bytes();
-        assert_eq!(per_slot_total, 8_519_680,
-            "iter-34: per-slot total must be TQ-only (3.94× savings vs F32+TQ shadow mode)");
+        assert_eq!(
+            per_slot_total, 8_519_680,
+            "iter-34: per-slot total must be TQ-only (3.94× savings vs F32+TQ shadow mode)"
+        );
         // Reference: pre-iter-34 shadow total was 42_074_112 bytes
         // (2 × 16 MB F32 K+V + 8.52 MB TQ). Now 8_519_680 bytes.
         let pre_iter34_shadow_total = 2 * (1 * 2 * 8192 * 256 * 4) + 8_519_680;
@@ -4839,13 +4907,17 @@ mod tests {
         let f32_only_baseline = 1 * 2 * 8192 * 256 * 4 * 2; // K + V each at 16 MB
         assert_eq!(f32_only_baseline, 33_554_432);
         let savings_ratio_vs_f32_only = f32_only_baseline as f64 / per_slot_total as f64;
-        assert!(savings_ratio_vs_f32_only > 3.93 && savings_ratio_vs_f32_only < 3.95,
-            "expected 3.94× F32-only→TQ-only savings, got {savings_ratio_vs_f32_only:.4}×");
+        assert!(
+            savings_ratio_vs_f32_only > 3.93 && savings_ratio_vs_f32_only < 3.95,
+            "expected 3.94× F32-only→TQ-only savings, got {savings_ratio_vs_f32_only:.4}×"
+        );
         // Bonus: vs pre-iter-34 shadow mode (which carried F32 + TQ),
         // savings is 4.94×.
         let savings_ratio_vs_shadow = pre_iter34_shadow_total as f64 / per_slot_total as f64;
-        assert!(savings_ratio_vs_shadow > 4.93 && savings_ratio_vs_shadow < 4.95,
-            "expected 4.94× shadow→TQ-only savings, got {savings_ratio_vs_shadow:.4}×");
+        assert!(
+            savings_ratio_vs_shadow > 4.93 && savings_ratio_vs_shadow < 4.95,
+            "expected 4.94× shadow→TQ-only savings, got {savings_ratio_vs_shadow:.4}×"
+        );
     }
 
     #[test]
@@ -4862,8 +4934,8 @@ mod tests {
         };
         let mut cfg = moe_cfg_40layer();
         cfg.mtp_num_hidden_layers = 1;
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
-            .expect("kv tq-on with mtp");
+        let cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, true).expect("kv tq-on with mtp");
         assert!(cache.mtp_slot.is_some(), "cfg has MTP layer");
         let mtp = cache.mtp_slot.as_ref().unwrap();
         assert!(
@@ -4893,8 +4965,7 @@ mod tests {
         let cfg = moe_cfg_40layer();
 
         // tq_kv_active=false: field reads false; every slot.tq is None.
-        let off = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
-            .expect("kv tq-off");
+        let off = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false).expect("kv tq-off");
         assert!(!off.tq_kv_active, "tq_kv_active must propagate (false)");
         for (i, slot) in off.full_attn.iter().enumerate() {
             assert!(
@@ -4904,8 +4975,7 @@ mod tests {
         }
 
         // tq_kv_active=true: field reads true; every slot.tq is Some.
-        let on = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
-            .expect("kv tq-on");
+        let on = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true).expect("kv tq-on");
         assert!(on.tq_kv_active, "tq_kv_active must propagate (true)");
         for (i, slot) in on.full_attn.iter().enumerate() {
             assert!(
@@ -4962,8 +5032,8 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
-            .expect("kv tq-off");
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, false).expect("kv tq-off");
         // Pick a real full-attn slot.
         let slot = &mut cache.full_attn[0];
         assert!(slot.tq.is_none());
@@ -4975,8 +5045,18 @@ mod tests {
         let mut encoder = device.command_encoder().expect("encoder");
         let err = slot
             .encode_token_to_tq(
-                &k_token, &v_token, n_kv_heads, head_dim, 64, 0, false, 1.0, 8,
-                &mut encoder, &mut registry, &device,
+                &k_token,
+                &v_token,
+                n_kv_heads,
+                head_dim,
+                64,
+                0,
+                false,
+                1.0,
+                8,
+                &mut encoder,
+                &mut registry,
+                &device,
             )
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -5002,9 +5082,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 64;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         assert!(slot.tq.is_some());
         let n_kv_heads = cfg.num_key_value_heads as u32;
@@ -5079,9 +5158,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 16;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         let n_kv_heads = cfg.num_key_value_heads as u32;
         let head_dim = cfg.head_dim;
@@ -5091,8 +5169,18 @@ mod tests {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
         slot.encode_token_to_tq(
-            &k_token, &v_token, n_kv_heads, head_dim, cache_capacity,
-            3, false, 1.0, 8, &mut encoder, &mut registry, &device,
+            &k_token,
+            &v_token,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            3,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode dispatch");
         encoder.commit_and_wait().expect("encoder commit_and_wait");
@@ -5131,9 +5219,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 16;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         let n_kv_heads = cfg.num_key_value_heads as u32;
         let head_dim = cfg.head_dim;
@@ -5147,13 +5234,33 @@ mod tests {
         // encoder per per-layer per-token write).
         let mut encoder = device.command_encoder().expect("encoder");
         slot.encode_token_to_tq(
-            &k_a, &v_a, n_kv_heads, head_dim, cache_capacity, 2, false, 1.0, 8,
-            &mut encoder, &mut registry, &device,
+            &k_a,
+            &v_a,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            2,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode A");
         slot.encode_token_to_tq(
-            &k_b, &v_b, n_kv_heads, head_dim, cache_capacity, 7, false, 1.0, 8,
-            &mut encoder, &mut registry, &device,
+            &k_b,
+            &v_b,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            7,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode B");
         encoder.commit_and_wait().expect("encoder commit_and_wait");
@@ -5204,9 +5311,8 @@ mod tests {
                 vec![num_heads as usize, head_dim as usize],
             )
             .expect("alloc output");
-        let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
-            num_heads, head_dim,
-        );
+        let tmp_bytes =
+            mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(num_heads, head_dim);
         let tmp = device
             .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
             .expect("alloc tmp");
@@ -5226,8 +5332,8 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
-            .expect("kv tq-off");
+        let cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, false).expect("kv tq-off");
         let slot = &cache.full_attn[0];
         assert!(slot.tq.is_none());
         let num_heads = cfg.num_attention_heads;
@@ -5250,7 +5356,15 @@ mod tests {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
         let err = slot
-            .dispatch_tq_sdpa(&q, &output, &tmp, &params, &mut encoder, &mut registry, &device)
+            .dispatch_tq_sdpa(
+                &q,
+                &output,
+                &tmp,
+                &params,
+                &mut encoder,
+                &mut registry,
+                &device,
+            )
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -5277,9 +5391,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 64;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         let n_kv_heads = cfg.num_key_value_heads;
         let num_heads = cfg.num_attention_heads;
@@ -5293,8 +5406,18 @@ mod tests {
         let mut encoder = device.command_encoder().expect("encoder");
         // Encode the single KV token at write_pos=0.
         slot.encode_token_to_tq(
-            &k_token, &v_token, n_kv_heads, head_dim, cache_capacity,
-            0, false, 1.0, 8, &mut encoder, &mut registry, &device,
+            &k_token,
+            &v_token,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            0,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode");
 
@@ -5325,7 +5448,13 @@ mod tests {
         // Dispatch SDPA on the SAME encoder (production pattern: encode
         // → dispatch in one CB).
         slot.dispatch_tq_sdpa(
-            &q_buf, &output, &tmp, &params, &mut encoder, &mut registry, &device,
+            &q_buf,
+            &output,
+            &tmp,
+            &params,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("dispatch_tq_sdpa");
         encoder.commit_and_wait().expect("commit_and_wait");
@@ -5360,9 +5489,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 16;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         let n_kv_heads = cfg.num_key_value_heads;
         let num_heads = cfg.num_attention_heads;
@@ -5376,13 +5504,33 @@ mod tests {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
         slot.encode_token_to_tq(
-            &k0, &v0, n_kv_heads, head_dim, cache_capacity, 0, false, 1.0, 8,
-            &mut encoder, &mut registry, &device,
+            &k0,
+            &v0,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            0,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode pos 0");
         slot.encode_token_to_tq(
-            &k1, &v1, n_kv_heads, head_dim, cache_capacity, 1, false, 1.0, 8,
-            &mut encoder, &mut registry, &device,
+            &k1,
+            &v1,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            1,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode pos 1");
 
@@ -5409,7 +5557,13 @@ mod tests {
         };
 
         slot.dispatch_tq_sdpa(
-            &q_buf, &output, &tmp, &params, &mut encoder, &mut registry, &device,
+            &q_buf,
+            &output,
+            &tmp,
+            &params,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("dispatch_tq_sdpa");
         encoder.commit_and_wait().expect("commit_and_wait");
@@ -5417,7 +5571,10 @@ mod tests {
         let out = output.as_slice::<f32>().expect("output slice");
         let mut any_nonzero = false;
         for &v in out.iter() {
-            assert!(v.is_finite(), "SDPA output must be finite at kv_seq_len=2; got {v}");
+            assert!(
+                v.is_finite(),
+                "SDPA output must be finite at kv_seq_len=2; got {v}"
+            );
             if v != 0.0 {
                 any_nonzero = true;
             }
@@ -5439,8 +5596,7 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
-            .expect("kv tq-on");
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true).expect("kv tq-on");
         let slot = &cache.full_attn[0];
         let num_heads = cfg.num_attention_heads;
         let head_dim = cfg.head_dim;
@@ -5462,7 +5618,15 @@ mod tests {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
         let err = slot
-            .dispatch_tq_sdpa(&q, &output, &tmp, &params, &mut encoder, &mut registry, &device)
+            .dispatch_tq_sdpa(
+                &q,
+                &output,
+                &tmp,
+                &params,
+                &mut encoder,
+                &mut registry,
+                &device,
+            )
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -5483,10 +5647,9 @@ mod tests {
     /// scores after sign×FWHT round-trip equal the F32 baseline modulo
     /// quantization (sign[i]^2 = 1 cancels under Q@K^T).
     const TBQ_SIGNS_256: [u8; 32] = [
-        0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e,
-        0xb3, 0x7f, 0x24, 0xd6, 0x89, 0x45, 0xea, 0x1c,
-        0x63, 0xaf, 0xd8, 0x52, 0x97, 0x0b, 0xe1, 0x3d,
-        0x76, 0xc4, 0x19, 0xfe, 0x4a, 0x85, 0x2c, 0xdb,
+        0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e, 0xb3, 0x7f, 0x24, 0xd6, 0x89, 0x45, 0xea,
+        0x1c, 0x63, 0xaf, 0xd8, 0x52, 0x97, 0x0b, 0xe1, 0x3d, 0x76, 0xc4, 0x19, 0xfe, 0x4a, 0x85,
+        0x2c, 0xdb,
     ];
 
     /// Apply the D1 sign pattern in-place (TBQ_SIGNS_256). Self-inverse.
@@ -5609,9 +5772,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 64;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         let n_kv_heads = cfg.num_key_value_heads;
         let num_heads = cfg.num_attention_heads;
@@ -5620,19 +5782,27 @@ mod tests {
 
         // Step 1: synthetic K, V with both CPU mirrors (for reference) and
         // GPU buffers (for encoding).
-        let (k_cpu, k_buf) = synth_token_with_cpu_mirror(
-            &device, n_kv_heads as usize, head_dim as usize, 7,
-        );
-        let (v_cpu, v_buf) = synth_token_with_cpu_mirror(
-            &device, n_kv_heads as usize, head_dim as usize, 11,
-        );
+        let (k_cpu, k_buf) =
+            synth_token_with_cpu_mirror(&device, n_kv_heads as usize, head_dim as usize, 7);
+        let (v_cpu, v_buf) =
+            synth_token_with_cpu_mirror(&device, n_kv_heads as usize, head_dim as usize, 11);
 
         // Step 2: GPU encode at write_pos=0.
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
         slot.encode_token_to_tq(
-            &k_buf, &v_buf, n_kv_heads, head_dim, cache_capacity,
-            0, false, 1.0, 8, &mut encoder, &mut registry, &device,
+            &k_buf,
+            &v_buf,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            0,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode");
         encoder.commit_and_wait().expect("encode commit");
@@ -5657,8 +5827,7 @@ mod tests {
         // Apply D1 sign × FWHT to each head of Q (mirrors GPU
         // dispatch_fwht_sign_premult_f32 — the Q pre-rotation Gemma's
         // production path uses; iter-12 will dispatch this on GPU).
-        let mut q_fwht: Vec<f32> =
-            Vec::with_capacity((num_heads as usize) * (head_dim as usize));
+        let mut q_fwht: Vec<f32> = Vec::with_capacity((num_heads as usize) * (head_dim as usize));
         for head in &q_orig {
             let mut buf = head.clone();
             sign_premult_fwht_d256(&mut buf);
@@ -5680,8 +5849,7 @@ mod tests {
             scale_factor_d512: 1.0,
             codebook_bits: 8,
         };
-        let mut oracle_output =
-            vec![0.0_f32; (num_heads as usize) * (head_dim as usize)];
+        let mut oracle_output = vec![0.0_f32; (num_heads as usize) * (head_dim as usize)];
         mlx_native::tq_oracle::flash_attn_vec_tq_hb_oracle(
             &q_fwht,
             &k_packed_bytes,
@@ -5792,22 +5960,34 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
-                .expect("kv tq-off");
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, false).expect("kv tq-off");
         let slot = &mut cache.full_attn[0];
         assert!(slot.tq.is_none());
         let seq_kv = synth_seq_kv_buffer(
-            &device, 4, cfg.num_key_value_heads as usize,
-            cfg.head_dim as usize, 17,
+            &device,
+            4,
+            cfg.num_key_value_heads as usize,
+            cfg.head_dim as usize,
+            17,
         );
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
         let err = slot
             .encode_seq_tokens_to_tq(
-                &seq_kv, true, 4,
-                cfg.num_key_value_heads, cfg.head_dim, 64,
-                0, 0, false, 1.0, 8,
-                &mut encoder, &mut registry, &device,
+                &seq_kv,
+                true,
+                4,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                64,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                &mut encoder,
+                &mut registry,
+                &device,
             )
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -5842,9 +6022,8 @@ mod tests {
 
         // Reference path: 5 separate single-token tokens encoded via
         // encode_token_to_tq into reference cache slot.
-        let mut cache_ref =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv ref tq-on");
+        let mut cache_ref = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv ref tq-on");
         let slot_ref = &mut cache_ref.full_attn[0];
 
         // Build N single-token K and V buffers (each shape
@@ -5853,25 +6032,36 @@ mod tests {
         let mut single_v_bufs: Vec<MlxBuffer> = Vec::new();
         for t in 0..n_tokens as usize {
             single_k_bufs.push(synth_token_buffer(
-                &device, n_kv_heads as usize, head_dim as usize,
+                &device,
+                n_kv_heads as usize,
+                head_dim as usize,
                 100 + t as u32,
             ));
             single_v_bufs.push(synth_token_buffer(
-                &device, n_kv_heads as usize, head_dim as usize,
+                &device,
+                n_kv_heads as usize,
+                head_dim as usize,
                 200 + t as u32,
             ));
         }
 
         let mut registry = mlx_native::KernelRegistry::new();
         let mut enc_ref = device.command_encoder().expect("encoder ref");
-        for (t, (k_buf, v_buf)) in
-            single_k_bufs.iter().zip(single_v_bufs.iter()).enumerate()
-        {
+        for (t, (k_buf, v_buf)) in single_k_bufs.iter().zip(single_v_bufs.iter()).enumerate() {
             slot_ref
                 .encode_token_to_tq(
-                    k_buf, v_buf, n_kv_heads, head_dim, cache_capacity,
-                    t as u32, false, 1.0, 8, &mut enc_ref,
-                    &mut registry, &device,
+                    k_buf,
+                    v_buf,
+                    n_kv_heads,
+                    head_dim,
+                    cache_capacity,
+                    t as u32,
+                    false,
+                    1.0,
+                    8,
+                    &mut enc_ref,
+                    &mut registry,
+                    &device,
                 )
                 .expect("encode_token_to_tq per-token");
         }
@@ -5883,16 +6073,14 @@ mod tests {
         // encode_seq_tokens_to_tq once per side.
         let mut seq_k = device
             .alloc_buffer(
-                (n_tokens as usize) * (n_kv_heads as usize)
-                    * (head_dim as usize) * 4,
+                (n_tokens as usize) * (n_kv_heads as usize) * (head_dim as usize) * 4,
                 DType::F32,
                 vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
             )
             .expect("alloc seq_k");
         let mut seq_v = device
             .alloc_buffer(
-                (n_tokens as usize) * (n_kv_heads as usize)
-                    * (head_dim as usize) * 4,
+                (n_tokens as usize) * (n_kv_heads as usize) * (head_dim as usize) * 4,
                 DType::F32,
                 vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
             )
@@ -5909,21 +6097,44 @@ mod tests {
             }
         }
 
-        let mut cache_seq =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv seq tq-on");
+        let mut cache_seq = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv seq tq-on");
         let slot_seq = &mut cache_seq.full_attn[0];
         let mut enc_seq = device.command_encoder().expect("encoder seq");
         slot_seq
             .encode_seq_tokens_to_tq(
-                &seq_k, true, n_tokens, n_kv_heads, head_dim, cache_capacity,
-                0, 0, false, 1.0, 8, &mut enc_seq, &mut registry, &device,
+                &seq_k,
+                true,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                &mut enc_seq,
+                &mut registry,
+                &device,
             )
             .expect("encode K seq");
         slot_seq
             .encode_seq_tokens_to_tq(
-                &seq_v, false, n_tokens, n_kv_heads, head_dim, cache_capacity,
-                0, 0, false, 1.0, 8, &mut enc_seq, &mut registry, &device,
+                &seq_v,
+                false,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                &mut enc_seq,
+                &mut registry,
+                &device,
             )
             .expect("encode V seq");
         enc_seq.commit_and_wait().expect("seq commit");
@@ -5995,9 +6206,8 @@ mod tests {
 
         // Build a TQ-active cache + encode N tokens of K into slot 0
         // via the production seq-encode path.
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
 
         // Build a [n_tokens, n_kv_heads, head_dim] f32 source buffer
@@ -6007,7 +6217,8 @@ mod tests {
         let total_elems = (n_tokens as usize) * stride;
         let mut seq_k = device
             .alloc_buffer(
-                total_elems * 4, DType::F32,
+                total_elems * 4,
+                DType::F32,
                 vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
             )
             .expect("alloc seq_k");
@@ -6030,15 +6241,23 @@ mod tests {
 
         // Encode K seq into TQ.
         let mut enc = device.command_encoder().expect("encoder");
-        slot
-            .encode_seq_tokens_to_tq(
-                &seq_k, /*is_k=*/ true, n_tokens, n_kv_heads, head_dim,
-                cache_capacity, /*write_pos=*/ 0, /*src_tok_offset=*/ 0,
-                /*sliding=*/ false, /*scale_factor_d512=*/ 1.0,
-                /*codebook_bits=*/ 8,
-                &mut enc, &mut registry, &device,
-            )
-            .expect("encode K seq");
+        slot.encode_seq_tokens_to_tq(
+            &seq_k,
+            /*is_k=*/ true,
+            n_tokens,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            /*write_pos=*/ 0,
+            /*src_tok_offset=*/ 0,
+            /*sliding=*/ false,
+            /*scale_factor_d512=*/ 1.0,
+            /*codebook_bits=*/ 8,
+            &mut enc,
+            &mut registry,
+            &device,
+        )
+        .expect("encode K seq");
         enc.commit_and_wait().expect("encode commit");
 
         // Reference: per-position dispatch into separate buffers.
@@ -6059,10 +6278,15 @@ mod tests {
             let tq = slot.tq.as_ref().unwrap();
             for t in 0..n_tokens {
                 mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv(
-                    &mut enc, &mut registry, device.metal_device(),
-                    &tq.k_packed, &tq.k_norms,
+                    &mut enc,
+                    &mut registry,
+                    device.metal_device(),
+                    &tq.k_packed,
+                    &tq.k_norms,
                     &ref_per_pos[t as usize],
-                    n_kv_heads, head_dim, cache_capacity,
+                    n_kv_heads,
+                    head_dim,
+                    cache_capacity,
                     /*read_pos=*/ t,
                     /*scale_factor_d512=*/ 1.0,
                     /*codebook_bits=*/ 8,
@@ -6078,9 +6302,15 @@ mod tests {
             let mut enc = device.command_encoder().expect("encoder seq");
             let buf = slot
                 .dequant_seq_to_temp_f32(
-                    /*is_k=*/ true, n_tokens, /*start_pos=*/ 0,
-                    cache_capacity, n_kv_heads, head_dim,
-                    &mut enc, &mut registry, &device,
+                    /*is_k=*/ true,
+                    n_tokens,
+                    /*start_pos=*/ 0,
+                    cache_capacity,
+                    n_kv_heads,
+                    head_dim,
+                    &mut enc,
+                    &mut registry,
+                    &device,
                 )
                 .expect("dequant_seq_to_temp_f32");
             enc.commit_and_wait().expect("seq commit");
@@ -6156,9 +6386,8 @@ mod tests {
         let head_dim = cfg.head_dim;
         assert_eq!(head_dim, 256);
 
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
 
         // Build a [n_tokens, n_kv_heads, head_dim] f32 K source with
@@ -6178,7 +6407,8 @@ mod tests {
         }
         let mut seq_k = device
             .alloc_buffer(
-                total_elems * 4, DType::F32,
+                total_elems * 4,
+                DType::F32,
                 vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
             )
             .expect("alloc seq_k");
@@ -6193,11 +6423,20 @@ mod tests {
         {
             let mut enc = device.command_encoder().expect("encoder");
             slot.encode_seq_tokens_to_tq(
-                &seq_k, /*is_k=*/ true, n_tokens, n_kv_heads, head_dim,
-                cache_capacity, /*write_pos=*/ 0, /*src_tok_offset=*/ 0,
-                /*sliding=*/ false, /*scale_factor_d512=*/ 1.0,
+                &seq_k,
+                /*is_k=*/ true,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                /*write_pos=*/ 0,
+                /*src_tok_offset=*/ 0,
+                /*sliding=*/ false,
+                /*scale_factor_d512=*/ 1.0,
                 /*codebook_bits=*/ 8,
-                &mut enc, &mut registry, &device,
+                &mut enc,
+                &mut registry,
+                &device,
             )
             .expect("encode K seq");
             enc.commit_and_wait().expect("encode commit");
@@ -6208,9 +6447,15 @@ mod tests {
             let mut enc = device.command_encoder().expect("encoder dequant");
             let buf = slot
                 .dequant_seq_to_temp_f32_unrotated(
-                    /*is_k=*/ true, n_tokens, /*start_pos=*/ 0,
-                    cache_capacity, n_kv_heads, head_dim,
-                    &mut enc, &mut registry, &device,
+                    /*is_k=*/ true,
+                    n_tokens,
+                    /*start_pos=*/ 0,
+                    cache_capacity,
+                    n_kv_heads,
+                    head_dim,
+                    &mut enc,
+                    &mut registry,
+                    &device,
                 )
                 .expect("dequant_seq_to_temp_f32_unrotated");
             enc.commit_and_wait().expect("dequant commit");
@@ -6225,8 +6470,8 @@ mod tests {
         for h in 0..n_kv_heads as usize {
             for t in 0..n_tokens as usize {
                 for d in 0..head_dim as usize {
-                    let head_major_off = h * (n_tokens as usize) * (head_dim as usize)
-                        + t * (head_dim as usize) + d;
+                    let head_major_off =
+                        h * (n_tokens as usize) * (head_dim as usize) + t * (head_dim as usize) + d;
                     let seq_major_off = t * stride + h * (head_dim as usize) + d;
                     recovered_seq_major[seq_major_off] = recovered_slice[head_major_off];
                 }
@@ -6242,9 +6487,7 @@ mod tests {
         // Iter-13 single-position measured 0.008. Seq variant should be in
         // the same ballpark — failing this is a regression signal even if
         // technically under threshold.
-        eprintln!(
-            "[iter-32 round-trip NRMSE] {nrmse_value:.6} (iter-13 single-pos: ~0.008)"
-        );
+        eprintln!("[iter-32 round-trip NRMSE] {nrmse_value:.6} (iter-13 single-pos: ~0.008)");
     }
 
     /// ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — TQ-cache-backed
@@ -6302,10 +6545,8 @@ mod tests {
         let head_dim = cfg.head_dim;
         assert_eq!(head_dim, 256);
 
-        let mut cache = HybridKvCache::new_with_options(
-            &cfg, &device, cache_capacity, 1, true,
-        )
-        .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
 
         // Synthesize K, V seq-major.
         let stride_seq = (n_kv_heads as usize) * (head_dim as usize);
@@ -6316,10 +6557,8 @@ mod tests {
             for h in 0..n_kv_heads as usize {
                 for d in 0..head_dim as usize {
                     let off = t * stride_seq + h * head_dim as usize + d;
-                    k_seq_major_cpu[off] =
-                        ((t * 31 + h * 17 + d * 7) as f32 / 137.0).sin() * 0.4;
-                    v_seq_major_cpu[off] =
-                        ((t * 13 + h * 23 + d * 5) as f32 / 211.0).cos() * 0.35;
+                    k_seq_major_cpu[off] = ((t * 31 + h * 17 + d * 7) as f32 / 137.0).sin() * 0.4;
+                    v_seq_major_cpu[off] = ((t * 13 + h * 23 + d * 5) as f32 / 211.0).cos() * 0.35;
                 }
             }
         }
@@ -6334,13 +6573,15 @@ mod tests {
         let f32_kv_elems = (n_kv_heads as usize) * cap * (head_dim as usize);
         let mut local_k_f32 = device
             .alloc_buffer(
-                f32_kv_elems * 4, DType::F32,
+                f32_kv_elems * 4,
+                DType::F32,
                 vec![1, n_kv_heads as usize, cap, head_dim as usize],
             )
             .expect("alloc local F32 K (Path A reference)");
         let mut local_v_f32 = device
             .alloc_buffer(
-                f32_kv_elems * 4, DType::F32,
+                f32_kv_elems * 4,
+                DType::F32,
                 vec![1, n_kv_heads as usize, cap, head_dim as usize],
             )
             .expect("alloc local F32 V (Path A reference)");
@@ -6349,14 +6590,17 @@ mod tests {
             let dst_v = local_v_f32.as_mut_slice::<f32>().expect("local v mut");
             // Zero the unused [n_tokens..max_seq_len) tail so the kernel
             // attends over a well-defined region.
-            for v in dst_k.iter_mut() { *v = 0.0; }
-            for v in dst_v.iter_mut() { *v = 0.0; }
+            for v in dst_k.iter_mut() {
+                *v = 0.0;
+            }
+            for v in dst_v.iter_mut() {
+                *v = 0.0;
+            }
             for h in 0..n_kv_heads as usize {
                 for t in 0..n_tokens as usize {
                     for d in 0..head_dim as usize {
                         let src_off = t * stride_seq + h * head_dim as usize + d;
-                        let dst_off = h * cap * head_dim as usize
-                            + t * head_dim as usize + d;
+                        let dst_off = h * cap * head_dim as usize + t * head_dim as usize + d;
                         dst_k[dst_off] = k_seq_major_cpu[src_off];
                         dst_v[dst_off] = v_seq_major_cpu[src_off];
                     }
@@ -6367,18 +6611,26 @@ mod tests {
         // Encode K, V into slot.tq via the seq-batch encoder.
         let mut seq_k = device
             .alloc_buffer(
-                kv_total_elems * 4, DType::F32,
+                kv_total_elems * 4,
+                DType::F32,
                 vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
             )
             .expect("alloc seq_k");
         let mut seq_v = device
             .alloc_buffer(
-                kv_total_elems * 4, DType::F32,
+                kv_total_elems * 4,
+                DType::F32,
                 vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
             )
             .expect("alloc seq_v");
-        seq_k.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_seq_major_cpu);
-        seq_v.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_seq_major_cpu);
+        seq_k
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&k_seq_major_cpu);
+        seq_v
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&v_seq_major_cpu);
 
         let mut registry = mlx_native::KernelRegistry::new();
         // The flash-attn-prefill kernel entry points are registered
@@ -6389,15 +6641,37 @@ mod tests {
             let slot = &mut cache.full_attn[0];
             let mut enc = device.command_encoder().expect("encoder");
             slot.encode_seq_tokens_to_tq(
-                &seq_k, true, n_tokens, n_kv_heads, head_dim,
-                cache_capacity, 0, 0, false, 1.0, 8,
-                &mut enc, &mut registry, &device,
+                &seq_k,
+                true,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                &mut enc,
+                &mut registry,
+                &device,
             )
             .expect("encode K seq");
             slot.encode_seq_tokens_to_tq(
-                &seq_v, false, n_tokens, n_kv_heads, head_dim,
-                cache_capacity, 0, 0, false, 1.0, 8,
-                &mut enc, &mut registry, &device,
+                &seq_v,
+                false,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                &mut enc,
+                &mut registry,
+                &device,
             )
             .expect("encode V seq");
             enc.commit_and_wait().expect("encode commit");
@@ -6409,15 +6683,16 @@ mod tests {
         for t in 0..chunk2_seq_len as usize {
             for h in 0..n_heads as usize {
                 for d in 0..head_dim as usize {
-                    let off = t * (n_heads as usize) * (head_dim as usize)
-                        + h * head_dim as usize + d;
+                    let off =
+                        t * (n_heads as usize) * (head_dim as usize) + h * head_dim as usize + d;
                     q_cpu[off] = ((t * 19 + h * 11 + d * 3) as f32 / 173.0).sin() * 0.3;
                 }
             }
         }
         let mut q_gpu = device
             .alloc_buffer(
-                q_total_elems * 4, DType::F32,
+                q_total_elems * 4,
+                DType::F32,
                 vec![chunk2_seq_len as usize, n_heads as usize, head_dim as usize],
             )
             .expect("alloc q");
@@ -6427,26 +6702,43 @@ mod tests {
         // locally-allocated F32 K/V (slot.k/v are None in iter-34's
         // TQ-only mode).
         let out_a = apply_flash_attn_prefill_seq_major_resume(
-            &device, &mut registry,
-            &q_gpu, &local_k_f32, &local_v_f32,
-            chunk2_seq_len, cur_len, n_tokens, cache_capacity,
-            n_heads, n_kv_heads, head_dim,
+            &device,
+            &mut registry,
+            &q_gpu,
+            &local_k_f32,
+            &local_v_f32,
+            chunk2_seq_len,
+            cur_len,
+            n_tokens,
+            cache_capacity,
+            n_heads,
+            n_kv_heads,
+            head_dim,
         )
         .expect("F32 prefill resume");
 
         let slot_ref = &cache.full_attn[0];
         // iter-34 invariant pin: in tq_kv_active=true mode the slot's
         // F32 K/V are dropped at alloc time.
-        assert!(slot_ref.k.is_none(),
-            "iter-34: slot.k must be None when tq_kv_active=true");
+        assert!(
+            slot_ref.k.is_none(),
+            "iter-34: slot.k must be None when tq_kv_active=true"
+        );
         assert!(slot_ref.v.is_none(), "iter-34: slot.v must be None");
 
         // Path B (UNDER TEST).
         let out_b = apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
-            &device, &mut registry,
-            slot_ref, &q_gpu,
-            chunk2_seq_len, cur_len, n_tokens, cache_capacity,
-            n_heads, n_kv_heads, head_dim,
+            &device,
+            &mut registry,
+            slot_ref,
+            &q_gpu,
+            chunk2_seq_len,
+            cur_len,
+            n_tokens,
+            cache_capacity,
+            n_heads,
+            n_kv_heads,
+            head_dim,
         )
         .expect("TQ-cache prefill resume");
 
@@ -6487,8 +6779,8 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
-            .expect("kv tq-off");
+        let cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, false).expect("kv tq-off");
         let slot = &cache.full_attn[0];
         assert!(slot.tq.is_none(), "test precondition: slot.tq must be None");
 
@@ -6502,9 +6794,17 @@ mod tests {
 
         let mut registry = mlx_native::KernelRegistry::new();
         let res = apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
-            &device, &mut registry, slot, &q_gpu,
-            8, 16, 24, 64,
-            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+            &device,
+            &mut registry,
+            slot,
+            &q_gpu,
+            8,
+            16,
+            24,
+            64,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
         );
         assert!(res.is_err(), "must error when slot.tq is None");
         let msg = format!("{:?}", res.err().unwrap());
@@ -6529,17 +6829,23 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         // tq_kv_active=false: slot.tq is None.
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 32, 1, false)
-            .expect("kv tq-off");
+        let cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 1, false).expect("kv tq-off");
         let slot = &cache.full_attn[0];
         assert!(slot.tq.is_none(), "test precondition: slot.tq must be None");
 
         let mut registry = mlx_native::KernelRegistry::new();
         let mut enc = device.command_encoder().expect("encoder");
         let res = slot.dequant_seq_to_temp_f32(
-            true, 1, 0, 32,
-            cfg.num_key_value_heads, cfg.head_dim,
-            &mut enc, &mut registry, &device,
+            true,
+            1,
+            0,
+            32,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            &mut enc,
+            &mut registry,
+            &device,
         );
         assert!(res.is_err(), "must error when slot.tq is None");
         let msg = format!("{:?}", res.err().unwrap());
@@ -6574,15 +6880,17 @@ mod tests {
 
         // Build source seq buffer (5 tokens).
         let seq_k = synth_seq_kv_buffer(
-            &device, total_src_tokens as usize,
-            n_kv_heads as usize, head_dim as usize, 333,
+            &device,
+            total_src_tokens as usize,
+            n_kv_heads as usize,
+            head_dim as usize,
+            333,
         );
 
         // Reference: encode tokens [2, 3] via per-token loop using
         // single-token buffers extracted from positions 2 and 3.
-        let mut cache_ref =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv ref");
+        let mut cache_ref = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv ref");
         let slot_ref = &mut cache_ref.full_attn[0];
         let mut registry = mlx_native::KernelRegistry::new();
         let mut enc_ref = device.command_encoder().expect("encoder ref");
@@ -6592,52 +6900,95 @@ mod tests {
         {
             let mut tok_buf = device
                 .alloc_buffer(
-                    stride * 4, DType::F32,
+                    stride * 4,
+                    DType::F32,
                     vec![n_kv_heads as usize, head_dim as usize],
                 )
                 .expect("alloc tok");
             {
                 let dst = tok_buf.as_mut_slice::<f32>().expect("tok mut");
-                let src_slice =
-                    seq_k.as_slice::<f32>().expect("seq_k slice");
+                let src_slice = seq_k.as_slice::<f32>().expect("seq_k slice");
                 let src_offset = (src_pos as usize) * stride;
                 dst.copy_from_slice(&src_slice[src_offset..src_offset + stride]);
             }
             // Use the same buffer for K + V (test only cares about K side).
             slot_ref
                 .encode_token_to_tq(
-                    &tok_buf, &tok_buf, n_kv_heads, head_dim, cache_capacity,
-                    cache_slot as u32, false, 1.0, 8, &mut enc_ref,
-                    &mut registry, &device,
+                    &tok_buf,
+                    &tok_buf,
+                    n_kv_heads,
+                    head_dim,
+                    cache_capacity,
+                    cache_slot as u32,
+                    false,
+                    1.0,
+                    8,
+                    &mut enc_ref,
+                    &mut registry,
+                    &device,
                 )
                 .expect("encode token");
         }
         enc_ref.commit_and_wait().expect("ref commit");
 
         // Test path: encode_seq_tokens_to_tq with src_tok_offset=2.
-        let mut cache_seq =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv seq");
+        let mut cache_seq = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv seq");
         let slot_seq = &mut cache_seq.full_attn[0];
         let mut enc_seq = device.command_encoder().expect("encoder seq");
         slot_seq
             .encode_seq_tokens_to_tq(
-                &seq_k, true, n_tokens_to_encode, n_kv_heads, head_dim,
-                cache_capacity, 0, src_tok_offset, false, 1.0, 8,
-                &mut enc_seq, &mut registry, &device,
+                &seq_k,
+                true,
+                n_tokens_to_encode,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                0,
+                src_tok_offset,
+                false,
+                1.0,
+                8,
+                &mut enc_seq,
+                &mut registry,
+                &device,
             )
             .expect("encode seq K");
         enc_seq.commit_and_wait().expect("seq commit");
 
         // K side bytes must match.
         assert_eq!(
-            slot_ref.tq.as_ref().unwrap().k_packed.as_slice::<u8>().unwrap(),
-            slot_seq.tq.as_ref().unwrap().k_packed.as_slice::<u8>().unwrap(),
+            slot_ref
+                .tq
+                .as_ref()
+                .unwrap()
+                .k_packed
+                .as_slice::<u8>()
+                .unwrap(),
+            slot_seq
+                .tq
+                .as_ref()
+                .unwrap()
+                .k_packed
+                .as_slice::<u8>()
+                .unwrap(),
             "src_tok_offset semantics mismatch on k_packed"
         );
         assert_eq!(
-            slot_ref.tq.as_ref().unwrap().k_norms.as_slice::<f32>().unwrap(),
-            slot_seq.tq.as_ref().unwrap().k_norms.as_slice::<f32>().unwrap(),
+            slot_ref
+                .tq
+                .as_ref()
+                .unwrap()
+                .k_norms
+                .as_slice::<f32>()
+                .unwrap(),
+            slot_seq
+                .tq
+                .as_ref()
+                .unwrap()
+                .k_norms
+                .as_slice::<f32>()
+                .unwrap(),
             "src_tok_offset semantics mismatch on k_norms"
         );
     }
@@ -6662,8 +7013,8 @@ mod tests {
         let cfg = moe_cfg_40layer();
         // At default_layer_types(40, 4), every 4th layer is full-attn:
         // layers [0, 4, 8, 12, 16, 20, 24, 28, 32, 36] = 10 full-attn slots.
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 8192, 1, false)
-            .expect("kv tq-off");
+        let cache =
+            HybridKvCache::new_with_options(&cfg, &device, 8192, 1, false).expect("kv tq-off");
         let breakdown = cache.full_attn_bytes_breakdown();
         assert_eq!(breakdown.n_full_attn_slots, 10);
         assert!(!breakdown.has_mtp_slot, "moe_cfg_40layer has no MTP");
@@ -6697,14 +7048,16 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let cache = HybridKvCache::new_with_options(&cfg, &device, 8192, 1, true)
-            .expect("kv tq-on");
+        let cache =
+            HybridKvCache::new_with_options(&cfg, &device, 8192, 1, true).expect("kv tq-on");
         let breakdown = cache.full_attn_bytes_breakdown();
         assert_eq!(breakdown.n_full_attn_slots, 10);
         assert!(!breakdown.has_mtp_slot);
         // **iter-34 LOAD-BEARING REGRESSION-PIN: F32 K/V alloc dropped.**
-        assert_eq!(breakdown.f32_k_v_bytes, 0,
-            "iter-34: f32_k_v_bytes MUST be 0 in TQ-only mode (alloc-drop)");
+        assert_eq!(
+            breakdown.f32_k_v_bytes, 0,
+            "iter-34: f32_k_v_bytes MUST be 0 in TQ-only mode (alloc-drop)"
+        );
         // TQ packed: 1×2×8192×256 (U8) = 4_194_304 per K, ×2 (K+V) ×10 slots.
         assert_eq!(breakdown.tq_packed_bytes, 10 * 2 * 4_194_304);
         // TQ norms: 1×2×8192×1 (F32) = 65_536 per K, ×2 (K+V) ×10 slots.
@@ -6737,8 +7090,10 @@ mod tests {
         let breakdown = cache.full_attn_bytes_breakdown();
         assert_eq!(breakdown.n_full_attn_slots, 10);
         // **iter-34 LOAD-BEARING REGRESSION-PIN AT 32K SHAPE.**
-        assert_eq!(breakdown.f32_k_v_bytes, 0,
-            "iter-34 at 32K: f32_k_v_bytes MUST be 0 in TQ-only mode");
+        assert_eq!(
+            breakdown.f32_k_v_bytes, 0,
+            "iter-34 at 32K: f32_k_v_bytes MUST be 0 in TQ-only mode"
+        );
         assert_eq!(breakdown.tq_packed_bytes, 10 * 33_554_432);
         assert_eq!(breakdown.tq_norms_bytes, 10 * 524_288);
         // Per-slot total: 33_554_432 + 524_288 = 34_078_720 bytes.
@@ -6750,8 +7105,10 @@ mod tests {
         let f32_only_total = 10 * f32_only_baseline_per_slot;
         assert_eq!(f32_only_total, 1_342_177_280); // 1.34 GB matches §1 ADR claim
         let savings_ratio = f32_only_total as f64 / breakdown.total_bytes() as f64;
-        assert!((3.93..=3.95).contains(&savings_ratio),
-            "iter-34 32K F32-only→TQ-only savings: expected ~3.94×, got {savings_ratio:.4}×");
+        assert!(
+            (3.93..=3.95).contains(&savings_ratio),
+            "iter-34 32K F32-only→TQ-only savings: expected ~3.94×, got {savings_ratio:.4}×"
+        );
     }
 
     #[test]
@@ -6777,8 +7134,10 @@ mod tests {
         let per_slot_tq_norms = 1 * 2 * 1024 * 1 * 4 * 2;
         assert_eq!(breakdown.n_full_attn_slots, 10);
         // iter-34 invariant — MTP slot also dropped F32.
-        assert_eq!(breakdown.f32_k_v_bytes, 0,
-            "iter-34: MTP slot must also drop F32 K/V");
+        assert_eq!(
+            breakdown.f32_k_v_bytes, 0,
+            "iter-34: MTP slot must also drop F32 K/V"
+        );
         assert_eq!(breakdown.tq_packed_bytes, 11 * per_slot_tq_packed);
         assert_eq!(breakdown.tq_norms_bytes, 11 * per_slot_tq_norms);
     }
@@ -6831,9 +7190,8 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let cache_capacity: u32 = 64;
-        let mut cache =
-            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
-                .expect("kv tq-on");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+            .expect("kv tq-on");
         let slot = &mut cache.full_attn[0];
         let n_kv_heads = cfg.num_key_value_heads;
         let num_heads = cfg.num_attention_heads;
@@ -6841,12 +7199,10 @@ mod tests {
         assert_eq!(head_dim, 256);
 
         // Synthesize K, V tokens with both CPU mirrors + GPU buffers.
-        let (_k_cpu, k_buf) = synth_token_with_cpu_mirror(
-            &device, n_kv_heads as usize, head_dim as usize, 7,
-        );
-        let (v_cpu, v_buf) = synth_token_with_cpu_mirror(
-            &device, n_kv_heads as usize, head_dim as usize, 11,
-        );
+        let (_k_cpu, k_buf) =
+            synth_token_with_cpu_mirror(&device, n_kv_heads as usize, head_dim as usize, 7);
+        let (v_cpu, v_buf) =
+            synth_token_with_cpu_mirror(&device, n_kv_heads as usize, head_dim as usize, 11);
 
         // Synthesize Q with both CPU mirror (for closed-form ref) AND
         // GPU buffer (for the GPU FWHT pre-rotation + SDPA).
@@ -6883,9 +7239,8 @@ mod tests {
                 vec![num_heads as usize, head_dim as usize],
             )
             .expect("alloc output");
-        let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
-            num_heads, head_dim,
-        );
+        let tmp_bytes =
+            mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(num_heads, head_dim);
         let tmp = device
             .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
             .expect("alloc tmp");
@@ -6895,16 +7250,30 @@ mod tests {
 
         // (a) GPU encode K, V at write_pos=0.
         slot.encode_token_to_tq(
-            &k_buf, &v_buf, n_kv_heads, head_dim, cache_capacity,
-            0, false, 1.0, 8, &mut encoder, &mut registry, &device,
+            &k_buf,
+            &v_buf,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            0,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("encode_token_to_tq");
         encoder.memory_barrier();
 
         // (b) GPU Q pre-rotation: sign × FWHT (in-place on q_gpu).
         mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
-            &mut encoder, &mut registry, device.metal_device(),
-            &q_gpu, num_heads, head_dim,
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &q_gpu,
+            num_heads,
+            head_dim,
         )
         .expect("fwht sign-premult Q");
         encoder.memory_barrier();
@@ -6925,23 +7294,32 @@ mod tests {
             codebook_bits: 8,
         };
         slot.dispatch_tq_sdpa(
-            &q_gpu, &output, &tmp, &params, &mut encoder, &mut registry, &device,
+            &q_gpu,
+            &output,
+            &tmp,
+            &params,
+            &mut encoder,
+            &mut registry,
+            &device,
         )
         .expect("dispatch_tq_sdpa");
         encoder.memory_barrier();
 
         // (d) GPU output inverse-rotation: FWHT × sign-undo (in-place on output).
         mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-            &mut encoder, &mut registry, device.metal_device(),
-            &output, num_heads, head_dim,
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &output,
+            num_heads,
+            head_dim,
         )
         .expect("fwht sign-undo output");
 
         encoder.commit_and_wait().expect("commit chain");
 
         // Read GPU output to CPU + compare to F32 closed-form reference.
-        let output_gpu_flat: Vec<f32> =
-            output.as_slice::<f32>().expect("output slice").to_vec();
+        let output_gpu_flat: Vec<f32> = output.as_slice::<f32>().expect("output slice").to_vec();
         let heads_per_kv = (num_heads / n_kv_heads) as usize;
         let mut output_ref_flat: Vec<f32> =
             Vec::with_capacity((num_heads as usize) * (head_dim as usize));
@@ -7001,8 +7379,8 @@ mod tests {
             }
         };
         let cfg = moe_cfg_40layer();
-        let buffers = alloc_tq_full_attn_buffers(&cfg, &device, 64, 2)
-            .expect("alloc_tq_full_attn_buffers");
+        let buffers =
+            alloc_tq_full_attn_buffers(&cfg, &device, 64, 2).expect("alloc_tq_full_attn_buffers");
         // Expected: k_packed = [n_seqs=2, n_kv_heads=2, max_seq_len=64,
         // head_dim=256] = 2*2*64*256 = 65_536 bytes (U8).
         assert_eq!(buffers.k_packed.byte_len(), 65_536);
@@ -7029,9 +7407,14 @@ mod tests {
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
         // Pre-condition: every LA slot has capture_states = None.
         for s in &cache.linear_attn {
-            assert!(s.capture_states.is_none(), "pre-ensure: capture_states must be None");
+            assert!(
+                s.capture_states.is_none(),
+                "pre-ensure: capture_states must be None"
+            );
         }
-        cache.ensure_la_capture(&cfg, &device, 4).expect("ensure_la_capture");
+        cache
+            .ensure_la_capture(&cfg, &device, 4)
+            .expect("ensure_la_capture");
         // Post-condition: every LA slot has a properly-sized capture buffer.
         let expected_elems = (cfg.linear_key_head_dim as usize)
             * (cfg.linear_value_head_dim as usize)
@@ -7039,10 +7422,15 @@ mod tests {
             * 4   // n_tokens_max
             * 1; // n_seqs
         for (i, s) in cache.linear_attn.iter().enumerate() {
-            let buf = s.capture_states.as_ref()
+            let buf = s
+                .capture_states
+                .as_ref()
                 .unwrap_or_else(|| panic!("LA[{i}] capture None after ensure"));
-            assert_eq!(buf.element_count(), expected_elems,
-                "LA[{i}] capture element_count mismatch");
+            assert_eq!(
+                buf.element_count(),
+                expected_elems,
+                "LA[{i}] capture element_count mismatch"
+            );
             assert_eq!(buf.dtype(), DType::F32, "LA[{i}] capture must be F32");
         }
     }
@@ -7056,13 +7444,27 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
-        cache.ensure_la_capture(&cfg, &device, 4).expect("first call");
+        cache
+            .ensure_la_capture(&cfg, &device, 4)
+            .expect("first call");
         // Snapshot the buffer pointer/identity for one slot.
-        let first_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
-        cache.ensure_la_capture(&cfg, &device, 4).expect("second call — same size");
-        let second_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
-        assert_eq!(first_elems, second_elems,
-            "idempotent ensure at same n_tokens_max must preserve buffer size");
+        let first_elems = cache.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .unwrap()
+            .element_count();
+        cache
+            .ensure_la_capture(&cfg, &device, 4)
+            .expect("second call — same size");
+        let second_elems = cache.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .unwrap()
+            .element_count();
+        assert_eq!(
+            first_elems, second_elems,
+            "idempotent ensure at same n_tokens_max must preserve buffer size"
+        );
     }
 
     #[test]
@@ -7074,14 +7476,31 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
-        cache.ensure_la_capture(&cfg, &device, 4).expect("first call");
-        let first_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
-        cache.ensure_la_capture(&cfg, &device, 8).expect("second call — larger");
-        let second_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
-        assert!(second_elems > first_elems,
-            "larger n_tokens_max must reallocate to bigger buffer");
-        assert_eq!(second_elems, 2 * first_elems,
-            "n_tokens_max=8 should double the buffer vs n_tokens_max=4");
+        cache
+            .ensure_la_capture(&cfg, &device, 4)
+            .expect("first call");
+        let first_elems = cache.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .unwrap()
+            .element_count();
+        cache
+            .ensure_la_capture(&cfg, &device, 8)
+            .expect("second call — larger");
+        let second_elems = cache.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .unwrap()
+            .element_count();
+        assert!(
+            second_elems > first_elems,
+            "larger n_tokens_max must reallocate to bigger buffer"
+        );
+        assert_eq!(
+            second_elems,
+            2 * first_elems,
+            "n_tokens_max=8 should double the buffer vs n_tokens_max=4"
+        );
     }
 
     #[test]
@@ -7093,8 +7512,10 @@ mod tests {
         };
         let cfg = moe_cfg_40layer();
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
-        assert!(cache.ensure_la_capture(&cfg, &device, 0).is_err(),
-            "n_tokens_max=0 must reject");
+        assert!(
+            cache.ensure_la_capture(&cfg, &device, 0).is_err(),
+            "n_tokens_max=0 must reject"
+        );
     }
 
     #[test]
@@ -7117,8 +7538,7 @@ mod tests {
             let cap_slice = cap.as_mut_slice::<f32>().expect("cap mut");
             assert_eq!(cap_slice.len(), state_elems * n_tokens_max);
             for t in 0..n_tokens_max {
-                for (idx, v) in cap_slice
-                    [t * state_elems..(t + 1) * state_elems]
+                for (idx, v) in cap_slice[t * state_elems..(t + 1) * state_elems]
                     .iter_mut()
                     .enumerate()
                 {
@@ -7131,8 +7551,7 @@ mod tests {
             let cap = cache.linear_attn[1].capture_states.as_mut().unwrap();
             let cap_slice = cap.as_mut_slice::<f32>().expect("cap mut");
             for t in 0..n_tokens_max {
-                for (idx, v) in cap_slice
-                    [t * state_elems..(t + 1) * state_elems]
+                for (idx, v) in cap_slice[t * state_elems..(t + 1) * state_elems]
                     .iter_mut()
                     .enumerate()
                 {
@@ -7146,16 +7565,28 @@ mod tests {
             .expect("rollback to idx=2");
 
         // LA[0].recurrent should now equal capture[2*state_elems..]
-        let rec0 = cache.linear_attn[0].recurrent.as_slice::<f32>().expect("rec0");
+        let rec0 = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .expect("rec0");
         for (idx, &v) in rec0.iter().enumerate() {
-            assert_eq!(v, (2 * 1000 + idx) as f32,
-                "LA[0].recurrent[{idx}] after rollback to idx=2");
+            assert_eq!(
+                v,
+                (2 * 1000 + idx) as f32,
+                "LA[0].recurrent[{idx}] after rollback to idx=2"
+            );
         }
         // LA[1].recurrent should equal capture[2*state_elems..] from LA[1]'s buffer
-        let rec1 = cache.linear_attn[1].recurrent.as_slice::<f32>().expect("rec1");
+        let rec1 = cache.linear_attn[1]
+            .recurrent
+            .as_slice::<f32>()
+            .expect("rec1");
         for (idx, &v) in rec1.iter().enumerate() {
-            assert_eq!(v, (2 * 1000 + idx + 99) as f32,
-                "LA[1].recurrent[{idx}] after rollback to idx=2");
+            assert_eq!(
+                v,
+                (2 * 1000 + idx + 99) as f32,
+                "LA[1].recurrent[{idx}] after rollback to idx=2"
+            );
         }
     }
 
@@ -7303,10 +7734,8 @@ mod tests {
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
 
-        let cache_1 = HybridKvCache::new(&cfg, &device, max_seq_len, 1)
-            .expect("alloc at n_seqs=1");
-        let cache_4 = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
-            .expect("alloc at n_seqs=4");
+        let cache_1 = HybridKvCache::new(&cfg, &device, max_seq_len, 1).expect("alloc at n_seqs=1");
+        let cache_4 = HybridKvCache::new(&cfg, &device, max_seq_len, 4).expect("alloc at n_seqs=4");
 
         assert_eq!(cache_1.n_seqs, 1, "H1: n_seqs=1 baseline construction");
         assert_eq!(cache_4.n_seqs, 4, "H1: n_seqs=4 lift surfaced");
@@ -7315,30 +7744,44 @@ mod tests {
         // (n_seqs is the outermost axis at kv_cache.rs:2231-2236; the
         // alloc multiplies by `n_seqs as usize` at kv_cache.rs:2226.)
         assert!(!cache_1.full_attn.is_empty(), "tiny cfg has full-attn slot");
-        let baseline_k = cache_1.full_attn[0].k.as_ref()
+        let baseline_k = cache_1.full_attn[0]
+            .k
+            .as_ref()
             .expect("F32 K present (legacy non-TQ path)")
             .byte_len();
-        let lifted_k = cache_4.full_attn[0].k.as_ref()
+        let lifted_k = cache_4.full_attn[0]
+            .k
+            .as_ref()
             .expect("F32 K present (legacy non-TQ path)")
             .byte_len();
         assert_eq!(
-            lifted_k, baseline_k * 4,
+            lifted_k,
+            baseline_k * 4,
             "H1 FALSIFIED: full-attn K does not scale linearly with n_seqs \
              ({} != {} * 4 = {}); ADR-040 §1.3 structural claim broken",
-            lifted_k, baseline_k, baseline_k * 4
+            lifted_k,
+            baseline_k,
+            baseline_k * 4
         );
 
-        let baseline_v = cache_1.full_attn[0].v.as_ref()
+        let baseline_v = cache_1.full_attn[0]
+            .v
+            .as_ref()
             .expect("F32 V present (legacy non-TQ path)")
             .byte_len();
-        let lifted_v = cache_4.full_attn[0].v.as_ref()
+        let lifted_v = cache_4.full_attn[0]
+            .v
+            .as_ref()
             .expect("F32 V present (legacy non-TQ path)")
             .byte_len();
         assert_eq!(
-            lifted_v, baseline_v * 4,
+            lifted_v,
+            baseline_v * 4,
             "H1 FALSIFIED: full-attn V does not scale linearly with n_seqs \
              ({} != {} * 4 = {})",
-            lifted_v, baseline_v, baseline_v * 4
+            lifted_v,
+            baseline_v,
+            baseline_v * 4
         );
 
         // Falsifier 4: linear-attn recurrent scales exactly 4× with n_seqs.
@@ -7348,10 +7791,13 @@ mod tests {
             let baseline_r = cache_1.linear_attn[0].recurrent.byte_len();
             let lifted_r = cache_4.linear_attn[0].recurrent.byte_len();
             assert_eq!(
-                lifted_r, baseline_r * 4,
+                lifted_r,
+                baseline_r * 4,
                 "H1 FALSIFIED: linear-attn recurrent does not scale \
                  linearly with n_seqs ({} != {} * 4 = {})",
-                lifted_r, baseline_r, baseline_r * 4
+                lifted_r,
+                baseline_r,
+                baseline_r * 4
             );
 
             // Capture-buffer assertion intentionally OMITTED — see dossier
@@ -7363,11 +7809,13 @@ mod tests {
         // at kv_cache.rs:2213 + 2247 — pin this so a future refactor
         // can't silently regress the per-slot bookkeeping.
         assert_eq!(
-            cache_1.full_attn[0].current_len.len(), 1,
+            cache_1.full_attn[0].current_len.len(),
+            1,
             "H1: baseline current_len Vec length tracks n_seqs"
         );
         assert_eq!(
-            cache_4.full_attn[0].current_len.len(), 4,
+            cache_4.full_attn[0].current_len.len(),
+            4,
             "H1: lifted current_len Vec length tracks n_seqs"
         );
 
@@ -7430,10 +7878,12 @@ mod tests {
         // catches an axis-permutation where n_seqs is correctly
         // outermost but, e.g., n_kv_heads and head_dim swap.
         assert_eq!(
-            &k_shape_4[1..], &k_shape_1[1..],
+            &k_shape_4[1..],
+            &k_shape_1[1..],
             "M5 FALSIFIED: non-n_seqs dims diverge between n_seqs=1 \
              ({:?}) and n_seqs=4 ({:?}) — silent axis swap",
-            k_shape_1, k_shape_4
+            k_shape_1,
+            k_shape_4
         );
 
         // Full-attn V: same convention as K.  Catches an asymmetric
@@ -7451,9 +7901,11 @@ mod tests {
             v_shape_4
         );
         assert_eq!(
-            &v_shape_4[1..], &v_shape_1[1..],
+            &v_shape_4[1..],
+            &v_shape_1[1..],
             "M5 FALSIFIED: V non-n_seqs dims diverge ({:?} vs {:?})",
-            v_shape_1, v_shape_4
+            v_shape_1,
+            v_shape_4
         );
 
         // Linear-attn recurrent: shape.last() must be n_seqs;
@@ -7535,12 +7987,10 @@ mod tests {
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
 
-        let cache_1 =
-            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
-                .expect("TQ-active alloc at n_seqs=1");
-        let cache_4 =
-            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 4, true)
-                .expect("TQ-active alloc at n_seqs=4");
+        let cache_1 = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("TQ-active alloc at n_seqs=1");
+        let cache_4 = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 4, true)
+            .expect("TQ-active alloc at n_seqs=4");
 
         // Falsifier 2: tq_kv_active flag propagated.
         assert!(
@@ -7650,10 +8100,12 @@ mod tests {
             kp_shape_4
         );
         assert_eq!(
-            &kp_shape_4[1..], &kp_shape_1[1..],
+            &kp_shape_4[1..],
+            &kp_shape_1[1..],
             "H1-tq M5 FALSIFIED: TQ K-packed non-n_seqs dims diverge \
              ({:?} vs {:?})",
-            kp_shape_1, kp_shape_4
+            kp_shape_1,
+            kp_shape_4
         );
         // Same for K-norms.
         let kn_shape_1 = tq_1.k_norms.shape().to_vec();
@@ -7669,7 +8121,8 @@ mod tests {
             kn_shape_4
         );
         assert_eq!(
-            &kn_shape_4[1..], &kn_shape_1[1..],
+            &kn_shape_4[1..],
+            &kn_shape_1[1..],
             "H1-tq M5 FALSIFIED: TQ K-norms non-n_seqs dims diverge"
         );
 
@@ -7689,9 +8142,7 @@ mod tests {
     // Trait-surface tests use the local `MultiSeqKvCache` impl (above the
     // tests module).  Pulling the trait + types into scope here keeps the
     // production code at the parent module untouched by test-only imports.
-    use crate::serve::multi_seq_kv::{
-        MultiSeqError, MultiSeqKvCache as _, MultiSeqLayout, SlotId,
-    };
+    use crate::serve::multi_seq_kv::{MultiSeqError, MultiSeqKvCache as _, MultiSeqLayout, SlotId};
 
     /// Pin: `slot_count()` returns the constructor's `n_seqs` verbatim.
     /// Falsifies any future refactor that introduces a u32→u64 cast or
@@ -7732,25 +8183,67 @@ mod tests {
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
 
         // seq_len OOR
-        let err = cache.seq_len(SlotId(4)).expect_err("slot 4 OOR for n_seqs=4");
-        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        let err = cache
+            .seq_len(SlotId(4))
+            .expect_err("slot 4 OOR for n_seqs=4");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
+        );
         let err = cache.seq_len(SlotId(99)).expect_err("slot 99 OOR");
-        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 });
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(99),
+                max_slots: 4
+            }
+        );
 
         // append_for_seq OOR
         let err = cache.append_for_seq(SlotId(4), 1).expect_err("append OOR");
-        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
+        );
 
         // drop_seq OOR
         let err = cache.drop_seq(SlotId(4)).expect_err("drop OOR");
-        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
+        );
 
         // fork_seq src OOR FIRST (deterministic per fixture-parity contract).
-        let err = cache.fork_seq(SlotId(4), SlotId(5)).expect_err("fork: src OOR first");
-        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        let err = cache
+            .fork_seq(SlotId(4), SlotId(5))
+            .expect_err("fork: src OOR first");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
+        );
         // fork_seq src valid, dst OOR.
-        let err = cache.fork_seq(SlotId(0), SlotId(4)).expect_err("fork: dst OOR");
-        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        let err = cache
+            .fork_seq(SlotId(0), SlotId(4))
+            .expect_err("fork: dst OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(4),
+                max_slots: 4
+            }
+        );
     }
 
     /// Pin: `append_for_seq` advances ONLY the named slot's cursor —
@@ -7799,7 +8292,8 @@ mod tests {
 
         // H3 falsifier: slot 1 must be byte-equal-cursor to its seed.
         assert_eq!(
-            cache.seq_len(SlotId(1)).unwrap(), 7,
+            cache.seq_len(SlotId(1)).unwrap(),
+            7,
             "H3 FALSIFIED: slot 1 cursor mutated by writes to slots 0/2"
         );
         // Sanity: 0 and 2 took the expected increments.
@@ -7830,7 +8324,9 @@ mod tests {
         // Identical op sequence against slot 0 of each cache.
         for &n in &[1u32, 3, 5, 2] {
             cache1.append_for_seq(SlotId(0), n).expect("append cache1");
-            cache4.append_for_seq(SlotId(0), n).expect("append cache4 slot 0");
+            cache4
+                .append_for_seq(SlotId(0), n)
+                .expect("append cache4 slot 0");
         }
 
         let l1 = cache1.seq_len(SlotId(0)).unwrap();
@@ -7850,7 +8346,8 @@ mod tests {
         for (idx, slot) in cache4.full_attn.iter().enumerate() {
             assert_eq!(
                 slot.current_len[0], l4,
-                "full_attn slot {} cursor drift at n_seqs=4 slot 0", idx
+                "full_attn slot {} cursor drift at n_seqs=4 slot 0",
+                idx
             );
         }
     }
@@ -7949,14 +8446,20 @@ mod tests {
 
         assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 10);
         assert_eq!(cache.seq_len(SlotId(1)).unwrap(), 20);
-        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 0,  "slot 2 reset");
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 0, "slot 2 reset");
         assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 40);
 
         // Pin: drop wipes the cursor on EVERY full-attn slot, not just
         // the one `seq_len()` happens to read.
         for slot in &cache.full_attn {
-            assert_eq!(slot.current_len[2], 0,  "every full-attn slot's cursor[2] reset");
-            assert_eq!(slot.current_len[0], 10, "every full-attn slot's cursor[0] preserved");
+            assert_eq!(
+                slot.current_len[2], 0,
+                "every full-attn slot's cursor[2] reset"
+            );
+            assert_eq!(
+                slot.current_len[0], 10,
+                "every full-attn slot's cursor[0] preserved"
+            );
             assert_eq!(slot.current_len[1], 20);
             assert_eq!(slot.current_len[3], 40);
         }
@@ -8008,8 +8511,7 @@ mod tests {
         // because the contract under audit is "drop_seq does NOT
         // touch this buffer", which is observable purely from a
         // host-side byte snapshot.
-        let total_f32 = cache.linear_attn[0].recurrent.byte_len()
-            / std::mem::size_of::<f32>();
+        let total_f32 = cache.linear_attn[0].recurrent.byte_len() / std::mem::size_of::<f32>();
         assert!(
             total_f32 > 0,
             "fixture sanity: recurrent buffer must have non-zero element count"
@@ -8131,11 +8633,11 @@ mod tests {
         cache.append_for_seq(SlotId(0), 7).unwrap();
         // iter-A2c closure: fork now returns Ok(()) (was previously
         // CapabilityUnsupported per iter-2.5 M1 typed-clamp).
-        cache
-            .fork_seq(SlotId(0), SlotId(1))
-            .expect("iter-A2c closure: cross-slot fork must return Ok(()) — \
+        cache.fork_seq(SlotId(0), SlotId(1)).expect(
+            "iter-A2c closure: cross-slot fork must return Ok(()) — \
                      was previously CapabilityUnsupported per A2a typed-clamp; \
-                     A2c (this iter) ships the real same-buffer cross-region memcpy");
+                     A2c (this iter) ships the real same-buffer cross-region memcpy",
+        );
         // Cursor copy invariant: dst.seq_len == src.seq_len after fork
         // (H165 sub-pin; fully exercised at H158/H165).
         assert_eq!(
@@ -8216,14 +8718,14 @@ mod tests {
         let max_seq_len = 64u32;
         let n_tokens_max = 4u32;
 
-        let mut cache_1 = HybridKvCache::new(&cfg, &device, max_seq_len, 1)
-            .expect("alloc n_seqs=1");
+        let mut cache_1 =
+            HybridKvCache::new(&cfg, &device, max_seq_len, 1).expect("alloc n_seqs=1");
         cache_1
             .ensure_la_capture(&cfg, &device, n_tokens_max)
             .expect("ensure n_seqs=1");
 
-        let mut cache_4 = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
-            .expect("alloc n_seqs=4");
+        let mut cache_4 =
+            HybridKvCache::new(&cfg, &device, max_seq_len, 4).expect("alloc n_seqs=4");
         cache_4
             .ensure_la_capture(&cfg, &device, n_tokens_max)
             .expect("ensure n_seqs=4");
@@ -8245,18 +8747,20 @@ mod tests {
             .expect("ensure_la_capture allocated capture_states at n_seqs=4")
             .byte_len();
         assert_eq!(
-            lifted_cap, baseline_cap * 4,
+            lifted_cap,
+            baseline_cap * 4,
             "H31 FALSIFIED: recurrent capture does not scale linearly with n_seqs \
              ({} != {} * 4 = {})",
-            lifted_cap, baseline_cap, baseline_cap * 4
+            lifted_cap,
+            baseline_cap,
+            baseline_cap * 4
         );
 
         // Closed-form check: bytes = n_seqs * n_tokens_max * per_seq_elems * 4.
         let per_seq_elems = (cfg.linear_key_head_dim as usize)
             * (cfg.linear_value_head_dim as usize)
             * (cfg.linear_num_value_heads as usize);
-        let expected_bytes_4 =
-            4 * (n_tokens_max as usize) * per_seq_elems * 4;
+        let expected_bytes_4 = 4 * (n_tokens_max as usize) * per_seq_elems * 4;
         assert_eq!(
             lifted_cap, expected_bytes_4,
             "H31 closed-form: capture bytes at n_seqs=4 must equal \
@@ -8276,17 +8780,19 @@ mod tests {
             .expect("ensure_la_capture allocated conv_capture at n_seqs=4")
             .byte_len();
         assert_eq!(
-            lifted_conv, baseline_conv * 4,
+            lifted_conv,
+            baseline_conv * 4,
             "H31 FALSIFIED: conv_capture does not scale linearly with n_seqs \
              ({} != {} * 4 = {})",
-            lifted_conv, baseline_conv, baseline_conv * 4
+            lifted_conv,
+            baseline_conv,
+            baseline_conv * 4
         );
 
         let conv_channels = conv_channels_for(&cfg) as usize;
         let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
         let conv_per_seq = conv_channels * k_minus1;
-        let expected_conv_bytes_4 =
-            4 * (n_tokens_max as usize) * conv_per_seq * 4;
+        let expected_conv_bytes_4 = 4 * (n_tokens_max as usize) * conv_per_seq * 4;
         assert_eq!(
             lifted_conv, expected_conv_bytes_4,
             "H31 closed-form: conv_capture bytes at n_seqs=4 must equal \
@@ -8435,11 +8941,9 @@ mod tests {
             let slice = cap.as_mut_slice::<f32>().expect("cap mut slice");
             for t in 0..(n_tokens_max as usize) {
                 for idx in 0..per_seq_elems {
-                    let s0 =
-                        0 * cap_seq_stride + t * per_seq_elems + idx;
+                    let s0 = 0 * cap_seq_stride + t * per_seq_elems + idx;
                     slice[s0] = (1000 + t * 100 + idx) as f32;
-                    let s1 =
-                        1 * cap_seq_stride + t * per_seq_elems + idx;
+                    let s1 = 1 * cap_seq_stride + t * per_seq_elems + idx;
                     slice[s1] = (9000 + t * 100 + idx) as f32;
                 }
             }
@@ -8453,11 +8957,9 @@ mod tests {
             let slice = cap.as_mut_slice::<f32>().expect("conv cap mut slice");
             for t in 0..(n_tokens_max as usize) {
                 for idx in 0..conv_per_seq {
-                    let s0 = 0 * conv_cap_seq_stride
-                        + t * conv_per_seq + idx;
+                    let s0 = 0 * conv_cap_seq_stride + t * conv_per_seq + idx;
                     slice[s0] = (2000 + t * 200 + idx) as f32;
-                    let s1 = 1 * conv_cap_seq_stride
-                        + t * conv_per_seq + idx;
+                    let s1 = 1 * conv_cap_seq_stride + t * conv_per_seq + idx;
                     slice[s1] = (8000 + t * 200 + idx) as f32;
                 }
             }
@@ -8472,8 +8974,7 @@ mod tests {
             assert_eq!(s.len(), per_seq_elems * 4);
             for slot in 0..4usize {
                 for i in 0..per_seq_elems {
-                    s[slot * per_seq_elems + i] =
-                        (5_000_000 + slot * 1000 + i) as f32;
+                    s[slot * per_seq_elems + i] = (5_000_000 + slot * 1000 + i) as f32;
                 }
             }
         }
@@ -8483,42 +8984,29 @@ mod tests {
             assert_eq!(s.len(), conv_per_seq * 4);
             for slot in 0..4usize {
                 for i in 0..conv_per_seq {
-                    s[slot * conv_per_seq + i] =
-                        (6_000_000 + slot * 2000 + i) as f32;
+                    s[slot * conv_per_seq + i] = (6_000_000 + slot * 2000 + i) as f32;
                 }
             }
         }
 
         // Snapshot slots 1, 2, 3 BEFORE rollback.
-        let pre_rec_slot1: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[per_seq_elems..2 * per_seq_elems]
+        let pre_rec_slot1: Vec<f32> = cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()
+            [per_seq_elems..2 * per_seq_elems]
             .to_vec();
-        let pre_rec_slot2: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[2 * per_seq_elems..3 * per_seq_elems]
+        let pre_rec_slot2: Vec<f32> = cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()
+            [2 * per_seq_elems..3 * per_seq_elems]
             .to_vec();
-        let pre_rec_slot3: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[3 * per_seq_elems..4 * per_seq_elems]
+        let pre_rec_slot3: Vec<f32> = cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()
+            [3 * per_seq_elems..4 * per_seq_elems]
             .to_vec();
-        let pre_conv_slot1: Vec<f32> = cache.linear_attn[0]
-            .conv_state
-            .as_slice::<f32>()
-            .unwrap()[conv_per_seq..2 * conv_per_seq]
+        let pre_conv_slot1: Vec<f32> = cache.linear_attn[0].conv_state.as_slice::<f32>().unwrap()
+            [conv_per_seq..2 * conv_per_seq]
             .to_vec();
-        let pre_conv_slot2: Vec<f32> = cache.linear_attn[0]
-            .conv_state
-            .as_slice::<f32>()
-            .unwrap()[2 * conv_per_seq..3 * conv_per_seq]
+        let pre_conv_slot2: Vec<f32> = cache.linear_attn[0].conv_state.as_slice::<f32>().unwrap()
+            [2 * conv_per_seq..3 * conv_per_seq]
             .to_vec();
-        let pre_conv_slot3: Vec<f32> = cache.linear_attn[0]
-            .conv_state
-            .as_slice::<f32>()
-            .unwrap()[3 * conv_per_seq..4 * conv_per_seq]
+        let pre_conv_slot3: Vec<f32> = cache.linear_attn[0].conv_state.as_slice::<f32>().unwrap()
+            [3 * conv_per_seq..4 * conv_per_seq]
             .to_vec();
 
         // Rollback ONLY slot 0 to token index 2.
@@ -8527,11 +9015,8 @@ mod tests {
             .expect("rollback slot 0 ok");
 
         // Verify slot 0's recurrent now contains the capture[s=0, t=2] pattern.
-        let post_rec_slot0: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[0..per_seq_elems]
-            .to_vec();
+        let post_rec_slot0: Vec<f32> =
+            cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()[0..per_seq_elems].to_vec();
         for (idx, &v) in post_rec_slot0.iter().enumerate() {
             assert_eq!(
                 v,
@@ -8541,28 +9026,22 @@ mod tests {
         }
 
         // Slot 1's, 2's, 3's recurrent must be byte-identical to pre-rollback.
-        let post_rec_slot1: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[per_seq_elems..2 * per_seq_elems]
+        let post_rec_slot1: Vec<f32> = cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()
+            [per_seq_elems..2 * per_seq_elems]
             .to_vec();
         assert_eq!(
             post_rec_slot1, pre_rec_slot1,
             "H33 FALSIFIED: slot 1 recurrent perturbed by rollback of slot 0"
         );
-        let post_rec_slot2: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[2 * per_seq_elems..3 * per_seq_elems]
+        let post_rec_slot2: Vec<f32> = cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()
+            [2 * per_seq_elems..3 * per_seq_elems]
             .to_vec();
         assert_eq!(
             post_rec_slot2, pre_rec_slot2,
             "H33 FALSIFIED: slot 2 recurrent perturbed by rollback of slot 0"
         );
-        let post_rec_slot3: Vec<f32> = cache.linear_attn[0]
-            .recurrent
-            .as_slice::<f32>()
-            .unwrap()[3 * per_seq_elems..4 * per_seq_elems]
+        let post_rec_slot3: Vec<f32> = cache.linear_attn[0].recurrent.as_slice::<f32>().unwrap()
+            [3 * per_seq_elems..4 * per_seq_elems]
             .to_vec();
         assert_eq!(
             post_rec_slot3, pre_rec_slot3,
@@ -8570,28 +9049,22 @@ mod tests {
         );
 
         // Slot 1's, 2's, 3's conv_state must be byte-identical too.
-        let post_conv_slot1: Vec<f32> = cache.linear_attn[0]
-            .conv_state
-            .as_slice::<f32>()
-            .unwrap()[conv_per_seq..2 * conv_per_seq]
+        let post_conv_slot1: Vec<f32> = cache.linear_attn[0].conv_state.as_slice::<f32>().unwrap()
+            [conv_per_seq..2 * conv_per_seq]
             .to_vec();
         assert_eq!(
             post_conv_slot1, pre_conv_slot1,
             "H33 FALSIFIED: slot 1 conv_state perturbed by rollback of slot 0"
         );
-        let post_conv_slot2: Vec<f32> = cache.linear_attn[0]
-            .conv_state
-            .as_slice::<f32>()
-            .unwrap()[2 * conv_per_seq..3 * conv_per_seq]
+        let post_conv_slot2: Vec<f32> = cache.linear_attn[0].conv_state.as_slice::<f32>().unwrap()
+            [2 * conv_per_seq..3 * conv_per_seq]
             .to_vec();
         assert_eq!(
             post_conv_slot2, pre_conv_slot2,
             "H33 FALSIFIED: slot 2 conv_state perturbed by rollback of slot 0"
         );
-        let post_conv_slot3: Vec<f32> = cache.linear_attn[0]
-            .conv_state
-            .as_slice::<f32>()
-            .unwrap()[3 * conv_per_seq..4 * conv_per_seq]
+        let post_conv_slot3: Vec<f32> = cache.linear_attn[0].conv_state.as_slice::<f32>().unwrap()
+            [3 * conv_per_seq..4 * conv_per_seq]
             .to_vec();
         assert_eq!(
             post_conv_slot3, pre_conv_slot3,
@@ -8619,15 +9092,13 @@ mod tests {
         let n_tokens_max = 4u32;
 
         // Cache (a): exercise new per-slot rollback path.
-        let mut cache_a =
-            HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc a");
+        let mut cache_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc a");
         cache_a
             .ensure_la_capture(&cfg, &device, n_tokens_max)
             .expect("ensure a");
 
         // Cache (b): identical seed, used as the "shadow" for legacy math.
-        let mut cache_b =
-            HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc b");
+        let mut cache_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc b");
         cache_b
             .ensure_la_capture(&cfg, &device, n_tokens_max)
             .expect("ensure b");
@@ -8640,28 +9111,24 @@ mod tests {
         let conv_per_seq = conv_channels * k_minus1;
 
         // Identical capture pattern for both caches.
-        let seed_capture =
-            |cache: &mut HybridKvCache| {
-                for la in cache.linear_attn.iter_mut() {
-                    let cap = la.capture_states.as_mut().unwrap();
-                    let s = cap.as_mut_slice::<f32>().unwrap();
-                    for t in 0..(n_tokens_max as usize) {
-                        for idx in 0..per_seq_elems {
-                            s[t * per_seq_elems + idx] =
-                                (t as f32) * 1000.0 + idx as f32 + 0.5;
-                        }
-                    }
-                    let conv_cap =
-                        la.conv_capture_states.as_mut().unwrap();
-                    let cs = conv_cap.as_mut_slice::<f32>().unwrap();
-                    for t in 0..(n_tokens_max as usize) {
-                        for idx in 0..conv_per_seq {
-                            cs[t * conv_per_seq + idx] =
-                                (t as f32) * 3000.0 + idx as f32 + 0.25;
-                        }
+        let seed_capture = |cache: &mut HybridKvCache| {
+            for la in cache.linear_attn.iter_mut() {
+                let cap = la.capture_states.as_mut().unwrap();
+                let s = cap.as_mut_slice::<f32>().unwrap();
+                for t in 0..(n_tokens_max as usize) {
+                    for idx in 0..per_seq_elems {
+                        s[t * per_seq_elems + idx] = (t as f32) * 1000.0 + idx as f32 + 0.5;
                     }
                 }
-            };
+                let conv_cap = la.conv_capture_states.as_mut().unwrap();
+                let cs = conv_cap.as_mut_slice::<f32>().unwrap();
+                for t in 0..(n_tokens_max as usize) {
+                    for idx in 0..conv_per_seq {
+                        cs[t * conv_per_seq + idx] = (t as f32) * 3000.0 + idx as f32 + 0.25;
+                    }
+                }
+            }
+        };
         seed_capture(&mut cache_a);
         seed_capture(&mut cache_b);
 
@@ -8680,24 +9147,18 @@ mod tests {
             assert_eq!(state_elems, per_seq_elems);
             let cap_slice = capture.as_slice::<f32>().unwrap();
             let src_offset = 2 * state_elems;
-            let src_owned: Vec<f32> =
-                cap_slice[src_offset..src_offset + state_elems].to_vec();
-            let dst =
-                slot_data.recurrent.as_mut_slice::<f32>().unwrap();
+            let src_owned: Vec<f32> = cap_slice[src_offset..src_offset + state_elems].to_vec();
+            let dst = slot_data.recurrent.as_mut_slice::<f32>().unwrap();
             dst.copy_from_slice(&src_owned);
 
-            let conv_capture =
-                slot_data.conv_capture_states.as_ref().unwrap();
+            let conv_capture = slot_data.conv_capture_states.as_ref().unwrap();
             let conv_state_elems = slot_data.conv_state.element_count();
             assert_eq!(conv_state_elems, conv_per_seq);
-            let conv_cap_slice =
-                conv_capture.as_slice::<f32>().unwrap();
+            let conv_cap_slice = conv_capture.as_slice::<f32>().unwrap();
             let conv_src_offset = 2 * conv_state_elems;
-            let conv_src_owned: Vec<f32> = conv_cap_slice
-                [conv_src_offset..conv_src_offset + conv_state_elems]
-                .to_vec();
-            let conv_dst =
-                slot_data.conv_state.as_mut_slice::<f32>().unwrap();
+            let conv_src_owned: Vec<f32> =
+                conv_cap_slice[conv_src_offset..conv_src_offset + conv_state_elems].to_vec();
+            let conv_dst = slot_data.conv_state.as_mut_slice::<f32>().unwrap();
             for k_i in 0..k_minus1 {
                 for c in 0..conv_channels {
                     let src_idx = k_i * conv_channels + c;
@@ -8708,11 +9169,7 @@ mod tests {
         }
 
         // Byte-equality of recurrent + conv_state across both caches.
-        for (la_a, la_b) in cache_a
-            .linear_attn
-            .iter()
-            .zip(cache_b.linear_attn.iter())
-        {
+        for (la_a, la_b) in cache_a.linear_attn.iter().zip(cache_b.linear_attn.iter()) {
             let ra = la_a.recurrent.as_slice::<f32>().unwrap();
             let rb = la_b.recurrent.as_slice::<f32>().unwrap();
             assert_eq!(
@@ -8746,8 +9203,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
 
-        let mut cache =
-            HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc n_seqs=4");
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc n_seqs=4");
         cache.ensure_la_capture(&cfg, &device, 4).expect("ensure");
 
         // SlotId(4) is one past the valid range [0, 3].
@@ -8785,8 +9241,7 @@ mod tests {
         // still surfaces SlotOutOfRange (not the "capture_states is None"
         // message). This pins cfa-finding-F5's "bounds before pre-condition"
         // ordering against any future iter that re-orders the validation.
-        let mut cache_no_cap =
-            HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        let mut cache_no_cap = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
         let err = cache_no_cap
             .rollback_la_to(crate::serve::multi_seq_kv::SlotId(99), 0)
             .expect_err("slot OOR before ensure_la_capture");
@@ -8954,10 +9409,7 @@ mod tests {
         for fa in cache.full_attn.iter() {
             for s in 0..(n_seqs as usize) {
                 if s == 1 {
-                    assert_eq!(
-                        fa.current_len[s], 0,
-                        "iter-1: slot 1 current_len must be 0"
-                    );
+                    assert_eq!(fa.current_len[s], 0, "iter-1: slot 1 current_len must be 0");
                 } else {
                     assert_eq!(
                         fa.current_len[s],
@@ -9038,8 +9490,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
-        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
-            .expect("alloc n_seqs=4");
+        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, 4).expect("alloc n_seqs=4");
 
         // Seed slot 0's full-attn K/V bytes with deterministic
         // non-zero patterns per layer.  Production write path is the
@@ -9088,31 +9539,26 @@ mod tests {
             .collect();
 
         // iter-A2c closure: fork must return Ok(()).
-        cache.fork_seq(SlotId(0), SlotId(1))
+        cache
+            .fork_seq(SlotId(0), SlotId(1))
             .expect("H158: fork_seq must succeed post-A2c");
 
         // Per-layer byte-equality: dst slot 1's K/V bytes == src slot 0's.
         for (layer_idx, slot) in cache.full_attn.iter().enumerate() {
             if let Some(ref k) = slot.k {
-                let dst_bytes: Vec<u8> = k
-                    .as_slice::<u8>()
-                    .unwrap()[slot_bytes_f32..2 * slot_bytes_f32]
-                    .to_vec();
+                let dst_bytes: Vec<u8> =
+                    k.as_slice::<u8>().unwrap()[slot_bytes_f32..2 * slot_bytes_f32].to_vec();
                 assert_eq!(
-                    dst_bytes,
-                    src_k_per_layer[layer_idx],
+                    dst_bytes, src_k_per_layer[layer_idx],
                     "H158 FALSIFIED: full_attn[{layer_idx}] K bytes at dst slot 1 \
                      do not match src slot 0 after fork"
                 );
             }
             if let Some(ref v) = slot.v {
-                let dst_bytes: Vec<u8> = v
-                    .as_slice::<u8>()
-                    .unwrap()[slot_bytes_f32..2 * slot_bytes_f32]
-                    .to_vec();
+                let dst_bytes: Vec<u8> =
+                    v.as_slice::<u8>().unwrap()[slot_bytes_f32..2 * slot_bytes_f32].to_vec();
                 assert_eq!(
-                    dst_bytes,
-                    src_v_per_layer[layer_idx],
+                    dst_bytes, src_v_per_layer[layer_idx],
                     "H158 FALSIFIED: full_attn[{layer_idx}] V bytes at dst slot 1 \
                      do not match src slot 0 after fork"
                 );
@@ -9131,8 +9577,7 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
-        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
-            .expect("alloc n_seqs=4");
+        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, 4).expect("alloc n_seqs=4");
         let nkv = cfg.num_key_value_heads as usize;
         let hd = cfg.head_dim as usize;
         let cap = max_seq_len as usize;
@@ -9161,14 +9606,12 @@ mod tests {
         let src_cursor_before: Vec<u32> =
             cache.full_attn.iter().map(|s| s.current_len[0]).collect();
 
-        cache.fork_seq(SlotId(0), SlotId(2))
-            .expect("H163: fork ok");
+        cache.fork_seq(SlotId(0), SlotId(2)).expect("H163: fork ok");
 
         // src slot 0's bytes must be UNCHANGED.
         for (layer_idx, slot) in cache.full_attn.iter().enumerate() {
             if let Some(ref k) = slot.k {
-                let src_after: Vec<u8> =
-                    k.as_slice::<u8>().unwrap()[..slot_bytes_f32].to_vec();
+                let src_after: Vec<u8> = k.as_slice::<u8>().unwrap()[..slot_bytes_f32].to_vec();
                 assert_eq!(
                     src_before[layer_idx], src_after,
                     "H163 FALSIFIED: full_attn[{layer_idx}] src slot 0 K bytes \
@@ -9198,8 +9641,7 @@ mod tests {
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
         let n_seqs = 4u32;
-        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
-            .expect("alloc");
+        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs).expect("alloc");
 
         // Seed linear-attn recurrent + conv_state bytes for slot 0
         // (n_seqs is the LAST shape dim ⇒ outermost in memory; per-slot
@@ -9222,8 +9664,7 @@ mod tests {
         }
         cache.append_for_seq(SlotId(0), 5).unwrap();
 
-        cache.fork_seq(SlotId(0), SlotId(3))
-            .expect("H164: fork ok");
+        cache.fork_seq(SlotId(0), SlotId(3)).expect("H164: fork ok");
 
         // Per-layer dst slot 3 byte-equality on linear-attn buffers.
         for (layer_idx, slot) in cache.linear_attn.iter().enumerate() {
@@ -9263,8 +9704,7 @@ mod tests {
         // Pre-fork: src cursor = 11, dst (slot 3) cursor = 0.
         assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 11);
         assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 0);
-        cache.fork_seq(SlotId(0), SlotId(3))
-            .expect("H165: fork ok");
+        cache.fork_seq(SlotId(0), SlotId(3)).expect("H165: fork ok");
         // Post-fork: dst cursor must equal src cursor.
         assert_eq!(
             cache.seq_len(SlotId(3)).unwrap(),
@@ -9336,9 +9776,14 @@ mod tests {
 
         // (4) Same-slot fork is a successful no-op per trait spec.
         cache.append_for_seq(SlotId(2), 7).unwrap();
-        cache.fork_seq(SlotId(2), SlotId(2))
+        cache
+            .fork_seq(SlotId(2), SlotId(2))
             .expect("H166: same-slot fork must be a successful no-op");
-        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 7, "H166: same-slot fork preserves cursor");
+        assert_eq!(
+            cache.seq_len(SlotId(2)).unwrap(),
+            7,
+            "H166: same-slot fork preserves cursor"
+        );
     }
 
     /// ADR-040 M-QWEN (2026-07-01) — per-slot ping-pong parity semantics.
@@ -9399,16 +9844,36 @@ mod tests {
             let n = n_seqs as usize;
             // Slot 1's CURRENT is now the scratch-named buffer.
             let (c1, s1) = la.conv_bufs_for_slot(SlotId(1));
-            assert_eq!(read_slot0th(c1, 1, n), 201.0, "slot1 conv current = scratch region");
-            assert_eq!(read_slot0th(s1, 1, n), 101.0, "slot1 conv scratch = named region");
+            assert_eq!(
+                read_slot0th(c1, 1, n),
+                201.0,
+                "slot1 conv current = scratch region"
+            );
+            assert_eq!(
+                read_slot0th(s1, 1, n),
+                101.0,
+                "slot1 conv scratch = named region"
+            );
             let (r1, _) = la.recurrent_bufs_for_slot(SlotId(1));
-            assert_eq!(read_slot0th(r1, 1, n), 401.0, "slot1 rec current = scratch region");
+            assert_eq!(
+                read_slot0th(r1, 1, n),
+                401.0,
+                "slot1 rec current = scratch region"
+            );
             // Slots 0/2/3 untouched: current still the named buffers.
             for s in [0usize, 2, 3] {
                 let (c, _) = la.conv_bufs_for_slot(SlotId(s as u32));
-                assert_eq!(read_slot0th(c, s, n), 100.0 + s as f32, "slot{s} conv current unchanged");
+                assert_eq!(
+                    read_slot0th(c, s, n),
+                    100.0 + s as f32,
+                    "slot{s} conv current unchanged"
+                );
                 let (r, _) = la.recurrent_bufs_for_slot(SlotId(s as u32));
-                assert_eq!(read_slot0th(r, s, n), 300.0 + s as f32, "slot{s} rec current unchanged");
+                assert_eq!(
+                    read_slot0th(r, s, n),
+                    300.0 + s as f32,
+                    "slot{s} rec current unchanged"
+                );
             }
         }
 
@@ -9416,9 +9881,21 @@ mod tests {
         let snap = cache.snapshot(&device).expect("snapshot");
         {
             let n = n_seqs as usize;
-            assert_eq!(read_slot0th(&snap.linear_conv[0], 0, n), 100.0, "snap slot0 conv = current(named)");
-            assert_eq!(read_slot0th(&snap.linear_conv[0], 1, n), 201.0, "snap slot1 conv = current(scratch)");
-            assert_eq!(read_slot0th(&snap.linear_recurrent[0], 1, n), 401.0, "snap slot1 rec = current(scratch)");
+            assert_eq!(
+                read_slot0th(&snap.linear_conv[0], 0, n),
+                100.0,
+                "snap slot0 conv = current(named)"
+            );
+            assert_eq!(
+                read_slot0th(&snap.linear_conv[0], 1, n),
+                201.0,
+                "snap slot1 conv = current(scratch)"
+            );
+            assert_eq!(
+                read_slot0th(&snap.linear_recurrent[0], 1, n),
+                401.0,
+                "snap slot1 rec = current(scratch)"
+            );
         }
 
         // (3) fork_seq 1 → 2 carries parity; dst-current == src-current.
@@ -9429,7 +9906,11 @@ mod tests {
             assert!(la.pp_flipped[2], "fork carries parity");
             let n = n_seqs as usize;
             let (c2, _) = la.conv_bufs_for_slot(SlotId(2));
-            assert_eq!(read_slot0th(c2, 2, n), 201.0, "slot2 conv current == slot1's forked current");
+            assert_eq!(
+                read_slot0th(c2, 2, n),
+                201.0,
+                "slot2 conv current == slot1's forked current"
+            );
         }
 
         // (4) reset_for_slot returns canonical parity + zeroes.
@@ -9443,7 +9924,9 @@ mod tests {
         }
 
         // (5) rollback under flipped parity lands in the slot's CURRENT.
-        cache.ensure_la_capture(&cfg, &device, 2).expect("ensure_la_capture");
+        cache
+            .ensure_la_capture(&cfg, &device, 2)
+            .expect("ensure_la_capture");
         {
             // Fill capture position 0 for slot 3 with 777.0 (recurrent) and
             // conv capture with 888.0.
@@ -9459,7 +9942,10 @@ mod tests {
                 }
             }
             {
-                let ccap = la.conv_capture_states.as_mut().expect("conv_capture_states");
+                let ccap = la
+                    .conv_capture_states
+                    .as_mut()
+                    .expect("conv_capture_states");
                 let s = ccap.as_mut_slice::<f32>().expect("ccap slice");
                 let total = s.len();
                 let per_seq = total / n;
@@ -9469,7 +9955,9 @@ mod tests {
             }
             la.swap_for_slot(SlotId(3)); // flip slot 3
         }
-        cache.rollback_la_to(SlotId(3), 0).expect("rollback_la_to slot3");
+        cache
+            .rollback_la_to(SlotId(3), 0)
+            .expect("rollback_la_to slot3");
         {
             let la = &cache.linear_attn[0];
             let n = n_seqs as usize;
@@ -9544,29 +10032,42 @@ mod tests {
         let n_tokens = 40usize;
 
         // Source cache in TQ-only mode with planted deterministic bytes.
-        let mut src =
-            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true).expect("alloc src");
+        let mut src = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc src");
         assert!(src.tq_kv_active, "fixture must be TQ-active");
         assert!(src.full_attn[0].k.is_none(), "TQ-only: F32 dropped");
         assert!(src.full_attn[0].tq.is_some(), "TQ-only: tq populated");
-        assert!(src.mtp_slot.as_ref().expect("mtp").k.is_none(), "TQ-only MTP: F32 dropped");
+        assert!(
+            src.mtp_slot.as_ref().expect("mtp").k.is_none(),
+            "TQ-only MTP: F32 dropped"
+        );
         for slot in src.full_attn.iter_mut() {
             plant_tq_pattern(slot.tq.as_mut().expect("tq"), 1);
         }
-        plant_tq_pattern(src.mtp_slot.as_mut().expect("mtp").tq.as_mut().expect("tq"), 2);
+        plant_tq_pattern(
+            src.mtp_slot.as_mut().expect("mtp").tq.as_mut().expect("tq"),
+            2,
+        );
         // Linear-attn state must also survive the round-trip (unchanged path).
         src.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = 9.5;
 
         let snap = src.snapshot(&device).expect("snapshot");
         assert!(snap.full_attn_k[0].is_none(), "TQ-only snapshot: k None");
         assert!(snap.full_attn_tq[0].is_some(), "TQ-only snapshot: tq Some");
-        assert!(snap.mtp.as_ref().expect("mtp snap").k.is_none(), "TQ-only MTP snap: k None");
-        assert!(snap.mtp.as_ref().expect("mtp snap").tq.is_some(), "TQ-only MTP snap: tq Some");
+        assert!(
+            snap.mtp.as_ref().expect("mtp snap").k.is_none(),
+            "TQ-only MTP snap: k None"
+        );
+        assert!(
+            snap.mtp.as_ref().expect("mtp snap").tq.is_some(),
+            "TQ-only MTP snap: tq Some"
+        );
 
         // Destination: fresh zeroed TQ-only cache.
-        let mut dst =
-            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true).expect("alloc dst");
-        dst.restore_partial(&snap, n_tokens).expect("restore_partial");
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc dst");
+        dst.restore_partial(&snap, n_tokens)
+            .expect("restore_partial");
 
         // Every full-attn slot: all four TQ buffers carry the prefix.
         for (i, slot) in dst.full_attn.iter().enumerate() {
@@ -9603,7 +10104,10 @@ mod tests {
         // MTP slot: same pin.
         let dst_mtp = dst.mtp_slot.as_ref().expect("dst mtp");
         let src_mtp = src.mtp_slot.as_ref().expect("src mtp");
-        let (dt, st) = (dst_mtp.tq.as_ref().expect("dst mtp tq"), src_mtp.tq.as_ref().expect("src mtp tq"));
+        let (dt, st) = (
+            dst_mtp.tq.as_ref().expect("dst mtp tq"),
+            src_mtp.tq.as_ref().expect("src mtp tq"),
+        );
         for (name, d, s) in [
             ("k_packed", &dt.k_packed, &st.k_packed),
             ("k_norms", &dt.k_norms, &st.k_norms),
@@ -9651,11 +10155,23 @@ mod tests {
         }
         let snap = src.snapshot(&device).expect("snapshot");
         let mut dst = HybridKvCache::new(&cfg, &device, max_seq_len, 1).expect("alloc dst");
-        dst.restore_partial(&snap, n_tokens).expect("restore_partial");
+        dst.restore_partial(&snap, n_tokens)
+            .expect("restore_partial");
 
-        let d = dst.full_attn[0].k.as_ref().expect("dst k").as_slice::<f32>().unwrap();
-        let s = src.full_attn[0].k.as_ref().expect("src k").as_slice::<f32>().unwrap();
-        let inner = d.len() / (src.full_attn[0].k.as_ref().unwrap().shape()[1] * max_seq_len as usize);
+        let d = dst.full_attn[0]
+            .k
+            .as_ref()
+            .expect("dst k")
+            .as_slice::<f32>()
+            .unwrap();
+        let s = src.full_attn[0]
+            .k
+            .as_ref()
+            .expect("src k")
+            .as_slice::<f32>()
+            .unwrap();
+        let inner =
+            d.len() / (src.full_attn[0].k.as_ref().unwrap().shape()[1] * max_seq_len as usize);
         for head in 0..2usize {
             let stride = max_seq_len as usize * inner;
             assert_eq!(

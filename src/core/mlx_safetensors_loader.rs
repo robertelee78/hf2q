@@ -73,16 +73,20 @@ impl MlxQuantConfig {
                 path.display()
             ));
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("parse json {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parse json {}", path.display()))?;
 
         // Prefer "quantization", fall back to "quantization_config"
         // (both are written identically per mlx_lm/utils.py:914-915,
         // but legacy models may have only one).
-        let q = v.get("quantization").or_else(|| v.get("quantization_config"));
-        let Some(q) = q else { return Ok(None); };
+        let q = v
+            .get("quantization")
+            .or_else(|| v.get("quantization_config"));
+        let Some(q) = q else {
+            return Ok(None);
+        };
         let q_obj = q
             .as_object()
             .ok_or_else(|| anyhow!("'quantization' is not a JSON object: {q}"))?;
@@ -248,7 +252,7 @@ impl MlxAffineLinear {
             for j in 0..self.k {
                 let g = j / self.group_size;
                 let scale = self.scales[i * groups_per_row + g];
-                let bias  = self.biases[i * groups_per_row + g];
+                let bias = self.biases[i * groups_per_row + g];
                 w[i * self.k + j] = scale * (self.q_int[i * self.k + j] as f32) + bias;
             }
         }
@@ -274,21 +278,24 @@ impl MlxAffineLinear {
     /// Errors if `k` is not a multiple of the Q4_0 block size (32) —
     /// the same alignment requirement that `quantize_row_q4_0` enforces.
     pub fn q4_0_round_trip_drift(&self) -> Result<RoundTripDrift> {
-        use crate::quantize::ggml_quants::q4_0::{quantize as q4_0_quantize, BLOCK_BYTES as Q4_0_BLOCK_BYTES, QK4_0};
+        use crate::quantize::ggml_quants::q4_0::{
+            quantize as q4_0_quantize, BLOCK_BYTES as Q4_0_BLOCK_BYTES, QK4_0,
+        };
         use half::f16;
 
         let qk = QK4_0; // 32 — production Q4_0 codec constant.
         if self.k % qk != 0 {
             return Err(anyhow!(
                 "q4_0_round_trip_drift: k={} not a multiple of Q4_0 block size {}",
-                self.k, qk
+                self.k,
+                qk
             ));
         }
 
         let w_dwq = self.dequantize_to_f32();
         let mut max_abs_drift = 0f32;
         let mut sum_abs_drift = 0.0f64;
-        let mut sum_sq_drift  = 0.0f64;
+        let mut sum_sq_drift = 0.0f64;
         let mut sum_sq_signal = 0.0f64;
         let total_elems = self.n * self.k;
 
@@ -319,17 +326,19 @@ impl MlxAffineLinear {
             for j in 0..self.k {
                 let signal = row[j];
                 let drift = (signal - w_rt_row[j]).abs();
-                if drift > max_abs_drift { max_abs_drift = drift; }
+                if drift > max_abs_drift {
+                    max_abs_drift = drift;
+                }
                 sum_abs_drift += drift as f64;
-                sum_sq_drift  += (drift as f64) * (drift as f64);
+                sum_sq_drift += (drift as f64) * (drift as f64);
                 sum_sq_signal += (signal as f64) * (signal as f64);
             }
         }
 
         let mean_abs_drift = (sum_abs_drift / total_elems as f64) as f32;
-        let rms_drift      = ((sum_sq_drift / total_elems as f64).sqrt()) as f32;
-        let rms_signal     = ((sum_sq_signal / total_elems as f64).sqrt()) as f32;
-        let relative_rms   = if rms_signal.abs() > f32::EPSILON {
+        let rms_drift = ((sum_sq_drift / total_elems as f64).sqrt()) as f32;
+        let rms_signal = ((sum_sq_signal / total_elems as f64).sqrt()) as f32;
+        let relative_rms = if rms_signal.abs() > f32::EPSILON {
             rms_drift / rms_signal
         } else {
             f32::NAN
@@ -640,18 +649,10 @@ impl MlxAffineLinearBytes {
         use safetensors::tensor::TensorView;
         let w = TensorView::new(Dtype::U32, vec![self.n, self.k_packed], &self.weight)
             .map_err(|e| anyhow!("weight TensorView: {e:?}"))?;
-        let s = TensorView::new(
-            self.float_dtype,
-            vec![self.n, self.n_groups],
-            &self.scales,
-        )
-        .map_err(|e| anyhow!("scales TensorView: {e:?}"))?;
-        let b = TensorView::new(
-            self.float_dtype,
-            vec![self.n, self.n_groups],
-            &self.biases,
-        )
-        .map_err(|e| anyhow!("biases TensorView: {e:?}"))?;
+        let s = TensorView::new(self.float_dtype, vec![self.n, self.n_groups], &self.scales)
+            .map_err(|e| anyhow!("scales TensorView: {e:?}"))?;
+        let b = TensorView::new(self.float_dtype, vec![self.n, self.n_groups], &self.biases)
+            .map_err(|e| anyhow!("biases TensorView: {e:?}"))?;
         Ok((w, s, b))
     }
 }
@@ -661,9 +662,7 @@ impl MlxAffineLinearBytes {
 /// `model.safetensors.index.json` is present, or a single `[(*, "model.safetensors")]`
 /// equivalent if the model is a single-file save.  Mirrors mlx-lm's
 /// `save_model` output convention (utils.py:728-771).
-pub fn discover_shards(
-    model_dir: &Path,
-) -> Result<BTreeMap<String, PathBuf>> {
+pub fn discover_shards(model_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
     let single = model_dir.join("model.safetensors");
     let index_path = model_dir.join("model.safetensors.index.json");
     if index_path.exists() {
@@ -755,14 +754,8 @@ mod tests {
     fn read_floats_to_f32_handles_all_three_dtypes() {
         // F32 round-trip
         let f32_in: Vec<f32> = vec![1.5, -0.25, 3.14];
-        let f32_bytes: Vec<u8> = f32_in
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        assert_eq!(
-            read_floats_to_f32(&f32_bytes, Dtype::F32).unwrap(),
-            f32_in
-        );
+        let f32_bytes: Vec<u8> = f32_in.iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(read_floats_to_f32(&f32_bytes, Dtype::F32).unwrap(), f32_in);
 
         // F16 round-trip (within f16 precision)
         let f16_vals: Vec<f32> = vec![1.0, -0.5, 2.5];
@@ -811,34 +804,13 @@ mod tests {
         assert_eq!(w_packed.len(), n * w_n_u32_per_row * 4);
 
         // F32 byte buffers.
-        let scales_bytes: Vec<u8> = scales
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        let biases_bytes: Vec<u8> = biases
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let scales_bytes: Vec<u8> = scales.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let biases_bytes: Vec<u8> = biases.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         // Wrap in safetensors views + serialize.
-        let w_view = TensorView::new(
-            Dtype::U32,
-            vec![n, w_n_u32_per_row],
-            &w_packed,
-        )
-        .unwrap();
-        let s_view = TensorView::new(
-            Dtype::F32,
-            vec![n, groups_per_row],
-            &scales_bytes,
-        )
-        .unwrap();
-        let b_view = TensorView::new(
-            Dtype::F32,
-            vec![n, groups_per_row],
-            &biases_bytes,
-        )
-        .unwrap();
+        let w_view = TensorView::new(Dtype::U32, vec![n, w_n_u32_per_row], &w_packed).unwrap();
+        let s_view = TensorView::new(Dtype::F32, vec![n, groups_per_row], &scales_bytes).unwrap();
+        let b_view = TensorView::new(Dtype::F32, vec![n, groups_per_row], &biases_bytes).unwrap();
         let bytes = safetensors::tensor::serialize(
             [
                 ("model.layers.0.q_proj.weight".to_string(), &w_view),
@@ -851,13 +823,8 @@ mod tests {
 
         // Deserialize + read.
         let st = SafeTensors::deserialize(&bytes).unwrap();
-        let lin = MlxAffineLinear::from_safetensors(
-            &st,
-            "model.layers.0.q_proj",
-            bits,
-            group_size,
-        )
-        .unwrap();
+        let lin = MlxAffineLinear::from_safetensors(&st, "model.layers.0.q_proj", bits, group_size)
+            .unwrap();
 
         assert_eq!(lin.n, n);
         assert_eq!(lin.k, k);
@@ -892,24 +859,11 @@ mod tests {
             .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
             .collect();
 
-        let w_view = TensorView::new(
-            Dtype::U32,
-            vec![n, k / 8],
-            &w_packed,
-        )
-        .unwrap();
-        let s_view = TensorView::new(
-            Dtype::BF16,
-            vec![n, groups_per_row],
-            &scales_bf16_bytes,
-        )
-        .unwrap();
-        let b_view = TensorView::new(
-            Dtype::BF16,
-            vec![n, groups_per_row],
-            &biases_bf16_bytes,
-        )
-        .unwrap();
+        let w_view = TensorView::new(Dtype::U32, vec![n, k / 8], &w_packed).unwrap();
+        let s_view =
+            TensorView::new(Dtype::BF16, vec![n, groups_per_row], &scales_bf16_bytes).unwrap();
+        let b_view =
+            TensorView::new(Dtype::BF16, vec![n, groups_per_row], &biases_bf16_bytes).unwrap();
 
         let bytes = safetensors::tensor::serialize(
             [
@@ -921,8 +875,7 @@ mod tests {
         )
         .unwrap();
         let st = SafeTensors::deserialize(&bytes).unwrap();
-        let lin = MlxAffineLinear::from_safetensors(&st, "layer", bits, group_size)
-            .unwrap();
+        let lin = MlxAffineLinear::from_safetensors(&st, "layer", bits, group_size).unwrap();
         assert_eq!(lin.q_int, q_int_unpacked);
         // BF16 has ~7-bit mantissa; round-trip is exact for these
         // chosen powers of 2 and small integers.
@@ -976,7 +929,9 @@ mod tests {
             serde_json::to_string_pretty(&cfg).unwrap(),
         )
         .unwrap();
-        let mq = MlxQuantConfig::from_config_json(tmp.path()).unwrap().unwrap();
+        let mq = MlxQuantConfig::from_config_json(tmp.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(mq.bits, 4);
         assert_eq!(mq.group_size, 64);
         assert_eq!(mq.mode, "affine");
@@ -1000,7 +955,9 @@ mod tests {
             serde_json::to_string_pretty(&cfg).unwrap(),
         )
         .unwrap();
-        let mq = MlxQuantConfig::from_config_json(tmp.path()).unwrap().unwrap();
+        let mq = MlxQuantConfig::from_config_json(tmp.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(mq.bits, 4);
         assert_eq!(mq.per_path.len(), 2);
         // bool override: lm_head is excluded from quantization.
@@ -1104,8 +1061,7 @@ mod tests {
         .unwrap();
 
         let st = SafeTensors::deserialize(&bytes).unwrap();
-        let lin2 =
-            MlxAffineLinear::from_safetensors(&st, "layer", bits, group_size).unwrap();
+        let lin2 = MlxAffineLinear::from_safetensors(&st, "layer", bits, group_size).unwrap();
         assert_eq!(lin2.n, n);
         assert_eq!(lin2.k, k);
         assert_eq!(lin2.group_size, group_size);
@@ -1152,8 +1108,7 @@ mod tests {
         )
         .unwrap();
         let st = SafeTensors::deserialize(&bytes).unwrap();
-        let lin2 =
-            MlxAffineLinear::from_safetensors(&st, "l", bits, group_size).unwrap();
+        let lin2 = MlxAffineLinear::from_safetensors(&st, "l", bits, group_size).unwrap();
         assert_eq!(lin2.q_int, q_int);
         // BF16-exact for bf16-representable values.
         assert_eq!(lin2.scales, scales);
@@ -1254,18 +1209,14 @@ mod tests {
             // scales/biases: BF16 has ~7-bit mantissa, so non-power-of-2
             // values round-trip with ~0.4% precision loss.  Compare
             // within bf16 precision, not byte-identical.
-            for (i, (a, b)) in
-                got.scales.iter().zip(expected.scales.iter()).enumerate()
-            {
+            for (i, (a, b)) in got.scales.iter().zip(expected.scales.iter()).enumerate() {
                 let tol = 0.01 * b.abs().max(1e-3);
                 assert!(
                     (a - b).abs() < tol,
                     "{name}.scales[{i}]: got {a} expected {b} tol {tol}"
                 );
             }
-            for (i, (a, b)) in
-                got.biases.iter().zip(expected.biases.iter()).enumerate()
-            {
+            for (i, (a, b)) in got.biases.iter().zip(expected.biases.iter()).enumerate() {
                 let tol = 0.01 * b.abs().max(1e-3);
                 assert!(
                     (a - b).abs() < tol,
@@ -1304,16 +1255,12 @@ mod tests {
             .collect();
 
         let w_packed = pack_u32(&q_int, bits);
-        let scales_bytes: Vec<u8> =
-            scales.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let biases_bytes: Vec<u8> =
-            biases.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let scales_bytes: Vec<u8> = scales.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let biases_bytes: Vec<u8> = biases.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let w_view = TensorView::new(Dtype::U32, vec![n, k / 8], &w_packed).unwrap();
-        let s_view =
-            TensorView::new(Dtype::F32, vec![n, groups_per_row], &scales_bytes).unwrap();
-        let b_view =
-            TensorView::new(Dtype::F32, vec![n, groups_per_row], &biases_bytes).unwrap();
+        let s_view = TensorView::new(Dtype::F32, vec![n, groups_per_row], &scales_bytes).unwrap();
+        let b_view = TensorView::new(Dtype::F32, vec![n, groups_per_row], &biases_bytes).unwrap();
         let bytes = safetensors::tensor::serialize(
             [
                 ("l.weight".to_string(), &w_view),
@@ -1324,17 +1271,20 @@ mod tests {
         )
         .unwrap();
         let st = SafeTensors::deserialize(&bytes).unwrap();
-        let lin =
-            MlxAffineLinear::from_safetensors(&st, "l", bits, group_size).unwrap();
+        let lin = MlxAffineLinear::from_safetensors(&st, "l", bits, group_size).unwrap();
 
         // Build activations + run iter-15 fused kernel.
         let m = 4usize;
-        let x: Vec<f32> = (0..(m * k)).map(|i| ((i as f32) * 0.013).sin() * 0.4).collect();
+        let x: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.013).sin() * 0.4)
+            .collect();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
         fn alloc_f32(device: &MlxDevice, n: usize, shape: Vec<usize>) -> MlxBuffer {
-            device.alloc_buffer(n * 4, DType::F32, shape).expect("alloc f32")
+            device
+                .alloc_buffer(n * 4, DType::F32, shape)
+                .expect("alloc f32")
         }
         fn alloc_u8(device: &MlxDevice, n: usize, shape: Vec<usize>) -> MlxBuffer {
             device.alloc_buffer(n, DType::U8, shape).expect("alloc u8")
@@ -1342,11 +1292,20 @@ mod tests {
         let mut x_buf = alloc_f32(&device, m * k, vec![m, k]);
         x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
         let mut q_buf = alloc_u8(&device, n * k, vec![n, k]);
-        q_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&lin.q_int);
+        q_buf
+            .as_mut_slice::<u8>()
+            .unwrap()
+            .copy_from_slice(&lin.q_int);
         let mut s_buf = alloc_f32(&device, lin.scales.len(), vec![n, groups_per_row]);
-        s_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&lin.scales);
+        s_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&lin.scales);
         let mut b_buf = alloc_f32(&device, lin.biases.len(), vec![n, groups_per_row]);
-        b_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&lin.biases);
+        b_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&lin.biases);
         let y_buf = alloc_f32(&device, m * n, vec![m, n]);
         let mut meta = device.alloc_buffer(16, DType::U32, vec![4]).unwrap();
         meta.as_mut_slice::<u32>().unwrap().copy_from_slice(&[
@@ -1407,8 +1366,12 @@ mod tests {
 
     /// Helper: build a synthetic Linear with explicit (s, b) per group.
     fn make_synthetic_linear(
-        n: usize, k: usize, group_size: usize, bits: u32,
-        scales_per_group: f32, biases_per_group: f32,
+        n: usize,
+        k: usize,
+        group_size: usize,
+        bits: u32,
+        scales_per_group: f32,
+        biases_per_group: f32,
         codes: impl Fn(usize, usize) -> u8,
     ) -> MlxAffineLinear {
         let groups_per_row = k / group_size;
@@ -1420,7 +1383,15 @@ mod tests {
         }
         let scales = vec![scales_per_group; n * groups_per_row];
         let biases = vec![biases_per_group; n * groups_per_row];
-        MlxAffineLinear { n, k, group_size, bits, q_int, scales, biases }
+        MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits,
+            q_int,
+            scales,
+            biases,
+        }
     }
 
     #[test]
@@ -1434,8 +1405,11 @@ mod tests {
         assert_eq!(d.max_abs_drift, 0.0);
         assert_eq!(d.rms_drift, 0.0);
         assert_eq!(d.rms_signal, 0.0);
-        assert!(d.relative_rms.is_nan(),
-                "rms_signal == 0 ⇒ relative_rms = NaN; got {}", d.relative_rms);
+        assert!(
+            d.relative_rms.is_nan(),
+            "rms_signal == 0 ⇒ relative_rms = NaN; got {}",
+            d.relative_rms
+        );
     }
 
     #[test]
@@ -1461,9 +1435,13 @@ mod tests {
         // inputs (the codec's natural fixed point), and falsifies any
         // implementation bug that would introduce drift on this input.
         let lin = make_synthetic_linear(
-            1, 32, 32, 4,
-            1.0, -8.0,
-            |_, j| (j % 16) as u8,  // codes 0..15, repeated twice in 32-block
+            1,
+            32,
+            32,
+            4,
+            1.0,
+            -8.0,
+            |_, j| (j % 16) as u8, // codes 0..15, repeated twice in 32-block
         );
         let d = lin.q4_0_round_trip_drift().expect("drift");
         assert!(
@@ -1471,13 +1449,11 @@ mod tests {
             "max_abs_drift {} should be ~0 for already-Q4_0-grid values",
             d.max_abs_drift,
         );
-        assert!(
-            d.rms_drift < 1e-5,
-            "rms_drift {} should be ~0", d.rms_drift,
-        );
+        assert!(d.rms_drift < 1e-5, "rms_drift {} should be ~0", d.rms_drift,);
         assert!(
             d.relative_rms < 1e-3,
-            "relative_rms {} should be ~0", d.relative_rms,
+            "relative_rms {} should be ~0",
+            d.relative_rms,
         );
     }
 
@@ -1493,24 +1469,33 @@ mod tests {
 
         // Case A: small bias relative to scale (low bias_fraction).
         let lin_low = make_synthetic_linear(
-            2, 64, 32, 4,
-            0.1, 0.01,                // scale=0.1, bias=0.01
-            |_, j| (j % 16) as u8,    // codes 0..15
+            2,
+            64,
+            32,
+            4,
+            0.1,
+            0.01,                  // scale=0.1, bias=0.01
+            |_, j| (j % 16) as u8, // codes 0..15
         );
         // Case B: large bias dominates (high bias_fraction).
         let lin_high = make_synthetic_linear(
-            2, 64, 32, 4,
-            0.01, 1.0,                // scale=0.01, bias=1.0
-            |_, j| (j % 16) as u8,    // same codes
+            2,
+            64,
+            32,
+            4,
+            0.01,
+            1.0,                   // scale=0.01, bias=1.0
+            |_, j| (j % 16) as u8, // same codes
         );
-        let d_low  = lin_low.q4_0_round_trip_drift().expect("low");
+        let d_low = lin_low.q4_0_round_trip_drift().expect("low");
         let d_high = lin_high.q4_0_round_trip_drift().expect("high");
 
         // Sanity on bias_fraction direction.
         assert!(
             d_high.bias_fraction > d_low.bias_fraction,
             "high bias_fraction {} should exceed low {}",
-            d_high.bias_fraction, d_low.bias_fraction,
+            d_high.bias_fraction,
+            d_low.bias_fraction,
         );
         // The high-bias case lives almost entirely in the bias term:
         // expect bias_fraction near 1.0 (bias dominates signal energy).
@@ -1537,23 +1522,30 @@ mod tests {
     fn round_trip_drift_per_element_metrics_are_consistent() {
         // mean_abs_drift <= max_abs_drift, rms_drift <= max_abs_drift,
         // and relative_rms = rms_drift / rms_signal (within fp).
-        let lin = make_synthetic_linear(
-            4, 64, 32, 4,
-            0.1, 0.05,
-            |i, j| ((i + j) % 16) as u8,
-        );
+        let lin = make_synthetic_linear(4, 64, 32, 4, 0.1, 0.05, |i, j| ((i + j) % 16) as u8);
         let d = lin.q4_0_round_trip_drift().expect("drift");
-        assert!(d.mean_abs_drift <= d.max_abs_drift,
-                "mean {} > max {}", d.mean_abs_drift, d.max_abs_drift);
-        assert!(d.rms_drift <= d.max_abs_drift,
-                "rms {} > max {}", d.rms_drift, d.max_abs_drift);
+        assert!(
+            d.mean_abs_drift <= d.max_abs_drift,
+            "mean {} > max {}",
+            d.mean_abs_drift,
+            d.max_abs_drift
+        );
+        assert!(
+            d.rms_drift <= d.max_abs_drift,
+            "rms {} > max {}",
+            d.rms_drift,
+            d.max_abs_drift
+        );
         // Reconstruct relative_rms and check it agrees.
         if d.rms_signal > 0.0 {
             let expected = d.rms_drift / d.rms_signal;
             assert!(
                 (d.relative_rms - expected).abs() < 1e-5 * expected.abs().max(1.0),
                 "relative_rms {} != rms_drift {} / rms_signal {} = {}",
-                d.relative_rms, d.rms_drift, d.rms_signal, expected,
+                d.relative_rms,
+                d.rms_drift,
+                d.rms_signal,
+                expected,
             );
         }
     }

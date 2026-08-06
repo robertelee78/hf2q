@@ -80,12 +80,12 @@
 
 use anyhow::{anyhow, Context};
 
+use crate::inference::models::gemma4::MlxModelWeights;
 use crate::inference::spec_decode::dflash::hidden_capture::{
     extract_final_layer_slab, DFlashCaptureSession,
 };
 use crate::inference::spec_decode::ngram_proposer::{propose as ngram_propose, NgramConfig};
 use crate::inference::spec_decode::verifier::accept_prefix_argmax;
-use crate::inference::models::gemma4::MlxModelWeights;
 use crate::serve::gpu::GpuContext;
 
 /// Per-round accounting emitted when `HF2Q_SPEC_NGRAM_PROFILE=1`.
@@ -283,12 +283,8 @@ pub fn dispatch_ngram_generate(
         };
         let verify_prefix_len = verify_prefix.len();
 
-        let session = DFlashCaptureSession::new(
-            combined_capture_ids.clone(),
-            verify_prefix_len,
-            hs,
-            false,
-        );
+        let session =
+            DFlashCaptureSession::new(combined_capture_ids.clone(), verify_prefix_len, hs, false);
         target.install_dflash_capture(session);
 
         let t_verify = if profile_on {

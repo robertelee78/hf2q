@@ -98,19 +98,19 @@ impl GgmlType {
             GgmlType::F16 => 2,
             GgmlType::BF16 => 2,
             GgmlType::I32 => 4,
-            GgmlType::Q4_0 => 18,     // f16 d + 16 nibbles
-            GgmlType::Q4_1 => 20,     // f16 d + f16 m + 16 nibbles
-            GgmlType::Q5_0 => 22,     // f16 d + u32 qh + 16 nibbles
-            GgmlType::Q5_1 => 24,     // f16 d + f16 m + u32 qh + 16 nibbles
-            GgmlType::Q8_0 => 34,     // f16 d + 32 i8
-            GgmlType::Q8_1 => 36,     // 2*f16 + 32 i8
-            GgmlType::IQ4_NL => 18,   // f16 d + 16 nibbles (codebook lookup)
-            GgmlType::Q2_K => 84,     // scales[16] + qs[64] + f16 d + f16 dmin
-            GgmlType::Q3_K => 110,    // hmask[32] + qs[64] + scales[12] + f16 d
-            GgmlType::Q4_K => 144,    // f16 d + f16 dmin + scales[12] + qs[128]
-            GgmlType::Q5_K => 176,    // f16 d + f16 dmin + scales[12] + qh[32] + qs[128]
-            GgmlType::Q6_K => 210,    // ql[128] + qh[64] + scales[16] (i8) + f16 d
-            GgmlType::Q8_K => 292,    // f32 d + qs[256] + bsums[16] (only used internally by llama.cpp)
+            GgmlType::Q4_0 => 18,   // f16 d + 16 nibbles
+            GgmlType::Q4_1 => 20,   // f16 d + f16 m + 16 nibbles
+            GgmlType::Q5_0 => 22,   // f16 d + u32 qh + 16 nibbles
+            GgmlType::Q5_1 => 24,   // f16 d + f16 m + u32 qh + 16 nibbles
+            GgmlType::Q8_0 => 34,   // f16 d + 32 i8
+            GgmlType::Q8_1 => 36,   // 2*f16 + 32 i8
+            GgmlType::IQ4_NL => 18, // f16 d + 16 nibbles (codebook lookup)
+            GgmlType::Q2_K => 84,   // scales[16] + qs[64] + f16 d + f16 dmin
+            GgmlType::Q3_K => 110,  // hmask[32] + qs[64] + scales[12] + f16 d
+            GgmlType::Q4_K => 144,  // f16 d + f16 dmin + scales[12] + qs[128]
+            GgmlType::Q5_K => 176,  // f16 d + f16 dmin + scales[12] + qh[32] + qs[128]
+            GgmlType::Q6_K => 210,  // ql[128] + qh[64] + scales[16] (i8) + f16 d
+            GgmlType::Q8_K => 292, // f32 d + qs[256] + bsums[16] (only used internally by llama.cpp)
             // Placeholder IQ/TQ/MXFP4 types — no Quantizer impl in v1.
             // Sizes mirror llama.cpp's ggml-common.h for documentation
             // value; v1 pipeline never emits these rows (NoQuantizerForType).

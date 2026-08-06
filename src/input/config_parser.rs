@@ -48,29 +48,33 @@ pub enum ConfigParseError {
 /// 2. Falling back to nested text_config (for multimodal models like Gemma4)
 /// 3. Warning on missing optional fields rather than failing
 pub fn parse_config(config_path: &Path) -> Result<ModelMetadata, ConfigParseError> {
-    let content = std::fs::read_to_string(config_path).map_err(|e| ConfigParseError::ReadError {
-        path: config_path.display().to_string(),
-        source: e,
-    })?;
+    let content =
+        std::fs::read_to_string(config_path).map_err(|e| ConfigParseError::ReadError {
+            path: config_path.display().to_string(),
+            source: e,
+        })?;
 
-    let config: Value = serde_json::from_str(&content).map_err(|e| ConfigParseError::JsonError {
-        path: config_path.display().to_string(),
-        source: e,
-    })?;
+    let config: Value =
+        serde_json::from_str(&content).map_err(|e| ConfigParseError::JsonError {
+            path: config_path.display().to_string(),
+            source: e,
+        })?;
 
     parse_config_value(&config, config_path)
 }
 
 /// Parse a config.json Value into ModelMetadata.
-fn parse_config_value(config: &Value, config_path: &Path) -> Result<ModelMetadata, ConfigParseError> {
+fn parse_config_value(
+    config: &Value,
+    config_path: &Path,
+) -> Result<ModelMetadata, ConfigParseError> {
     // Architecture name — required
-    let architecture = extract_architecture(config)
-        .ok_or_else(|| ConfigParseError::MissingField {
+    let architecture =
+        extract_architecture(config).ok_or_else(|| ConfigParseError::MissingField {
             field: "architectures".to_string(),
         })?;
 
-    let model_type = extract_string(config, "model_type")
-        .unwrap_or_else(|| "unknown".to_string());
+    let model_type = extract_string(config, "model_type").unwrap_or_else(|| "unknown".to_string());
 
     // For multimodal models (like Gemma4), the text config is nested
     let text_config = config.get("text_config");
@@ -250,9 +254,7 @@ fn validate_required_qwen35_common_fields(
 /// Dense Qwen3.5 does not use `moe_intermediate_size` or
 /// `shared_expert_intermediate_size`. Calling the MoE validator on a
 /// dense model produces a false-positive "missing field" error.
-pub fn validate_required_qwen35_fields(
-    metadata: &ModelMetadata,
-) -> Result<(), ConfigParseError> {
+pub fn validate_required_qwen35_fields(metadata: &ModelMetadata) -> Result<(), ConfigParseError> {
     validate_required_qwen35_common_fields(metadata)
 }
 
@@ -295,7 +297,10 @@ fn extract_architecture(config: &Value) -> Option<String> {
 
 /// Extract a string field.
 fn extract_string(config: &Value, field: &str) -> Option<String> {
-    config.get(field).and_then(|v| v.as_str()).map(|s| s.to_string())
+    config
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract a u64 field.
@@ -329,12 +334,21 @@ fn extract_layer_types(config: &Value) -> Vec<String> {
     let num_layers = extract_u64(config, "num_hidden_layers").unwrap_or(0) as usize;
     if num_layers > 0 {
         // Check for MoE indicators
-        let has_moe = config.get("enable_moe_block")
+        let has_moe = config
+            .get("enable_moe_block")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
-            || config.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) > 1;
+            || config
+                .get("num_experts")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 1;
 
-        let layer_type = if has_moe { "moe_attention" } else { "attention" };
+        let layer_type = if has_moe {
+            "moe_attention"
+        } else {
+            "attention"
+        };
         return vec![layer_type.to_string(); num_layers];
     }
 
@@ -346,11 +360,14 @@ fn extract_layer_types(config: &Value) -> Vec<String> {
 /// Returns None when the field is absent (Gemma4 path — None preserves existing AST).
 /// Returns Some(...) only when the JSON explicitly contains "layer_types".
 fn extract_explicit_layer_types(config: &Value) -> Option<Vec<String>> {
-    config.get("layer_types").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect()
-    })
+    config
+        .get("layer_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
 }
 
 /// Extract nested rope config.
@@ -406,7 +423,13 @@ fn extract_rope_parameters(config: &Value) -> Option<RopeParameters> {
     // legacy `rope_scaling` form.
     let rope_type = obj
         .get("rope_type")
-        .or_else(|| if is_scaling_form { obj.get("type") } else { None })
+        .or_else(|| {
+            if is_scaling_form {
+                obj.get("type")
+            } else {
+                None
+            }
+        })
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -435,11 +458,13 @@ fn extract_mamba_ssm_dtype(config: &Value) -> Result<Option<String>, ConfigParse
     match config.get("mamba_ssm_dtype") {
         None => Ok(None),
         Some(v) => {
-            let s = v.as_str().ok_or_else(|| ConfigParseError::InvalidFieldValue {
-                field: "mamba_ssm_dtype".to_string(),
-                value: v.to_string(),
-                reason: "must be a string".to_string(),
-            })?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| ConfigParseError::InvalidFieldValue {
+                    field: "mamba_ssm_dtype".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a string".to_string(),
+                })?;
             match s {
                 "float32" | "bfloat16" | "float16" => Ok(Some(s.to_string())),
                 other => Err(ConfigParseError::InvalidFieldValue {
@@ -779,7 +804,11 @@ mod tests {
         );
 
         // Fields 13-14: MoE sizing
-        assert_eq!(meta.moe_intermediate_size, Some(512), "moe_intermediate_size");
+        assert_eq!(
+            meta.moe_intermediate_size,
+            Some(512),
+            "moe_intermediate_size"
+        );
         assert_eq!(
             meta.shared_expert_intermediate_size,
             Some(512),
@@ -847,29 +876,71 @@ mod tests {
         assert!(meta.is_moe());
 
         // All 18 new P1 fields must be None — no semantic change for Gemma4
-        assert!(meta.full_attention_interval.is_none(), "full_attention_interval must be None");
-        assert!(meta.attn_output_gate.is_none(), "attn_output_gate must be None");
+        assert!(
+            meta.full_attention_interval.is_none(),
+            "full_attention_interval must be None"
+        );
+        assert!(
+            meta.attn_output_gate.is_none(),
+            "attn_output_gate must be None"
+        );
         assert!(meta.head_dim.is_none(), "head_dim must be None");
-        assert!(meta.partial_rotary_factor.is_none(), "partial_rotary_factor must be None");
-        assert!(meta.rope_parameters.is_none(), "rope_parameters must be None");
-        assert!(meta.linear_conv_kernel_dim.is_none(), "linear_conv_kernel_dim must be None");
-        assert!(meta.linear_key_head_dim.is_none(), "linear_key_head_dim must be None");
-        assert!(meta.linear_num_key_heads.is_none(), "linear_num_key_heads must be None");
-        assert!(meta.linear_value_head_dim.is_none(), "linear_value_head_dim must be None");
-        assert!(meta.linear_num_value_heads.is_none(), "linear_num_value_heads must be None");
-        assert!(meta.mamba_ssm_dtype.is_none(), "mamba_ssm_dtype must be None");
-        assert!(meta.moe_intermediate_size.is_none(), "moe_intermediate_size must be None");
+        assert!(
+            meta.partial_rotary_factor.is_none(),
+            "partial_rotary_factor must be None"
+        );
+        assert!(
+            meta.rope_parameters.is_none(),
+            "rope_parameters must be None"
+        );
+        assert!(
+            meta.linear_conv_kernel_dim.is_none(),
+            "linear_conv_kernel_dim must be None"
+        );
+        assert!(
+            meta.linear_key_head_dim.is_none(),
+            "linear_key_head_dim must be None"
+        );
+        assert!(
+            meta.linear_num_key_heads.is_none(),
+            "linear_num_key_heads must be None"
+        );
+        assert!(
+            meta.linear_value_head_dim.is_none(),
+            "linear_value_head_dim must be None"
+        );
+        assert!(
+            meta.linear_num_value_heads.is_none(),
+            "linear_num_value_heads must be None"
+        );
+        assert!(
+            meta.mamba_ssm_dtype.is_none(),
+            "mamba_ssm_dtype must be None"
+        );
+        assert!(
+            meta.moe_intermediate_size.is_none(),
+            "moe_intermediate_size must be None"
+        );
         assert!(
             meta.shared_expert_intermediate_size.is_none(),
             "shared_expert_intermediate_size must be None"
         );
-        assert!(meta.mtp_num_hidden_layers.is_none(), "mtp_num_hidden_layers must be None");
+        assert!(
+            meta.mtp_num_hidden_layers.is_none(),
+            "mtp_num_hidden_layers must be None"
+        );
         assert!(
             meta.mtp_use_dedicated_embeddings.is_none(),
             "mtp_use_dedicated_embeddings must be None"
         );
-        assert!(meta.output_router_logits.is_none(), "output_router_logits must be None");
-        assert!(meta.router_aux_loss_coef.is_none(), "router_aux_loss_coef must be None");
+        assert!(
+            meta.output_router_logits.is_none(),
+            "output_router_logits must be None"
+        );
+        assert!(
+            meta.router_aux_loss_coef.is_none(),
+            "router_aux_loss_coef must be None"
+        );
 
         // explicit_layer_types: the text_config has "layer_types" so this will be Some —
         // the explicit_layer_types captures whatever is in the JSON.
@@ -996,8 +1067,7 @@ mod tests {
             "resolved[1] must be linear_attention from explicit (interval=2 would give full_attention)"
         );
         assert_eq!(
-            resolved[3],
-            "full_attention",
+            resolved[3], "full_attention",
             "resolved[3] must be full_attention from explicit"
         );
 
@@ -1230,12 +1300,13 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let meta = parse_config_value(&config, Path::new("/nonexistent/config.json"))
-            .unwrap();
+        let meta = parse_config_value(&config, Path::new("/nonexistent/config.json")).unwrap();
 
         // Sanity: raw layer_types is the parser placeholder.
         assert!(
-            meta.layer_types.iter().all(|t| t == "moe_attention" || t == "attention"),
+            meta.layer_types
+                .iter()
+                .all(|t| t == "moe_attention" || t == "attention"),
             "raw layer_types must be parser placeholder for Qwen3.5 derived config"
         );
 

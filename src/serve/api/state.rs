@@ -17,19 +17,19 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::engine::Engine;
 use super::schema::OverflowPolicy;
+use crate::core::hardware::HardwareProfile;
 use crate::inference::models::bert::config::PoolingType;
-use crate::inference::models::bert::BertConfig;
 use crate::inference::models::bert::weights::LoadedBertWeights;
+use crate::inference::models::bert::BertConfig;
 use crate::inference::models::nomic_bert::{LoadedNomicBertWeights, NomicBertConfig};
 use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
-use crate::core::hardware::HardwareProfile;
 use crate::serve::cache::ModelCache;
 use crate::serve::multi_model::{
     DefaultModelLoader, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
@@ -611,11 +611,7 @@ pub struct AppState {
     /// opt-in per Phase C.1); the graceful-shutdown drain becomes a
     /// no-op in that mode.
     pub kv_spiller: Option<
-        Arc<
-            crate::serve::kv_persist::BlockPrefixCacheSpiller<
-                crate::serve::api::engine::Engine,
-            >,
-        >,
+        Arc<crate::serve::kv_persist::BlockPrefixCacheSpiller<crate::serve::api::engine::Engine>>,
     >,
 }
 
@@ -902,9 +898,7 @@ impl AppState {
     pub fn with_kv_spiller(
         mut self,
         spiller: Arc<
-            crate::serve::kv_persist::BlockPrefixCacheSpiller<
-                crate::serve::api::engine::Engine,
-            >,
+            crate::serve::kv_persist::BlockPrefixCacheSpiller<crate::serve::api::engine::Engine>,
         >,
     ) -> Self {
         self.kv_spiller = Some(spiller);
@@ -1046,7 +1040,9 @@ mod tests {
         let em = EmbeddingModel {
             gguf_path: "/tmp/synthetic.gguf".into(),
             vocab: Arc::new(vocab.clone()),
-            tokenizer: Arc::new(crate::inference::models::bert::BertWpmTokenizer::new(&vocab)),
+            tokenizer: Arc::new(crate::inference::models::bert::BertWpmTokenizer::new(
+                &vocab,
+            )),
             model_id: "synthetic-embed".into(),
             arch: None,
         };
@@ -1092,7 +1088,10 @@ mod tests {
         let state = AppState::new(ServerConfig::default()).with_mmproj(m);
         let attached = state.mmproj.as_ref().expect("mmproj should be Some");
         assert_eq!(attached.model_id, "synthetic-mmproj");
-        assert_eq!(attached.gguf_path.file_name().unwrap(), "synthetic-mmproj.gguf");
+        assert_eq!(
+            attached.gguf_path.file_name().unwrap(),
+            "synthetic-mmproj.gguf"
+        );
         assert_eq!(attached.config, cfg);
         assert_eq!(attached.arch, ArchProfile::Gemma4Siglip);
         assert!(attached.config.projector.is_supported());

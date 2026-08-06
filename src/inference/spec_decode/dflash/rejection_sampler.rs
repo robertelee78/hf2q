@@ -104,7 +104,12 @@ pub fn leviathan_step(
         "leviathan_step: target/drafter probs must have same vocab"
     );
     let v = draft_token as usize;
-    assert!(v < vocab, "leviathan_step: draft_token {} out of vocab {}", v, vocab);
+    assert!(
+        v < vocab,
+        "leviathan_step: draft_token {} out of vocab {}",
+        v,
+        vocab
+    );
 
     let p = target_probs[v];
     let q = drafter_probs[v];
@@ -133,10 +138,16 @@ pub fn leviathan_step(
             .iter()
             .enumerate()
             .fold((0usize, f32::NEG_INFINITY), |(i_max, v_max), (i, &v)| {
-                if v > v_max { (i, v) } else { (i_max, v_max) }
+                if v > v_max {
+                    (i, v)
+                } else {
+                    (i_max, v_max)
+                }
             })
             .0;
-        return SampleStep::Reject { replacement_token: argmax_t as u32 };
+        return SampleStep::Reject {
+            replacement_token: argmax_t as u32,
+        };
     }
 
     // Normalize + sample
@@ -149,13 +160,17 @@ pub fn leviathan_step(
     for (i, &r) in residual.iter().enumerate() {
         acc += r;
         if u_resample < acc {
-            return SampleStep::Reject { replacement_token: i as u32 };
+            return SampleStep::Reject {
+                replacement_token: i as u32,
+            };
         }
     }
     // Numerical edge: floats sum slightly < 1.0 due to rounding.
     // Fall through to last index.
     let last = residual.len() - 1;
-    SampleStep::Reject { replacement_token: last as u32 }
+    SampleStep::Reject {
+        replacement_token: last as u32,
+    }
 }
 
 /// Full multi-position Leviathan accept-prefix loop.
@@ -241,9 +256,7 @@ mod tests {
     fn softmax_temp_zero_panics_via_assert() {
         // temp must be > 0 (we panic on temp == 0 since the limit is
         // argmax). Test that this is enforced.
-        let result = std::panic::catch_unwind(|| {
-            softmax_with_temp(&[1.0, 2.0, 3.0], 0.0)
-        });
+        let result = std::panic::catch_unwind(|| softmax_with_temp(&[1.0, 2.0, 3.0], 0.0));
         assert!(result.is_err(), "temp=0 should panic via assert");
     }
 
@@ -326,14 +339,10 @@ mod tests {
             vec![0.1, 0.1, 0.8],
             vec![0.5, 0.3, 0.2],
         ];
-        let drafter_probs = vec![
-            vec![0.45, 0.1, 0.45],
-            vec![0.45, 0.45, 0.1],
-        ];
+        let drafter_probs = vec![vec![0.45, 0.1, 0.45], vec![0.45, 0.45, 0.1]];
         let mut rng = StdRng::seed_from_u64(42);
-        let (accept_count, continuation) = leviathan_accept_prefix(
-            &drafts, &target_probs, &drafter_probs, &mut rng,
-        );
+        let (accept_count, continuation) =
+            leviathan_accept_prefix(&drafts, &target_probs, &drafter_probs, &mut rng);
         assert_eq!(accept_count, 2, "all drafts accepted");
         // Continuation is sampled from target_probs[2] = [0.5, 0.3, 0.2]
         assert!(continuation < 3, "continuation in vocab");
@@ -351,17 +360,13 @@ mod tests {
             vec![0.475, 0.05, 0.475],
             vec![0.5, 0.3, 0.2],
         ];
-        let drafter_probs = vec![
-            vec![0.1, 0.8, 0.1],
-            vec![0.025, 0.95, 0.025],
-        ];
+        let drafter_probs = vec![vec![0.1, 0.8, 0.1], vec![0.025, 0.95, 0.025]];
         // Trial multiple seeds to verify partial-reject is achievable
         let mut saw_partial = false;
         for seed in 0..100 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let (accept_count, _) = leviathan_accept_prefix(
-                &drafts, &target_probs, &drafter_probs, &mut rng,
-            );
+            let (accept_count, _) =
+                leviathan_accept_prefix(&drafts, &target_probs, &drafter_probs, &mut rng);
             if accept_count == 1 {
                 saw_partial = true;
                 break;

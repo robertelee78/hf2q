@@ -115,9 +115,7 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn qwen3vl_chat_e2e_default_skips_when_env_gate_unset() {
     if std::env::var(ENV_GATE).ok().as_deref() == Some("1") {
-        eprintln!(
-            "{ENV_GATE}=1 — running real Qwen3-VL E2E in `qwen3vl_chat_e2e_real`"
-        );
+        eprintln!("{ENV_GATE}=1 — running real Qwen3-VL E2E in `qwen3vl_chat_e2e_real`");
         return;
     }
     // Sanity: the coherence helper rejects empty + repeating-token text.
@@ -197,10 +195,7 @@ fn qwen3vl_chat_e2e_real() {
     // Build the OpenAI chat-completions request body. Image is a
     // base64-encoded 768x768 red square.
     let img_bytes = std::fs::read(&fixture).expect("read fixture image");
-    let img_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &img_bytes,
-    );
+    let img_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &img_bytes);
     let data_uri = format!("data:image/png;base64,{img_b64}");
     let req_body = serde_json::json!({
         "model": model_id,
@@ -234,10 +229,7 @@ fn qwen3vl_chat_e2e_real() {
         }
     };
 
-    assert_and_kill(
-        status.is_success(),
-        format!("expected 2xx, got {status}"),
-    );
+    assert_and_kill(status.is_success(), format!("expected 2xx, got {status}"));
 
     // Soft-tokens header check — proves the soft-token path actually ran.
     let soft_total: usize = headers
@@ -250,8 +242,7 @@ fn qwen3vl_chat_e2e_real() {
         format!("X-HF2Q-Soft-Tokens-Total header missing or zero (got {soft_total}); the request did not flow through the soft-token path"),
     );
 
-    let body_json: serde_json::Value =
-        serde_json::from_str(&body_text).expect("body is JSON");
+    let body_json: serde_json::Value = serde_json::from_str(&body_text).expect("body is JSON");
     let content = body_json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("")

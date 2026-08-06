@@ -87,8 +87,8 @@ pub use weights::Qwen3VlTextWeights;
 // know they're on a Qwen3-VL load path.
 
 pub use crate::inference::models::qwen35::{
-    is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN3VLMOE_UPSTREAM,
-    ARCH_QWEN3VL_UPSTREAM, ARCH_QWEN3_VL,
+    is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN3VLMOE_UPSTREAM, ARCH_QWEN3VL_UPSTREAM,
+    ARCH_QWEN3_VL,
 };
 
 // ---------------------------------------------------------------------------
@@ -320,16 +320,15 @@ impl Qwen3VlTextConfig {
                 .ok_or_else(|| anyhow!("Qwen3VlTextConfig: missing {prefix}.{key}"))
         };
 
-        let num_hidden_layers = req_u32("block_count")
-            .context("Qwen3VlTextConfig: block_count")?;
-        let hidden_size = req_u32("embedding_length")
-            .context("Qwen3VlTextConfig: embedding_length")?;
-        let num_attention_heads = req_u32("attention.head_count")
-            .context("Qwen3VlTextConfig: attention.head_count")?;
+        let num_hidden_layers = req_u32("block_count").context("Qwen3VlTextConfig: block_count")?;
+        let hidden_size =
+            req_u32("embedding_length").context("Qwen3VlTextConfig: embedding_length")?;
+        let num_attention_heads =
+            req_u32("attention.head_count").context("Qwen3VlTextConfig: attention.head_count")?;
         let num_key_value_heads = req_u32("attention.head_count_kv")
             .context("Qwen3VlTextConfig: attention.head_count_kv")?;
-        let intermediate_size = req_u32("feed_forward_length")
-            .context("Qwen3VlTextConfig: feed_forward_length")?;
+        let intermediate_size =
+            req_u32("feed_forward_length").context("Qwen3VlTextConfig: feed_forward_length")?;
         let max_position_embeddings = gguf
             .metadata_u32(&format!("{prefix}.context_length"))
             .unwrap_or(0);
@@ -405,42 +404,41 @@ impl Qwen3VlTextConfig {
         // Pre-iter-228b GGUFs (mtime ≤ 2026-05-02) lack the key —
         // fall through to [`DEFAULT_MROPE_SECTION`] for those, with a
         // single warn-once on the first unwrap.
-        let mrope_section: [u32; 4] = match gguf
-            .metadata(&format!("{prefix}.rope.dimension_sections"))
-        {
-            Some(MetadataValue::Array(arr)) => {
-                if arr.len() < 4 {
-                    return Err(anyhow!(
-                        "Qwen3VlTextConfig: {prefix}.rope.dimension_sections has length {}, \
+        let mrope_section: [u32; 4] =
+            match gguf.metadata(&format!("{prefix}.rope.dimension_sections")) {
+                Some(MetadataValue::Array(arr)) => {
+                    if arr.len() < 4 {
+                        return Err(anyhow!(
+                            "Qwen3VlTextConfig: {prefix}.rope.dimension_sections has length {}, \
                          must be ≥ 4 (peer canonical layout is exactly 4 ints; \
                          convert_hf_to_gguf.py:11944 pads with 0 when source has 3)",
-                        arr.len()
-                    ));
-                }
-                let mut out = [0u32; 4];
-                for (i, slot) in out.iter_mut().enumerate() {
-                    *slot = match &arr[i] {
-                        MetadataValue::Int32(v) if *v >= 0 => *v as u32,
-                        MetadataValue::Uint32(v) => *v,
-                        other => {
-                            return Err(anyhow!(
-                                "Qwen3VlTextConfig: {prefix}.rope.dimension_sections[{i}] \
+                            arr.len()
+                        ));
+                    }
+                    let mut out = [0u32; 4];
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = match &arr[i] {
+                            MetadataValue::Int32(v) if *v >= 0 => *v as u32,
+                            MetadataValue::Uint32(v) => *v,
+                            other => {
+                                return Err(anyhow!(
+                                    "Qwen3VlTextConfig: {prefix}.rope.dimension_sections[{i}] \
                                  has unexpected metadata type ({other:?}); expected Int32 \
                                  or Uint32"
-                            ));
-                        }
-                    };
+                                ));
+                            }
+                        };
+                    }
+                    out
                 }
-                out
-            }
-            Some(other) => {
-                return Err(anyhow!(
-                    "Qwen3VlTextConfig: {prefix}.rope.dimension_sections has unexpected \
+                Some(other) => {
+                    return Err(anyhow!(
+                        "Qwen3VlTextConfig: {prefix}.rope.dimension_sections has unexpected \
                      metadata kind ({other:?}); expected Array of Int32"
-                ));
-            }
-            None => DEFAULT_MROPE_SECTION,
-        };
+                    ));
+                }
+                None => DEFAULT_MROPE_SECTION,
+            };
         // Phase-2c invariant: rotary axis count must equal head_dim/2
         // under IMROPE (`mrope_interleaved=true`). Sum >= 0 by construction.
         // For Qwen3-VL-2B/4B: 24+20+20+0 = 64 = 128/2 ✓.
@@ -506,8 +504,7 @@ impl Qwen3VlTextConfig {
         // is already baked into this signal at convert time.
         let tied_word_embeddings = gguf.tensor_info("output.weight").is_none();
 
-        let layer_types =
-            vec![Qwen3VlTextLayerKind::Dense; num_hidden_layers as usize];
+        let layer_types = vec![Qwen3VlTextLayerKind::Dense; num_hidden_layers as usize];
 
         Ok(Self {
             num_hidden_layers,
@@ -610,7 +607,7 @@ pub(crate) mod test_fixtures {
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes()); // version
         buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes()); // tensor_count
-        // metadata_kv_count = 1 (general.architecture) + extras
+                                                                      // metadata_kv_count = 1 (general.architecture) + extras
         let kv_count = 1 + extra_kvs.len() as u64;
         buf.extend_from_slice(&kv_count.to_le_bytes());
         // KV: general.architecture
@@ -762,7 +759,9 @@ mod tests {
         );
         assert_eq!(cfg.layer_types.len(), 28);
         assert!(
-            cfg.layer_types.iter().all(|k| *k == Qwen3VlTextLayerKind::Dense),
+            cfg.layer_types
+                .iter()
+                .all(|k| *k == Qwen3VlTextLayerKind::Dense),
             "every layer is Dense for Qwen3-VL-2B/4B"
         );
         assert_eq!(cfg.gqa_group_ratio(), 2);
@@ -800,8 +799,8 @@ mod tests {
         }];
         let path = write_minimal_qwen3vl_gguf("gemma4", &kvs, &tensors);
         let gguf = GgufFile::open(&path).expect("open synthetic GGUF");
-        let err = Qwen3VlTextConfig::from_gguf(&gguf)
-            .expect_err("non-Qwen3-VL arch must be rejected");
+        let err =
+            Qwen3VlTextConfig::from_gguf(&gguf).expect_err("non-Qwen3-VL arch must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not a Qwen3-VL family arch"),
@@ -1030,18 +1029,15 @@ mod tests {
         // MUST honor it. Use a non-default value to prove the override
         // path fires.
         let mut kvs = standard_2b_kvs("qwen3_vl");
-        kvs.push(Kv::U32(
-            "qwen3_vl.n_deepstack_layers".to_string(),
-            5,
-        ));
+        kvs.push(Kv::U32("qwen3_vl.n_deepstack_layers".to_string(), 5));
         let tensors = [TensorDesc {
             name: "token_embd.weight",
             shape: &[2048, 151936],
         }];
         let path = write_minimal_qwen3vl_gguf("qwen3_vl", &kvs, &tensors);
         let gguf = GgufFile::open(&path).expect("open synthetic GGUF");
-        let cfg = Qwen3VlTextConfig::from_gguf(&gguf)
-            .expect("parse with explicit n_deepstack_layers");
+        let cfg =
+            Qwen3VlTextConfig::from_gguf(&gguf).expect("parse with explicit n_deepstack_layers");
         assert_eq!(cfg.n_deepstack_layers, 5);
         let _ = std::fs::remove_file(&path);
     }
@@ -1084,9 +1080,8 @@ mod tests {
             eprintln!("skip: HF2Q_QWEN3VL_LM_LOAD!=1");
             return;
         }
-        let p = std::path::PathBuf::from(
-            "/opt/hf2q/.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf",
-        );
+        let p =
+            std::path::PathBuf::from("/opt/hf2q/.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf");
         if !p.exists() {
             eprintln!("skip: real GGUF fixture not present at {}", p.display());
             return;

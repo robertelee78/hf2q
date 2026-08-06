@@ -289,7 +289,10 @@ pub fn download_model(
     match download_via_hf_hub(repo_id, progress) {
         Ok(path) => Ok(path),
         Err(e) => {
-            warn!("hf-hub crate download failed: {}. Trying hf CLI fallback...", e);
+            warn!(
+                "hf-hub crate download failed: {}. Trying hf CLI fallback...",
+                e
+            );
 
             // Attempt 2: Fall back to hf CLI on PATH (Story 3.2)
             match download_via_hf_cli(repo_id, progress) {
@@ -297,10 +300,7 @@ pub fn download_model(
                 Err(cli_err) => {
                     // Both methods failed — report both errors
                     Err(DownloadError::DownloadFailed {
-                        reason: format!(
-                            "hf-hub crate: {}. hf CLI: {}",
-                            e, cli_err
-                        ),
+                        reason: format!("hf-hub crate: {}. hf CLI: {}", e, cli_err),
                     })
                 }
             }
@@ -320,17 +320,14 @@ fn download_via_hf_hub(
     debug!(has_token = token.is_some(), "Auth token resolution");
 
     // Build the API client
-    let mut builder = ApiBuilder::new()
-        .with_progress(true);
+    let mut builder = ApiBuilder::new().with_progress(true);
 
     if let Some(t) = token {
         builder = builder.with_token(Some(t));
     }
 
-    let api = builder.build().map_err(|e| {
-        DownloadError::DownloadFailed {
-            reason: format!("Failed to initialize HuggingFace API client: {}", e),
-        }
+    let api = builder.build().map_err(|e| DownloadError::DownloadFailed {
+        reason: format!("Failed to initialize HuggingFace API client: {}", e),
     })?;
 
     let repo = api.model(repo_id.to_string());
@@ -360,7 +357,10 @@ fn download_via_hf_hub(
         .map(|s| s.rfilename.clone())
         .collect();
 
-    debug!(file_count = all_files.len(), "Repository file listing retrieved");
+    debug!(
+        file_count = all_files.len(),
+        "Repository file listing retrieved"
+    );
 
     // Find safetensors files
     let safetensors_files: Vec<&String> = all_files
@@ -406,11 +406,11 @@ fn download_via_hf_hub(
 
         // Download the index now to discover required shards
         debug!("Downloading index file to determine required shards");
-        let idx_path = repo.get(idx.as_str()).map_err(|e| {
-            DownloadError::DownloadFailed {
+        let idx_path = repo
+            .get(idx.as_str())
+            .map_err(|e| DownloadError::DownloadFailed {
                 reason: format!("Failed to download index file: {}", e),
-            }
-        })?;
+            })?;
 
         // Parse weight_map to find which shard files are actually referenced
         if let Ok(content) = std::fs::read_to_string(&idx_path) {
@@ -499,9 +499,7 @@ fn download_via_hf_cli(
     _progress: &ProgressReporter,
 ) -> Result<PathBuf, DownloadError> {
     // Check if hf CLI is available — try both 'hf' and 'huggingface-cli'
-    let hf_check = std::process::Command::new("hf")
-        .arg("--version")
-        .output();
+    let hf_check = std::process::Command::new("hf").arg("--version").output();
 
     match hf_check {
         Ok(output) if output.status.success() => {
@@ -524,11 +522,9 @@ fn download_via_hf_cli(
                     );
                     download_with_cli_command("huggingface-cli", repo_id)
                 }
-                _ => {
-                    Err(DownloadError::CliFallbackFailed {
-                        reason: "Neither 'hf' nor 'huggingface-cli' found on PATH".to_string(),
-                    })
-                }
+                _ => Err(DownloadError::CliFallbackFailed {
+                    reason: "Neither 'hf' nor 'huggingface-cli' found on PATH".to_string(),
+                }),
             }
         }
     }
@@ -542,15 +538,24 @@ fn download_with_cli_command(cmd: &str, repo_id: &str) -> Result<PathBuf, Downlo
         .args([
             "download",
             repo_id,
-            "--include", "*.safetensors",
-            "--include", "*.json",
-            "--include", "tokenizer.model",
-            "--exclude", "*.gguf",
-            "--exclude", "*.bin",
-            "--exclude", "*.pt",
-            "--exclude", "*.h5",
-            "--exclude", "*.msgpack",
-            "--exclude", "*.ot",
+            "--include",
+            "*.safetensors",
+            "--include",
+            "*.json",
+            "--include",
+            "tokenizer.model",
+            "--exclude",
+            "*.gguf",
+            "--exclude",
+            "*.bin",
+            "--exclude",
+            "*.pt",
+            "--exclude",
+            "*.h5",
+            "--exclude",
+            "*.msgpack",
+            "--exclude",
+            "*.ot",
         ])
         .output()
         .map_err(|e| DownloadError::CliFallbackFailed {
@@ -678,11 +683,7 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("USERPROFILE")
-                .ok()
-                .map(PathBuf::from)
-        })
+        .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from))
 }
 
 #[cfg(test)]
@@ -779,10 +780,7 @@ mod tests {
 
     #[test]
     fn test_model_class_from_repo_id_qwen35_dense() {
-        let cases = [
-            "Qwen/Qwen3.5-27B-Instruct",
-            "org/qwen35-27b-dense",
-        ];
+        let cases = ["Qwen/Qwen3.5-27B-Instruct", "org/qwen35-27b-dense"];
         for repo in &cases {
             assert_eq!(
                 ModelClass::from_repo_id(repo),
@@ -818,10 +816,7 @@ mod tests {
             ModelClass::Qwen35Dense.min_free_bytes(),
             55 * 1024 * 1024 * 1024
         );
-        assert_eq!(
-            ModelClass::Other.min_free_bytes(),
-            100 * 1024 * 1024 * 1024
-        );
+        assert_eq!(ModelClass::Other.min_free_bytes(), 100 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -844,10 +839,7 @@ mod tests {
             msg.contains("≥150 GB"),
             "Error must state the requirement: {msg}"
         );
-        assert!(
-            msg.contains("50 GB"),
-            "Error must state found bytes: {msg}"
-        );
+        assert!(msg.contains("50 GB"), "Error must state found bytes: {msg}");
         assert!(
             msg.contains("Free space or change --cache-dir"),
             "Error must be actionable: {msg}"
@@ -878,11 +870,13 @@ mod tests {
         let available: u64 = 30 * 1024 * 1024 * 1024;
         let repo = "Qwen/Qwen3.5-27B-Instruct";
 
-        let err = check_disk_preflight(repo, tmp.path(), Some(available))
-            .expect_err("Should fail");
+        let err = check_disk_preflight(repo, tmp.path(), Some(available)).expect_err("Should fail");
 
         let msg = err.to_string();
-        assert!(msg.contains("Qwen3.5 27B dense"), "Expected dense label: {msg}");
+        assert!(
+            msg.contains("Qwen3.5 27B dense"),
+            "Expected dense label: {msg}"
+        );
         assert!(msg.contains("≥55 GB"), "Expected 55 GB requirement: {msg}");
     }
 

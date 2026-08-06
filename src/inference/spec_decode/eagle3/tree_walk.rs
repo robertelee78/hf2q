@@ -66,10 +66,7 @@ use anyhow::{ensure, Result};
 /// # Errors
 /// - `verifier_argmax.len() != tree.len()`: shape mismatch.
 /// - `tree.validate()` fails: corrupt input.
-pub fn walk_tree_accept(
-    tree: &ExpandedTree,
-    verifier_argmax: &[u32],
-) -> Result<Vec<usize>> {
+pub fn walk_tree_accept(tree: &ExpandedTree, verifier_argmax: &[u32]) -> Result<Vec<usize>> {
     tree.validate()?;
     ensure!(
         verifier_argmax.len() == tree.len(),
@@ -157,10 +154,7 @@ pub fn walk_and_summarize<'a>(
     verifier_argmax: &[u32],
 ) -> Result<AcceptWalk<'a>> {
     let accepted = walk_tree_accept(tree, verifier_argmax)?;
-    Ok(AcceptWalk {
-        accepted,
-        tree,
-    })
+    Ok(AcceptWalk { accepted, tree })
 }
 
 #[cfg(test)]
@@ -189,11 +183,7 @@ mod tests {
         // Tree: root=100, child=200.
         // Verifier argmax at root=999 (not 200).
         // Walk: [0] only.
-        let tree = make_tree(
-            vec![100, 200],
-            vec![None, Some(0)],
-            vec![0, 1],
-        );
+        let tree = make_tree(vec![100, 200], vec![None, Some(0)], vec![0, 1]);
         let argmax = vec![999_u32, 0]; // verifier says next-after-root is 999
         let accepted = walk_tree_accept(&tree, &argmax).expect("walk");
         assert_eq!(accepted, vec![0]);
@@ -246,7 +236,10 @@ mod tests {
         let tree = make_tree(vec![10, 20], vec![None, Some(0)], vec![0, 1]);
         let argmax = vec![20_u32]; // wrong size
         let err = walk_tree_accept(&tree, &argmax).unwrap_err();
-        assert!(err.to_string().contains("verifier_argmax len"), "got: {err}");
+        assert!(
+            err.to_string().contains("verifier_argmax len"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -397,9 +390,7 @@ mod tests {
         let mut verifier_argmax = vec![0_u32; tree.len()];
         for i in 0..tree.len() {
             // Find any direct child of node i; verifier picks its token.
-            if let Some(child) = (i + 1..tree.len())
-                .find(|&c| tree.parents[c] == Some(i))
-            {
+            if let Some(child) = (i + 1..tree.len()).find(|&c| tree.parents[c] == Some(i)) {
                 verifier_argmax[i] = tree.tokens[child];
             }
         }

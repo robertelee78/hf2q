@@ -142,9 +142,7 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
     // SAFETY: `T: Copy + repr(C)` with primitive fields means the
     // in-memory representation is contiguous and exactly
     // `size_of::<T>()` bytes.
-    unsafe {
-        std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>())
-    }
+    unsafe { std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
 /// Position-gated residual add for image-token rows (in-place).
@@ -207,7 +205,9 @@ pub fn image_token_residual_add_gpu(
     // We compare against the slice's logical span (byte_len - byte_offset)
     // so a buffer view backed by a larger storage still validates.
     let cur_span = cur.byte_len().saturating_sub(cur.byte_offset() as usize);
-    let chunk_span = chunk.byte_len().saturating_sub(chunk.byte_offset() as usize);
+    let chunk_span = chunk
+        .byte_len()
+        .saturating_sub(chunk.byte_offset() as usize);
     if cur_span < cur_required {
         return Err(anyhow!(
             "image_token_residual_add_gpu: cur span {} < required {} \
@@ -235,7 +235,11 @@ pub fn image_token_residual_add_gpu(
     // which are dtype-agnostic).
     let positions_bytes = (n_image_tokens as usize) * std::mem::size_of::<u32>();
     let mut positions_buf = device
-        .alloc_buffer(positions_bytes, mlx_native::DType::F32, vec![n_image_tokens as usize])
+        .alloc_buffer(
+            positions_bytes,
+            mlx_native::DType::F32,
+            vec![n_image_tokens as usize],
+        )
         .map_err(|e| anyhow!("image_token_residual_add_gpu: alloc positions buffer: {e}"))?;
     {
         // SAFETY: just-allocated F32 buffer of n_image_tokens elements;
@@ -358,9 +362,7 @@ mod tests {
         )
         .expect("dispatch");
         encoder.commit_and_wait().expect("commit_and_wait");
-        cur.as_slice::<f32>()
-            .expect("cur readback")
-            .to_vec()
+        cur.as_slice::<f32>().expect("cur readback").to_vec()
     }
 
     #[test]
@@ -398,8 +400,8 @@ mod tests {
         // chunk row 0 = [10, 20, 30].
         let chunk_vals = [10.0f32, 20.0, 30.0];
         let result = dispatch_once(
-            |_| 0.0,             // cur all zeros
-            |i| chunk_vals[i],  // chunk[0] = [10,20,30]
+            |_| 0.0,           // cur all zeros
+            |i| chunk_vals[i], // chunk[0] = [10,20,30]
             &positions,
             n_tokens,
             hidden,
@@ -442,25 +444,13 @@ mod tests {
             let c = i % hidden as usize;
             (r * 10 + c) as f32
         };
-        let result = dispatch_once(
-            cur_init,
-            |i| chunk_vals[i],
-            &positions,
-            n_tokens,
-            hidden,
-        );
+        let result = dispatch_once(cur_init, |i| chunk_vals[i], &positions, n_tokens, hidden);
         // row 0: cur 0,1 + chunk 1,2 → 1,3
         // row 1: untouched → 10,11
         // row 2: cur 20,21 + chunk 10,20 → 30,41
         // row 3: untouched → 30,31
         // row 4: cur 40,41 + chunk 100,200 → 140,241
-        let expected: Vec<f32> = vec![
-            1.0, 3.0,
-            10.0, 11.0,
-            30.0, 41.0,
-            30.0, 31.0,
-            140.0, 241.0,
-        ];
+        let expected: Vec<f32> = vec![1.0, 3.0, 10.0, 11.0, 30.0, 41.0, 30.0, 31.0, 140.0, 241.0];
         assert_eq!(result.len(), expected.len());
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -485,13 +475,7 @@ mod tests {
             // unique positive shift per (k, h).
             ((i + 1) as f32) * 0.25
         };
-        let result = dispatch_once(
-            cur_init,
-            chunk_init,
-            &positions,
-            n_tokens,
-            hidden,
-        );
+        let result = dispatch_once(cur_init, chunk_init, &positions, n_tokens, hidden);
         let h = hidden as usize;
         let pos_set: std::collections::HashSet<u32> = positions.iter().copied().collect();
         for t in 0..n_tokens as usize {
@@ -499,10 +483,7 @@ mod tests {
                 let i = t * h + hh;
                 if pos_set.contains(&(t as u32)) {
                     // Image-token row: result = cur_init + chunk_at_k
-                    let k = positions
-                        .iter()
-                        .position(|&p| p == t as u32)
-                        .unwrap();
+                    let k = positions.iter().position(|&p| p == t as u32).unwrap();
                     let chunk_idx = k * h + hh;
                     let expected = cur_init(i) + chunk_init(chunk_idx);
                     assert!(
@@ -633,15 +614,11 @@ mod tests {
         let hidden = 3u32;
         // Position 99 is out-of-bounds; the second position 1 is valid.
         let positions = [99u32, 1];
-        let chunk_vals = [7.0f32, 8.0, 9.0,  // chunk[0] — should be skipped
-                          11.0, 12.0, 13.0]; // chunk[1] — applied at row 1
-        let result = dispatch_once(
-            |_| 0.0,
-            |i| chunk_vals[i],
-            &positions,
-            n_tokens,
-            hidden,
-        );
+        let chunk_vals = [
+            7.0f32, 8.0, 9.0, // chunk[0] — should be skipped
+            11.0, 12.0, 13.0,
+        ]; // chunk[1] — applied at row 1
+        let result = dispatch_once(|_| 0.0, |i| chunk_vals[i], &positions, n_tokens, hidden);
         // Only row 1 should carry chunk[1]; rows 0,2,3 stay zero.
         for t in 0..n_tokens as usize {
             for h in 0..hidden as usize {

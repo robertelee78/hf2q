@@ -83,7 +83,10 @@ impl Drop for ServerGuard {
 
 impl ServerGuard {
     fn log_tail(&self) -> Vec<String> {
-        self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -149,9 +152,7 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!("malformed status: {line:?}")));
     }
     parts[1]
         .parse::<u16>()
@@ -249,7 +250,12 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn chat_with_timing(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32) -> ChatTiming {
+fn chat_with_timing(
+    server: &ServerGuard,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> ChatTiming {
     let body = format!(
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"{escaped}"}}],"max_tokens":{max_tokens},"temperature":0,"stream":false}}"#,
         escaped = json_escape(prompt)
@@ -397,11 +403,26 @@ fn iter6_r_p7_multiturn_chat_speedup() {
                   Stay on the user's most recent question and don't reference earlier topics. \
                   Avoid emojis. Avoid lists. Avoid headers.";
     let turn_questions: [(&str, &str); 5] = [
-        ("What is the capital of France?", "Paris is the capital of France."),
-        ("What is the capital of Japan?", "Tokyo is the capital of Japan."),
-        ("What is the capital of Brazil?", "Brasilia is the capital of Brazil."),
-        ("What is the capital of Australia?", "Canberra is the capital of Australia."),
-        ("What is the capital of Egypt?", "Cairo is the capital of Egypt."),
+        (
+            "What is the capital of France?",
+            "Paris is the capital of France.",
+        ),
+        (
+            "What is the capital of Japan?",
+            "Tokyo is the capital of Japan.",
+        ),
+        (
+            "What is the capital of Brazil?",
+            "Brasilia is the capital of Brazil.",
+        ),
+        (
+            "What is the capital of Australia?",
+            "Canberra is the capital of Australia.",
+        ),
+        (
+            "What is the capital of Egypt?",
+            "Cairo is the capital of Egypt.",
+        ),
     ];
 
     // Turn i sends a transcript with turns [0..i] (each prior turn's
@@ -450,8 +471,13 @@ fn iter6_r_p7_multiturn_chat_speedup() {
         eprintln!(
             "[iter-6 R-P7] turn {} (prompt_tokens={}): wall={:.1}ms, server_ttft={:.1}ms, \
              lookups_total={}, detected_total={} (Δ={})",
-            turn_idx, t.prompt_tokens, t.wall_ms, t.server_ttft_ms,
-            lookups, detected, delta_detected
+            turn_idx,
+            t.prompt_tokens,
+            t.wall_ms,
+            t.server_ttft_ms,
+            lookups,
+            detected,
+            delta_detected
         );
         prior_detected = detected;
         timings.push(t);
@@ -485,7 +511,11 @@ fn iter6_r_p7_multiturn_chat_speedup() {
              server_ttft={:.3}",
             idx,
             wall_ratio,
-            if wall_ratio <= 0.10 { "MEETS" } else { "MISSES" },
+            if wall_ratio <= 0.10 {
+                "MEETS"
+            } else {
+                "MISSES"
+            },
             ttft_ratio
         );
     }
@@ -501,8 +531,7 @@ fn iter6_r_p7_multiturn_chat_speedup() {
         "[iter-6 R-P7] FAIL — at least one turn 2-5 wall time >= turn 1. \
          iter-3 partial-prefill resume not delivering speedup on multi-turn shape. \
          Min ratio: {:.3}, max: {:.3}",
-        min_speedup_ratio,
-        max_speedup_ratio
+        min_speedup_ratio, max_speedup_ratio
     );
 }
 
@@ -574,7 +603,11 @@ fn iter6_cfa_fanout_shared_prefix() {
     );
     eprintln!(
         "[iter-6 /cfa] dossier target: ratio ≤ 1.25 ({}); CONSERVATIVE pass: ratio ≤ 2.0",
-        if aggregate_ratio <= 1.25 { "MEETS" } else { "MISSES" }
+        if aggregate_ratio <= 1.25 {
+            "MEETS"
+        } else {
+            "MISSES"
+        }
     );
 
     let workers_2_to_4_avg_wall: f64 = timings.iter().skip(1).map(|t| t.wall_ms).sum::<f64>() / 3.0;

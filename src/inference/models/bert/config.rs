@@ -107,8 +107,8 @@ impl BertConfig {
     /// absent, since that's the most common pooling for sentence-embedding
     /// BERTs (matches nomic-embed-text and bge-small conventions).
     pub fn from_config_json(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("parsing {} as JSON", path.display()))?;
         Self::from_hf_value(&v)
@@ -149,8 +149,7 @@ impl BertConfig {
                 .and_then(|x| x.as_u64())
                 .map(|u| u as usize)
                 .unwrap_or(2),
-            layer_norm_eps: get_f32("layer_norm_eps")
-                .or_else(|_| get_f32("layer_norm_epsilon"))?,
+            layer_norm_eps: get_f32("layer_norm_eps").or_else(|_| get_f32("layer_norm_epsilon"))?,
             hidden_act: v
                 .get("hidden_act")
                 .and_then(|x| x.as_str())
@@ -168,10 +167,7 @@ impl BertConfig {
             .metadata_string("general.architecture")
             .ok_or_else(|| anyhow!("GGUF missing general.architecture"))?;
         if arch != super::ARCH_BERT {
-            return Err(anyhow!(
-                "GGUF architecture is '{}', expected 'bert'",
-                arch
-            ));
+            return Err(anyhow!("GGUF architecture is '{}', expected 'bert'", arch));
         }
         let u32_key = |key: &str| -> Result<u32> {
             gguf.metadata_u32(key)
@@ -208,7 +204,8 @@ impl BertConfig {
                     .and_then(|ti| ti.shape.first().copied())
                     .map(|s| s as u32)
             })
-            .ok_or_else(|| anyhow!("cannot determine BERT vocab_size"))? as usize;
+            .ok_or_else(|| anyhow!("cannot determine BERT vocab_size"))?
+            as usize;
 
         let type_vocab_size = u32_key("bert.token_type_count")
             .ok()
@@ -358,8 +355,7 @@ mod tests {
 
     #[test]
     fn hf_config_missing_required_fields_errors() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"hidden_size": 768}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"hidden_size": 768}"#).unwrap();
         let err = BertConfig::from_hf_value(&v).unwrap_err();
         let msg = format!("{}", err);
         // Should name the missing field.
@@ -391,7 +387,10 @@ mod tests {
     #[test]
     fn tensor_name_helper_formats_blk_prefix() {
         assert_eq!(bert_layer_tensor(0, "attn_q.weight"), "blk.0.attn_q.weight");
-        assert_eq!(bert_layer_tensor(11, "ffn_down.bias"), "blk.11.ffn_down.bias");
+        assert_eq!(
+            bert_layer_tensor(11, "ffn_down.bias"),
+            "blk.11.ffn_down.bias"
+        );
     }
 
     #[test]

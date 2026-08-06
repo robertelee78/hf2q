@@ -479,7 +479,11 @@ mod tests {
             (seq as usize) * (h as usize) * 4,
             "x_norm_buf"
         );
-        assert_eq!(arena.pre_norm_params_buf.byte_len(), 8, "pre_norm_params_buf");
+        assert_eq!(
+            arena.pre_norm_params_buf.byte_len(),
+            8,
+            "pre_norm_params_buf"
+        );
 
         // apply_proj expected sizes
         assert_eq!(

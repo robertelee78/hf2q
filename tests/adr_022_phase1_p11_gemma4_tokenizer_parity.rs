@@ -11,8 +11,10 @@
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-const GGUF_PATH: &str = "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf";
-const HF_TOKENIZER_PATH: &str = "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json";
+const GGUF_PATH: &str =
+    "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf";
+const HF_TOKENIZER_PATH: &str =
+    "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json";
 
 #[path = "../src/inference/models/gemma4/tokenizer.rs"]
 mod gemma4_tokenizer;
@@ -32,10 +34,9 @@ fn run_parity(text: &str) {
     }
 
     let gguf = ggml_open(GGUF_PATH);
-    let from_gguf = gemma4_tokenizer::build_tokenizer_from_gguf(&gguf)
-        .expect("build_tokenizer_from_gguf");
-    let from_disk = Tokenizer::from_file(HF_TOKENIZER_PATH)
-        .expect("Tokenizer::from_file");
+    let from_gguf =
+        gemma4_tokenizer::build_tokenizer_from_gguf(&gguf).expect("build_tokenizer_from_gguf");
+    let from_disk = Tokenizer::from_file(HF_TOKENIZER_PATH).expect("Tokenizer::from_file");
 
     let g_enc = from_gguf.encode(text, false).expect("encode (gguf)");
     let d_enc = from_disk.encode(text, false).expect("encode (disk)");

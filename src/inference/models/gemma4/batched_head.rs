@@ -41,11 +41,17 @@ static RERANK_PROFILE_ON: std::sync::LazyLock<bool> =
 /// (total_rerank_ns, total_candidates, calls) since last reset.
 pub fn rerank_profile() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    (RERANK_NS.load(Relaxed), RERANK_CAND.load(Relaxed), RERANK_CALLS.load(Relaxed))
+    (
+        RERANK_NS.load(Relaxed),
+        RERANK_CAND.load(Relaxed),
+        RERANK_CALLS.load(Relaxed),
+    )
 }
 pub fn rerank_profile_reset() {
     use std::sync::atomic::Ordering::Relaxed;
-    RERANK_NS.store(0, Relaxed); RERANK_CAND.store(0, Relaxed); RERANK_CALLS.store(0, Relaxed);
+    RERANK_NS.store(0, Relaxed);
+    RERANK_CAND.store(0, Relaxed);
+    RERANK_CALLS.store(0, Relaxed);
 }
 
 /// Output of [`MlxModelWeights::lm_head_batched`]: row-major per-slot logits and
@@ -174,7 +180,11 @@ impl MlxModelWeights {
 
         // ADR-040 §26 — gated profiling (HF2Q_RERANK_PROFILE=1).
         let _rr_prof = *RERANK_PROFILE_ON;
-        let _rr_t = if _rr_prof { Some(std::time::Instant::now()) } else { None };
+        let _rr_t = if _rr_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Exact F32 rerank via hidden · embed_row. Softcap is monotonic so
         // skipping it doesn't change argmax order. F64 accumulator for precision.
         let mut best_tok: u32 = gpu_top1;
@@ -196,8 +206,14 @@ impl MlxModelWeights {
             }
         }
         if let Some(t) = _rr_t {
-            RERANK_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            RERANK_CAND.fetch_add(candidates.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            RERANK_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            RERANK_CAND.fetch_add(
+                candidates.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             RERANK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(best_tok)
@@ -219,12 +235,18 @@ impl MlxModelWeights {
         let hs = self.hidden_size;
         let vocab = self.vocab_size;
         if n == 0 {
-            return Ok(BatchedHeadOut { logits: Vec::new(), normed: Vec::new(), gpu_sample: None });
+            return Ok(BatchedHeadOut {
+                logits: Vec::new(),
+                normed: Vec::new(),
+                gpu_sample: None,
+            });
         }
         if hidden_rows.len() != n * hs {
             anyhow::bail!(
                 "lm_head_batched: hidden_rows len {} != n*hidden_size {}*{}",
-                hidden_rows.len(), n, hs
+                hidden_rows.len(),
+                n,
+                hs
             );
         }
         // S1 production path: Q6_K lm_head only. Other quant heads (Q8/F16) are
@@ -274,7 +296,9 @@ impl MlxModelWeights {
             let p: &mut [f32] = softcap_params_b
                 .as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("lm_head_batched softcap params slice: {e}"))?;
-            let total = n.checked_mul(vocab).expect("lm_head softcap: n*vocab overflow");
+            let total = n
+                .checked_mul(vocab)
+                .expect("lm_head softcap: n*vocab overflow");
             p[0] = cap;
             p[1] = f32::from_bits(total as u32);
         }
@@ -286,7 +310,11 @@ impl MlxModelWeights {
         // Batched final RMS norm: [n,hidden] -> [n,hidden]. norm_params ([eps,dim])
         // is per-element and identical for every row.
         let _bc_dbg = std::env::var("HF2Q_MVN_BARRIER_TRACE").as_deref() == Ok("1");
-        let _bc_before = if _bc_dbg { mlx_native::barrier_count() } else { 0 };
+        let _bc_before = if _bc_dbg {
+            mlx_native::barrier_count()
+        } else {
+            0
+        };
         // DIAGNOSTIC (HF2Q_MVN_ENCODE_TRACE=1): scope the mlx-native encode trace
         // (per-dispatch + per-barrier with encoder pointer) to JUST this head
         // call, so codex can read the command-stream order around mN→softcap
@@ -299,19 +327,23 @@ impl MlxModelWeights {
         }
         s.barrier_between(&[&hidden_b, &self.final_norm], &[&normed_b]);
         s.rms_norm(
-            reg, metal_dev,
+            reg,
+            metal_dev,
             &hidden_b,
             &self.final_norm,
             &normed_b,
             &self.activations.norm_params,
-            n as u32, hs as u32,
+            n as u32,
+            hs as u32,
         )
         .map_err(|e| anyhow::anyhow!("lm_head_batched final norm: {e}"))?;
 
         // Batched lm_head: [n,hidden] x Q6_K[hidden,vocab] -> [n,vocab].
         s.barrier_between(&[&normed_b, &q6k.buffer], &[&logits_b]);
         dispatch_qmatmul(
-            &mut s, reg, dev,
+            &mut s,
+            reg,
+            dev,
             &normed_b,
             q6k,
             &logits_b,
@@ -333,7 +365,9 @@ impl MlxModelWeights {
         if let Some(cap) = self.final_logit_softcapping {
             s.barrier_between(&[&logits_b], &[&logits_b]);
             mlx_native::ops::softcap::dispatch_softcap(
-                s.encoder_mut(), reg, metal_dev,
+                s.encoder_mut(),
+                reg,
+                metal_dev,
                 &logits_b,
                 &logits_b,
                 &softcap_params_b,
@@ -347,13 +381,20 @@ impl MlxModelWeights {
         }
         if _bc_dbg {
             let after = mlx_native::barrier_count();
-            eprintln!("[BARRIER-TRACE] lm_head_batched n={} barriers_emitted={}", n, after - _bc_before);
+            eprintln!(
+                "[BARRIER-TRACE] lm_head_batched n={} barriers_emitted={}",
+                n,
+                after - _bc_before
+            );
         }
         use crate::inference::models::gemma4::batched_body::host_phases;
         let _hp = std::time::Instant::now();
         s.finish()
             .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
-        host_phases::add(host_phases::Phase::LmheadWait, _hp.elapsed().as_nanos() as u64);
+        host_phases::add(
+            host_phases::Phase::LmheadWait,
+            _hp.elapsed().as_nanos() as u64,
+        );
 
         let _hp = std::time::Instant::now();
         let logits: Vec<f32> = logits_b
@@ -364,8 +405,15 @@ impl MlxModelWeights {
             .as_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("lm_head_batched read normed_b: {e}"))?
             .to_vec();
-        host_phases::add(host_phases::Phase::LmheadReadback, _hp.elapsed().as_nanos() as u64);
-        Ok(BatchedHeadOut { logits, normed, gpu_sample: None })
+        host_phases::add(
+            host_phases::Phase::LmheadReadback,
+            _hp.elapsed().as_nanos() as u64,
+        );
+        Ok(BatchedHeadOut {
+            logits,
+            normed,
+            gpu_sample: None,
+        })
     }
 
     /// ADR-040 §25 iter-L — encode the lm_head (final RMS-norm + Q6_K matmul +
@@ -464,38 +512,65 @@ impl MlxModelWeights {
         // back after the single finish. Byte-identical (slot_aware_n8 +
         // staggered GREEN): the GPU candidate set == host threshold scan, both
         // feed the shared rerank_candidates tail (specials+sort+dedup+F64 rerank).
-        let gpu_sample = if std::env::var("HF2Q_GPU_SAMPLE").as_deref() != Ok("0")
-            && self.rerank_active()
-        {
-            const CAP: usize = 1024;
-            let top1_idx = dev.alloc_buffer(n * 4, DType::U32, vec![n])
-                .map_err(|e| anyhow::anyhow!("gpu_sample alloc top1_idx: {e}"))?;
-            let top1_val = dev.alloc_buffer(n * 4, DType::F32, vec![n])
-                .map_err(|e| anyhow::anyhow!("gpu_sample alloc top1_val: {e}"))?;
-            let cand_count = dev.alloc_buffer(n * 4, DType::U32, vec![n])
-                .map_err(|e| anyhow::anyhow!("gpu_sample alloc cand_count: {e}"))?;
-            let overflow = dev.alloc_buffer(n * 4, DType::U32, vec![n])
-                .map_err(|e| anyhow::anyhow!("gpu_sample alloc overflow: {e}"))?;
-            let cand_ids = dev.alloc_buffer(n * CAP * 4, DType::U32, vec![n, CAP])
-                .map_err(|e| anyhow::anyhow!("gpu_sample alloc cand_ids: {e}"))?;
-            let mut params = dev.alloc_buffer(8, DType::U32, vec![2])
-                .map_err(|e| anyhow::anyhow!("gpu_sample alloc params: {e}"))?;
-            params.as_mut_slice::<u32>()
-                .map_err(|e| anyhow::anyhow!("gpu_sample params slice: {e}"))?
-                .copy_from_slice(&[vocab as u32, CAP as u32]);
-            // RAW: the softcap (or qmatmul, if no softcap) wrote logits_b in THIS
-            // session; barrier so the sample kernel reads the final logits.
-            s.barrier_between(&[&logits_b], &[&top1_idx, &top1_val, &cand_count, &overflow, &cand_ids]);
-            mlx_native::ops::gpu_sample::dispatch_gpu_sample_argmax_candidates(
-                s.encoder_mut(), reg, metal_dev,
-                &logits_b, &top1_idx, &top1_val, &cand_count, &overflow, &cand_ids, &params,
-                n as u32, vocab as u32, CAP as u32,
-            )
-            .map_err(|e| anyhow::anyhow!("gpu_sample dispatch: {e}"))?;
-            Some(GpuSampleBuffers { top1_idx, top1_val, cand_count, overflow, cand_ids, params, cap: CAP })
-        } else {
-            None
-        };
+        let gpu_sample =
+            if std::env::var("HF2Q_GPU_SAMPLE").as_deref() != Ok("0") && self.rerank_active() {
+                const CAP: usize = 1024;
+                let top1_idx = dev
+                    .alloc_buffer(n * 4, DType::U32, vec![n])
+                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc top1_idx: {e}"))?;
+                let top1_val = dev
+                    .alloc_buffer(n * 4, DType::F32, vec![n])
+                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc top1_val: {e}"))?;
+                let cand_count = dev
+                    .alloc_buffer(n * 4, DType::U32, vec![n])
+                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc cand_count: {e}"))?;
+                let overflow = dev
+                    .alloc_buffer(n * 4, DType::U32, vec![n])
+                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc overflow: {e}"))?;
+                let cand_ids = dev
+                    .alloc_buffer(n * CAP * 4, DType::U32, vec![n, CAP])
+                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc cand_ids: {e}"))?;
+                let mut params = dev
+                    .alloc_buffer(8, DType::U32, vec![2])
+                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc params: {e}"))?;
+                params
+                    .as_mut_slice::<u32>()
+                    .map_err(|e| anyhow::anyhow!("gpu_sample params slice: {e}"))?
+                    .copy_from_slice(&[vocab as u32, CAP as u32]);
+                // RAW: the softcap (or qmatmul, if no softcap) wrote logits_b in THIS
+                // session; barrier so the sample kernel reads the final logits.
+                s.barrier_between(
+                    &[&logits_b],
+                    &[&top1_idx, &top1_val, &cand_count, &overflow, &cand_ids],
+                );
+                mlx_native::ops::gpu_sample::dispatch_gpu_sample_argmax_candidates(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &logits_b,
+                    &top1_idx,
+                    &top1_val,
+                    &cand_count,
+                    &overflow,
+                    &cand_ids,
+                    &params,
+                    n as u32,
+                    vocab as u32,
+                    CAP as u32,
+                )
+                .map_err(|e| anyhow::anyhow!("gpu_sample dispatch: {e}"))?;
+                Some(GpuSampleBuffers {
+                    top1_idx,
+                    top1_val,
+                    cand_count,
+                    overflow,
+                    cand_ids,
+                    params,
+                    cap: CAP,
+                })
+            } else {
+                None
+            };
 
         Ok((logits_b, normed_b, softcap_params_b, gpu_sample))
     }

@@ -197,8 +197,7 @@ pub fn load_image_bytes(input: &ImageInput) -> Result<Vec<u8>> {
 /// biggest reasonable VLM input (a 4K JPEG is ~6 MB).
 fn read_file_bounded(p: &Path) -> Result<Vec<u8>> {
     const MAX: u64 = 20 * 1024 * 1024;
-    let meta = std::fs::metadata(p)
-        .map_err(|e| anyhow!("stat {}: {e}", p.display()))?;
+    let meta = std::fs::metadata(p).map_err(|e| anyhow!("stat {}: {e}", p.display()))?;
     if meta.len() > MAX {
         return Err(anyhow!(
             "image file {} exceeds {}-byte cap (got {})",
@@ -227,16 +226,13 @@ fn fetch_https_image(url: &str) -> Result<Vec<u8>> {
             .build()
             .map_err(|e| anyhow!("HTTPS fetch: failed to build client: {e}"))?;
 
-        let resp = client
-            .get(url)
-            .send()
-            .map_err(|e| {
-                if e.is_timeout() {
-                    anyhow!("HTTPS fetch timed out after 10 s ({})", url)
-                } else {
-                    anyhow!("HTTPS fetch network error ({}): {e}", url)
-                }
-            })?;
+        let resp = client.get(url).send().map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("HTTPS fetch timed out after 10 s ({})", url)
+            } else {
+                anyhow!("HTTPS fetch network error ({}): {e}", url)
+            }
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -280,15 +276,13 @@ fn fetch_https_image(url: &str) -> Result<Vec<u8>> {
             .map(|cl| (cl as usize).min(cap as usize))
             .unwrap_or(0);
         let mut buf: Vec<u8> = Vec::with_capacity(hint);
-        resp.take(cap)
-            .read_to_end(&mut buf)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::TimedOut {
-                    anyhow!("HTTPS fetch body read timed out ({})", url)
-                } else {
-                    anyhow!("HTTPS fetch body read error ({}): {e}", url)
-                }
-            })?;
+        resp.take(cap).read_to_end(&mut buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                anyhow!("HTTPS fetch body read timed out ({})", url)
+            } else {
+                anyhow!("HTTPS fetch body read error ({}): {e}", url)
+            }
+        })?;
 
         if buf.len() as u64 >= cap {
             return Err(anyhow!(
@@ -322,7 +316,10 @@ mod tests {
     fn parse_image_url_data_png() {
         let got = parse_image_url("data:image/png;base64,iVBORw0K").unwrap();
         match got {
-            ImageInput::DataUri { mime_type, payload_base64 } => {
+            ImageInput::DataUri {
+                mime_type,
+                payload_base64,
+            } => {
                 assert_eq!(mime_type, "image/png");
                 assert_eq!(payload_base64, "iVBORw0K");
             }
@@ -454,7 +451,10 @@ mod tests {
     fn fetch_https_image_cap_fires_without_content_length() {
         use std::io::Write as _;
         use std::net::TcpListener;
-        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
         use std::thread;
 
         const MAX_BYTES: u64 = 20 * 1024 * 1024; // must match fetch_https_image
@@ -493,7 +493,9 @@ mod tests {
                         bytes_accepted_srv.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         // Stop once we've offered significantly more than the cap —
                         // the client will have disconnected long before this.
-                        if bytes_accepted_srv.load(Ordering::Relaxed) > MAX_BYTES + chunk.len() as u64 {
+                        if bytes_accepted_srv.load(Ordering::Relaxed)
+                            > MAX_BYTES + chunk.len() as u64
+                        {
                             break;
                         }
                     }
@@ -505,9 +507,8 @@ mod tests {
         // Use fetch_https_image against our local mock (HTTP, not HTTPS — the
         // function accepts both http:// and https:// URLs via the same code path).
         let url = format!("http://127.0.0.1:{}/oversized.bin", addr.port());
-        let err = fetch_https_image(&url).expect_err(
-            "expected fetch_https_image to return an error for oversized body",
-        );
+        let err = fetch_https_image(&url)
+            .expect_err("expected fetch_https_image to return an error for oversized body");
         let msg = format!("{err}");
         assert!(
             msg.contains("cap") || msg.contains("exceed"),

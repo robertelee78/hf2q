@@ -91,9 +91,8 @@ pub fn convert_vision_tower(
     // vision_config key. No vision_config → return Ok(None).
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| VitConvertError::Config(VisionConfigError::Io(e.to_string())))?;
-    let root: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        VitConvertError::Config(VisionConfigError::BadJson(e.to_string()))
-    })?;
+    let root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| VitConvertError::Config(VisionConfigError::BadJson(e.to_string())))?;
     if root.get("vision_config").is_none() {
         return Ok(None);
     }
@@ -117,10 +116,7 @@ pub fn convert_vision_tower(
 /// Derive a filesystem-safe slug for the mmproj filename.
 /// Priority: config.json::_name_or_path → last segment of hf_repo_dir.
 pub fn compute_slug(config_root: &serde_json::Value, hf_repo_dir: &Path) -> String {
-    if let Some(name) = config_root
-        .get("_name_or_path")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(name) = config_root.get("_name_or_path").and_then(|v| v.as_str()) {
         return sanitize_slug(name);
     }
     hf_repo_dir
@@ -263,6 +259,9 @@ mod tests {
         let out_dir = tmp.path().join("out");
 
         let result = convert_vision_tower(&input, &out_dir).unwrap();
-        assert!(result.is_none(), "MoE without vision_config must silent-skip");
+        assert!(
+            result.is_none(),
+            "MoE without vision_config must silent-skip"
+        );
     }
 }

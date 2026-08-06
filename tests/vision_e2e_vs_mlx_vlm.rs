@@ -289,8 +289,7 @@ fn materialize_fixture_images_round_trips_5_decodable_pngs() {
         let path = dir.join(name);
         assert!(path.exists(), "fixture missing: {}", path.display());
         // Decode round-trip: every PNG must reload as a non-empty RGB image.
-        let img = image::open(&path)
-            .unwrap_or_else(|e| panic!("decode {}: {e}", path.display()));
+        let img = image::open(&path).unwrap_or_else(|e| panic!("decode {}: {e}", path.display()));
         let (w, h) = (img.width(), img.height());
         assert!(w > 0 && h > 0, "fixture {name} decoded to 0×0");
     }
@@ -382,9 +381,7 @@ struct PairOutcome {
 
 fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
     materialize_fixture_images()?;
-    let model_dir = PathBuf::from(
-        "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq",
-    );
+    let model_dir = PathBuf::from("/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq");
     let gguf = std::env::var("HF2Q_VISION_E2E_GGUF").unwrap_or_else(|_| {
         model_dir
             .join("gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf")
@@ -479,13 +476,12 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
         .args(["-s", "-H", "Accept: application/json", &models_url])
         .output()?;
     let models_body = String::from_utf8_lossy(&models_out.stdout).into_owned();
-    let models_json: serde_json::Value =
-        serde_json::from_str(&models_body).map_err(|e| {
-            let _ = hf2q.kill();
-            std::io::Error::other(format!(
-                "GET /v1/models returned non-JSON ({e}): {models_body}",
-            ))
-        })?;
+    let models_json: serde_json::Value = serde_json::from_str(&models_body).map_err(|e| {
+        let _ = hf2q.kill();
+        std::io::Error::other(format!(
+            "GET /v1/models returned non-JSON ({e}): {models_body}",
+        ))
+    })?;
     let canonical_model_id = models_json["data"][0]["id"]
         .as_str()
         .map(str::to_string)
@@ -528,14 +524,20 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
             // Iter-102 captures the headers so the X-HF2Q-* triage
             // fields land in the report.
             let resp = std::process::Command::new("curl")
-                .args(["-s", "-i", "-X", "POST", &format!("{base}/v1/chat/completions")])
+                .args([
+                    "-s",
+                    "-i",
+                    "-X",
+                    "POST",
+                    &format!("{base}/v1/chat/completions"),
+                ])
                 .args(["-H", "Content-Type: application/json"])
                 .args(["-d", &format!("@{}", body_path.display())])
                 .output()?;
             let raw = String::from_utf8_lossy(&resp.stdout).into_owned();
             let (headers, body, status_line) = split_curl_response(&raw);
-            let parsed: serde_json::Value = serde_json::from_str(body)
-                .unwrap_or_else(|_| serde_json::json!({"_raw": body}));
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({"_raw": body}));
             let hf2q_text = parsed["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
@@ -655,10 +657,7 @@ pub(crate) fn split_curl_response(raw: &str) -> (&str, &str, &str) {
         Some(i) => (&prelude[..i], &prelude[i + 2..]),
         None => (prelude, ""),
     };
-    let status_compact = status_line
-        .splitn(2, ' ')
-        .nth(1)
-        .unwrap_or(status_line);
+    let status_compact = status_line.splitn(2, ' ').nth(1).unwrap_or(status_line);
     (headers_block, body, status_compact)
 }
 
@@ -786,9 +785,15 @@ fn extract_x_hf2q_headers_filters_to_x_hf2q_prefix() {
     let block = "Content-Type: application/json\r\nX-HF2Q-ViT-Forward-Ms: 12\r\nX-HF2Q-ViT-Images: 1\r\nX-HF2Q-Soft-Tokens-Total: 49\r\nX-Other-Header: ignored\r\n";
     let headers = extract_x_hf2q_headers(block);
     assert_eq!(headers.len(), 3);
-    assert_eq!(headers.get("x-hf2q-vit-forward-ms"), Some(&"12".to_string()));
+    assert_eq!(
+        headers.get("x-hf2q-vit-forward-ms"),
+        Some(&"12".to_string())
+    );
     assert_eq!(headers.get("x-hf2q-vit-images"), Some(&"1".to_string()));
-    assert_eq!(headers.get("x-hf2q-soft-tokens-total"), Some(&"49".to_string()));
+    assert_eq!(
+        headers.get("x-hf2q-soft-tokens-total"),
+        Some(&"49".to_string())
+    );
     assert!(!headers.contains_key("content-type"));
     assert!(!headers.contains_key("x-other-header"));
 }

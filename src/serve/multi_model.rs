@@ -131,9 +131,8 @@ pub struct EngineConfig {
     /// Arc the `/metrics` handler reads.  Set by `cmd_serve` from
     /// `state.kv_spill_counters`. `None` for tests / standalone engine
     /// constructions; the LCP probe becomes a no-op there.
-    pub kv_metrics_sink: Option<
-        std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>,
-    >,
+    pub kv_metrics_sink:
+        Option<std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>>,
     /// ADR-020 AC#5 Iter D — optional path to a DWQ-trained mlx-affine
     /// safetensors overlay.  When `Some`, applied after GGUF load via
     /// `MlxModelWeights::apply_dwq_overlay` (dense families only;
@@ -350,11 +349,7 @@ impl LoadedPool {
     /// to that range — passing 1.5 yields full physical memory; passing
     /// 0.0 yields a zero-budget pool that refuses everything (matches
     /// `from_hardware_with(_, 0, _)` semantically).
-    pub fn from_hardware_with(
-        hw: &HardwareProfile,
-        capacity_models: usize,
-        fraction: f64,
-    ) -> Self {
+    pub fn from_hardware_with(hw: &HardwareProfile, capacity_models: usize, fraction: f64) -> Self {
         let f = fraction.clamp(0.0, 1.0);
         // f64 → u64 with floor; never panics for finite f.
         let budget = ((hw.total_memory_bytes as f64) * f).floor() as u64;
@@ -426,7 +421,9 @@ impl LoadedPool {
         if let Some(pos) = self.lru_order.iter().position(|r| r == repo_id) {
             self.lru_order.remove(pos);
         }
-        self.total_resident_bytes = self.total_resident_bytes.saturating_sub(handle.bytes_resident);
+        self.total_resident_bytes = self
+            .total_resident_bytes
+            .saturating_sub(handle.bytes_resident);
         Some(handle)
     }
 
@@ -545,17 +542,10 @@ impl LoadedPool {
     /// Helper used by the re-insert path: evict LRU entries until
     /// `total_resident_bytes <= memory_budget_bytes`, skipping the
     /// just-promoted entry (`spare_repo_id`).
-    fn evict_until_within_budget(
-        &mut self,
-        evicted: &mut Vec<LoadedHandle>,
-        spare_repo_id: &str,
-    ) {
+    fn evict_until_within_budget(&mut self, evicted: &mut Vec<LoadedHandle>, spare_repo_id: &str) {
         while self.total_resident_bytes > self.memory_budget_bytes {
             // Find the LRU entry that is NOT the spare.
-            let victim_idx = self
-                .lru_order
-                .iter()
-                .position(|k| k != spare_repo_id);
+            let victim_idx = self.lru_order.iter().position(|k| k != spare_repo_id);
             let Some(idx) = victim_idx else {
                 // Only the spare remains; the precheck guaranteed
                 // `spare.bytes <= budget`, so the loop terminates here.
@@ -1068,10 +1058,7 @@ impl<E> HotSwapManager<E> {
     /// would not increment anyway, and explicit-outcome tests in
     /// router-level tests construct via `AppState` so the counters
     /// thread through automatically.
-    pub fn set_kv_counters(
-        &mut self,
-        counters: Arc<crate::serve::api::state::KvSpillCounters>,
-    ) {
+    pub fn set_kv_counters(&mut self, counters: Arc<crate::serve::api::state::KvSpillCounters>) {
         self.kv_counters = Some(counters);
     }
 
@@ -1473,7 +1460,10 @@ mod tests {
         let evicted = p.insert(h("big/1", 950)).unwrap();
         assert_eq!(evicted.len(), 3);
         assert_eq!(
-            evicted.iter().map(|h| h.repo_id.as_str()).collect::<Vec<_>>(),
+            evicted
+                .iter()
+                .map(|h| h.repo_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["a/1", "b/2", "c/3"]
         );
         assert_eq!(p.len(), 1);
@@ -1488,8 +1478,8 @@ mod tests {
         let mut p = LoadedPool::with_capacity_and_budget(2, 800);
         let _ = p.insert(h("a/1", 400)).unwrap();
         let _ = p.insert(h("b/2", 400)).unwrap(); // total 800, capacity 2/2
-        // Third: capacity pass evicts a/1 → total 400, len 1.  Budget
-        // pass: 400+500=900 > 800 → evict b/2 → total 0.  +500 = 500.
+                                                  // Third: capacity pass evicts a/1 → total 400, len 1.  Budget
+                                                  // pass: 400+500=900 > 800 → evict b/2 → total 0.  +500 = 500.
         let evicted = p.insert(h("c/3", 500)).unwrap();
         assert_eq!(evicted.len(), 2);
         let names: Vec<&str> = evicted.iter().map(|h| h.repo_id.as_str()).collect();
@@ -1560,9 +1550,9 @@ mod tests {
         let _ = p.insert(h("a/1", 100)).unwrap(); // LRU
         let _ = p.insert(h("b/2", 200)).unwrap();
         let _ = p.insert(h("c/3", 300)).unwrap(); // MRU
-        // Re-insert a/1 with new bytes 1500: it should NOT be evicted,
-        // total goes 100→1500 = +1400, no other eviction (well under
-        // budget).  a/1 promotes to MRU.
+                                                  // Re-insert a/1 with new bytes 1500: it should NOT be evicted,
+                                                  // total goes 100→1500 = +1400, no other eviction (well under
+                                                  // budget).  a/1 promotes to MRU.
         let evicted = p.insert(h("a/1", 1500)).unwrap();
         assert!(evicted.is_empty(), "re-insert must not self-evict");
         let order: Vec<&str> = p.iter().map(|h| h.repo_id.as_str()).collect();
@@ -1710,10 +1700,7 @@ mod tests {
 
     impl ModelLoader<MockEngine> for MockLoader {
         fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
-            let n = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if self.fail_on_call == Some(n) {
                 anyhow::bail!("MockLoader synthetic failure on call {n}");
             }
@@ -1927,9 +1914,7 @@ mod tests {
         let loaded = mgr
             .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
             .expect("load");
-        let viewed = mgr
-            .try_get("acme/m1", QuantType::Q4_K_M)
-            .expect("present");
+        let viewed = mgr.try_get("acme/m1", QuantType::Q4_K_M).expect("present");
         // Same Arc.
         assert!(Arc::ptr_eq(&loaded, &viewed));
     }
@@ -2742,11 +2727,8 @@ mod tests {
         let loader = Arc::new(MockLoader::new());
         let spiller = Arc::new(MockSpiller::new());
         let pool = LoadedPool::with_capacity_and_budget(capacity_models, memory_budget_bytes);
-        let mgr = HotSwapManager::<MockEngine>::new_with_spiller(
-            pool,
-            loader.clone(),
-            spiller.clone(),
-        );
+        let mgr =
+            HotSwapManager::<MockEngine>::new_with_spiller(pool, loader.clone(), spiller.clone());
         (mgr, loader, spiller)
     }
 

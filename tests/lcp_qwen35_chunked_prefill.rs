@@ -83,8 +83,7 @@ const READYZ_BUDGET: Duration = Duration::from_secs(180);
 // to monolithic.  Use the longer prompt as the canonical fixture so
 // B.2a guards both the 2-chunk safe-zone AND the 3-chunk-with-tail<16
 // (formerly "danger zone") byte-identity invariants.
-const PROMPT: &str =
-    "Write a detailed essay describing the four seasons in temperate climates. \
+const PROMPT: &str = "Write a detailed essay describing the four seasons in temperate climates. \
      Cover spring with its blossoming flowers and warming temperatures, summer \
      with long sunny days and outdoor activities, autumn with falling leaves \
      and harvest festivals, and winter with snow and shorter daylight hours. \
@@ -136,16 +135,14 @@ impl Drop for ServerGuard {
 
 impl ServerGuard {
     fn log_tail(&self) -> Vec<String> {
-        self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
-fn spawn_server(
-    bin: &Path,
-    model: &Path,
-    port: u16,
-    extra_envs: &[(&str, &str)],
-) -> ServerGuard {
+fn spawn_server(bin: &Path, model: &Path, port: u16, extra_envs: &[(&str, &str)]) -> ServerGuard {
     let mut cmd = Command::new(bin);
     cmd.args([
         "serve",
@@ -208,9 +205,9 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()
@@ -292,9 +289,7 @@ fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32)
     );
 
     let key = "\"content\":\"";
-    let p = body
-        .find(key)
-        .unwrap_or_else(|| panic!("no content field"));
+    let p = body.find(key).unwrap_or_else(|| panic!("no content field"));
     let rest = &body[p + key.len()..];
     let mut out = String::new();
     let mut chars = rest.chars();
@@ -382,10 +377,7 @@ fn phase_b2a_chunked_vs_monolithic_byte_identity() {
     );
 
     let a_decoded = chat_decode(&server_a, &canonical_a, PROMPT, MAX_TOKENS);
-    assert!(
-        !a_decoded.is_empty(),
-        "[Phase B.2a] server A decoded empty"
-    );
+    assert!(!a_decoded.is_empty(), "[Phase B.2a] server A decoded empty");
     eprintln!("[Phase B.2a] server A decoded {} bytes", a_decoded.len());
 
     // Engagement assertion: server A's stderr must contain a "chunked
@@ -429,10 +421,7 @@ fn phase_b2a_chunked_vs_monolithic_byte_identity() {
     );
 
     let b_decoded = chat_decode(&server_b, &canonical_b, PROMPT, MAX_TOKENS);
-    assert!(
-        !b_decoded.is_empty(),
-        "[Phase B.2a] server B decoded empty"
-    );
+    assert!(!b_decoded.is_empty(), "[Phase B.2a] server B decoded empty");
     eprintln!("[Phase B.2a] server B decoded {} bytes", b_decoded.len());
 
     // Falsifier: byte-for-byte identity.

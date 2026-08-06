@@ -80,9 +80,9 @@ mod helpers;
 
 use helpers::{
     assert_nonstreaming_invariants, assert_streaming_invariants, assistant_msg, base_url,
-    fetch_canonical_model_id, nonstreaming_chat, replay_fixture_assert, streaming_chat,
-    user_msg, wait_for_readyz, write_fixture, ServerGuard, DEFAULT_CHAT_GGUF, ENV_GATE,
-    ENV_GGUF, ENV_RECORD, HOST, PORT,
+    fetch_canonical_model_id, nonstreaming_chat, replay_fixture_assert, streaming_chat, user_msg,
+    wait_for_readyz, write_fixture, ServerGuard, DEFAULT_CHAT_GGUF, ENV_GATE, ENV_GGUF, ENV_RECORD,
+    HOST, PORT,
 };
 
 /// Fixture path for the turn-1 SSE chunk recording. Truncated at
@@ -209,11 +209,7 @@ fn openwebui_multiturn_streaming_chat_scenario_1() {
     // -----------------------------------------------------------------
     // Turn 2: streaming, multi-turn (turn 1 reply baked into history)
     // -----------------------------------------------------------------
-    let messages_t2 = vec![
-        user_msg(user1),
-        assistant_msg(&turn1_text),
-        user_msg(user2),
-    ];
+    let messages_t2 = vec![user_msg(user1), assistant_msg(&turn1_text), user_msg(user2)];
     let (turn2_chunks, turn2_text) = rt.block_on(streaming_chat(&model_id, &messages_t2));
     assert_streaming_invariants("turn2", &turn2_chunks);
     assert!(
@@ -283,7 +279,9 @@ fn openwebui_multiturn_streaming_chat_scenario_1() {
     eprintln!(
         "openwebui_multiturn: non-streaming companion PASS — id={}, finish_reason={}",
         nonstream_resp["id"].as_str().unwrap_or("<missing>"),
-        nonstream_resp["choices"][0]["finish_reason"].as_str().unwrap_or("<missing>")
+        nonstream_resp["choices"][0]["finish_reason"]
+            .as_str()
+            .unwrap_or("<missing>")
     );
 
     // -----------------------------------------------------------------

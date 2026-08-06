@@ -29,17 +29,17 @@
 
 use super::config::DFlashConfig;
 use super::tensors::DFlashLayerTensors;
-use anyhow::{anyhow, Context, Result};
-use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
-use mlx_native::ops::elementwise::elementwise_add;
-use mlx_native::ops::rms_norm::dispatch_rms_norm;
-use mlx_native::ops::silu_mul::dispatch_silu_mul;
-use mlx_native::ops::softcap::dispatch_softcap;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_sdpa_causal_from_seq_major,
 };
+use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::elementwise::elementwise_add;
+use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
+use mlx_native::ops::silu_mul::dispatch_silu_mul;
+use mlx_native::ops::softcap::dispatch_softcap;
 use mlx_native::ops::transpose::permute_021_f32;
+use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
 ///
@@ -91,7 +91,11 @@ pub fn dispatch_dflash_input_layernorm(
         ));
     }
     let normed = device
-        .alloc_buffer(element_count * 4, DType::F32, vec![seq_len as usize, hidden as usize])
+        .alloc_buffer(
+            element_count * 4,
+            DType::F32,
+            vec![seq_len as usize, hidden as usize],
+        )
         .map_err(|e| anyhow!("alloc input_layernorm output: {e}"))?;
     let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, hidden)?;
     dispatch_rms_norm(
@@ -244,7 +248,11 @@ pub fn dispatch_dflash_head_norm(
         ));
     }
     let normed = device
-        .alloc_buffer(expected_elem * 4, DType::F32, vec![seq_len as usize, num_heads as usize, head_dim as usize])
+        .alloc_buffer(
+            expected_elem * 4,
+            DType::F32,
+            vec![seq_len as usize, num_heads as usize, head_dim as usize],
+        )
         .map_err(|e| anyhow!("alloc head_norm output: {e}"))?;
     let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, head_dim)?;
     dispatch_rms_norm(
@@ -320,13 +328,27 @@ pub fn dispatch_dflash_mlp(
 
     // 1. gate = mlp_gate @ input → [L, intermediate_size]
     let gate = apply_linear_projection_f32(
-        encoder, registry, device, input, &layer.mlp_gate, seq_len, hidden, inter,
+        encoder,
+        registry,
+        device,
+        input,
+        &layer.mlp_gate,
+        seq_len,
+        hidden,
+        inter,
     )
     .context("dispatch_dflash_mlp: gate_proj")?;
 
     // 2. up = mlp_up @ input → [L, intermediate_size]
     let up = apply_linear_projection_f32(
-        encoder, registry, device, input, &layer.mlp_up, seq_len, hidden, inter,
+        encoder,
+        registry,
+        device,
+        input,
+        &layer.mlp_up,
+        seq_len,
+        hidden,
+        inter,
     )
     .context("dispatch_dflash_mlp: up_proj")?;
 
@@ -365,7 +387,14 @@ pub fn dispatch_dflash_mlp(
 
     // 4. mlp_down @ activated → [L, hidden_size]
     apply_linear_projection_f32(
-        encoder, registry, device, &activated, &layer.mlp_down, seq_len, inter, hidden,
+        encoder,
+        registry,
+        device,
+        &activated,
+        &layer.mlp_down,
+        seq_len,
+        inter,
+        hidden,
     )
     .context("dispatch_dflash_mlp: down_proj")
 }
@@ -379,11 +408,7 @@ pub fn dispatch_dflash_mlp(
 /// axes; the sections=`[head_dim/2, 0, 0, 0]` config sends every pair
 /// to axis 0 so axes 1-3 are unused, but the kernel still expects a
 /// non-zero pos_buf of the right shape.
-fn build_dflash_pos_buf(
-    device: &MlxDevice,
-    seq_len: u32,
-    offset: u32,
-) -> Result<MlxBuffer> {
+fn build_dflash_pos_buf(device: &MlxDevice, seq_len: u32, offset: u32) -> Result<MlxBuffer> {
     let n_pos = 4 * (seq_len as usize);
     let mut buf = device
         .alloc_buffer(n_pos * 4, DType::I32, vec![n_pos])
@@ -437,17 +462,8 @@ pub fn dispatch_dflash_rope(
     let sections = [head_dim / 2, 0, 0, 0];
     let positions = build_dflash_pos_buf(device, seq_len, offset)?;
     apply_imrope(
-        encoder,
-        registry,
-        device,
-        qk_in,
-        &positions,
-        seq_len,
-        num_heads,
-        head_dim,
-        rope_dim,
-        freq_base,
-        sections,
+        encoder, registry, device, qk_in, &positions, seq_len, num_heads, head_dim, rope_dim,
+        freq_base, sections,
     )
     .context("dispatch_dflash_rope")
 }
@@ -478,9 +494,14 @@ pub fn dispatch_dflash_fc(
     let fc_in = cfg.fc_input_dim() as u32;
     let hidden = cfg.hidden_size as u32;
     apply_linear_projection_f32(
-        encoder, registry, device,
-        target_hidden_concat, &model.fc,
-        ctx_seq_len, fc_in, hidden,
+        encoder,
+        registry,
+        device,
+        target_hidden_concat,
+        &model.fc,
+        ctx_seq_len,
+        fc_in,
+        hidden,
     )
     .context("dispatch_dflash_fc")
 }
@@ -517,9 +538,15 @@ pub fn dispatch_dflash_hidden_norm(
         .map_err(|e| anyhow!("alloc hidden_norm output: {e}"))?;
     let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, hidden)?;
     dispatch_rms_norm(
-        encoder, registry, device.metal_device(),
-        fc_out, &model.hidden_norm, &normed, &params,
-        ctx_seq_len, hidden,
+        encoder,
+        registry,
+        device.metal_device(),
+        fc_out,
+        &model.hidden_norm,
+        &normed,
+        &params,
+        ctx_seq_len,
+        hidden,
     )
     .context("dispatch_rms_norm hidden_norm")?;
     Ok(normed)
@@ -559,9 +586,15 @@ pub fn dispatch_dflash_final_norm(
         .map_err(|e| anyhow!("alloc final_norm output: {e}"))?;
     let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, hidden)?;
     dispatch_rms_norm(
-        encoder, registry, device.metal_device(),
-        h, &model.final_norm, &normed, &params,
-        seq_len, hidden,
+        encoder,
+        registry,
+        device.metal_device(),
+        h,
+        &model.final_norm,
+        &normed,
+        &params,
+        seq_len,
+        hidden,
     )
     .context("dispatch_rms_norm final_norm")?;
     Ok(normed)
@@ -609,8 +642,13 @@ pub fn dispatch_dflash_softcap(
         s[1] = f32::from_bits(n as u32);
     }
     dispatch_softcap(
-        encoder, registry, device.metal_device(),
-        logits, &out, &params, cap,
+        encoder,
+        registry,
+        device.metal_device(),
+        logits,
+        &out,
+        &params,
+        cap,
     )
     .context("dispatch_softcap")?;
     let _ = registry; // silence
@@ -700,9 +738,7 @@ pub fn dispatch_dflash_sdpa_self_attn(
     let n_kv_heads = cfg.num_key_value_heads as u32;
     let head_dim = cfg.head_dim as u32;
     apply_sdpa_causal_from_seq_major(
-        encoder, registry, device,
-        q_roped, k_roped, v,
-        seq_len, n_heads, n_kv_heads, head_dim,
+        encoder, registry, device, q_roped, k_roped, v, seq_len, n_heads, n_kv_heads, head_dim,
     )
     .context("dispatch_dflash_sdpa_self_attn")
 }
@@ -779,10 +815,9 @@ pub fn dispatch_dflash_decoder_layer_attention(
         .command_encoder()
         .context("decoder_layer_attention: open encoder A")?;
 
-    let normed_h = dispatch_dflash_input_layernorm(
-        &mut enc, registry, device, h, layer_weights, cfg, l,
-    )
-    .context("layer attn: input_layernorm")?;
+    let normed_h =
+        dispatch_dflash_input_layernorm(&mut enc, registry, device, h, layer_weights, cfg, l)
+            .context("layer attn: input_layernorm")?;
     enc.memory_barrier();
 
     let q = dispatch_dflash_q_proj(&mut enc, registry, device, &normed_h, layer_weights, cfg, l)
@@ -800,15 +835,36 @@ pub fn dispatch_dflash_decoder_layer_attention(
     enc.memory_barrier();
 
     let q_normed = dispatch_dflash_head_norm(
-        &mut enc, registry, device, &q, &layer_weights.q_norm, cfg, l, n_q,
+        &mut enc,
+        registry,
+        device,
+        &q,
+        &layer_weights.q_norm,
+        cfg,
+        l,
+        n_q,
     )
     .context("layer attn: q_norm")?;
     let k_ctx_normed = dispatch_dflash_head_norm(
-        &mut enc, registry, device, &k_ctx, &layer_weights.k_norm, cfg, s, n_kv,
+        &mut enc,
+        registry,
+        device,
+        &k_ctx,
+        &layer_weights.k_norm,
+        cfg,
+        s,
+        n_kv,
     )
     .context("layer attn: k_ctx_norm")?;
     let k_prop_normed = dispatch_dflash_head_norm(
-        &mut enc, registry, device, &k_prop, &layer_weights.k_norm, cfg, l, n_kv,
+        &mut enc,
+        registry,
+        device,
+        &k_prop,
+        &layer_weights.k_norm,
+        cfg,
+        l,
+        n_kv,
     )
     .context("layer attn: k_prop_norm")?;
     enc.memory_barrier();
@@ -818,15 +874,36 @@ pub fn dispatch_dflash_decoder_layer_attention(
     //   ctx_keys → offset = cache.offset            (= prior — appended positions)
     //   prop_keys → offset = cache.offset + S       (same as queries — the block positions)
     let q_roped = dispatch_dflash_rope(
-        &mut enc, registry, device, &q_normed, cfg, l, n_q, prior_offset + s,
+        &mut enc,
+        registry,
+        device,
+        &q_normed,
+        cfg,
+        l,
+        n_q,
+        prior_offset + s,
     )
     .context("layer attn: q rope")?;
     let k_ctx_roped = dispatch_dflash_rope(
-        &mut enc, registry, device, &k_ctx_normed, cfg, s, n_kv, prior_offset,
+        &mut enc,
+        registry,
+        device,
+        &k_ctx_normed,
+        cfg,
+        s,
+        n_kv,
+        prior_offset,
     )
     .context("layer attn: k_ctx rope")?;
     let k_prop_roped = dispatch_dflash_rope(
-        &mut enc, registry, device, &k_prop_normed, cfg, l, n_kv, prior_offset + s,
+        &mut enc,
+        registry,
+        device,
+        &k_prop_normed,
+        cfg,
+        l,
+        n_kv,
+        prior_offset + s,
     )
     .context("layer attn: k_prop rope")?;
 
@@ -855,8 +932,14 @@ pub fn dispatch_dflash_decoder_layer_attention(
     // kv_seq_len = cache.seq_len + l).
     cache_layer
         .append_seq_major_kv_gpu(
-            &mut enc, registry, device.metal_device(),
-            &k_ctx_roped, &v_ctx, s, n_kv, head_dim,
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &k_ctx_roped,
+            &v_ctx,
+            s,
+            n_kv,
+            head_dim,
         )
         .context("layer attn: append_seq_major_kv_gpu")?;
     debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
@@ -866,11 +949,21 @@ pub fn dispatch_dflash_decoder_layer_attention(
     enc.memory_barrier();
     cache_layer
         .write_slack_kv_gpu(
-            &mut enc, registry, device.metal_device(),
-            &k_prop_roped, &v_prop, l, n_kv, head_dim,
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &k_prop_roped,
+            &v_prop,
+            l,
+            n_kv,
+            head_dim,
         )
         .context("layer attn: write_slack_kv_gpu")?;
-    debug_assert_eq!(cache_layer.seq_len, prior_offset + s, "slack must not advance seq_len");
+    debug_assert_eq!(
+        cache_layer.seq_len,
+        prior_offset + s,
+        "slack must not advance seq_len"
+    );
     // commit_labeled (no wait) — Metal serial queue ordering makes the
     // SDPA encoder below see the cache writes after this CB completes.
     enc.commit_labeled("dflash.decoder_layer_attention.phase_a_kv_writes");
@@ -892,11 +985,25 @@ pub fn dispatch_dflash_decoder_layer_attention(
         .command_encoder()
         .context("decoder_layer_attention: open encoder for sdpa+o_proj")?;
     let attn_out = dispatch_dflash_sdpa_cross_length(
-        &mut sdpa_enc, registry, device, &q_roped, cache_layer, cfg, l, kv_seq_len, do_causal,
+        &mut sdpa_enc,
+        registry,
+        device,
+        &q_roped,
+        cache_layer,
+        cfg,
+        l,
+        kv_seq_len,
+        do_causal,
     )
     .context("layer attn: sdpa cross-length")?;
     let attn_proj = dispatch_dflash_o_proj(
-        &mut sdpa_enc, registry, device, &attn_out, layer_weights, cfg, l,
+        &mut sdpa_enc,
+        registry,
+        device,
+        &attn_out,
+        layer_weights,
+        cfg,
+        l,
     )
     .context("layer attn: o_proj (fused)")?;
     // ADR-034 task #95 sub-iter H (2026-05-22) — commit_labeled (no wait).
@@ -960,11 +1067,27 @@ pub fn dispatch_dflash_model_forward(
     let mut enc = device
         .command_encoder()
         .context("model_forward: open encoder for fc + hidden_norm")?;
-    let fc_out = dispatch_dflash_fc(&mut enc, registry, device, target_hidden_concat, model, cfg, ctx_chunk_size)
-        .context("model_forward: fc")?;
+    let fc_out = dispatch_dflash_fc(
+        &mut enc,
+        registry,
+        device,
+        target_hidden_concat,
+        model,
+        cfg,
+        ctx_chunk_size,
+    )
+    .context("model_forward: fc")?;
     enc.memory_barrier();
-    let h_ctx = dispatch_dflash_hidden_norm(&mut enc, registry, device, &fc_out, model, cfg, ctx_chunk_size)
-        .context("model_forward: hidden_norm")?;
+    let h_ctx = dispatch_dflash_hidden_norm(
+        &mut enc,
+        registry,
+        device,
+        &fc_out,
+        model,
+        cfg,
+        ctx_chunk_size,
+    )
+    .context("model_forward: hidden_norm")?;
     // ADR-034 task #95 sub-iter H (2026-05-22) — commit_labeled (no wait).
     // h_ctx is consumed by every layer's attention encoder; Metal serial
     // queue ordering preserves correctness without the CPU wait.
@@ -978,9 +1101,16 @@ pub fn dispatch_dflash_model_forward(
             None => h,
         };
         let h_out = dispatch_dflash_decoder_layer(
-            registry, device, h_in, &h_ctx,
-            &model.layers[layer_idx], &mut cache.layers[layer_idx],
-            cfg, layer_idx, block_size, ctx_chunk_size,
+            registry,
+            device,
+            h_in,
+            &h_ctx,
+            &model.layers[layer_idx],
+            &mut cache.layers[layer_idx],
+            cfg,
+            layer_idx,
+            block_size,
+            ctx_chunk_size,
         )
         .with_context(|| format!("model_forward: layer {layer_idx}"))?;
         h_curr_owned = Some(h_out);
@@ -991,9 +1121,18 @@ pub fn dispatch_dflash_model_forward(
     let mut enc = device
         .command_encoder()
         .context("model_forward: open encoder for final_norm")?;
-    let h_final = dispatch_dflash_final_norm(&mut enc, registry, device, &h_after_layers, model, cfg, block_size)
-        .context("model_forward: final_norm")?;
-    enc.commit_and_wait().context("model_forward: commit epilogue")?;
+    let h_final = dispatch_dflash_final_norm(
+        &mut enc,
+        registry,
+        device,
+        &h_after_layers,
+        model,
+        cfg,
+        block_size,
+    )
+    .context("model_forward: final_norm")?;
+    enc.commit_and_wait()
+        .context("model_forward: commit epilogue")?;
 
     Ok(h_final)
 }
@@ -1030,7 +1169,16 @@ pub fn dispatch_dflash_decoder_layer(
 ) -> Result<MlxBuffer> {
     // 1. Attention sub-block (internally commits + opens encoders).
     let attn_proj = dispatch_dflash_decoder_layer_attention(
-        registry, device, h, h_ctx, layer_weights, cache_layer, cfg, layer_idx, block_size, ctx_chunk_size,
+        registry,
+        device,
+        h,
+        h_ctx,
+        layer_weights,
+        cache_layer,
+        cfg,
+        layer_idx,
+        block_size,
+        ctx_chunk_size,
     )
     .context("decoder_layer: attention sub-block")?;
 
@@ -1044,13 +1192,27 @@ pub fn dispatch_dflash_decoder_layer(
     enc.memory_barrier();
 
     let post_normed = dispatch_dflash_post_attention_layernorm(
-        &mut enc, registry, device, &h_after_attn, layer_weights, cfg, block_size,
+        &mut enc,
+        registry,
+        device,
+        &h_after_attn,
+        layer_weights,
+        cfg,
+        block_size,
     )
     .context("decoder_layer: post_attention_layernorm")?;
     enc.memory_barrier();
 
-    let mlp_out = dispatch_dflash_mlp(&mut enc, registry, device, &post_normed, layer_weights, cfg, block_size)
-        .context("decoder_layer: mlp")?;
+    let mlp_out = dispatch_dflash_mlp(
+        &mut enc,
+        registry,
+        device,
+        &post_normed,
+        layer_weights,
+        cfg,
+        block_size,
+    )
+    .context("decoder_layer: mlp")?;
     enc.memory_barrier();
 
     let h_out = dispatch_dflash_residual_add(&mut enc, registry, device, &h_after_attn, &mlp_out)
@@ -1127,7 +1289,8 @@ pub fn dispatch_dflash_sdpa_cross_length(
     if kv_seq_len > cache_layer.capacity {
         return Err(anyhow!(
             "sdpa cross-length: kv_seq_len {} > cache.capacity {}",
-            kv_seq_len, cache_layer.capacity
+            kv_seq_len,
+            cache_layer.capacity
         ));
     }
 
@@ -1178,32 +1341,53 @@ pub fn dispatch_dflash_sdpa_cross_length(
 
     // Step 1: GPU permute Q seq-major [L, H_q, D] → head-major [H_q, L, D].
     permute_021_f32(
-        encoder, registry, device.metal_device(),
-        q_seq_major, &q_hm,
-        l, nh, d,
+        encoder,
+        registry,
+        device.metal_device(),
+        q_seq_major,
+        &q_hm,
+        l,
+        nh,
+        d,
     )
     .map_err(|e| anyhow!("permute_021_f32 q seq->hm: {e}"))?;
     encoder.memory_barrier();
 
     // Step 2: SDPA dispatch in same encoder.
     let params = SdpaParams {
-        n_heads, n_kv_heads, head_dim,
-        seq_len: q_seq_len, kv_seq_len, scale,
-        kv_capacity: cache_layer.capacity, do_causal,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        seq_len: q_seq_len,
+        kv_seq_len,
+        scale,
+        kv_capacity: cache_layer.capacity,
+        do_causal,
     };
     sdpa(
-        encoder, registry, device,
-        &q_hm, &cache_layer.keys, &cache_layer.values,
-        &out_hm, &params, 1,
+        encoder,
+        registry,
+        device,
+        &q_hm,
+        &cache_layer.keys,
+        &cache_layer.values,
+        &out_hm,
+        &params,
+        1,
     )
     .map_err(|e| anyhow!("sdpa cross-length: {e}"))?;
     encoder.memory_barrier();
 
     // Step 3: GPU permute output head-major [H_q, L, D] → seq-major [L, H_q, D].
     permute_021_f32(
-        encoder, registry, device.metal_device(),
-        &out_hm, &out_sm,
-        nh, l, d,
+        encoder,
+        registry,
+        device.metal_device(),
+        &out_hm,
+        &out_sm,
+        nh,
+        l,
+        d,
     )
     .map_err(|e| anyhow!("permute_021_f32 out hm->seq: {e}"))?;
 
@@ -1360,7 +1544,11 @@ mod tests {
         let hidden = cfg.hidden_size as u32;
         let elem = (block_size as usize) * (hidden as usize);
         let mut h_input = device
-            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h_input");
         {
             let slice = h_input.as_mut_slice::<f32>().expect("h_input slice");
@@ -1373,61 +1561,121 @@ mod tests {
         let mut encoder = device.command_encoder().expect("encoder");
         let layer = &tensors.layers[0];
         let normed = dispatch_dflash_input_layernorm(
-            &mut encoder, &mut registry, &device, &h_input, layer, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h_input,
+            layer,
+            &cfg,
+            block_size,
         )
         .expect("input_layernorm dispatch");
         encoder.memory_barrier(); // RAW: Q/K/V read `normed`
         let q = dispatch_dflash_q_proj(
-            &mut encoder, &mut registry, &device, &normed, layer, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &normed,
+            layer,
+            &cfg,
+            block_size,
         )
         .expect("q_proj dispatch");
         let k = dispatch_dflash_k_proj(
-            &mut encoder, &mut registry, &device, &normed, layer, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &normed,
+            layer,
+            &cfg,
+            block_size,
         )
         .expect("k_proj dispatch");
         let v = dispatch_dflash_v_proj(
-            &mut encoder, &mut registry, &device, &normed, layer, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &normed,
+            layer,
+            &cfg,
+            block_size,
         )
         .expect("v_proj dispatch");
         encoder.memory_barrier(); // RAW: head_norm reads Q/K just written
 
         // Per-head RMSNorm on Q and K (no v_norm by qwen3 convention)
         let q_normed = dispatch_dflash_head_norm(
-            &mut encoder, &mut registry, &device, &q, &layer.q_norm, &cfg,
-            block_size, cfg.num_attention_heads as u32,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q,
+            &layer.q_norm,
+            &cfg,
+            block_size,
+            cfg.num_attention_heads as u32,
         )
         .expect("q_norm dispatch");
         let k_normed = dispatch_dflash_head_norm(
-            &mut encoder, &mut registry, &device, &k, &layer.k_norm, &cfg,
-            block_size, cfg.num_key_value_heads as u32,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &k,
+            &layer.k_norm,
+            &cfg,
+            block_size,
+            cfg.num_key_value_heads as u32,
         )
         .expect("k_norm dispatch");
         encoder.memory_barrier(); // RAW: RoPE reads q_normed / k_normed
-        // RoPE applied to Q and K (V passes through unrotated)
+                                  // RoPE applied to Q and K (V passes through unrotated)
         let q_roped = dispatch_dflash_rope(
-            &mut encoder, &mut registry, &device, &q_normed, &cfg,
-            block_size, cfg.num_attention_heads as u32, 0,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q_normed,
+            &cfg,
+            block_size,
+            cfg.num_attention_heads as u32,
+            0,
         )
         .expect("q rope dispatch");
         let k_roped = dispatch_dflash_rope(
-            &mut encoder, &mut registry, &device, &k_normed, &cfg,
-            block_size, cfg.num_key_value_heads as u32, 0,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &k_normed,
+            &cfg,
+            block_size,
+            cfg.num_key_value_heads as u32,
+            0,
         )
         .expect("k rope dispatch");
         encoder.memory_barrier(); // RAW: SDPA reads Q_roped/K_roped/V
-        // SDPA: self-attention form (kv_seq_len = q_seq_len = block_size).
-        // The cross-length form (kv_seq_len > q_seq_len) for DFlash's
-        // ctx+prop concat is Phase 3 territory.
+                                  // SDPA: self-attention form (kv_seq_len = q_seq_len = block_size).
+                                  // The cross-length form (kv_seq_len > q_seq_len) for DFlash's
+                                  // ctx+prop concat is Phase 3 territory.
         let attn_out = dispatch_dflash_sdpa_self_attn(
-            &mut encoder, &mut registry, &device,
-            &q_roped, &k_roped, &v, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q_roped,
+            &k_roped,
+            &v,
+            &cfg,
+            block_size,
         )
         .expect("sdpa dispatch");
         // apply_sdpa_causal_from_seq_major internally commits, so the
         // next encoder is a fresh one — final O proj happens on it.
         let mut encoder = device.command_encoder().expect("encoder2");
         let h_out = dispatch_dflash_o_proj(
-            &mut encoder, &mut registry, &device, &attn_out, layer, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &attn_out,
+            layer,
+            &cfg,
+            block_size,
         )
         .expect("o_proj dispatch");
         encoder.commit_and_wait().expect("commit2");
@@ -1520,20 +1768,32 @@ mod tests {
         // Input h [L, hidden] F32-ones (stand-in for embed_tokens output)
         let h_elem = (block_size as usize) * (hidden as usize);
         let mut h = device
-            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                h_elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h");
         {
             let s = h.as_mut_slice::<f32>().expect("h slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
 
         // target_hidden_concat [S, fc_input_dim] F32 (synthetic)
         let thc_elem = (ctx_chunk as usize) * (fc_in as usize);
         let mut target_hidden = device
-            .alloc_buffer(thc_elem * 4, DType::F32, vec![ctx_chunk as usize, fc_in as usize])
+            .alloc_buffer(
+                thc_elem * 4,
+                DType::F32,
+                vec![ctx_chunk as usize, fc_in as usize],
+            )
             .expect("alloc target_hidden");
         {
-            let s = target_hidden.as_mut_slice::<f32>().expect("target_hidden slice");
+            let s = target_hidden
+                .as_mut_slice::<f32>()
+                .expect("target_hidden slice");
             for (i, v) in s.iter_mut().enumerate() {
                 *v = 0.1 + ((i % 17) as f32) / 170.0;
             }
@@ -1542,18 +1802,29 @@ mod tests {
         let initial_seq_lens: Vec<u32> = cache.layers.iter().map(|l| l.seq_len).collect();
 
         let h_final = dispatch_dflash_model_forward(
-            &mut registry, &device, &h, &target_hidden,
-            &tensors, &mut cache, &cfg, block_size, ctx_chunk,
+            &mut registry,
+            &device,
+            &h,
+            &target_hidden,
+            &tensors,
+            &mut cache,
+            &cfg,
+            block_size,
+            ctx_chunk,
         )
         .expect("model forward");
 
         // Shape: [L, hidden]
-        assert_eq!(h_final.element_count(), (block_size as usize) * (hidden as usize));
+        assert_eq!(
+            h_final.element_count(),
+            (block_size as usize) * (hidden as usize)
+        );
         let host: &[f32] = h_final.as_slice::<f32>().expect("h_final slice");
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         let n_zero = host.iter().filter(|v| **v == 0.0).count();
         assert_eq!(
-            n_finite, host.len(),
+            n_finite,
+            host.len(),
             "model forward output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
             host.len()
         );
@@ -1604,15 +1875,25 @@ mod tests {
 
         let h_elem = (block_size as usize) * (hidden as usize);
         let mut h = device
-            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                h_elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h");
         {
             let s = h.as_mut_slice::<f32>().expect("h slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
         let hctx_elem = (ctx_chunk as usize) * (hidden as usize);
         let mut h_ctx = device
-            .alloc_buffer(hctx_elem * 4, DType::F32, vec![ctx_chunk as usize, hidden as usize])
+            .alloc_buffer(
+                hctx_elem * 4,
+                DType::F32,
+                vec![ctx_chunk as usize, hidden as usize],
+            )
             .expect("alloc h_ctx");
         {
             let s = h_ctx.as_mut_slice::<f32>().expect("h_ctx slice");
@@ -1625,18 +1906,29 @@ mod tests {
         let initial_seq_len = cache.layers[layer_idx].seq_len;
 
         let h_out = dispatch_dflash_decoder_layer(
-            &mut registry, &device, &h, &h_ctx,
-            &tensors.layers[layer_idx], &mut cache.layers[layer_idx],
-            &cfg, layer_idx, block_size, ctx_chunk,
+            &mut registry,
+            &device,
+            &h,
+            &h_ctx,
+            &tensors.layers[layer_idx],
+            &mut cache.layers[layer_idx],
+            &cfg,
+            layer_idx,
+            block_size,
+            ctx_chunk,
         )
         .expect("decoder layer forward");
 
-        assert_eq!(h_out.element_count(), (block_size as usize) * (hidden as usize));
+        assert_eq!(
+            h_out.element_count(),
+            (block_size as usize) * (hidden as usize)
+        );
         let host: &[f32] = h_out.as_slice::<f32>().expect("h_out slice");
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         let n_zero = host.iter().filter(|v| **v == 0.0).count();
         assert_eq!(
-            n_finite, host.len(),
+            n_finite,
+            host.len(),
             "decoder layer forward output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
             host.len()
         );
@@ -1687,16 +1979,26 @@ mod tests {
         // Build synthetic h [L, hidden] F32-ones
         let h_elem = (block_size as usize) * (hidden as usize);
         let mut h = device
-            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                h_elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h");
         {
             let s = h.as_mut_slice::<f32>().expect("h slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
         // Build synthetic h_ctx [S, hidden] F32 with varied values
         let hctx_elem = (ctx_chunk as usize) * (hidden as usize);
         let mut h_ctx = device
-            .alloc_buffer(hctx_elem * 4, DType::F32, vec![ctx_chunk as usize, hidden as usize])
+            .alloc_buffer(
+                hctx_elem * 4,
+                DType::F32,
+                vec![ctx_chunk as usize, hidden as usize],
+            )
             .expect("alloc h_ctx");
         {
             let s = h_ctx.as_mut_slice::<f32>().expect("h_ctx slice");
@@ -1710,20 +2012,31 @@ mod tests {
         let initial_seq_len = cache.layers[layer_idx].seq_len;
 
         let attn_out = dispatch_dflash_decoder_layer_attention(
-            &mut registry, &device, &h, &h_ctx,
-            &tensors.layers[layer_idx], &mut cache.layers[layer_idx],
-            &cfg, layer_idx, block_size, ctx_chunk,
+            &mut registry,
+            &device,
+            &h,
+            &h_ctx,
+            &tensors.layers[layer_idx],
+            &mut cache.layers[layer_idx],
+            &cfg,
+            layer_idx,
+            block_size,
+            ctx_chunk,
         )
         .expect("decoder layer attention");
 
         // Validate output [L, hidden] F32
-        assert_eq!(attn_out.element_count(), (block_size as usize) * (hidden as usize));
+        assert_eq!(
+            attn_out.element_count(),
+            (block_size as usize) * (hidden as usize)
+        );
 
         let host: &[f32] = attn_out.as_slice::<f32>().expect("attn_out slice");
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         let n_zero = host.iter().filter(|v| **v == 0.0).count();
         assert_eq!(
-            n_finite, host.len(),
+            n_finite,
+            host.len(),
             "decoder layer attention output must be finite (got {n_finite}/{}; n_zero={n_zero})",
             host.len()
         );
@@ -1798,8 +2111,15 @@ mod tests {
 
         let mut encoder = device.command_encoder().expect("encoder");
         let out = dispatch_dflash_sdpa_cross_length(
-            &mut encoder, &mut registry, &device,
-            &q, &cache.layers[layer_idx], &cfg, q_seq_len, ctx_len, true,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q,
+            &cache.layers[layer_idx],
+            &cfg,
+            q_seq_len,
+            ctx_len,
+            true,
         )
         .expect("sdpa cross-length");
 
@@ -1809,7 +2129,8 @@ mod tests {
         let host: &[f32] = out.as_slice::<f32>().expect("out slice");
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         assert_eq!(
-            n_finite, host.len(),
+            n_finite,
+            host.len(),
             "cross-length SDPA output must be all finite (got {n_finite}/{})",
             host.len()
         );
@@ -1854,17 +2175,31 @@ mod tests {
             let s = target_hidden
                 .as_mut_slice::<f32>()
                 .expect("target_hidden slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
 
         let mut encoder = device.command_encoder().expect("encoder1");
         let fc_out = dispatch_dflash_fc(
-            &mut encoder, &mut registry, &device, &target_hidden, &tensors, &cfg, ctx_seq_len,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &target_hidden,
+            &tensors,
+            &cfg,
+            ctx_seq_len,
         )
         .expect("fc dispatch");
         encoder.memory_barrier();
         let h_ctx = dispatch_dflash_hidden_norm(
-            &mut encoder, &mut registry, &device, &fc_out, &tensors, &cfg, ctx_seq_len,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &fc_out,
+            &tensors,
+            &cfg,
+            ctx_seq_len,
         )
         .expect("hidden_norm dispatch");
 
@@ -1873,14 +2208,26 @@ mod tests {
         let hidden = cfg.hidden_size as u32;
         let h_elem = (block_size as usize) * (hidden as usize);
         let mut h = device
-            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                h_elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h");
         {
             let s = h.as_mut_slice::<f32>().expect("h slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
         let h_final = dispatch_dflash_final_norm(
-            &mut encoder, &mut registry, &device, &h, &tensors, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h,
+            &tensors,
+            &cfg,
+            block_size,
         )
         .expect("final_norm dispatch");
 
@@ -1920,7 +2267,8 @@ mod tests {
             let host: &[f32] = buf.as_slice::<f32>().expect("host slice");
             let n_finite = host.iter().filter(|v| v.is_finite()).count();
             assert_eq!(
-                n_finite, host.len(),
+                n_finite,
+                host.len(),
                 "{name}: all values must be finite (got {n_finite}/{})",
                 host.len()
             );
@@ -1936,7 +2284,10 @@ mod tests {
         );
         // And: the 100.0 inputs must be capped significantly down.
         let near_cap = s_host.iter().filter(|v| **v > cap - 0.5).count();
-        assert!(near_cap > 0, "expected some outputs near cap; got max_abs={max_abs}");
+        assert!(
+            near_cap > 0,
+            "expected some outputs near cap; got max_abs={max_abs}"
+        );
     }
 
     /// Independent layer-forward smoke test (self-attn form).
@@ -1976,11 +2327,17 @@ mod tests {
         let hidden = cfg.hidden_size as u32;
         let elem = (block_size as usize) * (hidden as usize);
         let mut h0 = device
-            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h0");
         {
             let s = h0.as_mut_slice::<f32>().expect("h0 slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
 
         let layer = &tensors.layers[0];
@@ -1990,63 +2347,158 @@ mod tests {
         // ====== Attention sub-block ======
         let mut encoder = device.command_encoder().expect("encoder1");
         let h0_normed = dispatch_dflash_input_layernorm(
-            &mut encoder, &mut registry, &device, &h0, layer, &cfg, block_size,
-        ).expect("input_norm");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h0,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("input_norm");
         encoder.memory_barrier();
         let q = dispatch_dflash_q_proj(
-            &mut encoder, &mut registry, &device, &h0_normed, layer, &cfg, block_size,
-        ).expect("q_proj");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h0_normed,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("q_proj");
         let k = dispatch_dflash_k_proj(
-            &mut encoder, &mut registry, &device, &h0_normed, layer, &cfg, block_size,
-        ).expect("k_proj");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h0_normed,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("k_proj");
         let v = dispatch_dflash_v_proj(
-            &mut encoder, &mut registry, &device, &h0_normed, layer, &cfg, block_size,
-        ).expect("v_proj");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h0_normed,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("v_proj");
         encoder.memory_barrier();
         let q_normed = dispatch_dflash_head_norm(
-            &mut encoder, &mut registry, &device, &q, &layer.q_norm, &cfg,
-            block_size, cfg.num_attention_heads as u32,
-        ).expect("q_norm");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q,
+            &layer.q_norm,
+            &cfg,
+            block_size,
+            cfg.num_attention_heads as u32,
+        )
+        .expect("q_norm");
         let k_normed = dispatch_dflash_head_norm(
-            &mut encoder, &mut registry, &device, &k, &layer.k_norm, &cfg,
-            block_size, cfg.num_key_value_heads as u32,
-        ).expect("k_norm");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &k,
+            &layer.k_norm,
+            &cfg,
+            block_size,
+            cfg.num_key_value_heads as u32,
+        )
+        .expect("k_norm");
         encoder.memory_barrier();
         let q_roped = dispatch_dflash_rope(
-            &mut encoder, &mut registry, &device, &q_normed, &cfg,
-            block_size, cfg.num_attention_heads as u32, 0,
-        ).expect("q rope");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q_normed,
+            &cfg,
+            block_size,
+            cfg.num_attention_heads as u32,
+            0,
+        )
+        .expect("q rope");
         let k_roped = dispatch_dflash_rope(
-            &mut encoder, &mut registry, &device, &k_normed, &cfg,
-            block_size, cfg.num_key_value_heads as u32, 0,
-        ).expect("k rope");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &k_normed,
+            &cfg,
+            block_size,
+            cfg.num_key_value_heads as u32,
+            0,
+        )
+        .expect("k rope");
         encoder.memory_barrier();
         let attn_out = dispatch_dflash_sdpa_self_attn(
-            &mut encoder, &mut registry, &device, &q_roped, &k_roped, &v, &cfg, block_size,
-        ).expect("sdpa");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q_roped,
+            &k_roped,
+            &v,
+            &cfg,
+            block_size,
+        )
+        .expect("sdpa");
         // sdpa internally commits + returns; fresh encoder for o_proj + residual
         let mut encoder = device.command_encoder().expect("encoder2");
         let h_after_attn_proj = dispatch_dflash_o_proj(
-            &mut encoder, &mut registry, &device, &attn_out, layer, &cfg, block_size,
-        ).expect("o_proj");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &attn_out,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("o_proj");
         encoder.memory_barrier();
         let h_after_attn = dispatch_dflash_residual_add(
-            &mut encoder, &mut registry, &device, &h0, &h_after_attn_proj,
-        ).expect("residual1");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h0,
+            &h_after_attn_proj,
+        )
+        .expect("residual1");
 
         // ====== MLP sub-block ======
         encoder.memory_barrier();
         let post_normed = dispatch_dflash_post_attention_layernorm(
-            &mut encoder, &mut registry, &device, &h_after_attn, layer, &cfg, block_size,
-        ).expect("post_norm");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h_after_attn,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("post_norm");
         encoder.memory_barrier();
         let mlp_out = dispatch_dflash_mlp(
-            &mut encoder, &mut registry, &device, &post_normed, layer, &cfg, block_size,
-        ).expect("mlp");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &post_normed,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("mlp");
         encoder.memory_barrier();
         let h_out = dispatch_dflash_residual_add(
-            &mut encoder, &mut registry, &device, &h_after_attn, &mlp_out,
-        ).expect("residual2");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h_after_attn,
+            &mlp_out,
+        )
+        .expect("residual2");
         encoder.commit_and_wait().expect("final commit");
 
         // Validate final layer output shape + finite/non-trivial.
@@ -2058,7 +2510,8 @@ mod tests {
         let n_finite = host_final.iter().filter(|v| v.is_finite()).count();
         let n_zero = host_final.iter().filter(|v| **v == 0.0).count();
         assert_eq!(
-            n_finite, host_final.len(),
+            n_finite,
+            host_final.len(),
             "decoder layer output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
             host_final.len()
         );
@@ -2096,17 +2549,29 @@ mod tests {
         let q_dim = (cfg.num_attention_heads * cfg.head_dim) as u32; // 32 * 128 = 4096
         let elem = (block_size as usize) * (q_dim as usize);
         let mut attn_out = device
-            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, q_dim as usize])
+            .alloc_buffer(
+                elem * 4,
+                DType::F32,
+                vec![block_size as usize, q_dim as usize],
+            )
             .expect("alloc attn_out");
         {
             let s = attn_out.as_mut_slice::<f32>().expect("attn_out slice");
-            for v in s.iter_mut() { *v = 1.0; }
+            for v in s.iter_mut() {
+                *v = 1.0;
+            }
         }
 
         let mut encoder = device.command_encoder().expect("encoder");
         let layer = &tensors.layers[0];
         let h_out = dispatch_dflash_o_proj(
-            &mut encoder, &mut registry, &device, &attn_out, layer, &cfg, block_size,
+            &mut encoder,
+            &mut registry,
+            &device,
+            &attn_out,
+            layer,
+            &cfg,
+            block_size,
         )
         .expect("o_proj dispatch");
         encoder.commit_and_wait().expect("commit");
@@ -2117,10 +2582,17 @@ mod tests {
         let host: &[f32] = h_out.as_slice::<f32>().expect("h_out slice");
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         let n_zero = host.iter().filter(|v| **v == 0.0).count();
-        assert_eq!(n_finite, host.len(),
-            "O projection output must be all finite (got {n_finite}/{}; n_zero={n_zero})", host.len());
-        assert!(n_zero < host.len() / 2,
-            "O projection output suspiciously sparse (n_zero={n_zero}/{})", host.len());
+        assert_eq!(
+            n_finite,
+            host.len(),
+            "O projection output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
+            host.len()
+        );
+        assert!(
+            n_zero < host.len() / 2,
+            "O projection output suspiciously sparse (n_zero={n_zero}/{})",
+            host.len()
+        );
     }
 
     /// Independent MLP smoke test: load drafter, apply
@@ -2150,23 +2622,43 @@ mod tests {
         let hidden = cfg.hidden_size as u32;
         let elem = (block_size as usize) * (hidden as usize);
         let mut h = device
-            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .alloc_buffer(
+                elem * 4,
+                DType::F32,
+                vec![block_size as usize, hidden as usize],
+            )
             .expect("alloc h");
         {
             let slice = h.as_mut_slice::<f32>().expect("h slice");
-            for v in slice.iter_mut() { *v = 1.0; }
+            for v in slice.iter_mut() {
+                *v = 1.0;
+            }
         }
 
         // Encoder: post_norm → MLP
         let mut encoder = device.command_encoder().expect("encoder");
         let layer = &tensors.layers[0];
         let post_normed = dispatch_dflash_post_attention_layernorm(
-            &mut encoder, &mut registry, &device, &h, layer, &cfg, block_size,
-        ).expect("post_norm");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &h,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("post_norm");
         encoder.memory_barrier();
         let mlp_out = dispatch_dflash_mlp(
-            &mut encoder, &mut registry, &device, &post_normed, layer, &cfg, block_size,
-        ).expect("mlp");
+            &mut encoder,
+            &mut registry,
+            &device,
+            &post_normed,
+            layer,
+            &cfg,
+            block_size,
+        )
+        .expect("mlp");
         encoder.commit_and_wait().expect("commit");
 
         // Validate shape: [block_size, hidden_size]
@@ -2177,7 +2669,8 @@ mod tests {
         let n_finite = host.iter().filter(|v| v.is_finite()).count();
         let n_zero = host.iter().filter(|v| **v == 0.0).count();
         assert_eq!(
-            n_finite, host.len(),
+            n_finite,
+            host.len(),
             "MLP output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
             host.len()
         );

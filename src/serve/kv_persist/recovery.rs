@@ -28,7 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use crate::serve::kv_persist::format::{self, EnvelopeHeader, ModelFingerprint, CURRENT_FORMAT_VERSION};
+use crate::serve::kv_persist::format::{
+    self, EnvelopeHeader, ModelFingerprint, CURRENT_FORMAT_VERSION,
+};
 use crate::serve::kv_persist::index::{BlockIndex, BlockMeta};
 use crate::serve::kv_persist::metrics::{KvCacheMetricsSink, KvQuarantineReason};
 
@@ -434,8 +436,7 @@ mod tests {
 
     impl crate::serve::kv_persist::metrics::KvCacheMetricsSink for TestMetricsSink {
         fn record_quarantine(&self, reason: KvQuarantineReason) {
-            self.quarantines[reason.index()]
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.quarantines[reason.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         fn record_eviction_budget_overflow(&self) {
             self.evictions[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -516,7 +517,10 @@ mod tests {
         let (idx, report) = recover_from_disk(&dir).expect("recover");
         assert_eq!(report.blocks_indexed, 50);
         assert_eq!(report.blocks_quarantined, 0);
-        assert_eq!(report.bytes_indexed, total_bytes, "bytes match real fs::metadata sum");
+        assert_eq!(
+            report.bytes_indexed, total_bytes,
+            "bytes match real fs::metadata sum"
+        );
         assert_eq!(report.partial_tmp_files_ignored, 0);
         assert_eq!(idx.block_count(), 50);
 
@@ -528,7 +532,10 @@ mod tests {
         }
 
         // No quarantine dir created on a clean recovery.
-        let q = dir.join("models").join(fp.short_hex()).join("kv-quarantine");
+        let q = dir
+            .join("models")
+            .join(fp.short_hex())
+            .join("kv-quarantine");
         assert!(!q.exists(), "no quarantine on clean recovery");
 
         let _ = fs::remove_dir_all(&dir);
@@ -585,7 +592,10 @@ mod tests {
         assert_eq!(idx.block_count(), 3);
 
         // Quarantine dir contains 2 files with prefixed names.
-        let q = dir.join("models").join(fp.short_hex()).join("kv-quarantine");
+        let q = dir
+            .join("models")
+            .join(fp.short_hex())
+            .join("kv-quarantine");
         let q_files: Vec<String> = fs::read_dir(&q)
             .expect("read q")
             .filter_map(|e| e.ok())
@@ -593,7 +603,10 @@ mod tests {
             .collect();
         assert_eq!(q_files.len(), 2, "two quarantined files; saw {q_files:?}");
         // One has the truncation prefix, one has the version prefix.
-        assert!(q_files.iter().any(|n| n.starts_with("trunc__")), "trunc__ prefix");
+        assert!(
+            q_files.iter().any(|n| n.starts_with("trunc__")),
+            "trunc__ prefix"
+        );
         assert!(
             q_files.iter().any(|n| n.starts_with("verbump__")),
             "verbump__ prefix"
@@ -630,7 +643,10 @@ mod tests {
         let dest_str = dest.to_string_lossy();
         assert!(dest_str.contains("/kv-quarantine/"));
         let dest_name = dest.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(dest_name.starts_with("trunc__"), "trunc prefix: {dest_name}");
+        assert!(
+            dest_name.starts_with("trunc__"),
+            "trunc prefix: {dest_name}"
+        );
         assert!(dest_name.ends_with(".safetensors"));
 
         // Bytes round-trip (we just moved the file; content is unchanged).
@@ -778,8 +794,8 @@ mod tests {
                 tv_usec: 0,
             },
         ];
-        let cstr = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-            .expect("path -> cstring");
+        let cstr =
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path -> cstring");
         let rc = unsafe { libc::utimes(cstr.as_ptr(), tv.as_ptr()) };
         rc == 0
     }
@@ -910,13 +926,9 @@ mod tests {
         let (body2, header2) = make_block(fp, ParentBlockHash(None), 100);
         let original2 = block_path(&dir, &fp, &header2.block_hash);
         write_envelope(&original2, &header2, &body2).expect("write");
-        let _ = quarantine_corrupted_block(
-            &dir,
-            &fp,
-            &original2,
-            QuarantineReason::BodyHashMismatch,
-        )
-        .expect("quarantine");
+        let _ =
+            quarantine_corrupted_block(&dir, &fp, &original2, QuarantineReason::BodyHashMismatch)
+                .expect("quarantine");
         assert_eq!(
             concrete.snapshot_quarantines(),
             [2u64, 1, 1, 1],

@@ -163,8 +163,7 @@ const ENV_PHASE_D_R_P6: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P6";
 
 /// Sourdough prompt — byte-identical to `scripts/sourdough_gate.sh`
 /// (DO NOT fix the typo; it is load-bearing for the fixture trajectory).
-const SOURDOUGH_PROMPT: &str =
-    "Complrehensive instructions for making sourdough bread.";
+const SOURDOUGH_PROMPT: &str = "Complrehensive instructions for making sourdough bread.";
 
 /// Sourdough decode-token cap — matches `sourdough_gate.sh::MAX_TOKENS`.
 const SOURDOUGH_MAX_TOKENS: u32 = 1000;
@@ -337,11 +336,16 @@ impl Cell {
 /// Generate the full matrix: every (quant, prefix, scenario) triple.
 /// Total = 5 × 4 × 3 = 60 cells.
 pub fn generate_matrix() -> Vec<Cell> {
-    let mut out = Vec::with_capacity(WeightQuant::ALL.len() * PrefixLength::ALL.len() * Scenario::ALL.len());
+    let mut out =
+        Vec::with_capacity(WeightQuant::ALL.len() * PrefixLength::ALL.len() * Scenario::ALL.len());
     for &quant in WeightQuant::ALL {
         for &prefix in PrefixLength::ALL {
             for &scenario in Scenario::ALL {
-                out.push(Cell { quant, prefix, scenario });
+                out.push(Cell {
+                    quant,
+                    prefix,
+                    scenario,
+                });
             }
         }
     }
@@ -559,9 +563,8 @@ pub fn run_cell_e2e(cell: &Cell, model_path: &Path, cache_dir: &Path) -> Result<
             model_path.display()
         ));
     }
-    std::fs::create_dir_all(cache_dir).map_err(|e| {
-        format!("mkdir cache_dir {}: {e}", cache_dir.display())
-    })?;
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| format!("mkdir cache_dir {}: {e}", cache_dir.display()))?;
 
     // Per-cell port: pin to the Phase D default. Sequential cell
     // execution (`--test-threads=1`) means there's never overlap.
@@ -601,13 +604,9 @@ pub fn run_cell_e2e(cell: &Cell, model_path: &Path, cache_dir: &Path) -> Result<
         .join(" ");
     let max_decode_tokens: u32 = 16;
 
-    let baseline = phase_d_driver::decode_full_text(
-        &server,
-        &canonical,
-        &prompt,
-        max_decode_tokens,
-    )
-    .map_err(|e| format!("baseline decode: {e}"))?;
+    let baseline =
+        phase_d_driver::decode_full_text(&server, &canonical, &prompt, max_decode_tokens)
+            .map_err(|e| format!("baseline decode: {e}"))?;
 
     // ColdLoad: just the baseline. Sanity-check non-empty decode.
     if matches!(cell.scenario, Scenario::ColdLoad) {
@@ -622,28 +621,19 @@ pub fn run_cell_e2e(cell: &Cell, model_path: &Path, cache_dir: &Path) -> Result<
 
     // EvictReadmit / Restart: force eviction via symlink, then
     // re-drive the SAME prompt and assert byte-exact decoded text.
-    let tmp_link_dir = tempfile::tempdir()
-        .map_err(|e| format!("tempdir for symlink: {e}"))?;
+    let tmp_link_dir = tempfile::tempdir().map_err(|e| format!("tempdir for symlink: {e}"))?;
     let (_link_path, _evict_wall_ms, _second_ttft_ms) =
-        phase_d_driver::force_eviction_via_symlink(
-            &server,
-            model_path,
-            tmp_link_dir.path(),
-        )
-        .map_err(|e| format!("force eviction: {e}"))?;
+        phase_d_driver::force_eviction_via_symlink(&server, model_path, tmp_link_dir.path())
+            .map_err(|e| format!("force eviction: {e}"))?;
     // Note: tmp_link_dir must outlive the eviction request — kept in
     // scope by binding above. The Restart scenario differs from
     // EvictReadmit only in pool-cache state semantics; both routes
     // read the same dense_kvs round-trip path under the hood.
     let _ = &tmp_link_dir;
 
-    let restored = phase_d_driver::decode_full_text(
-        &server,
-        &canonical,
-        &prompt,
-        max_decode_tokens,
-    )
-    .map_err(|e| format!("restored decode: {e}"))?;
+    let restored =
+        phase_d_driver::decode_full_text(&server, &canonical, &prompt, max_decode_tokens)
+            .map_err(|e| format!("restored decode: {e}"))?;
 
     if baseline.text != restored.text {
         let n = baseline.text.len().min(restored.text.len());
@@ -766,10 +756,7 @@ fn each_cell_payload_kind_includes_quant_prefix_scenario() {
             "payload_kind '{kind}' missing scenario tag '{}'",
             c.scenario.tag()
         );
-        assert!(
-            kinds.insert(kind.clone()),
-            "duplicate payload_kind: {kind}"
-        );
+        assert!(kinds.insert(kind.clone()), "duplicate payload_kind: {kind}");
     }
     assert_eq!(kinds.len(), 60, "60 distinct payload_kind tags");
 }
@@ -800,7 +787,10 @@ fn matrix_runnable_subset_filters_to_production_quants() {
     // Production-quant cells form the runnable substrate. Count
     // matches: 3 production quants × 4 prefix lengths × 3 scenarios
     // = 36 cells.
-    let prod_cells: Vec<&Cell> = cells.iter().filter(|c| c.quant.is_production_quant()).collect();
+    let prod_cells: Vec<&Cell> = cells
+        .iter()
+        .filter(|c| c.quant.is_production_quant())
+        .collect();
     assert_eq!(
         prod_cells.len(),
         36,
@@ -1128,15 +1118,11 @@ fn kv_persist_phase_d_coherence_e2e() {
         "[Phase D coherence] baseline output is empty — server returned 0-byte SSE stream"
     );
 
-    let tmp_link_dir = tempfile::tempdir()
-        .expect("[Phase D coherence] tempdir for symlink-eviction-trick");
+    let tmp_link_dir =
+        tempfile::tempdir().expect("[Phase D coherence] tempdir for symlink-eviction-trick");
     let (_link_path, evict_wall_ms, second_ttft_ms) =
-        phase_d_driver::force_eviction_via_symlink(
-            &server,
-            &model_path,
-            tmp_link_dir.path(),
-        )
-        .expect("[Phase D coherence] force eviction via symlink");
+        phase_d_driver::force_eviction_via_symlink(&server, &model_path, tmp_link_dir.path())
+            .expect("[Phase D coherence] force eviction via symlink");
     eprintln!(
         "[Phase D coherence] eviction cycle: wall={:.1}ms second_ttft={:.1}ms",
         evict_wall_ms, second_ttft_ms
@@ -1197,9 +1183,7 @@ fn kv_persist_phase_d_coherence_e2e() {
     // assert both A and B share >= 3094 bytes common prefix with it.
     let peer_active = std::env::var(ENV_PHASE_D_PEER).as_deref() == Ok("1");
     if !peer_active {
-        eprintln!(
-            "[Phase D coherence] peer arm skipped ({ENV_PHASE_D_PEER}=1 to enable)"
-        );
+        eprintln!("[Phase D coherence] peer arm skipped ({ENV_PHASE_D_PEER}=1 to enable)");
         return;
     }
 
@@ -1214,13 +1198,15 @@ fn kv_persist_phase_d_coherence_e2e() {
             return;
         }
     };
-    eprintln!("[Phase D coherence] llama-completion bin: {}", llama_bin.display());
+    eprintln!(
+        "[Phase D coherence] llama-completion bin: {}",
+        llama_bin.display()
+    );
 
     // Render the chat template via hf2q (BOS-included), then strip the
     // leading literal `<bos>` for llama-completion. Mirrors
     // `scripts/sourdough_gate.sh:115-140`.
-    let rendered_dir = tempfile::tempdir()
-        .expect("[Phase D coherence] rendered-prompt tempdir");
+    let rendered_dir = tempfile::tempdir().expect("[Phase D coherence] rendered-prompt tempdir");
     let rendered_path = rendered_dir.path().join("rendered.txt");
     let rendered_path_nobos = rendered_dir.path().join("rendered_nobos.txt");
     let render_out = Command::new(&bin)
@@ -1246,8 +1232,7 @@ fn kv_persist_phase_d_coherence_e2e() {
             String::from_utf8_lossy(&render_out.stderr),
         );
     }
-    let rendered = std::fs::read(&rendered_path)
-        .expect("[Phase D coherence] read rendered prompt");
+    let rendered = std::fs::read(&rendered_path).expect("[Phase D coherence] read rendered prompt");
     assert!(
         rendered.starts_with(b"<bos>"),
         "[Phase D coherence] rendered prompt does not start with literal '<bos>' \
@@ -1303,7 +1288,10 @@ fn kv_persist_phase_d_coherence_e2e() {
         common_restored,
         SOURDOUGH_MIN_COMMON_PREFIX,
     );
-    eprintln!("[R-C4 peer] PASS — both arms share >= {} bytes with llama.cpp", SOURDOUGH_MIN_COMMON_PREFIX);
+    eprintln!(
+        "[R-C4 peer] PASS — both arms share >= {} bytes with llama.cpp",
+        SOURDOUGH_MIN_COMMON_PREFIX
+    );
 }
 
 /// Phase D R-P4 ship-gate test (env-gated by
@@ -1413,13 +1401,8 @@ fn kv_persist_phase_d_r_p4_e2e() {
 
     // No-cache run: prompts the on-disk persistence layer for the
     // first time. TTFT here is the cold-prefill cost.
-    let no_cache = phase_d_driver::decode_full_text(
-        &server,
-        &canonical,
-        &prompt,
-        4,
-    )
-    .expect("[Phase D R-P4] no-cache decode");
+    let no_cache = phase_d_driver::decode_full_text(&server, &canonical, &prompt, 4)
+        .expect("[Phase D R-P4] no-cache decode");
     eprintln!(
         "[Phase D R-P4] no_cache_ttft={:.1}ms (prompt_tokens={:?}, total_tokens={})",
         no_cache.ttft_ms, no_cache.prompt_tokens, no_cache.total_tokens
@@ -1427,27 +1410,15 @@ fn kv_persist_phase_d_r_p4_e2e() {
 
     // Force eviction so the next request must hit the on-disk cache
     // rather than the in-RAM KV state from the no-cache run.
-    let tmp_link_dir = tempfile::tempdir()
-        .expect("[Phase D R-P4] tempdir for symlink-eviction-trick");
+    let tmp_link_dir =
+        tempfile::tempdir().expect("[Phase D R-P4] tempdir for symlink-eviction-trick");
     let (_link_path, evict_wall_ms, _second_ttft_ms) =
-        phase_d_driver::force_eviction_via_symlink(
-            &server,
-            &model_path,
-            tmp_link_dir.path(),
-        )
-        .expect("[Phase D R-P4] force eviction via symlink");
-    eprintln!(
-        "[Phase D R-P4] eviction cycle wall={:.1}ms",
-        evict_wall_ms
-    );
+        phase_d_driver::force_eviction_via_symlink(&server, &model_path, tmp_link_dir.path())
+            .expect("[Phase D R-P4] force eviction via symlink");
+    eprintln!("[Phase D R-P4] eviction cycle wall={:.1}ms", evict_wall_ms);
 
-    let cache_hit = phase_d_driver::decode_full_text(
-        &server,
-        &canonical,
-        &prompt,
-        4,
-    )
-    .expect("[Phase D R-P4] cache-hit decode");
+    let cache_hit = phase_d_driver::decode_full_text(&server, &canonical, &prompt, 4)
+        .expect("[Phase D R-P4] cache-hit decode");
     eprintln!(
         "[Phase D R-P4] cache_hit_ttft={:.1}ms (prompt_tokens={:?}, total_tokens={})",
         cache_hit.ttft_ms, cache_hit.prompt_tokens, cache_hit.total_tokens
@@ -1588,24 +1559,18 @@ fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
     // Both regimes are part of R-P1's contract.
     let mut baseline_ttfts: Vec<f64> = Vec::with_capacity(N_SAMPLES);
     for i in 0..N_SAMPLES {
-        let cap = phase_d_driver::decode_full_text(
-            &server,
-            &canonical,
-            prompt,
-            MAX_TOKENS,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "[Phase D R-P1] baseline decode #{i} failed: {e}\n\
+        let cap = phase_d_driver::decode_full_text(&server, &canonical, prompt, MAX_TOKENS)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P1] baseline decode #{i} failed: {e}\n\
                  --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                server.log_tail().len(),
-                server.log_tail().join("\n"),
-            )
-        });
+                    server.log_tail().len(),
+                    server.log_tail().join("\n"),
+                )
+            });
         baseline_ttfts.push(cap.ttft_ms);
     }
-    let baseline_ttft_avg: f64 =
-        baseline_ttfts.iter().sum::<f64>() / (baseline_ttfts.len() as f64);
+    let baseline_ttft_avg: f64 = baseline_ttfts.iter().sum::<f64>() / (baseline_ttfts.len() as f64);
     eprintln!(
         "[Phase D R-P1] baseline_ttft_avg={:.1}ms (samples={:?})",
         baseline_ttft_avg, baseline_ttfts
@@ -1617,40 +1582,31 @@ fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
     // path while the inference thread is decoding.
     let mut sustained_ttfts: Vec<f64> = Vec::with_capacity(N_SAMPLES);
     for i in 0..N_SAMPLES {
-        let tmp_link_dir = tempfile::tempdir()
-            .expect("[Phase D R-P1] tempdir for symlink-eviction-trick");
+        let tmp_link_dir =
+            tempfile::tempdir().expect("[Phase D R-P1] tempdir for symlink-eviction-trick");
         let (_link_path, evict_wall_ms, _second_ttft_ms) =
-            phase_d_driver::force_eviction_via_symlink(
-                &server,
-                &model_path,
-                tmp_link_dir.path(),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "[Phase D R-P1] force eviction #{i} failed: {e}\n\
+            phase_d_driver::force_eviction_via_symlink(&server, &model_path, tmp_link_dir.path())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "[Phase D R-P1] force eviction #{i} failed: {e}\n\
                      --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                    server.log_tail().len(),
-                    server.log_tail().join("\n"),
-                )
-            });
+                        server.log_tail().len(),
+                        server.log_tail().join("\n"),
+                    )
+                });
         eprintln!(
             "[Phase D R-P1] sustained #{i} eviction cycle wall={:.1}ms",
             evict_wall_ms
         );
-        let cap = phase_d_driver::decode_full_text(
-            &server,
-            &canonical,
-            prompt,
-            MAX_TOKENS,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "[Phase D R-P1] sustained decode #{i} failed: {e}\n\
+        let cap = phase_d_driver::decode_full_text(&server, &canonical, prompt, MAX_TOKENS)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P1] sustained decode #{i} failed: {e}\n\
                  --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                server.log_tail().len(),
-                server.log_tail().join("\n"),
-            )
-        });
+                    server.log_tail().len(),
+                    server.log_tail().join("\n"),
+                )
+            });
         sustained_ttfts.push(cap.ttft_ms);
     }
     let sustained_ttft_avg: f64 =
@@ -1664,10 +1620,7 @@ fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
     // than baseline (within noise). The gate fires only when
     // sustained > baseline by more than 5%.
     let overhead = (sustained_ttft_avg - baseline_ttft_avg) / baseline_ttft_avg;
-    eprintln!(
-        "[Phase D R-P1] overhead={:.3} (gate: <= 0.05)",
-        overhead
-    );
+    eprintln!("[Phase D R-P1] overhead={:.3} (gate: <= 0.05)", overhead);
     let pass = overhead <= 0.05;
     if pass {
         eprintln!("[R-P1] PASS — overhead within 5% gate");
@@ -1745,8 +1698,7 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
             return;
         }
     };
-    let r_p1c_active =
-        std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
+    let r_p1c_active = std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
     if !r_p1c_active {
         eprintln!(
             "[Phase D R-P1 concurrent] {ENV_PHASE_D_R_P1_CONCURRENT}=1 not set — \
@@ -1773,8 +1725,7 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    std::fs::create_dir_all(&cache_dir)
-        .expect("mkdir Phase D R-P1 concurrent cache_dir");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir Phase D R-P1 concurrent cache_dir");
 
     let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
         .ok()
@@ -1842,20 +1793,15 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
     for i in 0..N_SAMPLES {
         let prompt = unique_prompt(i, "baseline", &session_salt);
         let t0 = std::time::Instant::now();
-        let _cap = phase_d_driver::decode_full_text(
-            &server,
-            &canonical,
-            &prompt,
-            MAX_TOKENS,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "[Phase D R-P1 concurrent v2] baseline decode #{i} failed: {e}\n\
+        let _cap = phase_d_driver::decode_full_text(&server, &canonical, &prompt, MAX_TOKENS)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P1 concurrent v2] baseline decode #{i} failed: {e}\n\
                  --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                server.log_tail().len(),
-                server.log_tail().join("\n"),
-            )
-        });
+                    server.log_tail().len(),
+                    server.log_tail().join("\n"),
+                )
+            });
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         baseline_durations.push(wall_ms);
     }
@@ -1910,12 +1856,8 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
             });
             // Inference-thread leg: run the cache-MISS decode to
             // completion.
-            let cap_result = phase_d_driver::decode_full_text(
-                &server,
-                &canonical,
-                &prompt,
-                MAX_TOKENS,
-            );
+            let cap_result =
+                phase_d_driver::decode_full_text(&server, &canonical, &prompt, MAX_TOKENS);
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             // Always join the sibling thread — even on inference
             // failure — so the eviction request finishes cleanly
@@ -1953,8 +1895,7 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
         concurrent_durations.push(wall_ms);
     }
     // Drop sample #0 to mirror the baseline regime.
-    let concurrent_steady: Vec<f64> =
-        concurrent_durations.iter().skip(1).copied().collect();
+    let concurrent_steady: Vec<f64> = concurrent_durations.iter().skip(1).copied().collect();
     assert!(
         !concurrent_steady.is_empty(),
         "[Phase D R-P1 concurrent v2] concurrent_steady empty after dropping sample #0; \
@@ -1993,7 +1934,9 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
         if rel_pass { "PASS" } else { "FAIL" },
     );
     if pass {
-        eprintln!("[R-P1 concurrent v2] PASS — at least one bound (absolute OR relative) within gate");
+        eprintln!(
+            "[R-P1 concurrent v2] PASS — at least one bound (absolute OR relative) within gate"
+        );
     } else {
         eprintln!("[R-P1 concurrent v2] FAIL — both bounds exceeded (K2 fires)");
     }
@@ -2132,7 +2075,7 @@ fn kv_persist_phase_d_r_p5_e2e() {
             &cache_dir,
             phase_d_driver::HOST,
             port,
-        &[("HF2Q_USE_DENSE", "1")],
+            &[("HF2Q_USE_DENSE", "1")],
         )
         .expect("[Phase D R-P5] spawn server #1");
         phase_d_driver::wait_for_readyz(&server1).unwrap_or_else(|e| {
@@ -2145,20 +2088,15 @@ fn kv_persist_phase_d_r_p5_e2e() {
         });
         let canonical = phase_d_driver::fetch_canonical_model_id(&server1)
             .expect("[Phase D R-P5] server #1 fetch canonical model id");
-        let cap = phase_d_driver::decode_full_text(
-            &server1,
-            &canonical,
-            &prompt,
-            4,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "[Phase D R-P5] server #1 no-cache decode failed: {e}\n\
+        let cap = phase_d_driver::decode_full_text(&server1, &canonical, &prompt, 4)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P5] server #1 no-cache decode failed: {e}\n\
                  --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                server1.log_tail().len(),
-                server1.log_tail().join("\n"),
-            )
-        });
+                    server1.log_tail().len(),
+                    server1.log_tail().join("\n"),
+                )
+            });
         eprintln!(
             "[Phase D R-P5] server #1 no_cache_ttft={:.1}ms \
              (prompt_tokens={:?}, total_tokens={})",
@@ -2172,15 +2110,14 @@ fn kv_persist_phase_d_r_p5_e2e() {
         // ServerGuard::Drop SIGKILL bypasses the spiller and the
         // cache_dir stays empty (R-P5 ratio ≈ 1.0 — see ADR-017
         // §"Phase D Closure iter-1" finding).
-        let receipt = phase_d_driver::trigger_graceful_shutdown(&server1)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "[Phase D R-P5] server #1 POST /shutdown failed: {e}\n\
+        let receipt = phase_d_driver::trigger_graceful_shutdown(&server1).unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P5] server #1 POST /shutdown failed: {e}\n\
                      --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                    server1.log_tail().len(),
-                    server1.log_tail().join("\n"),
-                )
-            });
+                server1.log_tail().len(),
+                server1.log_tail().join("\n"),
+            )
+        });
         eprintln!(
             "[Phase D R-P5] server #1 /shutdown receipt: {}",
             serde_json::to_string(&receipt).unwrap_or_else(|_| "<unserializable>".into())
@@ -2209,8 +2146,13 @@ fn kv_persist_phase_d_r_p5_e2e() {
             exit_status
         );
         let s1_tail = server1.log_tail();
-        eprintln!("[Phase D R-P5] server #1 stderr_tail ({} lines), last 25:", s1_tail.len());
-        for l in s1_tail.iter().rev().take(25).rev() { eprintln!("    {}", l); }
+        eprintln!(
+            "[Phase D R-P5] server #1 stderr_tail ({} lines), last 25:",
+            s1_tail.len()
+        );
+        for l in s1_tail.iter().rev().take(25).rev() {
+            eprintln!("    {}", l);
+        }
         // ServerGuard::Drop will call child.kill() + child.wait() on
         // scope exit; both are harmless on an already-exited process
         // (kill returns ESRCH which we ignore).
@@ -2231,7 +2173,7 @@ fn kv_persist_phase_d_r_p5_e2e() {
             &cache_dir,
             phase_d_driver::HOST,
             port,
-        &[("HF2Q_USE_DENSE", "1")],
+            &[("HF2Q_USE_DENSE", "1")],
         )
         .expect("[Phase D R-P5] spawn server #2 (cold-process resume)");
         phase_d_driver::wait_for_readyz(&server2).unwrap_or_else(|e| {
@@ -2244,28 +2186,28 @@ fn kv_persist_phase_d_r_p5_e2e() {
         });
         let canonical = phase_d_driver::fetch_canonical_model_id(&server2)
             .expect("[Phase D R-P5] server #2 fetch canonical model id");
-        let cap = phase_d_driver::decode_full_text(
-            &server2,
-            &canonical,
-            &prompt,
-            4,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "[Phase D R-P5] server #2 cache-hit decode failed: {e}\n\
+        let cap = phase_d_driver::decode_full_text(&server2, &canonical, &prompt, 4)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P5] server #2 cache-hit decode failed: {e}\n\
                  --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                server2.log_tail().len(),
-                server2.log_tail().join("\n"),
-            )
-        });
+                    server2.log_tail().len(),
+                    server2.log_tail().join("\n"),
+                )
+            });
         eprintln!(
             "[Phase D R-P5] server #2 cache_hit_ttft={:.1}ms \
              (prompt_tokens={:?}, total_tokens={})",
             cap.ttft_ms, cap.prompt_tokens, cap.total_tokens
         );
         let s2_tail = server2.log_tail();
-        eprintln!("[Phase D R-P5] server #2 stderr_tail ({} lines), last 20:", s2_tail.len());
-        for l in s2_tail.iter().rev().take(20).rev() { eprintln!("    {}", l); }
+        eprintln!(
+            "[Phase D R-P5] server #2 stderr_tail ({} lines), last 20:",
+            s2_tail.len()
+        );
+        for l in s2_tail.iter().rev().take(20).rev() {
+            eprintln!("    {}", l);
+        }
         cap.ttft_ms
     };
 
@@ -2416,21 +2358,16 @@ fn kv_persist_phase_d_r_p6_e2e() {
     // CONCURRENCY NOTE on the test docstring.
     let mut agent_ttfts: Vec<f64> = Vec::with_capacity(4);
     for i in 0..4 {
-        let cap = phase_d_driver::decode_full_text(
-            &server,
-            &canonical,
-            &shared_prompt,
-            4,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "[Phase D R-P6] agent {} decode failed: {e}\n\
+        let cap = phase_d_driver::decode_full_text(&server, &canonical, &shared_prompt, 4)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P6] agent {} decode failed: {e}\n\
                  --- hf2q serve stderr_tail ({} lines) ---\n{}",
-                i + 1,
-                server.log_tail().len(),
-                server.log_tail().join("\n"),
-            )
-        });
+                    i + 1,
+                    server.log_tail().len(),
+                    server.log_tail().join("\n"),
+                )
+            });
         eprintln!(
             "[Phase D R-P6] agent {} ttft={:.1}ms (prompt_tokens={:?}, total_tokens={})",
             i + 1,
@@ -2440,7 +2377,11 @@ fn kv_persist_phase_d_r_p6_e2e() {
         );
         agent_ttfts.push(cap.ttft_ms);
     }
-    assert_eq!(agent_ttfts.len(), 4, "[Phase D R-P6] expected 4 agent TTFT samples");
+    assert_eq!(
+        agent_ttfts.len(),
+        4,
+        "[Phase D R-P6] expected 4 agent TTFT samples"
+    );
 
     let agent1 = agent_ttfts[0];
     let agent2 = agent_ttfts[1];
@@ -2469,10 +2410,7 @@ fn kv_persist_phase_d_r_p6_e2e() {
         pass,
         "[R-P6] ship-gate FAIL: aggregate={:.1}ms / single_agent={:.1}ms = {:.3}× > 1.25× \
          (per-agent ttfts: {:.1}/{:.1}/{:.1}/{:.1})",
-        aggregate_ttft_ms,
-        single_agent_cost_ms,
-        ratio,
-        agent1, agent2, agent3, agent4,
+        aggregate_ttft_ms, single_agent_cost_ms, ratio, agent1, agent2, agent3, agent4,
     );
 }
 
@@ -2484,9 +2422,7 @@ fn kv_persist_phase_d_r_p6_e2e() {
 /// missing model rather than returning a `DriverError`.
 #[test]
 fn phase_d_driver_rejects_missing_model_cleanly() {
-    let bogus_model = PathBuf::from(
-        "/var/empty/this-path-must-not-exist-phase-d-shape-test.gguf",
-    );
+    let bogus_model = PathBuf::from("/var/empty/this-path-must-not-exist-phase-d-shape-test.gguf");
     let cache_dir = std::env::temp_dir().join(format!(
         "hf2q-phase-d-shape-{}-{}",
         std::process::id(),
@@ -2518,9 +2454,7 @@ fn phase_d_driver_rejects_missing_model_cleanly() {
     match result {
         Err(phase_d_driver::DriverError::SpawnFailed(_)) => {}
         Err(other) => {
-            panic!(
-                "phase_d_driver should return SpawnFailed for missing model; got {other}"
-            );
+            panic!("phase_d_driver should return SpawnFailed for missing model; got {other}");
         }
         Ok(_) => panic!("phase_d_driver should not spawn against missing model path"),
     }
@@ -2645,8 +2579,7 @@ fn phase_d_r_p1_concurrent_env_gate_well_formed() {
     std::env::set_var(ENV_PHASE_D_GATE, "1");
     std::env::remove_var(ENV_PHASE_D_R_P1_CONCURRENT);
     let active_master = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
-    let active_r_p1c =
-        std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
+    let active_r_p1c = std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
     assert!(
         active_master && !active_r_p1c,
         "K2 concurrent short-circuit predicate must be false when only master is set"
@@ -2684,10 +2617,7 @@ fn phase_d_env_gates_are_well_formed() {
     ] {
         let prior = std::env::var(gate).ok();
         std::env::remove_var(gate);
-        assert!(
-            std::env::var(gate).is_err(),
-            "gate {gate} should be unset"
-        );
+        assert!(std::env::var(gate).is_err(), "gate {gate} should be unset");
         std::env::set_var(gate, "1");
         assert_eq!(
             std::env::var(gate).as_deref(),
@@ -2707,8 +2637,7 @@ fn phase_d_env_gates_are_well_formed() {
 #[test]
 fn phase_d_sourdough_constants_match_shell_gate() {
     assert_eq!(
-        SOURDOUGH_PROMPT,
-        "Complrehensive instructions for making sourdough bread.",
+        SOURDOUGH_PROMPT, "Complrehensive instructions for making sourdough bread.",
         "sourdough prompt must match scripts/sourdough_gate.sh literal"
     );
     assert_eq!(

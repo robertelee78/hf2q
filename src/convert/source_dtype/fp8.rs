@@ -319,8 +319,7 @@ mod tests {
         // 0x00 = +0.0  (pad to round shape)
         let payload = vec![0x38, 0x80, 0xff, 0x3c, 0x40, 0x30, 0xb8, 0x00];
         let scale_inv = vec![1.0_f32];
-        let out =
-            dequantize_fp8_block(&payload, &scale_inv, &[1, 8], (1, 8)).expect("dequant");
+        let out = dequantize_fp8_block(&payload, &scale_inv, &[1, 8], (1, 8)).expect("dequant");
 
         assert_eq!(out[0], 1.0);
         // -0.0 by bit pattern.
@@ -355,8 +354,7 @@ mod tests {
         //   top-left = 1, top-right = 2,
         //   bot-left = 3, bot-right = 4.
         let scale_inv = vec![1.0, 2.0, 3.0, 4.0];
-        let out =
-            dequantize_fp8_block(&payload, &scale_inv, &[4, 4], (2, 2)).expect("dequant");
+        let out = dequantize_fp8_block(&payload, &scale_inv, &[4, 4], (2, 2)).expect("dequant");
         // Row 0, 1 use scale row 0 (1.0 for cols 0-1, 2.0 for cols 2-3).
         // Row 2, 3 use scale row 1 (3.0 for cols 0-1, 4.0 for cols 2-3).
         let want = [
@@ -393,8 +391,8 @@ mod tests {
     fn invalid_block_size_errors() {
         let payload = vec![0u8; 4];
         let scale_inv = vec![1.0];
-        let err = dequantize_fp8_block(&payload, &scale_inv, &[2, 2], (0, 2))
-            .expect_err("must error");
+        let err =
+            dequantize_fp8_block(&payload, &scale_inv, &[2, 2], (0, 2)).expect_err("must error");
         matches!(err, Fp8Error::InvalidBlockSize { .. });
     }
 
@@ -414,8 +412,8 @@ mod tests {
     fn payload_length_mismatch_errors() {
         let payload = vec![0u8; 3];
         let scale_inv = vec![1.0];
-        let err = dequantize_fp8_block(&payload, &scale_inv, &[2, 2], (2, 2))
-            .expect_err("must error");
+        let err =
+            dequantize_fp8_block(&payload, &scale_inv, &[2, 2], (2, 2)).expect_err("must error");
         match err {
             Fp8Error::PayloadLengthMismatch {
                 expected_bytes,
@@ -432,12 +430,10 @@ mod tests {
     fn scale_length_mismatch_errors() {
         let payload = vec![0u8; 16]; // 4x4
         let scale_inv = vec![1.0, 2.0]; // need 4 entries for 2x2 block grid
-        let err = dequantize_fp8_block(&payload, &scale_inv, &[4, 4], (2, 2))
-            .expect_err("must error");
+        let err =
+            dequantize_fp8_block(&payload, &scale_inv, &[4, 4], (2, 2)).expect_err("must error");
         match err {
-            Fp8Error::ScaleLengthMismatch {
-                expected, got, ..
-            } => {
+            Fp8Error::ScaleLengthMismatch { expected, got, .. } => {
                 assert_eq!(expected, 4);
                 assert_eq!(got, 2);
             }

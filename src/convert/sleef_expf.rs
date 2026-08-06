@@ -348,7 +348,7 @@ mod tests {
         // 7 elements: 4-wide SIMD + 3-element scalar tail.
         let mut data7: Vec<f32> = vec![
             -3.796875, 0.0, 1.0, -1.0, // first 4 → SIMD path
-            -100.0, 90.0, -3.796875,    // last 3 → scalar tail
+            -100.0, 90.0, -3.796875, // last 3 → scalar tail
         ];
         sleef_expf_inplace_neon(&mut data7);
         let expected = [
@@ -401,7 +401,10 @@ mod tests {
                 if differ < 5 {
                     eprintln!(
                         "  divergence at idx {}: input={}, scalar=0x{:08x}, neon=0x{:08x}",
-                        i, input[i], s.to_bits(), nu.to_bits()
+                        i,
+                        input[i],
+                        s.to_bits(),
+                        nu.to_bits()
                     );
                 }
                 differ += 1;
@@ -478,10 +481,16 @@ mod tests {
              libm  f32::exp:           {:.3} ms   {:.1} M elem/s    [1.00× ref]\n  \
              scalar sleef_expf:        {:.3} ms   {:.1} M elem/s    [{:.2}× vs libm]\n  \
              NEON sleef_expf_inplace:  {:.3} ms   {:.1} M elem/s    [{:.2}× vs libm]",
-            N, ITERS,
-            libm_med / 1e6, N as f64 / (libm_med / 1e9) / 1e6,
-            scalar_med / 1e6, N as f64 / (scalar_med / 1e9) / 1e6, scalar_med / libm_med,
-            neon_med / 1e6, N as f64 / (neon_med / 1e9) / 1e6, neon_med / libm_med,
+            N,
+            ITERS,
+            libm_med / 1e6,
+            N as f64 / (libm_med / 1e9) / 1e6,
+            scalar_med / 1e6,
+            N as f64 / (scalar_med / 1e9) / 1e6,
+            scalar_med / libm_med,
+            neon_med / 1e6,
+            N as f64 / (neon_med / 1e9) / 1e6,
+            neon_med / libm_med,
         );
     }
 

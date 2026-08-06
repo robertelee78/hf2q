@@ -49,11 +49,9 @@ impl ProgressReporter {
     pub fn bar(&self, total: u64, message: &str) -> ProgressBar {
         let pb = self.multi.add(ProgressBar::new(total));
         pb.set_style(
-            ProgressStyle::with_template(
-                "{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})"
-            )
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> "),
+            ProgressStyle::with_template("{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=> "),
         );
         pb.set_message(message.to_string());
         pb
@@ -65,7 +63,7 @@ impl ProgressReporter {
         let pb = self.multi.add(ProgressBar::new(total_bytes));
         pb.set_style(
             ProgressStyle::with_template(
-                "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
+                "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
             )
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=> "),
@@ -88,7 +86,12 @@ impl ProgressReporter {
         } else if secs < 3600 {
             format!("{}m {:02}s", secs / 60, secs % 60)
         } else {
-            format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+            format!(
+                "{}h {:02}m {:02}s",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
         }
     }
 }
@@ -125,10 +128,7 @@ pub fn print_summary(
     println!("  Architecture: {}", architecture);
     println!("  Parameters:   {}", format_param_count(param_count));
     println!("  Quantization: {}", style(quant_method).cyan());
-    println!(
-        "  Input size:   {}",
-        format_bytes(input_size_bytes)
-    );
+    println!("  Input size:   {}", format_bytes(input_size_bytes));
     println!(
         "  Output size:  {} ({:.1}x compression)",
         format_bytes(output_size_bytes),

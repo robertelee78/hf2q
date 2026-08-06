@@ -404,10 +404,7 @@ mod tests {
                 .tensor_info(name)
                 .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
             let want = &expected_shapes[name];
-            assert_eq!(
-                &info.shape, want,
-                "shape round-trip failed for `{name}`"
-            );
+            assert_eq!(&info.shape, want, "shape round-trip failed for `{name}`");
             // Q8_0 has wire-position 3 in mlx_native's positional enum
             // (F32=0, F16=1, Q4_0=2, Q8_0=3, ...). Token_embd + output
             // route through the OUTPUT-branch which bumps to Q6_K

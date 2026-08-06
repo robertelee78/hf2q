@@ -133,10 +133,7 @@ pub struct StreamStats {
 #[derive(Debug)]
 pub enum GenerationEvent {
     /// A generated token fragment in a specific delta slot.
-    Delta {
-        kind: DeltaKind,
-        text: String,
-    },
+    Delta { kind: DeltaKind, text: String },
     /// A tool-call delta emitted by the grammar-aware sampler.
     ToolCallDelta {
         index: usize,
@@ -573,7 +570,10 @@ pub fn generation_events_to_sse_with_slot(
             "sse stream constructed (ADR-040 C3 per-slot seam)"
         );
     }
-    Sse::new(generation_events_stream(rx, request_id, model_name, created, opts)).keep_alive(
+    Sse::new(generation_events_stream(
+        rx, request_id, model_name, created, opts,
+    ))
+    .keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(SSE_KEEPALIVE_INTERVAL_SECS))
             .text(SSE_KEEPALIVE_TEXT),
@@ -633,7 +633,13 @@ mod tests {
         rx: mpsc::Receiver<GenerationEvent>,
         opts: SseStreamOptions,
     ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-        generation_events_to_sse(rx, "req-test".into(), "gemma4-test".into(), 1700000000, opts)
+        generation_events_to_sse(
+            rx,
+            "req-test".into(),
+            "gemma4-test".into(),
+            1700000000,
+            opts,
+        )
     }
 
     #[tokio::test]
@@ -658,7 +664,12 @@ mod tests {
         let sse = make_sse(rx, SseStreamOptions::default());
         tokio::spawn(spawn_feeder(tx, events));
         let payloads = drain_sse(sse).await;
-        assert!(payloads.len() >= 4, "got {} payloads: {:?}", payloads.len(), payloads);
+        assert!(
+            payloads.len() >= 4,
+            "got {} payloads: {:?}",
+            payloads.len(),
+            payloads
+        );
         // Role chunk
         let role: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
@@ -708,9 +719,9 @@ mod tests {
         assert!(reasoning["choices"][0]["delta"].get("content").is_none());
         let content: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "42");
-        assert!(
-            content["choices"][0]["delta"].get("reasoning_content").is_none()
-        );
+        assert!(content["choices"][0]["delta"]
+            .get("reasoning_content")
+            .is_none());
     }
 
     #[tokio::test]
@@ -741,13 +752,15 @@ mod tests {
         let sse = make_sse(rx, opts);
         tokio::spawn(spawn_feeder(tx, events));
         let payloads = drain_sse(sse).await;
-        let done: serde_json::Value =
-            serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        let done: serde_json::Value = serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
         assert_eq!(done["usage"]["prompt_tokens"], 7);
         assert_eq!(done["usage"]["completion_tokens"], 5);
         assert_eq!(done["usage"]["total_tokens"], 12);
         assert_eq!(done["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
-        assert_eq!(done["usage"]["completion_tokens_details"]["reasoning_tokens"], 1);
+        assert_eq!(
+            done["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            1
+        );
         assert_eq!(done["system_fingerprint"], "hf2q-test-mlx-native");
     }
 
@@ -799,8 +812,7 @@ mod tests {
         let payloads = drain_sse(sse).await;
         assert_eq!(payloads.last().unwrap(), "[DONE]");
         // Second-to-last chunk should be an error finish_reason
-        let err: serde_json::Value =
-            serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        let err: serde_json::Value = serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
         assert_eq!(err["choices"][0]["finish_reason"], "error");
     }
 
@@ -889,7 +901,10 @@ mod tests {
         let payloads = drain_sse(sse).await;
         // role, content (with logprobs), done, [DONE]
         let content: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
-        assert_eq!(content["choices"][0]["logprobs"]["content"][0]["token"], "Hello");
+        assert_eq!(
+            content["choices"][0]["logprobs"]["content"][0]["token"],
+            "Hello"
+        );
     }
 
     #[tokio::test]

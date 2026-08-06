@@ -41,19 +41,31 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
     // loader reads them via `src/inference/vision/mmproj.rs` constants.
     static STATIC_MAP: &[(&str, &str)] = &[
         // clip-model.h / src/inference/vision/mmproj.rs:228 TENSOR_PATCH_EMBD
-        ("model.vision_tower.embeddings.patch_embeddings.projection.weight", "v.patch_embd.weight"),
-        ("model.vision_tower.embeddings.patch_embeddings.projection.bias",   "v.patch_embd.bias"),
+        (
+            "model.vision_tower.embeddings.patch_embeddings.projection.weight",
+            "v.patch_embd.weight",
+        ),
+        (
+            "model.vision_tower.embeddings.patch_embeddings.projection.bias",
+            "v.patch_embd.bias",
+        ),
         // clip-model.h / mmproj.rs:232 TENSOR_POS_EMBD
-        ("model.vision_tower.embeddings.position_embeddings.weight", "v.position_embd.weight"),
+        (
+            "model.vision_tower.embeddings.position_embeddings.weight",
+            "v.position_embd.weight",
+        ),
         // clip-model.h / mmproj.rs:234 TENSOR_POST_LN_*
-        ("model.vision_tower.post_layernorm.weight", "v.post_ln.weight"),
-        ("model.vision_tower.post_layernorm.bias",   "v.post_ln.bias"),
+        (
+            "model.vision_tower.post_layernorm.weight",
+            "v.post_ln.weight",
+        ),
+        ("model.vision_tower.post_layernorm.bias", "v.post_ln.bias"),
         // MLP projector — clip.cpp's projector_type=="mlp" reads these exact names.
         // mmproj.rs:237-241 TENSOR_MM_0_*/TENSOR_MM_2_*.
         ("model.multi_modal_projector.linear_1.weight", "mm.0.weight"),
-        ("model.multi_modal_projector.linear_1.bias",   "mm.0.bias"),
+        ("model.multi_modal_projector.linear_1.bias", "mm.0.bias"),
         ("model.multi_modal_projector.linear_2.weight", "mm.2.weight"),
-        ("model.multi_modal_projector.linear_2.bias",   "mm.2.bias"),
+        ("model.multi_modal_projector.linear_2.bias", "mm.2.bias"),
     ];
     for (hf, gguf) in STATIC_MAP {
         if hf_name == *hf {
@@ -92,18 +104,18 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
         let l: usize = layer_str.parse().ok()?;
         let blk = format!("v.blk.{}", l);
         let mapped = match suffix {
-            "attn.qkv.weight"     => Some(format!("{}.attn_qkv.weight", blk)),
-            "attn.qkv.bias"       => Some(format!("{}.attn_qkv.bias", blk)),
-            "attn.proj.weight"    => Some(format!("{}.attn_out.weight", blk)),
-            "attn.proj.bias"      => Some(format!("{}.attn_out.bias", blk)),
+            "attn.qkv.weight" => Some(format!("{}.attn_qkv.weight", blk)),
+            "attn.qkv.bias" => Some(format!("{}.attn_qkv.bias", blk)),
+            "attn.proj.weight" => Some(format!("{}.attn_out.weight", blk)),
+            "attn.proj.bias" => Some(format!("{}.attn_out.bias", blk)),
             "mlp.linear_fc1.weight" => Some(format!("{}.ffn_up.weight", blk)),
-            "mlp.linear_fc1.bias"   => Some(format!("{}.ffn_up.bias", blk)),
+            "mlp.linear_fc1.bias" => Some(format!("{}.ffn_up.bias", blk)),
             "mlp.linear_fc2.weight" => Some(format!("{}.ffn_down.weight", blk)),
-            "mlp.linear_fc2.bias"   => Some(format!("{}.ffn_down.bias", blk)),
-            "norm1.weight"        => Some(format!("{}.ln1.weight", blk)),
-            "norm1.bias"          => Some(format!("{}.ln1.bias", blk)),
-            "norm2.weight"        => Some(format!("{}.ln2.weight", blk)),
-            "norm2.bias"          => Some(format!("{}.ln2.bias", blk)),
+            "mlp.linear_fc2.bias" => Some(format!("{}.ffn_down.bias", blk)),
+            "norm1.weight" => Some(format!("{}.ln1.weight", blk)),
+            "norm1.bias" => Some(format!("{}.ln1.bias", blk)),
+            "norm2.weight" => Some(format!("{}.ln2.weight", blk)),
+            "norm2.bias" => Some(format!("{}.ln2.bias", blk)),
             _ => None,
         };
         return mapped;
@@ -126,19 +138,22 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
         // patch_embed: 5-D [out, in, T=2, H, W] needs caller-side split
         // along T. We return the canonical first-slice name; pipeline
         // also emits the `.1` suffixed second slice.
-        ("model.visual.patch_embed.proj.weight", "v.patch_embd.weight"),
-        ("model.visual.patch_embed.proj.bias",   "v.patch_embd.bias"),
-        ("model.visual.pos_embed.weight",        "v.position_embd.weight"),
+        (
+            "model.visual.patch_embed.proj.weight",
+            "v.patch_embd.weight",
+        ),
+        ("model.visual.patch_embed.proj.bias", "v.patch_embd.bias"),
+        ("model.visual.pos_embed.weight", "v.position_embd.weight"),
         // PROJECTOR_TYPE_QWEN3VL uses mm.0 + mm.2 (linear_fc1, linear_fc2).
         ("model.visual.merger.linear_fc1.weight", "mm.0.weight"),
-        ("model.visual.merger.linear_fc1.bias",   "mm.0.bias"),
+        ("model.visual.merger.linear_fc1.bias", "mm.0.bias"),
         ("model.visual.merger.linear_fc2.weight", "mm.2.weight"),
-        ("model.visual.merger.linear_fc2.bias",   "mm.2.bias"),
+        ("model.visual.merger.linear_fc2.bias", "mm.2.bias"),
         // Wedge-4f: merger.norm goes to V_POST_NORM = `v.post_ln.*`,
         // matching convert_hf_to_gguf.py:4948-4949 via
         // MODEL_TENSOR.V_POST_NORM.
         ("model.visual.merger.norm.weight", "v.post_ln.weight"),
-        ("model.visual.merger.norm.bias",   "v.post_ln.bias"),
+        ("model.visual.merger.norm.bias", "v.post_ln.bias"),
     ];
     for (hf, gguf) in QWEN36_GLOBAL_MAP {
         if hf_name == *hf {
@@ -156,19 +171,19 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
 
         // Attention projections — clip-model.h LLM_VISION_ATTN_* convention.
         let mapped = match suffix {
-            "attention.q_proj.weight"  => Some(format!("{}.attn_q.weight", blk)),
-            "attention.q_proj.bias"    => Some(format!("{}.attn_q.bias", blk)),
-            "attention.k_proj.weight"  => Some(format!("{}.attn_k.weight", blk)),
-            "attention.k_proj.bias"    => Some(format!("{}.attn_k.bias", blk)),
-            "attention.v_proj.weight"  => Some(format!("{}.attn_v.weight", blk)),
-            "attention.v_proj.bias"    => Some(format!("{}.attn_v.bias", blk)),
+            "attention.q_proj.weight" => Some(format!("{}.attn_q.weight", blk)),
+            "attention.q_proj.bias" => Some(format!("{}.attn_q.bias", blk)),
+            "attention.k_proj.weight" => Some(format!("{}.attn_k.weight", blk)),
+            "attention.k_proj.bias" => Some(format!("{}.attn_k.bias", blk)),
+            "attention.v_proj.weight" => Some(format!("{}.attn_v.weight", blk)),
+            "attention.v_proj.bias" => Some(format!("{}.attn_v.bias", blk)),
             "attention.output.dense.weight" => Some(format!("{}.attn_out.weight", blk)),
-            "attention.output.dense.bias"   => Some(format!("{}.attn_out.bias", blk)),
+            "attention.output.dense.bias" => Some(format!("{}.attn_out.bias", blk)),
             // LayerNorms — clip.cpp's ViT convention: ln1 = pre-attn, ln2 = pre-ffn.
-            "layer_norm1.weight"       => Some(format!("{}.ln1.weight", blk)),
-            "layer_norm1.bias"         => Some(format!("{}.ln1.bias", blk)),
-            "layer_norm2.weight"       => Some(format!("{}.ln2.weight", blk)),
-            "layer_norm2.bias"         => Some(format!("{}.ln2.bias", blk)),
+            "layer_norm1.weight" => Some(format!("{}.ln1.weight", blk)),
+            "layer_norm1.bias" => Some(format!("{}.ln1.bias", blk)),
+            "layer_norm2.weight" => Some(format!("{}.ln2.weight", blk)),
+            "layer_norm2.bias" => Some(format!("{}.ln2.bias", blk)),
             // MLP — fc1 = FFN up-proj (hidden → intermediate); fc2 = down-proj.
             // Order verified against clip.cpp: fc1 runs first, fc2 collapses back
             // to hidden_size. GGUF's ffn_up / ffn_down convention mirrors that.
@@ -178,10 +193,10 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
             // projection collapses back to wrong dim and mmproj inference
             // produces garbage. `src/models/vit/convert.rs:test_fc1_fc2_ordering`
             // pins this.
-            "mlp.fc1.weight"           => Some(format!("{}.ffn_up.weight", blk)),
-            "mlp.fc1.bias"             => Some(format!("{}.ffn_up.bias", blk)),
-            "mlp.fc2.weight"           => Some(format!("{}.ffn_down.weight", blk)),
-            "mlp.fc2.bias"             => Some(format!("{}.ffn_down.bias", blk)),
+            "mlp.fc1.weight" => Some(format!("{}.ffn_up.weight", blk)),
+            "mlp.fc1.bias" => Some(format!("{}.ffn_up.bias", blk)),
+            "mlp.fc2.weight" => Some(format!("{}.ffn_down.weight", blk)),
+            "mlp.fc2.bias" => Some(format!("{}.ffn_down.bias", blk)),
             _ => None,
         };
         return mapped;
@@ -281,8 +296,7 @@ fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
             let mut out = Vec::with_capacity(n * 2);
             for i in 0..n {
                 let b = &tensor.data[i * 4..(i + 1) * 4];
-                let f =
-                    f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                let f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 let h = half::f16::from_f32(f);
                 out.extend_from_slice(&h.to_le_bytes());
             }
@@ -331,14 +345,9 @@ fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
 ///     `deepstack_visual_indexes` declared).
 ///   - The component is unrecognized (writer-bug: caller emitted a
 ///     deepstack tensor whose suffix is none of `norm`/`linear_fc1`/`linear_fc2`).
-fn hf_qwen3vl_deepstack_to_gguf(
-    hf_name: &str,
-    deepstack_indexes: &[u32],
-) -> Option<String> {
+fn hf_qwen3vl_deepstack_to_gguf(hf_name: &str, deepstack_indexes: &[u32]) -> Option<String> {
     // Strip optional `model.` prefix to match convert_hf_to_gguf.py:4908-4909.
-    let canon = hf_name
-        .strip_prefix("model.")
-        .unwrap_or(hf_name);
+    let canon = hf_name.strip_prefix("model.").unwrap_or(hf_name);
     let rest = canon.strip_prefix("visual.deepstack_merger_list.")?;
 
     // Layout: "{rel_idx}.{component}.{suffix}" where component ∈
@@ -507,10 +516,7 @@ pub fn load_vision_tensors(
 /// where I = in_channels, T = 2 (temporal frames), H = W = patch_size.
 fn split_qwen3vl_patch_embed_temporal(
     tensor: &TensorRef,
-) -> Result<(
-    (Vec<usize>, Vec<u8>),
-    (Vec<usize>, Vec<u8>),
-), VitConvertError> {
+) -> Result<((Vec<usize>, Vec<u8>), (Vec<usize>, Vec<u8>)), VitConvertError> {
     if tensor.shape.len() != 5 {
         return Err(VitConvertError::Safetensors(
             "patch_embed.proj.weight (expected 5-D)".to_string(),
@@ -551,10 +557,12 @@ fn split_qwen3vl_patch_embed_temporal(
         DType::F16 => s0_bytes,
         DType::BF16 => bf16_bytes_to_f16(&s0_bytes),
         DType::F32 => f32_bytes_to_f16(&s0_bytes),
-        _ => return Err(VitConvertError::Safetensors(format!(
-            "patch_embed.proj.weight: unsupported dtype {:?}",
-            tensor.dtype
-        ))),
+        _ => {
+            return Err(VitConvertError::Safetensors(format!(
+                "patch_embed.proj.weight: unsupported dtype {:?}",
+                tensor.dtype
+            )))
+        }
     };
     let s1_f16 = match tensor.dtype {
         DType::F16 => s1_bytes,
@@ -564,10 +572,7 @@ fn split_qwen3vl_patch_embed_temporal(
     };
 
     let split_shape = vec![out, inp, h, w];
-    Ok((
-        (split_shape.clone(), s0_f16),
-        (split_shape, s1_f16),
-    ))
+    Ok(((split_shape.clone(), s0_f16), (split_shape, s1_f16)))
 }
 
 fn bf16_bytes_to_f16(input: &[u8]) -> Vec<u8> {
@@ -668,23 +673,43 @@ mod tests {
         let l2 = hf_vit_name_to_gguf("model.multi_modal_projector.linear_2.weight")
             .expect("linear_2 mapped");
         assert_eq!(l1, "mm.0.weight", "linear_1 = mm.0 (runs first)");
-        assert_eq!(l2, "mm.2.weight", "linear_2 = mm.2 (runs after GELU at mm.1)");
+        assert_eq!(
+            l2, "mm.2.weight",
+            "linear_2 = mm.2 (runs after GELU at mm.1)"
+        );
     }
 
     /// Per-layer ViT encoder tensor mapping (full attention block).
     #[test]
     fn per_layer_attn_and_ln_names_map_correctly() {
         let cases = [
-            ("model.vision_tower.encoder.layer.5.attention.q_proj.weight",       "v.blk.5.attn_q.weight"),
-            ("model.vision_tower.encoder.layer.5.attention.k_proj.bias",         "v.blk.5.attn_k.bias"),
-            ("model.vision_tower.encoder.layer.5.attention.v_proj.weight",       "v.blk.5.attn_v.weight"),
-            ("model.vision_tower.encoder.layer.5.attention.output.dense.weight", "v.blk.5.attn_out.weight"),
-            ("model.vision_tower.encoder.layer.5.layer_norm1.weight",            "v.blk.5.ln1.weight"),
-            ("model.vision_tower.encoder.layer.5.layer_norm2.bias",              "v.blk.5.ln2.bias"),
+            (
+                "model.vision_tower.encoder.layer.5.attention.q_proj.weight",
+                "v.blk.5.attn_q.weight",
+            ),
+            (
+                "model.vision_tower.encoder.layer.5.attention.k_proj.bias",
+                "v.blk.5.attn_k.bias",
+            ),
+            (
+                "model.vision_tower.encoder.layer.5.attention.v_proj.weight",
+                "v.blk.5.attn_v.weight",
+            ),
+            (
+                "model.vision_tower.encoder.layer.5.attention.output.dense.weight",
+                "v.blk.5.attn_out.weight",
+            ),
+            (
+                "model.vision_tower.encoder.layer.5.layer_norm1.weight",
+                "v.blk.5.ln1.weight",
+            ),
+            (
+                "model.vision_tower.encoder.layer.5.layer_norm2.bias",
+                "v.blk.5.ln2.bias",
+            ),
         ];
         for (hf, expected) in cases {
-            let got = hf_vit_name_to_gguf(hf)
-                .unwrap_or_else(|| panic!("no mapping for {}", hf));
+            let got = hf_vit_name_to_gguf(hf).unwrap_or_else(|| panic!("no mapping for {}", hf));
             assert_eq!(got, expected, "mapping mismatch for {}", hf);
         }
     }
@@ -707,10 +732,9 @@ mod tests {
     /// happens at the load side (`mmproj.rs` + `tests/convert_vision_tower_integration.rs`).
     #[test]
     fn patch_embd_name_preserved() {
-        let got = hf_vit_name_to_gguf(
-            "model.vision_tower.embeddings.patch_embeddings.projection.weight",
-        )
-        .expect("mapped");
+        let got =
+            hf_vit_name_to_gguf("model.vision_tower.embeddings.patch_embeddings.projection.weight")
+                .expect("mapped");
         assert_eq!(got, "v.patch_embd.weight");
     }
 
@@ -733,7 +757,7 @@ mod tests {
         };
         let f16_bytes = ensure_f16_bytes(&tensor).unwrap();
         assert_eq!(f16_bytes.len(), 4 * 2); // 4 F16 elements
-        // Decode back + verify.
+                                            // Decode back + verify.
         for (i, chunk) in f16_bytes.chunks(2).enumerate() {
             let h = half::f16::from_le_bytes([chunk[0], chunk[1]]);
             assert_eq!(h.to_f32(), [1.0, 2.0, 3.0, 4.0][i]);
@@ -820,10 +844,7 @@ mod tests {
         let indexes = vec![5, 11, 17];
         // rel_idx=0 → abs 5
         assert_eq!(
-            hf_qwen3vl_deepstack_to_gguf(
-                "visual.deepstack_merger_list.0.norm.weight",
-                &indexes,
-            ),
+            hf_qwen3vl_deepstack_to_gguf("visual.deepstack_merger_list.0.norm.weight", &indexes,),
             Some("v.deepstack.5.norm.weight".to_string())
         );
         // rel_idx=1 → abs 11
@@ -889,16 +910,10 @@ mod tests {
     #[test]
     fn wedge4f_qwen3vl_deepstack_non_deepstack_returns_none() {
         let indexes = vec![5, 11, 17];
-        assert!(hf_qwen3vl_deepstack_to_gguf(
-            "visual.merger.linear_fc1.weight",
-            &indexes,
-        )
-        .is_none());
-        assert!(hf_qwen3vl_deepstack_to_gguf(
-            "visual.blocks.0.norm1.weight",
-            &indexes,
-        )
-        .is_none());
+        assert!(
+            hf_qwen3vl_deepstack_to_gguf("visual.merger.linear_fc1.weight", &indexes,).is_none()
+        );
+        assert!(hf_qwen3vl_deepstack_to_gguf("visual.blocks.0.norm1.weight", &indexes,).is_none());
         // CLIP-classic per-block tensor must not match the deepstack
         // helper (different prefix).
         assert!(hf_qwen3vl_deepstack_to_gguf(

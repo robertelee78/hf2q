@@ -448,7 +448,11 @@ fn map_linear_attn(
             } else {
                 // Fallback: shape may already be squeezed (2-D) in
                 // some checkpoints. Bare squeeze still required.
-                if hf_shape.len() >= 2 { hf_shape[1] } else { 1 }
+                if hf_shape.len() >= 2 {
+                    hf_shape[1]
+                } else {
+                    1
+                }
             };
             let bake = if reorder_required {
                 let qk_channels = kd * nk * 2;
@@ -608,7 +612,8 @@ fn map_mlp(layer: usize, mlp_rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<Mappe
         // which has 256 mtp.layers.0.mlp.experts.<E>.{gate,up,down}_proj.weight
         // tensors). Routes through ExpertGroup so the orchestrator
         // accumulates and fuses at plan-build time.
-        rest if rest.starts_with("experts.") && rest != "experts.gate_up_proj"
+        rest if rest.starts_with("experts.")
+            && rest != "experts.gate_up_proj"
             && rest != "experts.gate_up_proj.weight"
             && rest != "experts.down_proj"
             && rest != "experts.down_proj.weight" =>
@@ -889,11 +894,13 @@ pub fn build_metadata(
                 .collect()
         })
         .or_else(|| {
-            text.get("mrope_section").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_i64().map(|n| n as i32))
-                    .collect()
-            })
+            text.get("mrope_section")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_i64().map(|n| n as i32))
+                        .collect()
+                })
         })
         .unwrap_or_else(|| vec![11, 11, 10, 0]);
     while mrope_section.len() < 4 {
@@ -1030,7 +1037,6 @@ fn effective_text_config(config: &serde_json::Value) -> &serde_json::Value {
     config.get("text_config").unwrap_or(config)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,7 +1108,11 @@ mod tests {
     #[test]
     fn input_layernorm_gets_plus_one_bake() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.5.input_layernorm.weight", &[], &ctx) {
+        match map_tensor_name(
+            "model.language_model.layers.5.input_layernorm.weight",
+            &[],
+            &ctx,
+        ) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.5.attn_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
@@ -1114,7 +1124,11 @@ mod tests {
     #[test]
     fn post_attention_layernorm_gets_plus_one_bake() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.3.post_attention_layernorm.weight", &[], &ctx) {
+        match map_tensor_name(
+            "model.language_model.layers.3.post_attention_layernorm.weight",
+            &[],
+            &ctx,
+        ) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.3.post_attention_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
@@ -1128,7 +1142,11 @@ mod tests {
         // The single exception in canonical qwen.py:303 — every other
         // norm gets +1 EXCEPT linear_attn.norm.weight.
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.0.linear_attn.norm.weight", &[], &ctx) {
+        match map_tensor_name(
+            "model.language_model.layers.0.linear_attn.norm.weight",
+            &[],
+            &ctx,
+        ) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.0.ssm_norm.weight"),
             other => panic!("expected Direct (no bake), got: {other:?}"),
         }
@@ -1178,7 +1196,11 @@ mod tests {
                         assert_eq!(ops.len(), 2);
                         assert_eq!(ops[0], BakeOp::Squeeze);
                         match ops[1] {
-                            BakeOp::ReorderVHeads { head_dim, ref slice, .. } => {
+                            BakeOp::ReorderVHeads {
+                                head_dim,
+                                ref slice,
+                                ..
+                            } => {
                                 assert_eq!(head_dim, 128 * 4); // vd * kernel
                                 let r = slice.as_ref().expect("expected V-portion slice");
                                 // qk_channels = 128*16*2 = 4096; v_off = 4096*4 = 16384
@@ -1256,8 +1278,8 @@ mod tests {
                         assert_eq!(num_k_heads, 16);
                         assert_eq!(num_v_per_k, 2);
                         assert_eq!(head_dim, 128 * 2048); // vd * cols
-                        // V slice starts after Q+K rows:
-                        // (qd+kd)*nk*cols = (128+128)*16*2048
+                                                          // V slice starts after Q+K rows:
+                                                          // (qd+kd)*nk*cols = (128+128)*16*2048
                         let expect_start = (128 + 128) * 16 * 2048;
                         let expect_len = 2 * 128 * 16 * 2048;
                         let r = slice.expect("expected sliced reorder");
@@ -1391,9 +1413,15 @@ mod tests {
         let ctx = vlm_ctx();
         // The three shared-expert projections route through Direct.
         let direct_cases = [
-            ("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"),
+            (
+                "mlp.shared_expert.gate_proj.weight",
+                "ffn_gate_shexp.weight",
+            ),
             ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
-            ("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"),
+            (
+                "mlp.shared_expert.down_proj.weight",
+                "ffn_down_shexp.weight",
+            ),
         ];
         for (hf_suffix, gguf_suffix) in direct_cases {
             let hf = format!("model.language_model.layers.2.{hf_suffix}");
@@ -1423,7 +1451,11 @@ mod tests {
         let ctx = vlm_ctx();
         // No `.weight` suffix in canonical safetensors layout for this
         // pre-fused tensor (per operator's safetensors index inspection).
-        match map_tensor_name("model.language_model.layers.9.mlp.experts.gate_up_proj", &[], &ctx) {
+        match map_tensor_name(
+            "model.language_model.layers.9.mlp.experts.gate_up_proj",
+            &[],
+            &ctx,
+        ) {
             Some(MappedTensor::SplitInto(outputs)) => {
                 assert_eq!(outputs.len(), 2);
                 assert_eq!(outputs[0].gguf_name, "blk.9.ffn_gate_exps.weight");
@@ -1448,7 +1480,11 @@ mod tests {
     #[test]
     fn mlp_experts_down_proj_direct_rename() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.9.mlp.experts.down_proj", &[], &ctx) {
+        match map_tensor_name(
+            "model.language_model.layers.9.mlp.experts.down_proj",
+            &[],
+            &ctx,
+        ) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.9.ffn_down_exps.weight"),
             other => panic!("unexpected: {other:?}"),
         }

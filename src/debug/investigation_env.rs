@@ -452,7 +452,6 @@ pub struct InvestigationEnv {
     //   process start.  Snapshotted here so both are read once from the
     //   environment at LazyLock init time.
     // ========================================================================
-
     /// Raw (pre-guard) intent for `HF2Q_PARALLEL_ENCODE=1`.
     /// Use `parallel_encode_enabled()` for the guarded effective value.
     pub parallel_encode_raw: bool,
@@ -830,10 +829,7 @@ impl InvestigationEnv {
             skip_o_proj: env_eq_one("HF2Q_SKIP_O_PROJ"),
             skip_routing: env_eq_one("HF2Q_SKIP_ROUTING"),
             skip_v_norm: env_eq_one("HF2Q_SKIP_V_NORM"),
-            lmhead_rerank_disabled: matches!(
-                env::var("HF2Q_LMHEAD_RERANK").as_deref(),
-                Ok("0")
-            ),
+            lmhead_rerank_disabled: matches!(env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0")),
             chunk_scan_prefill: env_eq_one("HF2Q_CHUNK_SCAN_PREFILL"),
         };
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
@@ -914,10 +910,7 @@ impl InvestigationEnv {
             dump_run_name: env::var("HF2Q_DUMP_RUN_NAME").ok(),
 
             // iter-18 S2A post-scale RMS probe.
-            debug_tq_rms: matches!(
-                env::var("HF2Q_DEBUG_TQ_RMS").as_deref(),
-                Ok("1")
-            ),
+            debug_tq_rms: matches!(env::var("HF2Q_DEBUG_TQ_RMS").as_deref(), Ok("1")),
 
             // Wave 5a Qwen3.6 autoregressive opt-in (no ack gate — does not
             // alter forward-pass math, just unblocks dispatch).
@@ -948,9 +941,7 @@ impl InvestigationEnv {
             // chunk_gated_delta_rule precondition. We don't enforce the
             // multiple-of-64 here at parse time; the chunked-prefill
             // call site validates and rounds up if necessary.
-            kv_lcp_deltanet_checkpoint_stride: env::var(
-                "HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE",
-            )
+            kv_lcp_deltanet_checkpoint_stride: env::var("HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n > 0)
@@ -1231,8 +1222,11 @@ impl InvestigationEnv {
             let layers_str = if self.dump_tq_layers_list.is_empty() {
                 "all".to_string()
             } else {
-                self.dump_tq_layers_list.iter().map(|l| l.to_string())
-                    .collect::<Vec<_>>().join(",")
+                self.dump_tq_layers_list
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
             diagnostics.push(format!("HF2Q_DUMP_TQ_STATE=1 (layers: {layers_str})"));
         }
@@ -1248,8 +1242,16 @@ impl InvestigationEnv {
         if self.tq_codebook_bits != 8 {
             diagnostics.push(format!(
                 "HF2Q_TQ_CODEBOOK_BITS={} ({})",
-                if self.tq_codebook_bits == 0 { 4 } else { self.tq_codebook_bits },
-                if self.tq_codebook_bits == 0 { "legacy 4-bit TQ" } else { "HB SDPA" }
+                if self.tq_codebook_bits == 0 {
+                    4
+                } else {
+                    self.tq_codebook_bits
+                },
+                if self.tq_codebook_bits == 0 {
+                    "legacy 4-bit TQ"
+                } else {
+                    "HB SDPA"
+                }
             ));
         }
         if self.dump_sliding_layer_0 {
@@ -1264,7 +1266,8 @@ impl InvestigationEnv {
         if self.qwen36_autoreg {
             diagnostics.push(
                 "HF2Q_QWEN36_AUTOREG=1 (Wave 5a opt-in: autoregressive only; long-prefill SOTA \
-                 deferred to W-5b chunk-scan kernel)".into(),
+                 deferred to W-5b chunk-scan kernel)"
+                    .into(),
             );
         }
         // Wave 5b.20 `HF2Q_GQA_EXPAND_LEGACY` activate-diagnostic deleted in
@@ -1360,13 +1363,21 @@ fn env_default_true(name: &str) -> bool {
         // Env unset → default ON.
         None => true,
         // Truthy: "1", "true", "on" (case-insensitive) → ON.
-        Some(v) if v.eq_ignore_ascii_case("1")
-            || v.eq_ignore_ascii_case("true")
-            || v.eq_ignore_ascii_case("on") => true,
+        Some(v)
+            if v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on") =>
+        {
+            true
+        }
         // Falsy: "0", "false", "off" (case-insensitive) → OFF.
-        Some(v) if v.eq_ignore_ascii_case("0")
-            || v.eq_ignore_ascii_case("false")
-            || v.eq_ignore_ascii_case("off") => false,
+        Some(v)
+            if v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off") =>
+        {
+            false
+        }
         // Non-empty unrecognized value → permissive default-on.
         Some(_) => true,
     }
@@ -1391,7 +1402,8 @@ fn env_usize(name: &str) -> Option<usize> {
 /// Parses `HF2Q_DUMP_LAYERS_LIST=0,5` as a `Vec<usize>`.
 /// Returns an empty Vec if the env var is unset or empty.
 fn env_usize_list(name: &str) -> Vec<usize> {
-    env::var(name).ok()
+    env::var(name)
+        .ok()
         .filter(|v| !v.is_empty())
         .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
         .unwrap_or_default()
@@ -1403,9 +1415,14 @@ fn env_usize_list(name: &str) -> Vec<usize> {
 /// unparsable entries are silently skipped so the replay simply ends
 /// at the first malformed token (rather than blowing up the whole run).
 fn env_u32_list_space(name: &str) -> Vec<u32> {
-    env::var(name).ok()
+    env::var(name)
+        .ok()
         .filter(|v| !v.is_empty())
-        .map(|v| v.split_whitespace().filter_map(|s| s.parse::<u32>().ok()).collect())
+        .map(|v| {
+            v.split_whitespace()
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1755,10 +1772,7 @@ mod tests {
     #[test]
     fn chunk_scan_prefill_default_when_unset() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::new(&[
-            "HF2Q_CHUNK_SCAN_PREFILL",
-            "HF2Q_UNSAFE_EXPERIMENTS",
-        ]);
+        let _guard = EnvGuard::new(&["HF2Q_CHUNK_SCAN_PREFILL", "HF2Q_UNSAFE_EXPERIMENTS"]);
         assert!(
             !InvestigationEnv::from_env().chunk_scan_prefill,
             "unset => default false (chunk-pipeline prefill must be opt-in)"
@@ -1770,10 +1784,7 @@ mod tests {
         // Ack-required gate: HF2Q_CHUNK_SCAN_PREFILL=1 alone does NOT take
         // effect. Both vars must be set for the field to read true.
         let _lock = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::new(&[
-            "HF2Q_CHUNK_SCAN_PREFILL",
-            "HF2Q_UNSAFE_EXPERIMENTS",
-        ]);
+        let guard = EnvGuard::new(&["HF2Q_CHUNK_SCAN_PREFILL", "HF2Q_UNSAFE_EXPERIMENTS"]);
         guard.set("HF2Q_CHUNK_SCAN_PREFILL", "1");
         // Note: HF2Q_UNSAFE_EXPERIMENTS deliberately not set.
         let env = InvestigationEnv::from_env();
@@ -1781,17 +1792,17 @@ mod tests {
             !env.chunk_scan_prefill,
             "raw intent without ack must be REFUSED (effective false)"
         );
-        assert!(env.raw.chunk_scan_prefill, "raw intent must be captured for REFUSED reporting");
+        assert!(
+            env.raw.chunk_scan_prefill,
+            "raw intent must be captured for REFUSED reporting"
+        );
         assert!(!env.unsafe_experiments_acked);
     }
 
     #[test]
     fn chunk_scan_prefill_enabled_with_ack() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::new(&[
-            "HF2Q_CHUNK_SCAN_PREFILL",
-            "HF2Q_UNSAFE_EXPERIMENTS",
-        ]);
+        let guard = EnvGuard::new(&["HF2Q_CHUNK_SCAN_PREFILL", "HF2Q_UNSAFE_EXPERIMENTS"]);
         guard.set("HF2Q_CHUNK_SCAN_PREFILL", "1");
         guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
         let env = InvestigationEnv::from_env();
@@ -1802,10 +1813,7 @@ mod tests {
     #[test]
     fn chunk_scan_prefill_not_enabled_by_other_values() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::new(&[
-            "HF2Q_CHUNK_SCAN_PREFILL",
-            "HF2Q_UNSAFE_EXPERIMENTS",
-        ]);
+        let guard = EnvGuard::new(&["HF2Q_CHUNK_SCAN_PREFILL", "HF2Q_UNSAFE_EXPERIMENTS"]);
         guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
         // env_eq_one accepts only "1" — these must all be rejected.
         for bad in &["0", "true", "yes", "TRUE", "on", ""] {
@@ -1985,7 +1993,10 @@ mod tests {
         let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
 
         // Unset → false (not explicitly set).
-        assert!(!is_kv_lcp_resume_explicitly_one(), "unset must return false");
+        assert!(
+            !is_kv_lcp_resume_explicitly_one(),
+            "unset must return false"
+        );
 
         // "1" → true.
         guard.set("HF2Q_KV_LCP_RESUME", "1");
@@ -1993,11 +2004,17 @@ mod tests {
 
         // "true" → false (not the literal "1").
         guard.set("HF2Q_KV_LCP_RESUME", "true");
-        assert!(!is_kv_lcp_resume_explicitly_one(), r#""true" must return false (only "1" qualifies)"#);
+        assert!(
+            !is_kv_lcp_resume_explicitly_one(),
+            r#""true" must return false (only "1" qualifies)"#
+        );
 
         // "0" → false.
         guard.set("HF2Q_KV_LCP_RESUME", "0");
-        assert!(!is_kv_lcp_resume_explicitly_one(), r#""0" must return false"#);
+        assert!(
+            !is_kv_lcp_resume_explicitly_one(),
+            r#""0" must return false"#
+        );
     }
 
     // ── parallel_encode_enabled (ADR-031 Phase B) ────────────────────────────
@@ -2008,8 +2025,14 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::new(&["HF2Q_PARALLEL_ENCODE", "HF2Q_PER_LAYER_DISP"]);
         let env = InvestigationEnv::from_env();
-        assert!(!env.parallel_encode_raw, "raw field should be false when unset");
-        assert!(!env.per_layer_disp_raw, "per_layer_disp_raw should be false when unset");
+        assert!(
+            !env.parallel_encode_raw,
+            "raw field should be false when unset"
+        );
+        assert!(
+            !env.per_layer_disp_raw,
+            "per_layer_disp_raw should be false when unset"
+        );
         assert!(
             !env.parallel_encode_enabled(),
             "both unset => enabled() must return false (default OFF)"
@@ -2024,7 +2047,10 @@ mod tests {
         guard.set("HF2Q_PARALLEL_ENCODE", "1");
         let env = InvestigationEnv::from_env();
         assert!(env.parallel_encode_raw, "raw field should be true with =1");
-        assert!(!env.per_layer_disp_raw, "per_layer_disp_raw should be false when unset");
+        assert!(
+            !env.per_layer_disp_raw,
+            "per_layer_disp_raw should be false when unset"
+        );
         assert!(
             env.parallel_encode_enabled(),
             "PARALLEL=1, DISP unset => enabled() must return true"

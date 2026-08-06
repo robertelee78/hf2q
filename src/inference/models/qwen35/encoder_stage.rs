@@ -415,12 +415,9 @@ impl<'sess> LayerEncoder<'sess> {
                 // K-boundary callers needed pre-iter91 from the Plain arm
                 // (`device.command_encoder()` opens a fresh CB for the
                 // next layer).
-                sess.reset_for_next_stage()
-                    .with_context(|| {
-                        format!(
-                            "EncoderSession::reset_for_next_stage after commit_and_wait({label})"
-                        )
-                    })?;
+                sess.reset_for_next_stage().with_context(|| {
+                    format!("EncoderSession::reset_for_next_stage after commit_and_wait({label})")
+                })?;
             }
         }
         Ok(())

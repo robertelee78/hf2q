@@ -32,8 +32,7 @@ use std::process::Command;
 use std::time::Duration;
 
 const BIN: &str = "target/release/hf2q";
-const CHAT_TEMPLATE_RAW: &str =
-    "{% for message in messages %}{{ message.content }}{% endfor %}";
+const CHAT_TEMPLATE_RAW: &str = "{% for message in messages %}{{ message.content }}{% endfor %}";
 
 struct Cell {
     fixture: &'static str,
@@ -185,16 +184,12 @@ const GIBBERISH_MARKERS: &[&str] = &[
     "<|im_start|>", // ditto
     "<|im_end|>",   // ditto
     "<|endoftext|>",
-    "**_**_**",     // apex broken-decode signature
-    "2- 2- 2-",     // iter40 bisect specific repetition
+    "**_**_**", // apex broken-decode signature
+    "2- 2- 2-", // iter40 bisect specific repetition
     "2-2-2-2-",
 ];
 
-fn smoke_check_output(
-    cell: &Cell,
-    output: &str,
-    golden: &str,
-) -> Result<(), String> {
+fn smoke_check_output(cell: &Cell, output: &str, golden: &str) -> Result<(), String> {
     let trimmed = output.trim();
 
     // iter-125 (ADR-030): KNOWN_DEGENERATE_PEER lookup MUST happen before any
@@ -234,7 +229,11 @@ fn smoke_check_output(
                     "WARN {}/{}: single-token repetition ({:?} × {} of {} words) — \
                      KNOWN_DEGENERATE_PEER cell, peer also produces degenerate output \
                      for bare prompts at temp 0",
-                    cell.fixture, cell.prompt_slug, first, rep, words.len()
+                    cell.fixture,
+                    cell.prompt_slug,
+                    first,
+                    rep,
+                    words.len()
                 );
             } else {
                 return Err(format!(
@@ -313,9 +312,7 @@ fn run_hf2q_decode(cell: &Cell) -> Result<String, String> {
         // instead of "failed", and the failure is fully cited at
         // ADR-013 follow-up territory + ADR-014 P11 re-emit
         // operator action (see project_adr014_p11_closure.md).
-        if stderr.contains("unsupported quant type")
-            && stderr.contains("expert weights")
-        {
+        if stderr.contains("unsupported quant type") && stderr.contains("expert weights") {
             return Err(format!(
                 "QUANT_NOT_SUPPORTED: {} carries quant type unsupported by this build's \
                  qwen35::weight_loader (see ADR-013 followup territory: mlx-native \
@@ -517,7 +514,9 @@ fn coherence_smoke_inputs_are_internally_consistent() {
 
     // KNOWN_DEGENERATE_PEER must reference real cells.
     for (fix, slug) in KNOWN_DEGENERATE_PEER {
-        let found = CELLS.iter().any(|c| c.fixture == *fix && c.prompt_slug == *slug);
+        let found = CELLS
+            .iter()
+            .any(|c| c.fixture == *fix && c.prompt_slug == *slug);
         assert!(
             found,
             "KNOWN_DEGENERATE_PEER references unknown cell ({fix}, {slug})"

@@ -131,10 +131,7 @@ pub fn emit_general_prelude(
         kv.push(("general.version".into(), MetaValue::String(v.clone())));
     }
     if let Some(o) = &id_components.organization {
-        kv.push((
-            "general.organization".into(),
-            MetaValue::String(o.clone()),
-        ));
+        kv.push(("general.organization".into(), MetaValue::String(o.clone())));
     }
     if let Some(f) = &id_components.finetune {
         kv.push(("general.finetune".into(), MetaValue::String(f.clone())));
@@ -150,10 +147,7 @@ pub fn emit_general_prelude(
     }
     if let Some(card) = model_card {
         if let Some(license) = &card.license {
-            kv.push((
-                "general.license".into(),
-                MetaValue::String(license.clone()),
-            ));
+            kv.push(("general.license".into(), MetaValue::String(license.clone())));
         }
         if let Some(license_name) = &card.license_name {
             kv.push((
@@ -294,7 +288,9 @@ fn extract_frontmatter_block(contents: &str) -> Option<&str> {
         // Tolerate CRLF line endings on the sentinel line.
         trimmed_start.strip_prefix("---\r\n")
     })?;
-    let close_idx = after_first.find("\n---\n").or_else(|| after_first.find("\n---\r\n"))?;
+    let close_idx = after_first
+        .find("\n---\n")
+        .or_else(|| after_first.find("\n---\r\n"))?;
     Some(&after_first[..close_idx])
 }
 
@@ -493,11 +489,7 @@ pub fn format_param_count_rounded(n: u64, min_digits: usize) -> String {
     // For real model params this is negligible; we use the harness's
     // native rounding here.
     let rounded_int = scaled.round() as i64;
-    let int_str_len = rounded_int
-        .abs()
-        .to_string()
-        .trim_start_matches('0')
-        .len();
+    let int_str_len = rounded_int.abs().to_string().trim_start_matches('0').len();
     let fix = min_digits.saturating_sub(int_str_len);
     format!("{scaled:.*}{suffix}", fix)
 }
@@ -671,8 +663,7 @@ pub fn get_model_id_components(model_id: &str) -> ModelIdComponents {
     for (part, t) in name_parts.iter().zip(tags.iter_mut()) {
         let untagged = !t.has_any();
         if at_start
-            && ((untagged && part.chars().next().is_some_and(|c| c.is_alphabetic()))
-                || t.version)
+            && ((untagged && part.chars().next().is_some_and(|c| c.is_alphabetic())) || t.version)
         {
             t.basename = true;
         } else {
@@ -734,11 +725,7 @@ impl NameTagSet {
     }
 }
 
-fn collect_joined<F>(
-    parts: &[String],
-    tags: &[NameTagSet],
-    pred: F,
-) -> Option<String>
+fn collect_joined<F>(parts: &[String], tags: &[NameTagSet], pred: F) -> Option<String>
 where
     F: Fn(&NameTagSet) -> bool,
 {
@@ -756,11 +743,7 @@ where
     }
 }
 
-fn collect_joined_dedup<F>(
-    parts: &[String],
-    tags: &[NameTagSet],
-    pred: F,
-) -> Option<String>
+fn collect_joined_dedup<F>(parts: &[String], tags: &[NameTagSet], pred: F) -> Option<String>
 where
     F: Fn(&NameTagSet) -> bool,
 {
@@ -785,7 +768,10 @@ where
 /// latter only `v`/`iter` prefixed.
 fn is_version_marker(part: &str) -> bool {
     let lower = part.to_ascii_lowercase();
-    let rest = lower.strip_prefix('v').or_else(|| lower.strip_prefix("iter")).unwrap_or(&lower);
+    let rest = lower
+        .strip_prefix('v')
+        .or_else(|| lower.strip_prefix("iter"))
+        .unwrap_or(&lower);
     if rest.is_empty() {
         return false;
     }
@@ -825,7 +811,10 @@ fn quant_type_uppercased(part: &str) -> Option<String> {
     let lower = part.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     // Check b?fp?(16|32) variants first.
-    if matches!(lower.as_str(), "fp16" | "fp32" | "bfp16" | "bfp32" | "f16" | "f32" | "bf16" | "bf32") {
+    if matches!(
+        lower.as_str(),
+        "fp16" | "fp32" | "bfp16" | "bfp32" | "f16" | "f32" | "bf16" | "bf32"
+    ) {
         return Some(part.to_ascii_uppercase());
     }
     // Check `i?q\d(_\w)*` (e.g. `q4`, `q4_k`, `q4_k_m`, `iq2_xxs`).
@@ -1011,9 +1000,7 @@ fn is_python_islower(s: &str) -> bool {
 fn is_version_or_digit_start(s: &str) -> bool {
     // `v\d+(\.\d+)*` variant
     if let Some(rest) = s.strip_prefix('v') {
-        if !rest.is_empty()
-            && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
-        {
+        if !rest.is_empty() && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             let mut chars = rest.chars().peekable();
             while let Some(&c) = chars.peek() {
                 if c.is_ascii_digit() {
@@ -1137,7 +1124,10 @@ mod tests {
     #[test]
     fn extract_frontmatter_block_handles_lf() {
         let contents = "---\nfoo: bar\nbaz: qux\n---\nbody text\n";
-        assert_eq!(extract_frontmatter_block(contents), Some("foo: bar\nbaz: qux"));
+        assert_eq!(
+            extract_frontmatter_block(contents),
+            Some("foo: bar\nbaz: qux")
+        );
     }
 
     #[test]
@@ -1388,10 +1378,7 @@ language:
         );
         // Nomic v2-moe `_name_or_path` is "nomic-ai/nomic-xlm-2048";
         // we feed just the "nomic-xlm-2048" full-name component here.
-        assert_eq!(
-            title_case_hyphenated("nomic-xlm-2048"),
-            "Nomic Xlm 2048"
-        );
+        assert_eq!(title_case_hyphenated("nomic-xlm-2048"), "Nomic Xlm 2048");
         // Nomic v2-moe base_model[0] is
         // "nomic-ai/nomic-embed-text-v2-moe-unsupervised"; v2 keeps
         // lowercase per the version-marker regex skip.
@@ -1467,19 +1454,13 @@ language:
             by_key["general.architecture"],
             MetaValue::String("gemma4".into())
         );
-        assert_eq!(
-            by_key["general.type"],
-            MetaValue::String("model".into())
-        );
+        assert_eq!(by_key["general.type"], MetaValue::String("model".into()));
         assert_eq!(by_key["general.sampling.top_k"], MetaValue::I32(64));
         assert_eq!(
             by_key["general.name"],
             MetaValue::String("Google Gemma 4 26b A4B It".into())
         );
-        assert_eq!(
-            by_key["general.finetune"],
-            MetaValue::String("it".into())
-        );
+        assert_eq!(by_key["general.finetune"], MetaValue::String("it".into()));
         assert_eq!(
             by_key["general.basename"],
             MetaValue::String("google-gemma-4".into())
@@ -1502,10 +1483,7 @@ language:
             license: Some("apache-2.0".into()),
             license_name: None,
             license_link: None,
-            tags: vec![
-                "sentence-transformers".into(),
-                "sentence-similarity".into(),
-            ],
+            tags: vec!["sentence-transformers".into(), "sentence-similarity".into()],
             languages: vec!["en".into(), "es".into()],
             base_models: vec![BaseModelEntry {
                 raw: "nomic-ai/nomic-embed-text-v2-moe-unsupervised".into(),
@@ -1597,9 +1575,9 @@ language:
     fn compute_size_label_moe_8_experts() {
         let tensors = vec![
             (192_036_864_u64, false), // token_embd 250048×768
-            (28_000_000, false),       // attention layers
-            (28_320_000, false),       // dense FFN
-            (8 * 4_720_000, true),     // expert w1+w2 across 6 MoE layers (total expert params)
+            (28_000_000, false),      // attention layers
+            (28_320_000, false),      // dense FFN
+            (8 * 4_720_000, true),    // expert w1+w2 across 6 MoE layers (total expert params)
         ];
         // 192M + 28M + 28M + (8*4.72M)/8 = 192+28+28+4.72 = 252.72M shared+per_expert
         // Hmm — but actual nomic v2-moe is 277M. The composition above is
@@ -1612,10 +1590,7 @@ language:
 
     #[test]
     fn compute_size_label_dense_no_experts() {
-        let tensors = vec![
-            (192_000_000, false),
-            (100_000_000, false),
-        ];
+        let tensors = vec![(192_000_000, false), (100_000_000, false)];
         let label = compute_size_label(tensors, 0);
         // 292M total, format with min_digits=2 → "292M".
         assert_eq!(label, "292M");

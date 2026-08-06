@@ -124,9 +124,9 @@ impl DFlashConfig {
     pub fn from_json_str(s: &str) -> Result<Self, ConfigError> {
         let raw: RawDFlashConfigJson = serde_json::from_str(s)?;
 
-        let layer_types = raw.layer_types.unwrap_or_else(|| {
-            vec![LayerType::FullAttention; raw.num_hidden_layers]
-        });
+        let layer_types = raw
+            .layer_types
+            .unwrap_or_else(|| vec![LayerType::FullAttention; raw.num_hidden_layers]);
 
         // Validation mirrors `load_draft` lines 209-216 in model_mlx.py.
         if layer_types.len() != raw.num_hidden_layers {
@@ -136,7 +136,9 @@ impl DFlashConfig {
                 raw.num_hidden_layers
             )));
         }
-        if layer_types.iter().any(|t| matches!(t, LayerType::SlidingAttention))
+        if layer_types
+            .iter()
+            .any(|t| matches!(t, LayerType::SlidingAttention))
             && raw.sliding_window.is_none()
         {
             return Err(ConfigError::Invalid(
@@ -174,7 +176,8 @@ impl DFlashConfig {
                 )));
             }
         }
-        if raw.dflash_config.mask_token_id < 0 || raw.dflash_config.mask_token_id > u32::MAX as i64 {
+        if raw.dflash_config.mask_token_id < 0 || raw.dflash_config.mask_token_id > u32::MAX as i64
+        {
             return Err(ConfigError::Invalid(format!(
                 "mask_token_id {} not in u32 range",
                 raw.dflash_config.mask_token_id
@@ -326,7 +329,8 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_target_layer_ids_out_of_bounds() {
-        let bad = GEMMA4_26B_A4B_DFLASH_CONFIG.replace("[1, 6, 11, 17, 22, 27]", "[1, 6, 11, 17, 22, 30]");
+        let bad = GEMMA4_26B_A4B_DFLASH_CONFIG
+            .replace("[1, 6, 11, 17, 22, 27]", "[1, 6, 11, 17, 22, 30]");
         let err = DFlashConfig::from_json_str(&bad).unwrap_err();
         match err {
             ConfigError::Invalid(msg) => assert!(msg.contains("target_layer_ids")),
@@ -336,7 +340,8 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_target_layer_ids_not_monotonic() {
-        let bad = GEMMA4_26B_A4B_DFLASH_CONFIG.replace("[1, 6, 11, 17, 22, 27]", "[1, 6, 17, 11, 22, 27]");
+        let bad = GEMMA4_26B_A4B_DFLASH_CONFIG
+            .replace("[1, 6, 11, 17, 22, 27]", "[1, 6, 17, 11, 22, 27]");
         let err = DFlashConfig::from_json_str(&bad).unwrap_err();
         match err {
             ConfigError::Invalid(msg) => assert!(msg.contains("strictly increasing")),
@@ -377,15 +382,15 @@ pub(crate) mod tests {
             eprintln!("skipping: {path} not on disk");
             return None;
         }
-        Some(
-            DFlashConfig::from_json_path(path).unwrap_or_else(|e| panic!("parse {path}: {e}")),
-        )
+        Some(DFlashConfig::from_json_path(path).unwrap_or_else(|e| panic!("parse {path}: {e}")))
     }
 
     #[test]
     fn parses_real_qwen36_27b_dflash_config_2026_05_21() {
         let path = "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash/config.json";
-        let Some(cfg) = try_parse_real(path) else { return };
+        let Some(cfg) = try_parse_real(path) else {
+            return;
+        };
         // Per the actual drafter config inspected during ADR-034 prep:
         // target hidden=5120 (matches Qwen 3.6 27B dense); 5 layers (4 sliding + 1 full);
         // 32/8 attn/kv heads; intermediate=17408; target has 64 layers.
@@ -409,7 +414,9 @@ pub(crate) mod tests {
     #[test]
     fn parses_real_qwen36_35b_a3b_dflash_config_2026_05_21() {
         let path = "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-35B-A3B-DFlash/config.json";
-        let Some(cfg) = try_parse_real(path) else { return };
+        let Some(cfg) = try_parse_real(path) else {
+            return;
+        };
         // Per the actual drafter config: target hidden=2048 (Qwen 3.5/3.6 35B-A3B);
         // 8 layers (all full_attention); 32/4 attn/kv heads; intermediate=6144;
         // target has 40 layers.
@@ -431,9 +438,10 @@ pub(crate) mod tests {
 
     #[test]
     fn parses_real_gemma4_26b_dflash_config_2026_05_21() {
-        let path =
-            "/opt/hf2q/models/dflash-drafters/z-lab__gemma-4-26B-A4B-it-DFlash/config.json";
-        let Some(cfg) = try_parse_real(path) else { return };
+        let path = "/opt/hf2q/models/dflash-drafters/z-lab__gemma-4-26B-A4B-it-DFlash/config.json";
+        let Some(cfg) = try_parse_real(path) else {
+            return;
+        };
         // Per the actual drafter config: target hidden=2816 (Gemma 4 26B A4B);
         // 5 layers (4 sliding + 1 full); 32/8 attn/kv; intermediate=5632; target has 30 layers;
         // sliding_window=2048; final_logit_softcapping=30.0 (Gemma-specific).

@@ -420,13 +420,20 @@ pub enum AdmitError {
 impl fmt::Display for AdmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AdmitError::QueueFull { queue_capacity, total_admissible, in_flight } => write!(
+            AdmitError::QueueFull {
+                queue_capacity,
+                total_admissible,
+                in_flight,
+            } => write!(
                 f,
                 "queue full (queue_capacity={}, total_admissible={}, in_flight={})",
                 queue_capacity, total_admissible, in_flight,
             ),
             AdmitError::SchedulerStopped => write!(f, "scheduler stopped"),
-            AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes } => write!(
+            AdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            } => write!(
                 f,
                 "per-slot KV budget exceeded (needed_bytes={}, budget_bytes={}) \
                  — ADR-040 §3.5: reduce max_tokens or request a smaller prompt",
@@ -587,7 +594,11 @@ impl FifoSchedulerAdapter {
     }
 
     fn in_flight_count(&self) -> u32 {
-        if self.in_flight.is_some() { 1 } else { 0 }
+        if self.in_flight.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     fn total_admissible(&self) -> u32 {
@@ -620,12 +631,19 @@ impl FifoSchedulerAdapter {
     ) -> InFlightFifoSlot {
         InFlightFifoSlot {
             request_id,
-            handle: SlotHandle { slot_id: SlotId(0), generation: self.slot_generation },
+            handle: SlotHandle {
+                slot_id: SlotId(0),
+                generation: self.slot_generation,
+            },
             admitted_at,
             prompt_tokens,
             max_tokens,
             // iter-2.5 M2: prompt_tokens==0 skips prefill entirely.
-            prefill_remaining: if prompt_tokens == 0 { None } else { Some(prompt_tokens) },
+            prefill_remaining: if prompt_tokens == 0 {
+                None
+            } else {
+                Some(prompt_tokens)
+            },
             tokens_produced: 0,
         }
     }
@@ -660,15 +678,22 @@ impl FifoSchedulerAdapter {
     /// stuck slot. Under normal use (`admit` short-circuits FIRST), the
     /// branch is defensive.
     fn promote_one(&mut self) {
-        debug_assert!(self.in_flight.is_none(), "promote_one called with in_flight occupied");
+        debug_assert!(
+            self.in_flight.is_none(),
+            "promote_one called with in_flight occupied"
+        );
         while let Some(q) = self.queue.pop_front() {
-            if classify_admit(q.prompt_tokens, q.max_tokens) == InitialAdmitOutcome::CompletedAtAdmit
+            if classify_admit(q.prompt_tokens, q.max_tokens)
+                == InitialAdmitOutcome::CompletedAtAdmit
             {
                 self.completed_total = self.completed_total.saturating_add(1);
                 continue;
             }
             self.in_flight = Some(self.build_in_flight(
-                q.request_id, q.admitted_at, q.prompt_tokens, q.max_tokens,
+                q.request_id,
+                q.admitted_at,
+                q.prompt_tokens,
+                q.max_tokens,
             ));
             return;
         }
@@ -678,11 +703,21 @@ impl FifoSchedulerAdapter {
     /// just executed against the handle. Stale handles are no-ops.
     /// Transitions to decoding once `prefill_remaining` hits 0.
     pub fn advance_after_prefill(&mut self, handle: SlotHandle, n_consumed: u32) {
-        let Some(slot) = self.in_flight.as_mut() else { return; };
-        if slot.handle != handle { return; }
-        let Some(remaining) = slot.prefill_remaining else { return; };
+        let Some(slot) = self.in_flight.as_mut() else {
+            return;
+        };
+        if slot.handle != handle {
+            return;
+        }
+        let Some(remaining) = slot.prefill_remaining else {
+            return;
+        };
         let new_remaining = remaining.saturating_sub(n_consumed);
-        slot.prefill_remaining = if new_remaining == 0 { None } else { Some(new_remaining) };
+        slot.prefill_remaining = if new_remaining == 0 {
+            None
+        } else {
+            Some(new_remaining)
+        };
     }
 
     /// Driver callback: report that the slot just emitted one decode
@@ -690,10 +725,16 @@ impl FifoSchedulerAdapter {
     /// handles are no-ops.
     pub fn advance_after_decode(&mut self, handle: SlotHandle) {
         let should_release = {
-            let Some(slot) = self.in_flight.as_mut() else { return; };
-            if slot.handle != handle { return; }
+            let Some(slot) = self.in_flight.as_mut() else {
+                return;
+            };
+            if slot.handle != handle {
+                return;
+            }
             // Reject decode advance for a slot that is still prefilling.
-            if slot.prefill_remaining.is_some() { return; }
+            if slot.prefill_remaining.is_some() {
+                return;
+            }
             slot.tokens_produced = slot.tokens_produced.saturating_add(1);
             slot.tokens_produced >= slot.max_tokens
         };
@@ -715,8 +756,7 @@ impl Scheduler for FifoSchedulerAdapter {
         // the queue check is operator-honest (the 429 names the per-
         // request structural problem, not transient capacity).  Budget
         // == 0 disables the check entirely (pre-A5 byte-equivalence).
-        if self.per_slot_kv_budget_bytes > 0
-            && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
+        if self.per_slot_kv_budget_bytes > 0 && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
         {
             self.rejected_429_total = self.rejected_429_total.saturating_add(1);
             return Err(AdmitError::SlotBudgetExceeded {
@@ -742,7 +782,8 @@ impl Scheduler for FifoSchedulerAdapter {
         // No physical slot allocated, no queue entry, no generation bump
         // (no slot lifecycle to track). The caller observes
         // `handle.is_none()` and skips the drive loop.
-        if classify_admit(req.prompt_tokens, req.max_tokens) == InitialAdmitOutcome::CompletedAtAdmit
+        if classify_admit(req.prompt_tokens, req.max_tokens)
+            == InitialAdmitOutcome::CompletedAtAdmit
         {
             self.completed_total = self.completed_total.saturating_add(1);
             return Ok(RequestSlot {
@@ -755,9 +796,8 @@ impl Scheduler for FifoSchedulerAdapter {
         }
 
         let public = if self.in_flight.is_none() {
-            let slot = self.build_in_flight(
-                request_id, admitted_at, req.prompt_tokens, req.max_tokens,
-            );
+            let slot =
+                self.build_in_flight(request_id, admitted_at, req.prompt_tokens, req.max_tokens);
             let public = RequestSlot {
                 request_id,
                 handle: Some(slot.handle),
@@ -802,8 +842,12 @@ impl Scheduler for FifoSchedulerAdapter {
 
     fn release(&mut self, handle: SlotHandle) {
         // Stale or unknown handle — silent no-op (iter-2.5 C1).
-        let Some(slot) = self.in_flight.as_ref() else { return; };
-        if slot.handle != handle { return; }
+        let Some(slot) = self.in_flight.as_ref() else {
+            return;
+        };
+        if slot.handle != handle {
+            return;
+        }
         self.in_flight = None;
         // Bump generation so the next admit/promote sees a fresh value.
         self.slot_generation = self.slot_generation.saturating_add(1);
@@ -836,8 +880,13 @@ impl Scheduler for FifoSchedulerAdapter {
 /// normal Prefilling → Decoding transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotPhase {
-    Prefilling { tokens_remaining: u32 },
-    Decoding { tokens_produced: u32, max_tokens: u32 },
+    Prefilling {
+        tokens_remaining: u32,
+    },
+    Decoding {
+        tokens_produced: u32,
+        max_tokens: u32,
+    },
 }
 
 /// Outcome of evaluating a fresh admit request's prompt/budget shape.
@@ -1009,8 +1058,10 @@ impl InflightBatchedScheduler {
     /// Test-only: read the current generation counter for a slot.
     pub fn slot_generation(&self, slot_id: SlotId) -> u64 {
         let idx = slot_id.0 as usize;
-        debug_assert!(idx < self.slot_generations.len(),
-            "slot_generation called with out-of-bounds slot_id");
+        debug_assert!(
+            idx < self.slot_generations.len(),
+            "slot_generation called with out-of-bounds slot_id"
+        );
         self.slot_generations[idx]
     }
 
@@ -1057,7 +1108,10 @@ impl InflightBatchedScheduler {
                 | InitialAdmitOutcome::PhaseToDecoding) => {
                     let slot_id = self.alloc_slot_id();
                     let generation = self.slot_generations[slot_id.0 as usize];
-                    let handle = SlotHandle { slot_id, generation };
+                    let handle = SlotHandle {
+                        slot_id,
+                        generation,
+                    };
                     let phase = match outcome {
                         InitialAdmitOutcome::PhaseToPrefilling => SlotPhase::Prefilling {
                             tokens_remaining: q.prompt_tokens,
@@ -1066,9 +1120,9 @@ impl InflightBatchedScheduler {
                             tokens_produced: 0,
                             max_tokens: q.max_tokens,
                         },
-                        InitialAdmitOutcome::CompletedAtAdmit => unreachable!(
-                            "inner match already discriminated CompletedAtAdmit"
-                        ),
+                        InitialAdmitOutcome::CompletedAtAdmit => {
+                            unreachable!("inner match already discriminated CompletedAtAdmit")
+                        }
                     };
                     self.in_flight.push(InflightSlot {
                         request_id: q.request_id,
@@ -1114,9 +1168,14 @@ impl InflightBatchedScheduler {
         };
         let new_remaining = tokens_remaining.saturating_sub(n_consumed);
         slot.phase = if new_remaining == 0 {
-            SlotPhase::Decoding { tokens_produced: 0, max_tokens: slot.max_tokens }
+            SlotPhase::Decoding {
+                tokens_produced: 0,
+                max_tokens: slot.max_tokens,
+            }
         } else {
-            SlotPhase::Prefilling { tokens_remaining: new_remaining }
+            SlotPhase::Prefilling {
+                tokens_remaining: new_remaining,
+            }
         };
     }
 
@@ -1127,7 +1186,11 @@ impl InflightBatchedScheduler {
         let Some(idx) = self.in_flight.iter().position(|s| s.handle == handle) else {
             return;
         };
-        let SlotPhase::Decoding { tokens_produced, max_tokens } = self.in_flight[idx].phase else {
+        let SlotPhase::Decoding {
+            tokens_produced,
+            max_tokens,
+        } = self.in_flight[idx].phase
+        else {
             return;
         };
         let new_produced = tokens_produced.saturating_add(1);
@@ -1136,8 +1199,7 @@ impl InflightBatchedScheduler {
             let slot_id = handle.slot_id;
             self.in_flight.remove(idx);
             let gen_idx = slot_id.0 as usize;
-            self.slot_generations[gen_idx] =
-                self.slot_generations[gen_idx].saturating_add(1);
+            self.slot_generations[gen_idx] = self.slot_generations[gen_idx].saturating_add(1);
             self.slot_id_free_list.push(slot_id);
             self.completed_total = self.completed_total.saturating_add(1);
         } else {
@@ -1171,8 +1233,7 @@ impl Scheduler for InflightBatchedScheduler {
         // ADR-040 §3.5 iter-A5 — per-slot KV budget check FIRST (same
         // ordering as the FIFO adapter; see that admit body for the
         // rationale).  Budget == 0 disables (pre-A5 byte-equivalence).
-        if self.per_slot_kv_budget_bytes > 0
-            && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
+        if self.per_slot_kv_budget_bytes > 0 && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
         {
             self.rejected_429_total = self.rejected_429_total.saturating_add(1);
             return Err(AdmitError::SlotBudgetExceeded {
@@ -1217,7 +1278,10 @@ impl Scheduler for InflightBatchedScheduler {
             // (honouring iter-2.5 M2 for zero-prompt requests).
             let slot_id = self.alloc_slot_id();
             let generation = self.slot_generations[slot_id.0 as usize];
-            let handle = SlotHandle { slot_id, generation };
+            let handle = SlotHandle {
+                slot_id,
+                generation,
+            };
             let phase = match outcome {
                 InitialAdmitOutcome::PhaseToPrefilling => SlotPhase::Prefilling {
                     tokens_remaining: req.prompt_tokens,
@@ -1226,9 +1290,9 @@ impl Scheduler for InflightBatchedScheduler {
                     tokens_produced: 0,
                     max_tokens: req.max_tokens,
                 },
-                InitialAdmitOutcome::CompletedAtAdmit => unreachable!(
-                    "CompletedAtAdmit already handled by the early-return above"
-                ),
+                InitialAdmitOutcome::CompletedAtAdmit => {
+                    unreachable!("CompletedAtAdmit already handled by the early-return above")
+                }
             };
             self.in_flight.push(InflightSlot {
                 request_id,
@@ -1279,11 +1343,11 @@ impl Scheduler for InflightBatchedScheduler {
         match (prefill_idx, decode_handles.is_empty()) {
             (Some(idx), false) => {
                 // Mixed: oldest Prefilling slot batched with all Decoding.
-                let SlotPhase::Prefilling { tokens_remaining } = self.in_flight[idx].phase
-                else {
+                let SlotPhase::Prefilling { tokens_remaining } = self.in_flight[idx].phase else {
                     // first_prefilling_idx only returns Prefilling slots.
                     return Err(StepError::EngineFailed(
-                        "first_prefilling_idx returned non-Prefilling index — invariant violated".to_string(),
+                        "first_prefilling_idx returned non-Prefilling index — invariant violated"
+                            .to_string(),
                     ));
                 };
                 Ok(SchedulerStep::Mixed {
@@ -1293,10 +1357,10 @@ impl Scheduler for InflightBatchedScheduler {
                 })
             }
             (Some(idx), true) => {
-                let SlotPhase::Prefilling { tokens_remaining } = self.in_flight[idx].phase
-                else {
+                let SlotPhase::Prefilling { tokens_remaining } = self.in_flight[idx].phase else {
                     return Err(StepError::EngineFailed(
-                        "first_prefilling_idx returned non-Prefilling index — invariant violated".to_string(),
+                        "first_prefilling_idx returned non-Prefilling index — invariant violated"
+                            .to_string(),
                     ));
                 };
                 Ok(SchedulerStep::Prefill {
@@ -1304,7 +1368,9 @@ impl Scheduler for InflightBatchedScheduler {
                     n_tokens: tokens_remaining.min(DEFAULT_PREFILL_CHUNK_TOKENS),
                 })
             }
-            (None, false) => Ok(SchedulerStep::Decode { handles: decode_handles }),
+            (None, false) => Ok(SchedulerStep::Decode {
+                handles: decode_handles,
+            }),
             (None, true) => Ok(SchedulerStep::Idle),
         }
     }
@@ -1316,8 +1382,7 @@ impl Scheduler for InflightBatchedScheduler {
         };
         self.in_flight.remove(idx);
         let gen_idx = handle.slot_id.0 as usize;
-        self.slot_generations[gen_idx] =
-            self.slot_generations[gen_idx].saturating_add(1);
+        self.slot_generations[gen_idx] = self.slot_generations[gen_idx].saturating_add(1);
         self.slot_id_free_list.push(handle.slot_id);
         self.completed_total = self.completed_total.saturating_add(1);
         // Promotion is the responsibility of step(); not done here to
@@ -1345,19 +1410,28 @@ mod tests {
     use super::*;
 
     fn req(prompt_tokens: u32, max_tokens: u32) -> AdmitRequest {
-        AdmitRequest { prompt_tokens, max_tokens, kv_bytes_needed: 0 }
+        AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+        }
     }
 
     /// iter-A5 helper — admit request with explicit KV byte cost so
     /// per-slot KV budget tests can pin the SlotBudgetExceeded path.
     fn req_with_kv(prompt_tokens: u32, max_tokens: u32, kv_bytes_needed: u64) -> AdmitRequest {
-        AdmitRequest { prompt_tokens, max_tokens, kv_bytes_needed }
+        AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed,
+        }
     }
 
     /// Helper to extract the handle from a RequestSlot, panicking with a
     /// clear message if the slot was queued (handle == None).
     fn handle_of(slot: &RequestSlot) -> SlotHandle {
-        slot.handle.expect("expected admitted-in-flight slot (handle == Some)")
+        slot.handle
+            .expect("expected admitted-in-flight slot (handle == Some)")
     }
 
     // -----------------------------------------------------------------------
@@ -1382,9 +1456,18 @@ mod tests {
         let mut s = FifoSchedulerAdapter::new(4);
         let a = s.admit(req(10, 8)).expect("admit a");
         let b = s.admit(req(20, 16)).expect("admit b");
-        assert!(a.handle.is_some(), "a admitted to in_flight has Some(handle)");
-        assert!(b.handle.is_none(), "b queued has None handle until promoted");
-        assert_ne!(a.request_id, b.request_id, "request ids are unique per admit");
+        assert!(
+            a.handle.is_some(),
+            "a admitted to in_flight has Some(handle)"
+        );
+        assert!(
+            b.handle.is_none(),
+            "b queued has None handle until promoted"
+        );
+        assert_ne!(
+            a.request_id, b.request_id,
+            "request ids are unique per admit"
+        );
         assert_eq!(s.stats().in_flight_slots, 1);
 
         let a_handle = handle_of(&a);
@@ -1409,8 +1492,11 @@ mod tests {
         match s.step().unwrap() {
             SchedulerStep::Prefill { handle, n_tokens } => {
                 assert_eq!(handle.slot_id, SlotId(0));
-                assert_eq!(handle.generation, a_handle.generation + 1,
-                    "post-promote generation bumped by release");
+                assert_eq!(
+                    handle.generation,
+                    a_handle.generation + 1,
+                    "post-promote generation bumped by release"
+                );
                 assert_eq!(n_tokens, 20);
             }
             other => panic!("expected Prefill for b, got {:?}", other),
@@ -1424,9 +1510,16 @@ mod tests {
         let _b = s.admit(req(1, 1)).expect("b queued");
         let _c = s.admit(req(1, 1)).expect("c queued");
         match s.admit(req(1, 1)) {
-            Err(AdmitError::QueueFull { queue_capacity, total_admissible, in_flight }) => {
+            Err(AdmitError::QueueFull {
+                queue_capacity,
+                total_admissible,
+                in_flight,
+            }) => {
                 assert_eq!(queue_capacity, 2);
-                assert_eq!(total_admissible, 3, "FIFO total = queue_capacity (2) + 1 in-flight");
+                assert_eq!(
+                    total_admissible, 3,
+                    "FIFO total = queue_capacity (2) + 1 in-flight"
+                );
                 assert_eq!(in_flight, 1, "FIFO max in_flight is 1");
             }
             other => panic!("expected QueueFull, got {:?}", other),
@@ -1439,7 +1532,10 @@ mod tests {
         let mut s = FifoSchedulerAdapter::new(4);
         let _a = s.admit(req(1, 1)).expect("admit a");
         // Bogus handle: SlotId(0) with future generation.
-        s.release(SlotHandle { slot_id: SlotId(9_999), generation: 0 });
+        s.release(SlotHandle {
+            slot_id: SlotId(9_999),
+            generation: 0,
+        });
         assert_eq!(s.stats().completed_total, 0);
         assert_eq!(s.stats().in_flight_slots, 1);
         match s.step().unwrap() {
@@ -1519,7 +1615,10 @@ mod tests {
         let b = s.admit(req(1, 1)).expect("admit b");
         let b_handle = handle_of(&b);
         assert_eq!(b_handle.slot_id, SlotId(0), "second admit reuses slot 0");
-        assert!(b_handle.generation > a_handle.generation, "generation bumped on release");
+        assert!(
+            b_handle.generation > a_handle.generation,
+            "generation bumped on release"
+        );
     }
 
     #[test]
@@ -1532,8 +1631,12 @@ mod tests {
             let s = Arc::clone(&sched);
             handles.push(thread::spawn(move || {
                 let mut g = s.lock().unwrap();
-                g.admit(AdmitRequest { prompt_tokens: 1, max_tokens: 1, kv_bytes_needed: 0 })
-                    .map(|slot| (i, slot.request_id))
+                g.admit(AdmitRequest {
+                    prompt_tokens: 1,
+                    max_tokens: 1,
+                    kv_bytes_needed: 0,
+                })
+                .map(|slot| (i, slot.request_id))
             }));
         }
         let mut admitted = 0;
@@ -1592,7 +1695,11 @@ mod tests {
         // Cancel b — exactly one removed.
         let removed = s.cancel_queued(b.request_id);
         assert!(removed, "cancel returns true for known request");
-        assert_eq!(s.queue.len(), 2, "exactly one queued request removed (was 3)");
+        assert_eq!(
+            s.queue.len(),
+            2,
+            "exactly one queued request removed (was 3)"
+        );
         assert_eq!(s.stats().in_flight_slots, 1, "in_flight unaffected");
         assert_eq!(s.stats().completed_total, 1, "cancellation bumps completed");
     }
@@ -1617,7 +1724,11 @@ mod tests {
         let a_handle = handle_of(&a);
         assert_eq!(a_handle.generation, 0);
         s.release(a_handle);
-        assert_eq!(s.slot_generation(SlotId(0)), 1, "generation bumped on release");
+        assert_eq!(
+            s.slot_generation(SlotId(0)),
+            1,
+            "generation bumped on release"
+        );
     }
 
     #[test]
@@ -1653,7 +1764,11 @@ mod tests {
 
         // Stale decode for A also a no-op.
         s.advance_after_decode(a_handle);
-        assert_eq!(s.stats().completed_total, 1, "stale advance did not bump completed");
+        assert_eq!(
+            s.stats().completed_total,
+            1,
+            "stale advance did not bump completed"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1680,7 +1795,11 @@ mod tests {
         let _ = s.admit(req(1, 1)).expect("queued 0");
         let _ = s.admit(req(1, 1)).expect("queued 1");
         match s.admit(req(1, 1)) {
-            Err(AdmitError::QueueFull { queue_capacity, total_admissible, in_flight }) => {
+            Err(AdmitError::QueueFull {
+                queue_capacity,
+                total_admissible,
+                in_flight,
+            }) => {
                 assert_eq!(queue_capacity, 2);
                 assert_eq!(total_admissible, 4);
                 assert_eq!(in_flight, 2);
@@ -1710,7 +1829,10 @@ mod tests {
         assert_eq!(s.stats().in_flight_slots, 0);
         assert_eq!(s.stats().completed_total, 2);
         // Stale handle is a no-op.
-        s.release(SlotHandle { slot_id: SlotId(9_999), generation: 0 });
+        s.release(SlotHandle {
+            slot_id: SlotId(9_999),
+            generation: 0,
+        });
         assert_eq!(s.stats().completed_total, 2);
     }
 
@@ -1834,14 +1956,21 @@ mod tests {
         // Prefilling slot in FIFO order (b, since c was just promoted to
         // the back) is what step() emits.
         match s.step().unwrap() {
-            SchedulerStep::Prefill { handle: _, n_tokens } => {
+            SchedulerStep::Prefill {
+                handle: _,
+                n_tokens,
+            } => {
                 // FIFO across in_flight: b was admitted first, c was just
                 // promoted to the END of in_flight, so step picks b (7).
                 assert_eq!(n_tokens, 7, "first Prefilling slot in FIFO order is b");
             }
             other => panic!("expected Prefill after promotion, got {:?}", other),
         }
-        assert_eq!(s.stats().in_flight_slots, 2, "c was promoted into the freed slot");
+        assert_eq!(
+            s.stats().in_flight_slots,
+            2,
+            "c was promoted into the freed slot"
+        );
     }
 
     #[test]
@@ -1856,7 +1985,10 @@ mod tests {
         s.step().unwrap();
         s.advance_after_prefill(a_h, 4);
         // Find b's handle.
-        let b_h = s.in_flight.iter().find(|x| x.handle != a_h)
+        let b_h = s
+            .in_flight
+            .iter()
+            .find(|x| x.handle != a_h)
             .map(|x| x.handle)
             .expect("b in_flight");
         s.step().unwrap();
@@ -1870,7 +2002,10 @@ mod tests {
 
         // Admit C queued.
         let c = s.admit(req(9, 8)).expect("admit c queued");
-        assert!(c.handle.is_none(), "queued slot has None handle (no sentinel)");
+        assert!(
+            c.handle.is_none(),
+            "queued slot has None handle (no sentinel)"
+        );
 
         // Drain A.
         for _ in 0..8 {
@@ -1881,13 +2016,19 @@ mod tests {
         // step() — promotes C; B Decoding; FIRST Prefilling slot in FIFO
         // order is C (only Prefilling slot). Emits Mixed.
         match s.step().unwrap() {
-            SchedulerStep::Mixed { prefill, n_prefill_tokens, decode_handles } => {
+            SchedulerStep::Mixed {
+                prefill,
+                n_prefill_tokens,
+                decode_handles,
+            } => {
                 assert_eq!(n_prefill_tokens, 9);
                 assert_eq!(decode_handles.len(), 1);
                 assert_eq!(decode_handles[0], b_h);
                 assert_eq!(prefill.slot_id, SlotId(0), "c got a's recycled slot id");
-                assert!(prefill.generation > a_h.generation,
-                    "c's generation is bumped past a's");
+                assert!(
+                    prefill.generation > a_h.generation,
+                    "c's generation is bumped past a's"
+                );
             }
             other => panic!("expected Mixed, got {:?}", other),
         }
@@ -1975,7 +2116,13 @@ mod tests {
         let a = s.admit(req(5, 8)).expect("admit a");
         let a_h = handle_of(&a);
         // Unknown handle.
-        s.advance_after_prefill(SlotHandle { slot_id: SlotId(9_999), generation: 0 }, 100);
+        s.advance_after_prefill(
+            SlotHandle {
+                slot_id: SlotId(9_999),
+                generation: 0,
+            },
+            100,
+        );
         // a's state unchanged.
         match s.step().unwrap() {
             SchedulerStep::Prefill { handle, n_tokens } => {
@@ -2055,8 +2202,11 @@ mod tests {
         let a_h = handle_of(&a);
         s.advance_after_prefill(a_h, 1);
         s.advance_after_decode(a_h); // auto-release
-        assert_eq!(s.slot_generation(a_h.slot_id), 1,
-            "auto-release bumps generation just like explicit release");
+        assert_eq!(
+            s.slot_generation(a_h.slot_id),
+            1,
+            "auto-release bumps generation just like explicit release"
+        );
     }
 
     #[test]
@@ -2077,8 +2227,11 @@ mod tests {
         let b = s.admit(req(8, 4)).expect("b");
         let b_h = handle_of(&b);
         assert_eq!(b_h.slot_id, a_h.slot_id, "B got A's recycled slot id");
-        assert_eq!(b_h.generation, a_h.generation + 1,
-            "B's generation is exactly one past A's");
+        assert_eq!(
+            b_h.generation,
+            a_h.generation + 1,
+            "B's generation is exactly one past A's"
+        );
 
         // Stale callback for A — MUST be no-op, MUST NOT touch B's state.
         s.advance_after_prefill(a_h, 5);
@@ -2092,8 +2245,11 @@ mod tests {
         }
         // Also a stale decode for A is a no-op.
         s.advance_after_decode(a_h);
-        assert_eq!(s.stats().completed_total, 1,
-            "stale decode did not double-complete");
+        assert_eq!(
+            s.stats().completed_total,
+            1,
+            "stale decode did not double-complete"
+        );
     }
 
     #[test]
@@ -2114,11 +2270,17 @@ mod tests {
 
         // step() promotes B and emits Prefill with B's handle.
         match s.step().unwrap() {
-            SchedulerStep::Prefill { handle: b_h, n_tokens } => {
+            SchedulerStep::Prefill {
+                handle: b_h,
+                n_tokens,
+            } => {
                 assert_eq!(n_tokens, 7);
                 assert_eq!(b_h.slot_id, a_h.slot_id, "B recycled A's slot id");
-                assert_eq!(b_h.generation, a_h.generation + 1,
-                    "B's promoted handle generation == prior slot generation + 1");
+                assert_eq!(
+                    b_h.generation,
+                    a_h.generation + 1,
+                    "B's promoted handle generation == prior slot generation + 1"
+                );
                 // The slot_generations array now matches.
                 assert_eq!(s.slot_generation(b_h.slot_id), b_h.generation);
             }
@@ -2142,8 +2304,12 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let _ = {
                     let mut g = s.lock().unwrap();
-                    g.admit(AdmitRequest { prompt_tokens: 1, max_tokens: 4, kv_bytes_needed: 0 })
-                        .expect("admit ok")
+                    g.admit(AdmitRequest {
+                        prompt_tokens: 1,
+                        max_tokens: 4,
+                        kv_bytes_needed: 0,
+                    })
+                    .expect("admit ok")
                 };
                 for _ in 0..5 {
                     let action: SchedulerStep = {
@@ -2161,7 +2327,11 @@ mod tests {
                                 g.advance_after_decode(h);
                             }
                         }
-                        SchedulerStep::Mixed { prefill, n_prefill_tokens, decode_handles } => {
+                        SchedulerStep::Mixed {
+                            prefill,
+                            n_prefill_tokens,
+                            decode_handles,
+                        } => {
                             let mut g = s.lock().unwrap();
                             g.advance_after_prefill(prefill, n_prefill_tokens);
                             for h in decode_handles {
@@ -2210,9 +2380,16 @@ mod tests {
         // Cancel q2 — exactly one removed.
         let removed = s.cancel_queued(q2.request_id);
         assert!(removed);
-        assert_eq!(s.queue.len(), 2,
-            "exactly one queued request removed (regression: previously ALL queued removed)");
-        assert_eq!(s.stats().in_flight_slots, 1, "in_flight unaffected by cancel_queued");
+        assert_eq!(
+            s.queue.len(),
+            2,
+            "exactly one queued request removed (regression: previously ALL queued removed)"
+        );
+        assert_eq!(
+            s.stats().in_flight_slots,
+            1,
+            "in_flight unaffected by cancel_queued"
+        );
 
         // Verify q1 + q3 still there; q2 truly gone.
         let remaining_ids: Vec<_> = s.queue.iter().map(|q| q.request_id).collect();
@@ -2309,11 +2486,19 @@ mod tests {
         // step() — no queued (everything in_flight); first Prefilling in
         // FIFO order is A (slot 0). decode = [B].
         match s.step().unwrap() {
-            SchedulerStep::Mixed { prefill, n_prefill_tokens, decode_handles } => {
-                assert_eq!(prefill, a_h,
-                    "older Prefilling slot A wins over newer C (cfa-iter2.5 C3)");
-                assert_eq!(n_prefill_tokens, 488,
-                    "A's mid-chunk continuation must not be starved");
+            SchedulerStep::Mixed {
+                prefill,
+                n_prefill_tokens,
+                decode_handles,
+            } => {
+                assert_eq!(
+                    prefill, a_h,
+                    "older Prefilling slot A wins over newer C (cfa-iter2.5 C3)"
+                );
+                assert_eq!(
+                    n_prefill_tokens, 488,
+                    "A's mid-chunk continuation must not be starved"
+                );
                 assert_eq!(decode_handles, vec![b_h]);
                 let _ = c_h; // C waits its turn (still Prefilling{5})
             }
@@ -2334,8 +2519,11 @@ mod tests {
         let a_h = handle_of(&a);
         match s.step().unwrap() {
             SchedulerStep::Decode { handles } => {
-                assert_eq!(handles, vec![a_h],
-                    "zero-prompt admit transitions directly to Decoding");
+                assert_eq!(
+                    handles,
+                    vec![a_h],
+                    "zero-prompt admit transitions directly to Decoding"
+                );
             }
             other => panic!("expected Decode (M2), got {:?}", other),
         }
@@ -2364,10 +2552,16 @@ mod tests {
         // to Decoding and step() returns Decode (NOT Prefill).
         match s.step().unwrap() {
             SchedulerStep::Decode { handles } => {
-                assert_eq!(handles.len(), 1,
-                    "zero-prompt promoted slot skips Prefilling, emits Decode");
+                assert_eq!(
+                    handles.len(),
+                    1,
+                    "zero-prompt promoted slot skips Prefilling, emits Decode"
+                );
             }
-            other => panic!("expected Decode for promoted zero-prompt B, got {:?}", other),
+            other => panic!(
+                "expected Decode for promoted zero-prompt B, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2379,8 +2573,11 @@ mod tests {
         let a_h = handle_of(&a);
         match s.step().unwrap() {
             SchedulerStep::Decode { handles } => {
-                assert_eq!(handles, vec![a_h],
-                    "FIFO: zero-prompt admit skips Prefilling");
+                assert_eq!(
+                    handles,
+                    vec![a_h],
+                    "FIFO: zero-prompt admit skips Prefilling"
+                );
             }
             other => panic!("expected Decode (M2 FIFO), got {:?}", other),
         }
@@ -2419,29 +2616,46 @@ mod tests {
         // allocated, completed_total bumped.
         let mut s = FifoSchedulerAdapter::new(4);
         let r = s.admit(req(8, 0)).expect("zero-budget admit must succeed");
-        assert!(r.handle.is_none(),
-            "max_tokens=0 admit must return handle: None (no slot allocated)");
-        assert_eq!(r.prompt_tokens, 8, "RequestSlot still echoes input prompt_tokens");
+        assert!(
+            r.handle.is_none(),
+            "max_tokens=0 admit must return handle: None (no slot allocated)"
+        );
+        assert_eq!(
+            r.prompt_tokens, 8,
+            "RequestSlot still echoes input prompt_tokens"
+        );
         assert_eq!(r.max_tokens, 0, "RequestSlot still echoes input max_tokens");
 
         let stats = s.stats();
         assert_eq!(stats.admitted_total, 1, "admitted_total bumped");
-        assert_eq!(stats.completed_total, 1,
-            "completed_total bumped at admit time (zero-budget short-circuit)");
-        assert_eq!(stats.in_flight_slots, 0,
-            "no physical slot allocated for zero-budget admit");
+        assert_eq!(
+            stats.completed_total, 1,
+            "completed_total bumped at admit time (zero-budget short-circuit)"
+        );
+        assert_eq!(
+            stats.in_flight_slots, 0,
+            "no physical slot allocated for zero-budget admit"
+        );
 
         // step() returns Idle — the would-have-been slot doesn't exist.
-        assert_eq!(s.step().unwrap(), SchedulerStep::Idle,
-            "no in-flight slot, no queued slot → Idle");
+        assert_eq!(
+            s.step().unwrap(),
+            SchedulerStep::Idle,
+            "no in-flight slot, no queued slot → Idle"
+        );
 
         // A subsequent normal admit lands cleanly in the unoccupied slot.
         let b = s.admit(req(3, 5)).expect("normal admit after zero-budget");
         let b_h = handle_of(&b);
-        assert_eq!(b_h.slot_id, SlotId(0),
-            "next admit gets the never-allocated slot 0");
-        assert_eq!(b_h.generation, 0,
-            "no generation bump (no release happened — slot was never allocated)");
+        assert_eq!(
+            b_h.slot_id,
+            SlotId(0),
+            "next admit gets the never-allocated slot 0"
+        );
+        assert_eq!(
+            b_h.generation, 0,
+            "no generation bump (no release happened — slot was never allocated)"
+        );
     }
 
     #[test]
@@ -2451,18 +2665,27 @@ mod tests {
         let mut s = InflightBatchedScheduler::new(8, 4);
         for i in 0..16 {
             let r = s.admit(req(3, 0)).expect("zero-budget admit must succeed");
-            assert!(r.handle.is_none(),
-                "iter {}: max_tokens=0 admit must return handle: None", i);
+            assert!(
+                r.handle.is_none(),
+                "iter {}: max_tokens=0 admit must return handle: None",
+                i
+            );
         }
         let stats = s.stats();
-        assert_eq!(stats.in_flight_slots, 0,
+        assert_eq!(
+            stats.in_flight_slots, 0,
             "16 zero-budget admits must leak ZERO in-flight slots (regression: \
-             prior iter-2.5 pushed Decoding{{0,0}} into in_flight)");
+             prior iter-2.5 pushed Decoding{{0,0}} into in_flight)"
+        );
         assert_eq!(stats.admitted_total, 16, "all 16 counted as admitted");
-        assert_eq!(stats.completed_total, 16,
-            "all 16 counted as completed-at-admit (no slot lifecycle)");
-        assert_eq!(stats.rejected_429_total, 0,
-            "no QueueFull — short-circuit happens after capacity check");
+        assert_eq!(
+            stats.completed_total, 16,
+            "all 16 counted as completed-at-admit (no slot lifecycle)"
+        );
+        assert_eq!(
+            stats.rejected_429_total, 0,
+            "no QueueFull — short-circuit happens after capacity check"
+        );
 
         // step() returns Idle — no slots ever allocated.
         assert_eq!(s.step().unwrap(), SchedulerStep::Idle);
@@ -2474,8 +2697,10 @@ mod tests {
         // takes priority over prompt_tokens). No slot allocated.
         let mut s = FifoSchedulerAdapter::new(4);
         let r = s.admit(req(0, 0)).expect("both-zeros admit must succeed");
-        assert!(r.handle.is_none(),
-            "prompt_tokens=0 AND max_tokens=0 → handle: None (max_tokens wins)");
+        assert!(
+            r.handle.is_none(),
+            "prompt_tokens=0 AND max_tokens=0 → handle: None (max_tokens wins)"
+        );
         let stats = s.stats();
         assert_eq!(stats.admitted_total, 1);
         assert_eq!(stats.completed_total, 1);
@@ -2484,8 +2709,10 @@ mod tests {
         // Inflight side: same shape.
         let mut s2 = InflightBatchedScheduler::new(4, 2);
         let r2 = s2.admit(req(0, 0)).expect("both-zeros inflight admit ok");
-        assert!(r2.handle.is_none(),
-            "inflight prompt_tokens=0 AND max_tokens=0 → handle: None");
+        assert!(
+            r2.handle.is_none(),
+            "inflight prompt_tokens=0 AND max_tokens=0 → handle: None"
+        );
         let stats2 = s2.stats();
         assert_eq!(stats2.in_flight_slots, 0);
         assert_eq!(stats2.completed_total, 1);
@@ -2504,17 +2731,26 @@ mod tests {
         // zero-budget admit still short-circuits → handle: None,
         // in_flight unchanged, no queued entry.
         let mut s = InflightBatchedScheduler::new(4, 2);
-        let _a = s.admit(req(5, 4)).expect("a normal admit, in_flight slot 0");
-        let _b = s.admit(req(7, 4)).expect("b normal admit, in_flight slot 1");
+        let _a = s
+            .admit(req(5, 4))
+            .expect("a normal admit, in_flight slot 0");
+        let _b = s
+            .admit(req(7, 4))
+            .expect("b normal admit, in_flight slot 1");
         assert_eq!(s.stats().in_flight_slots, 2);
         assert_eq!(s.queue.len(), 0);
 
         // Now the would-be-queued admit is zero-budget; it short-circuits.
         let c = s.admit(req(11, 0)).expect("c zero-budget admit ok");
-        assert!(c.handle.is_none(),
-            "zero-budget admit at in_flight-cap still short-circuits — not queued");
-        assert_eq!(s.queue.len(), 0,
-            "zero-budget request MUST NOT enter the queue (cfa-iter-C2.5 M1)");
+        assert!(
+            c.handle.is_none(),
+            "zero-budget admit at in_flight-cap still short-circuits — not queued"
+        );
+        assert_eq!(
+            s.queue.len(),
+            0,
+            "zero-budget request MUST NOT enter the queue (cfa-iter-C2.5 M1)"
+        );
         assert_eq!(s.stats().in_flight_slots, 2, "in_flight unchanged");
         assert_eq!(s.stats().completed_total, 1, "c counted as completed");
 
@@ -2546,12 +2782,18 @@ mod tests {
         let stats = s.stats();
         // a's release bumped completed_total by 1; zero-budget queued
         // promote-skip bumped it by 1 more.
-        assert!(stats.completed_total >= completed_before + 2,
+        assert!(
+            stats.completed_total >= completed_before + 2,
             "release + zero-budget-queued-skip both bump completed_total \
-             (was {}, now {})", completed_before, stats.completed_total);
-        assert_eq!(stats.in_flight_slots, in_flight_before,
+             (was {}, now {})",
+            completed_before,
+            stats.completed_total
+        );
+        assert_eq!(
+            stats.in_flight_slots, in_flight_before,
             "in_flight unchanged: released a → promoted normal request \
-             past skipped zero-budget queued entry");
+             past skipped zero-budget queued entry"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2603,8 +2845,10 @@ mod tests {
         let r = s
             .admit(req_with_kv(8, 16, 512 * 1024))
             .expect("admit below budget must succeed");
-        assert!(r.handle.is_some(),
-            "below-budget admit lands in_flight with Some(handle)");
+        assert!(
+            r.handle.is_some(),
+            "below-budget admit lands in_flight with Some(handle)"
+        );
         assert_eq!(s.stats().admitted_total, 1);
         assert_eq!(s.stats().rejected_429_total, 0);
         assert_eq!(s.per_slot_kv_budget_bytes(), 1024 * 1024);
@@ -2616,22 +2860,34 @@ mod tests {
         let mut s = FifoSchedulerAdapter::new_with_kv_budget(4, 1024 * 1024);
         let needed = 2 * 1024 * 1024;
         match s.admit(req_with_kv(1024, 64, needed)) {
-            Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
-                assert_eq!(needed_bytes, needed,
-                    "error names the request's needed bytes");
-                assert_eq!(budget_bytes, 1024 * 1024,
-                    "error names the per-slot budget bytes");
+            Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => {
+                assert_eq!(
+                    needed_bytes, needed,
+                    "error names the request's needed bytes"
+                );
+                assert_eq!(
+                    budget_bytes,
+                    1024 * 1024,
+                    "error names the per-slot budget bytes"
+                );
             }
             other => panic!("expected SlotBudgetExceeded, got {:?}", other),
         }
         // Counters: rejected_429_total bumped; admitted_total NOT bumped
         // (admit returned Err before the admitted-counter increment).
         let stats = s.stats();
-        assert_eq!(stats.rejected_429_total, 1,
-            "SlotBudgetExceeded bumps rejected_429_total (maps to 429 upstream)");
+        assert_eq!(
+            stats.rejected_429_total, 1,
+            "SlotBudgetExceeded bumps rejected_429_total (maps to 429 upstream)"
+        );
         assert_eq!(stats.admitted_total, 0);
-        assert_eq!(stats.in_flight_slots, 0,
-            "no physical slot allocated for over-budget admit");
+        assert_eq!(
+            stats.in_flight_slots, 0,
+            "no physical slot allocated for over-budget admit"
+        );
     }
 
     #[test]
@@ -2639,8 +2895,11 @@ mod tests {
         // Default constructor (no budget arg) ⇒ enforcement disabled.
         // Even an astronomical kv_bytes_needed admits cleanly.
         let mut s = FifoSchedulerAdapter::new(4);
-        assert_eq!(s.per_slot_kv_budget_bytes(), 0,
-            "new() defaults to per_slot_kv_budget_bytes = 0 (unbounded)");
+        assert_eq!(
+            s.per_slot_kv_budget_bytes(),
+            0,
+            "new() defaults to per_slot_kv_budget_bytes = 0 (unbounded)"
+        );
         let r = s
             .admit(req_with_kv(1, 1, u64::MAX))
             .expect("zero-budget scheduler must accept any kv_bytes_needed");
@@ -2659,7 +2918,10 @@ mod tests {
         let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, 4 * 1024 * 1024);
         let needed = 5 * 1024 * 1024;
         match s.admit(req_with_kv(2048, 128, needed)) {
-            Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+            Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => {
                 assert_eq!(needed_bytes, needed);
                 assert_eq!(budget_bytes, 4 * 1024 * 1024);
             }
@@ -2667,8 +2929,11 @@ mod tests {
         }
         assert_eq!(s.stats().rejected_429_total, 1);
         assert_eq!(s.stats().admitted_total, 0);
-        assert_eq!(s.stats().in_flight_slots, 0,
-            "over-budget admit does not allocate a physical slot");
+        assert_eq!(
+            s.stats().in_flight_slots,
+            0,
+            "over-budget admit does not allocate a physical slot"
+        );
     }
 
     #[test]
@@ -2685,16 +2950,28 @@ mod tests {
         assert!(dbg.contains("4096000"));
 
         let disp = format!("{}", err);
-        assert!(disp.contains("needed_bytes=12345678"),
-            "Display names needed_bytes verbatim: {}", disp);
-        assert!(disp.contains("budget_bytes=4096000"),
-            "Display names budget_bytes verbatim: {}", disp);
+        assert!(
+            disp.contains("needed_bytes=12345678"),
+            "Display names needed_bytes verbatim: {}",
+            disp
+        );
+        assert!(
+            disp.contains("budget_bytes=4096000"),
+            "Display names budget_bytes verbatim: {}",
+            disp
+        );
         // Operator-actionable message MUST cite ADR-040 §3.5 + name the
         // remediation paths.
-        assert!(disp.contains("ADR-040"),
-            "Display cites ADR-040 §3.5: {}", disp);
-        assert!(disp.contains("max_tokens") || disp.contains("prompt"),
-            "Display names the actionable remediation: {}", disp);
+        assert!(
+            disp.contains("ADR-040"),
+            "Display cites ADR-040 §3.5: {}",
+            disp
+        );
+        assert!(
+            disp.contains("max_tokens") || disp.contains("prompt"),
+            "Display names the actionable remediation: {}",
+            disp
+        );
     }
 
     #[test]
@@ -2711,17 +2988,26 @@ mod tests {
             let r = s
                 .admit(req_with_kv(64, 16, per_slot))
                 .unwrap_or_else(|e| panic!("slot {} at-budget admit must succeed; got {:?}", i, e));
-            assert!(r.handle.is_some(),
-                "slot {}: at-budget admit lands in_flight", i);
+            assert!(
+                r.handle.is_some(),
+                "slot {}: at-budget admit lands in_flight",
+                i
+            );
             admitted.push(r);
         }
         let stats = s.stats();
-        assert_eq!(stats.admitted_total, 4,
-            "all 4 at-budget admits counted; per-slot budget does not sum");
-        assert_eq!(stats.in_flight_slots, 4,
-            "all 4 physical slots occupied (max_slots=4)");
-        assert_eq!(stats.rejected_429_total, 0,
-            "ZERO 429s — each request fits its own per-slot budget");
+        assert_eq!(
+            stats.admitted_total, 4,
+            "all 4 at-budget admits counted; per-slot budget does not sum"
+        );
+        assert_eq!(
+            stats.in_flight_slots, 4,
+            "all 4 physical slots occupied (max_slots=4)"
+        );
+        assert_eq!(
+            stats.rejected_429_total, 0,
+            "ZERO 429s — each request fits its own per-slot budget"
+        );
 
         // The 5th admit AT budget queues (in_flight cap reached, queue
         // accepts) — still NOT a budget rejection because the request
@@ -2729,14 +3015,22 @@ mod tests {
         let r5 = s
             .admit(req_with_kv(64, 16, per_slot))
             .expect("5th at-budget admit queues (not a budget violation)");
-        assert!(r5.handle.is_none(),
-            "5th admit is queued (in_flight at max_slots=4)");
-        assert_eq!(s.stats().rejected_429_total, 0,
-            "queueing is not a budget rejection");
+        assert!(
+            r5.handle.is_none(),
+            "5th admit is queued (in_flight at max_slots=4)"
+        );
+        assert_eq!(
+            s.stats().rejected_429_total,
+            0,
+            "queueing is not a budget rejection"
+        );
 
         // But an OVER-budget admit IS rejected even when queue has room.
         match s.admit(req_with_kv(64, 16, per_slot + 1)) {
-            Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+            Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => {
                 assert_eq!(needed_bytes, per_slot + 1);
                 assert_eq!(budget_bytes, per_slot);
             }

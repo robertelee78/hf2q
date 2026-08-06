@@ -129,10 +129,7 @@ pub enum PplDriverError {
     /// `PplDriverError` stays `Send + Sync + 'static` without
     /// transitively requiring the same of the qwen35 forward path.
     #[error("forward pass failed at chunk {chunk}: {cause}")]
-    Forward {
-        chunk: usize,
-        cause: String,
-    },
+    Forward { chunk: usize, cause: String },
 
     /// `compute_perplexity` rejected the `(logits, targets)` pair
     /// (count mismatch, NaN logits, OOB target, empty input). Should
@@ -232,7 +229,8 @@ pub fn measure_ppl_qwen35(
     }
     if let Some(0) = seq_len {
         return Err(PplDriverError::Invalid(
-            "seq_len override cannot be 0; pass None for the model default or a positive value".to_string(),
+            "seq_len override cannot be 0; pass None for the model default or a positive value"
+                .to_string(),
         ));
     }
 
@@ -309,7 +307,10 @@ pub fn measure_ppl_qwen35(
     // and matches `compute_perplexity`'s `logits.len() == targets.len()`
     // contract.
     let total_chunks = chunk_count(n_tokens, effective_seq_len);
-    debug_assert!(total_chunks >= 1, "n_tokens >= 2 and seq_len >= 1 ⇒ at least one chunk");
+    debug_assert!(
+        total_chunks >= 1,
+        "n_tokens >= 2 and seq_len >= 1 ⇒ at least one chunk"
+    );
 
     // Pre-allocate the accumulators once. Capacity = number of
     // (logits, target) PAIRS = n_tokens - total_chunks (we drop the
@@ -342,12 +343,12 @@ pub fn measure_ppl_qwen35(
         }
         let positions = text_positions(window_len as u32);
 
-        let chunk_logits = qwen
-            .forward_cpu(window, &positions)
-            .map_err(|e| PplDriverError::Forward {
-                chunk: chunk_idx,
-                cause: format!("{e:#}"),
-            })?;
+        let chunk_logits =
+            qwen.forward_cpu(window, &positions)
+                .map_err(|e| PplDriverError::Forward {
+                    chunk: chunk_idx,
+                    cause: format!("{e:#}"),
+                })?;
 
         // Shape sanity. `forward_cpu` returns `[seq_len * vocab_size]`.
         let expected_logits_len = window_len * vocab_size;
@@ -451,11 +452,7 @@ mod tests {
     #[test]
     fn measure_ppl_returns_invalid_on_short_input() {
         // < 2 tokens ⇒ Invalid (no prediction possible).
-        let result = measure_ppl_qwen35(
-            std::path::Path::new("/nonexistent/model.gguf"),
-            &[],
-            None,
-        );
+        let result = measure_ppl_qwen35(std::path::Path::new("/nonexistent/model.gguf"), &[], None);
         assert!(matches!(result, Err(PplDriverError::Invalid(_))));
 
         let result = measure_ppl_qwen35(
@@ -481,8 +478,7 @@ mod tests {
 
     #[test]
     fn measure_ppl_returns_gguf_on_missing_path() {
-        let missing =
-            std::path::Path::new("/nonexistent/path/that/cannot/exist/qwen35-dense.gguf");
+        let missing = std::path::Path::new("/nonexistent/path/that/cannot/exist/qwen35-dense.gguf");
         let result = measure_ppl_qwen35(missing, &[1u32, 2, 3, 4], Some(2));
         match result {
             Err(PplDriverError::Gguf { path, source: _ }) => {

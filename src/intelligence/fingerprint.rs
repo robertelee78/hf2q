@@ -244,7 +244,9 @@ mod tests {
         assert!(fp.is_moe());
         assert_eq!(fp.attention_types.len(), 2);
         assert!(fp.attention_types.contains(&"full_attention".to_string()));
-        assert!(fp.attention_types.contains(&"sliding_attention".to_string()));
+        assert!(fp
+            .attention_types
+            .contains(&"sliding_attention".to_string()));
     }
 
     #[test]

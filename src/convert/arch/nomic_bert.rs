@@ -204,12 +204,8 @@ pub fn map_tensor_name(
         "embeddings.LayerNorm.bias" => {
             return Some(MappedTensor::Direct("token_embd_norm.bias".to_string()))
         }
-        "emb_ln.weight" => {
-            return Some(MappedTensor::Direct("token_embd_norm.weight".to_string()))
-        }
-        "emb_ln.bias" => {
-            return Some(MappedTensor::Direct("token_embd_norm.bias".to_string()))
-        }
+        "emb_ln.weight" => return Some(MappedTensor::Direct("token_embd_norm.weight".to_string())),
+        "emb_ln.bias" => return Some(MappedTensor::Direct("token_embd_norm.bias".to_string())),
         // BertModel.filter_tensors drops the pooler at `bert.py:74-81`.
         "pooler.dense.weight" | "pooler.dense.bias" => return Some(MappedTensor::Drop),
         // BertModel.filter_tensors drops position embeddings at
@@ -390,11 +386,7 @@ pub fn build_metadata(
             .get(k_gpt)
             .and_then(|v| v.as_u64())
             .or_else(|| config.get(k_hf).and_then(|v| v.as_u64()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "config.json missing required key (`{k_gpt}` or `{k_hf}`)"
-                )
-            });
+            .unwrap_or_else(|| panic!("config.json missing required key (`{k_gpt}` or `{k_hf}`)"));
         v as u32
     };
 
@@ -422,7 +414,11 @@ pub fn build_metadata(
         .filter(|&n| n > 0)
         .map(|n| n as u32);
     let is_moe = moe_every_n.is_some();
-    let arch_name = if is_moe { "nomic-bert-moe" } else { "nomic-bert" };
+    let arch_name = if is_moe {
+        "nomic-bert-moe"
+    } else {
+        "nomic-bert"
+    };
 
     // Hparam selection mirrors what canonical sees AFTER
     // `transformers.AutoConfig.from_pretrained` injects defaults.
@@ -463,9 +459,8 @@ pub fn build_metadata(
         // `_xlmroberta_tokenizer_init`. For nomic v2-moe with
         // `pad_token_id=1` and AutoConfig-injected
         // `max_position_embeddings=2048`: `2048 - 2 = 2046`.
-        let offset = 1 + pad_token_id.expect(
-            "v2-moe config.json: pad_token_id required for context_length offset",
-        );
+        let offset = 1 + pad_token_id
+            .expect("v2-moe config.json: pad_token_id required for context_length offset");
         n_positions_raw.saturating_sub(offset)
     } else {
         n_positions_raw
@@ -534,10 +529,10 @@ pub fn build_metadata(
             ) as u32;
         let n_layers_per_moe = moe_every_n.unwrap();
         let _ = n_head_kv; // canonical doesn't emit head_count_kv for nomic
-        // v2-moe path uses the title-cased name from
-        // `get_model_id_components` to match canonical's observed
-        // `general.name = "Nomic Xlm 2048"`. Falls back to the raw
-        // `_name_or_path` for "human sentence" / unparseable inputs.
+                           // v2-moe path uses the title-cased name from
+                           // `get_model_id_components` to match canonical's observed
+                           // `general.name = "Nomic Xlm 2048"`. Falls back to the raw
+                           // `_name_or_path` for "human sentence" / unparseable inputs.
         let v2moe_name = id_components
             .name
             .clone()
@@ -553,7 +548,10 @@ pub fn build_metadata(
         kv_v2moe.reserve(20);
         kv_v2moe.extend([
             (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
-            (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
+            (
+                format!("{arch_name}.context_length"),
+                MetaValue::U32(ctx_len),
+            ),
             (
                 format!("{arch_name}.embedding_length"),
                 MetaValue::U32(hidden_size),
@@ -618,8 +616,14 @@ pub fn build_metadata(
                 "general.architecture".into(),
                 MetaValue::String(arch_name.into()),
             ),
-            ("general.name".into(), MetaValue::String(raw_name_string.clone())),
-            (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
+            (
+                "general.name".into(),
+                MetaValue::String(raw_name_string.clone()),
+            ),
+            (
+                format!("{arch_name}.context_length"),
+                MetaValue::U32(ctx_len),
+            ),
             (
                 format!("{arch_name}.embedding_length"),
                 MetaValue::U32(hidden_size),
@@ -686,9 +690,9 @@ mod tests {
                 expected_gguf,
                 "map_tensor_name({hf:?}) = Direct({s:?}), want Direct({expected_gguf:?})"
             ),
-            other => panic!(
-                "map_tensor_name({hf:?}) = {other:?}, want Some(Direct({expected_gguf:?}))"
-            ),
+            other => {
+                panic!("map_tensor_name({hf:?}) = {other:?}, want Some(Direct({expected_gguf:?}))")
+            }
         }
     }
 
@@ -724,10 +728,7 @@ mod tests {
                 "encoder.layers.3.norm1.weight",
                 "blk.3.attn_output_norm.weight",
             ),
-            (
-                "encoder.layers.3.norm1.bias",
-                "blk.3.attn_output_norm.bias",
-            ),
+            ("encoder.layers.3.norm1.bias", "blk.3.attn_output_norm.bias"),
             // v1.5 SwiGLU FFN tensors.
             ("encoder.layers.7.mlp.fc11.weight", "blk.7.ffn_gate.weight"),
             ("encoder.layers.7.mlp.fc12.weight", "blk.7.ffn_up.weight"),
@@ -771,7 +772,10 @@ mod tests {
     /// `BertModel.filter_tensors`).
     #[test]
     fn nomic_bert_strips_optional_bert_prefix() {
-        assert_direct("bert.embeddings.word_embeddings.weight", "token_embd.weight");
+        assert_direct(
+            "bert.embeddings.word_embeddings.weight",
+            "token_embd.weight",
+        );
         assert_direct(
             "bert.encoder.layers.0.attn.Wqkv.weight",
             "blk.0.attn_qkv.weight",
@@ -873,9 +877,7 @@ mod tests {
                     }
                 );
             }
-            other => panic!(
-                "expected DirectWithBake(MoeExpertReshape) for w1, got {other:?}"
-            ),
+            other => panic!("expected DirectWithBake(MoeExpertReshape) for w1, got {other:?}"),
         }
 
         match map_tensor_name("encoder.layers.7.mlp.experts.mlp.w2", hf_shape, &ctx) {
@@ -890,9 +892,7 @@ mod tests {
                     }
                 );
             }
-            other => panic!(
-                "expected DirectWithBake(MoeExpertTranspose) for w2, got {other:?}"
-            ),
+            other => panic!("expected DirectWithBake(MoeExpertTranspose) for w2, got {other:?}"),
         }
     }
 
@@ -937,11 +937,7 @@ mod tests {
         let ctx = ctx_v2_moe();
         // Wrong prefix (singular `layer` is BERT, not nomic-bert).
         assert_eq!(
-            map_tensor_name(
-                "encoder.layer.0.attention.self.Wqkv.weight",
-                NO_SHAPE,
-                &ctx
-            ),
+            map_tensor_name("encoder.layer.0.attention.self.Wqkv.weight", NO_SHAPE, &ctx),
             None
         );
         // BERT-style split QKV is NOT nomic — fused only.
@@ -1038,10 +1034,7 @@ mod tests {
             by_key["nomic-bert.attention.layer_norm_epsilon"],
             MetaValue::F32(1.0e-12)
         );
-        assert_eq!(
-            by_key["nomic-bert.rope.freq_base"],
-            MetaValue::F32(1000.0)
-        );
+        assert_eq!(by_key["nomic-bert.rope.freq_base"], MetaValue::F32(1000.0));
         assert_eq!(
             by_key["nomic-bert.pooling_type"],
             MetaValue::U32(1),
@@ -1152,10 +1145,7 @@ mod tests {
         // general.quantization_version + file_type are emitted at the
         // end of the v2-moe metadata block — canonical's
         // llama-quantize step writes them at GGUF positions 50-51.
-        assert_eq!(
-            by_key["general.quantization_version"],
-            MetaValue::U32(2)
-        );
+        assert_eq!(by_key["general.quantization_version"], MetaValue::U32(2));
         assert_eq!(by_key["general.file_type"], MetaValue::U32(17));
     }
 

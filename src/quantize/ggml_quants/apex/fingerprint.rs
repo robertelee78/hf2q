@@ -194,8 +194,9 @@ fn manifest() -> &'static [ApexConfigRef] {
     static CACHE: OnceLock<Vec<ApexConfigRef>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let env: ManifestEnvelope = serde_json::from_str(MANIFEST_JSON)
-                .expect("apex manifest JSON is malformed — check data/apex-references/manifest.json");
+            let env: ManifestEnvelope = serde_json::from_str(MANIFEST_JSON).expect(
+                "apex manifest JSON is malformed — check data/apex-references/manifest.json",
+            );
             env.entries
         })
         .as_slice()
@@ -396,7 +397,8 @@ mod tests {
     fn qwen35a3b_fingerprint_matches_manifest() {
         let fp = qwen35a3b_hparams().fingerprint();
         assert_eq!(
-            fp, "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223"
+            fp,
+            "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223"
         );
     }
 
@@ -408,7 +410,8 @@ mod tests {
         let mtp = carnice_mtp_hparams().fingerprint();
         assert_ne!(base, mtp, "mtp flag must produce distinct fingerprint");
         assert_eq!(
-            mtp, "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee"
+            mtp,
+            "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee"
         );
     }
 
@@ -430,10 +433,8 @@ mod tests {
     /// explicitly.
     #[test]
     fn detect_gemma4_26b_balanced_dispatch() {
-        let entry =
-            detect_apex_config(&gemma4_26b_hparams(), ApexTier::Balanced).expect(
-                "gemma4-26b-a4b-it@balanced must resolve to a manifest entry",
-            );
+        let entry = detect_apex_config(&gemma4_26b_hparams(), ApexTier::Balanced)
+            .expect("gemma4-26b-a4b-it@balanced must resolve to a manifest entry");
         assert_eq!(
             entry.mudler_config_path,
             "vendor/apex-quant/configs/gemma4_26b_balanced.txt"

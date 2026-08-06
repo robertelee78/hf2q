@@ -22,21 +22,21 @@
 
 #![allow(dead_code)] // some handlers + state helpers land with the engine iter
 
+pub mod embedding_pool;
+pub mod engine;
+pub mod engine_deepseek4;
+pub mod engine_qwen35;
+pub mod engine_qwen3vl;
+pub mod grammar;
+pub mod handlers;
+pub mod kv_spill_descriptor;
+pub mod middleware;
+pub mod registry;
+pub mod router;
 pub mod schema;
 pub mod sse;
 pub mod state;
-pub mod middleware;
-pub mod engine;
-pub mod engine_qwen35;
-pub mod engine_qwen3vl;
-pub mod engine_deepseek4;
-pub mod grammar;
-pub mod kv_spill_descriptor;
 pub mod tq_packed_descriptor;
-pub mod registry;
-pub mod handlers;
-pub mod router;
-pub mod embedding_pool;
 
 pub use router::build_router;
 #[allow(unused_imports)]

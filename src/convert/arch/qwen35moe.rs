@@ -321,22 +321,26 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .expect("config.json missing required key `num_attention_heads`") as u32;
     let n_head_kv = config["num_key_value_heads"]
         .as_u64()
-        .expect("config.json missing required key `num_key_value_heads`") as u32;
+        .expect("config.json missing required key `num_key_value_heads`")
+        as u32;
     let ctx_len = config["max_position_embeddings"]
         .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+        .expect("config.json missing required key `max_position_embeddings`")
+        as u32;
     let rms_eps = config["rms_norm_eps"]
         .as_f64()
         .expect("config.json missing required key `rms_norm_eps`") as f32;
     let moe_ffn = config["moe_intermediate_size"]
         .as_u64()
-        .expect("config.json missing required key `moe_intermediate_size`") as u32;
+        .expect("config.json missing required key `moe_intermediate_size`")
+        as u32;
     let n_experts = config["num_experts"]
         .as_u64()
         .expect("config.json missing required key `num_experts`") as u32;
     let n_experts_used = config["num_experts_per_tok"]
         .as_u64()
-        .expect("config.json missing required key `num_experts_per_tok`") as u32;
+        .expect("config.json missing required key `num_experts_per_tok`")
+        as u32;
 
     // Optional with defaults.
     let rope_theta = config
@@ -374,10 +378,7 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
             "qwen3moe.attention.layer_norm_rms_epsilon".into(),
             MetaValue::F32(rms_eps),
         ),
-        (
-            "qwen3moe.rope.freq_base".into(),
-            MetaValue::F32(rope_theta),
-        ),
+        ("qwen3moe.rope.freq_base".into(), MetaValue::F32(rope_theta)),
         ("qwen3moe.expert_count".into(), MetaValue::U32(n_experts)),
         (
             "qwen3moe.expert_used_count".into(),
@@ -450,7 +451,10 @@ mod tests {
                 "blk.7.attn_k_norm.weight",
             ),
             // Router gate — NOT per-expert. Maps to ffn_gate_inp.
-            ("model.layers.3.mlp.gate.weight", "blk.3.ffn_gate_inp.weight"),
+            (
+                "model.layers.3.mlp.gate.weight",
+                "blk.3.ffn_gate_inp.weight",
+            ),
         ];
 
         for &(hf, expected_gguf) in cases {
@@ -572,10 +576,7 @@ mod tests {
         // Unknown global.
         assert_eq!(map_tensor_name("model.unknown.weight"), None);
         // Wrong prefix.
-        assert_eq!(
-            map_tensor_name("transformer.layers.0.attn.weight"),
-            None
-        );
+        assert_eq!(map_tensor_name("transformer.layers.0.attn.weight"), None);
         // Qwen3MoE has no biases on linear projections.
         assert_eq!(
             map_tensor_name("model.layers.0.self_attn.q_proj.bias"),

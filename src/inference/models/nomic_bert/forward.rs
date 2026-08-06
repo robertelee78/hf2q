@@ -54,17 +54,17 @@ use anyhow::{anyhow, Context, Result};
 
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::flash_attn_prefill::{
-    self as flash_attn_prefill, dispatch_flash_attn_prefill_bf16_d64,
-    FlashAttnPrefillLayout, FlashAttnPrefillParams,
+    self as flash_attn_prefill, dispatch_flash_attn_prefill_bf16_d64, FlashAttnPrefillLayout,
+    FlashAttnPrefillParams,
 };
 use mlx_native::ops::rope::dispatch_rope_neox_f32;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::super::bert::bert_gpu::{
-    bert_embed_gather_gpu, bert_l2_normalize_gpu, bert_layer_norm_gpu,
-    bert_linear_bf16_gpu, bert_linear_gpu, bert_pool_gpu, bert_residual_add_gpu,
-    bert_residual_layer_norm_gpu, register_bert_custom_shaders, BertPoolKind,
+    bert_embed_gather_gpu, bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_bf16_gpu,
+    bert_linear_gpu, bert_pool_gpu, bert_residual_add_gpu, bert_residual_layer_norm_gpu,
+    register_bert_custom_shaders, BertPoolKind,
 };
 use super::super::bert::config::PoolingType;
 use super::config::NomicBertConfig;
@@ -151,9 +151,10 @@ pub fn nomic_bert_embeddings_gpu(
     let n_hidden = (seq_len as usize) * (hidden as usize);
 
     // 1. Token embedding gather.
-    let tok =
-        bert_embed_gather_gpu(encoder, registry, device, token_embd, input_ids, vocab, hidden, seq_len)
-            .context("nomic embeddings: token gather")?;
+    let tok = bert_embed_gather_gpu(
+        encoder, registry, device, token_embd, input_ids, vocab, hidden, seq_len,
+    )
+    .context("nomic embeddings: token gather")?;
     encoder.memory_barrier();
 
     // 2. Optional segment-type embedding gather + add. nomic-embed-text-v1.5
@@ -162,13 +163,19 @@ pub fn nomic_bert_embeddings_gpu(
     //    via apply_nomic_bert_full_forward_gpu).
     let summed = if let (Some(type_ids), Some(token_types)) = (type_ids_opt, token_types_opt) {
         let typ = bert_embed_gather_gpu(
-            encoder, registry, device, token_types, type_ids, type_vocab, hidden, seq_len,
+            encoder,
+            registry,
+            device,
+            token_types,
+            type_ids,
+            type_vocab,
+            hidden,
+            seq_len,
         )
         .context("nomic embeddings: type gather")?;
         encoder.memory_barrier();
-        let s =
-            bert_residual_add_gpu(encoder, registry, device, &tok, &typ, n_hidden as u32)
-                .context("nomic embeddings: token + type add")?;
+        let s = bert_residual_add_gpu(encoder, registry, device, &tok, &typ, n_hidden as u32)
+            .context("nomic embeddings: token + type add")?;
         encoder.memory_barrier();
         s
     } else {
@@ -597,27 +604,54 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // multiple intermediate allocations per layer.
     let n_attn_elems = (seq_len as usize) * (hidden as usize);
     let q_bf16 = device
-        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .alloc_buffer(
+            n_attn_elems * 2,
+            DType::BF16,
+            vec![seq_len as usize, hidden as usize],
+        )
         .map_err(|e| anyhow!("alloc q_bf16: {e}"))?;
     let k_bf16 = device
-        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .alloc_buffer(
+            n_attn_elems * 2,
+            DType::BF16,
+            vec![seq_len as usize, hidden as usize],
+        )
         .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
     let v_bf16 = device
-        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .alloc_buffer(
+            n_attn_elems * 2,
+            DType::BF16,
+            vec![seq_len as usize, hidden as usize],
+        )
         .map_err(|e| anyhow!("alloc v_bf16: {e}"))?;
     cast(
-        encoder, registry, device.metal_device(), &q_rotated, &q_bf16,
-        n_attn_elems, CastDirection::F32ToBF16,
+        encoder,
+        registry,
+        device.metal_device(),
+        &q_rotated,
+        &q_bf16,
+        n_attn_elems,
+        CastDirection::F32ToBF16,
     )
     .context("nomic block: cast Q F32→BF16")?;
     cast(
-        encoder, registry, device.metal_device(), &k_rotated, &k_bf16,
-        n_attn_elems, CastDirection::F32ToBF16,
+        encoder,
+        registry,
+        device.metal_device(),
+        &k_rotated,
+        &k_bf16,
+        n_attn_elems,
+        CastDirection::F32ToBF16,
     )
     .context("nomic block: cast K F32→BF16")?;
     cast(
-        encoder, registry, device.metal_device(), &v_proj, &v_bf16,
-        n_attn_elems, CastDirection::F32ToBF16,
+        encoder,
+        registry,
+        device.metal_device(),
+        &v_proj,
+        &v_bf16,
+        n_attn_elems,
+        CastDirection::F32ToBF16,
     )
     .context("nomic block: cast V F32→BF16")?;
     // The three Q/K/V casts write to disjoint output buffers and read
@@ -628,7 +662,11 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     encoder.memory_barrier();
 
     let mut attn_out_bf16 = device
-        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .alloc_buffer(
+            n_attn_elems * 2,
+            DType::BF16,
+            vec![seq_len as usize, hidden as usize],
+        )
         .map_err(|e| anyhow!("alloc attn_out_bf16: {e}"))?;
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -660,11 +698,20 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // Cast output back to F32 so the rest of the encoder block (output
     // projection + residual + LN) runs unchanged on F32.
     let attn_out = device
-        .alloc_buffer(n_attn_elems * 4, DType::F32, vec![seq_len as usize, hidden as usize])
+        .alloc_buffer(
+            n_attn_elems * 4,
+            DType::F32,
+            vec![seq_len as usize, hidden as usize],
+        )
         .map_err(|e| anyhow!("alloc attn_out F32: {e}"))?;
     cast(
-        encoder, registry, device.metal_device(), &attn_out_bf16, &attn_out,
-        n_attn_elems, CastDirection::BF16ToF32,
+        encoder,
+        registry,
+        device.metal_device(),
+        &attn_out_bf16,
+        &attn_out,
+        n_attn_elems,
+        CastDirection::BF16ToF32,
     )
     .context("nomic block: cast attn_out BF16→F32")?;
     encoder.memory_barrier();
@@ -672,12 +719,28 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // ---- 4. Output projection ----
     let attn_proj = if let Some(o_w_bf16) = tensors.o_w_bf16 {
         bert_linear_bf16_gpu(
-            encoder, registry, device, &attn_out, o_w_bf16, tensors.o_b, seq_len, hidden, hidden,
+            encoder,
+            registry,
+            device,
+            &attn_out,
+            o_w_bf16,
+            tensors.o_b,
+            seq_len,
+            hidden,
+            hidden,
         )
         .context("nomic block: attention output bf16 projection")?
     } else {
         bert_linear_gpu(
-            encoder, registry, device, &attn_out, tensors.o_w, tensors.o_b, seq_len, hidden, hidden,
+            encoder,
+            registry,
+            device,
+            &attn_out,
+            tensors.o_w,
+            tensors.o_b,
+            seq_len,
+            hidden,
+            hidden,
         )
         .context("nomic block: attention output projection (f32 fallback)")?
     };
@@ -725,28 +788,56 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // both outputs that follows.
     let up_proj = if let Some(up_w_bf16) = tensors.up_w_bf16 {
         bert_linear_bf16_gpu(
-            encoder, registry, device, &after_attn_norm, up_w_bf16, tensors.up_b, seq_len, hidden,
+            encoder,
+            registry,
+            device,
+            &after_attn_norm,
+            up_w_bf16,
+            tensors.up_b,
+            seq_len,
+            hidden,
             intermediate,
         )
         .context("nomic block: ffn_up bf16 linear")?
     } else {
         bert_linear_gpu(
-            encoder, registry, device, &after_attn_norm, tensors.up_w, tensors.up_b, seq_len,
-            hidden, intermediate,
+            encoder,
+            registry,
+            device,
+            &after_attn_norm,
+            tensors.up_w,
+            tensors.up_b,
+            seq_len,
+            hidden,
+            intermediate,
         )
         .context("nomic block: ffn_up linear (f32 fallback)")?
     };
 
     let gate_proj = if let Some(gate_w_bf16) = tensors.gate_w_bf16 {
         bert_linear_bf16_gpu(
-            encoder, registry, device, &after_attn_norm, gate_w_bf16, tensors.gate_b, seq_len,
-            hidden, intermediate,
+            encoder,
+            registry,
+            device,
+            &after_attn_norm,
+            gate_w_bf16,
+            tensors.gate_b,
+            seq_len,
+            hidden,
+            intermediate,
         )
         .context("nomic block: ffn_gate bf16 linear")?
     } else {
         bert_linear_gpu(
-            encoder, registry, device, &after_attn_norm, tensors.gate_w, tensors.gate_b, seq_len,
-            hidden, intermediate,
+            encoder,
+            registry,
+            device,
+            &after_attn_norm,
+            tensors.gate_w,
+            tensors.gate_b,
+            seq_len,
+            hidden,
+            intermediate,
         )
         .context("nomic block: ffn_gate linear (f32 fallback)")?
     };
@@ -783,14 +874,28 @@ pub fn apply_nomic_bert_encoder_block_gpu(
 
     let down_proj = if let Some(down_w_bf16) = tensors.down_w_bf16 {
         bert_linear_bf16_gpu(
-            encoder, registry, device, &silu_gated, down_w_bf16, tensors.down_b, seq_len,
-            intermediate, hidden,
+            encoder,
+            registry,
+            device,
+            &silu_gated,
+            down_w_bf16,
+            tensors.down_b,
+            seq_len,
+            intermediate,
+            hidden,
         )
         .context("nomic block: ffn_down bf16 linear")?
     } else {
         bert_linear_gpu(
-            encoder, registry, device, &silu_gated, tensors.down_w, tensors.down_b, seq_len,
-            intermediate, hidden,
+            encoder,
+            registry,
+            device,
+            &silu_gated,
+            tensors.down_w,
+            tensors.down_b,
+            seq_len,
+            intermediate,
+            hidden,
         )
         .context("nomic block: ffn_down linear (f32 fallback)")?
     };
@@ -905,17 +1010,17 @@ pub fn apply_nomic_bert_full_forward_gpu(
     // BERT-family GGUFs that ship `token_types.weight` need a synthetic
     // all-zero type_ids buffer when caller passes None — single-segment
     // is the universal default and llama-embedding's behavior locked.
-    let synthesized_type_ids: Option<MlxBuffer> =
-        match (type_ids_opt, weights.token_types_weight()) {
-            (None, Some(_)) => Some(alloc_zero_type_ids(device, seq_len)?),
-            _ => None,
-        };
-    let effective_type_ids: Option<&MlxBuffer> =
-        match (type_ids_opt, synthesized_type_ids.as_ref()) {
-            (Some(b), _) => Some(b),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+    let synthesized_type_ids: Option<MlxBuffer> = match (type_ids_opt, weights.token_types_weight())
+    {
+        (None, Some(_)) => Some(alloc_zero_type_ids(device, seq_len)?),
+        _ => None,
+    };
+    let effective_type_ids: Option<&MlxBuffer> = match (type_ids_opt, synthesized_type_ids.as_ref())
+    {
+        (Some(b), _) => Some(b),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
     let token_types_for_call = if effective_type_ids.is_some() {
         weights.token_types_weight()
     } else {
@@ -1050,10 +1155,10 @@ mod tests {
     /// removed both constraints in favor of a single fixed-D requirement.
     fn synthetic_min_cfg(num_layers: usize) -> NomicBertConfig {
         NomicBertConfig {
-            hidden_size: 128,           // 2 heads * 64 head_dim — flash-attn d=64 contract
+            hidden_size: 128, // 2 heads * 64 head_dim — flash-attn d=64 contract
             num_attention_heads: 2,
             num_hidden_layers: num_layers,
-            intermediate_size: 256,     // 2 * hidden, matches typical SwiGLU expansion
+            intermediate_size: 256, // 2 * hidden, matches typical SwiGLU expansion
             max_position_embeddings: 128,
             vocab_size: 100,
             type_vocab_size: 2,
@@ -1200,7 +1305,10 @@ mod tests {
             .expect("alloc input_ids");
         {
             let slice: &mut [u32] = unsafe {
-                std::slice::from_raw_parts_mut(input_ids.contents_ptr() as *mut u32, seq_len as usize)
+                std::slice::from_raw_parts_mut(
+                    input_ids.contents_ptr() as *mut u32,
+                    seq_len as usize,
+                )
             };
             for (i, slot) in slice.iter_mut().enumerate() {
                 *slot = (i as u32 * 7 + 3) % cfg.vocab_size as u32;
@@ -1529,8 +1637,7 @@ mod tests {
 
         use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
         if !model_path.exists() {
             eprintln!(
                 "skipping: nomic GGUF fixture not at {}",
@@ -1545,7 +1652,10 @@ mod tests {
         // Validate the production-shape parameters we expect for
         // nomic-embed-text-v1.5 — protects against a different model
         // accidentally being placed at this path.
-        assert_eq!(cfg.hidden_size, 768, "expected nomic-embed-text-v1.5 hidden=768");
+        assert_eq!(
+            cfg.hidden_size, 768,
+            "expected nomic-embed-text-v1.5 hidden=768"
+        );
         assert_eq!(cfg.num_hidden_layers, 12, "expected 12 blocks");
         assert_eq!(cfg.num_attention_heads, 12, "expected 12 heads");
         assert_eq!(cfg.intermediate_size, 3072, "expected n_ff=3072");
@@ -1553,7 +1663,11 @@ mod tests {
         // Tokenize "hello world" with [CLS]/[SEP] brackets.
         let tok = build_nomic_wordpiece_tokenizer(model_path).expect("build tokenizer");
         let real_ids = tok.encode("hello world", true);
-        assert_eq!(real_ids.len(), 4, "expected [CLS] hello world [SEP], got {real_ids:?}");
+        assert_eq!(
+            real_ids.len(),
+            4,
+            "expected [CLS] hello world [SEP], got {real_ids:?}"
+        );
 
         // Pad right with [PAD] up to seq_len = 32 (the kernel-floor minimum).
         let seq_len: u32 = 32;
@@ -1584,11 +1698,7 @@ mod tests {
 
         // Build input_ids buffer.
         let input_ids = device
-            .alloc_buffer(
-                (seq_len as usize) * 4,
-                DType::U32,
-                vec![seq_len as usize],
-            )
+            .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
             .expect("alloc input_ids");
         {
             let slice: &mut [u32] = unsafe {
@@ -1675,10 +1785,12 @@ mod tests {
 
         use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
         if !model_path.exists() {
-            eprintln!("skipping: nomic GGUF fixture not at {}", model_path.display());
+            eprintln!(
+                "skipping: nomic GGUF fixture not at {}",
+                model_path.display()
+            );
             return;
         }
 
@@ -1807,8 +1919,7 @@ mod tests {
 
         use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
         if !model_path.exists() {
             eprintln!(
                 "skipping: nomic GGUF fixture not at {}",
@@ -1843,11 +1954,7 @@ mod tests {
 
         // ---- Build input_ids buffer ----
         let input_ids = device
-            .alloc_buffer(
-                (seq_len as usize) * 4,
-                DType::U32,
-                vec![seq_len as usize],
-            )
+            .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
             .expect("alloc input_ids");
         {
             let slice: &mut [u32] = unsafe {
@@ -1953,8 +2060,7 @@ mod tests {
 
         use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
 
-        let model_path =
-            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        let model_path = Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
         if !model_path.exists() {
             eprintln!(
                 "skipping: nomic GGUF fixture not at {}",
@@ -2051,9 +2157,7 @@ mod tests {
             if drift > max_drift {
                 max_drift = drift;
             }
-            eprintln!(
-                "[pad-invariance] seq_len 32 vs {sl}: cosine={cosine:.7}, drift={drift:.2e}"
-            );
+            eprintln!("[pad-invariance] seq_len 32 vs {sl}: cosine={cosine:.7}, drift={drift:.2e}");
             assert!(
                 cosine >= 0.99999,
                 "seq_len 32 vs {sl}: cosine {cosine:.7} below 0.99999 padding-invariance gate \

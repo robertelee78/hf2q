@@ -84,7 +84,11 @@ pub fn regex_to_gbnf_body(pattern: &str, surface: Surface) -> Result<String, Reg
     let anchored_start = chars.first() == Some(&'^');
     let anchored_end = chars.last() == Some(&'$') && chars.len() > (anchored_start as usize);
     let start = if anchored_start { 1 } else { 0 };
-    let end = if anchored_end { chars.len() - 1 } else { chars.len() };
+    let end = if anchored_end {
+        chars.len() - 1
+    } else {
+        chars.len()
+    };
     let mut p = Parser {
         chars: &chars[start..end],
         pos: 0,
@@ -266,12 +270,8 @@ impl<'a> Parser<'a> {
                         Some('=') | Some('!') => {
                             return Err(RegexError("lookahead is not regular".into()))
                         }
-                        Some('<') => {
-                            return Err(RegexError("lookbehind is not regular".into()))
-                        }
-                        Some('>') => {
-                            return Err(RegexError("atomic groups unsupported".into()))
-                        }
+                        Some('<') => return Err(RegexError("lookbehind is not regular".into())),
+                        Some('>') => return Err(RegexError("atomic groups unsupported".into())),
                         _ => {
                             return Err(RegexError(format!(
                                 "unsupported group prefix '(?{}'",
@@ -326,10 +326,7 @@ impl<'a> Parser<'a> {
                 let h = self.take_hex(4)?;
                 Ok(self.lit_or_class_char(h, in_class))
             }
-            '1'..='9' => Err(RegexError(format!(
-                "backreference \\{} is not regular",
-                c
-            ))),
+            '1'..='9' => Err(RegexError(format!("backreference \\{} is not regular", c))),
             'b' | 'B' | 'A' | 'z' | 'Z' => Err(RegexError(format!(
                 "zero-width assertion \\{} unsupported",
                 c
@@ -530,8 +527,16 @@ mod tests {
     #[test]
     fn unanchored_pattern_gets_contains_wrappers() {
         let body = compile("foo");
-        assert!(body.starts_with(r#"[^"\\<\n\x00-\x1F]* "#), "prefix wrapper: {}", body);
-        assert!(body.ends_with(r#" [^"\\<\n\x00-\x1F]*"#), "suffix wrapper: {}", body);
+        assert!(
+            body.starts_with(r#"[^"\\<\n\x00-\x1F]* "#),
+            "prefix wrapper: {}",
+            body
+        );
+        assert!(
+            body.ends_with(r#" [^"\\<\n\x00-\x1F]*"#),
+            "suffix wrapper: {}",
+            body
+        );
         assert!(body.contains(r#""f" "o" "o""#));
     }
 
@@ -549,7 +554,10 @@ mod tests {
         // Groups containing alternation are double-parenthesized (inner
         // from parse_alternation, outer from the group) — semantically
         // identical in GBNF, kept for emitter simplicity.
-        assert_eq!(compile("^(get|post)$"), r#"( ( "g" "e" "t" | "p" "o" "s" "t" ) )"#);
+        assert_eq!(
+            compile("^(get|post)$"),
+            r#"( ( "g" "e" "t" | "p" "o" "s" "t" ) )"#
+        );
         assert_eq!(compile("^(?:ab|cd)x$"), r#"( ( "a" "b" | "c" "d" ) ) "x""#);
     }
 
@@ -563,10 +571,7 @@ mod tests {
     #[test]
     fn negated_class_adds_surface_forbiddens() {
         // `[^0-9]` must ALSO exclude `"` `\` `<` + controls on the JSON surface.
-        assert_eq!(
-            compile(r"^[^0-9]$"),
-            r#"[^0-9"\\<\x00-\x1F]"#
-        );
+        assert_eq!(compile(r"^[^0-9]$"), r#"[^0-9"\\<\x00-\x1F]"#);
     }
 
     #[test]

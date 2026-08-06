@@ -135,16 +135,18 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
     let row_bytes = blocks_per_row * BLOCK_BYTES;
     // ADR-036 Layer A: per-row parallelism.
     let mut out = vec![0u8; nrow * row_bytes];
-    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
-        let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
-        let mut tmp = Vec::with_capacity(row_bytes);
-        match imatrix {
-            None => quantize_row_ref(row_src, &mut tmp),
-            Some(im) => quantize_row_impl(row_src, im, &mut tmp),
-        }
-        debug_assert_eq!(tmp.len(), row_bytes);
-        dst.copy_from_slice(&tmp);
-    });
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, dst)| {
+            let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
+            let mut tmp = Vec::with_capacity(row_bytes);
+            match imatrix {
+                None => quantize_row_ref(row_src, &mut tmp),
+                Some(im) => quantize_row_impl(row_src, im, &mut tmp),
+            }
+            debug_assert_eq!(tmp.len(), row_bytes);
+            dst.copy_from_slice(&tmp);
+        });
 
     out
 }
@@ -156,8 +158,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set by cargo test");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo test");
         PathBuf::from(manifest)
             .join("tests/fixtures/ggml_quants")
             .join(name)

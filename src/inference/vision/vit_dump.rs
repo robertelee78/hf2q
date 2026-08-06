@@ -109,7 +109,10 @@ fn dump_dir_env() -> Option<PathBuf> {
 // not honoured. Matches the `HF2Q_VIT_F32_ATTENTION` and `HF2Q_VIT_DUMP`
 // patterns in this module.
 fn dtype_audit_env() -> bool {
-    matches!(std::env::var("HF2Q_VIT_DUMP_DTYPE_AUDIT").as_deref(), Ok("1"))
+    matches!(
+        std::env::var("HF2Q_VIT_DUMP_DTYPE_AUDIT").as_deref(),
+        Ok("1")
+    )
 }
 
 thread_local! {
@@ -271,8 +274,8 @@ pub fn drain_audit_entries() -> Vec<AuditEntry> {
 pub fn write_dtype_audit(dir: &Path, entries: &[AuditEntry]) -> Result<()> {
     use std::io::Write;
     let path = dir.join("_dtype_audit.json");
-    let mut f = std::fs::File::create(&path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let mut f =
+        std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
     f.write_all(b"[\n")
         .with_context(|| format!("write {}", path.display()))?;
     for (i, e) in entries.iter().enumerate() {
@@ -300,7 +303,6 @@ pub fn write_dtype_audit(dir: &Path, entries: &[AuditEntry]) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
-
 
 /// Record a CPU-side `&[f32]` slice as a synthetic stage. Used for the
 /// `00_pre_patchify` / `00_post_patchify` dumps (input tensors that are
@@ -486,10 +488,7 @@ mod tests {
     #[test]
     fn write_dump_inner_round_trip() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let tmp = std::env::temp_dir().join(format!(
-            "vit_dump_test_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("vit_dump_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
         let data = vec![1.5_f32, -2.25, 3.75, 0.0];
         let shape = vec![2, 2];

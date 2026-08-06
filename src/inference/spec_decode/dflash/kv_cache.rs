@@ -97,7 +97,10 @@ impl DFlashLayerKvCache {
         if self.would_overflow(n_new) {
             return Err(anyhow::anyhow!(
                 "dflash KV cache layer {} would overflow: seq_len={}, n_new={}, capacity={}",
-                self.layer_idx, self.seq_len, n_new, self.capacity
+                self.layer_idx,
+                self.seq_len,
+                n_new,
+                self.capacity
             ));
         }
         if self.is_sliding && self.seq_len.saturating_add(n_new) > self.capacity {
@@ -105,7 +108,10 @@ impl DFlashLayerKvCache {
             return Err(anyhow::anyhow!(
                 "dflash KV cache layer {} (sliding) would wrap past capacity {} — \
                  not supported in Phase 3 first cut (seq_len={}, n_new={})",
-                self.layer_idx, self.capacity, self.seq_len, n_new
+                self.layer_idx,
+                self.capacity,
+                self.seq_len,
+                n_new
             ));
         }
 
@@ -116,9 +122,7 @@ impl DFlashLayerKvCache {
         let start = self.seq_len as usize;
 
         let expected_input_elems = n * n_h * d;
-        if k_seq_major.len() != expected_input_elems
-            || v_seq_major.len() != expected_input_elems
-        {
+        if k_seq_major.len() != expected_input_elems || v_seq_major.len() != expected_input_elems {
             return Err(anyhow::anyhow!(
                 "dflash append_seq_major_kv: input lens K={} V={} != n_new({}) * num_kv_heads({}) * head_dim({}) = {}",
                 k_seq_major.len(), v_seq_major.len(), n_new, num_kv_heads, head_dim,
@@ -142,10 +146,8 @@ impl DFlashLayerKvCache {
             for t in 0..n {
                 let src_row = (t * n_h + h) * d;
                 let dst_row = (h * cap + start + t) * d;
-                k_dst[dst_row..dst_row + d]
-                    .copy_from_slice(&k_seq_major[src_row..src_row + d]);
-                v_dst[dst_row..dst_row + d]
-                    .copy_from_slice(&v_seq_major[src_row..src_row + d]);
+                k_dst[dst_row..dst_row + d].copy_from_slice(&k_seq_major[src_row..src_row + d]);
+                v_dst[dst_row..dst_row + d].copy_from_slice(&v_seq_major[src_row..src_row + d]);
             }
         }
 
@@ -189,30 +191,38 @@ impl DFlashLayerKvCache {
         if self.would_overflow(n_new) {
             return Err(anyhow::anyhow!(
                 "dflash KV cache layer {} (gpu) would overflow: seq_len={}, n_new={}, capacity={}",
-                self.layer_idx, self.seq_len, n_new, self.capacity
+                self.layer_idx,
+                self.seq_len,
+                n_new,
+                self.capacity
             ));
         }
         if self.is_sliding && self.seq_len.saturating_add(n_new) > self.capacity {
             return Err(anyhow::anyhow!(
                 "dflash KV cache layer {} (sliding, gpu) would wrap past capacity {}",
-                self.layer_idx, self.capacity,
+                self.layer_idx,
+                self.capacity,
             ));
         }
-        let expected_src_elems = (n_new as u64)
-            * (num_kv_heads as u64)
-            * (head_dim as u64);
+        let expected_src_elems = (n_new as u64) * (num_kv_heads as u64) * (head_dim as u64);
         for (name, b) in [("src_k", src_k), ("src_v", src_v)] {
             if (b.element_count() as u64) < expected_src_elems {
                 return Err(anyhow::anyhow!(
                     "dflash append_seq_major_kv_gpu: {} has {} elements, need {}",
-                    name, b.element_count(), expected_src_elems
+                    name,
+                    b.element_count(),
+                    expected_src_elems
                 ));
             }
         }
         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
-            encoder, registry, device,
-            src_k, src_v,
-            &self.keys, &self.values,
+            encoder,
+            registry,
+            device,
+            src_k,
+            src_v,
+            &self.keys,
+            &self.values,
             num_kv_heads,
             head_dim,
             self.capacity,
@@ -220,9 +230,7 @@ impl DFlashLayerKvCache {
             /* n_tokens = */ n_new,
             /* src_tok_offset = */ 0,
         )
-        .map_err(|e| anyhow::anyhow!(
-            "dflash append_seq_major_kv_gpu dispatch: {e}"
-        ))?;
+        .map_err(|e| anyhow::anyhow!("dflash append_seq_major_kv_gpu dispatch: {e}"))?;
         self.seq_len += n_new;
         Ok(())
     }
@@ -279,23 +287,30 @@ impl DFlashLayerKvCache {
         if k_seq_major.len() != expected || v_seq_major.len() != expected {
             return Err(anyhow::anyhow!(
                 "dflash write_slack_kv: lens K={} V={} != n({}) * H({}) * D({}) = {}",
-                k_seq_major.len(), v_seq_major.len(), n, num_kv_heads, head_dim, expected
+                k_seq_major.len(),
+                v_seq_major.len(),
+                n,
+                num_kv_heads,
+                head_dim,
+                expected
             ));
         }
 
-        let k_dst = self.keys.as_mut_slice::<f32>()
+        let k_dst = self
+            .keys
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("write_slack k_dst slice: {e}"))?;
-        let v_dst = self.values.as_mut_slice::<f32>()
+        let v_dst = self
+            .values
+            .as_mut_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("write_slack v_dst slice: {e}"))?;
 
         for h in 0..n_h {
             for t in 0..n_usize {
                 let src_row = (t * n_h + h) * d;
                 let dst_row = (h * cap + start + t) * d;
-                k_dst[dst_row..dst_row + d]
-                    .copy_from_slice(&k_seq_major[src_row..src_row + d]);
-                v_dst[dst_row..dst_row + d]
-                    .copy_from_slice(&v_seq_major[src_row..src_row + d]);
+                k_dst[dst_row..dst_row + d].copy_from_slice(&k_seq_major[src_row..src_row + d]);
+                v_dst[dst_row..dst_row + d].copy_from_slice(&v_seq_major[src_row..src_row + d]);
             }
         }
         // Intentionally NOT advancing seq_len — caller's responsibility.
@@ -341,21 +356,25 @@ impl DFlashLayerKvCache {
                 self.layer_idx, self.seq_len, n, self.capacity
             ));
         }
-        let expected_src_elems = (n as u64)
-            * (num_kv_heads as u64)
-            * (head_dim as u64);
+        let expected_src_elems = (n as u64) * (num_kv_heads as u64) * (head_dim as u64);
         for (name, b) in [("src_k", src_k), ("src_v", src_v)] {
             if (b.element_count() as u64) < expected_src_elems {
                 return Err(anyhow::anyhow!(
                     "dflash write_slack_kv_gpu: {} has {} elements, need {}",
-                    name, b.element_count(), expected_src_elems
+                    name,
+                    b.element_count(),
+                    expected_src_elems
                 ));
             }
         }
         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
-            encoder, registry, device,
-            src_k, src_v,
-            &self.keys, &self.values,
+            encoder,
+            registry,
+            device,
+            src_k,
+            src_v,
+            &self.keys,
+            &self.values,
             num_kv_heads,
             head_dim,
             self.capacity,
@@ -363,9 +382,7 @@ impl DFlashLayerKvCache {
             /* n_tokens = */ n,
             /* src_tok_offset = */ 0,
         )
-        .map_err(|e| anyhow::anyhow!(
-            "dflash write_slack_kv_gpu dispatch: {e}"
-        ))?;
+        .map_err(|e| anyhow::anyhow!("dflash write_slack_kv_gpu dispatch: {e}"))?;
         // Intentionally NOT advancing seq_len — caller's responsibility.
         Ok(())
     }
@@ -386,11 +403,7 @@ impl DFlashKvCache {
     /// - `max_capacity_full`: capacity for full-attention layers. Set
     ///   to the maximum number of (prompt + generated) positions the
     ///   drafter will need to track in the largest forward call.
-    pub fn new(
-        device: &MlxDevice,
-        cfg: &DFlashConfig,
-        max_capacity_full: u32,
-    ) -> Result<Self> {
+    pub fn new(device: &MlxDevice, cfg: &DFlashConfig, max_capacity_full: u32) -> Result<Self> {
         let num_kv_heads = cfg.num_key_value_heads as u32;
         let head_dim = cfg.head_dim as u32;
         let sliding_cap = cfg.sliding_window.map(|w| w as u32 - 1).unwrap_or(0);
@@ -458,10 +471,8 @@ mod tests {
     use crate::inference::spec_decode::dflash::config::DFlashConfig;
 
     fn gemma4_26b_a4b_dflash_config() -> DFlashConfig {
-        DFlashConfig::from_json_str(
-            super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
-        )
-        .expect("test fixture must parse")
+        DFlashConfig::from_json_str(super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG)
+            .expect("test fixture must parse")
     }
 
     /// GPU integration test: allocate a DFlash KV cache for the
@@ -495,17 +506,21 @@ mod tests {
             let expected_elem = (cfg.num_key_value_heads as usize)
                 * (l.capacity as usize)
                 * (cfg.head_dim as usize);
-            assert_eq!(l.keys.element_count(), expected_elem, "layer {i} K elem count");
-            assert_eq!(l.values.element_count(), expected_elem, "layer {i} V elem count");
+            assert_eq!(
+                l.keys.element_count(),
+                expected_elem,
+                "layer {i} K elem count"
+            );
+            assert_eq!(
+                l.values.element_count(),
+                expected_elem,
+                "layer {i} V elem count"
+            );
             assert_eq!(l.seq_len, 0, "fresh cache seq_len must be 0");
         }
 
         // Sanity: total bytes = 2 (K+V) × 5 layers × bytes per layer
-        let expected_bytes: usize = cache
-            .layers
-            .iter()
-            .map(|l| 2 * l.keys.byte_len())
-            .sum();
+        let expected_bytes: usize = cache.layers.iter().map(|l| 2 * l.keys.byte_len()).sum();
         assert_eq!(cache.gpu_resident_bytes(), expected_bytes);
 
         // Bump some seq_len, reset, verify cleared.
@@ -566,12 +581,14 @@ mod tests {
                     let expected_k = (t * 10000 + head * 100 + dimi) as f32;
                     let expected_v = expected_k + 0.5;
                     assert_eq!(
-                        k_storage[dst + dimi], expected_k,
+                        k_storage[dst + dimi],
+                        expected_k,
                         "K mismatch t={t} head={head} dim={dimi}: got {} expected {expected_k}",
                         k_storage[dst + dimi]
                     );
                     assert_eq!(
-                        v_storage[dst + dimi], expected_v,
+                        v_storage[dst + dimi],
+                        expected_v,
                         "V mismatch t={t} head={head} dim={dimi}"
                     );
                 }
@@ -617,7 +634,9 @@ mod tests {
         for (i, v) in v_ctx.iter_mut().enumerate() {
             *v = 1.5 + ((i % 100) as f32) / 1000.0;
         }
-        layer.append_seq_major_kv(&k_ctx, &v_ctx, n_ctx, h, d).expect("append ctx");
+        layer
+            .append_seq_major_kv(&k_ctx, &v_ctx, n_ctx, h, d)
+            .expect("append ctx");
         assert_eq!(layer.seq_len, n_ctx);
 
         // Phase 2: slack-write 5 positions with marker 2.x
@@ -630,7 +649,9 @@ mod tests {
         for (i, v) in v_slack.iter_mut().enumerate() {
             *v = 2.5 + ((i % 100) as f32) / 1000.0;
         }
-        layer.write_slack_kv(&k_slack, &v_slack, n_slack, h, d).expect("write slack");
+        layer
+            .write_slack_kv(&k_slack, &v_slack, n_slack, h, d)
+            .expect("write slack");
         assert_eq!(layer.seq_len, n_ctx, "slack write must NOT advance seq_len");
 
         // Phase 3: verify positions 0..3 still have ctx (1.x) markers
@@ -640,17 +661,21 @@ mod tests {
         for t in 0..(n_ctx as usize) {
             for head in 0..n_h {
                 let dst = (head * cap + t) * dim;
-                assert!(k_storage[dst] >= 1.0 && k_storage[dst] < 2.0,
+                assert!(
+                    k_storage[dst] >= 1.0 && k_storage[dst] < 2.0,
                     "ctx position t={t} head={head}: expected 1.x marker, got {}",
-                    k_storage[dst]);
+                    k_storage[dst]
+                );
             }
         }
         for t in 0..(n_slack as usize) {
             for head in 0..n_h {
                 let dst = (head * cap + (n_ctx as usize) + t) * dim;
-                assert!(k_storage[dst] >= 2.0 && k_storage[dst] < 3.0,
+                assert!(
+                    k_storage[dst] >= 2.0 && k_storage[dst] < 3.0,
                     "slack position t={t} head={head}: expected 2.x marker, got {}",
-                    k_storage[dst]);
+                    k_storage[dst]
+                );
             }
         }
 
@@ -658,9 +683,15 @@ mod tests {
         // the slack region.
         let mut k_new = vec![0.0f32; (2 as usize) * n_h * dim];
         let mut v_new = vec![0.0f32; (2 as usize) * n_h * dim];
-        for v in k_new.iter_mut() { *v = 9.0; }
-        for v in v_new.iter_mut() { *v = 9.5; }
-        layer.append_seq_major_kv(&k_new, &v_new, 2, h, d).expect("append after slack");
+        for v in k_new.iter_mut() {
+            *v = 9.0;
+        }
+        for v in v_new.iter_mut() {
+            *v = 9.5;
+        }
+        layer
+            .append_seq_major_kv(&k_new, &v_new, 2, h, d)
+            .expect("append after slack");
         assert_eq!(layer.seq_len, n_ctx + 2);
         let k_storage = layer.keys.as_slice::<f32>().expect("k_storage 2");
         for head in 0..n_h {
@@ -744,9 +775,14 @@ mod tests {
         let mut enc = device.command_encoder().expect("encoder");
         cache_gpu.layers[layer_idx]
             .append_seq_major_kv_gpu(
-                &mut enc, &mut registry, device.metal_device(),
-                &src_k, &src_v,
-                n_new, h, d,
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &src_k,
+                &src_v,
+                n_new,
+                h,
+                d,
             )
             .expect("GPU append");
         enc.commit_and_wait().expect("commit GPU append");
@@ -755,10 +791,22 @@ mod tests {
         assert_eq!(cache_cpu.layers[layer_idx].seq_len, n_new, "CPU seq_len");
         assert_eq!(cache_gpu.layers[layer_idx].seq_len, n_new, "GPU seq_len");
 
-        let k_cpu = cache_cpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_cpu");
-        let k_gpu = cache_gpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_gpu");
-        let v_cpu = cache_cpu.layers[layer_idx].values.as_slice::<f32>().expect("v_cpu");
-        let v_gpu = cache_gpu.layers[layer_idx].values.as_slice::<f32>().expect("v_gpu");
+        let k_cpu = cache_cpu.layers[layer_idx]
+            .keys
+            .as_slice::<f32>()
+            .expect("k_cpu");
+        let k_gpu = cache_gpu.layers[layer_idx]
+            .keys
+            .as_slice::<f32>()
+            .expect("k_gpu");
+        let v_cpu = cache_cpu.layers[layer_idx]
+            .values
+            .as_slice::<f32>()
+            .expect("v_cpu");
+        let v_gpu = cache_gpu.layers[layer_idx]
+            .values
+            .as_slice::<f32>()
+            .expect("v_gpu");
 
         // Compare only the WRITTEN region (head * cap + 0..n_new) per head.
         // Tail bytes after seq_len are uninitialized in both paths and
@@ -871,21 +919,40 @@ mod tests {
 
         // ── Path B: GPU slack write ──
         let mut src_k = device
-            .alloc_buffer(n_slack_elems * 4, DType::F32, vec![n_slack as usize, n_h, dim])
+            .alloc_buffer(
+                n_slack_elems * 4,
+                DType::F32,
+                vec![n_slack as usize, n_h, dim],
+            )
             .expect("alloc src_k");
         let mut src_v = device
-            .alloc_buffer(n_slack_elems * 4, DType::F32, vec![n_slack as usize, n_h, dim])
+            .alloc_buffer(
+                n_slack_elems * 4,
+                DType::F32,
+                vec![n_slack as usize, n_h, dim],
+            )
             .expect("alloc src_v");
-        src_k.as_mut_slice::<f32>().expect("src_k slice").copy_from_slice(&k_slack);
-        src_v.as_mut_slice::<f32>().expect("src_v slice").copy_from_slice(&v_slack);
+        src_k
+            .as_mut_slice::<f32>()
+            .expect("src_k slice")
+            .copy_from_slice(&k_slack);
+        src_v
+            .as_mut_slice::<f32>()
+            .expect("src_v slice")
+            .copy_from_slice(&v_slack);
 
         let mut registry = mlx_native::KernelRegistry::new();
         let mut enc = device.command_encoder().expect("encoder");
         cache_gpu.layers[layer_idx]
             .write_slack_kv_gpu(
-                &mut enc, &mut registry, device.metal_device(),
-                &src_k, &src_v,
-                n_slack, h, d,
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &src_k,
+                &src_v,
+                n_slack,
+                h,
+                d,
             )
             .expect("GPU slack write");
         enc.commit_and_wait().expect("commit GPU slack");
@@ -893,14 +960,32 @@ mod tests {
         // ── Compare ──
         // Both seq_len cursors MUST remain at n_ctx (slack write does
         // not advance).
-        assert_eq!(cache_cpu.layers[layer_idx].seq_len, n_ctx, "CPU seq_len unchanged");
-        assert_eq!(cache_gpu.layers[layer_idx].seq_len, n_ctx, "GPU seq_len unchanged");
+        assert_eq!(
+            cache_cpu.layers[layer_idx].seq_len, n_ctx,
+            "CPU seq_len unchanged"
+        );
+        assert_eq!(
+            cache_gpu.layers[layer_idx].seq_len, n_ctx,
+            "GPU seq_len unchanged"
+        );
 
         let cap = cache_cpu.layers[layer_idx].capacity as usize;
-        let k_cpu = cache_cpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_cpu");
-        let k_gpu = cache_gpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_gpu");
-        let v_cpu = cache_cpu.layers[layer_idx].values.as_slice::<f32>().expect("v_cpu");
-        let v_gpu = cache_gpu.layers[layer_idx].values.as_slice::<f32>().expect("v_gpu");
+        let k_cpu = cache_cpu.layers[layer_idx]
+            .keys
+            .as_slice::<f32>()
+            .expect("k_cpu");
+        let k_gpu = cache_gpu.layers[layer_idx]
+            .keys
+            .as_slice::<f32>()
+            .expect("k_gpu");
+        let v_cpu = cache_cpu.layers[layer_idx]
+            .values
+            .as_slice::<f32>()
+            .expect("v_cpu");
+        let v_gpu = cache_gpu.layers[layer_idx]
+            .values
+            .as_slice::<f32>()
+            .expect("v_gpu");
 
         // Compare WRITTEN region: prefix [0..n_ctx) + slack [n_ctx..n_ctx+n_slack).
         // Both paths wrote prefix via CPU + slack via their respective paths.
@@ -1004,7 +1089,16 @@ mod tests {
         let src_v1 = mk_gpu(&v1);
         let mut enc = device.command_encoder().expect("enc step 1");
         cache_gpu.layers[layer_idx]
-            .append_seq_major_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_k1, &src_v1, 3, h, d)
+            .append_seq_major_kv_gpu(
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &src_k1,
+                &src_v1,
+                3,
+                h,
+                d,
+            )
             .expect("GPU step 1 append");
         enc.commit_and_wait().expect("commit step 1");
         assert_eq!(cache_cpu.layers[layer_idx].seq_len, 3);
@@ -1019,7 +1113,16 @@ mod tests {
         let src_v2 = mk_gpu(&v2);
         let mut enc = device.command_encoder().expect("enc step 2");
         cache_gpu.layers[layer_idx]
-            .append_seq_major_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_k2, &src_v2, 2, h, d)
+            .append_seq_major_kv_gpu(
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &src_k2,
+                &src_v2,
+                2,
+                h,
+                d,
+            )
             .expect("GPU step 2 append");
         enc.commit_and_wait().expect("commit step 2");
         assert_eq!(cache_cpu.layers[layer_idx].seq_len, 5);
@@ -1041,7 +1144,16 @@ mod tests {
         let src_v3 = mk_gpu(&v3);
         let mut enc = device.command_encoder().expect("enc step 4");
         cache_gpu.layers[layer_idx]
-            .append_seq_major_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_k3, &src_v3, 1, h, d)
+            .append_seq_major_kv_gpu(
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &src_k3,
+                &src_v3,
+                1,
+                h,
+                d,
+            )
             .expect("GPU step 4 append");
         enc.commit_and_wait().expect("commit step 4");
         assert_eq!(cache_cpu.layers[layer_idx].seq_len, 5);
@@ -1056,7 +1168,16 @@ mod tests {
         let src_vs = mk_gpu(&vs);
         let mut enc = device.command_encoder().expect("enc step 5");
         cache_gpu.layers[layer_idx]
-            .write_slack_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_ks, &src_vs, 2, h, d)
+            .write_slack_kv_gpu(
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &src_ks,
+                &src_vs,
+                2,
+                h,
+                d,
+            )
             .expect("GPU step 5 slack");
         enc.commit_and_wait().expect("commit step 5");
         // Slack does NOT advance.
@@ -1068,10 +1189,22 @@ mod tests {
         // overwritten by step 4 at position 4 after rollback). Slack
         // positions [5..7) hold step 5 data. Compare both ranges.
         let cap = cache_cpu.layers[layer_idx].capacity as usize;
-        let k_cpu = cache_cpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_cpu");
-        let k_gpu = cache_gpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_gpu");
-        let v_cpu = cache_cpu.layers[layer_idx].values.as_slice::<f32>().expect("v_cpu");
-        let v_gpu = cache_gpu.layers[layer_idx].values.as_slice::<f32>().expect("v_gpu");
+        let k_cpu = cache_cpu.layers[layer_idx]
+            .keys
+            .as_slice::<f32>()
+            .expect("k_cpu");
+        let k_gpu = cache_gpu.layers[layer_idx]
+            .keys
+            .as_slice::<f32>()
+            .expect("k_gpu");
+        let v_cpu = cache_cpu.layers[layer_idx]
+            .values
+            .as_slice::<f32>()
+            .expect("v_cpu");
+        let v_gpu = cache_gpu.layers[layer_idx]
+            .values
+            .as_slice::<f32>()
+            .expect("v_gpu");
         // Compare positions [0..7) — appends [0..5) + slack [5..7).
         for head in 0..n_h {
             for t in 0..7usize {

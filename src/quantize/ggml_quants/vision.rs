@@ -91,18 +91,26 @@ mod tests {
     #[test]
     fn vision_matches_model_visual_dot() {
         assert!(is_vision_tensor_pattern("model.visual.patch_embd.weight"));
-        assert!(is_vision_tensor_pattern("model.visual.blocks.0.attn_q.weight"));
+        assert!(is_vision_tensor_pattern(
+            "model.visual.blocks.0.attn_q.weight"
+        ));
     }
 
     #[test]
     fn vision_matches_vision_tower_dot() {
-        assert!(is_vision_tensor_pattern("vision_tower.vision_model.embeddings"));
-        assert!(is_vision_tensor_pattern("language_model.vision_tower.patch_embd"));
+        assert!(is_vision_tensor_pattern(
+            "vision_tower.vision_model.embeddings"
+        ));
+        assert!(is_vision_tensor_pattern(
+            "language_model.vision_tower.patch_embd"
+        ));
     }
 
     #[test]
     fn vision_matches_vision_model_dot() {
-        assert!(is_vision_tensor_pattern("vision_model.encoder.layers.0.attn.q"));
+        assert!(is_vision_tensor_pattern(
+            "vision_model.encoder.layers.0.attn.q"
+        ));
     }
 
     #[test]
@@ -187,9 +195,8 @@ mod tests {
     fn combined_gate_for_dispatcher() {
         // Mirrors the dispatcher call:
         // `is_vision_tensor_pattern(name) || is_audio_tensor_pattern(name)`
-        let go_through_policy = |name: &str| {
-            !(is_vision_tensor_pattern(name) || is_audio_tensor_pattern(name))
-        };
+        let go_through_policy =
+            |name: &str| !(is_vision_tensor_pattern(name) || is_audio_tensor_pattern(name));
         assert!(go_through_policy("blk.0.attn_q.weight"));
         assert!(!go_through_policy("vision_tower.encoder.q"));
         assert!(!go_through_policy("audio_tower.encoder.q"));

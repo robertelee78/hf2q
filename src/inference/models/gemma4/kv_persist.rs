@@ -90,8 +90,16 @@ impl MlxModelWeights {
         // and byte reads all use the same buffer.
         let use_hb = bits_per_coord.0 >= 5;
 
-        let (k_packed_bytes, k_norms_f32, v_packed_bytes, v_norms_f32, capacity_runtime, hd_packed_runtime, n_kv_heads_runtime, seq_len_live):
-            (&[u8], &[f32], &[u8], &[f32], usize, usize, usize, usize) = if use_hb {
+        let (
+            k_packed_bytes,
+            k_norms_f32,
+            v_packed_bytes,
+            v_norms_f32,
+            capacity_runtime,
+            hd_packed_runtime,
+            n_kv_heads_runtime,
+            seq_len_live,
+        ): (&[u8], &[f32], &[u8], &[f32], usize, usize, usize, usize) = if use_hb {
             let hb = self
                 .leg_hb_encoded
                 .as_ref()
@@ -104,10 +112,18 @@ impl MlxModelWeights {
             // HB shares the kv_caches' seq_len bookkeeping (same
             // forward_decode increments both); read from kv_caches.
             (
-                lay.k_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
-                lay.k_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
-                lay.v_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
-                lay.v_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
+                lay.k_packed
+                    .as_slice::<u8>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
+                lay.k_norms
+                    .as_slice::<f32>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
+                lay.v_packed
+                    .as_slice::<u8>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
+                lay.v_norms
+                    .as_slice::<f32>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
                 lay.capacity,
                 lay.k_packed.shape().get(2).copied().unwrap_or(0),
                 lay.k_packed.shape().first().copied().unwrap_or(0),
@@ -119,10 +135,22 @@ impl MlxModelWeights {
                 .get(layer_rank)
                 .ok_or(SpillErrorKind::CodecErr)?;
             (
-                cache.k_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
-                cache.k_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
-                cache.v_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
-                cache.v_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
+                cache
+                    .k_packed
+                    .as_slice::<u8>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
+                cache
+                    .k_norms
+                    .as_slice::<f32>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
+                cache
+                    .v_packed
+                    .as_slice::<u8>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
+                cache
+                    .v_norms
+                    .as_slice::<f32>()
+                    .map_err(|_| SpillErrorKind::IoErr)?,
                 cache.capacity,
                 cache.k_packed.shape().get(2).copied().unwrap_or(0),
                 cache.k_packed.shape().first().copied().unwrap_or(0),
@@ -460,8 +488,7 @@ impl MlxModelWeights {
                 for t in 0..n_tokens {
                     for k in 0..norms_per_pos {
                         let dst_idx = head_base + (range.start as usize + t) * norms_per_pos + k;
-                        let src_off =
-                            ((h * n_tokens + t) * norms_per_pos + k) * 4;
+                        let src_off = ((h * n_tokens + t) * norms_per_pos + k) * 4;
                         let bytes = [
                             norms[src_off],
                             norms[src_off + 1],
@@ -477,5 +504,4 @@ impl MlxModelWeights {
 
         Ok(())
     }
-
 }

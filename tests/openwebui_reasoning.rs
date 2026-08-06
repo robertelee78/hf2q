@@ -66,8 +66,7 @@ use helpers::{
 
 /// Default reasoning-capable test model (Qwen 3.6 27B DWQ-46) — matches
 /// the QWEN35 registry entry's `<think>` / `</think>` markers.
-const DEFAULT_REASONING_GGUF: &str =
-    "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf";
+const DEFAULT_REASONING_GGUF: &str = "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf";
 
 /// Env override for the reasoning model (per the iter C directive).
 const ENV_REASONING_MODEL: &str = "HF2Q_REASONING_TEST_MODEL";
@@ -276,12 +275,18 @@ fn openwebui_reasoning_streaming_scenario_3() {
     }
     eprintln!(
         "openwebui_reasoning: content first 300 chars: {:?}",
-        cap.accumulated_content.chars().take(300).collect::<String>()
+        cap.accumulated_content
+            .chars()
+            .take(300)
+            .collect::<String>()
     );
     if saw_reasoning {
         eprintln!(
             "openwebui_reasoning: reasoning first 300 chars: {:?}",
-            cap.accumulated_reasoning.chars().take(300).collect::<String>()
+            cap.accumulated_reasoning
+                .chars()
+                .take(300)
+                .collect::<String>()
         );
     }
 
@@ -301,7 +306,8 @@ fn openwebui_reasoning_streaming_scenario_3() {
             .map(|(s, _)| *s)
             .expect("at least one non-empty delta in stream");
         assert_eq!(
-            first_slot, "reasoning",
+            first_slot,
+            "reasoning",
             "Decision #21 ordering violated: first non-empty delta was {first_slot:?} \
              (expected `reasoning`). Slot sequence head: {:?}",
             cap.slot_sequence.iter().take(8).collect::<Vec<_>>()
@@ -340,13 +346,19 @@ fn openwebui_reasoning_streaming_scenario_3() {
             !cap.accumulated_content.contains(*m),
             "splitter regression: delta.content contains raw marker {m:?}. \
              Content was: {:?}",
-            cap.accumulated_content.chars().take(400).collect::<String>()
+            cap.accumulated_content
+                .chars()
+                .take(400)
+                .collect::<String>()
         );
         assert!(
             !cap.accumulated_reasoning.contains(*m),
             "splitter regression: delta.reasoning_content contains raw marker {m:?}. \
              Reasoning was: {:?}",
-            cap.accumulated_reasoning.chars().take(400).collect::<String>()
+            cap.accumulated_reasoning
+                .chars()
+                .take(400)
+                .collect::<String>()
         );
     }
 
@@ -366,9 +378,8 @@ fn openwebui_reasoning_streaming_scenario_3() {
     // Reasoning split at T=0 must be byte-identical: the splitter is
     // deterministic over deterministic input.
     // -----------------------------------------------------------------
-    let rerun: ReasoningStreamCapture = rt.block_on(streaming_chat_extract_reasoning(
-        &model_id, &messages, 2048,
-    ));
+    let rerun: ReasoningStreamCapture =
+        rt.block_on(streaming_chat_extract_reasoning(&model_id, &messages, 2048));
     eprintln!(
         "openwebui_reasoning: rerun reasoning len={} chars, content len={} chars, frames={}, finish_reason={:?}",
         rerun.accumulated_reasoning.chars().count(),
@@ -383,13 +394,7 @@ fn openwebui_reasoning_streaming_scenario_3() {
         );
         eprintln!(
             "openwebui_reasoning: rerun last 5 frames: {:?}",
-            rerun
-                .frames
-                .iter()
-                .rev()
-                .take(5)
-                .rev()
-                .collect::<Vec<_>>()
+            rerun.frames.iter().rev().take(5).rev().collect::<Vec<_>>()
         );
     }
     assert_eq!(

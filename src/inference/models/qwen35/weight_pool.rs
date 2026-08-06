@@ -111,19 +111,21 @@ pub fn register_weight_buffer(
     device: &MlxDevice,
     buffer: &MlxBuffer,
 ) -> std::result::Result<(), MlxError> {
-    WEIGHT_POOL.with(|cell| match cell.borrow_mut().register_existing(device, buffer) {
-        Ok(()) => Ok(()),
-        // Tolerate the cross-device case: hf2q's loader spans multiple
-        // `MlxDevice` instances, each with its own `ResidencySet`.  The
-        // first registration claims the pool; later devices' buffers stay
-        // unregistered (no residency hint) but loading must not fail.
-        Err(MlxError::InvalidArgument(ref msg))
-            if msg.contains("cannot mix residency-enabled devices") =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(e),
-    })
+    WEIGHT_POOL.with(
+        |cell| match cell.borrow_mut().register_existing(device, buffer) {
+            Ok(()) => Ok(()),
+            // Tolerate the cross-device case: hf2q's loader spans multiple
+            // `MlxDevice` instances, each with its own `ResidencySet`.  The
+            // first registration claims the pool; later devices' buffers stay
+            // unregistered (no residency hint) but loading must not fail.
+            Err(MlxError::InvalidArgument(ref msg))
+                if msg.contains("cannot mix residency-enabled devices") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+    )
 }
 
 /// Diagnostic accessor: number of buffers tracked in the residency set

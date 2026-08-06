@@ -112,10 +112,7 @@ impl AsyncWriterHandle {
     /// variant carries the failed job for the same reason as
     /// [`Self::enqueue`].
     #[allow(clippy::result_large_err)]
-    pub fn enqueue_blocking(
-        &self,
-        job: WriteJob,
-    ) -> Result<(), mpsc::SendError<WriteJob>> {
+    pub fn enqueue_blocking(&self, job: WriteJob) -> Result<(), mpsc::SendError<WriteJob>> {
         match self.tx.as_ref() {
             Some(tx) => match tx.send(job) {
                 Ok(()) => {
@@ -165,11 +162,7 @@ impl AsyncWriterHandle {
                     panic_payload
                         .downcast_ref::<&str>()
                         .copied()
-                        .or_else(|| {
-                            panic_payload
-                                .downcast_ref::<String>()
-                                .map(|s| s.as_str())
-                        })
+                        .or_else(|| { panic_payload.downcast_ref::<String>().map(|s| s.as_str()) })
                         .unwrap_or("<non-string panic payload>")
                 ))
             })?;
@@ -285,10 +278,7 @@ fn process_job(store: &DiskBlockStore, job: WriteJob, pending: &Arc<AtomicUsize>
 /// and a receiver the caller can `recv_timeout` on. This is a thin
 /// wrapper over `mpsc::sync_channel(1)` — we keep it here so the call
 /// sites read clearly.
-pub fn completion_channel() -> (
-    SyncSender<io::Result<()>>,
-    mpsc::Receiver<io::Result<()>>,
-) {
+pub fn completion_channel() -> (SyncSender<io::Result<()>>, mpsc::Receiver<io::Result<()>>) {
     mpsc::sync_channel::<io::Result<()>>(1)
 }
 

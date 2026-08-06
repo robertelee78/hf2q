@@ -192,8 +192,8 @@ fn write_synthetic_safetensors(model_dir: &Path, tensors: &[(&str, &[usize], &st
 /// streaming contract Decision 2 codifies.
 fn drive_lazy_iter(model_dir: &Path) -> (usize, String, usize) {
     let progress = ProgressReporter::new();
-    let lazy_map: LazyTensorMap = read_tensors_lazy(model_dir, &progress)
-        .expect("lazy reader opens safetensors directory");
+    let lazy_map: LazyTensorMap =
+        read_tensors_lazy(model_dir, &progress).expect("lazy reader opens safetensors directory");
 
     let mut tensors_seen = 0usize;
     let mut last_name = String::new();

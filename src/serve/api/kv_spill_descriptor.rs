@@ -350,7 +350,8 @@ mod kv_spill_descriptor_tests {
         assert_eq!(cost_f32, 32, "8 * 4 bytes per head/token (F32)");
         assert_eq!(cost_f16, 16, "8 * 2 bytes per head/token (F16)");
         assert_eq!(
-            cost_f32, cost_f16 * 2,
+            cost_f32,
+            cost_f16 * 2,
             "F32 is exactly twice the byte cost of F16 per element"
         );
     }

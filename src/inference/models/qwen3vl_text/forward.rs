@@ -258,7 +258,8 @@ pub fn forward_text_prefill_logits_last(
                  (`qwen3vl.cpp:146-150`) reads chunk `il` for every LM layer \
                  `il < n_deepstack_layers`; missing chunks would silently skip \
                  their dispatch and break image conditioning.",
-                n_chunks, n_required
+                n_chunks,
+                n_required
             ));
         }
         if n_image_tokens == 0 {
@@ -274,7 +275,9 @@ pub fn forward_text_prefill_logits_last(
                 return Err(anyhow!(
                     "forward_text_prefill_logits_last: deepstack.image_token_positions[{}] \
                      = {} >= seq_len ({}); position out of range",
-                    i, pos, seq_len_usize
+                    i,
+                    pos,
+                    seq_len_usize
                 ));
             }
         }
@@ -306,8 +309,8 @@ pub fn forward_text_prefill_logits_last(
     //
     // weights.token_embd is F32 [vocab, hidden] (cast at load time from
     // GGUF F16 — see weights.rs::load_from_gguf rationale).
-    let token_embd_cpu = download_f32(&weights.token_embd)
-        .context("download token_embd for embedding lookup")?;
+    let token_embd_cpu =
+        download_f32(&weights.token_embd).context("download token_embd for embedding lookup")?;
     let mut hidden_cpu = embed_tokens(tokens, &token_embd_cpu, vocab, hidden);
     drop(token_embd_cpu); // release the 1.24 GB CPU buffer ASAP
 
@@ -332,14 +335,17 @@ pub fn forward_text_prefill_logits_last(
                 return Err(anyhow!(
                     "forward_text: SoftTokenInjection has empty/inverted range \
                      [{}, {}); each injection must cover ≥ 1 token",
-                    inj.range.start, inj.range.end
+                    inj.range.start,
+                    inj.range.end
                 ));
             }
             if inj.range.end > seq_len_usize {
                 return Err(anyhow!(
                     "forward_text: SoftTokenInjection range [{}, {}) extends past \
                      prompt_len ({})",
-                    inj.range.start, inj.range.end, seq_len_usize
+                    inj.range.start,
+                    inj.range.end,
+                    seq_len_usize
                 ));
             }
             for p in inj.range.clone() {
@@ -354,13 +360,18 @@ pub fn forward_text_prefill_logits_last(
             // may carry bucket-rounded byte_len from the pool; we compare
             // against the row-major span we'll actually read.
             let required_bytes = inj.range.len() * h * 4;
-            let span = inj.embeddings.byte_len()
+            let span = inj
+                .embeddings
+                .byte_len()
                 .saturating_sub(inj.embeddings.byte_offset() as usize);
             if span < required_bytes {
                 return Err(anyhow!(
                     "forward_text: SoftTokenInjection embeddings span {} < required {} \
                      (range.len()={} * hidden={} * 4)",
-                    span, required_bytes, inj.range.len(), hidden
+                    span,
+                    required_bytes,
+                    inj.range.len(),
+                    hidden
                 ));
             }
             if inj.embeddings.dtype() != DType::F32 {
@@ -372,14 +383,14 @@ pub fn forward_text_prefill_logits_last(
         }
         // All injections validated; perform the overwrite passes.
         for inj in soft_tokens {
-            let chunk = inj.embeddings
+            let chunk = inj
+                .embeddings
                 .as_slice::<f32>()
                 .map_err(|e| anyhow!("soft-token embeddings as_slice: {e}"))?;
             for (i, p) in inj.range.clone().enumerate() {
                 let src_off = i * h;
                 let dst_off = p * h;
-                hidden_cpu[dst_off..dst_off + h]
-                    .copy_from_slice(&chunk[src_off..src_off + h]);
+                hidden_cpu[dst_off..dst_off + h].copy_from_slice(&chunk[src_off..src_off + h]);
             }
         }
     }
@@ -397,8 +408,9 @@ pub fn forward_text_prefill_logits_last(
     // the registration cost is amortized once and free thereafter.
     // Mirrors qwen35::forward_gpu's primed-path registration at
     // `forward_gpu.rs:1884-1885`.
-    crate::inference::vision::image_token_residual_add::
-        register_image_token_residual_add_shader(registry);
+    crate::inference::vision::image_token_residual_add::register_image_token_residual_add_shader(
+        registry,
+    );
 
     // Upload initial residual stream `hidden_gpu` and IMROPE positions.
     // Both are persistent across the full forward.
@@ -409,11 +421,7 @@ pub fn forward_text_prefill_logits_last(
     let positions_gpu = {
         let byte_len = positions_flat.len() * 4;
         let mut buf = device
-            .alloc_buffer(
-                byte_len,
-                DType::I32,
-                vec![positions_flat.len()],
-            )
+            .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
             .map_err(|e| anyhow!("alloc IMROPE positions buffer: {e}"))?;
         buf.as_mut_slice::<i32>()
             .map_err(|e| anyhow!("positions as_mut_slice: {e}"))?
@@ -468,26 +476,50 @@ pub fn forward_text_prefill_logits_last(
             let enc = session_a.encoder_mut();
 
             let attn_normed = rms_norm_2d(
-                enc, registry, device, &hidden_gpu, &lw.attn_norm,
-                seq_len, hidden, rms_eps,
+                enc,
+                registry,
+                device,
+                &hidden_gpu,
+                &lw.attn_norm,
+                seq_len,
+                hidden,
+                rms_eps,
             )
             .with_context(|| format!("layer {il}: pre-attn rms_norm"))?;
             // RAW: Q/K/V projections read attn_normed.
             enc.memory_barrier();
 
             let q_seq = apply_linear_projection_f32(
-                enc, registry, device, &attn_normed, &lw.attn_q,
-                seq_len, hidden, hidden,
+                enc,
+                registry,
+                device,
+                &attn_normed,
+                &lw.attn_q,
+                seq_len,
+                hidden,
+                hidden,
             )
             .with_context(|| format!("layer {il}: Q proj"))?;
             let k_seq = apply_linear_projection_f32(
-                enc, registry, device, &attn_normed, &lw.attn_k,
-                seq_len, hidden, kv_dim,
+                enc,
+                registry,
+                device,
+                &attn_normed,
+                &lw.attn_k,
+                seq_len,
+                hidden,
+                kv_dim,
             )
             .with_context(|| format!("layer {il}: K proj"))?;
             let v_seq = apply_linear_projection_f32(
-                enc, registry, device, &attn_normed, &lw.attn_v,
-                seq_len, hidden, kv_dim,
+                enc,
+                registry,
+                device,
+                &attn_normed,
+                &lw.attn_v,
+                seq_len,
+                hidden,
+                kv_dim,
             )
             .with_context(|| format!("layer {il}: V proj"))?;
             // RAW: per-head rms_norm reads q_seq / k_seq.
@@ -499,13 +531,27 @@ pub fn forward_text_prefill_logits_last(
             // memory-equivalent. `apply_q_or_k_per_head_rms_norm`
             // validates `rows × dim` element count, not strict shape.
             let q_normed = apply_q_or_k_per_head_rms_norm(
-                enc, registry, device, &q_seq, &lw.attn_q_norm,
-                seq_len, n_heads, head_dim, rms_eps,
+                enc,
+                registry,
+                device,
+                &q_seq,
+                &lw.attn_q_norm,
+                seq_len,
+                n_heads,
+                head_dim,
+                rms_eps,
             )
             .with_context(|| format!("layer {il}: Q per-head rms_norm"))?;
             let k_normed = apply_q_or_k_per_head_rms_norm(
-                enc, registry, device, &k_seq, &lw.attn_k_norm,
-                seq_len, n_kv_heads, head_dim, rms_eps,
+                enc,
+                registry,
+                device,
+                &k_seq,
+                &lw.attn_k_norm,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+                rms_eps,
             )
             .with_context(|| format!("layer {il}: K per-head rms_norm"))?;
             // RAW: IMROPE reads q_normed / k_normed.
@@ -514,13 +560,31 @@ pub fn forward_text_prefill_logits_last(
             // 3D-IMROPE: mode=40 (Imrope), sections=[24,20,20,0] for
             // Qwen3-VL-2B → first 64 slots rotated, next 64 identity.
             let q_rope = apply_imrope(
-                enc, registry, device, &q_normed, &positions_gpu,
-                seq_len, n_heads, head_dim, rotary_dim, rope_theta, mrope_section,
+                enc,
+                registry,
+                device,
+                &q_normed,
+                &positions_gpu,
+                seq_len,
+                n_heads,
+                head_dim,
+                rotary_dim,
+                rope_theta,
+                mrope_section,
             )
             .with_context(|| format!("layer {il}: Q IMROPE"))?;
             let k_rope = apply_imrope(
-                enc, registry, device, &k_normed, &positions_gpu,
-                seq_len, n_kv_heads, head_dim, rotary_dim, rope_theta, mrope_section,
+                enc,
+                registry,
+                device,
+                &k_normed,
+                &positions_gpu,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+                rotary_dim,
+                rope_theta,
+                mrope_section,
             )
             .with_context(|| format!("layer {il}: K IMROPE"))?;
 
@@ -544,8 +608,8 @@ pub fn forward_text_prefill_logits_last(
                 .with_context(|| format!("layer {il}: begin Phase B session"))?;
             let enc = session_b.encoder_mut();
             let attn_out = apply_sdpa_causal_from_seq_major(
-                enc, registry, device, &q_rope, &k_rope, &v_seq,
-                seq_len, n_heads, n_kv_heads, head_dim,
+                enc, registry, device, &q_rope, &k_rope, &v_seq, seq_len, n_heads, n_kv_heads,
+                head_dim,
             )
             .with_context(|| format!("layer {il}: SDPA"))?;
             // session_b drops here — its encoder is already discharged
@@ -562,23 +626,41 @@ pub fn forward_text_prefill_logits_last(
             let enc = session_c.encoder_mut();
 
             let attn_proj = apply_linear_projection_f32(
-                enc, registry, device, &attn_out, &lw.attn_output,
-                seq_len, hidden, hidden,
+                enc,
+                registry,
+                device,
+                &attn_out,
+                &lw.attn_output,
+                seq_len,
+                hidden,
+                hidden,
             )
             .with_context(|| format!("layer {il}: output proj"))?;
             // RAW: residual add reads attn_proj.
             enc.memory_barrier();
 
             let ffn_inp = elementwise_add_f32_2d(
-                enc, registry, device, &hidden_gpu, &attn_proj,
-                seq_len, hidden,
+                enc,
+                registry,
+                device,
+                &hidden_gpu,
+                &attn_proj,
+                seq_len,
+                hidden,
             )
             .with_context(|| format!("layer {il}: post-attn residual add"))?;
             // RAW: ffn_norm reads ffn_inp.
             enc.memory_barrier();
 
             let ffn_normed = rms_norm_2d(
-                enc, registry, device, &ffn_inp, &lw.ffn_norm, seq_len, hidden, rms_eps,
+                enc,
+                registry,
+                device,
+                &ffn_inp,
+                &lw.ffn_norm,
+                seq_len,
+                hidden,
+                rms_eps,
             )
             .with_context(|| format!("layer {il}: ffn rms_norm"))?;
             // RAW: dense_ffn reads ffn_normed (and ffn_inp as residual).
@@ -607,7 +689,12 @@ pub fn forward_text_prefill_logits_last(
                 hidden_size: hidden,
             };
             let l_out = build_dense_ffn_layer_gpu_q_into(
-                enc, device, registry, &ffn_normed, &ffn_weights, Some(&ffn_inp),
+                enc,
+                device,
+                registry,
+                &ffn_normed,
+                &ffn_weights,
+                Some(&ffn_inp),
             )
             .with_context(|| format!("layer {il}: dense SwiGLU FFN"))?;
 
@@ -670,9 +757,7 @@ pub fn forward_text_prefill_logits_last(
                         n_image_tokens,
                         hidden,
                     )
-                    .with_context(|| {
-                        format!("layer {il}: deepstack residual add (slab {il})")
-                    })?;
+                    .with_context(|| format!("layer {il}: deepstack residual add (slab {il})"))?;
                     session_d.finish().with_context(|| {
                         format!("layer {il}: finish Phase D (deepstack) session")
                     })?;
@@ -704,8 +789,8 @@ pub fn forward_text_prefill_logits_last(
     let last_row_end = last_row_start + (hidden as usize);
     let last_row: Vec<f32> = final_residual_cpu[last_row_start..last_row_end].to_vec();
 
-    let last_row_gpu = upload_f32(&last_row, device)
-        .context("upload last-row residual for output head")?;
+    let last_row_gpu =
+        upload_f32(&last_row, device).context("upload last-row residual for output head")?;
     drop(last_row);
 
     // LM head — tied or untied. Per peer `qwen3vl.cpp:18-26`:
@@ -718,35 +803,42 @@ pub fn forward_text_prefill_logits_last(
     let lm_head_weight: &MlxBuffer = if tied {
         &weights.token_embd
     } else {
-        weights
-            .output
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow!(
-                    "Qwen3-VL text-LM weights inconsistent: tied_word_embeddings=false but \
+        weights.output.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Qwen3-VL text-LM weights inconsistent: tied_word_embeddings=false but \
                      output is None — config and weights disagree"
-                )
-            })?
+            )
+        })?
     };
 
     let logits_buf = {
-        let mut session_head = executor
-            .begin()
-            .context("begin output-head session")?;
+        let mut session_head = executor.begin().context("begin output-head session")?;
         let enc = session_head.encoder_mut();
 
         // Final RMSNorm (output_norm).
         let final_normed = rms_norm_2d(
-            enc, registry, device, &last_row_gpu, &weights.output_norm,
-            1, hidden, rms_eps,
+            enc,
+            registry,
+            device,
+            &last_row_gpu,
+            &weights.output_norm,
+            1,
+            hidden,
+            rms_eps,
         )
         .context("final output rms_norm")?;
         // RAW: LM head matmul reads final_normed.
         enc.memory_barrier();
 
         let logits_buf = apply_linear_projection_f32(
-            enc, registry, device, &final_normed, lm_head_weight,
-            1, hidden, vocab,
+            enc,
+            registry,
+            device,
+            &final_normed,
+            lm_head_weight,
+            1,
+            hidden,
+            vocab,
         )
         .context("LM head matmul")?;
 
@@ -916,15 +1008,13 @@ mod tests {
             eprintln!("skip: HF2Q_QWEN3VL_LM_LOAD!=1");
             return;
         }
-        let p = std::path::PathBuf::from(
-            "/opt/hf2q/.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf",
-        );
+        let p =
+            std::path::PathBuf::from("/opt/hf2q/.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf");
         if !p.exists() {
             eprintln!("skip: real GGUF fixture not present at {}", p.display());
             return;
         }
-        let gguf = mlx_native::gguf::GgufFile::open(&p)
-            .expect("open real Qwen3-VL-2B GGUF");
+        let gguf = mlx_native::gguf::GgufFile::open(&p).expect("open real Qwen3-VL-2B GGUF");
         let mut progress = crate::serve::header::LoadProgress::new(false, 0, 28);
         let mut model = Qwen3VlTextModel::load_from_gguf(&gguf, &mut progress)
             .expect("load real Qwen3-VL-2B text-LM model");
@@ -942,10 +1032,8 @@ mod tests {
             }
         }
 
-        let logits = forward_text_prefill_logits_last(
-            &mut model, &tokens, &positions, None, &[],
-        )
-        .expect("forward must succeed on the canonical GGUF");
+        let logits = forward_text_prefill_logits_last(&mut model, &tokens, &positions, None, &[])
+            .expect("forward must succeed on the canonical GGUF");
 
         assert_eq!(
             logits.len(),

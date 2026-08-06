@@ -51,16 +51,15 @@ pub fn load_mtp_weights_if_present(
     // Logged at INFO level so operators can confirm the path.
     let embed_tokens_tname = format!("{nextn}.embed_tokens.weight");
     let embed_tokens = if cfg.mtp_use_dedicated_embeddings {
-        let buf = upload_bf16_required(gguf, &embed_tokens_tname, device)
-            .with_context(|| {
-                format!(
-                    "MTP loader expected dedicated `{embed_tokens_tname}` because \
+        let buf = upload_bf16_required(gguf, &embed_tokens_tname, device).with_context(|| {
+            format!(
+                "MTP loader expected dedicated `{embed_tokens_tname}` because \
                      mtp_use_dedicated_embeddings=True (set explicitly via metadata or \
                      inferred from tensor presence); to share main embeddings, re-emit \
                      the GGUF without `nextn.embed_tokens.weight` or set the metadata \
                      key `{p}.nextn.use_dedicated_embeddings = false`"
-                )
-            })?;
+            )
+        })?;
         tracing::info!(
             mtp_layer = layer_index,
             mtp_use_dedicated_embeddings = true,
@@ -235,7 +234,8 @@ fn load_mtp_attn(
     let (wq_f32, w_gate_f32) = if q_or_q_gate.len() == q_total * h {
         let gate_name = format!("{p}.attn_gate.weight");
         let gate = if gguf.tensor_info(&gate_name).is_some() {
-            let gate = load_f32_tensor(gguf, &gate_name, device).with_context(|| gate_name.clone())?;
+            let gate =
+                load_f32_tensor(gguf, &gate_name, device).with_context(|| gate_name.clone())?;
             ensure!(gate.len() == q_total * h, "{gate_name} shape mismatch");
             Some(gate)
         } else {
@@ -259,9 +259,18 @@ fn load_mtp_attn(
         .with_context(|| format!("{p}.attn_v.weight"))?;
     let wo_f32 = load_f32_tensor(gguf, &format!("{p}.attn_output.weight"), device)
         .with_context(|| format!("{p}.attn_output.weight"))?;
-    ensure!(wk_f32.len() == kv_total * h, "{p}.attn_k.weight shape mismatch");
-    ensure!(wv_f32.len() == kv_total * h, "{p}.attn_v.weight shape mismatch");
-    ensure!(wo_f32.len() == h * q_total, "{p}.attn_output.weight shape mismatch");
+    ensure!(
+        wk_f32.len() == kv_total * h,
+        "{p}.attn_k.weight shape mismatch"
+    );
+    ensure!(
+        wv_f32.len() == kv_total * h,
+        "{p}.attn_v.weight shape mismatch"
+    );
+    ensure!(
+        wo_f32.len() == h * q_total,
+        "{p}.attn_output.weight shape mismatch"
+    );
 
     Ok(MtpFullAttnWeightsGpu {
         attn_norm,
@@ -319,8 +328,14 @@ fn load_mtp_dense_ffn(
         .with_context(|| format!("{p}.ffn_up.weight"))?;
     let down = load_f32_tensor(gguf, &format!("{p}.ffn_down.weight"), device)
         .with_context(|| format!("{p}.ffn_down.weight"))?;
-    ensure!(up.len() == intermediate * h, "{p}.ffn_up.weight shape mismatch");
-    ensure!(down.len() == h * intermediate, "{p}.ffn_down.weight shape mismatch");
+    ensure!(
+        up.len() == intermediate * h,
+        "{p}.ffn_up.weight shape mismatch"
+    );
+    ensure!(
+        down.len() == h * intermediate,
+        "{p}.ffn_down.weight shape mismatch"
+    );
     let weights = DenseFfnWeights { gate, up, down };
     let dense_gpu =
         DenseFfnWeightsGpu::from_cpu(&weights, device).context("MTP upload dense FFN")?;
@@ -405,7 +420,10 @@ fn load_split_eh_proj(
     device: &MlxDevice,
 ) -> Result<(MlxBuffer, MlxBuffer)> {
     let data = load_f32_tensor(gguf, name, device).with_context(|| name.to_string())?;
-    ensure!(data.len() == hidden_size * hidden_size * 2, "{name} shape mismatch");
+    ensure!(
+        data.len() == hidden_size * hidden_size * 2,
+        "{name} shape mismatch"
+    );
     let mut embed = vec![0.0f32; hidden_size * hidden_size];
     let mut hidden = vec![0.0f32; hidden_size * hidden_size];
     for row in 0..hidden_size {
@@ -421,12 +439,18 @@ fn load_split_eh_proj(
     ))
 }
 
-fn split_interleaved_q_gate(data: &[f32], cfg: &Qwen35Config) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+fn split_interleaved_q_gate(
+    data: &[f32],
+    cfg: &Qwen35Config,
+) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
     let h = cfg.hidden_size as usize;
     let nh = cfg.num_attention_heads as usize;
     let d = cfg.head_dim as usize;
     let q_total = nh * d;
-    ensure!(data.len() == 2 * q_total * h, "interleaved Q+gate shape mismatch");
+    ensure!(
+        data.len() == 2 * q_total * h,
+        "interleaved Q+gate shape mismatch"
+    );
     let mut q = vec![0.0f32; q_total * h];
     let mut gate = vec![0.0f32; q_total * h];
     for head_idx in 0..nh {

@@ -41,8 +41,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use mlx_native::{MlxBuffer, MlxDevice};
 use mlx_native::gguf::GgufFile;
+use mlx_native::{MlxBuffer, MlxDevice};
 
 // W59 ADR-005 Phase 2c iter-128: route F16-stored mmproj tensors through
 // `gguf.load_tensor` (native dtype-preserving) instead of
@@ -106,11 +106,7 @@ impl LoadedMmprojWeights {
     /// because a future lazy/tiered loader will partition tensor loads
     /// by cfg (e.g., load only stem + first few blocks on cold start,
     /// lazy-load remaining blocks on first request).
-    pub fn load(
-        gguf: &GgufFile,
-        cfg: &MmprojConfig,
-        device: MlxDevice,
-    ) -> Result<Self> {
+    pub fn load(gguf: &GgufFile, cfg: &MmprojConfig, device: MlxDevice) -> Result<Self> {
         let names = gguf.tensor_names();
         let mut tensors = HashMap::with_capacity(names.len());
         for name in &names {
@@ -223,9 +219,9 @@ impl LoadedMmprojWeights {
             }
 
             // The fused-only path. Slice the weight.
-            let fused_buf = tensors.get(&fused_w).expect(
-                "has_fused_w=true contract violated by tensors.get",
-            );
+            let fused_buf = tensors
+                .get(&fused_w)
+                .expect("has_fused_w=true contract violated by tensors.get");
             let elem_size = fused_buf.dtype().size_of();
             let chunk_elems = hidden * hidden;
             let chunk_bytes = chunk_elems * elem_size;
@@ -255,9 +251,9 @@ impl LoadedMmprojWeights {
                 let split_q_b = vit_layer_tensor(layer_idx, "attn_q.bias");
                 let split_k_b = vit_layer_tensor(layer_idx, "attn_k.bias");
                 let split_v_b = vit_layer_tensor(layer_idx, "attn_v.bias");
-                let fused_bias_buf = tensors.get(&fused_b).expect(
-                    "tensors.contains_key(&fused_b) contract violated by tensors.get",
-                );
+                let fused_bias_buf = tensors
+                    .get(&fused_b)
+                    .expect("tensors.contains_key(&fused_b) contract violated by tensors.get");
                 let bias_elem = fused_bias_buf.dtype().size_of();
                 let bias_chunk_bytes = hidden * bias_elem;
                 let bias_expected = 3 * bias_chunk_bytes;
@@ -288,8 +284,8 @@ impl LoadedMmprojWeights {
     pub fn load_from_path(path: &Path, cfg: &MmprojConfig) -> Result<Self> {
         let gguf = GgufFile::open(path)
             .map_err(|e| anyhow!("open mmproj GGUF {}: {e}", path.display()))?;
-        let device = MlxDevice::new()
-            .map_err(|e| anyhow!("create MlxDevice for mmproj load: {e}"))?;
+        let device =
+            MlxDevice::new().map_err(|e| anyhow!("create MlxDevice for mmproj load: {e}"))?;
         Self::load(&gguf, cfg, device)
     }
 
@@ -363,10 +359,7 @@ impl LoadedMmprojWeights {
     /// in-process rather than load a real GGUF (which would require a
     /// fixture file on disk and the full 400 MB dequant cost).
     #[cfg(test)]
-    pub fn from_tensors_for_test(
-        tensors: HashMap<String, MlxBuffer>,
-        device: MlxDevice,
-    ) -> Self {
+    pub fn from_tensors_for_test(tensors: HashMap<String, MlxBuffer>, device: MlxDevice) -> Self {
         Self {
             tensors,
             _device: device,
@@ -494,15 +487,15 @@ impl LoadedMmprojWeights {
         }
         // Try the legacy/canonical alias.
         let alias_suffix: Option<&str> = match suffix {
-            "attn_output.weight"   => Some("attn_out.weight"),
-            "attn_output.bias"     => Some("attn_out.bias"),
-            "attn_out.weight"      => Some("attn_output.weight"),
-            "attn_out.bias"        => Some("attn_output.bias"),
+            "attn_output.weight" => Some("attn_out.weight"),
+            "attn_output.bias" => Some("attn_out.bias"),
+            "attn_out.weight" => Some("attn_output.weight"),
+            "attn_out.bias" => Some("attn_output.bias"),
             "post_ffw_norm.weight" => Some("ffn_post_norm.weight"),
-            "post_ffw_norm.bias"   => Some("ffn_post_norm.bias"),
+            "post_ffw_norm.bias" => Some("ffn_post_norm.bias"),
             "ffn_post_norm.weight" => Some("post_ffw_norm.weight"),
-            "ffn_post_norm.bias"   => Some("post_ffw_norm.bias"),
-            _                      => None,
+            "ffn_post_norm.bias" => Some("post_ffw_norm.bias"),
+            _ => None,
         };
         if let Some(alt) = alias_suffix {
             let alt_key = vit_layer_tensor(layer_idx, alt);
@@ -529,7 +522,10 @@ impl LoadedMmprojWeights {
         if let Some(b) = self.tensors.get(super::mmproj::TENSOR_MM_0_WEIGHT) {
             return Ok(b);
         }
-        if let Some(b) = self.tensors.get(super::mmproj::TENSOR_MM_INPUT_PROJECTION_WEIGHT) {
+        if let Some(b) = self
+            .tensors
+            .get(super::mmproj::TENSOR_MM_INPUT_PROJECTION_WEIGHT)
+        {
             return Ok(b);
         }
         Err(anyhow!(
@@ -628,8 +624,8 @@ impl LoadedMmprojWeights {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mmproj::ProjectorType;
+    use super::*;
 
     /// Gemma 4 26B mmproj — present on this dev machine. Tests gate on
     /// existence so CI without the fixture skips them cleanly.
@@ -646,7 +642,10 @@ mod tests {
         // See /opt/hf2q/docs/ADR-005 iter 31 for the real tensor manifest.
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open gemma4 mmproj");
@@ -669,7 +668,9 @@ mod tests {
         assert_eq!(weights.len(), 356);
         // Arch-agnostic shortcuts present.
         weights.patch_embd_weight().expect("patch_embd_weight");
-        weights.position_embd_weight().expect("position_embd_weight");
+        weights
+            .position_embd_weight()
+            .expect("position_embd_weight");
         weights.mm_0_weight().expect("mm_0_weight");
         // post_ln + mm.2 do NOT exist in Gemma 4 mmproj.
         assert!(weights.post_ln_weight().is_err());
@@ -713,7 +714,10 @@ mod tests {
         // dequantizes to F32.
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open gemma4 mmproj");
@@ -721,10 +725,8 @@ mod tests {
         let device = MlxDevice::new().expect("create device");
         let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load weights");
         let patch = weights.patch_embd_weight().expect("patch_embd");
-        let expected_elems = (cfg.hidden_size as usize)
-            * 3
-            * (cfg.patch_size as usize)
-            * (cfg.patch_size as usize);
+        let expected_elems =
+            (cfg.hidden_size as usize) * 3 * (cfg.patch_size as usize) * (cfg.patch_size as usize);
         // Element-count check is dtype-agnostic via element_count(); it
         // matches expected_elems regardless of F16/F32 storage.
         assert_eq!(
@@ -763,7 +765,10 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
-            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            eprintln!(
+                "skipping: mmproj fixture not found at {}",
+                GEMMA4_MMPROJ_PATH
+            );
             return;
         }
         let gguf = GgufFile::open(path).expect("open for cfg");
@@ -832,10 +837,7 @@ mod tests {
         };
         let err = weights.position_embd_table_3d().unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("expected 3-D"),
-            "wrong error msg: {msg}"
-        );
+        assert!(msg.contains("expected 3-D"), "wrong error msg: {msg}");
     }
 
     #[test]
@@ -853,10 +855,7 @@ mod tests {
         };
         let err = weights.position_embd_table_3d().unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("first dim 2"),
-            "wrong error msg: {msg}"
-        );
+        assert!(msg.contains("first dim 2"), "wrong error msg: {msg}");
     }
 
     #[test]
@@ -866,7 +865,11 @@ mod tests {
         let pos_size = 27usize;
         let hidden = 1152usize;
         let buf = device
-            .alloc_buffer(2 * pos_size * hidden * 4, mlx_native::DType::F32, vec![2, pos_size, hidden])
+            .alloc_buffer(
+                2 * pos_size * hidden * 4,
+                mlx_native::DType::F32,
+                vec![2, pos_size, hidden],
+            )
             .expect("alloc");
         let mut tensors = HashMap::new();
         tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
@@ -917,19 +920,18 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::DType;
         let device = MlxDevice::new().expect("device");
-        let put = |tensors: &mut HashMap<String, MlxBuffer>,
-                   dev: &MlxDevice,
-                   name: &str,
-                   value: f32| {
-            // 1-element f32 tensor with shape [1] — matches what
-            // convert_hf_to_gguf.py emits for the unsqueeze(0)'d scalar.
-            let buf = dev.alloc_buffer(4, DType::F32, vec![1]).expect("alloc scalar");
-            let s: &mut [f32] = unsafe {
-                std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, 1)
+        let put =
+            |tensors: &mut HashMap<String, MlxBuffer>, dev: &MlxDevice, name: &str, value: f32| {
+                // 1-element f32 tensor with shape [1] — matches what
+                // convert_hf_to_gguf.py emits for the unsqueeze(0)'d scalar.
+                let buf = dev
+                    .alloc_buffer(4, DType::F32, vec![1])
+                    .expect("alloc scalar");
+                let s: &mut [f32] =
+                    unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, 1) };
+                s[0] = value;
+                tensors.insert(name.to_string(), buf);
             };
-            s[0] = value;
-            tensors.insert(name.to_string(), buf);
-        };
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         put(&mut tensors, &device, "mm.0.input_min", -2.5);
         put(&mut tensors, &device, "mm.0.input_max", 2.5);
@@ -1042,7 +1044,7 @@ mod tests {
         assert_eq!(q.byte_offset(), 0);
         assert_eq!(k.byte_offset(), 64); // 16 floats × 4 bytes.
         assert_eq!(v.byte_offset(), 128); // 32 floats × 4 bytes.
-        // shape was flattened to a 1-D view of n_elements = hidden*hidden.
+                                          // shape was flattened to a 1-D view of n_elements = hidden*hidden.
         assert_eq!(q.element_count(), 16);
         assert_eq!(k.element_count(), 16);
         assert_eq!(v.element_count(), 16);
@@ -1054,21 +1056,25 @@ mod tests {
             let off = buf.byte_offset() as usize;
             // SAFETY: synthetic test buffer alloc'd above; we hold a
             // shared ref via `tensors.get` and no GPU work is in flight.
-            unsafe {
-                std::slice::from_raw_parts(
-                    (ptr.add(off)) as *const f32,
-                    n,
-                )
-                .to_vec()
-            }
+            unsafe { std::slice::from_raw_parts((ptr.add(off)) as *const f32, n).to_vec() }
         };
         let q_s = read_slice(q, 16);
         let k_s = read_slice(k, 16);
         let v_s = read_slice(v, 16);
         for i in 0..16 {
             assert_eq!(q_s[i], i as f32, "Q[{i}] must equal fused[{i}]");
-            assert_eq!(k_s[i], (16 + i) as f32, "K[{i}] must equal fused[{}]", 16 + i);
-            assert_eq!(v_s[i], (32 + i) as f32, "V[{i}] must equal fused[{}]", 32 + i);
+            assert_eq!(
+                k_s[i],
+                (16 + i) as f32,
+                "K[{i}] must equal fused[{}]",
+                16 + i
+            );
+            assert_eq!(
+                v_s[i],
+                (32 + i) as f32,
+                "V[{i}] must equal fused[{}]",
+                32 + i
+            );
         }
     }
 
@@ -1100,22 +1106,12 @@ mod tests {
         let read_slice = |buf: &MlxBuffer, n: usize| -> Vec<f32> {
             let ptr = buf.contents_ptr() as *const u8;
             let off = buf.byte_offset() as usize;
-            unsafe {
-                std::slice::from_raw_parts(ptr.add(off) as *const f32, n).to_vec()
-            }
+            unsafe { std::slice::from_raw_parts(ptr.add(off) as *const f32, n).to_vec() }
         };
-        for (label, view, n_off) in [
-            ("Q", q_b, 0usize),
-            ("K", k_b, 8),
-            ("V", v_b, 16),
-        ] {
+        for (label, view, n_off) in [("Q", q_b, 0usize), ("K", k_b, 8), ("V", v_b, 16)] {
             let s = read_slice(view, 8);
             for i in 0..8 {
-                assert_eq!(
-                    s[i],
-                    -((n_off + i) as f32),
-                    "{label} bias [{i}] mismatch"
-                );
+                assert_eq!(s[i], -((n_off + i) as f32), "{label} bias [{i}] mismatch");
             }
         }
     }
@@ -1136,7 +1132,11 @@ mod tests {
         let n_before = tensors.len();
         LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
             .expect("split-only must be a no-op");
-        assert_eq!(tensors.len(), n_before, "split-only tensor map must be unchanged");
+        assert_eq!(
+            tensors.len(),
+            n_before,
+            "split-only tensor map must be unchanged"
+        );
     }
 
     #[test]
@@ -1198,9 +1198,7 @@ mod tests {
         let cfg = synth_qwen3vl_loader_cfg(4, 3);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         for layer_idx in 0..3 {
-            let fused = alloc_f32_with(&device, 48, vec![12, 4], |i| {
-                (layer_idx * 100 + i) as f32
-            });
+            let fused = alloc_f32_with(&device, 48, vec![12, 4], |i| (layer_idx * 100 + i) as f32);
             tensors.insert(format!("v.blk.{layer_idx}.attn_qkv.weight"), fused);
         }
         LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
@@ -1208,12 +1206,11 @@ mod tests {
         let read_slice = |buf: &MlxBuffer, n: usize| -> Vec<f32> {
             let ptr = buf.contents_ptr() as *const u8;
             let off = buf.byte_offset() as usize;
-            unsafe {
-                std::slice::from_raw_parts(ptr.add(off) as *const f32, n).to_vec()
-            }
+            unsafe { std::slice::from_raw_parts(ptr.add(off) as *const f32, n).to_vec() }
         };
         for layer_idx in 0..3 {
-            let q = tensors.get(&format!("v.blk.{layer_idx}.attn_q.weight"))
+            let q = tensors
+                .get(&format!("v.blk.{layer_idx}.attn_q.weight"))
                 .unwrap_or_else(|| panic!("Q for block {layer_idx}"));
             assert_eq!(q.byte_offset(), 0, "Q view always at fused-tensor start");
             let q_s = read_slice(q, 16);

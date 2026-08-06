@@ -40,8 +40,7 @@ const READYZ_BUDGET: Duration = Duration::from_secs(180);
 const TEST_STRIDE: u32 = 64;
 const MAX_TOKENS: u32 = 16;
 
-const TURN1_USER: &str =
-    "I'm working on a Rust project organized by Domain-Driven Design \
+const TURN1_USER: &str = "I'm working on a Rust project organized by Domain-Driven Design \
      bounded contexts. Could you describe in detail how bounded contexts \
      in DDD map to Rust crate boundaries with a concrete example showing \
      order, payment, and inventory in a typical e-commerce system that \
@@ -87,16 +86,14 @@ impl Drop for ServerGuard {
 
 impl ServerGuard {
     fn log_tail(&self) -> Vec<String> {
-        self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
-fn spawn_server(
-    bin: &Path,
-    model: &Path,
-    port: u16,
-    extra_envs: &[(&str, &str)],
-) -> ServerGuard {
+fn spawn_server(bin: &Path, model: &Path, port: u16, extra_envs: &[(&str, &str)]) -> ServerGuard {
     let mut cmd = Command::new(bin);
     cmd.args([
         "serve",
@@ -158,9 +155,9 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::other(
-            format!("malformed status line: {line:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "malformed status line: {line:?}"
+        )));
     }
     parts[1]
         .parse::<u16>()

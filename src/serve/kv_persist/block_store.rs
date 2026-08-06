@@ -224,11 +224,9 @@ impl DiskBlockStore {
     fn lock_path(&self, model_fp: &ModelFingerprint, hash: &BlockHash) -> PathBuf {
         let hex = hash.to_string();
         let prefix = &hex[..2];
-        self.cache_root.join("locks").join(format!(
-            "{}__{}.lock",
-            model_fp.short_hex(),
-            prefix
-        ))
+        self.cache_root
+            .join("locks")
+            .join(format!("{}__{}.lock", model_fp.short_hex(), prefix))
     }
 
     /// Synchronous write: enforce the §R-F11 size ceiling, acquire the
@@ -237,11 +235,7 @@ impl DiskBlockStore {
     /// freshly-published block immediately.
     ///
     /// Returns the absolute path of the published file.
-    pub fn write_block_sync(
-        &self,
-        header: &EnvelopeHeader,
-        body: &[u8],
-    ) -> io::Result<PathBuf> {
+    pub fn write_block_sync(&self, header: &EnvelopeHeader, body: &[u8]) -> io::Result<PathBuf> {
         let body_len = body.len() as u64;
         let ceiling = self.max_block_bytes();
         if body_len > ceiling {
@@ -252,7 +246,8 @@ impl DiskBlockStore {
         }
 
         let path = self.block_path(&header.model_fingerprint, &header.block_hash);
-        let _lock = AdvisoryLock::acquire(&self.lock_path(&header.model_fingerprint, &header.block_hash))?;
+        let _lock =
+            AdvisoryLock::acquire(&self.lock_path(&header.model_fingerprint, &header.block_hash))?;
 
         let total_bytes = format::write_envelope(&path, header, body)?;
 
@@ -262,7 +257,10 @@ impl DiskBlockStore {
         let metadata = fs::metadata(&path)?;
         let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
         let bytes_on_disk = metadata.len();
-        debug_assert_eq!(bytes_on_disk, total_bytes, "stat size matches writer return");
+        debug_assert_eq!(
+            bytes_on_disk, total_bytes,
+            "stat size matches writer return"
+        );
 
         let meta = BlockMeta {
             hash: header.block_hash,
@@ -337,10 +335,7 @@ impl DiskBlockStore {
     /// (held by an inference engine, mid-restore, etc.). Phase A.3 will
     /// wire this to the live KV-cache liveness; A.2's callers (and tests)
     /// pass `|_| false` when the pin set is empty.
-    pub fn evict_lru_until_under_budget<F>(
-        &self,
-        is_block_pinned: F,
-    ) -> io::Result<u64>
+    pub fn evict_lru_until_under_budget<F>(&self, is_block_pinned: F) -> io::Result<u64>
     where
         F: Fn(&BlockHash) -> bool,
     {
@@ -509,10 +504,7 @@ mod tests {
     }
 
     impl crate::serve::kv_persist::metrics::KvCacheMetricsSink for TestMetricsSink {
-        fn record_quarantine(
-            &self,
-            reason: crate::serve::kv_persist::metrics::KvQuarantineReason,
-        ) {
+        fn record_quarantine(&self, reason: crate::serve::kv_persist::metrics::KvQuarantineReason) {
             self.quarantines[reason.index()].fetch_add(1, AtomicOrdering::Relaxed);
         }
         fn record_eviction_budget_overflow(&self) {
@@ -721,9 +713,18 @@ mod tests {
             .expect("evict");
 
         // Eviction took block 2 (oldest non-pinned).
-        assert!(store.index().lookup(&hashes[2]).is_none(), "block 2 evicted");
-        assert!(store.index().lookup(&hashes[0]).is_some(), "pinned 0 survived");
-        assert!(store.index().lookup(&hashes[1]).is_some(), "pinned 1 survived");
+        assert!(
+            store.index().lookup(&hashes[2]).is_none(),
+            "block 2 evicted"
+        );
+        assert!(
+            store.index().lookup(&hashes[0]).is_some(),
+            "pinned 0 survived"
+        );
+        assert!(
+            store.index().lookup(&hashes[1]).is_some(),
+            "pinned 1 survived"
+        );
         assert_eq!(freed, sizes[2], "freed bytes = block 2 size");
 
         let _ = fs::remove_dir_all(&dir);
@@ -770,10 +771,7 @@ mod tests {
 
         // Helper that builds a header whose block_hash starts with 0xAB
         // so both threads route to the same `__ab.lock` bucket.
-        fn forced_prefix_header(
-            fp: ModelFingerprint,
-            suffix: u32,
-        ) -> (Vec<u8>, EnvelopeHeader) {
+        fn forced_prefix_header(fp: ModelFingerprint, suffix: u32) -> (Vec<u8>, EnvelopeHeader) {
             let body: Vec<u8> = (0..1024u32)
                 .flat_map(|i| (i.wrapping_add(suffix)).to_le_bytes())
                 .collect();
@@ -799,8 +797,7 @@ mod tests {
             (body, header)
         }
 
-        let log: Arc<Mutex<Vec<(u32, SystemTime, SystemTime)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let log: Arc<Mutex<Vec<(u32, SystemTime, SystemTime)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let store_a = Arc::clone(&store);
         let log_a = Arc::clone(&log);

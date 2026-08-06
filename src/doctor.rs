@@ -35,7 +35,9 @@ pub fn run_doctor() -> anyhow::Result<()> {
     println!("{}", style("hf2q doctor").bold().green());
     println!(
         "{}",
-        style("═══════════════════════════════════════").bold().green()
+        style("═══════════════════════════════════════")
+            .bold()
+            .green()
     );
     println!();
 
@@ -93,7 +95,9 @@ pub fn run_doctor() -> anyhow::Result<()> {
     } else {
         println!(
             "{}",
-            style("All checks passed. hf2q is ready to use.").green().bold()
+            style("All checks passed. hf2q is ready to use.")
+                .green()
+                .bold()
         );
     }
     println!();
@@ -184,10 +188,7 @@ fn check_ruvector() -> CheckResult {
 
     if status.record_count == 0 {
         CheckResult::Warn(
-            format!(
-                "RuVector operational but empty at {}",
-                status.db_path
-            ),
+            format!("RuVector operational but empty at {}", status.db_path),
             "This is normal for first use. The database will populate after your first conversion."
                 .to_string(),
         )
@@ -203,9 +204,7 @@ fn check_ruvector() -> CheckResult {
 
 /// Check hf CLI availability.
 fn check_hf_cli() -> CheckResult {
-    let hf_cli = std::process::Command::new("hf")
-        .arg("--version")
-        .output();
+    let hf_cli = std::process::Command::new("hf").arg("--version").output();
 
     match hf_cli {
         Ok(output) if output.status.success() => {
@@ -244,12 +243,7 @@ fn check_disk_space() -> CheckResult {
             match &best_match {
                 Some((_, _)) => {
                     // Prefer more specific mount point (longer path)
-                    if mount.as_os_str().len()
-                        > best_match
-                            .as_ref()
-                            .map(|_| 0)
-                            .unwrap_or(0)
-                    {
+                    if mount.as_os_str().len() > best_match.as_ref().map(|_| 0).unwrap_or(0) {
                         best_match = Some((available, total));
                     }
                 }
@@ -288,7 +282,9 @@ fn check_disk_space() -> CheckResult {
         None => {
             // Fallback: check if the hf2q directory is writable
             if hf2q_dir.exists() || std::fs::create_dir_all(&hf2q_dir).is_ok() {
-                CheckResult::Pass("Disk accessible (unable to determine exact free space)".to_string())
+                CheckResult::Pass(
+                    "Disk accessible (unable to determine exact free space)".to_string(),
+                )
             } else {
                 CheckResult::Warn(
                     "Unable to determine disk space".to_string(),

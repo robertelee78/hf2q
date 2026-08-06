@@ -63,9 +63,7 @@ impl KernelParityReport {
     /// as parity FAIL — the caller should guard with their own
     /// all-zeros parallel-contention check before relying on this).
     pub fn passes(&self, cos_min: f64, max_abs_max: f32) -> bool {
-        self.cosine.is_finite()
-            && self.cosine >= cos_min
-            && self.max_abs_diff <= max_abs_max
+        self.cosine.is_finite() && self.cosine >= cos_min && self.max_abs_diff <= max_abs_max
     }
 }
 
@@ -159,7 +157,13 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// );
 /// ```
 #[track_caller]
-pub fn assert_kernel_equivalence(a: &[f32], b: &[f32], cos_min: f64, max_abs_max: f32, label: &str) {
+pub fn assert_kernel_equivalence(
+    a: &[f32],
+    b: &[f32],
+    cos_min: f64,
+    max_abs_max: f32,
+    label: &str,
+) {
     let report = kernel_parity_report(a, b);
     assert!(
         report.passes(cos_min, max_abs_max),
@@ -215,14 +219,20 @@ mod tests {
             }
         }
         let report = kernel_parity_report(&a, &b);
-        assert!(report.cosine >= 0.9999, "cosine {} should be ≥ 0.9999", report.cosine);
+        assert!(
+            report.cosine >= 0.9999,
+            "cosine {} should be ≥ 0.9999",
+            report.cosine
+        );
         assert!(
             report.max_abs_diff <= 1e-4,
             "max_abs_diff {:e} should be ≤ 1e-4 for ULP-class perturbations",
             report.max_abs_diff,
         );
-        assert!(report.passes(0.9999, 1e-4),
-            "iter83 ULP profile should pass tolerance: {report}");
+        assert!(
+            report.passes(0.9999, 1e-4),
+            "iter83 ULP profile should pass tolerance: {report}"
+        );
     }
 
     #[test]
@@ -240,8 +250,10 @@ mod tests {
             a_mut[i] = 0.0; // wrapper position
         }
         let report = kernel_parity_report(&a_mut, &b);
-        assert!(!report.passes(0.9999, 1e-4),
-            "structural divergence (19% zeros vs finite) must fail tolerance: {report}");
+        assert!(
+            !report.passes(0.9999, 1e-4),
+            "structural divergence (19% zeros vs finite) must fail tolerance: {report}"
+        );
     }
 
     #[test]

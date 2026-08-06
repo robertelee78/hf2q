@@ -46,13 +46,11 @@ pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
     use axum::http::Method;
     let methods = [Method::GET, Method::POST, Method::OPTIONS];
-    let headers = [
-        header::CONTENT_TYPE,
-        header::AUTHORIZATION,
-        X_REQUEST_ID,
-    ];
+    let headers = [header::CONTENT_TYPE, header::AUTHORIZATION, X_REQUEST_ID];
 
-    let mut layer = CorsLayer::new().allow_methods(methods).allow_headers(headers);
+    let mut layer = CorsLayer::new()
+        .allow_methods(methods)
+        .allow_headers(headers);
 
     if allowed_origins.is_empty() {
         layer = layer.allow_origin(AllowOrigin::any());
@@ -152,10 +150,7 @@ fn is_safe_request_id_char(c: char) -> bool {
 /// Middleware: derive a request ID (extracting a client-supplied one or
 /// generating), stamp it on the request extensions, run the handler, then
 /// echo it on the response as `X-Request-Id`.
-pub async fn request_id_layer(
-    mut req: Request<Body>,
-    next: Next,
-) -> axum::response::Response {
+pub async fn request_id_layer(mut req: Request<Body>, next: Next) -> axum::response::Response {
     let request_id = extract_or_generate_request_id(req.headers());
     req.extensions_mut().insert(RequestId(request_id.clone()));
 
@@ -217,10 +212,7 @@ mod tests {
     #[test]
     fn request_id_regenerated_when_header_contains_unsafe_chars() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            &X_REQUEST_ID,
-            HeaderValue::from_static("has space and $"),
-        );
+        headers.insert(&X_REQUEST_ID, HeaderValue::from_static("has space and $"));
         let id = extract_or_generate_request_id(&headers);
         // Generated UUIDs don't contain spaces or $
         assert!(!id.contains(' '));
@@ -231,10 +223,7 @@ mod tests {
     fn request_id_regenerated_when_header_too_long() {
         let mut headers = HeaderMap::new();
         let too_long = "a".repeat(257);
-        headers.insert(
-            &X_REQUEST_ID,
-            HeaderValue::from_str(&too_long).unwrap(),
-        );
+        headers.insert(&X_REQUEST_ID, HeaderValue::from_str(&too_long).unwrap());
         let id = extract_or_generate_request_id(&headers);
         assert_eq!(id.len(), 36);
     }

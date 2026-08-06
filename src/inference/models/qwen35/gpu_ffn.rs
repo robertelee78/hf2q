@@ -552,12 +552,12 @@ fn proj(
         // U8, so this is a no-op on the apex fixture); lifted for
         // forward-compatibility and to remove the pattern entirely.
         let buf = super::decode_pool::pooled_alloc_buffer(
-                device,
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
+            device,
+            n_w * 2,
+            DType::BF16,
+            vec![out_features as usize, in_features as usize],
+        )
+        .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
         cast(
             encoder,
             registry,
@@ -798,10 +798,8 @@ fn proj_into(
         dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
             .context("dense_gemv_bf16_f32 proj_into M=1")?;
     } else {
-        dense_matmul_bf16_f32_tensor(
-            encoder, registry, device, weight, input, dst, &params,
-        )
-        .context("dense_matmul_bf16_f32_tensor proj_into")?;
+        dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, dst, &params)
+            .context("dense_matmul_bf16_f32_tensor proj_into")?;
     }
     Ok(())
 }
@@ -885,14 +883,13 @@ pub fn build_dense_ffn_layer_gpu(
     // which already pools its scratches in `build_dense_ffn_layer_gpu_q_into_pooled`),
     // but we lift for forward-compat and to remove the unsafe pattern.
     let hidden_buf = super::decode_pool::pooled_alloc_buffer(
-            device,
-            n_h as usize * 4,
-            DType::F32,
-            vec![seq_len as usize, m as usize],
-        )
-        .map_err(|e| anyhow!("alloc dense silu hidden (pooled): {e}"))?;
-    let mut silu_params = super::decode_pool::pooled_alloc_buffer(
-            device, 4, DType::U32, vec![1])
+        device,
+        n_h as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|e| anyhow!("alloc dense silu hidden (pooled): {e}"))?;
+    let mut silu_params = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc dense silu params (pooled): {e}"))?;
     silu_params
         .as_mut_slice::<u32>()
@@ -1291,8 +1288,8 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
     );
-    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k)
-        && !fused_off;
+    let fused_eligible =
+        (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k) && !fused_off;
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
@@ -3016,7 +3013,6 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             )
             .map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
         }
-
 
         // NOTE: this `_into` variant does NOT commit.  The caller is
         // responsible for committing the encoder, allowing fusion with

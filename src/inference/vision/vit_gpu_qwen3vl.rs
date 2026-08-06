@@ -91,9 +91,7 @@ use mlx_native::ops::gelu::dispatch_gelu;
 use mlx_native::ops::im2col_2d_3ch::{
     dispatch_im2col_2d_3ch_f32, register as register_im2col_2d_3ch,
 };
-use mlx_native::ops::rope_multi::{
-    dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams,
-};
+use mlx_native::ops::rope_multi::{dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::inference::models::bert::bert_gpu::{
@@ -250,10 +248,7 @@ impl Qwen3VlViTConfig {
     /// - `MmprojConfig.projection_dim == None`
     /// - `MmprojConfig.deepstack_indexes == None`
     /// - `num_position_embeddings == 0`
-    pub fn from_mmproj(
-        cfg: &MmprojConfig,
-        num_position_embeddings: u32,
-    ) -> Result<Self> {
+    pub fn from_mmproj(cfg: &MmprojConfig, num_position_embeddings: u32) -> Result<Self> {
         let spatial_merge_size = cfg.spatial_merge_size.ok_or_else(|| {
             anyhow!(
                 "Qwen3VlViTConfig: MmprojConfig.spatial_merge_size is None — \
@@ -713,9 +708,7 @@ fn qwen3vl_stage_a_dispatch(
         ));
     }
     if num_position_embeddings == 0 {
-        return Err(anyhow!(
-            "{ctx}: num_position_embeddings must be > 0"
-        ));
+        return Err(anyhow!("{ctx}: num_position_embeddings must be > 0"));
     }
     let trained_n = (num_position_embeddings as f64).sqrt() as u32;
     if trained_n.saturating_mul(trained_n) != num_position_embeddings {
@@ -754,10 +747,7 @@ fn qwen3vl_stage_a_dispatch(
     }
     if let Some(b) = bias {
         if b.len() != h {
-            return Err(anyhow!(
-                "{ctx}: bias.len() ({}) != hidden ({h})",
-                b.len()
-            ));
+            return Err(anyhow!("{ctx}: bias.len() ({}) != hidden ({h})", b.len()));
         }
     }
     if pos_embd_table.len() != expected_pos_table {
@@ -917,11 +907,7 @@ fn qwen3vl_stage_a_dispatch(
         .map_err(|e| anyhow!("pos_embd src mut: {e}"))?
         .copy_from_slice(pos_embd_table);
     let pos_resized_buf = device
-        .alloc_buffer(
-            num_patches * h * 4,
-            DType::F32,
-            vec![nps_y, nps_x, h],
-        )
+        .alloc_buffer(num_patches * h * 4, DType::F32, vec![nps_y, nps_x, h])
         .map_err(|e| anyhow!("alloc pos_embd resized: {e}"))?;
     dispatch_bilinear_resize_2d_f32(
         encoder,
@@ -1090,8 +1076,7 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
             let x_min = ((x - support_x + pixel_offset).max(0.0)) as i64;
             let x_max = ((x + support_x + pixel_offset).min(trained as f32)) as i64;
 
-            let dst_off =
-                ((y_dst as usize) * (target_x as usize) + (x_dst as usize)) * h;
+            let dst_off = ((y_dst as usize) * (target_x as usize) + (x_dst as usize)) * h;
 
             // Accumulate weighted source contributions per channel.
             // We initialize an all-zeros window then divide by total
@@ -1102,8 +1087,7 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
             for sy in y_min..y_max {
                 let weight_y = triangle_filter(((sy as f32) - y + pixel_offset) * invscale_y);
                 for sx in x_min..x_max {
-                    let weight_x =
-                        triangle_filter(((sx as f32) - x + pixel_offset) * invscale_x);
+                    let weight_x = triangle_filter(((sx as f32) - x + pixel_offset) * invscale_x);
                     let weight = weight_x * weight_y;
                     if weight <= 0.0 {
                         continue;
@@ -1175,11 +1159,7 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
 /// given shape. Used for the patch+pos prelude tensor and for the
 /// I32 positions tensor (via the i32 sibling below).
 #[cfg(test)]
-fn upload_f32_to_gpu(
-    device: &MlxDevice,
-    data: &[f32],
-    shape: Vec<usize>,
-) -> Result<MlxBuffer> {
+fn upload_f32_to_gpu(device: &MlxDevice, data: &[f32], shape: Vec<usize>) -> Result<MlxBuffer> {
     let n = data.len();
     let buf = device
         .alloc_buffer(n * 4, DType::F32, shape)
@@ -1197,11 +1177,7 @@ fn upload_f32_to_gpu(
 /// the `positions` tensor consumed by `dispatch_rope_multi_cached`
 /// (see /opt/mlx-native/src/ops/rope_multi.rs:194-210 — positions must
 /// be I32 or U32 with element count `4 * seq_len`).
-fn upload_i32_to_gpu(
-    device: &MlxDevice,
-    data: &[i32],
-    shape: Vec<usize>,
-) -> Result<MlxBuffer> {
+fn upload_i32_to_gpu(device: &MlxDevice, data: &[i32], shape: Vec<usize>) -> Result<MlxBuffer> {
     let n = data.len();
     let buf = device
         .alloc_buffer(n * 4, DType::I32, shape)
@@ -1400,7 +1376,12 @@ fn vit_qwen3vl_2d_rope_gpu(
         // Per qwen3vl.cpp:113 `freq_base = 10000`.
         freq_base,
         mode: RopeMultiMode::Vision,
-        sections: [n_dims_quarter, n_dims_quarter, n_dims_quarter, n_dims_quarter],
+        sections: [
+            n_dims_quarter,
+            n_dims_quarter,
+            n_dims_quarter,
+            n_dims_quarter,
+        ],
     };
     dispatch_rope_multi_cached(encoder, registry, device, qkv_buf, &out, positions, params)
         .map_err(|e| anyhow!("vit_qwen3vl_2d_rope_gpu: dispatch_rope_multi_cached: {e}"))?;
@@ -1462,7 +1443,9 @@ fn vit_qwen3vl_geglu_split_gpu(
     n_elements: u32,
 ) -> Result<MlxBuffer> {
     if n_elements == 0 {
-        return Err(anyhow!("vit_qwen3vl_geglu_split_gpu: n_elements must be > 0"));
+        return Err(anyhow!(
+            "vit_qwen3vl_geglu_split_gpu: n_elements must be > 0"
+        ));
     }
     let gelu_out = vit_qwen3vl_gelu_gpu(encoder, registry, device, gate, n_elements)?;
     encoder.memory_barrier();
@@ -1661,28 +1644,12 @@ fn apply_qwen3vl_block_forward_gpu(
     // Stage 3: 2D-RoPE on Q and K (qwen3vl.cpp:111-116).
     // -----------------------------------------------------------------
     let q_rot = vit_qwen3vl_2d_rope_gpu(
-        encoder,
-        registry,
-        device,
-        &q,
-        positions,
-        n_pos,
-        n_heads,
-        head_dim,
-        freq_base,
+        encoder, registry, device, &q, positions, n_pos, n_heads, head_dim, freq_base,
     )
     .context("apply_qwen3vl_block_forward_gpu: rope Q")?;
     encoder.memory_barrier();
     let k_rot = vit_qwen3vl_2d_rope_gpu(
-        encoder,
-        registry,
-        device,
-        &k,
-        positions,
-        n_pos,
-        n_heads,
-        head_dim,
-        freq_base,
+        encoder, registry, device, &k, positions, n_pos, n_heads, head_dim, freq_base,
     )
     .context("apply_qwen3vl_block_forward_gpu: rope K")?;
     encoder.memory_barrier();
@@ -1700,16 +1667,7 @@ fn apply_qwen3vl_block_forward_gpu(
     // layout vit_linear_gpu produces for `[batch, hidden]` since
     // hidden = num_heads * head_dim).
     let attn = vit_attention_gpu(
-        encoder,
-        registry,
-        device,
-        &q_rot,
-        &k_rot,
-        &v,
-        n_pos,
-        n_heads,
-        head_dim,
-        scale,
+        encoder, registry, device, &q_rot, &k_rot, &v, n_pos, n_heads, head_dim, scale,
     )
     .context("apply_qwen3vl_block_forward_gpu: attention")?;
     encoder.memory_barrier();
@@ -2397,8 +2355,7 @@ fn qwen3vl_concat_augmented_embed_cpu(
         for (c, chunk) in chunks.iter().enumerate() {
             let src_off = t * lm_hidden;
             let dst_off = t * row_stride + c * lm_hidden;
-            out[dst_off..dst_off + lm_hidden]
-                .copy_from_slice(&chunk[src_off..src_off + lm_hidden]);
+            out[dst_off..dst_off + lm_hidden].copy_from_slice(&chunk[src_off..src_off + lm_hidden]);
         }
     }
     Ok(out)
@@ -2614,16 +2571,14 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     let patch_embd_f32 = mmproj_weights
         .tensor_as_f32_owned(patch_embd_buf)
         .context("compute_vision_embeddings_gpu_qwen3vl: patch_embd → f32 widen")?;
-    let patch_embd_1_buf = mmproj_weights
-        .get("v.patch_embd.weight.1")
-        .ok_or_else(|| {
-            anyhow!(
-                "compute_vision_embeddings_gpu_qwen3vl: missing '{}' (Qwen3-VL ViT \
+    let patch_embd_1_buf = mmproj_weights.get("v.patch_embd.weight.1").ok_or_else(|| {
+        anyhow!(
+            "compute_vision_embeddings_gpu_qwen3vl: missing '{}' (Qwen3-VL ViT \
                  dual-stem patch embedding requires both `v.patch_embd.weight` and \
                  `v.patch_embd.weight.1`; see qwen3vl.cpp:17, 23-25)",
-                "v.patch_embd.weight.1",
-            )
-        })?;
+            "v.patch_embd.weight.1",
+        )
+    })?;
     let patch_embd_1_f32 = mmproj_weights
         .tensor_as_f32_owned(patch_embd_1_buf)
         .context("compute_vision_embeddings_gpu_qwen3vl: patch_embd.1 → f32 widen")?;
@@ -2697,9 +2652,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     //     block-merged order (matches the post-block-merge tensor
     //     layout above). qwen3vl.cpp uses freq_base = 10000.
     let positions = build_qwen3vl_2d_rope_positions(
-        device,
-        n_x_merged,
-        n_y_merged,
+        device, n_x_merged, n_y_merged,
         true, // block-merged order — patches are 2x2-block-major
     )
     .context("compute_vision_embeddings_gpu_qwen3vl: build rope positions")?;
@@ -2899,9 +2852,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
             DType::F32,
             vec![n_image_tokens, augmented_dim],
         )
-        .map_err(|e| anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: alloc augmented buf: {e}"
-        ))?;
+        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: alloc augmented buf: {e}"))?;
 
     // Chunk 0 — main projector output at column offset 0.
     dispatch_feature_concat_f32(
@@ -2950,9 +2901,9 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .finish()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: finish: {e}"))?;
 
-    let augmented_slice: &[f32] = augmented_buf.as_slice::<f32>().map_err(|e| {
-        anyhow!("compute_vision_embeddings_gpu_qwen3vl: augmented readback: {e}")
-    })?;
+    let augmented_slice: &[f32] = augmented_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: augmented readback: {e}"))?;
     if augmented_slice.len() < expected_augmented_len {
         return Err(anyhow!(
             "compute_vision_embeddings_gpu_qwen3vl: augmented embed len {} < \
@@ -3007,12 +2958,7 @@ mod tests {
     fn qwen3vl_vit_config_from_mmproj_round_trip() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Qwen3-VL-2B-style fixture: 24 layers, DeepStack at 5/11/17.
-        let cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![5, 11, 17]),
-            Some(2),
-            Some(2048),
-        );
+        let cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![5, 11, 17]), Some(2), Some(2048));
         let vit = Qwen3VlViTConfig::from_mmproj(&cfg, 2304)
             .expect("from_mmproj on a fully-populated Qwen3-VL config must succeed");
         assert_eq!(vit.n_layer, 24);
@@ -3087,12 +3033,7 @@ mod tests {
     #[test]
     fn qwen3vl_vit_config_fails_on_zero_num_position_embeddings() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![5, 11, 17]),
-            Some(2),
-            Some(2048),
-        );
+        let cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![5, 11, 17]), Some(2), Some(2048));
         let err = Qwen3VlViTConfig::from_mmproj(&cfg, 0)
             .expect_err("from_mmproj must reject num_position_embeddings=0");
         assert!(format!("{err}").contains("num_position_embeddings"));
@@ -3105,12 +3046,7 @@ mod tests {
         // Sanity-check that should have been caught at parse time but
         // we belt-and-suspender re-validate here so the kernel-side
         // 4c.3 path can index `model.layers[idx]` without bounds checks.
-        let cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![5, 11, 24]),
-            Some(2),
-            Some(2048),
-        );
+        let cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![5, 11, 24]), Some(2), Some(2048));
         let err = Qwen3VlViTConfig::from_mmproj(&cfg, 2304)
             .expect_err("from_mmproj must reject deepstack_indexes >= num_hidden_layers");
         let msg = format!("{err}");
@@ -3126,12 +3062,7 @@ mod tests {
         // Some(empty Vec) is legal — the metadata key was present but
         // no layer was flagged. The augmented embed dim collapses to
         // out_hidden_size (1 + 0 deepstack chunks).
-        let cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![]),
-            Some(2),
-            Some(2048),
-        );
+        let cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![]), Some(2), Some(2048));
         let vit = Qwen3VlViTConfig::from_mmproj(&cfg, 2304)
             .expect("Some(empty Vec) is a valid deepstack_indexes value");
         assert_eq!(vit.deepstack_indexes, Vec::<u32>::new());
@@ -3148,19 +3079,12 @@ mod tests {
         // 4c.2 ships. The "4c.3 marker" message lives behind a valid
         // 1-input call (see `qwen3vl_compute_returns_err_with_4c3_marker`
         // below).
-        let cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![5, 11, 17]),
-            Some(2),
-            Some(2048),
-        );
+        let cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![5, 11, 17]), Some(2), Some(2048));
         let vit_cfg = Qwen3VlViTConfig::from_mmproj(&cfg, 2304).unwrap();
         let weights = make_empty_loaded_mmproj_weights();
-        let result =
-            compute_vision_embeddings_gpu_qwen3vl(&[], &weights, &vit_cfg, &cfg);
-        let err = result.expect_err(
-            "compute_vision_embeddings_gpu_qwen3vl must reject an empty input slice",
-        );
+        let result = compute_vision_embeddings_gpu_qwen3vl(&[], &weights, &vit_cfg, &cfg);
+        let err = result
+            .expect_err("compute_vision_embeddings_gpu_qwen3vl must reject an empty input slice");
         let msg = format!("{err}");
         // Phase-2 (iter-225): the entry point is per-image, so an empty
         // batch is rejected as "expects exactly 1 input image". The
@@ -3186,8 +3110,7 @@ mod tests {
     /// Sub-iters 4c.2+ will replace this with a real loader-backed
     /// fixture once arithmetic exists to consume the tensors.
     fn make_empty_loaded_mmproj_weights() -> LoadedMmprojWeights {
-        let device =
-            mlx_native::MlxDevice::new().expect("MlxDevice::new() for unit test");
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice::new() for unit test");
         LoadedMmprojWeights::empty(device)
     }
 
@@ -3232,9 +3155,15 @@ mod tests {
         )
         .expect("dual-conv prelude must succeed for matching weight shapes");
 
-        let solo_stem_0 =
-            patch_embed_forward(&pixel_values, &weight_0, None, image_size, patch_size, hidden)
-                .expect("stem-0 reference patch_embed_forward");
+        let solo_stem_0 = patch_embed_forward(
+            &pixel_values,
+            &weight_0,
+            None,
+            image_size,
+            patch_size,
+            hidden,
+        )
+        .expect("stem-0 reference patch_embed_forward");
 
         // Single 16×16 patch with hidden=64 → 64 output elements.
         assert_eq!(dual.len(), hidden as usize);
@@ -3313,8 +3242,8 @@ mod tests {
         let trained_n: u32 = 2;
         let n_embd: u32 = 1;
         let num_pos = trained_n * trained_n; // 4
-        // Row-major [num_pos, n_embd]: index (y*2 + x) → value.
-        // (0,0)=1, (1,0)=2, (0,1)=3, (1,1)=4.
+                                             // Row-major [num_pos, n_embd]: index (y*2 + x) → value.
+                                             // (0,0)=1, (1,0)=2, (0,1)=3, (1,1)=4.
         let table: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let target_n: u32 = 3;
 
@@ -3395,8 +3324,8 @@ mod tests {
         let trained_n: u32 = 4;
         let n_embd: u32 = 1;
         let num_pos = trained_n * trained_n; // 16
-        // Source pattern: value(y, x) = y * 10 + x.
-        // Row-major (n_pos, n_embd) layout → table[(y*4+x)*1] = 10*y+x.
+                                             // Source pattern: value(y, x) = y * 10 + x.
+                                             // Row-major (n_pos, n_embd) layout → table[(y*4+x)*1] = 10*y+x.
         let mut table: Vec<f32> = Vec::with_capacity(num_pos as usize);
         for y in 0..trained_n {
             for x in 0..trained_n {
@@ -3493,12 +3422,7 @@ mod tests {
         // Drive the config builder with the real value (not the 4c.1
         // sentinel `1`) and confirm `cfg.num_position_embeddings`
         // round-trips byte-equal.
-        let mmproj_cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![5, 11, 17]),
-            Some(2),
-            Some(2048),
-        );
+        let mmproj_cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![5, 11, 17]), Some(2), Some(2048));
         let vit_cfg =
             Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, extracted_count).expect("from_mmproj");
         assert_eq!(vit_cfg.num_position_embeddings, 2304);
@@ -3527,12 +3451,7 @@ mod tests {
         use crate::inference::vision::vit_gpu::VisionInput;
         use crate::inference::vision::PreprocessedImage;
 
-        let mmproj_cfg = synth_qwen3vl_mmproj_cfg(
-            24,
-            Some(vec![5, 11, 17]),
-            Some(2),
-            Some(2048),
-        );
+        let mmproj_cfg = synth_qwen3vl_mmproj_cfg(24, Some(vec![5, 11, 17]), Some(2), Some(2048));
         // Use a small valid image_size: must be a multiple of
         // patch_size * spatial_merge_size = 16 * 2 = 32. Pick 32 so
         // the pixel buffer is small (3 * 32² = 3072 f32).
@@ -3552,12 +3471,8 @@ mod tests {
         let inputs = vec![VisionInput::Siglip49(img)];
 
         let weights = make_empty_loaded_mmproj_weights();
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs,
-            &weights,
-            &vit_cfg,
-            &mmproj_cfg_small,
-        );
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg_small);
         let err = result.expect_err(
             "4c.3: with a valid 1-input batch but empty weights, the function \
              must surface a missing-tensor error from the patch-embed step \
@@ -3758,10 +3673,16 @@ mod tests {
         // Post LN.
         let post_w = alloc_f32(h, vec![h]);
         fill_f32(&post_w, ln_gain, h);
-        tensors.insert(super::super::mmproj::TENSOR_POST_LN_WEIGHT.to_string(), post_w);
+        tensors.insert(
+            super::super::mmproj::TENSOR_POST_LN_WEIGHT.to_string(),
+            post_w,
+        );
         let post_b = alloc_f32(h, vec![h]);
         fill_f32(&post_b, ln_bias, h);
-        tensors.insert(super::super::mmproj::TENSOR_POST_LN_BIAS.to_string(), post_b);
+        tensors.insert(
+            super::super::mmproj::TENSOR_POST_LN_BIAS.to_string(),
+            post_b,
+        );
 
         // Per block.
         for il in 0..n_layers as usize {
@@ -3887,20 +3808,15 @@ mod tests {
     /// vit_gpu.rs:6303-6305 audit). num_position_emb=64 (matches the
     /// 8×8 trained grid; fast-path resize fires).
     fn synth_qwen3vl_block_cfg(n_layers: u32) -> (Qwen3VlViTConfig, MmprojConfig) {
-        let mut cfg = synth_qwen3vl_mmproj_cfg(
-            n_layers,
-            Some(vec![]),
-            Some(2),
-            Some(32),
-        );
+        let mut cfg = synth_qwen3vl_mmproj_cfg(n_layers, Some(vec![]), Some(2), Some(32));
         cfg.image_size = 128;
         cfg.patch_size = 16;
         cfg.num_patches_side = 8;
         cfg.hidden_size = 32;
         cfg.intermediate_size = 64;
         cfg.num_attention_heads = 1;
-        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&cfg, 64)
-            .expect("synth_qwen3vl_block_cfg: from_mmproj");
+        let vit_cfg =
+            Qwen3VlViTConfig::from_mmproj(&cfg, 64).expect("synth_qwen3vl_block_cfg: from_mmproj");
         (vit_cfg, cfg)
     }
 
@@ -4004,10 +3920,16 @@ mod tests {
         // Post LN.
         let post_w = alloc_f32(h, vec![h]);
         fill_f32(&post_w, ln_gain, h);
-        tensors.insert(super::super::mmproj::TENSOR_POST_LN_WEIGHT.to_string(), post_w);
+        tensors.insert(
+            super::super::mmproj::TENSOR_POST_LN_WEIGHT.to_string(),
+            post_w,
+        );
         let post_b = alloc_f32(h, vec![h]);
         fill_f32(&post_b, ln_bias, h);
-        tensors.insert(super::super::mmproj::TENSOR_POST_LN_BIAS.to_string(), post_b);
+        tensors.insert(
+            super::super::mmproj::TENSOR_POST_LN_BIAS.to_string(),
+            post_b,
+        );
 
         // Per block (with `block_proj_w` and `block_ffn_w`).
         for il in 0..n_layers as usize {
@@ -4096,7 +4018,9 @@ mod tests {
 
     /// Helper: synthesize a 1-input batch of zero pixels for the given
     /// `image_size`, wrapped in a `Siglip49(_)` `VisionInput`.
-    fn synth_zero_pixel_inputs(image_size: u32) -> Vec<crate::inference::vision::vit_gpu::VisionInput> {
+    fn synth_zero_pixel_inputs(
+        image_size: u32,
+    ) -> Vec<crate::inference::vision::vit_gpu::VisionInput> {
         use crate::inference::vision::vit_gpu::VisionInput;
         use crate::inference::vision::PreprocessedImage;
         let pixel_values = vec![0.0f32; 3 * (image_size as usize) * (image_size as usize)];
@@ -4180,25 +4104,19 @@ mod tests {
             projection_dim: Some(32),
             deepstack_indexes: Some(vec![]),
         };
-        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 16)
-            .expect("from_mmproj");
+        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 16).expect("from_mmproj");
 
         // Synthetic input `[n_pos=32, n_embd=32]` row-major with row
         // r containing channel-varying values `[r*0.1 + k*0.01]` so
         // every (row, channel) pair is distinct.
         let n_total = (n_pos * n_embd) as usize;
         let input_data: Vec<f32> = (0..n_pos)
-            .flat_map(|r| {
-                (0..n_embd).map(move |k| 0.5 + (r as f32) * 0.1 + (k as f32) * 0.01)
-            })
+            .flat_map(|r| (0..n_embd).map(move |k| 0.5 + (r as f32) * 0.1 + (k as f32) * 0.01))
             .collect();
         assert_eq!(input_data.len(), n_total);
-        let input_buf = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![n_pos as usize, n_embd as usize],
-        )
-        .expect("upload input");
+        let input_buf =
+            upload_f32_to_gpu(&device, &input_data, vec![n_pos as usize, n_embd as usize])
+                .expect("upload input");
 
         // Build per-block weights (proj_w = 0, ffn_w = 0, ln_gain = 1,
         // ln_bias = 0).
@@ -4255,9 +4173,8 @@ mod tests {
         let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
 
         // Drive the per-block forward directly.
-        let executor = GraphExecutor::new(
-            mlx_native::MlxDevice::new().expect("MlxDevice for executor"),
-        );
+        let executor =
+            GraphExecutor::new(mlx_native::MlxDevice::new().expect("MlxDevice for executor"));
         let mut session = executor.begin().expect("begin");
         let mut registry = mlx_native::KernelRegistry::new();
         mlx_native::ops::softmax::register(&mut registry);
@@ -4376,19 +4293,22 @@ mod tests {
         // We set every pair to (1, 0) — pair_real = 1, pair_imag = 0.
         // For head_dim=4, n_dims=2 → 2 pairs per row → real=[idx 0, 1],
         // imag=[idx 2, 3]. So [1, 1, 0, 0] per row.
-        let q_data: Vec<f32> = vec![1.0, 1.0, 0.0, 0.0,  // pos 0
-                                    1.0, 1.0, 0.0, 0.0]; // pos 1
-        // Positions buffer (4 * n_pos = 8 entries, sectioned).
-        // **Vision-mode** layout: axis 0 = y, axis 1 = x (axes 2/3
-        // ignored per ggml.h:1843-1846 — we set axis 3 to a non-zero
-        // sentinel to verify it's truly unused).
-        //   axis 0 (y)      = [0, 0]   pos 0 has y=0; pos 1 has y=0 (same row)
-        //   axis 1 (x)      = [0, 1]   pos 0 has x=0; pos 1 has x=1
-        //   axis 2          = [0, 0]   ignored
-        //   axis 3 (extra)  = [99, 99] non-zero on purpose; vision mode must
-        //                              IGNORE these per ggml.h:1843-1846.
-        let positions_data: Vec<i32> =
-            vec![/* y */ 0, 0, /* x */ 0, 1, /* axis2 */ 0, 0, /* axis3 */ 99, 99];
+        let q_data: Vec<f32> = vec![
+            1.0, 1.0, 0.0, 0.0, // pos 0
+            1.0, 1.0, 0.0, 0.0,
+        ]; // pos 1
+           // Positions buffer (4 * n_pos = 8 entries, sectioned).
+           // **Vision-mode** layout: axis 0 = y, axis 1 = x (axes 2/3
+           // ignored per ggml.h:1843-1846 — we set axis 3 to a non-zero
+           // sentinel to verify it's truly unused).
+           //   axis 0 (y)      = [0, 0]   pos 0 has y=0; pos 1 has y=0 (same row)
+           //   axis 1 (x)      = [0, 1]   pos 0 has x=0; pos 1 has x=1
+           //   axis 2          = [0, 0]   ignored
+           //   axis 3 (extra)  = [99, 99] non-zero on purpose; vision mode must
+           //                              IGNORE these per ggml.h:1843-1846.
+        let positions_data: Vec<i32> = vec![
+            /* y */ 0, 0, /* x */ 0, 1, /* axis2 */ 0, 0, /* axis3 */ 99, 99,
+        ];
 
         let q_buf = upload_f32_to_gpu(
             &device,
@@ -4396,9 +4316,8 @@ mod tests {
             vec![n_pos as usize, n_heads as usize, head_dim as usize],
         )
         .expect("upload q");
-        let positions_buf =
-            upload_i32_to_gpu(&device, &positions_data, vec![positions_data.len()])
-                .expect("upload positions");
+        let positions_buf = upload_i32_to_gpu(&device, &positions_data, vec![positions_data.len()])
+            .expect("upload positions");
 
         let executor = GraphExecutor::new(device);
         let mut session = executor.begin().expect("begin");
@@ -4421,7 +4340,12 @@ mod tests {
             seq_len: n_pos,
             freq_base: 10000.0,
             mode: RopeMultiMode::Vision,
-            sections: [n_dims_quarter, n_dims_quarter, n_dims_quarter, n_dims_quarter],
+            sections: [
+                n_dims_quarter,
+                n_dims_quarter,
+                n_dims_quarter,
+                n_dims_quarter,
+            ],
         };
         dispatch_rope_multi_cached(
             session.encoder_mut(),
@@ -4441,12 +4365,14 @@ mod tests {
         assert!(
             (got[0] - 1.0).abs() < 1e-5 && (got[1] - 1.0).abs() < 1e-5,
             "pos 0 real parts must stay 1.0, got [{}, {}]",
-            got[0], got[1]
+            got[0],
+            got[1]
         );
         assert!(
             got[2].abs() < 1e-5 && got[3].abs() < 1e-5,
             "pos 0 imag parts must stay 0.0, got [{}, {}]",
-            got[2], got[3]
+            got[2],
+            got[3]
         );
         // Position 1: y = 0, x = 1 → axis 0 (y) section has theta = 0
         // (pair stays (1, 0)). axis 1 (x) section has theta = x *
@@ -4718,22 +4644,16 @@ mod tests {
             projection_dim: Some(32),
             deepstack_indexes: Some(vec![]),
         };
-        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 16)
-            .expect("from_mmproj");
+        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 16).expect("from_mmproj");
 
         // Different non-uniform input pattern from test #1.
         let n_total = (n_pos * n_embd) as usize;
         let input_data: Vec<f32> = (0..n_pos)
-            .flat_map(|r| {
-                (0..n_embd).map(move |k| 1.0 + (r as f32) * 0.05 - (k as f32) * 0.02)
-            })
+            .flat_map(|r| (0..n_embd).map(move |k| 1.0 + (r as f32) * 0.05 - (k as f32) * 0.02))
             .collect();
-        let input_buf = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![n_pos as usize, n_embd as usize],
-        )
-        .expect("upload input");
+        let input_buf =
+            upload_f32_to_gpu(&device, &input_data, vec![n_pos as usize, n_embd as usize])
+                .expect("upload input");
 
         // Build per-block weights for 2 blocks.
         let alloc_f32 = |bytes_count: usize, shape: Vec<usize>| -> mlx_native::MlxBuffer {
@@ -4790,9 +4710,8 @@ mod tests {
         }
         let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
 
-        let executor = GraphExecutor::new(
-            mlx_native::MlxDevice::new().expect("MlxDevice for executor"),
-        );
+        let executor =
+            GraphExecutor::new(mlx_native::MlxDevice::new().expect("MlxDevice for executor"));
         let mut session = executor.begin().expect("begin");
         let mut registry = mlx_native::KernelRegistry::new();
         mlx_native::ops::softmax::register(&mut registry);
@@ -4805,10 +4724,8 @@ mod tests {
         let device_borrow: &mlx_native::MlxDevice = unsafe { &*device_ref };
 
         // Positions tensor for n_pos=32 (n_x=8, n_y=4, both even).
-        let positions = build_qwen3vl_2d_rope_positions(
-            device_borrow, 8, 4, true,
-        )
-        .expect("build positions");
+        let positions =
+            build_qwen3vl_2d_rope_positions(device_borrow, 8, 4, true).expect("build positions");
         let head_dim = (n_embd / n_head) as f32;
         let scale = 1.0_f32 / head_dim.sqrt();
 
@@ -4896,29 +4813,24 @@ mod tests {
             vit_cfg.n_embd,
             vit_cfg.intermediate_size,
             (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
-            1.0,  // ln_gain
-            0.0,  // ln_bias
-            0.1,  // proj_w (for both per-block AND projector/deepstack)
-            0.1,  // ffn_w
+            1.0, // ln_gain
+            0.0, // ln_bias
+            0.1, // proj_w (for both per-block AND projector/deepstack)
+            0.1, // ffn_w
             vit_cfg.patch_size,
             &vit_cfg.deepstack_indexes,
             vit_cfg.out_hidden_size,
         );
         let inputs = synth_zero_pixel_inputs(mmproj_cfg.image_size);
 
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs,
-            &weights,
-            &vit_cfg,
-            &mmproj_cfg,
-        )
-        .expect("4c.4 dispatch must return Ok for a complete synthetic 2-block fixture");
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                .expect("4c.4 dispatch must return Ok for a complete synthetic 2-block fixture");
         assert_eq!(result.len(), 1, "single-image input → single-image output");
         let out = &result[0];
 
         let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
-        let n_pos_merged =
-            (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
+        let n_pos_merged = (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
         let n_image_tokens = n_pos_merged / merge_factor;
         let expected_len = n_image_tokens * (vit_cfg.augmented_embed_dim() as usize);
         assert_eq!(
@@ -5051,12 +4963,9 @@ mod tests {
         let input_data: Vec<f32> = (0..(n_pos * n_embd) as usize)
             .map(|i| (i + 1) as f32)
             .collect();
-        let input_buf = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![n_pos as usize, n_embd as usize],
-        )
-        .expect("upload input");
+        let input_buf =
+            upload_f32_to_gpu(&device, &input_data, vec![n_pos as usize, n_embd as usize])
+                .expect("upload input");
 
         // Build weights map with non-trivial fc1.bias = 1 so the
         // GELU input is non-zero (bypassing the LN-of-symmetric-row →
@@ -5102,16 +5011,14 @@ mod tests {
         let fc2_b = alloc_f32(lh, vec![lh]);
         fill_f32(&fc2_b, 0.0, lh);
         tensors.insert("v.deepstack.0.fc2.bias".to_string(), fc2_b);
-        let weights =
-            LoadedMmprojWeights::from_tensors_for_test(tensors, device);
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
 
         // Run the GPU forward on a fresh device — Apple Silicon Metal
         // shares unified memory across all `Device::system_default()`
         // instances, so different MlxDevice handles see the same byte
         // pool. (Same pattern as `compute_vision_embeddings_gpu_qwen3vl`.)
-        let executor = GraphExecutor::new(
-            mlx_native::MlxDevice::new().expect("MlxDevice for executor"),
-        );
+        let executor =
+            GraphExecutor::new(mlx_native::MlxDevice::new().expect("MlxDevice for executor"));
         let mut session = executor.begin().expect("begin");
         let mut registry = mlx_native::KernelRegistry::new();
         mlx_native::ops::softmax::register(&mut registry);
@@ -5158,11 +5065,12 @@ mod tests {
         let mean = (1.0 + n_input) / 2.0; // = 16.5
         let var = ((n_input * n_input) - 1.0) / 12.0; // = 85.25
         let _stddev = (var + eps).sqrt(); // ≈ 9.233 (consumed for documentation)
-        // After LN (gain=1, bias=0): zero-mean → fc1's uniform-weight
-        // matmul produces 0 → +bias=1 → 1 → GELU(1) ≈ 0.8413.
+                                          // After LN (gain=1, bias=0): zero-mean → fc1's uniform-weight
+                                          // matmul produces 0 → +bias=1 → 1 → GELU(1) ≈ 0.8413.
         let gelu_at_one: f32 = 0.5
             * 1.0
-            * (1.0 + (((2.0_f32) / std::f32::consts::PI).sqrt() * (1.0 + 0.044715 * 1.0_f32)).tanh());
+            * (1.0
+                + (((2.0_f32) / std::f32::consts::PI).sqrt() * (1.0 + 0.044715 * 1.0_f32)).tanh());
         let expected_per_element = 0.5 * (fc1_out as f32) * gelu_at_one;
         // expected_per_element ≈ 0.5 * 32 * 0.8413 ≈ 13.461.
 
@@ -5224,12 +5132,9 @@ mod tests {
                 input_data[(r * n_embd + c) as usize] = r as f32;
             }
         }
-        let input_buf = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![n_pos as usize, n_embd as usize],
-        )
-        .expect("upload input");
+        let input_buf =
+            upload_f32_to_gpu(&device, &input_data, vec![n_pos as usize, n_embd as usize])
+                .expect("upload input");
 
         // Weight: identity `[merged_hidden, merged_hidden] = [32, 32]`.
         // After matmul, output is byte-identical to the (reshape-view'd)
@@ -5347,12 +5252,9 @@ mod tests {
         let input_data: Vec<f32> = (0..(n_pos * n_embd) as usize)
             .map(|i| (i + 1) as f32)
             .collect();
-        let input_buf = upload_f32_to_gpu(
-            &device,
-            &input_data,
-            vec![n_pos as usize, n_embd as usize],
-        )
-        .expect("upload input");
+        let input_buf =
+            upload_f32_to_gpu(&device, &input_data, vec![n_pos as usize, n_embd as usize])
+                .expect("upload input");
 
         let alloc_f32 = |bytes_count: usize, shape: Vec<usize>| -> mlx_native::MlxBuffer {
             device
@@ -5388,12 +5290,10 @@ mod tests {
         let mm2_b = alloc_f32(lh, vec![lh]);
         fill_f32(&mm2_b, 0.0, lh);
         tensors.insert(super::super::mmproj::TENSOR_MM_2_BIAS.to_string(), mm2_b);
-        let weights =
-            LoadedMmprojWeights::from_tensors_for_test(tensors, device);
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
 
-        let executor = GraphExecutor::new(
-            mlx_native::MlxDevice::new().expect("MlxDevice for executor"),
-        );
+        let executor =
+            GraphExecutor::new(mlx_native::MlxDevice::new().expect("MlxDevice for executor"));
         let mut session = executor.begin().expect("begin");
         let mut registry = mlx_native::KernelRegistry::new();
         mlx_native::ops::gelu::register(&mut registry);
@@ -5431,10 +5331,12 @@ mod tests {
         // the BF16 round-down case.
         let row_sum: f32 = (1..=32).sum::<i32>() as f32; // 528
         let mm0_pre_gelu = 0.5 * row_sum + 1.0; // 265
-        let gelu_pre = 0.5 * mm0_pre_gelu * (1.0
-            + ((2.0_f32 / std::f32::consts::PI).sqrt()
-                * (mm0_pre_gelu + 0.044715 * mm0_pre_gelu.powi(3)))
-            .tanh());
+        let gelu_pre = 0.5
+            * mm0_pre_gelu
+            * (1.0
+                + ((2.0_f32 / std::f32::consts::PI).sqrt()
+                    * (mm0_pre_gelu + 0.044715 * mm0_pre_gelu.powi(3)))
+                .tanh());
         let expected = 0.5 * (mm0_out as f32) * gelu_pre; // ≈ 4240
 
         for (i, &v) in got.iter().enumerate() {
@@ -5528,8 +5430,7 @@ mod tests {
         mmproj_cfg.hidden_size = 32;
         mmproj_cfg.intermediate_size = 64;
         mmproj_cfg.num_attention_heads = 1;
-        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 64)
-            .expect("from_mmproj");
+        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 64).expect("from_mmproj");
 
         let weights = build_synth_qwen3vl_weights_with_deepstack(
             device,
@@ -5547,13 +5448,9 @@ mod tests {
         );
         let inputs = synth_zero_pixel_inputs(mmproj_cfg.image_size);
 
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs,
-            &weights,
-            &vit_cfg,
-            &mmproj_cfg,
-        )
-        .expect("forward must succeed with single-flag fixture");
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                .expect("forward must succeed with single-flag fixture");
         let out = &result[0];
 
         // Pin: augmented_embed_dim corresponds to `1 + |flagged|`,
@@ -5562,8 +5459,7 @@ mod tests {
         // NOT `lm_hidden * (1 + 3) = 4 * lm_hidden` (which would imply
         // a head at EVERY block index).
         let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
-        let n_pos_merged =
-            (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
+        let n_pos_merged = (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
         let n_image_tokens = n_pos_merged / merge_factor;
 
         let one_plus_flagged = 1 + vit_cfg.deepstack_indexes.len(); // = 2
@@ -5658,20 +5554,14 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         // 3-block fixture with all 3 blocks flagged.
-        let mut mmproj_cfg = synth_qwen3vl_mmproj_cfg(
-            3,
-            Some(vec![0, 1, 2]),
-            Some(2),
-            Some(32),
-        );
+        let mut mmproj_cfg = synth_qwen3vl_mmproj_cfg(3, Some(vec![0, 1, 2]), Some(2), Some(32));
         mmproj_cfg.image_size = 128;
         mmproj_cfg.patch_size = 16;
         mmproj_cfg.num_patches_side = 8;
         mmproj_cfg.hidden_size = 32;
         mmproj_cfg.intermediate_size = 64;
         mmproj_cfg.num_attention_heads = 1;
-        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 64)
-            .expect("from_mmproj");
+        let vit_cfg = Qwen3VlViTConfig::from_mmproj(&mmproj_cfg, 64).expect("from_mmproj");
 
         let weights = build_synth_qwen3vl_weights_with_deepstack(
             device,
@@ -5688,18 +5578,13 @@ mod tests {
             vit_cfg.out_hidden_size,
         );
         let inputs = synth_zero_pixel_inputs(mmproj_cfg.image_size);
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs,
-            &weights,
-            &vit_cfg,
-            &mmproj_cfg,
-        )
-        .expect("forward must succeed with 3-flag fixture");
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                .expect("forward must succeed with 3-flag fixture");
         let out = &result[0];
 
         let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
-        let n_pos_merged =
-            (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
+        let n_pos_merged = (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
         let n_image_tokens = n_pos_merged / merge_factor;
         let lm_hidden = vit_cfg.out_hidden_size as usize;
         let n_deepstack = vit_cfg.deepstack_indexes.len(); // = 3
@@ -5893,9 +5778,8 @@ mod tests {
             Ok(out) => {
                 // Routed correctly: returned the augmented embed.
                 assert_eq!(out.len(), 1, "single image → single output");
-                let n_pos_merged = (mmproj_cfg.image_size as usize
-                    / mmproj_cfg.patch_size as usize)
-                    .pow(2);
+                let n_pos_merged =
+                    (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
                 let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
                 let n_image_tokens = n_pos_merged / merge_factor;
                 // augmented_embed_dim with empty deepstack = out_hidden_size.
@@ -5938,7 +5822,7 @@ mod tests {
         let trained_n: u32 = 8;
         let n_embd: u32 = 2;
         let num_pos = trained_n * trained_n; // 64
-        // Distinct values per row so the bilinear blend is observable.
+                                             // Distinct values per row so the bilinear blend is observable.
         let table: Vec<f32> = (0..(num_pos as usize) * (n_embd as usize))
             .map(|i| (i as f32) * 0.01 - 0.5)
             .collect();
@@ -5946,22 +5830,20 @@ mod tests {
         let target_n_x: u32 = 8;
         let target_n_y: u32 = 4;
         let resized = qwen3vl_resize_position_embeddings_bilinear(
-            &table,
-            num_pos,
-            n_embd,
-            target_n_x,
-            target_n_y,
+            &table, num_pos, n_embd, target_n_x, target_n_y,
         )
         .expect("rectangular resize 8×8 → 8×4 must succeed");
-        let expected_len =
-            (target_n_x as usize) * (target_n_y as usize) * (n_embd as usize);
+        let expected_len = (target_n_x as usize) * (target_n_y as usize) * (n_embd as usize);
         assert_eq!(resized.len(), expected_len);
         // All output values finite; some non-zero (the input was non-zero).
         for (i, v) in resized.iter().enumerate() {
             assert!(v.is_finite(), "resized[{i}] = {v} not finite");
         }
         let any_nonzero = resized.iter().any(|v| v.abs() > 1e-6);
-        assert!(any_nonzero, "all-zero output suggests bilinear blend collapsed");
+        assert!(
+            any_nonzero,
+            "all-zero output suggests bilinear blend collapsed"
+        );
     }
 
     /// Phase-2 #2: rectangular ViT forward — feed `[3, 64, 128]`
@@ -6001,10 +5883,7 @@ mod tests {
         // The bilinear resize from 8×8 trained → 8×4 target is the
         // rectangular path under test.
         mmproj_cfg.image_size = pixel_h; // canvas reporting field
-        let pixel_values = vec![
-            0.0f32;
-            3 * (pixel_h as usize) * (pixel_w as usize)
-        ];
+        let pixel_values = vec![0.0f32; 3 * (pixel_h as usize) * (pixel_w as usize)];
         let img = crate::inference::vision::PreprocessedImage {
             pixel_values,
             target_size: pixel_h,
@@ -6012,16 +5891,16 @@ mod tests {
             pixel_h: Some(pixel_h),
             source_label: "phase2-rect-fixture".to_string(),
         };
-        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
+        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(
+            img,
+        )];
 
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs, &weights, &vit_cfg, &mmproj_cfg,
-        )
-        .expect("Phase-2 rectangular ViT forward must succeed");
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                .expect("Phase-2 rectangular ViT forward must succeed");
         assert_eq!(result.len(), 1);
         let n_image_tokens = 8usize;
-        let expected_len =
-            n_image_tokens * (vit_cfg.augmented_embed_dim() as usize);
+        let expected_len = n_image_tokens * (vit_cfg.augmented_embed_dim() as usize);
         assert_eq!(
             result[0].len(),
             expected_len,
@@ -6067,11 +5946,11 @@ mod tests {
             pixel_h: Some(pixel_h),
             source_label: "phase2-misaligned-fixture".to_string(),
         };
-        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
-        let err = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs, &weights, &vit_cfg, &mmproj_cfg,
-        )
-        .expect_err("misaligned pixel_w must fail loud");
+        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(
+            img,
+        )];
+        let err = compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+            .expect_err("misaligned pixel_w must fail loud");
         let msg = format!("{err}");
         assert!(
             msg.contains("must be a multiple") && msg.contains("48"),
@@ -6109,13 +5988,11 @@ mod tests {
         // (image_size, image_size) and produce the square Phase-1
         // augmented embed.
         let inputs = synth_zero_pixel_inputs(mmproj_cfg.image_size);
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs, &weights, &vit_cfg, &mmproj_cfg,
-        )
-        .expect("backward-compat square input must succeed");
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                .expect("backward-compat square input must succeed");
         let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
-        let n_pos_merged =
-            (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
+        let n_pos_merged = (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
         let n_image_tokens = n_pos_merged / merge_factor;
         let expected_len = n_image_tokens * (vit_cfg.augmented_embed_dim() as usize);
         assert_eq!(result[0].len(), expected_len);
@@ -6170,14 +6047,12 @@ mod tests {
         let inputs_1 = synth_zero_pixel_inputs(mmproj_cfg.image_size);
         let inputs_2 = synth_zero_pixel_inputs(mmproj_cfg.image_size);
 
-        let r1 = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs_1, &weights_1, &vit_cfg, &mmproj_cfg,
-        )
-        .expect("first call");
-        let r2 = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs_2, &weights_2, &vit_cfg, &mmproj_cfg,
-        )
-        .expect("second call");
+        let r1 =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs_1, &weights_1, &vit_cfg, &mmproj_cfg)
+                .expect("first call");
+        let r2 =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs_2, &weights_2, &vit_cfg, &mmproj_cfg)
+                .expect("second call");
         assert_eq!(r1.len(), 1);
         assert_eq!(r2.len(), 1);
         assert_eq!(r1[0].len(), r2[0].len());
@@ -6254,11 +6129,22 @@ mod tests {
             .map(|i| ((i as f32) * 0.01).sin())
             .collect();
         let legacy = patch_embed_forward(
-            &pixel_values_sq, &weight, Some(&bias), 16, patch_size, hidden,
+            &pixel_values_sq,
+            &weight,
+            Some(&bias),
+            16,
+            patch_size,
+            hidden,
         )
         .expect("legacy square");
         let phase2_sq = patch_embed_forward_hw(
-            &pixel_values_sq, &weight, Some(&bias), 16, 16, patch_size, hidden,
+            &pixel_values_sq,
+            &weight,
+            Some(&bias),
+            16,
+            16,
+            patch_size,
+            hidden,
         )
         .expect("phase-2 square");
         assert_eq!(legacy.len(), phase2_sq.len());
@@ -6271,10 +6157,17 @@ mod tests {
         }
 
         // Rectangular 16×32 input: 1 patch tall, 2 patches wide → 2 patches total.
-        let pixel_values_rect: Vec<f32> =
-            (0..(3 * 16 * 32)).map(|i| ((i as f32) * 0.01).cos()).collect();
+        let pixel_values_rect: Vec<f32> = (0..(3 * 16 * 32))
+            .map(|i| ((i as f32) * 0.01).cos())
+            .collect();
         let phase2_rect = patch_embed_forward_hw(
-            &pixel_values_rect, &weight, Some(&bias), 16, 32, patch_size, hidden,
+            &pixel_values_rect,
+            &weight,
+            Some(&bias),
+            16,
+            32,
+            patch_size,
+            hidden,
         )
         .expect("phase-2 rect");
         // 2 patches × hidden = 64 floats.
@@ -6386,34 +6279,114 @@ mod tests {
         override_tensor_with_seeded_sin(&weights, "v.post_ln.bias", 0.01, 17.0);
         for il in 0..(vit_cfg.n_layer as usize) {
             let blk = format!("v.blk.{il}");
-            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln1.weight"), 1.0, (101 + il) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln1.bias"),   0.01, (151 + il) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln2.weight"), 1.0, (201 + il) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln2.bias"),   0.01, (251 + il) as f32);
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("{blk}.ln1.weight"),
+                1.0,
+                (101 + il) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("{blk}.ln1.bias"),
+                0.01,
+                (151 + il) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("{blk}.ln2.weight"),
+                1.0,
+                (201 + il) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("{blk}.ln2.bias"),
+                0.01,
+                (251 + il) as f32,
+            );
             for which in ["attn_q", "attn_k", "attn_v", "attn_out"] {
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.weight"), 0.04, (301 + il * 7) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.bias"),   0.01, (401 + il * 7) as f32);
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.{which}.weight"),
+                    0.04,
+                    (301 + il * 7) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.{which}.bias"),
+                    0.01,
+                    (401 + il * 7) as f32,
+                );
             }
             for which in ["ffn_gate", "ffn_up"] {
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.weight"), 0.03, (501 + il * 5) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.bias"),   0.01, (601 + il * 5) as f32);
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.{which}.weight"),
+                    0.03,
+                    (501 + il * 5) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.{which}.bias"),
+                    0.01,
+                    (601 + il * 5) as f32,
+                );
             }
-            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ffn_down.weight"), 0.03, (701 + il * 3) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ffn_down.bias"),   0.01, (801 + il * 3) as f32);
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("{blk}.ffn_down.weight"),
+                0.03,
+                (701 + il * 3) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("{blk}.ffn_down.bias"),
+                0.01,
+                (801 + il * 3) as f32,
+            );
         }
         // Main projector + flagged DeepStack head (vit_cfg.deepstack_indexes = [0]).
         override_tensor_with_seeded_sin(&weights, "mm.0.weight", 0.02, 9001.0);
-        override_tensor_with_seeded_sin(&weights, "mm.0.bias",   0.01, 9011.0);
+        override_tensor_with_seeded_sin(&weights, "mm.0.bias", 0.01, 9011.0);
         override_tensor_with_seeded_sin(&weights, "mm.2.weight", 0.02, 9101.0);
-        override_tensor_with_seeded_sin(&weights, "mm.2.bias",   0.01, 9111.0);
+        override_tensor_with_seeded_sin(&weights, "mm.2.bias", 0.01, 9111.0);
         for &il in &vit_cfg.deepstack_indexes {
             let il_us = il as usize;
-            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.norm.weight"), 1.0, (10001 + il_us) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.norm.bias"),   0.01, (10101 + il_us) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc1.weight"),  0.02, (10201 + il_us) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc1.bias"),    0.01, (10301 + il_us) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc2.weight"),  0.02, (10401 + il_us) as f32);
-            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc2.bias"),    0.01, (10501 + il_us) as f32);
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("v.deepstack.{il_us}.norm.weight"),
+                1.0,
+                (10001 + il_us) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("v.deepstack.{il_us}.norm.bias"),
+                0.01,
+                (10101 + il_us) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("v.deepstack.{il_us}.fc1.weight"),
+                0.02,
+                (10201 + il_us) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("v.deepstack.{il_us}.fc1.bias"),
+                0.01,
+                (10301 + il_us) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("v.deepstack.{il_us}.fc2.weight"),
+                0.02,
+                (10401 + il_us) as f32,
+            );
+            override_tensor_with_seeded_sin(
+                &weights,
+                &format!("v.deepstack.{il_us}.fc2.bias"),
+                0.01,
+                (10501 + il_us) as f32,
+            );
         }
 
         // Pseudo-random pixels — square `image_size×image_size` (128²).
@@ -6431,12 +6404,13 @@ mod tests {
             pixel_h: Some(pixel_h),
             source_label: "adr021-iter1a-baseline".to_string(),
         };
-        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
+        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(
+            img,
+        )];
 
-        let result = compute_vision_embeddings_gpu_qwen3vl(
-            &inputs, &weights, &vit_cfg, &mmproj_cfg,
-        )
-        .expect("ADR-021 iter-1a baseline must succeed");
+        let result =
+            compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                .expect("ADR-021 iter-1a baseline must succeed");
         assert_eq!(result.len(), 1);
         let out = &result[0];
 
@@ -6498,21 +6472,35 @@ mod tests {
         //                         live fixture.
         const EXPECTED_FNV1A64: u64 = 0x7da7_f3ad_353c_585b;
         const EXPECTED_FIRST8: [u32; 8] = [
-            0x3b43_3e0f, 0x3b15_c486, 0x3ba1_1b92, 0x3c05_1b52,
-            0x3c0b_aa1a, 0x3bbf_01b9, 0x3b50_238e, 0x3b6f_5af2,
+            0x3b43_3e0f,
+            0x3b15_c486,
+            0x3ba1_1b92,
+            0x3c05_1b52,
+            0x3c0b_aa1a,
+            0x3bbf_01b9,
+            0x3b50_238e,
+            0x3b6f_5af2,
         ];
         const EXPECTED_LAST8: [u32; 8] = [
-            0xbb22_572b, 0x384c_57e0, 0x3aa7_c065, 0x3837_f620,
-            0xbb09_8b6f, 0xbb2a_2262, 0xba36_da0c, 0x3adc_9039,
+            0xbb22_572b,
+            0x384c_57e0,
+            0x3aa7_c065,
+            0x3837_f620,
+            0xbb09_8b6f,
+            0xbb2a_2262,
+            0xba36_da0c,
+            0x3adc_9039,
         ];
         assert_eq!(out.len(), EXPECTED_LEN);
         // Hash + spot-pin checks: only enforced when a real value is
         // pinned (sentinel 0 means "first capture, fill me in").
         if EXPECTED_FNV1A64 != 0 {
-            assert_eq!(h, EXPECTED_FNV1A64,
+            assert_eq!(
+                h, EXPECTED_FNV1A64,
                 "ADR-021 iter-1a byte-pinned hash drift — re-run \
                  from a clean main, capture the printed fnv1a64, \
-                 update EXPECTED_FNV1A64 if the drift is intentional");
+                 update EXPECTED_FNV1A64 if the drift is intentional"
+            );
             assert_eq!(first8, EXPECTED_FIRST8, "first8 bit drift");
             assert_eq!(last8, EXPECTED_LAST8, "last8 bit drift");
         }
@@ -6562,7 +6550,10 @@ mod tests {
                 vit_cfg.n_embd,
                 vit_cfg.intermediate_size,
                 (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
-                1.0, 0.0, 0.0, 0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
                 vit_cfg.patch_size,
                 &vit_cfg.deepstack_indexes,
                 vit_cfg.out_hidden_size,
@@ -6577,33 +6568,113 @@ mod tests {
             override_tensor_with_seeded_sin(&weights, "v.post_ln.bias", 0.01, 17.0);
             for il in 0..(vit_cfg.n_layer as usize) {
                 let blk = format!("v.blk.{il}");
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln1.weight"), 1.0, (101 + il) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln1.bias"),   0.01, (151 + il) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln2.weight"), 1.0, (201 + il) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln2.bias"),   0.01, (251 + il) as f32);
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.ln1.weight"),
+                    1.0,
+                    (101 + il) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.ln1.bias"),
+                    0.01,
+                    (151 + il) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.ln2.weight"),
+                    1.0,
+                    (201 + il) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.ln2.bias"),
+                    0.01,
+                    (251 + il) as f32,
+                );
                 for which in ["attn_q", "attn_k", "attn_v", "attn_out"] {
-                    override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.weight"), 0.04, (301 + il * 7) as f32);
-                    override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.bias"),   0.01, (401 + il * 7) as f32);
+                    override_tensor_with_seeded_sin(
+                        &weights,
+                        &format!("{blk}.{which}.weight"),
+                        0.04,
+                        (301 + il * 7) as f32,
+                    );
+                    override_tensor_with_seeded_sin(
+                        &weights,
+                        &format!("{blk}.{which}.bias"),
+                        0.01,
+                        (401 + il * 7) as f32,
+                    );
                 }
                 for which in ["ffn_gate", "ffn_up"] {
-                    override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.weight"), 0.03, (501 + il * 5) as f32);
-                    override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.bias"),   0.01, (601 + il * 5) as f32);
+                    override_tensor_with_seeded_sin(
+                        &weights,
+                        &format!("{blk}.{which}.weight"),
+                        0.03,
+                        (501 + il * 5) as f32,
+                    );
+                    override_tensor_with_seeded_sin(
+                        &weights,
+                        &format!("{blk}.{which}.bias"),
+                        0.01,
+                        (601 + il * 5) as f32,
+                    );
                 }
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.ffn_down.weight"), 0.03, (701 + il * 3) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("{blk}.ffn_down.bias"),   0.01, (801 + il * 3) as f32);
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.ffn_down.weight"),
+                    0.03,
+                    (701 + il * 3) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("{blk}.ffn_down.bias"),
+                    0.01,
+                    (801 + il * 3) as f32,
+                );
             }
             override_tensor_with_seeded_sin(&weights, "mm.0.weight", 0.02, 9001.0);
-            override_tensor_with_seeded_sin(&weights, "mm.0.bias",   0.01, 9011.0);
+            override_tensor_with_seeded_sin(&weights, "mm.0.bias", 0.01, 9011.0);
             override_tensor_with_seeded_sin(&weights, "mm.2.weight", 0.02, 9101.0);
-            override_tensor_with_seeded_sin(&weights, "mm.2.bias",   0.01, 9111.0);
+            override_tensor_with_seeded_sin(&weights, "mm.2.bias", 0.01, 9111.0);
             for &il in &vit_cfg.deepstack_indexes {
                 let il_us = il as usize;
-                override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.norm.weight"), 1.0, (10001 + il_us) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.norm.bias"),   0.01, (10101 + il_us) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc1.weight"),  0.02, (10201 + il_us) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc1.bias"),    0.01, (10301 + il_us) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc2.weight"),  0.02, (10401 + il_us) as f32);
-                override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc2.bias"),    0.01, (10501 + il_us) as f32);
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("v.deepstack.{il_us}.norm.weight"),
+                    1.0,
+                    (10001 + il_us) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("v.deepstack.{il_us}.norm.bias"),
+                    0.01,
+                    (10101 + il_us) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("v.deepstack.{il_us}.fc1.weight"),
+                    0.02,
+                    (10201 + il_us) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("v.deepstack.{il_us}.fc1.bias"),
+                    0.01,
+                    (10301 + il_us) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("v.deepstack.{il_us}.fc2.weight"),
+                    0.02,
+                    (10401 + il_us) as f32,
+                );
+                override_tensor_with_seeded_sin(
+                    &weights,
+                    &format!("v.deepstack.{il_us}.fc2.bias"),
+                    0.01,
+                    (10501 + il_us) as f32,
+                );
             }
 
             let n_px = 3 * (pixel_h as usize) * (pixel_w as usize);
@@ -6617,9 +6688,12 @@ mod tests {
                 pixel_h: Some(pixel_h),
                 source_label: format!("adr021-iter5b-{pixel_h}x{pixel_w}"),
             };
-            let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
-            let result = compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
-                .expect("ADR-021 iter-5b run must succeed");
+            let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(
+                img,
+            )];
+            let result =
+                compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit_cfg, &mmproj_cfg)
+                    .expect("ADR-021 iter-5b run must succeed");
             assert_eq!(result.len(), 1);
             let out = result.into_iter().next().unwrap();
             let h = fnv1a64_of_f32_slice(&out);
@@ -6632,42 +6706,75 @@ mod tests {
         let (tall_out, tall_hash) = run_at_shape(128, 64);
 
         eprintln!("=== ADR-021 iter-5b AC-3 substitute ===");
-        eprintln!("  square  128x128 : len={} fnv1a64=0x{:016x}", square_out.len(), square_hash);
-        eprintln!("  wide    64x128  : len={} fnv1a64=0x{:016x}", wide_out.len(), wide_hash);
-        eprintln!("  tall    128x64  : len={} fnv1a64=0x{:016x}", tall_out.len(), tall_hash);
+        eprintln!(
+            "  square  128x128 : len={} fnv1a64=0x{:016x}",
+            square_out.len(),
+            square_hash
+        );
+        eprintln!(
+            "  wide    64x128  : len={} fnv1a64=0x{:016x}",
+            wide_out.len(),
+            wide_hash
+        );
+        eprintln!(
+            "  tall    128x64  : len={} fnv1a64=0x{:016x}",
+            tall_out.len(),
+            tall_hash
+        );
 
         // (a) finiteness for all elements at every shape.
-        for (label, out) in &[("square", &square_out), ("wide", &wide_out), ("tall", &tall_out)] {
+        for (label, out) in &[
+            ("square", &square_out),
+            ("wide", &wide_out),
+            ("tall", &tall_out),
+        ] {
             for (i, &v) in out.iter().enumerate() {
                 assert!(v.is_finite(), "{label}[{i}] = {v} is not finite");
             }
         }
         // (b) the wide grid is not square — n_image_tokens differs vs the
         //     128x128 fixture, so output lengths differ. Same for tall.
-        assert_ne!(square_out.len(), wide_out.len(),
+        assert_ne!(
+            square_out.len(),
+            wide_out.len(),
             "square (128x128) and wide (64x128) must produce different \
-             output lengths because n_image_tokens differs");
-        assert_ne!(square_out.len(), tall_out.len(),
+             output lengths because n_image_tokens differs"
+        );
+        assert_ne!(
+            square_out.len(),
+            tall_out.len(),
             "square (128x128) and tall (128x64) must produce different \
-             output lengths because n_image_tokens differs");
+             output lengths because n_image_tokens differs"
+        );
         // wide and tall happen to share the same n_image_tokens (both
         // are 8x4 patch grids post-merge, just transposed) — but the
         // HASH should differ because the per-patch values are reshape-
         // dependent on the input grid order.
-        assert_eq!(wide_out.len(), tall_out.len(),
+        assert_eq!(
+            wide_out.len(),
+            tall_out.len(),
             "wide (64x128) and tall (128x64) share n_image_tokens=8 \
-             post-merge but with different per-patch ordering");
-        assert_ne!(wide_hash, tall_hash,
+             post-merge but with different per-patch ordering"
+        );
+        assert_ne!(
+            wide_hash, tall_hash,
             "wide (64x128) and tall (128x64) hashes must differ — \
-             same n_image_tokens but different patch ordering");
+             same n_image_tokens but different patch ordering"
+        );
 
         // (c) deterministic across two runs at the SAME shape.
         let (rerun_wide_out, rerun_wide_hash) = run_at_shape(64, 128);
         assert_eq!(wide_out.len(), rerun_wide_out.len());
-        assert_eq!(wide_hash, rerun_wide_hash, "wide rerun must be byte-deterministic");
+        assert_eq!(
+            wide_hash, rerun_wide_hash,
+            "wide rerun must be byte-deterministic"
+        );
         for (i, (a, b)) in wide_out.iter().zip(rerun_wide_out.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(),
-                "wide rerun byte drift at element {i}: a={a} b={b}");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "wide rerun byte drift at element {i}: a={a} b={b}"
+            );
         }
     }
 
@@ -6740,20 +6847,30 @@ mod tests {
         // CPU oracle pipeline (the chain ADR-021 replaced).
         let cpu_oracle = || -> Vec<f32> {
             let patches_pre = qwen3vl_dual_conv_patch_embed_cpu_hw(
-                &pixels, &weight_0, &weight_1, Some(&bias),
-                PIXEL_H, PIXEL_W, PATCH_SIZE, HIDDEN,
-            ).expect("CPU dual conv");
+                &pixels,
+                &weight_0,
+                &weight_1,
+                Some(&bias),
+                PIXEL_H,
+                PIXEL_W,
+                PATCH_SIZE,
+                HIDDEN,
+            )
+            .expect("CPU dual conv");
             let pos_resized = qwen3vl_resize_position_embeddings_bilinear(
-                &pos_embd, (TRAINED_N * TRAINED_N) as u32, HIDDEN,
-                nps_x as u32, nps_y as u32,
-            ).expect("CPU bilinear resize");
+                &pos_embd,
+                (TRAINED_N * TRAINED_N) as u32,
+                HIDDEN,
+                nps_x as u32,
+                nps_y as u32,
+            )
+            .expect("CPU bilinear resize");
             let mut summed = patches_pre;
             for (a, b) in summed.iter_mut().zip(pos_resized.iter()) {
                 *a += *b;
             }
-            qwen3vl_2x2_block_merge_reshape(
-                &summed, nps_x, nps_y, HIDDEN as usize,
-            ).expect("CPU block merge")
+            qwen3vl_2x2_block_merge_reshape(&summed, nps_x, nps_y, HIDDEN as usize)
+                .expect("CPU block merge")
         };
 
         // GPU pipeline (Stage A only — opens its own session,
@@ -6776,10 +6893,18 @@ mod tests {
                 session.encoder_mut(),
                 &mut registry,
                 device,
-                &pixels, &weight_0, &weight_1, Some(&bias),
-                &pos_embd, (TRAINED_N * TRAINED_N) as u32,
-                PIXEL_H, PIXEL_W, PATCH_SIZE, HIDDEN,
-            ).expect("GPU stage A");
+                &pixels,
+                &weight_0,
+                &weight_1,
+                Some(&bias),
+                &pos_embd,
+                (TRAINED_N * TRAINED_N) as u32,
+                PIXEL_H,
+                PIXEL_W,
+                PATCH_SIZE,
+                HIDDEN,
+            )
+            .expect("GPU stage A");
             session.finish().expect("finish");
             merged_buf.as_slice::<f32>().expect("readback").to_vec()
         };
@@ -6811,7 +6936,9 @@ mod tests {
         assert_eq!(cpu_out.len(), gpu_out.len());
         // ULP-bounded equality: matmul reduction order differs (see
         // K1 docs) but the result should be close in absolute value.
-        let max_abs_diff = cpu_out.iter().zip(gpu_out.iter())
+        let max_abs_diff = cpu_out
+            .iter()
+            .zip(gpu_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
@@ -6849,7 +6976,8 @@ mod tests {
         assert!(
             gpu_us < cpu_us,
             "Stage A GPU pipeline ({:.1}µs) is slower than CPU oracle ({:.1}µs)",
-            gpu_us, cpu_us
+            gpu_us,
+            cpu_us
         );
     }
 }

@@ -12,13 +12,13 @@ mod deepseek4_cli;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
 pub mod forward_mlx_shared;
-pub mod layer_ctx;
 pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;
 pub mod header;
 #[allow(dead_code)]
 pub mod kv_persist;
+pub mod layer_ctx;
 #[allow(dead_code)]
 pub mod load_info;
 #[allow(dead_code)]
@@ -30,14 +30,14 @@ pub mod multi_seq_kv;
 // ADR-040 Phase B iter-1 scaffolding — Scheduler trait + FifoSchedulerAdapter +
 // InflightBatchedScheduler signature stub. Production activation gated on
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
-#[allow(dead_code)]
-pub mod scheduler;
 pub mod parity_quality;
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub mod quant_select;
 #[allow(dead_code)]
 pub mod sampler_pure;
+#[allow(dead_code)]
+pub mod scheduler;
 pub mod spec_decode_cli;
 
 use anyhow::{Context, Result};
@@ -145,7 +145,10 @@ fn build_warmed_embedding_registry(
 /// `serve::api::engine_qwen35::Qwen35LoadedModel::load` constructor
 /// can reuse the same tokenizer-resolution logic `cmd_generate_qwen35`
 /// uses (parity with the working CLI chat path).
-pub(crate) fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::PathBuf> {
+pub(crate) fn find_tokenizer(
+    model_path: &Path,
+    explicit: Option<&Path>,
+) -> Result<std::path::PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
@@ -287,7 +290,10 @@ fn print_benchmark_summary(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let generated_str = if generated_per_run.iter().all(|&g| Some(g) == generated_per_run.first().copied()) {
+    let generated_str = if generated_per_run
+        .iter()
+        .all(|&g| Some(g) == generated_per_run.first().copied())
+    {
         format!("{}", generated_per_run.first().copied().unwrap_or(0))
     } else {
         let parts: Vec<String> = generated_per_run.iter().map(|g| g.to_string()).collect();
@@ -303,7 +309,12 @@ fn print_benchmark_summary(
     println!("Runs: {}", decode_tps.len());
     if let Some(pp) = prefill_tps {
         for (i, (&pp_tps, &dec_tps)) in pp.iter().zip(decode_tps.iter()).enumerate() {
-            println!("Run {}: prefill {:.1} tok/s, decode {:.1} tok/s", i + 1, pp_tps, dec_tps);
+            println!(
+                "Run {}: prefill {:.1} tok/s, decode {:.1} tok/s",
+                i + 1,
+                pp_tps,
+                dec_tps
+            );
         }
     } else {
         for (i, &dec_tps) in decode_tps.iter().enumerate() {
@@ -572,18 +583,8 @@ fn render_chat_template(
     // template output as authoritative, and Qwen equivalence depends on the
     // same contract. Decode behavior differences belong in the sampler/stop
     // pipeline, not in prompt surgery.
-    let bos_token = resolve_token_text(
-        gguf,
-        tokenizer,
-        "tokenizer.ggml.bos_token_id",
-        "<bos>",
-    );
-    let eos_token = resolve_token_text(
-        gguf,
-        tokenizer,
-        "tokenizer.ggml.eos_token_id",
-        "<eos>",
-    );
+    let bos_token = resolve_token_text(gguf, tokenizer, "tokenizer.ggml.bos_token_id", "<bos>");
+    let eos_token = resolve_token_text(gguf, tokenizer, "tokenizer.ggml.eos_token_id", "<eos>");
 
     render_jinja_template_with_specials(
         &template_str,
@@ -610,7 +611,13 @@ fn render_jinja_template(
     user_prompt: &str,
     enable_thinking: Option<bool>,
 ) -> Result<String> {
-    render_jinja_template_with_specials(template_str, user_prompt, enable_thinking, "<bos>", "<eos>")
+    render_jinja_template_with_specials(
+        template_str,
+        user_prompt,
+        enable_thinking,
+        "<bos>",
+        "<eos>",
+    )
 }
 
 /// How a chat template's `raise_exception(msg)` call behaves
@@ -736,16 +743,14 @@ fn llama_cpp_special_token_id(
     llama_cpp_special_token_id_for_model(tokenizer_model, metadata_key)
 }
 
-fn llama_cpp_special_token_id_for_model(
-    tokenizer_model: &str,
-    metadata_key: &str,
-) -> Option<u32> {
+fn llama_cpp_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
     match (tokenizer_model, metadata_key) {
         // Mirrors `/opt/llama.cpp/src/llama-vocab.cpp`: for tokenizer model
         // `gpt2`, llama.cpp initializes both BOS and EOS to token id 11 before
         // applying GGUF metadata overrides.
-        ("gpt2", "tokenizer.ggml.bos_token_id")
-        | ("gpt2", "tokenizer.ggml.eos_token_id") => Some(11),
+        ("gpt2", "tokenizer.ggml.bos_token_id") | ("gpt2", "tokenizer.ggml.eos_token_id") => {
+            Some(11)
+        }
         _ => None,
     }
 }
@@ -777,9 +782,7 @@ fn tokenize_rendered_prompt_llama_style(
     tokenizer: &tokenizers::Tokenizer,
     prompt_text: &str,
 ) -> Result<Vec<u32>> {
-    crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
-        gguf, tokenizer, prompt_text,
-    )
+    crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(gguf, tokenizer, prompt_text)
 }
 
 /// Run the `generate` subcommand.
@@ -812,8 +815,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
         if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
             use crate::inference::models::qwen35::{
-                is_qwen36_gguf, is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN35,
-                ARCH_QWEN35MOE,
+                is_qwen36_gguf, is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN35, ARCH_QWEN35MOE,
             };
             // Wedge-4 / iter-227 (2026-05-02): originally a runtime
             // actionable-error dispatch shim that bailed on Qwen3-VL
@@ -928,8 +930,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             .map(std::path::PathBuf::from),
     };
     let load_start = std::time::Instant::now();
-    let loaded = api::engine::GemmaLoadedModel::load(&load_opts)
-        .context("GemmaLoadedModel::load")?;
+    let loaded =
+        api::engine::GemmaLoadedModel::load(&load_opts).context("GemmaLoadedModel::load")?;
     let load_elapsed = load_start.elapsed();
 
     // ADR-018 C3: emit the unified 13-line load banner on stdout (dim
@@ -948,7 +950,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("GGUF re-open (post-load, banner+prompt): {e}"))?;
 
     let mut info = <api::engine::GemmaLoadedModel as load_info::LoadInfoBuilder>::build_load_info(
-        &loaded, &gguf, load_elapsed, None, false,
+        &loaded,
+        &gguf,
+        load_elapsed,
+        None,
+        false,
     );
 
     anyhow::ensure!(
@@ -966,98 +972,91 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // soft-token splice) before prefill. Mirrors the SERVE
     // `cmd_serve --mmproj` path (mod.rs:3432) so SERVE + CLI exercise
     // one validation surface.
-    let loaded_mmproj: Option<api::state::LoadedMmproj> =
-        if let Some(mmp_path) = args.mmproj.as_ref() {
-            anyhow::ensure!(
-                mmp_path.exists(),
-                "mmproj not found: {}",
-                mmp_path.display()
-            );
-            let mmp_gguf = mlx_native::gguf::GgufFile::open(mmp_path)
-                .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
-            let mmp_config =
-                crate::inference::vision::mmproj::MmprojConfig::from_gguf(&mmp_gguf)
-                    .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
-            let actual_names: Vec<&str> = mmp_gguf.tensor_names();
-            crate::inference::vision::mmproj::validate_tensor_set(
-                &mmp_config,
-                &actual_names,
-            )
+    let loaded_mmproj: Option<api::state::LoadedMmproj> = if let Some(mmp_path) =
+        args.mmproj.as_ref()
+    {
+        anyhow::ensure!(
+            mmp_path.exists(),
+            "mmproj not found: {}",
+            mmp_path.display()
+        );
+        let mmp_gguf = mlx_native::gguf::GgufFile::open(mmp_path)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
+        let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&mmp_gguf)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
+        let actual_names: Vec<&str> = mmp_gguf.tensor_names();
+        crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
             .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
-            let arch_profile =
-                crate::inference::vision::mmproj::detect_arch_profile_with_projector(
-                    &mmp_config.projector,
-                    &actual_names,
-                );
-            anyhow::ensure!(
-                arch_profile.is_supported(),
-                "mmproj arch profile is Unknown — neither Gemma 4 SigLIP nor \
+        let arch_profile = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+            &mmp_config.projector,
+            &actual_names,
+        );
+        anyhow::ensure!(
+            arch_profile.is_supported(),
+            "mmproj arch profile is Unknown — neither Gemma 4 SigLIP nor \
                  classic CLIP nor Qwen3-VL SigLIP markers found. hf2q's ViT \
                  forward path cannot dispatch on this file."
+        );
+        let mmproj_sha256 = mmp_gguf
+            .metadata_string("hf2q.mmproj_sha256")
+            .map(|s| s.to_string());
+        info.vision_projector = Some(load_info::VisionProjector {
+            mmproj_path: mmp_path.clone(),
+            mmproj_sha256,
+        });
+        // Load weights on demand: only when --image is set does the
+        // generate path need the projector resident on the GPU. This
+        // keeps text-only `generate --mmproj` cheap (banner + header
+        // parse) while paying full cost (~10s on M5 Max) when the
+        // user actually intends to run vision.
+        if args.image.is_some() {
+            let device = mlx_native::MlxDevice::new()
+                .map_err(|e| anyhow::anyhow!("MlxDevice for mmproj load: {e}"))?;
+            let weights = crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
+                &mmp_gguf,
+                &mmp_config,
+                device,
+            )
+            .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?;
+            let model_id = mmp_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "mmproj".into());
+            tracing::info!(
+                path = %mmp_path.display(),
+                image_size = mmp_config.image_size,
+                patch_size = mmp_config.patch_size,
+                hidden = mmp_config.hidden_size,
+                layers = mmp_config.num_hidden_layers,
+                projector = mmp_config.projector.as_str(),
+                arch = arch_profile.as_str(),
+                tensors_loaded = weights.len(),
+                "Loaded mmproj GGUF header + tensor set + weights"
             );
-            let mmproj_sha256 = mmp_gguf
-                .metadata_string("hf2q.mmproj_sha256")
-                .map(|s| s.to_string());
-            info.vision_projector = Some(load_info::VisionProjector {
-                mmproj_path: mmp_path.clone(),
-                mmproj_sha256,
-            });
-            // Load weights on demand: only when --image is set does the
-            // generate path need the projector resident on the GPU. This
-            // keeps text-only `generate --mmproj` cheap (banner + header
-            // parse) while paying full cost (~10s on M5 Max) when the
-            // user actually intends to run vision.
-            if args.image.is_some() {
-                let device = mlx_native::MlxDevice::new().map_err(|e| {
-                    anyhow::anyhow!("MlxDevice for mmproj load: {e}")
-                })?;
-                let weights =
-                    crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
-                        &mmp_gguf,
-                        &mmp_config,
-                        device,
-                    )
-                    .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?;
-                let model_id = mmp_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "mmproj".into());
-                tracing::info!(
-                    path = %mmp_path.display(),
-                    image_size = mmp_config.image_size,
-                    patch_size = mmp_config.patch_size,
-                    hidden = mmp_config.hidden_size,
-                    layers = mmp_config.num_hidden_layers,
-                    projector = mmp_config.projector.as_str(),
-                    arch = arch_profile.as_str(),
-                    tensors_loaded = weights.len(),
-                    "Loaded mmproj GGUF header + tensor set + weights"
-                );
-                Some(api::state::LoadedMmproj {
-                    gguf_path: mmp_path.clone(),
-                    config: mmp_config,
-                    arch: arch_profile,
-                    weights: std::sync::Arc::new(weights),
-                    model_id,
-                })
-            } else {
-                tracing::info!(
-                    path = %mmp_path.display(),
-                    image_size = mmp_config.image_size,
-                    patch_size = mmp_config.patch_size,
-                    arch = arch_profile.as_str(),
-                    "Loaded mmproj GGUF header (no --image; weight load skipped)"
-                );
-                None
-            }
+            Some(api::state::LoadedMmproj {
+                gguf_path: mmp_path.clone(),
+                config: mmp_config,
+                arch: arch_profile,
+                weights: std::sync::Arc::new(weights),
+                model_id,
+            })
         } else {
+            tracing::info!(
+                path = %mmp_path.display(),
+                image_size = mmp_config.image_size,
+                patch_size = mmp_config.patch_size,
+                arch = arch_profile.as_str(),
+                "Loaded mmproj GGUF header (no --image; weight load skipped)"
+            );
             None
-        };
+        }
+    } else {
+        None
+    };
 
     load_info::emit_tracing(&info);
     let mut stdout = std::io::stdout();
-    load_info::print_banner(&info, &mut stdout, stdout_is_tty)
-        .context("print load banner")?;
+    load_info::print_banner(&info, &mut stdout, stdout_is_tty).context("print load banner")?;
 
     // Partial-move the loaded artifacts into local mutable bindings so
     // the rest of cmd_generate (prefill + decode + profiler) keeps the
@@ -1083,12 +1082,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let prompt_text_with_image_marker = if args.image.is_some() {
         if let Some(mmproj) = loaded_mmproj.as_ref() {
             let family = mmproj.arch.vision_family();
-            let placeholder = family
-                .placeholder_token_literal()
-                .ok_or_else(|| anyhow::anyhow!(
+            let placeholder = family.placeholder_token_literal().ok_or_else(|| {
+                anyhow::anyhow!(
                     "mmproj arch profile {:?} has no placeholder token literal",
                     mmproj.arch
-                ))?;
+                )
+            })?;
             let (open, close) = family.marker_pair();
             format!("{open}{placeholder}{close}\n{prompt_text_raw}")
         } else {
@@ -1097,7 +1096,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     } else {
         prompt_text_raw
     };
-    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_with_image_marker)?;
+    let prompt_text = render_chat_template(
+        &gguf,
+        &args,
+        Some(&tokenizer),
+        &prompt_text_with_image_marker,
+    )?;
 
     // ADR-005 1bNEW.0c: dump rendered prompt and exit if requested
     if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
@@ -1139,17 +1143,18 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let mmproj = loaded_mmproj
             .as_ref()
             .expect("--mmproj checked above when --image is set");
-        let image_input = crate::inference::vision::parse_image_url(
-            image_path.to_string_lossy().as_ref(),
-        )
-        .with_context(|| format!("--image: parse {}", image_path.display()))?;
+        let image_input =
+            crate::inference::vision::parse_image_url(image_path.to_string_lossy().as_ref())
+                .with_context(|| format!("--image: parse {}", image_path.display()))?;
         let bytes = crate::inference::vision::load_image_bytes(&image_input)
             .with_context(|| format!("--image: load {}", image_path.display()))?;
         let preprocessed_input = match mmproj.arch {
             crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip => {
                 let cfg = &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT;
                 let pp = crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, cfg)
-                    .with_context(|| format!("--image: gemma4v preprocess {}", image_path.display()))?;
+                    .with_context(|| {
+                        format!("--image: gemma4v preprocess {}", image_path.display())
+                    })?;
                 let source_label = image_path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -1168,8 +1173,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             }
             crate::inference::vision::mmproj::ArchProfile::ClipClassic => {
                 let preprocess_cfg = mmproj.config.preprocess_config();
-                let pixel_values = crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
-                    .with_context(|| format!("--image: clip preprocess {}", image_path.display()))?;
+                let pixel_values =
+                    crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
+                        .with_context(|| {
+                            format!("--image: clip preprocess {}", image_path.display())
+                        })?;
                 let source_label = image_path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -1194,9 +1202,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                      Qwen3-VL vision; this CLI works for Gemma4 + classic-CLIP."
                 );
             }
-            crate::inference::vision::mmproj::ArchProfile::Unknown => unreachable!(
-                "Unknown arch rejected at mmproj load above"
-            ),
+            crate::inference::vision::mmproj::ArchProfile::Unknown => {
+                unreachable!("Unknown arch rejected at mmproj load above")
+            }
         };
         let pipeline_out = crate::inference::vision::pipeline::run_vit_forward(
             std::slice::from_ref(&preprocessed_input),
@@ -1413,7 +1421,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             }
             let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
             let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
-            eprintln!("\n=== Bench regime: gen_target={} (cap={}) ===", regime_target, regime_cap);
+            eprintln!(
+                "\n=== Bench regime: gen_target={} (cap={}) ===",
+                regime_target, regime_cap
+            );
             for run_idx in 0..BENCH_NUM_RUNS {
                 let last_token = if !soft_tokens_owned.is_empty() {
                     let borrowed: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> =
@@ -1491,7 +1502,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         println!("Prompt tokens: {}", prompt_tokens.len());
         println!("Runs per regime: {}", BENCH_NUM_RUNS);
         println!();
-        println!("{:>10} {:>10} {:>10} {:>10}", "regime", "median", "p95", "min/max");
+        println!(
+            "{:>10} {:>10} {:>10} {:>10}",
+            "regime", "median", "p95", "min/max"
+        );
         for (target, tps_runs, _gen_per_run) in &regime_results {
             let med = median_f64(tps_runs);
             let p95 = p95_f64(tps_runs);
@@ -1508,7 +1522,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         // hide long-context regressions in CI.
         if let Some((_, tps_runs, _)) = regime_results.last() {
             println!();
-            println!("Decode tok/s: {:.1}  (longest-regime median; full table above)", median_f64(tps_runs));
+            println!(
+                "Decode tok/s: {:.1}  (longest-regime median; full table above)",
+                median_f64(tps_runs)
+            );
             println!("Median: {:.1} tok/s", median_f64(tps_runs));
             println!("P95:    {:.1} tok/s", p95_f64(tps_runs));
         }
@@ -1533,7 +1550,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                     embeddings: &s.embeddings,
                 })
                 .collect();
-        mlx_w.forward_prefill_with_soft_tokens(&prompt_tokens, &borrowed, args.max_tokens, &mut ctx)?
+        mlx_w.forward_prefill_with_soft_tokens(
+            &prompt_tokens,
+            &borrowed,
+            args.max_tokens,
+            &mut ctx,
+        )?
     } else if use_batched {
         // ADR-028 iter-137: cold prefill always starts at position 0.
         // Future verify_batched (Phase 2 GPU iter-139) passes start_pos > 0.
@@ -1577,9 +1599,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let mut next_token = last_token;
     all_tokens.push(next_token);
     let mut decoded_tokens: Vec<u32> = vec![next_token];
-    let mut printed_text = tokenizer
-        .decode(&decoded_tokens, false)
-        .unwrap_or_default();
+    let mut printed_text = tokenizer.decode(&decoded_tokens, false).unwrap_or_default();
     print!("{}", printed_text);
     std::io::stdout().flush()?;
 
@@ -1638,9 +1658,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         decoded_tokens.push(next_token);
 
         // Cumulative decode + delta print (llama.cpp tok_str_pos pattern).
-        let new_full = tokenizer
-            .decode(&decoded_tokens, false)
-            .unwrap_or_default();
+        let new_full = tokenizer.decode(&decoded_tokens, false).unwrap_or_default();
         if new_full.len() > printed_text.len() && new_full.starts_with(&printed_text) {
             print!("{}", &new_full[printed_text.len()..]);
             std::io::stdout().flush()?;
@@ -1672,7 +1690,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                      repeated {} times); stopping. Pass --temperature 0.8 or \
                      --repetition-penalty 1.1 (or use the chat-completion API) to \
                      opt into sampling.",
-                    ngram, repeats
+                    ngram,
+                    repeats
                 );
                 eprintln!(
                     "\n[hf2q] Gemma greedy decode entered a {}-token repetition loop \
@@ -1709,7 +1728,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     // Print kernel-type profiling report if enabled
     if kernel_profile_mode && !kernel_profiles.is_empty() {
-        crate::inference::models::gemma4::MlxModelWeights::print_kernel_profile_report(&kernel_profiles);
+        crate::inference::models::gemma4::MlxModelWeights::print_kernel_profile_report(
+            &kernel_profiles,
+        );
     }
 
     // `--benchmark` is handled by the 5-run loop earlier in this
@@ -1757,10 +1778,16 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
              prompt_tokens={} decode_tokens={} \
              dispatches/decode_tok={:.2} syncs/decode_tok={:.2} \
              cmd_bufs/decode_tok={:.4} barriers/decode_tok={:.2}",
-            dispatches, syncs, cmd_bufs, barriers,
-            prompt_n, decode_n,
-            dispatches_per_decode_tok, syncs_per_decode_tok,
-            cb_per_decode_tok, barriers_per_decode_tok,
+            dispatches,
+            syncs,
+            cmd_bufs,
+            barriers,
+            prompt_n,
+            decode_n,
+            dispatches_per_decode_tok,
+            syncs_per_decode_tok,
+            cb_per_decode_tok,
+            barriers_per_decode_tok,
         );
         // ADR-028 iter-284: dump per-pipeline dispatch buckets if MLX_DISP_BUCKET=1.
         // Mirrors llama.cpp's LLAMA_DISP_COUNT atexit dump for direct compare.
@@ -1773,7 +1800,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 total,
             );
             for (label, count) in &buckets {
-                let pct = if total > 0 { 100.0 * (*count as f64) / (total as f64) } else { 0.0 };
+                let pct = if total > 0 {
+                    100.0 * (*count as f64) / (total as f64)
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "[MLX_DISP_BUCKET]   {:>8}  ({:5.2}%)  {}",
                     count, pct, label,
@@ -2339,8 +2370,7 @@ fn find_special_token_stop_pos(generated_text: &str) -> Option<(usize, &'static 
 /// qwen3.6-35B-A3B-dwq48 that cost ~19 tok/s vs the truly-greedy path at
 /// 122 tok/s — the regression that matched 4adf689's pre-CLI-sampling perf.
 fn qwen35_generate_uses_sampling(args: &cli::GenerateArgs) -> bool {
-    args.temperature > crate::serve::sampler_pure::SAMPLING_EPS
-        || args.repetition_penalty != 1.0
+    args.temperature > crate::serve::sampler_pure::SAMPLING_EPS || args.repetition_penalty != 1.0
 }
 
 fn sample_qwen35_logits_for_generate(
@@ -2552,9 +2582,7 @@ where
         // 2026-05-03 — emit raw decoded text directly. See seed-event
         // comment above for the rationale (inference vs display layering).
         let new_full = decode_text(&decoded_tokens);
-        let delta = if new_full.len() > emitted_text.len()
-            && new_full.starts_with(&emitted_text)
-        {
+        let delta = if new_full.len() > emitted_text.len() && new_full.starts_with(&emitted_text) {
             &new_full[emitted_text.len()..]
         } else {
             // Tokenizer rewrote an earlier prefix (rare; happens with some
@@ -2651,7 +2679,10 @@ const SCRUB_TAGS: &[&str] = &[
 
 impl DisplayScrubber {
     fn new() -> Self {
-        Self { buf: String::new(), emitted: 0 }
+        Self {
+            buf: String::new(),
+            emitted: 0,
+        }
     }
 
     /// Append `delta`, return the bytes safe to print right now (with
@@ -2754,8 +2785,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
 
         if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
-            std::fs::write(dump_path, prompt_text.as_bytes())
-                .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
+            std::fs::write(dump_path, prompt_text.as_bytes()).with_context(|| {
+                format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}")
+            })?;
             eprintln!(
                 "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
                 prompt_text.len(),
@@ -2796,12 +2828,15 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // rendering / prefill. Order matches cmd_generate (Gemma) and the
     // legacy `print_header_top` site.
     let info = <Qwen35LoadedModel as load_info::LoadInfoBuilder>::build_load_info(
-        &loaded, &gguf, load_elapsed, None, false,
+        &loaded,
+        &gguf,
+        load_elapsed,
+        None,
+        false,
     );
     load_info::emit_tracing(&info);
     let mut stdout = std::io::stdout();
-    load_info::print_banner(&info, &mut stdout, stdout_is_tty)
-        .context("print load banner")?;
+    load_info::print_banner(&info, &mut stdout, stdout_is_tty).context("print load banner")?;
 
     // Partial-move the loaded artifacts into local mutable bindings so
     // the rest of cmd_generate_qwen35 (prefill + decode) keeps the same
@@ -3174,7 +3209,12 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 // ADR-040 Phase B4b (2026-05-24): CLI benchmark path is
                 // single-seq (kv_cache allocated at n_seqs=1); slot 0
                 // preserves pre-B4b behaviour.
-                .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache, SlotId(0))
+                .forward_gpu_last_logits(
+                    &prompt_tokens,
+                    &prefill_positions,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
                 .context("Qwen35Model::forward_gpu_last_logits (benchmark prefill)")?;
             let prefill_elapsed = prefill_start.elapsed();
             let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
@@ -3236,7 +3276,12 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                             // is single-seq today (FifoSerial /
                             // SerialFifo); SlotId(0) is byte-identical
                             // to pre-B4d.
-                            .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache, SlotId(0))
+                            .forward_gpu_greedy(
+                                &[prev_token],
+                                &decode_positions,
+                                &mut kv_cache,
+                                SlotId(0),
+                            )
                             .with_context(|| {
                                 format!("forward_gpu_greedy decode at pos {pos} (benchmark)")
                             })
@@ -3538,7 +3583,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         DecodeStopReason::MaxSeq => {
             tracing::warn!(
                 "Qwen3.5 decode: reached max_seq {} after {} tokens; stopping",
-                max_seq, outcome.generated
+                max_seq,
+                outcome.generated
             );
         }
         DecodeStopReason::SpecialTokenLeak(marker) => {
@@ -3552,7 +3598,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             tracing::info!(
                 "Qwen3.5 decode: consecutive n-gram repetition detected after {} \
                  tokens (last {} tokens repeated {} times consecutively); stopping.",
-                outcome.generated, ngram, repeats
+                outcome.generated,
+                ngram,
+                repeats
             );
             // 2026-05-03 — when the user passed `--no-thinking` AND the loop
             // fired EARLY (within 32-200 tokens), the most likely cause is
@@ -3631,7 +3679,11 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 total,
             );
             for (label, count) in &buckets {
-                let pct = if total > 0 { 100.0 * (*count as f64) / (total as f64) } else { 0.0 };
+                let pct = if total > 0 {
+                    100.0 * (*count as f64) / (total as f64)
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "[MLX_DISP_BUCKET]   {:>8}  ({:5.2}%)  {}",
                     count, pct, label,
@@ -3924,29 +3976,27 @@ pub(crate) fn parse_scheduler_config(
     //
     // CLI flag wins; env is the fallback. Whitespace-only env values
     // are treated as unset (trim semantics match `should_enable_kv_persist`).
-    let scheduler_from_env: Option<cli::SchedulerArg> = match scheduler_env
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        None => None,
-        Some(raw) => {
-            let lower = raw.to_ascii_lowercase();
-            match lower.as_str() {
-                "fifo_serial" => Some(cli::SchedulerArg::FifoSerial),
-                "inflight_batched" => Some(cli::SchedulerArg::InflightBatched),
-                _ => {
-                    return Err(format!(
-                        "ADR-040 C4: HF2Q_SCHEDULER={raw:?} is not a recognized \
+    let scheduler_from_env: Option<cli::SchedulerArg> =
+        match scheduler_env.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(raw) => {
+                let lower = raw.to_ascii_lowercase();
+                match lower.as_str() {
+                    "fifo_serial" => Some(cli::SchedulerArg::FifoSerial),
+                    "inflight_batched" => Some(cli::SchedulerArg::InflightBatched),
+                    _ => {
+                        return Err(format!(
+                            "ADR-040 C4: HF2Q_SCHEDULER={raw:?} is not a recognized \
                          scheduler policy. Supported values (case-insensitive): \
                          `fifo_serial` (default; ADR-005 byte-equivalent path), \
                          `inflight_batched` (ADR-040 slot-aware path, gated on \
                          iter-2b/2c worker-arm landing). Unset the env var to \
                          use the default."
-                    ));
+                        ));
+                    }
                 }
             }
-        }
-    };
+        };
     let scheduler = scheduler_cli.or(scheduler_from_env);
 
     // ---- 2. Resolve max_slots ----
@@ -3954,23 +4004,21 @@ pub(crate) fn parse_scheduler_config(
     // CLI flag wins; env is the fallback. `HF2Q_MAX_SLOTS=0` is
     // refused loudly (per ADR-040 iter-2.5 F3a). Whitespace-only env
     // values are treated as unset.
-    let max_slots_from_env: Option<u32> = match max_slots_env
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        None => None,
-        Some(raw) => match raw.parse::<u32>() {
-            Ok(parsed) => Some(parsed),
-            Err(err) => {
-                return Err(format!(
-                    "ADR-040 C4: HF2Q_MAX_SLOTS={raw:?} does not parse as a \
+    let max_slots_from_env: Option<u32> =
+        match max_slots_env.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(raw) => match raw.parse::<u32>() {
+                Ok(parsed) => Some(parsed),
+                Err(err) => {
+                    return Err(format!(
+                        "ADR-040 C4: HF2Q_MAX_SLOTS={raw:?} does not parse as a \
                      non-negative u32: {err}. Supply a positive integer (default \
                      {}), or unset the env var.",
-                    DEFAULT_MAX_SLOTS_UNDER_INFLIGHT
-                ));
-            }
-        },
-    };
+                        DEFAULT_MAX_SLOTS_UNDER_INFLIGHT
+                    ));
+                }
+            },
+        };
     let max_slots_requested = max_slots_cli.or(max_slots_from_env);
     if let Some(0) = max_slots_requested {
         return Err(format!(
@@ -4147,11 +4195,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             path_for_log = path_for_log,
         );
     }
-    let kv_persist_loader_wrapper: Option<std::sync::Arc<
-        crate::serve::kv_persist::LoaderWrapper<api::engine::Engine>,
-    >> = if let Some(cache_dir) = args.kv_persist_path.as_ref().filter(|_| kv_persist_enabled) {
-        use std::path::PathBuf;
-        use std::sync::{Arc, Mutex};
+    let kv_persist_loader_wrapper: Option<
+        std::sync::Arc<crate::serve::kv_persist::LoaderWrapper<api::engine::Engine>>,
+    > = if let Some(cache_dir) = args.kv_persist_path.as_ref().filter(|_| kv_persist_enabled) {
         use crate::serve::kv_persist::families::gemma4_dense::{
             Gemma4DenseConfig, Gemma4DenseSpillFactory,
         };
@@ -4164,6 +4210,8 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             LoaderWrapper, StubGemma4Spill, DEFAULT_CHANNEL_CAPACITY,
         };
         use crate::serve::multi_model::{DefaultModelLoader, HotSwapManager, LoadedPool};
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
 
         // 1. Ensure cache_dir exists.
         std::fs::create_dir_all(cache_dir).with_context(|| {
@@ -4193,12 +4241,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 cache_dir,
                 Some(&metrics_sink),
             )
-            .with_context(|| {
-                format!(
-                    "ADR-017 C.1: recover_from_disk({})",
-                    cache_dir.display()
-                )
-            })?;
+            .with_context(|| format!("ADR-017 C.1: recover_from_disk({})", cache_dir.display()))?;
         tracing::info!(
             cache_dir = %cache_dir.display(),
             blocks_indexed = recovery_report.blocks_indexed,
@@ -4226,30 +4269,30 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         //    source-compat with existing callers), then override
         //    through `set_budget_bytes` so the AtomicU64 holds the
         //    parsed value before any eviction call fires.
-        let kv_persist_budget_bytes: u64 =
-            match std::env::var("HF2Q_KV_PERSIST_BUDGET_BYTES") {
-                Ok(raw) => match raw.trim().parse::<u64>() {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        tracing::warn!(
-                            raw = %raw,
-                            error = %err,
-                            "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES \
-                             parse failed; defaulting to 0 (unlimited)"
-                        );
-                        0
-                    }
-                },
-                Err(_) => 0,
-            };
+        let kv_persist_budget_bytes: u64 = match std::env::var("HF2Q_KV_PERSIST_BUDGET_BYTES") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    tracing::warn!(
+                        raw = %raw,
+                        error = %err,
+                        "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES \
+                         parse failed; defaulting to 0 (unlimited)"
+                    );
+                    0
+                }
+            },
+            Err(_) => 0,
+        };
         let store = Arc::new(
-            DiskBlockStore::new_with_index(cache_dir.clone(), recovered_index, 0)
-                .with_context(|| {
+            DiskBlockStore::new_with_index(cache_dir.clone(), recovered_index, 0).with_context(
+                || {
                     format!(
                         "ADR-017 C.1: DiskBlockStore::new_with_index({})",
                         cache_dir.display()
                     )
-                })?,
+                },
+            )?,
         );
         store.set_budget_bytes(kv_persist_budget_bytes);
         // ADR-017 §R-F7: wire the DiskBlockStore to the AppState's
@@ -4277,11 +4320,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
 
         // 5. BlockPrefixCacheSpiller — owns the lifecycle. Per-
         //    family hooks register below.
-        let spiller: Arc<BlockPrefixCacheSpiller<api::engine::Engine>> =
-            Arc::new(BlockPrefixCacheSpiller::new(
-                Arc::clone(&store),
-                Arc::clone(&writer),
-            ));
+        let spiller: Arc<BlockPrefixCacheSpiller<api::engine::Engine>> = Arc::new(
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), Arc::clone(&writer)),
+        );
 
         // 6. KvPersistRegistry — the Phase C.1 EngineBindable
         //    registry. Populated once per known family below.
@@ -4309,12 +4350,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         //    + EngineHandle construction lands.
         if let Some(model_arg) = default_model_arg.as_deref() {
             let stub = Arc::new(StubGemma4Spill);
-            let stub_for_spiller: Arc<
-                Mutex<dyn crate::serve::kv_persist::KvCacheSpill>,
-            > = Arc::new(Mutex::new(StubGemma4Spill));
-            let stub_for_registry: Arc<
-                dyn crate::serve::kv_persist::EngineBindable,
-            > = stub.clone();
+            let stub_for_spiller: Arc<Mutex<dyn crate::serve::kv_persist::KvCacheSpill>> =
+                Arc::new(Mutex::new(StubGemma4Spill));
+            let stub_for_registry: Arc<dyn crate::serve::kv_persist::EngineBindable> = stub.clone();
             // Keys: derive a synthetic (repo, quant) the same way
             // the pre-warm path will (so the spiller's lookup hits
             // when load_or_get fires). Phase D's GGUF-derived
@@ -4471,9 +4509,8 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         //    before the pre-warm load_or_get call (per the
         //    synchronous-contract rationale in
         //    loader_wrapper.rs's module docs).
-        let real_loader: Arc<
-            dyn crate::serve::multi_model::ModelLoader<api::engine::Engine>,
-        > = Arc::new(DefaultModelLoader);
+        let real_loader: Arc<dyn crate::serve::multi_model::ModelLoader<api::engine::Engine>> =
+            Arc::new(DefaultModelLoader);
         let wrapper = Arc::new(LoaderWrapper::new(real_loader, Arc::clone(&registry)));
         // ADR-017 B-dense.2 — wire the spiller into the wrapper so a
         // successful factory substitution updates both the registry
@@ -4493,13 +4530,12 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         //    behavior diverges from the off-path ONLY in the
         //    spiller wiring.
         let pool = LoadedPool::from_hardware(state.hardware.as_ref());
-        let mut manager: HotSwapManager<api::engine::Engine> =
-            HotSwapManager::new_with_spiller(
-                pool,
-                loader_for_manager,
-                Arc::clone(&spiller)
-                    as Arc<dyn crate::serve::multi_model::KvSpiller<api::engine::Engine>>,
-            );
+        let mut manager: HotSwapManager<api::engine::Engine> = HotSwapManager::new_with_spiller(
+            pool,
+            loader_for_manager,
+            Arc::clone(&spiller)
+                as Arc<dyn crate::serve::multi_model::KvSpiller<api::engine::Engine>>,
+        );
         manager.set_kv_counters(Arc::clone(&state.kv_spill_counters));
         state.pool = Arc::new(std::sync::RwLock::new(manager));
         // ADR-017 Closure iter-2 (2026-05-04): expose the concrete
@@ -5005,10 +5041,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // available for axum's outstanding shutdown work.
         let state_for_drain = state_for_warmup.clone();
         let drain_summary = tokio::task::spawn_blocking(move || {
-            drain_loaded_models_to_disk(
-                &state_for_drain,
-                std::time::Duration::from_secs(30),
-            )
+            drain_loaded_models_to_disk(&state_for_drain, std::time::Duration::from_secs(30))
         })
         .await
         .unwrap_or_default();
@@ -5170,7 +5203,12 @@ pub fn drain_loaded_models_to_disk(
     }
 
     let drain_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    ShutdownDrainSummary { evicted, drain_ms, queue_depth_at_exit, timed_out }
+    ShutdownDrainSummary {
+        evicted,
+        drain_ms,
+        queue_depth_at_exit,
+        timed_out,
+    }
 }
 
 /// Graceful-shutdown signal handler: wait for Ctrl-C or SIGTERM (Decision #17).
@@ -5289,10 +5327,7 @@ fn cmd_cache_kv_list(kv_path: Option<&Path>) -> Result<()> {
     let kv_root = cache_ops::resolve_kv_root(kv_path)?;
     let entries = cache_ops::list_namespaces(&kv_root)?;
     if entries.is_empty() {
-        println!(
-            "(kv-cache empty — root: {})",
-            kv_root.display()
-        );
+        println!("(kv-cache empty — root: {})", kv_root.display());
         return Ok(());
     }
     println!("hf2q kv-cache @ {}", kv_root.display());
@@ -5360,8 +5395,8 @@ fn cmd_cache_kv_clear(
     let kv_root = cache_ops::resolve_kv_root(kv_path)?;
 
     if let Some(q_str) = quant {
-        let q = QuantType::from_canonical_str(q_str)
-            .map_err(|e| anyhow::anyhow!("--quant: {}", e))?;
+        let q =
+            QuantType::from_canonical_str(q_str).map_err(|e| anyhow::anyhow!("--quant: {}", e))?;
         let outcome = cache_ops::clear_namespace(&kv_root, repo, q, force).map_err(|e| {
             anyhow::anyhow!(
                 "hf2q cache clear --kv-namespace --model {} --quant {}: {}",
@@ -5373,20 +5408,26 @@ fn cmd_cache_kv_clear(
         if outcome.existed {
             println!(
                 "hf2q kv-cache: cleared {}@{} (fp_short={}, {} bytes freed)",
-                repo, q.as_str(), outcome.fp_short, outcome.bytes_freed
+                repo,
+                q.as_str(),
+                outcome.fp_short,
+                outcome.bytes_freed
             );
         } else {
             println!(
                 "hf2q kv-cache: nothing to clear for {}@{} (fp_short={} not present)",
-                repo, q.as_str(), outcome.fp_short
+                repo,
+                q.as_str(),
+                outcome.fp_short
             );
         }
     } else {
-        let outcomes = cache_ops::clear_namespace_all_quants(&kv_root, repo, force)
-            .map_err(|e| {
+        let outcomes =
+            cache_ops::clear_namespace_all_quants(&kv_root, repo, force).map_err(|e| {
                 anyhow::anyhow!(
                     "hf2q cache clear --kv-namespace --model {} (all quants): {}",
-                    repo, e
+                    repo,
+                    e
                 )
             })?;
         let total_bytes: u64 = outcomes.iter().map(|o| o.bytes_freed).sum();
@@ -5673,8 +5714,12 @@ fn cmd_parity_check(
     let cfg = config::Gemma4Config::from_gguf(&gguf)?;
     // cmd_parity has its own output contract — no progress line.
     let mut parity_progress = header::LoadProgress::new(false, 1, 0);
-    let mut mlx_w =
-        crate::inference::models::gemma4::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut parity_progress)?;
+    let mut mlx_w = crate::inference::models::gemma4::MlxModelWeights::load_from_gguf(
+        &gguf,
+        &cfg,
+        &mut ctx,
+        &mut parity_progress,
+    )?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
@@ -5936,20 +5981,16 @@ fn cmd_parity_capture(
 mod tests {
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
-        detect_greedy_repetition_loop_with_text,
-        find_special_token_stop, maybe_print_serve_banner,
-        llama_cpp_special_token_id_for_model, parse_scheduler_config,
-        render_jinja_template, resolve_enable_thinking, run_decode_loop,
-        should_enable_kv_persist, DecodeStopReason, RaisePolicy,
-        DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
-        FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        detect_greedy_repetition_loop_with_text, find_special_token_stop,
+        llama_cpp_special_token_id_for_model, maybe_print_serve_banner, parse_scheduler_config,
+        render_jinja_template, resolve_enable_thinking, run_decode_loop, should_enable_kv_persist,
+        DecodeStopReason, RaisePolicy, DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
+        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
-    use crate::core::chat_templates::QWEN3_CHATML;
     use crate::cli;
-    use crate::serve::load_info::{
-        ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
-    };
+    use crate::core::chat_templates::QWEN3_CHATML;
     use crate::core::provenance::Provenance;
+    use crate::serve::load_info::{ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -6079,7 +6120,6 @@ mod tests {
         assert!(should_enable_kv_persist(Some("/path"), Some("00")));
     }
 
-
     /// iter-219b parity-gate fix (2026-05-01) regression guard. The CLI
     /// fallback chat template MUST NOT activate Gemma 4's thinking-mode
     /// via `<|think|>` system marker — that diverged from llama.cpp's
@@ -6176,7 +6216,7 @@ mod tests {
         buf.extend_from_slice(&3u32.to_le_bytes()); // version
         buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
         buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count = 1
-        // KV: key="general.architecture" value=<arch>
+                                                    // KV: key="general.architecture" value=<arch>
         let key = b"general.architecture";
         buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
         buf.extend_from_slice(key);
@@ -6413,7 +6453,10 @@ mod tests {
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err(), "the minimal DeepSeek-V4 fixture must fail validation");
+        assert!(
+            result.is_err(),
+            "the minimal DeepSeek-V4 fixture must fail validation"
+        );
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
             msg.contains("DeepSeek-V4 tokenizer") || msg.contains("native DeepSeek-V4 model"),
@@ -6517,7 +6560,10 @@ mod tests {
             toks.push(777);
         }
         let result = detect_greedy_repetition_loop(&toks);
-        assert!(result.is_some(), "single-token loop should be detected (was missed by prior detector)");
+        assert!(
+            result.is_some(),
+            "single-token loop should be detected (was missed by prior detector)"
+        );
         let (ngram, _) = result.unwrap();
         assert_eq!(ngram, 2, "should detect at the smallest matching size");
     }
@@ -6531,7 +6577,10 @@ mod tests {
             toks.extend_from_slice(&cycle);
         }
         let result = detect_greedy_repetition_loop(&toks);
-        assert!(result.is_some(), "7-token cycle should be detected (was missed by prior detector)");
+        assert!(
+            result.is_some(),
+            "7-token cycle should be detected (was missed by prior detector)"
+        );
         assert_eq!(result.unwrap().0, 7);
     }
 
@@ -6544,7 +6593,10 @@ mod tests {
             toks.extend_from_slice(&cycle);
         }
         let result = detect_greedy_repetition_loop(&toks);
-        assert!(result.is_some(), "11-token cycle should be detected (was missed by prior detector)");
+        assert!(
+            result.is_some(),
+            "11-token cycle should be detected (was missed by prior detector)"
+        );
         assert_eq!(result.unwrap().0, 11);
     }
 
@@ -6555,15 +6607,18 @@ mod tests {
         // Agent" failure mode from the 2026-05-16 user report (4 terms
         // each ~4-5 BPE tokens plus delimiters → cycle ~18 tokens).
         let cycle: [u32; 18] = [
-            701, 702, 703, 704, 705, 706, 707, 708, 709, 710,
-            711, 712, 713, 714, 715, 716, 717, 718,
+            701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716, 717,
+            718,
         ];
         let mut toks: Vec<u32> = (0..30).collect();
         for _ in 0..8 {
             toks.extend_from_slice(&cycle);
         }
         let result = detect_greedy_repetition_loop(&toks);
-        assert!(result.is_some(), "18-token cycle should be detected (was missed by prior detector)");
+        assert!(
+            result.is_some(),
+            "18-token cycle should be detected (was missed by prior detector)"
+        );
         assert_eq!(result.unwrap().0, 18);
     }
 
@@ -6571,16 +6626,18 @@ mod tests {
     fn detect_repetition_finds_22_token_cycle() {
         // 22-token cycle — between the prior fixed-set steps {20, 24}.
         let cycle: [u32; 22] = [
-            801, 802, 803, 804, 805, 806, 807, 808, 809, 810,
-            811, 812, 813, 814, 815, 816, 817, 818, 819, 820,
-            821, 822,
+            801, 802, 803, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814, 815, 816, 817,
+            818, 819, 820, 821, 822,
         ];
         let mut toks: Vec<u32> = (0..30).collect();
         for _ in 0..6 {
             toks.extend_from_slice(&cycle);
         }
         let result = detect_greedy_repetition_loop(&toks);
-        assert!(result.is_some(), "22-token cycle should be detected (was missed by prior detector)");
+        assert!(
+            result.is_some(),
+            "22-token cycle should be detected (was missed by prior detector)"
+        );
         assert_eq!(result.unwrap().0, 22);
     }
 
@@ -6644,9 +6701,8 @@ mod tests {
         for _ in 0..8 {
             toks2.extend_from_slice(&cycle);
         }
-        let result2 = detect_greedy_repetition_loop_with_text(&toks2, |_cycle| {
-            "| :--- ".to_string()
-        });
+        let result2 =
+            detect_greedy_repetition_loop_with_text(&toks2, |_cycle| "| :--- ".to_string());
         assert!(
             result2.is_some(),
             "structural cycle at 8 reps should fire (genuine pad-loop)"
@@ -7046,7 +7102,8 @@ mod tests {
     #[test]
     fn iter229_parity_raise_exception_lenient_warns_and_continues() {
         let mut env = build_chat_template_env(RaisePolicy::Lenient);
-        env.add_template("t", "{{ raise_exception('boom') }}x").unwrap();
+        env.add_template("t", "{{ raise_exception('boom') }}x")
+            .unwrap();
         let out = env.get_template("t").unwrap().render(()).unwrap();
         assert_eq!(out, "x", "Lenient policy must render through the raise");
     }
@@ -7054,7 +7111,8 @@ mod tests {
     #[test]
     fn iter229_parity_raise_exception_strict_hard_errors_with_message() {
         let mut env = build_chat_template_env(RaisePolicy::Strict);
-        env.add_template("t", "{{ raise_exception('boom') }}x").unwrap();
+        env.add_template("t", "{{ raise_exception('boom') }}x")
+            .unwrap();
         let err = env.get_template("t").unwrap().render(()).unwrap_err();
         assert!(err.to_string().contains("boom"), "err={err}");
     }
@@ -7775,13 +7833,8 @@ mod tests {
     fn c4_max_slots_env_unset_defaults_to_1_under_fifo_serial() {
         // CLI says `--max-slots 8` but env+cli say SerialFifo → SerialFifo
         // wins, max_slots is IGNORED.
-        let mode = parse_scheduler_config(
-            Some(cli::SchedulerArg::FifoSerial),
-            None,
-            Some(8),
-            None,
-        )
-        .expect("max_slots on fifo_serial must be ignored, not error");
+        let mode = parse_scheduler_config(Some(cli::SchedulerArg::FifoSerial), None, Some(8), None)
+            .expect("max_slots on fifo_serial must be ignored, not error");
         assert_eq!(
             mode,
             crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7819,13 +7872,8 @@ mod tests {
         );
 
         // Env-supplied HF2Q_MAX_SLOTS=0 → error
-        let err = parse_scheduler_config(
-            None,
-            Some("inflight_batched"),
-            None,
-            Some("0"),
-        )
-        .expect_err("HF2Q_MAX_SLOTS=0 must be rejected, not silently coerced");
+        let err = parse_scheduler_config(None, Some("inflight_batched"), None, Some("0"))
+            .expect_err("HF2Q_MAX_SLOTS=0 must be rejected, not silently coerced");
         assert!(err.contains("max-slots"), "msg: {err}");
 
         // Bonus: non-parseable env value also errors with named diag.

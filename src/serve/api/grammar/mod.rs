@@ -28,11 +28,11 @@
 //! - **Trigger patterns / lazy grammars**: a runtime-sampler feature, not
 //!   a parser concern. Belongs with the sampler iter.
 
-pub mod parser;
-pub mod sampler;
 pub mod json_schema;
 pub mod mask;
+pub mod parser;
 pub mod regex_gbnf;
+pub mod sampler;
 pub mod serialize;
 
 #[allow(unused_imports)]

@@ -194,8 +194,8 @@ impl Qwen35Model {
     ) -> Result<Self> {
         let mut cfg = Self::load_config_only(gguf)?;
 
-        let device = MlxDevice::new()
-            .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+        let device =
+            MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
 
         let (mut token_embd, output_weight, output_norm) =
             weight_loader::load_global_tensors(gguf, &cfg, &device)
@@ -247,9 +247,7 @@ impl Qwen35Model {
         if h > 0 {
             const QWEN35_FULL_VOCAB: u32 = 248_320;
             let current_vocab = cfg.vocab_size;
-            if current_vocab < QWEN35_FULL_VOCAB
-                && (QWEN35_FULL_VOCAB - current_vocab) < 2048
-            {
+            if current_vocab < QWEN35_FULL_VOCAB && (QWEN35_FULL_VOCAB - current_vocab) < 2048 {
                 let rows_to_add = (QWEN35_FULL_VOCAB - current_vocab) as usize;
                 tracing::info!(
                     current_vocab,
@@ -325,19 +323,23 @@ impl Qwen35Model {
                         Qwen35LayerKind::FullAttention => {
                             let attn = weight_loader::load_full_attn_layer(gguf, &cfg, i, &device)
                                 .with_context(|| format!("load_full_attn layer {i}"))?;
-                            Qwen35LayerWeights::FullAttn { attn, ffn: ffn_weights }
+                            Qwen35LayerWeights::FullAttn {
+                                attn,
+                                ffn: ffn_weights,
+                            }
                         }
                         Qwen35LayerKind::LinearAttention => {
                             let attn = weight_loader::load_delta_net_layer(gguf, &cfg, i, &device)
                                 .with_context(|| format!("load_delta_net layer {i}"))?;
-                            Qwen35LayerWeights::LinearAttn { attn, ffn: ffn_weights }
+                            Qwen35LayerWeights::LinearAttn {
+                                attn,
+                                ffn: ffn_weights,
+                            }
                         }
                     }
                 }
-                Qwen35Variant::Dense => {
-                    weight_loader::load_layer(gguf, &cfg, i, &device)
-                        .with_context(|| format!("load_layer {i}"))?
-                }
+                Qwen35Variant::Dense => weight_loader::load_layer(gguf, &cfg, i, &device)
+                    .with_context(|| format!("load_layer {i}"))?,
             };
             layers.push(layer);
         }
@@ -416,9 +418,8 @@ impl Qwen35Model {
             .with_context(|| format!("qwen35 apply_dwq_overlay: read {}", path.display()))?;
         let (_n, metadata_obj) = safetensors::SafeTensors::read_metadata(&bytes)
             .map_err(|e| anyhow::anyhow!("qwen35 apply_dwq_overlay: read_metadata: {e:?}"))?;
-        let (bits, group_size) =
-            parse_dwq_overlay_metadata(metadata_obj.metadata().as_ref())
-                .with_context(|| format!("qwen35 apply_dwq_overlay: metadata of {}", path.display()))?;
+        let (bits, group_size) = parse_dwq_overlay_metadata(metadata_obj.metadata().as_ref())
+            .with_context(|| format!("qwen35 apply_dwq_overlay: metadata of {}", path.display()))?;
         let st = safetensors::SafeTensors::deserialize(&bytes)
             .map_err(|e| anyhow::anyhow!("qwen35 apply_dwq_overlay: deserialize: {e:?}"))?;
 
@@ -471,7 +472,10 @@ impl Qwen35Model {
                 if linear.n != v || linear.k != h {
                     anyhow::bail!(
                         "qwen35 DWQ overlay: output shape ({}, {}) != model lm_head ({}, {})",
-                        linear.n, linear.k, v, h,
+                        linear.n,
+                        linear.k,
+                        v,
+                        h,
                     );
                 }
                 // ADR-020 AC#7 foundation F2 — measure the Q4_0 round-trip
@@ -491,9 +495,14 @@ impl Qwen35Model {
                              ({n}x{k}, gs={gs}, bits={bits}); \
                              read: relative_rms<0.1 ⇒ codec preserves signal, \
                              >0.5 ⇒ codec destroys it",
-                            rms = d.rms_drift, max = d.max_abs_drift,
-                            rrms = d.relative_rms, bf = d.bias_fraction,
-                            n = d.n, k = d.k, gs = d.group_size, bits = d.bits,
+                            rms = d.rms_drift,
+                            max = d.max_abs_drift,
+                            rrms = d.relative_rms,
+                            bf = d.bias_fraction,
+                            n = d.n,
+                            k = d.k,
+                            gs = d.group_size,
+                            bits = d.bits,
                         );
                     }
                     Err(e) => {
@@ -551,9 +560,9 @@ impl Qwen35Model {
             // layer iter), so a DeltaNet stem would mean a malformed
             // overlay; we log + skip rather than panic.
             let attn_role_target: Option<AttnRole> = match role {
-                "attn_q"      => Some(AttnRole::Q),
-                "attn_k"      => Some(AttnRole::K),
-                "attn_v"      => Some(AttnRole::V),
+                "attn_q" => Some(AttnRole::Q),
+                "attn_k" => Some(AttnRole::K),
+                "attn_v" => Some(AttnRole::V),
                 "attn_output" => Some(AttnRole::Output),
                 _ => None,
             };
@@ -578,8 +587,10 @@ impl Qwen35Model {
                                  rms={rms:.4e} max={max:.4e} \
                                  relative_rms={rrms:.4} bias_fraction={bf:.4}",
                                 role_label = layer_kind_label,
-                                rms = d.rms_drift, max = d.max_abs_drift,
-                                rrms = d.relative_rms, bf = d.bias_fraction,
+                                rms = d.rms_drift,
+                                max = d.max_abs_drift,
+                                rrms = d.relative_rms,
+                                bf = d.bias_fraction,
                             ),
                             Err(e) => tracing::warn!(error = %e,
                                 "qwen35 DWQ overlay: {} layer {} drift skipped",
@@ -612,7 +623,7 @@ impl Qwen35Model {
             // every dense FFN role (codec preserves >90% of DWQ signal).
             let dense_ffn_role: Option<DenseFfnRole> = match role {
                 "ffn_gate" => Some(DenseFfnRole::Gate),
-                "ffn_up"   => Some(DenseFfnRole::Up),
+                "ffn_up" => Some(DenseFfnRole::Up),
                 "ffn_down" => Some(DenseFfnRole::Down),
                 _ => None,
             };
@@ -621,7 +632,12 @@ impl Qwen35Model {
                     .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
                 let role_label = format!("{ffn_role:?}");
                 match overwrite_dense_ffn_q4_0_linear(
-                    &mut self.layers[layer_idx], ffn_role, &linear, layer_idx, stem, device,
+                    &mut self.layers[layer_idx],
+                    ffn_role,
+                    &linear,
+                    layer_idx,
+                    stem,
+                    device,
                 ) {
                     Ok(()) => {
                         match linear.q4_0_round_trip_drift() {
@@ -630,8 +646,10 @@ impl Qwen35Model {
                                  (layer {layer_idx}) Q4_0 round-trip drift: \
                                  rms={rms:.4e} max={max:.4e} \
                                  relative_rms={rrms:.4} bias_fraction={bf:.4}",
-                                rms = d.rms_drift, max = d.max_abs_drift,
-                                rrms = d.relative_rms, bf = d.bias_fraction,
+                                rms = d.rms_drift,
+                                max = d.max_abs_drift,
+                                rrms = d.relative_rms,
+                                bf = d.bias_fraction,
                             ),
                             Err(e) => tracing::warn!(error = %e,
                                 "qwen35 DWQ overlay: {} layer {} drift skipped",
@@ -694,7 +712,8 @@ impl Qwen35Model {
             if bits_per != 4 || gs_per != 32 {
                 anyhow::bail!(
                     "qwen35 DWQ overlay: only bits=4 group_size=32 supported (got bits={}, gs={})",
-                    bits_per, gs_per,
+                    bits_per,
+                    gs_per,
                 );
             }
             let pack_factor = 32 / bits_per as usize;
@@ -704,10 +723,8 @@ impl Qwen35Model {
             // Pack + BF16 conversion + upload.
             let stack_words = n_experts * n * k_packed;
             let mut packed_stack: Vec<u32> = vec![0u32; stack_words];
-            let mut scales_stack_bf16: Vec<u16> =
-                vec![0u16; n_experts * n * groups_per_row];
-            let mut biases_stack_bf16: Vec<u16> =
-                vec![0u16; n_experts * n * groups_per_row];
+            let mut scales_stack_bf16: Vec<u16> = vec![0u16; n_experts * n * groups_per_row];
+            let mut biases_stack_bf16: Vec<u16> = vec![0u16; n_experts * n * groups_per_row];
             for (e, lin) in &linears {
                 for row in 0..n {
                     for kp in 0..k_packed {
@@ -791,7 +808,14 @@ impl Qwen35Model {
                     }
                 }
                 moe_stacked += 1;
-                tracing::debug!(layer_idx, ?base, n_experts, n, k, "qwen35 DWQ overlay applied");
+                tracing::debug!(
+                    layer_idx,
+                    ?base,
+                    n_experts,
+                    n,
+                    k,
+                    "qwen35 DWQ overlay applied"
+                );
             } else {
                 tracing::warn!(
                     layer_idx,
@@ -880,11 +904,14 @@ fn dwq_to_native_q4_0_f32(
     if linear.n != expect_n || linear.k != expect_k {
         anyhow::bail!(
             "dwq_to_native_q4_0_f32: {role:?} shape ({}, {}) != expected ({}, {})",
-            linear.n, linear.k, expect_n, expect_k,
+            linear.n,
+            linear.k,
+            expect_n,
+            expect_k,
         );
     }
 
-    let dwq_flat = linear.dequantize_to_f32();   // [n, k] row-major
+    let dwq_flat = linear.dequantize_to_f32(); // [n, k] row-major
     debug_assert_eq!(dwq_flat.len(), expect_n * expect_k);
 
     // Transpose into GGUF native layout (rows = output dim).
@@ -981,13 +1008,11 @@ fn overwrite_dense_ffn_q4_0_linear(
     let hidden = dq.hidden_size as usize;
     let native_f32 = dwq_to_native_q4_0_f32(linear, role, intermediate, hidden)?;
     let new_buf =
-        crate::inference::models::qwen35::gpu_full_attn::upload_q4_0_from_f32(
-            &native_f32, device,
-        )
-        .with_context(|| format!("qwen35 DWQ overlay: re-Q4_0 upload {stem}"))?;
+        crate::inference::models::qwen35::gpu_full_attn::upload_q4_0_from_f32(&native_f32, device)
+            .with_context(|| format!("qwen35 DWQ overlay: re-Q4_0 upload {stem}"))?;
     match role {
         DenseFfnRole::Gate => dq.gate_q = new_buf,
-        DenseFfnRole::Up   => dq.up_q   = new_buf,
+        DenseFfnRole::Up => dq.up_q = new_buf,
         DenseFfnRole::Down => dq.down_q = new_buf,
     }
     Ok(())
@@ -1031,16 +1056,19 @@ fn overwrite_full_attn_f32_linear(
     // Target Vec<f32> slot for this role (mut borrow needed; pick after
     // the LinearAttn rejection).
     let (slot, expected_label): (&mut Vec<f32>, &'static str) = match role {
-        AttnRole::Q      => (&mut attn.wq, "wq"),
-        AttnRole::K      => (&mut attn.wk, "wk"),
-        AttnRole::V      => (&mut attn.wv, "wv"),
+        AttnRole::Q => (&mut attn.wq, "wq"),
+        AttnRole::K => (&mut attn.wk, "wk"),
+        AttnRole::V => (&mut attn.wv, "wv"),
         AttnRole::Output => (&mut attn.wo, "wo"),
     };
     if linear.n * linear.k != slot.len() {
         anyhow::bail!(
             "qwen35 DWQ overlay: {expected_label} layer {layer_idx} shape \
              mismatch — overlay [{} x {}] = {} elements vs live slot {} elements",
-            linear.n, linear.k, linear.n * linear.k, slot.len(),
+            linear.n,
+            linear.k,
+            linear.n * linear.k,
+            slot.len(),
         );
     }
     *slot = linear.dequantize_to_f32();
@@ -1110,10 +1138,7 @@ fn empty_ffn_for(cfg: &Qwen35Config) -> Qwen35FfnWeights {
             })
         }
         Qwen35Variant::Moe => {
-            let moe_cfg = cfg
-                .moe
-                .as_ref()
-                .expect("moe variant requires moe config");
+            let moe_cfg = cfg.moe.as_ref().expect("moe variant requires moe config");
             let h = cfg.hidden_size as usize;
             let ne = moe_cfg.num_experts as usize;
             let m_moe = moe_cfg.moe_intermediate_size as usize;
@@ -1131,7 +1156,6 @@ fn empty_ffn_for(cfg: &Qwen35Config) -> Qwen35FfnWeights {
         }
     }
 }
-
 
 // ================================================================
 // Tests
@@ -1231,10 +1255,7 @@ mod tests {
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         for i in 0..40 {
-            assert_eq!(
-                m.layer_kind(i).unwrap(),
-                cfg.layer_types[i as usize]
-            );
+            assert_eq!(m.layer_kind(i).unwrap(), cfg.layer_types[i as usize]);
         }
     }
 
@@ -1278,10 +1299,9 @@ mod tests {
                 let nv = cfg.linear_num_value_heads as usize;
                 assert_eq!(attn.ssm_a.len(), nv);
                 assert_eq!(attn.ssm_dt_bias.len(), nv);
-                let qkv_channels =
-                    (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
-                        + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
-                        as usize;
+                let qkv_channels = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
+                    as usize;
                 let k_width = cfg.linear_conv_kernel_dim as usize;
                 assert_eq!(attn.ssm_conv1d.len(), k_width * qkv_channels);
             }
@@ -1317,7 +1337,15 @@ mod tests {
         let biases: Vec<f32> = (0..(n * groups_per_row))
             .map(|i| -0.05 + (i as f32) * 1e-4)
             .collect();
-        MlxAffineLinear { n, k, group_size, bits: 4, q_int, scales, biases }
+        MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits: 4,
+            q_int,
+            scales,
+            biases,
+        }
     }
 
     /// Build a 1-FullAttn-layer Qwen35Config (for cheap unit tests of
@@ -1338,28 +1366,32 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = one_full_attn_cfg();
         let mut model = Qwen35Model::empty_from_cfg(cfg);
-        let n_q  = model.cfg.num_attention_heads as usize * model.cfg.head_dim as usize;
-        let h    = model.cfg.hidden_size as usize;
-        let lin  = synth_attn_linear(n_q, h);
+        let n_q = model.cfg.num_attention_heads as usize * model.cfg.head_dim as usize;
+        let h = model.cfg.hidden_size as usize;
+        let lin = synth_attn_linear(n_q, h);
         let expected = lin.dequantize_to_f32();
 
         // Sanity: empty_from_cfg gives wq filled with 0s; ensure overlay changes it.
         match &model.layers[0] {
             Qwen35LayerWeights::FullAttn { attn, .. } => {
-                assert!(attn.wq.iter().all(|&v| v == 0.0), "empty wq must start zeroed");
+                assert!(
+                    attn.wq.iter().all(|&v| v == 0.0),
+                    "empty wq must start zeroed"
+                );
             }
             _ => panic!("layer 0 must be FullAttn after one_full_attn_cfg override"),
         }
 
-        overwrite_full_attn_f32_linear(
-            &mut model.layers[0], AttnRole::Q, &lin, 0, "blk.0.attn_q",
-        ).expect("overwrite must succeed on shape match");
+        overwrite_full_attn_f32_linear(&mut model.layers[0], AttnRole::Q, &lin, 0, "blk.0.attn_q")
+            .expect("overwrite must succeed on shape match");
 
         match &model.layers[0] {
             Qwen35LayerWeights::FullAttn { attn, .. } => {
                 assert_eq!(attn.wq.len(), expected.len());
-                assert_eq!(attn.wq, expected,
-                    "wq must equal dequantize_to_f32 output bit-identically");
+                assert_eq!(
+                    attn.wq, expected,
+                    "wq must equal dequantize_to_f32 output bit-identically"
+                );
             }
             _ => unreachable!(),
         }
@@ -1370,43 +1402,50 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Each AttnRole must hit its own slot; no cross-pollination.
         let cfg = one_full_attn_cfg();
-        let n_q  = cfg.num_attention_heads as usize * cfg.head_dim as usize;
+        let n_q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
         let n_kv = cfg.num_key_value_heads as usize * cfg.head_dim as usize;
-        let h    = cfg.hidden_size as usize;
+        let h = cfg.hidden_size as usize;
 
         let cases: &[(AttnRole, usize, usize)] = &[
-            (AttnRole::Q,      n_q,  h   ),
-            (AttnRole::K,      n_kv, h   ),
-            (AttnRole::V,      n_kv, h   ),
-            (AttnRole::Output, h,    n_q ),
+            (AttnRole::Q, n_q, h),
+            (AttnRole::K, n_kv, h),
+            (AttnRole::V, n_kv, h),
+            (AttnRole::Output, h, n_q),
         ];
         for (role, n, k) in cases.iter().copied() {
             let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
             let lin = synth_attn_linear(n, k);
             let expected = lin.dequantize_to_f32();
-            overwrite_full_attn_f32_linear(
-                &mut model.layers[0], role, &lin, 0, "test",
-            ).expect("must succeed");
+            overwrite_full_attn_f32_linear(&mut model.layers[0], role, &lin, 0, "test")
+                .expect("must succeed");
             match &model.layers[0] {
                 Qwen35LayerWeights::FullAttn { attn, .. } => {
                     let actual = match role {
-                        AttnRole::Q      => &attn.wq,
-                        AttnRole::K      => &attn.wk,
-                        AttnRole::V      => &attn.wv,
+                        AttnRole::Q => &attn.wq,
+                        AttnRole::K => &attn.wk,
+                        AttnRole::V => &attn.wv,
                         AttnRole::Output => &attn.wo,
                     };
-                    assert_eq!(actual, &expected,
-                        "role {role:?} must hit its own slot bit-identically");
+                    assert_eq!(
+                        actual, &expected,
+                        "role {role:?} must hit its own slot bit-identically"
+                    );
                     // Other roles' slots remain zeroed (no cross-pollination).
                     let untouched: &[&Vec<f32>] = &[&attn.wq, &attn.wk, &attn.wv, &attn.wo];
                     for (idx, slot) in untouched.iter().enumerate() {
                         let role_idx = match role {
-                            AttnRole::Q => 0, AttnRole::K => 1,
-                            AttnRole::V => 2, AttnRole::Output => 3,
+                            AttnRole::Q => 0,
+                            AttnRole::K => 1,
+                            AttnRole::V => 2,
+                            AttnRole::Output => 3,
                         };
-                        if idx == role_idx { continue; }
-                        assert!(slot.iter().all(|&v| v == 0.0),
-                            "non-target slot {idx} for role {role:?} was modified");
+                        if idx == role_idx {
+                            continue;
+                        }
+                        assert!(
+                            slot.iter().all(|&v| v == 0.0),
+                            "non-target slot {idx} for role {role:?} was modified"
+                        );
                     }
                 }
                 _ => unreachable!(),
@@ -1421,18 +1460,27 @@ mod tests {
         // Find a LinearAttention layer (default arrangement has them
         // at every non-(every-Nth) position).
         let mut model = Qwen35Model::empty_from_cfg(cfg);
-        let linear_idx = model.layers.iter()
+        let linear_idx = model
+            .layers
+            .iter()
             .position(|l| matches!(l, Qwen35LayerWeights::LinearAttn { .. }))
             .expect("dense_cfg_12 must contain at least one LinearAttn layer");
         let n_q = model.cfg.num_attention_heads as usize * model.cfg.head_dim as usize;
-        let h   = model.cfg.hidden_size as usize;
+        let h = model.cfg.hidden_size as usize;
         let lin = synth_attn_linear(n_q, h);
         let err = overwrite_full_attn_f32_linear(
-            &mut model.layers[linear_idx], AttnRole::Q, &lin, linear_idx, "blk.X.attn_q",
-        ).expect_err("overlay on LinearAttn layer must error");
+            &mut model.layers[linear_idx],
+            AttnRole::Q,
+            &lin,
+            linear_idx,
+            "blk.X.attn_q",
+        )
+        .expect_err("overlay on LinearAttn layer must error");
         let msg = format!("{err}");
-        assert!(msg.contains("LinearAttention"),
-            "error must name the layer kind; got: {msg}");
+        assert!(
+            msg.contains("LinearAttention"),
+            "error must name the layer kind; got: {msg}"
+        );
     }
 
     #[test]
@@ -1444,11 +1492,18 @@ mod tests {
         // wrong N: pass an arbitrary too-small (n, k) pair.
         let bad = synth_attn_linear(32, h);
         let err = overwrite_full_attn_f32_linear(
-            &mut model.layers[0], AttnRole::Q, &bad, 0, "blk.0.attn_q",
-        ).expect_err("shape mismatch must error");
+            &mut model.layers[0],
+            AttnRole::Q,
+            &bad,
+            0,
+            "blk.0.attn_q",
+        )
+        .expect_err("shape mismatch must error");
         let msg = format!("{err}");
-        assert!(msg.contains("shape mismatch"),
-            "error must name shape mismatch; got: {msg}");
+        assert!(
+            msg.contains("shape mismatch"),
+            "error must name shape mismatch; got: {msg}"
+        );
     }
 
     // ── ADR-020 AC#7 iter B2.B — dwq_to_native_q4_0_f32 transpose tests ──
@@ -1469,7 +1524,15 @@ mod tests {
             .collect();
         let scales = vec![1.0f32; n * groups_per_row];
         let biases = vec![0.0f32; n * groups_per_row];
-        MlxAffineLinear { n, k, group_size, bits: 4, q_int, scales, biases }
+        MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits: 4,
+            q_int,
+            scales,
+            biases,
+        }
     }
 
     #[test]
@@ -1486,16 +1549,17 @@ mod tests {
         // Native should be transposed: native[r=inter_row, c=hidden_col]
         // = dwq_flat[c=hidden_row, r=inter_col]. Re-index check:
         //   native[r * hidden + c] = dwq_flat[c * inter + r]
-        let native = dwq_to_native_q4_0_f32(
-            &lin, DenseFfnRole::Gate, inter, hidden,
-        ).expect("must succeed on shape match");
+        let native = dwq_to_native_q4_0_f32(&lin, DenseFfnRole::Gate, inter, hidden)
+            .expect("must succeed on shape match");
         assert_eq!(native.len(), inter * hidden);
         for r in 0..inter {
             for c in 0..hidden {
                 let want = ((c * inter + r) % 16) as f32;
                 let got = native[r * hidden + c];
-                assert_eq!(got, want,
-                    "gate transpose [r={r}, c={c}]: got {got} want {want}");
+                assert_eq!(
+                    got, want,
+                    "gate transpose [r={r}, c={c}]: got {got} want {want}"
+                );
             }
         }
     }
@@ -1508,17 +1572,18 @@ mod tests {
         let hidden = 64usize;
         let inter = 128usize;
         let lin = synth_ffn_linear(inter, hidden);
-        let native = dwq_to_native_q4_0_f32(
-            &lin, DenseFfnRole::Down, inter, hidden,
-        ).expect("must succeed on shape match");
+        let native = dwq_to_native_q4_0_f32(&lin, DenseFfnRole::Down, inter, hidden)
+            .expect("must succeed on shape match");
         assert_eq!(native.len(), hidden * inter);
         // native[r=hidden_row, c=inter_col] = dwq_flat[c=inter_row, r=hidden_col]
         for r in 0..hidden {
             for c in 0..inter {
                 let want = ((c * hidden + r) % 16) as f32;
                 let got = native[r * inter + c];
-                assert_eq!(got, want,
-                    "down transpose [r={r}, c={c}]: got {got} want {want}");
+                assert_eq!(
+                    got, want,
+                    "down transpose [r={r}, c={c}]: got {got} want {want}"
+                );
             }
         }
     }
@@ -1530,13 +1595,14 @@ mod tests {
         // must error rather than silently transposing wrong data.
         let hidden = 64usize;
         let inter = 128usize;
-        let bad = synth_ffn_linear(inter, hidden);  // wrong order for Gate
-        let err = dwq_to_native_q4_0_f32(
-            &bad, DenseFfnRole::Gate, inter, hidden,
-        ).expect_err("wrong-shape MlxAffineLinear must error for Gate role");
+        let bad = synth_ffn_linear(inter, hidden); // wrong order for Gate
+        let err = dwq_to_native_q4_0_f32(&bad, DenseFfnRole::Gate, inter, hidden)
+            .expect_err("wrong-shape MlxAffineLinear must error for Gate role");
         let msg = format!("{err}");
-        assert!(msg.contains("shape"),
-            "error message must mention shape; got: {msg}");
+        assert!(
+            msg.contains("shape"),
+            "error message must mention shape; got: {msg}"
+        );
     }
 
     #[test]
@@ -1548,20 +1614,24 @@ mod tests {
         let inter = 128usize;
         let cases: &[(DenseFfnRole, usize, usize, usize)] = &[
             (DenseFfnRole::Gate, hidden, inter, hidden), // row_len = hidden
-            (DenseFfnRole::Up,   hidden, inter, hidden),
-            (DenseFfnRole::Down, inter,  hidden, inter), // row_len = inter
+            (DenseFfnRole::Up, hidden, inter, hidden),
+            (DenseFfnRole::Down, inter, hidden, inter), // row_len = inter
         ];
         for (role, dwq_n, dwq_k, expected_row_len) in cases.iter().copied() {
             let lin = synth_ffn_linear(dwq_n, dwq_k);
-            let native = dwq_to_native_q4_0_f32(
-                &lin, role, inter, hidden,
-            ).expect("must succeed");
-            assert_eq!(native.len(), hidden * inter,
-                "{role:?}: total element count must be hidden*inter");
+            let native = dwq_to_native_q4_0_f32(&lin, role, inter, hidden).expect("must succeed");
+            assert_eq!(
+                native.len(),
+                hidden * inter,
+                "{role:?}: total element count must be hidden*inter"
+            );
             // Row length determines Q4_0 quantize_row block alignment;
             // both 64 and 128 are multiples of QK4_0=32.
-            assert_eq!(expected_row_len % 32, 0,
-                "{role:?}: row_len {expected_row_len} must align to QK4_0=32");
+            assert_eq!(
+                expected_row_len % 32,
+                0,
+                "{role:?}: row_len {expected_row_len} must align to QK4_0=32"
+            );
         }
     }
 
@@ -1589,9 +1659,15 @@ mod tests {
         // production overlays save as BF16 (writer_round_trips_with_reader_bf16_scales
         // covers that path).  F32 keeps the assertion deterministic at
         // dequantize_to_f32 bit-identity.
-        let owned: Vec<(String, MlxAffineLinearBytes)> = triplets.iter()
-            .map(|(stem, lin)| (stem.clone(),
-                lin.to_safetensors_bytes(Dtype::F32).expect("to_safetensors_bytes")))
+        let owned: Vec<(String, MlxAffineLinearBytes)> = triplets
+            .iter()
+            .map(|(stem, lin)| {
+                (
+                    stem.clone(),
+                    lin.to_safetensors_bytes(Dtype::F32)
+                        .expect("to_safetensors_bytes"),
+                )
+            })
             .collect();
         let mut entries: Vec<(String, safetensors::tensor::TensorView<'_>)> = Vec::new();
         for (stem, bytes) in &owned {
@@ -1604,8 +1680,8 @@ mod tests {
         metadata.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
         metadata.insert("bits".to_string(), bits.to_string());
         metadata.insert("group_size".to_string(), group_size.to_string());
-        let serialized = safetensors::tensor::serialize(entries, Some(metadata))
-            .expect("safetensors serialize");
+        let serialized =
+            safetensors::tensor::serialize(entries, Some(metadata)).expect("safetensors serialize");
         std::fs::write(path, &serialized).expect("write tempfile");
     }
 
@@ -1616,8 +1692,8 @@ mod tests {
         let mut cfg = dense_cfg_12();
         cfg.layer_types[0] = Qwen35LayerKind::FullAttention;
         let n_q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
-        let h   = cfg.hidden_size as usize;
-        let v   = cfg.vocab_size as usize;
+        let h = cfg.hidden_size as usize;
+        let v = cfg.vocab_size as usize;
         let mut model = Qwen35Model::empty_from_cfg(cfg);
 
         // Synthetic: lm_head (output) and one attn_q on layer 0.
@@ -1640,20 +1716,29 @@ mod tests {
             }
         };
 
-        let n_overrides = model.apply_dwq_overlay(&device, &path)
+        let n_overrides = model
+            .apply_dwq_overlay(&device, &path)
             .expect("apply_dwq_overlay must succeed on a clean overlay");
-        assert_eq!(n_overrides, 2,
-            "expected 2 overrides (1 lm_head + 1 attn_q); got {n_overrides}");
+        assert_eq!(
+            n_overrides, 2,
+            "expected 2 overrides (1 lm_head + 1 attn_q); got {n_overrides}"
+        );
 
         // lm_head: Vec<f32> matches dequantized DWQ codes bit-identically.
-        assert_eq!(model.output_weight, lin_output.dequantize_to_f32(),
-            "lm_head Vec<f32> must equal MlxAffineLinear::dequantize_to_f32 output");
+        assert_eq!(
+            model.output_weight,
+            lin_output.dequantize_to_f32(),
+            "lm_head Vec<f32> must equal MlxAffineLinear::dequantize_to_f32 output"
+        );
 
         // attn_q: layer 0's wq matches dequantized DWQ codes.
         match &model.layers[0] {
             Qwen35LayerWeights::FullAttn { attn, .. } => {
-                assert_eq!(attn.wq, lin_attn_q.dequantize_to_f32(),
-                    "layer-0 wq must equal MlxAffineLinear::dequantize_to_f32 output");
+                assert_eq!(
+                    attn.wq,
+                    lin_attn_q.dequantize_to_f32(),
+                    "layer-0 wq must equal MlxAffineLinear::dequantize_to_f32 output"
+                );
             }
             _ => panic!("layer 0 must be FullAttn after override"),
         }
@@ -1669,16 +1754,16 @@ mod tests {
         // overall return count is 0.
         let mut cfg = dense_cfg_12();
         cfg.layer_types[0] = Qwen35LayerKind::FullAttention;
-        let h     = cfg.hidden_size as usize;
-        let inter = cfg.intermediate_size.expect("dense_cfg_12 sets intermediate_size") as usize;
+        let h = cfg.hidden_size as usize;
+        let inter = cfg
+            .intermediate_size
+            .expect("dense_cfg_12 sets intermediate_size") as usize;
         let mut model = Qwen35Model::empty_from_cfg(cfg);
 
         // Synthetic ffn_gate sized correctly but routed at a Dense (not
         // DenseQ) FFN; helper must error → handler logs warn + skips.
         let lin_gate = synth_attn_linear(h, inter);
-        let triplets = vec![
-            ("blk.0.ffn_gate".to_string(), lin_gate),
-        ];
+        let triplets = vec![("blk.0.ffn_gate".to_string(), lin_gate)];
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("overlay.safetensors");
@@ -1686,13 +1771,19 @@ mod tests {
 
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
-            Err(e) => { eprintln!("SKIP: {e}"); return; }
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
         };
 
-        let n_overrides = model.apply_dwq_overlay(&device, &path)
+        let n_overrides = model
+            .apply_dwq_overlay(&device, &path)
             .expect("apply_dwq_overlay must succeed even when ffn variant gates");
-        assert_eq!(n_overrides, 0,
-            "expected 0 overrides — Dense (not DenseQ) variant must be skipped; got {n_overrides}");
+        assert_eq!(
+            n_overrides, 0,
+            "expected 0 overrides — Dense (not DenseQ) variant must be skipped; got {n_overrides}"
+        );
     }
 
     /// Integration smoke: load_from_gguf on the real apex returns a fully-

@@ -70,9 +70,9 @@ use sha2::Digest;
 mod synthetic_spiller;
 
 use synthetic_spiller::{
-    chain_hash_blocks, fingerprint_for_test, make_test_payload, BlockHash, BlockStore,
-    ModelFingerprint, MockEngine, MockKvSpiller, MockLoadedHandle, RestoreOutcome,
-    SpillOutcome, SyntheticSpiller, BLOCK_TOKENS, KV_CACHE_FORMAT_VERSION,
+    chain_hash_blocks, fingerprint_for_test, make_test_payload, BlockHash, BlockStore, MockEngine,
+    MockKvSpiller, MockLoadedHandle, ModelFingerprint, RestoreOutcome, SpillOutcome,
+    SyntheticSpiller, BLOCK_TOKENS, KV_CACHE_FORMAT_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,10 +197,7 @@ impl MatrixCell {
         match self.family {
             Family::Gemma4_26b => matches!(
                 self.quant,
-                WeightQuant::Q4_0
-                    | WeightQuant::Q4_K_M
-                    | WeightQuant::Q6_K
-                    | WeightQuant::Q8_0
+                WeightQuant::Q4_0 | WeightQuant::Q4_K_M | WeightQuant::Q6_K | WeightQuant::Q8_0
             ),
             Family::Qwen35Moe_DynamicQuant46 => false, // ADR-013 gate
         }
@@ -262,8 +259,12 @@ pub fn generate_matrix() -> Vec<MatrixCell> {
     ];
 
     let mut out = Vec::with_capacity(
-        families.len() * quants.len() * kv_paths.len() * prefix_lens.len()
-            * cache_states.len() * scenarios.len(),
+        families.len()
+            * quants.len()
+            * kv_paths.len()
+            * prefix_lens.len()
+            * cache_states.len()
+            * scenarios.len(),
     );
     for family in &families {
         for quant in &quants {
@@ -495,9 +496,7 @@ pub mod subprocess_driver {
     //!   short-circuit fails
     //!   `synthesize_cache_hit_prediction_uses_real_io_wall_not_constants`.
 
-    use super::synthetic_spiller::{
-        ModelFingerprint, SyntheticSpiller, BLOCK_TOKENS,
-    };
+    use super::synthetic_spiller::{ModelFingerprint, SyntheticSpiller, BLOCK_TOKENS};
     use super::{Family, KvPath, MatrixCell};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::path::{Path, PathBuf};
@@ -613,7 +612,10 @@ pub mod subprocess_driver {
                     write!(f, "hf2q binary not found: {s}")
                 }
                 DriverError::SpawnFailed(s) => write!(f, "spawn failed: {s}"),
-                DriverError::ReadyzTimeout { waited_secs, last_err } => {
+                DriverError::ReadyzTimeout {
+                    waited_secs,
+                    last_err,
+                } => {
                     write!(
                         f,
                         "readyz timeout after {waited_secs}s; last_err={last_err}"
@@ -719,9 +721,7 @@ pub mod subprocess_driver {
     /// stderr into a bounded ring buffer for `log_tail`. The caller is
     /// responsible for calling `wait_for_readyz` before issuing any
     /// HTTP requests.
-    pub fn spawn_hf2q_serve_subprocess(
-        cfg: &CellConfig,
-    ) -> Result<ServerGuard, DriverError> {
+    pub fn spawn_hf2q_serve_subprocess(cfg: &CellConfig) -> Result<ServerGuard, DriverError> {
         let bin = locate_binary()?;
         if !cfg.model_path.exists() {
             return Err(DriverError::SpawnFailed(format!(
@@ -795,10 +795,8 @@ pub mod subprocess_driver {
         let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.write_all(
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )?;
         let mut head = [0u8; 64];
         let n = s.read(&mut head)?;
@@ -844,7 +842,11 @@ pub mod subprocess_driver {
             "temperature": 0,
             "stream": false,
         });
-        let url = format!("http://{}:{}/v1/chat/completions", server.host(), server.port());
+        let url = format!(
+            "http://{}:{}/v1/chat/completions",
+            server.host(),
+            server.port()
+        );
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -858,10 +860,7 @@ pub mod subprocess_driver {
         let status = resp.status().as_u16();
         let txt = resp.text().unwrap_or_else(|_| "<unreadable>".into());
         if status != 200 {
-            return Err(DriverError::Http {
-                status,
-                body: txt,
-            });
+            return Err(DriverError::Http { status, body: txt });
         }
         Ok(t0.elapsed())
     }
@@ -882,10 +881,7 @@ pub mod subprocess_driver {
         if resp.status().as_u16() != 200 {
             let status = resp.status().as_u16();
             let txt = resp.text().unwrap_or_else(|_| "<unreadable>".into());
-            return Err(DriverError::Http {
-                status,
-                body: txt,
-            });
+            return Err(DriverError::Http { status, body: txt });
         }
         let v: serde_json::Value = resp
             .json()
@@ -893,11 +889,9 @@ pub mod subprocess_driver {
         v["data"][0]["id"]
             .as_str()
             .map(|s| s.to_string())
-            .ok_or_else(|| {
-                DriverError::Http {
-                    status: 200,
-                    body: format!("/v1/models missing data[0].id: {v}"),
-                }
+            .ok_or_else(|| DriverError::Http {
+                status: 200,
+                body: format!("/v1/models missing data[0].id: {v}"),
             })
     }
 
@@ -936,8 +930,7 @@ pub mod subprocess_driver {
                 Err((err, elapsed_ms)) => {
                     let is_transient_transport = matches!(err, DriverError::Transport(_))
                         && elapsed_ms < TRANSIENT_RETRY_THRESHOLD_MS;
-                    if !is_transient_transport
-                        || (retry_count as usize) >= RETRY_BACKOFFS_MS.len()
+                    if !is_transient_transport || (retry_count as usize) >= RETRY_BACKOFFS_MS.len()
                     {
                         return Err(err);
                     }
@@ -986,22 +979,17 @@ pub mod subprocess_driver {
             .map_err(|e| (DriverError::Transport(e.to_string()), 0))?;
 
         let t0 = Instant::now();
-        let resp = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .map_err(|e| (DriverError::Transport(e.to_string()), t0.elapsed().as_millis()))?;
+        let resp = client.post(&url).json(&body).send().map_err(|e| {
+            (
+                DriverError::Transport(e.to_string()),
+                t0.elapsed().as_millis(),
+            )
+        })?;
         let status = resp.status().as_u16();
         if status != 200 {
             let elapsed = t0.elapsed().as_millis();
             let txt = resp.text().unwrap_or_else(|_| "<unreadable>".into());
-            return Err((
-                DriverError::Http {
-                    status,
-                    body: txt,
-                },
-                elapsed,
-            ));
+            return Err((DriverError::Http { status, body: txt }, elapsed));
         }
         let ct = resp
             .headers()
@@ -1162,10 +1150,7 @@ pub mod subprocess_driver {
         let status = resp.status().as_u16();
         if status != 200 {
             let txt = resp.text().unwrap_or_else(|_| "<unreadable>".into());
-            return Err(DriverError::Http {
-                status,
-                body: txt,
-            });
+            return Err(DriverError::Http { status, body: txt });
         }
         let mut ttft_ms: Option<f64> = None;
         let mut reader = BufReader::new(resp);
@@ -1204,9 +1189,7 @@ pub mod subprocess_driver {
         }
         let eviction_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let second_request_ttft_ms = ttft_ms.ok_or_else(|| {
-            DriverError::Eviction(
-                "no content delta observed on swap-back-in turn".to_string(),
-            )
+            DriverError::Eviction("no content delta observed on swap-back-in turn".to_string())
         })?;
         Ok(EvictionMeasurement {
             eviction_wall_ms,
@@ -1658,12 +1641,7 @@ fn run_cell_with_subprocess(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let no_cache = subprocess_driver::measure_ttft_subprocess(
-        &server,
-        &canonical,
-        &prompt,
-        16,
-    )?;
+    let no_cache = subprocess_driver::measure_ttft_subprocess(&server, &canonical, &prompt, 16)?;
 
     // Synthesize the cache-hit prediction via real disk I/O on the
     // synthetic-spiller fixture. The fixture's BlockStore was already
@@ -1697,9 +1675,8 @@ fn run_cell_with_subprocess(
         let link_path = tmp_link.path().join("kv-persist-clone.gguf");
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(model_path, &link_path).map_err(|e| {
-                subprocess_driver::DriverError::Eviction(format!("symlink: {e}"))
-            })?;
+            std::os::unix::fs::symlink(model_path, &link_path)
+                .map_err(|e| subprocess_driver::DriverError::Eviction(format!("symlink: {e}")))?;
             // Phase A0.2b defect 2: the swap-back-in pool-key trick
             // creates a tempdir with a distinct file_stem, but
             // `find_config` / `find_tokenizer` (src/serve/mod.rs:127-188)
@@ -1740,12 +1717,9 @@ fn run_cell_with_subprocess(
             if let Some(src_stem) = model_path.file_stem().and_then(|s| s.to_str()) {
                 let mmproj_src = model_parent.join(format!("{src_stem}-mmproj.gguf"));
                 if mmproj_src.exists() {
-                    if let Some(link_stem) = link_path.file_stem().and_then(|s| s.to_str())
-                    {
-                        let mmproj_dst =
-                            tmp_link.path().join(format!("{link_stem}-mmproj.gguf"));
-                        if let Err(e) = std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst)
-                        {
+                    if let Some(link_stem) = link_path.file_stem().and_then(|s| s.to_str()) {
+                        let mmproj_dst = tmp_link.path().join(format!("{link_stem}-mmproj.gguf"));
+                        if let Err(e) = std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst) {
                             return Err(subprocess_driver::DriverError::Eviction(format!(
                                 "symlink mmproj: {e}"
                             )));
@@ -1818,10 +1792,9 @@ fn matrix_max_prefix_override() -> Option<u32> {
 /// fixture-only path. Gates short-circuit with a single diagnostic when
 /// this is false, instead of asserting on placeholder NaN fields.
 fn matrix_was_measured(results: &[CellResult]) -> bool {
-    results.iter().any(|r| {
-        r.ran
-            && (r.no_cache_ttft_ms.is_finite() || r.cache_hit_ttft_ms.is_finite())
-    })
+    results
+        .iter()
+        .any(|r| r.ran && (r.no_cache_ttft_ms.is_finite() || r.cache_hit_ttft_ms.is_finite()))
 }
 
 /// R-P4, R-P5, R-P6 — the three "ship gates" out of ADR-017 §Performance
@@ -1937,7 +1910,8 @@ pub fn assert_coherence_gates(results: &[CellResult]) {
     for r in results.iter().filter(|r| r.ran) {
         if matches!(r.cell.kv_path, KvPath::Dense) {
             assert_eq!(
-                r.kv_sha256_pre, r.kv_sha256_post,
+                r.kv_sha256_pre,
+                r.kv_sha256_post,
                 "R-C1 FAILED: K/V byte hash mismatch at {label}; \
                  pre={pre} post={post}",
                 label = r.cell.label(),
@@ -1982,8 +1956,7 @@ pub fn assert_decode_regression(results: &[CellResult]) {
     }
     let mut evaluated = 0u32;
     for r in results.iter().filter(|r| r.ran) {
-        if r.decode_tok_s_no_cache.is_finite() && r.decode_tok_s_cache_enabled_miss.is_finite()
-        {
+        if r.decode_tok_s_no_cache.is_finite() && r.decode_tok_s_cache_enabled_miss.is_finite() {
             let regression = (r.decode_tok_s_no_cache - r.decode_tok_s_cache_enabled_miss)
                 / r.decode_tok_s_no_cache;
             assert!(
@@ -2061,8 +2034,12 @@ pub fn write_results_md(results: &[CellResult], path: &str) -> std::io::Result<(
          measurement passes.\n\n",
     );
     buf.push_str("## Reproducer\n\n```bash\n");
-    buf.push_str("# 1. Pre-bench process audit (fail if mcp-brain-server / llama-server / ollama running)\n");
-    buf.push_str("ps -Ao comm,pid,%cpu | grep -E 'mcp-brain-server|llama-server|ollama' || echo OK\n\n");
+    buf.push_str(
+        "# 1. Pre-bench process audit (fail if mcp-brain-server / llama-server / ollama running)\n",
+    );
+    buf.push_str(
+        "ps -Ao comm,pid,%cpu | grep -E 'mcp-brain-server|llama-server|ollama' || echo OK\n\n",
+    );
     buf.push_str("# 2. Run matrix on M5 Max (clean SoC required)\n");
     buf.push_str("HF2Q_KV_PERSIST_E2E=1 \\\n");
     buf.push_str("  cargo test --release --test kv_persist_harness \\\n");
@@ -2087,9 +2064,7 @@ pub fn write_results_md(results: &[CellResult], path: &str) -> std::io::Result<(
          pre_evict (ms) | insert (ms) | load (ms) | kv_sha256 pre/post match | \
          actual_prompt_tokens | retry_count | note |\n",
     );
-    buf.push_str(
-        "|---|---|---|---|---|---|---|---|---|---|---|\n",
-    );
+    buf.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
 
     let mut by_status: BTreeMap<&str, u32> = BTreeMap::new();
     for r in results {
@@ -2125,10 +2100,7 @@ pub fn write_results_md(results: &[CellResult], path: &str) -> std::io::Result<(
     for (status, count) in &by_status {
         buf.push_str(&format!("- **{status}:** {count} cell(s)\n"));
     }
-    buf.push_str(&format!(
-        "- **Total cells:** {}\n",
-        results.len()
-    ));
+    buf.push_str(&format!("- **Total cells:** {}\n", results.len()));
     buf.push_str(&format!(
         "- **KV cache format version:** {}\n",
         KV_CACHE_FORMAT_VERSION
@@ -2191,18 +2163,26 @@ fn matrix_generator_yields_runnable_gemma_subset() {
         "expected at least one Gemma 4 dense runnable cell"
     );
     assert!(
-        runnable.iter().all(|c| matches!(c.family, Family::Gemma4_26b)
-            && matches!(
-                c.quant,
-                WeightQuant::Q4_0 | WeightQuant::Q4_K_M | WeightQuant::Q6_K | WeightQuant::Q8_0
-            )),
+        runnable
+            .iter()
+            .all(|c| matches!(c.family, Family::Gemma4_26b)
+                && matches!(
+                    c.quant,
+                    WeightQuant::Q4_0 | WeightQuant::Q4_K_M | WeightQuant::Q6_K | WeightQuant::Q8_0
+                )),
         "runnable filter must scope to gemma4 Q4_0/Q4_K_M/Q6_K/Q8_0 \
          (KvPath::TqActive unblocked 2026-05-05 by ADR-007 codec freeze + B-tq.1 substrate)"
     );
     // Post-2026-05-05: both Dense AND TqActive paths are runnable for
     // Gemma 4 26B; A0.3 matrix population depends on this expansion.
-    let dense_count = runnable.iter().filter(|c| matches!(c.kv_path, KvPath::Dense)).count();
-    let tq_count = runnable.iter().filter(|c| matches!(c.kv_path, KvPath::TqActive)).count();
+    let dense_count = runnable
+        .iter()
+        .filter(|c| matches!(c.kv_path, KvPath::Dense))
+        .count();
+    let tq_count = runnable
+        .iter()
+        .filter(|c| matches!(c.kv_path, KvPath::TqActive))
+        .count();
     assert!(dense_count > 0, "expected at least one dense runnable cell");
     assert!(
         tq_count > 0,
@@ -2334,15 +2314,14 @@ fn forward_compat_trait_surface_round_trip() {
         fingerprint: fp.clone(),
     };
     let engine = std::sync::Arc::new(MockEngine);
-    let outcome = <SyntheticSpiller as MockKvSpiller<MockEngine>>::pre_evict(
-        &spiller, &handle, &engine,
-    );
+    let outcome =
+        <SyntheticSpiller as MockKvSpiller<MockEngine>>::pre_evict(&spiller, &handle, &engine);
     assert_eq!(outcome, SpillOutcome::EnqueuedBlocks(2));
-    spiller
-        .restore_token_chain
-        .lock()
-        .unwrap()
-        .push(("harness/repo".to_string(), fp.clone(), hashes));
+    spiller.restore_token_chain.lock().unwrap().push((
+        "harness/repo".to_string(),
+        fp.clone(),
+        hashes,
+    ));
     let restore = <SyntheticSpiller as MockKvSpiller<MockEngine>>::post_admit(
         &spiller,
         "harness/repo",
@@ -2402,9 +2381,7 @@ fn kv_persist_matrix_e2e() {
     // floor). Scope-limit collapses to 7 ship-gate-relevant cells with
     // a single quant (Q4_0 — the only quant with a converted GGUF on
     // this system). All other cells short-circuit with diagnostic.
-    let ship_gate_only = std::env::var("HF2Q_KV_PERSIST_E2E_SHIP_GATE_ONLY")
-        .as_deref()
-        == Ok("1");
+    let ship_gate_only = std::env::var("HF2Q_KV_PERSIST_E2E_SHIP_GATE_ONLY").as_deref() == Ok("1");
     let cells_to_run: Vec<MatrixCell> = if ship_gate_only {
         let filtered: Vec<MatrixCell> = cells
             .into_iter()
@@ -2510,7 +2487,9 @@ fn kv_persist_matrix_e2e() {
     // round-trip (R-C1 byte-exact). If this fails, the substrate is
     // broken and A0.2 cannot proceed.
     assert!(
-        results.iter().any(|r| r.ran && r.kv_sha256_pre == r.kv_sha256_post && !r.kv_sha256_pre.is_empty()),
+        results
+            .iter()
+            .any(|r| r.ran && r.kv_sha256_pre == r.kv_sha256_post && !r.kv_sha256_pre.is_empty()),
         "substrate failure: no runnable cell produced a valid K/V hash round-trip"
     );
 
@@ -2533,8 +2512,8 @@ fn kv_persist_matrix_e2e() {
 #[test]
 fn subprocess_driver_smoke_binary_locatable() {
     let parent = hf2q_binary_path();
-    let driver = subprocess_driver::binary_path()
-        .expect("driver locator must resolve when parent does");
+    let driver =
+        subprocess_driver::binary_path().expect("driver locator must resolve when parent does");
     assert_eq!(
         parent, driver,
         "subprocess_driver::binary_path must return same path as parent helper"
@@ -2584,8 +2563,7 @@ fn server_guard_lifecycle_starts_and_stops_cleanly() {
         scenario: Scenario::ColdResume,
     };
     let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
-    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
-        .expect("spawn hf2q serve");
+    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg).expect("spawn hf2q serve");
     subprocess_driver::wait_for_readyz(&server).expect("readyz");
     // Drop fires here.
     drop(server);
@@ -2623,13 +2601,10 @@ fn warm_request_returns_under_10min_budget() {
         scenario: Scenario::ColdResume,
     };
     let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
-    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
-        .expect("spawn");
+    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg).expect("spawn");
     subprocess_driver::wait_for_readyz(&server).expect("readyz");
-    let canonical = subprocess_driver::fetch_canonical_model_id(&server)
-        .expect("/v1/models");
-    let warm_wall = subprocess_driver::warm_request(&server, &canonical)
-        .expect("warm_request");
+    let canonical = subprocess_driver::fetch_canonical_model_id(&server).expect("/v1/models");
+    let warm_wall = subprocess_driver::warm_request(&server, &canonical).expect("warm_request");
     assert!(
         warm_wall <= Duration::from_secs(READYZ_BUDGET_SECS),
         "warm_request wall {:?} exceeds {}s budget",
@@ -2669,22 +2644,18 @@ fn measure_ttft_parses_sse_first_content_delta() {
         scenario: Scenario::ColdResume,
     };
     let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
-    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
-        .expect("spawn");
+    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg).expect("spawn");
     subprocess_driver::wait_for_readyz(&server).expect("readyz");
-    let canonical = subprocess_driver::fetch_canonical_model_id(&server)
-        .expect("/v1/models");
+    let canonical = subprocess_driver::fetch_canonical_model_id(&server).expect("/v1/models");
     let _ = subprocess_driver::warm_request(&server, &canonical);
-    let m = subprocess_driver::measure_ttft_subprocess(
-        &server,
-        &canonical,
-        "Hi.",
-        16,
-    )
-    .expect("ttft");
+    let m =
+        subprocess_driver::measure_ttft_subprocess(&server, &canonical, "Hi.", 16).expect("ttft");
     assert!(m.ttft_ms.is_finite(), "ttft must be finite");
     assert!(m.ttft_ms > 0.0, "ttft must be positive");
-    assert!(m.total_tokens > 0, "must observe at least one content delta");
+    assert!(
+        m.total_tokens > 0,
+        "must observe at least one content delta"
+    );
     assert!(m.decode_tps >= 0.0, "decode_tps cannot be negative");
     eprintln!(
         "measure_ttft: ttft_ms={:.1}, total_tokens={}, decode_tps={:.2}, \
@@ -2726,18 +2697,14 @@ fn measure_ttft_parses_sse_first_content_delta() {
 #[test]
 fn synthesize_cache_hit_prediction_uses_real_io_wall_not_constants() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let store = std::sync::Arc::new(synthetic_spiller::BlockStore::new(
-        tmp.path().to_path_buf(),
-    ));
+    let store = std::sync::Arc::new(synthetic_spiller::BlockStore::new(tmp.path().to_path_buf()));
 
     // (A) Direct evidence: time_round_trip walls scale with n_blocks.
     // Use representative byte size (1 MiB / block) per
     // representative_block_bytes(Gemma4_26b, Dense). Distinct
     // fingerprints so neither call's directory shadows the other's.
-    let block_bytes = subprocess_driver::representative_block_bytes(
-        &Family::Gemma4_26b,
-        &KvPath::Dense,
-    );
+    let block_bytes =
+        subprocess_driver::representative_block_bytes(&Family::Gemma4_26b, &KvPath::Dense);
     let fp_a = synthetic_spiller::ModelFingerprint::compute(
         "repo/test-rt-a",
         "Q4_0",
@@ -2867,7 +2834,9 @@ fn pool_key_for_path_symlink_trick_reproduces_iter210_pattern() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Create a "primary" file and a "clone" symlink under a distinct
     // stem in the same tempdir.
-    let primary = tmp.path().join("gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf");
+    let primary = tmp
+        .path()
+        .join("gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf");
     std::fs::write(&primary, b"GGUFstub").expect("write primary");
     let clone = tmp.path().join("gemma-4-clone.gguf");
     #[cfg(unix)]
@@ -2917,9 +2886,7 @@ fn pool_key_for_path_symlink_trick_reproduces_iter210_pattern() {
 #[test]
 fn synthesize_cache_hit_prediction_rejects_nan_no_cache_ttft() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let store = std::sync::Arc::new(synthetic_spiller::BlockStore::new(
-        tmp.path().to_path_buf(),
-    ));
+    let store = std::sync::Arc::new(synthetic_spiller::BlockStore::new(tmp.path().to_path_buf()));
     let spiller = synthetic_spiller::SyntheticSpiller::new(store);
     let err = subprocess_driver::synthesize_cache_hit_prediction(
         f64::NAN,
@@ -3045,9 +3012,8 @@ fn build_word_stream_prompt(target_tokens: u32) -> String {
 /// Max runs always have the tokenizer present.
 #[test]
 fn prompt_construction_target_tokens_within_30_percent() {
-    let tok_path = PathBuf::from(
-        "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/tokenizer.json",
-    );
+    let tok_path =
+        PathBuf::from("/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/tokenizer.json");
     if !tok_path.exists() {
         eprintln!(
             "prompt_construction_target_tokens_within_30_percent: skipped \
@@ -3084,9 +3050,7 @@ fn prompt_construction_target_tokens_within_30_percent() {
         let n = enc.get_ids().len() as u32;
         let lo = (target as f64 * 0.7) as u32;
         let hi = (target as f64 * 1.3) as u32;
-        eprintln!(
-            "prompt_construction: target={target}, actual={n}, range=[{lo},{hi}]"
-        );
+        eprintln!("prompt_construction: target={target}, actual={n}, range=[{lo},{hi}]");
         // The pre-fix `"hello ".repeat(N)` collapsed to <50 tokens at
         // every target. The post-fix construction must land within
         // ±30 %. We assert the LOWER bound strictly (the load-bearing
@@ -3323,12 +3287,11 @@ fn measure_ttft_includes_actual_prompt_tokens() {
     let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
     let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg).expect("spawn");
     subprocess_driver::wait_for_readyz(&server).expect("readyz");
-    let canonical = subprocess_driver::fetch_canonical_model_id(&server)
-        .expect("/v1/models");
+    let canonical = subprocess_driver::fetch_canonical_model_id(&server).expect("/v1/models");
     let _ = subprocess_driver::warm_request(&server, &canonical);
     let prompt = build_word_stream_prompt(512);
-    let m = subprocess_driver::measure_ttft_subprocess(&server, &canonical, &prompt, 16)
-        .expect("ttft");
+    let m =
+        subprocess_driver::measure_ttft_subprocess(&server, &canonical, &prompt, 16).expect("ttft");
     eprintln!(
         "measure_ttft_includes_actual_prompt_tokens: prompt_tokens={:?}, \
          retry_count={}, ttft_ms={:.1}",

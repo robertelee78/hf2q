@@ -43,11 +43,11 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 
 use super::cache::{cache_model_path, ModelCache, QuantEntry, SourcePointer};
+use super::quant_select::{select_quant, GpuInfo, QuantType};
+use crate::core::hardware::HardwareProfile;
 use crate::core::provenance::{self, compute_source_bundle_sha256, Provenance};
 use crate::core::sha256::sha256_file;
-use super::quant_select::{select_quant, GpuInfo, QuantType};
 use crate::input::integrity::verify_repo;
-use crate::core::hardware::HardwareProfile;
 
 /// Classify a `--model` argument into one of the two supported shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,9 +189,7 @@ pub fn resolve_or_prepare_model(
             quant: None,
             from_cache: false,
         }),
-        ModelInput::HfRepoId(repo_id) => {
-            run_auto_pipeline(&repo_id, cache, hw, no_integrity)
-        }
+        ModelInput::HfRepoId(repo_id) => run_auto_pipeline(&repo_id, cache, hw, no_integrity),
     }
 }
 
@@ -204,8 +202,8 @@ fn run_auto_pipeline(
     no_integrity: bool,
 ) -> Result<ResolvedModel> {
     let info = GpuInfo::from_hardware_profile(hw);
-    let quant = select_quant(&info)
-        .with_context(|| format!("hardware → quant selection for {repo_id}"))?;
+    let quant =
+        select_quant(&info).with_context(|| format!("hardware → quant selection for {repo_id}"))?;
 
     tracing::info!(
         repo = repo_id,
@@ -631,10 +629,10 @@ fn run_convert_subprocess(
 /// ADR-014 P7 wires K-quant emit through clap.
 fn cli_quant_was_degraded(quant: QuantType) -> bool {
     match quant {
-        QuantType::Q8_0 => false,         // Q8 maps clean
-        QuantType::Q6_K => true,          // → q8 (Q8_0)
-        QuantType::Q4_K_M => true,        // → q4 (Q4_0)
-        QuantType::Q3_K_M => true,        // → q4 (Q4_0)
+        QuantType::Q8_0 => false,  // Q8 maps clean
+        QuantType::Q6_K => true,   // → q8 (Q8_0)
+        QuantType::Q4_K_M => true, // → q4 (Q4_0)
+        QuantType::Q3_K_M => true, // → q4 (Q4_0)
     }
 }
 
@@ -925,7 +923,10 @@ mod tests {
 
         // With --no-integrity, the same call returns the (unsafe!) hit.
         let hit_unsafe = lookup_and_verify(&cache, repo_id, quant, true).expect("must not error");
-        assert!(hit_unsafe.is_some(), "--no-integrity must skip the SHA check");
+        assert!(
+            hit_unsafe.is_some(),
+            "--no-integrity must skip the SHA check"
+        );
     }
 
     // ── ADR-005 Phase 4 iter-207 — provenance short-circuit ────────────
@@ -1144,8 +1145,7 @@ mod tests {
             synthetic_shards(),
         );
 
-        let result =
-            lookup_and_verify(&cache, repo_id, quant, false).expect("verify path must Ok");
+        let result = lookup_and_verify(&cache, repo_id, quant, false).expect("verify path must Ok");
         let hit = result.expect("matching SHA must produce Some(hit)");
         assert!(hit.from_cache);
     }
@@ -1158,9 +1158,7 @@ mod tests {
         let repo_id = "iter207/external-fail";
         let quant = QuantType::Q8_0;
 
-        let gguf_bytes = build_gguf_with_string_metadata(&[
-            ("general.architecture", "qwen35"),
-        ]);
+        let gguf_bytes = build_gguf_with_string_metadata(&[("general.architecture", "qwen35")]);
         let bogus_sha = "f".repeat(64);
         let (cache, _) = fab_cache_with_provenance(
             tmp.path(),
@@ -1207,14 +1205,8 @@ mod tests {
             hex::encode(h.finalize())
         };
 
-        let (cache, gguf_path) = fab_cache_with_provenance(
-            tmp.path(),
-            repo_id,
-            quant,
-            &gguf_bytes,
-            &real_sha,
-            shards,
-        );
+        let (cache, gguf_path) =
+            fab_cache_with_provenance(tmp.path(), repo_id, quant, &gguf_bytes, &real_sha, shards);
 
         let err = lookup_and_verify(&cache, repo_id, quant, false)
             .expect_err("provenance mismatch must Err, not silently re-quantize");
@@ -1287,8 +1279,7 @@ mod tests {
         // verify_quantized PASSES (manifest SHA matches), so we get
         // Some(hit).  The hf2q.* keys are ignored because the cache
         // has no shards to cross-verify against.
-        let result =
-            lookup_and_verify(&cache, repo_id, quant, false).expect("ok");
+        let result = lookup_and_verify(&cache, repo_id, quant, false).expect("ok");
         let hit = result.expect("verify-quantized passes → Some(hit)");
         assert_eq!(hit.gguf_path, gguf_path);
     }

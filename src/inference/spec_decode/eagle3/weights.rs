@@ -55,17 +55,13 @@ pub enum Eagle3WeightsError {
     Safetensors(#[from] safetensors::SafeTensorError),
     #[error("eagle3 weights: missing tensor `{0}`")]
     Missing(String),
-    #[error(
-        "eagle3 weights: tensor `{name}` has dtype {actual:?}, expected {expected:?}"
-    )]
+    #[error("eagle3 weights: tensor `{name}` has dtype {actual:?}, expected {expected:?}")]
     Dtype {
         name: String,
         actual: Dtype,
         expected: Dtype,
     },
-    #[error(
-        "eagle3 weights: tensor `{name}` has shape {actual:?}, expected {expected:?}"
-    )]
+    #[error("eagle3 weights: tensor `{name}` has shape {actual:?}, expected {expected:?}")]
     Shape {
         name: String,
         actual: Vec<usize>,
@@ -281,8 +277,7 @@ impl Eagle3WeightsFile {
         // is valid for the lifetime of `self`. Borrowers via
         // `Eagle3Weights::load` get a constrained lifetime tied to
         // the &self borrow.
-        let bytes: &'static [u8] =
-            unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
+        let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
         Ok(Self { _mmap: mmap, bytes })
     }
 
@@ -313,10 +308,7 @@ impl<'data> Eagle3Weights<'data> {
     /// `draft_id_to_target_id` and `t2d` is skipped. We apply the
     /// same normalization here so vLLM-format checkpoints load
     /// without manual remapping.
-    pub fn load(
-        bytes: &'data [u8],
-        cfg: &Eagle3DrafterConfig,
-    ) -> Result<Self, Eagle3WeightsError> {
+    pub fn load(bytes: &'data [u8], cfg: &Eagle3DrafterConfig) -> Result<Self, Eagle3WeightsError> {
         // Codex /cfa E3 Major (2026-05-22): defensive cfg.validate()
         // at the loader entry. Without this, an invalid config silently
         // builds a wrong manifest and surfaces as confusing
@@ -446,7 +438,12 @@ mod tests {
         //  - draft_id_to_target_id
         // Total: 2 + 3 + 3 + 4 + 2 + 3 + 1 + 1 + 1 = 20
         let m = expected_manifest(&qwen35_default());
-        assert_eq!(m.len(), 20, "got: {:?}", m.iter().map(|t| &t.name).collect::<Vec<_>>());
+        assert_eq!(
+            m.len(),
+            20,
+            "got: {:?}",
+            m.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -549,7 +546,8 @@ mod tests {
         cfg.use_qk_norm = false;
         let m = expected_manifest(&cfg);
         assert!(
-            m.iter().all(|t| !t.name.contains("q_norm") && !t.name.contains("k_norm")),
+            m.iter()
+                .all(|t| !t.name.contains("q_norm") && !t.name.contains("k_norm")),
             "qk_norm tensors absent when use_qk_norm=false"
         );
 
@@ -705,8 +703,7 @@ mod tests {
         // Catch typos / accidental duplication in expected_manifest.
         let cfg = qwen35_default();
         let m = expected_manifest(&cfg);
-        let names: std::collections::HashSet<&str> =
-            m.iter().map(|t| t.name.as_str()).collect();
+        let names: std::collections::HashSet<&str> = m.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names.len(), m.len(), "duplicate name in manifest");
     }
 
@@ -717,8 +714,7 @@ mod tests {
         for t in &m {
             if t.name != "draft_id_to_target_id" {
                 assert_eq!(
-                    t.dtype,
-                    EAGLE3_FLOAT_DTYPE,
+                    t.dtype, EAGLE3_FLOAT_DTYPE,
                     "tensor {} should be BF16",
                     t.name
                 );
@@ -742,9 +738,7 @@ mod tests {
     /// Build a synthetic safetensors blob containing tensors at the
     /// shapes the manifest expects. Float tensors get zeros (BF16);
     /// integer mapping gets zeros (I64).
-    fn build_synthetic_safetensors(
-        manifest: &[ExpectedTensor],
-    ) -> Vec<u8> {
+    fn build_synthetic_safetensors(manifest: &[ExpectedTensor]) -> Vec<u8> {
         let mut storage: Vec<Vec<u8>> = Vec::with_capacity(manifest.len());
         let mut tensors: BTreeMap<String, TensorView> = BTreeMap::new();
         // Need to keep storage alive for view lifetime.
@@ -759,12 +753,8 @@ mod tests {
         }
         // Second pass to build views (now that storage is stable).
         for (i, exp) in manifest.iter().enumerate() {
-            let view = TensorView::new(
-                exp.dtype,
-                exp.shape.clone(),
-                storage[i].as_slice(),
-            )
-            .expect("synthetic tensor view");
+            let view = TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
+                .expect("synthetic tensor view");
             tensors.insert(exp.name.clone(), view);
         }
         safetensors::serialize(&tensors, None::<std::collections::HashMap<String, String>>)
@@ -776,8 +766,7 @@ mod tests {
         let cfg = qwen35_default();
         let manifest = expected_manifest(&cfg);
         let blob = build_synthetic_safetensors(&manifest);
-        let w = Eagle3Weights::load(&blob, &cfg)
-            .expect("synthetic blob matches manifest exactly");
+        let w = Eagle3Weights::load(&blob, &cfg).expect("synthetic blob matches manifest exactly");
         assert_eq!(w.tensors.len(), manifest.len());
         // Lookup by name returns same tensor.
         let fc = w.tensor("fc.weight").expect("fc.weight reachable");
@@ -816,10 +805,7 @@ mod tests {
         // Build correct manifest but corrupt one tensor's shape.
         let mut manifest = expected_manifest(&cfg);
         // Find fc.weight and corrupt its shape.
-        let fc_idx = manifest
-            .iter()
-            .position(|t| t.name == "fc.weight")
-            .unwrap();
+        let fc_idx = manifest.iter().position(|t| t.name == "fc.weight").unwrap();
         manifest[fc_idx].shape = vec![cfg.hidden_size, cfg.fc_input_size() + 1];
         let blob = build_synthetic_safetensors(&manifest);
         // Load with ORIGINAL config — expects fc_input_size().
@@ -874,7 +860,9 @@ mod tests {
         let w = Eagle3Weights::load(&blob, &cfg).expect("d2t normalization should work");
         // Lookup uses canonical name — works because manifest stored
         // canonical names, even though the file used `d2t`.
-        let map = w.tensor("draft_id_to_target_id").expect("found by canonical");
+        let map = w
+            .tensor("draft_id_to_target_id")
+            .expect("found by canonical");
         assert_eq!(map.shape(), &[cfg.draft_vocab_size]);
     }
 
@@ -885,10 +873,7 @@ mod tests {
         // should NOT trigger Extra error.
         let cfg = qwen35_default();
         let mut manifest = expected_manifest(&cfg);
-        manifest.push(ExpectedTensor::int_i64(
-            "t2d",
-            vec![cfg.vocab_size],
-        ));
+        manifest.push(ExpectedTensor::int_i64("t2d", vec![cfg.vocab_size]));
         let blob = build_synthetic_safetensors(&manifest);
         // Original cfg expected manifest — load with cfg, NOT
         // augmented manifest, so loader does its own resolution.
@@ -907,8 +892,8 @@ mod tests {
         // GQA divisibility (`num_q_heads % num_kv_heads == 0`).
         let mut cfg = qwen35_default();
         cfg.num_kv_heads = 7; // 40 % 7 != 0 → GQA invariant violated
-        // Build SOME synthetic blob (empty manifest is fine since
-        // validate fires first).
+                              // Build SOME synthetic blob (empty manifest is fine since
+                              // validate fires first).
         let blob = build_synthetic_safetensors(&[]);
         let err = Eagle3Weights::load(&blob, &cfg).unwrap_err();
         assert!(
@@ -922,7 +907,10 @@ mod tests {
         let cfg = qwen35_default();
         let mut manifest = expected_manifest(&cfg);
         // Find norm.weight (float) and corrupt its dtype to I64.
-        let nidx = manifest.iter().position(|t| t.name == "norm.weight").unwrap();
+        let nidx = manifest
+            .iter()
+            .position(|t| t.name == "norm.weight")
+            .unwrap();
         manifest[nidx].dtype = Dtype::I64;
         let blob = build_synthetic_safetensors(&manifest);
         // Original cfg expects BF16; synthetic blob has I64.

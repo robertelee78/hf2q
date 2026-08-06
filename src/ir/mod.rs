@@ -212,7 +212,10 @@ impl TensorRef {
         if n.contains("bias") {
             return false;
         }
-        if n.contains("layer_scalar") || n.contains("router.scale") || n.contains("router.per_expert_scale") {
+        if n.contains("layer_scalar")
+            || n.contains("router.scale")
+            || n.contains("router.per_expert_scale")
+        {
             return false;
         }
         if n.contains("embed_tokens") || n.contains("embedding_projection") {
@@ -470,7 +473,6 @@ pub struct ModelMetadata {
     pub raw_config: serde_json::Value,
 
     // --- ADR-012 Decision 2: Qwen3.5-family extended fields ---
-
     /// Explicit per-layer attention type enumeration (preferred over full_attention_interval).
     /// None when the config omits it (e.g. Gemma4 — Chesterton's fence: no behavior change).
     pub explicit_layer_types: Option<Vec<String>>,
@@ -493,7 +495,6 @@ pub struct ModelMetadata {
     pub rope_parameters: Option<RopeParameters>,
 
     // Linear-attention (Gated DeltaNet) kernel dimensions:
-
     /// Convolution kernel width for the linear-attention SSM state.
     pub linear_conv_kernel_dim: Option<u32>,
     /// Head dimension for linear-attention key projections.
@@ -510,21 +511,18 @@ pub struct ModelMetadata {
     pub mamba_ssm_dtype: Option<String>,
 
     // MoE sizing (Qwen3.5-MoE):
-
     /// Size of each expert's FFN intermediate layer.
     pub moe_intermediate_size: Option<u32>,
     /// Intermediate size of the always-active shared expert (Qwen3.5-MoE).
     pub shared_expert_intermediate_size: Option<u32>,
 
     // Multi-Token Prediction (MTP) fields:
-
     /// Number of hidden layers in the MTP draft head.
     pub mtp_num_hidden_layers: Option<u32>,
     /// Whether the MTP head uses its own embedding table.
     pub mtp_use_dedicated_embeddings: Option<bool>,
 
     // Router fields:
-
     /// Whether to output router logits in the forward pass (training-time flag).
     pub output_router_logits: Option<bool>,
     /// Auxiliary load-balancing loss coefficient.
@@ -830,7 +828,9 @@ mod tests {
         };
 
         // Vision tensors — should return true
-        assert!(make("model.vision_tower.encoder.layers.0.self_attn.q_proj.weight").is_vision_tensor());
+        assert!(
+            make("model.vision_tower.encoder.layers.0.self_attn.q_proj.weight").is_vision_tensor()
+        );
         assert!(make("model.vision_tower.patch_embedder.input_proj.weight").is_vision_tensor());
         assert!(make("model.embed_vision.embedding_projection.weight").is_vision_tensor());
 
@@ -849,7 +849,10 @@ mod tests {
             data: std::sync::Arc::new(vec![]),
         };
         assert!(vt.is_weight(), "vision weight should pass is_weight()");
-        assert!(vt.is_vision_tensor(), "vision weight should pass is_vision_tensor()");
+        assert!(
+            vt.is_vision_tensor(),
+            "vision weight should pass is_vision_tensor()"
+        );
     }
 
     #[test]
@@ -978,7 +981,14 @@ mod tests {
     /// analysis.
     #[test]
     fn to_f32_vec_rejects_non_float_dtypes() {
-        for dtype in [DType::I32, DType::I64, DType::U8, DType::U16, DType::U32, DType::Bool] {
+        for dtype in [
+            DType::I32,
+            DType::I64,
+            DType::U8,
+            DType::U16,
+            DType::U32,
+            DType::Bool,
+        ] {
             let bytes = vec![0u8; 16];
             let t = TensorRef {
                 name: format!("test_{dtype}"),

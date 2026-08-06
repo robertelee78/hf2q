@@ -890,9 +890,7 @@ impl DrafterKvCacheVariant {
 /// - ADR-040 §6.1.55 (closure block — names the full structural
 ///   bundle).
 #[inline]
-pub fn select_drafter_kv_variant_for_mode(
-    max_slots: u32,
-) -> DrafterKvCacheSelection {
+pub fn select_drafter_kv_variant_for_mode(max_slots: u32) -> DrafterKvCacheSelection {
     if max_slots <= 1 {
         DrafterKvCacheSelection::SingleSeq
     } else {
@@ -1027,8 +1025,7 @@ mod tests {
             for h in 0..cache.num_kv_heads {
                 for d in 0..cache.head_dim {
                     let offset = h * stride_per_head + new_pos * cache.head_dim + d;
-                    let expected =
-                        (src_tag * 1000 + h as u32 * 100 + d as u32) as f32;
+                    let expected = (src_tag * 1000 + h as u32 * 100 + d as u32) as f32;
                     assert_eq!(
                         k_data[offset], expected,
                         "rollback pos {} head {} dim {} expected tag {} got {}",
@@ -1062,10 +1059,7 @@ mod tests {
         let v = sentinel_row(2, 4, 0);
         cache.append(&k, &v).expect("append"); // len = 1
         let err = cache.rollback_to_accepted(&[0, 5]).unwrap_err();
-        assert!(
-            err.to_string().contains(">= current len"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains(">= current len"), "got: {err}");
     }
 
     #[test]
@@ -1163,8 +1157,7 @@ mod tests {
         for (new_pos, expected_tag) in [0_u32, 1, 2].iter().enumerate() {
             for h in 0..cache.num_kv_heads {
                 let offset = h * stride_per_head + new_pos * cache.head_dim;
-                let expected =
-                    (expected_tag * 1000 + h as u32 * 100) as f32;
+                let expected = (expected_tag * 1000 + h as u32 * 100) as f32;
                 assert_eq!(k_data[offset], expected);
             }
         }
@@ -1197,12 +1190,9 @@ mod tests {
     // unconditionally.
     // ──────────────────────────────────────────────────────────────────
 
-    fn make_multi_seq_cache(
-        n_seqs: u32,
-    ) -> Option<(MlxDevice, MultiSeqDrafterKvCache)> {
+    fn make_multi_seq_cache(n_seqs: u32) -> Option<(MlxDevice, MultiSeqDrafterKvCache)> {
         let device = MlxDevice::new().ok()?;
-        let cache =
-            alloc_multi_seq_drafter_kv_for_layer(&device, 2, 8, 4, n_seqs).expect("alloc");
+        let cache = alloc_multi_seq_drafter_kv_for_layer(&device, 2, 8, 4, n_seqs).expect("alloc");
         Some((device, cache))
     }
 
@@ -1339,7 +1329,9 @@ mod tests {
 
         // PADDING_SLOT surfaces as SlotOutOfRange too (typed signal,
         // not silent no-op).
-        let pad_err = cache.seq_len(MultiSeqDrafterKvCache::PADDING_SLOT).unwrap_err();
+        let pad_err = cache
+            .seq_len(MultiSeqDrafterKvCache::PADDING_SLOT)
+            .unwrap_err();
         assert!(
             matches!(pad_err, MultiSeqError::SlotOutOfRange { .. }),
             "H227: PADDING_SLOT against trait surface MUST be \
@@ -1363,7 +1355,9 @@ mod tests {
             }
         }
         // Same-slot fork is a no-op (slot 1 → slot 1).
-        cache.fork_seq(SlotId(1), SlotId(1)).expect("same-slot fork");
+        cache
+            .fork_seq(SlotId(1), SlotId(1))
+            .expect("same-slot fork");
         // Cross-slot fork: slot 1 → slot 2. Cursor + bytes copied.
         cache.fork_seq(SlotId(1), SlotId(2)).expect("fork 1→2");
         assert_eq!(
@@ -1472,8 +1466,7 @@ mod tests {
             }
         };
         let legacy = DrafterKvCache::new(&device, 2, 8, 4).expect("legacy alloc");
-        let multi =
-            alloc_multi_seq_drafter_kv_for_layer(&device, 2, 8, 4, 1).expect("multi alloc");
+        let multi = alloc_multi_seq_drafter_kv_for_layer(&device, 2, 8, 4, 1).expect("multi alloc");
         assert_eq!(
             legacy.k_buf.byte_len(),
             multi.k_buf.byte_len(),
@@ -1531,12 +1524,9 @@ mod tests {
         // by the existing C2c/C2d/C2e arms in `engine::spawn_with_mode`
         // — H232 fails to compile if any per-arch trait impl was
         // accidentally dropped during the iter-A4 lift.
-        assert_multi_seq_kv::<
-            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
-        >();
-        assert_multi_seq_kv::<
-            crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers,
-        >();
+        assert_multi_seq_kv::<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>();
+        assert_multi_seq_kv::<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>(
+        );
         assert_multi_seq_kv::<crate::serve::multi_seq_kv::NoopMultiSeqKvCache>();
     }
 
@@ -1598,7 +1588,11 @@ mod tests {
             }
         };
         let variant = DrafterKvCacheVariant::SingleSeq(single);
-        assert_eq!(variant.slot_count(), 1, "H235b: SingleSeq arm slot_count == 1");
+        assert_eq!(
+            variant.slot_count(),
+            1,
+            "H235b: SingleSeq arm slot_count == 1"
+        );
         assert!(!variant.is_multi_seq(), "H235b: SingleSeq is NOT multi_seq");
     }
 

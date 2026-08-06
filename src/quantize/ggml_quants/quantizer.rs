@@ -126,8 +126,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set by cargo test");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo test");
         PathBuf::from(manifest)
             .join("tests/fixtures/ggml_quants")
             .join(name)
@@ -177,10 +177,7 @@ mod tests {
             GgmlType::Q8_K,
         ] {
             assert!(
-                matches!(
-                    quantizer_for(ty),
-                    Err(QuantizeError::NoQuantizerForType(_))
-                ),
+                matches!(quantizer_for(ty), Err(QuantizeError::NoQuantizerForType(_))),
                 "unexpected: {:?} returned Ok",
                 ty
             );
@@ -194,24 +191,83 @@ mod tests {
     #[test]
     fn dispatch_matches_kernel_all_types() {
         let cases: &[(GgmlType, &str, &str, usize)] = &[
-            (GgmlType::Q4_0, "q4_0_64_noim_input.bin", "q4_0_64_noim_expected.bin", 64),
-            (GgmlType::Q4_1, "q4_1_64_noim_input.bin", "q4_1_64_noim_expected.bin", 64),
-            (GgmlType::Q5_0, "q5_0_64_noim_input.bin", "q5_0_64_noim_expected.bin", 64),
-            (GgmlType::Q5_1, "q5_1_64_noim_input.bin", "q5_1_64_noim_expected.bin", 64),
-            (GgmlType::Q8_0, "q8_0_64_noim_input.bin", "q8_0_64_noim_expected.bin", 64),
-            (GgmlType::IQ4_NL, "iq4_nl_64_noim_input.bin", "iq4_nl_64_noim_expected.bin", 64),
-            (GgmlType::Q2_K, "q2_k_512_noim_input.bin", "q2_k_512_noim_expected.bin", 512),
-            (GgmlType::Q3_K, "q3_k_512_noim_input.bin", "q3_k_512_noim_expected.bin", 512),
-            (GgmlType::Q4_K, "q4_k_512_noim_input.bin", "q4_k_512_noim_expected.bin", 512),
-            (GgmlType::Q5_K, "q5_k_512_noim_input.bin", "q5_k_512_noim_expected.bin", 512),
-            (GgmlType::Q6_K, "q6_k_512_noim_input.bin", "q6_k_512_noim_expected.bin", 512),
+            (
+                GgmlType::Q4_0,
+                "q4_0_64_noim_input.bin",
+                "q4_0_64_noim_expected.bin",
+                64,
+            ),
+            (
+                GgmlType::Q4_1,
+                "q4_1_64_noim_input.bin",
+                "q4_1_64_noim_expected.bin",
+                64,
+            ),
+            (
+                GgmlType::Q5_0,
+                "q5_0_64_noim_input.bin",
+                "q5_0_64_noim_expected.bin",
+                64,
+            ),
+            (
+                GgmlType::Q5_1,
+                "q5_1_64_noim_input.bin",
+                "q5_1_64_noim_expected.bin",
+                64,
+            ),
+            (
+                GgmlType::Q8_0,
+                "q8_0_64_noim_input.bin",
+                "q8_0_64_noim_expected.bin",
+                64,
+            ),
+            (
+                GgmlType::IQ4_NL,
+                "iq4_nl_64_noim_input.bin",
+                "iq4_nl_64_noim_expected.bin",
+                64,
+            ),
+            (
+                GgmlType::Q2_K,
+                "q2_k_512_noim_input.bin",
+                "q2_k_512_noim_expected.bin",
+                512,
+            ),
+            (
+                GgmlType::Q3_K,
+                "q3_k_512_noim_input.bin",
+                "q3_k_512_noim_expected.bin",
+                512,
+            ),
+            (
+                GgmlType::Q4_K,
+                "q4_k_512_noim_input.bin",
+                "q4_k_512_noim_expected.bin",
+                512,
+            ),
+            (
+                GgmlType::Q5_K,
+                "q5_k_512_noim_input.bin",
+                "q5_k_512_noim_expected.bin",
+                512,
+            ),
+            (
+                GgmlType::Q6_K,
+                "q6_k_512_noim_input.bin",
+                "q6_k_512_noim_expected.bin",
+                512,
+            ),
         ];
         for (ty, in_name, exp_name, n_per_row) in cases {
             let input = read_f32s(in_name);
             let expected = read_bytes(exp_name);
             let q = quantizer_for(*ty).unwrap();
             let got = q.quantize(&input, *n_per_row, None).unwrap();
-            assert_eq!(got, expected, "trait dispatch differs from fixture for {:?}", ty);
+            assert_eq!(
+                got, expected,
+                "trait dispatch differs from fixture for {:?}",
+                ty
+            );
         }
     }
 

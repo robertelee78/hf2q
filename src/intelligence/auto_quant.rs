@@ -138,45 +138,85 @@ fn estimate_bandwidth(hardware: &HardwareProfile) -> f64 {
     let _mem_gb = hardware.total_memory_gb();
 
     let profile = if chip.contains("m5 ultra") {
-        BandwidthProfile { effective_bandwidth_gbps: 780.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 780.0,
+        }
     } else if chip.contains("m5 max") {
-        BandwidthProfile { effective_bandwidth_gbps: 401.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 401.0,
+        }
     } else if chip.contains("m5 pro") {
-        BandwidthProfile { effective_bandwidth_gbps: 250.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 250.0,
+        }
     } else if chip.contains("m5") {
-        BandwidthProfile { effective_bandwidth_gbps: 100.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 100.0,
+        }
     } else if chip.contains("m4 ultra") {
-        BandwidthProfile { effective_bandwidth_gbps: 700.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 700.0,
+        }
     } else if chip.contains("m4 max") {
-        BandwidthProfile { effective_bandwidth_gbps: 370.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 370.0,
+        }
     } else if chip.contains("m4 pro") {
-        BandwidthProfile { effective_bandwidth_gbps: 230.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 230.0,
+        }
     } else if chip.contains("m4") {
-        BandwidthProfile { effective_bandwidth_gbps: 100.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 100.0,
+        }
     } else if chip.contains("m3 ultra") {
-        BandwidthProfile { effective_bandwidth_gbps: 600.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 600.0,
+        }
     } else if chip.contains("m3 max") {
-        BandwidthProfile { effective_bandwidth_gbps: 300.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 300.0,
+        }
     } else if chip.contains("m3 pro") {
-        BandwidthProfile { effective_bandwidth_gbps: 150.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 150.0,
+        }
     } else if chip.contains("m3") {
-        BandwidthProfile { effective_bandwidth_gbps: 100.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 100.0,
+        }
     } else if chip.contains("m2 ultra") {
-        BandwidthProfile { effective_bandwidth_gbps: 600.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 600.0,
+        }
     } else if chip.contains("m2 max") {
-        BandwidthProfile { effective_bandwidth_gbps: 300.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 300.0,
+        }
     } else if chip.contains("m2 pro") {
-        BandwidthProfile { effective_bandwidth_gbps: 150.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 150.0,
+        }
     } else if chip.contains("m2") {
-        BandwidthProfile { effective_bandwidth_gbps: 100.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 100.0,
+        }
     } else if chip.contains("m1 ultra") {
-        BandwidthProfile { effective_bandwidth_gbps: 500.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 500.0,
+        }
     } else if chip.contains("m1 max") {
-        BandwidthProfile { effective_bandwidth_gbps: 250.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 250.0,
+        }
     } else if chip.contains("m1 pro") {
-        BandwidthProfile { effective_bandwidth_gbps: 150.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 150.0,
+        }
     } else if chip.contains("m1") {
-        BandwidthProfile { effective_bandwidth_gbps: 60.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 60.0,
+        }
     } else {
         // Unknown hardware: assume 100 GB/s as a conservative baseline.
         // This is roughly the lower bound for any modern unified-memory chip.
@@ -185,7 +225,9 @@ fn estimate_bandwidth(hardware: &HardwareProfile) -> f64 {
             "Unknown hardware — using conservative 100 GB/s bandwidth estimate. \
              Pass --bandwidth to override."
         );
-        BandwidthProfile { effective_bandwidth_gbps: 100.0 }
+        BandwidthProfile {
+            effective_bandwidth_gbps: 100.0,
+        }
     };
 
     let gbps = profile.effective_bandwidth_gbps;
@@ -286,20 +328,24 @@ fn estimate_bytes_per_token(
     // expert_count. Each expert has ~3 * hidden_size * intermediate_size params
     // (gate_proj, up_proj, down_proj). With N experts, expert params dominate.
     let h = fingerprint.hidden_size as f64;
-    let i = fingerprint.intermediate_size.unwrap_or(fingerprint.hidden_size * 4) as f64;
+    let i = fingerprint
+        .intermediate_size
+        .unwrap_or(fingerprint.hidden_size * 4) as f64;
     let n_experts = fingerprint.expert_count as f64;
     let n_layers = fingerprint.layer_count as f64;
 
     // Expert params per layer: N_experts * 3 * H * I (gate, up, down projections)
     let expert_params_per_layer = n_experts * 3.0 * h * i;
     // Shared params per layer: attention (4 * H * H for q/k/v/o) + norms + router
-    let num_kv_heads = fingerprint.num_kv_heads.unwrap_or(fingerprint.num_attention_heads) as f64;
+    let num_kv_heads = fingerprint
+        .num_kv_heads
+        .unwrap_or(fingerprint.num_attention_heads) as f64;
     let num_heads = fingerprint.num_attention_heads as f64;
     let head_dim = h / num_heads;
     let shared_attn_per_layer = h * (num_heads * head_dim)  // q_proj
         + h * (num_kv_heads * head_dim)                      // k_proj
         + h * (num_kv_heads * head_dim)                      // v_proj
-        + (num_heads * head_dim) * h;                         // o_proj
+        + (num_heads * head_dim) * h; // o_proj
 
     let total_expert_params = expert_params_per_layer * n_layers;
     let total_shared_attn_params = shared_attn_per_layer * n_layers;
@@ -311,7 +357,11 @@ fn estimate_bytes_per_token(
 
     // What fraction of experts is read per token?
     // Default top_k=8 for Gemma4-style, top_k=2 for Mixtral-style
-    let top_k = if fingerprint.expert_count >= 64 { 8.0 } else { 2.0 };
+    let top_k = if fingerprint.expert_count >= 64 {
+        8.0
+    } else {
+        2.0
+    };
     let expert_activation_ratio = top_k / n_experts;
 
     let shared_bytes = (total_shared_params * plan_base_bits as f64 / 8.0) as u64;
@@ -471,15 +521,14 @@ pub fn resolve_auto_plan(
         }
     }
 
-    let (base_bits, est_tok_s, total_bytes) = best_plan.ok_or_else(|| {
-        AutoQuantError::ModelTooLarge {
+    let (base_bits, est_tok_s, total_bytes) =
+        best_plan.ok_or_else(|| AutoQuantError::ModelTooLarge {
             reason: format!(
                 "Model ({:.1}B params) does not fit in {:.0} GB memory even at 2-bit quantization.",
                 fingerprint.total_params as f64 / 1e9,
                 hardware.total_memory_gb()
             ),
-        }
-    })?;
+        })?;
 
     // Step 4: Build the final plan
     let overrides = build_component_overrides(arch_family, fingerprint, base_bits);
@@ -672,7 +721,7 @@ fn build_component_overrides(
         //   model.layers.N.mlp.shared_expert.up_proj.weight   → ffn_up_shexp
         //   model.layers.N.mlp.shared_expert.down_proj.weight → ffn_down_shexp
         for router_pattern in &[
-            ".mlp.gate.weight",        // router: ffn_gate_inp
+            ".mlp.gate.weight",         // router: ffn_gate_inp
             ".shared_expert.gate_proj", // ffn_gate_shexp
             ".shared_expert.up_proj",   // ffn_up_shexp
             ".shared_expert.down_proj", // ffn_down_shexp
@@ -720,9 +769,7 @@ fn build_component_overrides(
     // -----------------------------------------------------------------------
     // Rule 2: MoE router projections for non-qwen35 MoE (Gemma4 / GenericMoE)
     // -----------------------------------------------------------------------
-    if fingerprint.is_moe()
-        && !matches!(arch_family, ArchFamily::Qwen35MoE)
-    {
+    if fingerprint.is_moe() && !matches!(arch_family, ArchFamily::Qwen35MoE) {
         overrides.push(ComponentOverride {
             pattern: "router.proj".to_string(),
             bits: 8.max(base_bits),
@@ -1063,12 +1110,25 @@ mod tests {
         let fp = make_qwen35_dense_fingerprint();
         let overrides = build_component_overrides(ArchFamily::Qwen35Dense, &fp, 4);
 
-        for ssm in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias", ".conv1d.weight"] {
+        for ssm in &[
+            ".A_log",
+            ".dt_bias",
+            ".dt_proj.weight",
+            ".dt_proj.bias",
+            ".conv1d.weight",
+        ] {
             let found = overrides.iter().find(|o| o.pattern == *ssm);
             assert!(found.is_some(), "qwen35 dense cohort prior missing: {ssm}");
-            assert!(found.unwrap().bits >= 4u8, "SSM prior must be >= base_bits for {ssm}");
+            assert!(
+                found.unwrap().bits >= 4u8,
+                "SSM prior must be >= base_bits for {ssm}"
+            );
             // Must be at sensitive_bits (8, the max valid >= base_bits)
-            assert_eq!(found.unwrap().bits, 8, "SSM prior for {ssm} must be 8-bit (sensitive_bits)");
+            assert_eq!(
+                found.unwrap().bits,
+                8,
+                "SSM prior for {ssm} must be 8-bit (sensitive_bits)"
+            );
         }
     }
 
@@ -1078,7 +1138,13 @@ mod tests {
         let fp = make_qwen35moe_fingerprint();
         let overrides = build_component_overrides(ArchFamily::Qwen35MoE, &fp, 4);
 
-        for ssm in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias", ".conv1d.weight"] {
+        for ssm in &[
+            ".A_log",
+            ".dt_bias",
+            ".dt_proj.weight",
+            ".dt_proj.bias",
+            ".conv1d.weight",
+        ] {
             let found = overrides.iter().find(|o| o.pattern == *ssm);
             assert!(found.is_some(), "qwen35moe SSM cohort prior missing: {ssm}");
             assert_eq!(found.unwrap().bits, 8, "SSM prior for {ssm} must be 8-bit");
@@ -1098,8 +1164,15 @@ mod tests {
             ".shared_expert.down_proj",
         ] {
             let found = overrides.iter().find(|o| o.pattern == *moe_pattern);
-            assert!(found.is_some(), "qwen35moe router/shared-expert prior missing: {moe_pattern}");
-            assert_eq!(found.unwrap().bits, 8, "Router/shared-expert prior for {moe_pattern} must be 8-bit");
+            assert!(
+                found.is_some(),
+                "qwen35moe router/shared-expert prior missing: {moe_pattern}"
+            );
+            assert_eq!(
+                found.unwrap().bits,
+                8,
+                "Router/shared-expert prior for {moe_pattern} must be 8-bit"
+            );
         }
     }
 
@@ -1111,9 +1184,16 @@ mod tests {
 
         // ".experts." catches ffn_gate_exps / ffn_up_exps / ffn_down_exps
         let found = overrides.iter().find(|o| o.pattern == ".experts.");
-        assert!(found.is_some(), "qwen35moe routed-expert elevated prior missing");
+        assert!(
+            found.is_some(),
+            "qwen35moe routed-expert elevated prior missing"
+        );
         // base_bits=4, +2 → 6
-        assert_eq!(found.unwrap().bits, 6, "Routed expert prior must be base+2 = 6-bit at 4-bit base");
+        assert_eq!(
+            found.unwrap().bits,
+            6,
+            "Routed expert prior must be base+2 = 6-bit at 4-bit base"
+        );
     }
 
     /// ADR-012 D12: Router and shared-expert priors NOT present for qwen35 dense
@@ -1156,9 +1236,16 @@ mod tests {
         let patterns: Vec<&str> = overrides.iter().map(|o| o.pattern.as_str()).collect();
 
         // No qwen35-only patterns present
-        for qwen35_only in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias",
-                               ".conv1d.weight", ".mlp.gate.weight", ".shared_expert.",
-                               ".experts."] {
+        for qwen35_only in &[
+            ".A_log",
+            ".dt_bias",
+            ".dt_proj.weight",
+            ".dt_proj.bias",
+            ".conv1d.weight",
+            ".mlp.gate.weight",
+            ".shared_expert.",
+            ".experts.",
+        ] {
             assert!(
                 !patterns.contains(qwen35_only),
                 "Gemma regression: qwen35-only pattern '{qwen35_only}' appeared in Gemma overrides"
@@ -1173,9 +1260,11 @@ mod tests {
             );
         }
         assert_eq!(
-            overrides.len(), overrides_before.len(),
+            overrides.len(),
+            overrides_before.len(),
             "Gemma regression: override count changed — pre-P6={}, post-P6={}",
-            overrides_before.len(), overrides.len()
+            overrides_before.len(),
+            overrides.len()
         );
     }
 
@@ -1189,11 +1278,15 @@ mod tests {
         let overrides = build_component_overrides(ArchFamily::Qwen35MoE, &fp, 4);
 
         // Cohort priors are present
-        assert!(overrides.iter().any(|o| o.pattern == ".A_log"),
-            "SSM cohort prior must be present");
+        assert!(
+            overrides.iter().any(|o| o.pattern == ".A_log"),
+            "SSM cohort prior must be present"
+        );
         // v_proj override (Rule 4) is still present alongside cohort priors
-        assert!(overrides.iter().any(|o| o.pattern == "v_proj"),
-            "v_proj override must still be present alongside cohort priors");
+        assert!(
+            overrides.iter().any(|o| o.pattern == "v_proj"),
+            "v_proj override must still be present alongside cohort priors"
+        );
     }
 
     /// Mock: verify no SSM priors for a non-qwen35 dense model (Llama).
@@ -1202,7 +1295,13 @@ mod tests {
         let fp = make_dense_fingerprint(8.0); // LlamaForCausalLM
         let overrides = build_component_overrides(ArchFamily::DenseDecoder, &fp, 4);
 
-        for ssm in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias", ".conv1d.weight"] {
+        for ssm in &[
+            ".A_log",
+            ".dt_bias",
+            ".dt_proj.weight",
+            ".dt_proj.bias",
+            ".conv1d.weight",
+        ] {
             assert!(
                 !overrides.iter().any(|o| o.pattern == *ssm),
                 "Non-qwen35 dense must not have SSM cohort prior: {ssm}"
@@ -1252,7 +1351,10 @@ mod tests {
             .component_overrides
             .iter()
             .find(|o| o.pattern == "router.proj");
-        assert!(router_override.is_some(), "MoE plan must include router.proj override");
+        assert!(
+            router_override.is_some(),
+            "MoE plan must include router.proj override"
+        );
         assert_eq!(router_override.unwrap().bits, 8);
     }
 
@@ -1352,7 +1454,11 @@ mod tests {
 
         for component in &["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
             let found = overrides.iter().find(|o| o.pattern == *component);
-            assert!(found.is_some(), "4-bit plan should elevate {} to 8-bit", component);
+            assert!(
+                found.is_some(),
+                "4-bit plan should elevate {} to 8-bit",
+                component
+            );
             assert_eq!(found.unwrap().bits, 8, "{} should be 8-bit", component);
         }
     }
@@ -1496,8 +1602,7 @@ mod tests {
     #[test]
     fn test_decision18_arch_override_lookup_falls_through_when_none() {
         // Registered arch with no auto_override → lookup returns None.
-        let lookup =
-            crate::arch::registry::lookup_auto_override("Qwen3_5ForCausalLM");
+        let lookup = crate::arch::registry::lookup_auto_override("Qwen3_5ForCausalLM");
         assert!(
             lookup.is_none(),
             "qwen35 ArchEntry has auto_override = None → lookup must return None, \
@@ -1505,8 +1610,7 @@ mod tests {
         );
 
         // Unregistered arch → lookup returns None (falls through to table).
-        let lookup =
-            crate::arch::registry::lookup_auto_override("CompletelyUnknownArch");
+        let lookup = crate::arch::registry::lookup_auto_override("CompletelyUnknownArch");
         assert!(
             lookup.is_none(),
             "Unknown arch must return None (falls through to table)"

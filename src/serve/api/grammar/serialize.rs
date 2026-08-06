@@ -197,10 +197,8 @@ fn write_rule(
         if elem.ty.is_char_element() {
             // rule[i+1] always exists — End is always last.
             let next_ty = rule[i + 1].ty;
-            let inside_class_continues = matches!(
-                next_ty,
-                GretType::CharAlt | GretType::CharRngUpper
-            );
+            let inside_class_continues =
+                matches!(next_ty, GretType::CharAlt | GretType::CharRngUpper);
             if !inside_class_continues {
                 // CharAny was emitted as `.` (a standalone atom, no
                 // bracket).  Suppress `] ` for that case only.
@@ -330,8 +328,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::parser::{parse, GretElement, GretType};
+    use super::*;
 
     /// Semantic AST equality: every rule NAME present in `a` must
     /// also be present in `b`, and the element-sequence under each
@@ -418,7 +416,9 @@ mod tests {
         assert!(
             ast_eq(&g1, &g2),
             "AST identity broken on round-trip\noriginal:\n{:?}\nserialized:\n{}\nreparsed:\n{:?}",
-            g1, serialized, g2
+            g1,
+            serialized,
+            g2
         );
         g2
     }
@@ -662,9 +662,9 @@ mod tests {
     fn write_char_emits_unicode_escape_for_bmp() {
         let mut s = String::new();
         write_char(&mut s, 0x03B1, true); // Greek alpha
-        // BMP code point above ASCII → emitted as `\uHHHH` so the
-        // serialized output is round-trip safe through `parse_char`'s
-        // `\u` branch (parser.rs:698).
+                                          // BMP code point above ASCII → emitted as `\uHHHH` so the
+                                          // serialized output is round-trip safe through `parse_char`'s
+                                          // `\u` branch (parser.rs:698).
         assert_eq!(s, r"\u03B1");
     }
 
@@ -717,7 +717,9 @@ mod tests {
         let g2 = parse(&serialized).expect("re-parse");
         // Semantic equivalence: the gemma4-str-char rule body matches.
         let id1 = g1.rule_id("gemma4-str-char").expect("rule exists");
-        let id2 = g2.rule_id("gemma4-str-char").expect("rule exists post-roundtrip");
+        let id2 = g2
+            .rule_id("gemma4-str-char")
+            .expect("rule exists post-roundtrip");
         assert_eq!(
             g1.rules[id1 as usize], g2.rules[id2 as usize],
             "gemma4-str-char rule body differs after round trip"

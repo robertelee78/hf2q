@@ -263,10 +263,7 @@ pub struct MmprojConfig {
 ///     means the writer mis-encoded the bool array, and silently
 ///     consuming a length-mismatched array could mask off-by-one
 ///     deepstack-layer routing in Wedge-4c).
-fn read_deepstack_indexes(
-    gguf: &GgufFile,
-    num_hidden_layers: u32,
-) -> Result<Option<Vec<u32>>> {
+fn read_deepstack_indexes(gguf: &GgufFile, num_hidden_layers: u32) -> Result<Option<Vec<u32>>> {
     let raw = match gguf.metadata("clip.vision.is_deepstack_layers") {
         Some(v) => v,
         None => return Ok(None),
@@ -327,9 +324,8 @@ impl MmprojConfig {
             gguf.metadata_u32(k)
                 .ok_or_else(|| anyhow!("mmproj GGUF missing u32 '{}'", k))
         };
-        let f32_key_default = |k: &str, default: f32| -> f32 {
-            gguf.metadata_f32(k).unwrap_or(default)
-        };
+        let f32_key_default =
+            |k: &str, default: f32| -> f32 { gguf.metadata_f32(k).unwrap_or(default) };
 
         let image_size = u32_key("clip.vision.image_size")?;
         let patch_size = u32_key("clip.vision.patch_size")?;
@@ -349,9 +345,7 @@ impl MmprojConfig {
         let num_attention_heads = u32_key("clip.vision.attention.head_count")?;
         let num_hidden_layers = u32_key("clip.vision.block_count")?;
         let layer_norm_eps = f32_key_default("clip.vision.attention.layer_norm_epsilon", 1e-6);
-        let projector_str = gguf
-            .metadata_string("clip.projector_type")
-            .unwrap_or("mlp");
+        let projector_str = gguf.metadata_string("clip.projector_type").unwrap_or("mlp");
         let projector = ProjectorType::from_str_gguf(projector_str);
 
         // Optional mean/std arrays. llama.cpp writes each as `Array(Float32
@@ -506,11 +500,7 @@ pub fn vit_deepstack_tensor(layer_idx: usize, suffix: &str) -> String {
 /// validator enforces only the weights, matching the
 /// `has_deepstack()` predicate at clip-model.h:227-229 which keys on
 /// `deepstack_fc1_w != nullptr`.
-pub const DEEPSTACK_REQUIRED_SUFFIXES: &[&str] = &[
-    "norm.weight",
-    "fc1.weight",
-    "fc2.weight",
-];
+pub const DEEPSTACK_REQUIRED_SUFFIXES: &[&str] = &["norm.weight", "fc1.weight", "fc2.weight"];
 
 /// Per-layer tensor name helper.
 pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
@@ -709,8 +699,7 @@ pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
         return ArchProfile::Qwen3VlSiglip;
     }
 
-    let has_ln_pair = set.contains("v.blk.0.ln1.weight")
-        && set.contains("v.blk.0.ln2.weight");
+    let has_ln_pair = set.contains("v.blk.0.ln1.weight") && set.contains("v.blk.0.ln2.weight");
     let has_gemma4_post_norm = set.contains("v.blk.0.ffn_post_norm.weight")
         || set.contains("v.blk.0.post_ffw_norm.weight");
     if has_ln_pair && has_gemma4_post_norm {
@@ -802,10 +791,7 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
     // QKV + attn_out checks moved into the layer loop below, so this
     // list now carries only the patch-embed + position-embed pair —
     // no longer needs to grow inside the loop.
-    let required: Vec<String> = vec![
-        TENSOR_PATCH_EMBD.to_string(),
-        TENSOR_POS_EMBD.to_string(),
-    ];
+    let required: Vec<String> = vec![TENSOR_PATCH_EMBD.to_string(), TENSOR_POS_EMBD.to_string()];
     // Per-block QKV + output (present in CLIP, Gemma 4, AND Qwen3-VL).
     // The output projection's vision-namespace short-form is `attn_out`
     // per `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`
@@ -865,9 +851,15 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
                     ));
                 } else {
                     // partial split, no fused — list each missing leg
-                    if !actual_set.contains(q_w.as_str()) { missing.push(q_w); }
-                    if !actual_set.contains(k_w.as_str()) { missing.push(k_w); }
-                    if !actual_set.contains(v_w.as_str()) { missing.push(v_w); }
+                    if !actual_set.contains(q_w.as_str()) {
+                        missing.push(q_w);
+                    }
+                    if !actual_set.contains(k_w.as_str()) {
+                        missing.push(k_w);
+                    }
+                    if !actual_set.contains(v_w.as_str()) {
+                        missing.push(v_w);
+                    }
                 }
             }
         }
@@ -894,9 +886,7 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
     {
         missing.push(format!(
             "{} (or {}, or gemma4v's {})",
-            TENSOR_MM_0_WEIGHT,
-            TENSOR_MM_2_WEIGHT,
-            TENSOR_MM_INPUT_PROJECTION_WEIGHT,
+            TENSOR_MM_0_WEIGHT, TENSOR_MM_2_WEIGHT, TENSOR_MM_INPUT_PROJECTION_WEIGHT,
         ));
     }
 
@@ -1023,10 +1013,7 @@ mod tests {
         // iter-224 Wedge-4b: round-trip through the GGUF string form
         // matches `PROJECTOR_TYPE_NAMES[QWEN3VL]` at clip-impl.h:318.
         assert_eq!(ProjectorType::Qwen3VlMerger.as_str(), "qwen3vl_merger");
-        assert_eq!(
-            ProjectorType::Other("q-former".into()).as_str(),
-            "q-former"
-        );
+        assert_eq!(ProjectorType::Other("q-former".into()).as_str(), "q-former");
     }
 
     #[test]
@@ -1254,7 +1241,10 @@ mod tests {
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let err = validate_tensor_set(&cfg, &actual).expect_err("unsupported projector");
         let msg = format!("{err}");
-        assert!(msg.contains("'resampler' is not yet supported"), "got: {msg}");
+        assert!(
+            msg.contains("'resampler' is not yet supported"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1705,8 +1695,8 @@ mod tests {
             names.push(vit_layer_tensor(layer_idx, "attn_out.weight"));
         }
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let err = validate_tensor_set(&cfg, &actual)
-            .expect_err("missing QKV in any form must fail");
+        let err =
+            validate_tensor_set(&cfg, &actual).expect_err("missing QKV in any form must fail");
         let msg = format!("{err}");
         assert!(
             msg.contains("attn_qkv") && msg.contains("attn_q/k/v"),

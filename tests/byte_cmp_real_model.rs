@@ -32,8 +32,13 @@ fn check_prereqs(model_dir: &str) -> Result<(), String> {
     if !Path::new(model_dir).exists() {
         return Err(format!("model dir {model_dir} not present"));
     }
-    if !Path::new(LLAMA_CPP).join("build/bin/llama-quantize").exists() {
-        return Err(format!("canonical llama-quantize not built at {LLAMA_CPP}/build/bin/"));
+    if !Path::new(LLAMA_CPP)
+        .join("build/bin/llama-quantize")
+        .exists()
+    {
+        return Err(format!(
+            "canonical llama-quantize not built at {LLAMA_CPP}/build/bin/"
+        ));
     }
     if let Ok(pin) = std::fs::read_to_string("data/llama_cpp_pin.txt") {
         let pinned = pin.trim();
@@ -163,7 +168,10 @@ fn byte_cmp_cell(model_dir: &str, quant: &str) {
     let canonical_q = match ensure_canonical_quant(&f16, quant) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[SKIP] {} {quant}: ensure_quant: {e}", short_name(model_dir));
+            eprintln!(
+                "[SKIP] {} {quant}: ensure_quant: {e}",
+                short_name(model_dir)
+            );
             return;
         }
     };
@@ -175,14 +183,18 @@ fn byte_cmp_cell(model_dir: &str, quant: &str) {
         short_name(model_dir)
     );
     assert_eq!(
-        diff, 0,
+        diff,
+        0,
         "byte-cmp drift for {} {quant}: {diff}/{total}",
         short_name(model_dir)
     );
 }
 
 fn short_name(p: &str) -> &str {
-    Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or(p)
+    Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p)
 }
 
 macro_rules! byte_cmp_test {

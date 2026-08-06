@@ -331,10 +331,7 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
     // `gguf.metadata_u32(...)` without ok_or_else), so omitting it
     // is byte-compatible with non-Qwen3-VL profiles.
     if let Some(pd) = cfg.projection_dim {
-        kvs.push((
-            "clip.vision.projection_dim".into(),
-            MetaValue::Uint32(pd),
-        ));
+        kvs.push(("clip.vision.projection_dim".into(), MetaValue::Uint32(pd)));
     }
 
     // ---- Qwen3-VL extension keys -------------------------------------
@@ -367,10 +364,7 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
     //     `read_deepstack_indexes` at mmproj.rs:266-308 and converts
     //     to `Vec<u32>` of true-flagged indexes.
     if cfg.is_qwen3vl() {
-        kvs.push((
-            "clip.use_gelu".into(),
-            MetaValue::Bool(true),
-        ));
+        kvs.push(("clip.use_gelu".into(), MetaValue::Bool(true)));
         if let Some(sms) = cfg.spatial_merge_size {
             kvs.push((
                 "clip.vision.spatial_merge_size".into(),
@@ -574,7 +568,8 @@ mod tests {
                 keys.contains(key),
                 "Wedge-4f: build_metadata must emit Qwen3-VL key {:?} \
                  when cfg.is_qwen3vl(); got keys: {:?}",
-                key, keys
+                key,
+                keys
             );
         }
 
@@ -601,10 +596,7 @@ mod tests {
                 assert!(bools[0], "deepstack_visual_indexes[0]=0 → bools[0]=true");
                 assert!(bools[1], "deepstack_visual_indexes[1]=1 → bools[1]=true");
             }
-            other => panic!(
-                "is_deepstack_layers must be ArrayBool; got {:?}",
-                other
-            ),
+            other => panic!("is_deepstack_layers must be ArrayBool; got {:?}", other),
         }
 
         // use_gelu must be Bool(true).
@@ -636,7 +628,8 @@ mod tests {
                 !keys.contains(key),
                 "Wedge-4f regression: CLIP-classic build_metadata must NOT \
                  emit Qwen3-VL key {:?}; got keys: {:?}",
-                key, keys
+                key,
+                keys
             );
         }
 
@@ -658,8 +651,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("qwen3vl-roundtrip.mmproj.gguf");
-        write_mmproj_gguf(&out, &qwen3vl_tiny_config(), &tiny_tensors())
-            .expect("write");
+        write_mmproj_gguf(&out, &qwen3vl_tiny_config(), &tiny_tensors()).expect("write");
 
         let gguf = GgufFile::open(&out).expect("open");
         assert_eq!(
@@ -729,8 +721,7 @@ mod tests {
         let kv_off = 8 + 12;
         let array_tag = u32::from_le_bytes(buf[kv_off..kv_off + 4].try_into().unwrap());
         assert_eq!(array_tag, GGUF_TYPE_ARRAY);
-        let elem_tag =
-            u32::from_le_bytes(buf[kv_off + 4..kv_off + 8].try_into().unwrap());
+        let elem_tag = u32::from_le_bytes(buf[kv_off + 4..kv_off + 8].try_into().unwrap());
         assert_eq!(elem_tag, GGUF_TYPE_BOOL);
         let len = u64::from_le_bytes(buf[kv_off + 8..kv_off + 16].try_into().unwrap());
         assert_eq!(len, 4);

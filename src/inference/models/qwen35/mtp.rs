@@ -155,7 +155,13 @@ impl MtpWeights {
         cfg: &Qwen35Config,
     ) -> Result<MlxBuffer> {
         let (logits, _hidden) = self.forward_draft_with_hidden(
-            prev_hidden, embed_t, kv_cache, position_ids, device, registry, cfg,
+            prev_hidden,
+            embed_t,
+            kv_cache,
+            position_ids,
+            device,
+            registry,
+            cfg,
         )?;
         Ok(logits)
     }
@@ -206,7 +212,8 @@ impl MtpWeights {
         let pos_buf = upload_i32(position_ids, device).context("MTP upload positions")?;
 
         let t0 = std::time::Instant::now();
-        let projected = self.project_embedding_and_hidden(embed_t, prev_hidden, device, registry)?;
+        let projected =
+            self.project_embedding_and_hidden(embed_t, prev_hidden, device, registry)?;
         if mtp_substep_profile {
             // Force GPU sync to measure sub-step time accurately.
             let mut enc = device.command_encoder().context("MTP profile sync 1")?;
@@ -215,7 +222,8 @@ impl MtpWeights {
         let t_proj = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
-        let attn_out = self.forward_full_attention(&projected, &pos_buf, kv_cache, device, registry, cfg)?;
+        let attn_out =
+            self.forward_full_attention(&projected, &pos_buf, kv_cache, device, registry, cfg)?;
         if mtp_substep_profile {
             let mut enc = device.command_encoder().context("MTP profile sync 2")?;
             enc.commit_and_wait().ok();
@@ -237,7 +245,10 @@ impl MtpWeights {
         if mtp_substep_profile {
             eprintln!(
                 "[MTP_SUBSTEP] proj={:.2}ms attn={:.2}ms ffn={:.2}ms head={:.2}ms total={:.2}ms",
-                t_proj, t_attn, t_ffn, t_head,
+                t_proj,
+                t_attn,
+                t_ffn,
+                t_head,
                 t_proj + t_attn + t_ffn + t_head,
             );
         }
@@ -253,16 +264,8 @@ impl MtpWeights {
     ) -> Result<MlxBuffer> {
         let h = self.hidden_size;
         let mut enc = device.command_encoder().context("MTP enc eh_proj")?;
-        let embed_norm = rms_norm_with_weight(
-            &mut enc,
-            registry,
-            device,
-            embed_t,
-            &self.enorm,
-            1,
-            h,
-            1e-6,
-        )?;
+        let embed_norm =
+            rms_norm_with_weight(&mut enc, registry, device, embed_t, &self.enorm, 1, h, 1e-6)?;
         let hidden_norm = rms_norm_with_weight(
             &mut enc,
             registry,
@@ -438,14 +441,7 @@ impl MtpWeights {
 
         let mut enc = device.command_encoder().context("MTP enc attn output")?;
         let gated_or_attn = if let Some(gate) = gate_flat.as_ref() {
-            apply_sigmoid_gate_multiply(
-                &mut enc,
-                registry,
-                device,
-                &attn_out,
-                gate,
-                q_total,
-            )?
+            apply_sigmoid_gate_multiply(&mut enc, registry, device, &attn_out, gate, q_total)?
         } else {
             attn_out
         };
@@ -496,7 +492,10 @@ impl MtpWeights {
         enc.commit();
 
         match &self.ffn {
-            MtpFfnWeightsGpu::Dense { weights, intermediate_size } => build_dense_ffn_layer_gpu(
+            MtpFfnWeightsGpu::Dense {
+                weights,
+                intermediate_size,
+            } => build_dense_ffn_layer_gpu(
                 device,
                 registry,
                 &ffn_input,
@@ -518,9 +517,7 @@ impl MtpWeights {
                 // The legacy wrapper `build_moe_ffn_layer_gpu_q` hardcodes
                 // `layer_idx=0` (gpu_ffn.rs:2263); using it from production
                 // would silently mis-tag MTP expert records.
-                let mut enc = device
-                    .command_encoder()
-                    .context("MTP enc moe_ffn_q")?;
+                let mut enc = device.command_encoder().context("MTP enc moe_ffn_q")?;
                 let out = build_moe_ffn_layer_gpu_q_into(
                     &mut enc,
                     device,

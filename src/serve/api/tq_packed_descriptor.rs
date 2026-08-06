@@ -242,12 +242,7 @@ mod tests {
     #[test]
     fn parse_tq_codebook_bits_invalid_falls_back_to_default() {
         for bad in ["", "0", "1", "7", "9", "16", "garbage", "  "] {
-            assert_eq!(
-                parse_tq_codebook_bits(Some(bad)),
-                8,
-                "bad={:?}",
-                bad
-            );
+            assert_eq!(parse_tq_codebook_bits(Some(bad)), 8, "bad={:?}", bad);
         }
     }
 

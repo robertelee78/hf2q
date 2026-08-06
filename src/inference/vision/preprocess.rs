@@ -120,8 +120,7 @@ pub fn preprocess_rgb_chw(bytes: &[u8], config: &PreprocessConfig) -> Result<Vec
         }
     }
 
-    let img = image::load_from_memory(bytes)
-        .map_err(|e| anyhow!("decode image: {e}"))?;
+    let img = image::load_from_memory(bytes).map_err(|e| anyhow!("decode image: {e}"))?;
     let (_w, _h) = img.dimensions();
 
     // Resize to target × target. `FilterType::Triangle` = bilinear;
@@ -311,14 +310,8 @@ pub fn preprocess_gemma4v(
     }
 
     let p = cfg.patch_size;
-    let (n_x, n_y) = compute_gemma4v_patch_grid(
-        orig_w,
-        orig_h,
-        p,
-        cfg.n_merge,
-        cfg.token_min,
-        cfg.token_max,
-    )?;
+    let (n_x, n_y) =
+        compute_gemma4v_patch_grid(orig_w, orig_h, p, cfg.n_merge, cfg.token_min, cfg.token_max)?;
     let target_w = n_x * p;
     let target_h = n_y * p;
 
@@ -460,15 +453,12 @@ fn compute_gemma4v_patch_grid(
     let max_pixels: u64 = (token_max as u64) * patch_area;
 
     // Helpers: round / ceil / floor `x` to a multiple of `align_size`.
-    let round_by = |x: f64| -> u64 {
-        ((x / align_size as f64).round() as i64).max(0) as u64 * align_size
-    };
-    let ceil_by = |x: f64| -> u64 {
-        ((x / align_size as f64).ceil() as i64).max(0) as u64 * align_size
-    };
-    let floor_by = |x: f64| -> u64 {
-        ((x / align_size as f64).floor() as i64).max(0) as u64 * align_size
-    };
+    let round_by =
+        |x: f64| -> u64 { ((x / align_size as f64).round() as i64).max(0) as u64 * align_size };
+    let ceil_by =
+        |x: f64| -> u64 { ((x / align_size as f64).ceil() as i64).max(0) as u64 * align_size };
+    let floor_by =
+        |x: f64| -> u64 { ((x / align_size as f64).floor() as i64).max(0) as u64 * align_size };
 
     let width = orig_w as u64;
     let height = orig_h as u64;
@@ -1039,22 +1029,14 @@ fn qwen3vl_calc_size_preserved_ratio(
 ) -> Result<(u32, u32)> {
     let align: u64 = align_size as u64;
     if align == 0 {
-        return Err(anyhow!(
-            "qwen3vl smart_resize: align_size must be > 0"
-        ));
+        return Err(anyhow!("qwen3vl smart_resize: align_size must be > 0"));
     }
     let width = orig_w as u64;
     let height = orig_h as u64;
 
-    let round_by = |x: f64| -> u64 {
-        ((x / align as f64).round() as i64).max(0) as u64 * align
-    };
-    let ceil_by = |x: f64| -> u64 {
-        ((x / align as f64).ceil() as i64).max(0) as u64 * align
-    };
-    let floor_by = |x: f64| -> u64 {
-        ((x / align as f64).floor() as i64).max(0) as u64 * align
-    };
+    let round_by = |x: f64| -> u64 { ((x / align as f64).round() as i64).max(0) as u64 * align };
+    let ceil_by = |x: f64| -> u64 { ((x / align as f64).ceil() as i64).max(0) as u64 * align };
+    let floor_by = |x: f64| -> u64 { ((x / align as f64).floor() as i64).max(0) as u64 * align };
 
     let mut h_bar: u64 = align.max(round_by(height as f64));
     let mut w_bar: u64 = align.max(round_by(width as f64));
@@ -1072,7 +1054,10 @@ fn qwen3vl_calc_size_preserved_ratio(
     if h_bar == 0 || w_bar == 0 || h_bar > u32::MAX as u64 || w_bar > u32::MAX as u64 {
         return Err(anyhow!(
             "qwen3vl smart_resize: degenerate output ({} x {}) for input ({} x {})",
-            w_bar, h_bar, orig_w, orig_h
+            w_bar,
+            h_bar,
+            orig_w,
+            orig_h
         ));
     }
     Ok((w_bar as u32, h_bar as u32))
@@ -1134,12 +1119,7 @@ mod tests {
         for i in 0..4 {
             assert!((out[i] - 0.0).abs() < 1e-5, "R[{}] = {}", i, out[i]);
             assert!((out[4 + i] - 0.0).abs() < 1e-5, "G[{}] = {}", i, out[4 + i]);
-            assert!(
-                (out[8 + i] - 1.0).abs() < 1e-5,
-                "B[{}] = {}",
-                i,
-                out[8 + i]
-            );
+            assert!((out[8 + i] - 1.0).abs() < 1e-5, "B[{}] = {}", i, out[8 + i]);
         }
     }
 
@@ -1289,8 +1269,18 @@ mod tests {
             let png = encode_solid_png(w, h, [128, 128, 128]);
             let out = preprocess_gemma4v(&png, &GEMMA4V_PREPROCESS_DEFAULT)
                 .unwrap_or_else(|e| panic!("({w},{h}): {e}"));
-            assert_eq!(out.n_x % n_merge, 0, "({w},{h}) n_x={} not mul of {n_merge}", out.n_x);
-            assert_eq!(out.n_y % n_merge, 0, "({w},{h}) n_y={} not mul of {n_merge}", out.n_y);
+            assert_eq!(
+                out.n_x % n_merge,
+                0,
+                "({w},{h}) n_x={} not mul of {n_merge}",
+                out.n_x
+            );
+            assert_eq!(
+                out.n_y % n_merge,
+                0,
+                "({w},{h}) n_y={} not mul of {n_merge}",
+                out.n_y
+            );
             let post_pool = (out.n_x / n_merge) * (out.n_y / n_merge);
             assert!(
                 (252..=280).contains(&post_pool),
@@ -1312,10 +1302,7 @@ mod tests {
         // to the byte-faithful llama.cpp two-step chain folded as `4x − 3`
         // (range [-3, +1]). Solid black (0) → 4*0 - 3 = -3.0. Solid white
         // (255) → 4*1 - 3 = +1.0. Mid-gray (128) → 4*(128/255) - 3 ≈ -0.992.
-        for (rgb, expect) in [
-            ([0u8, 0, 0], -3.0_f32),
-            ([255, 255, 255], 1.0),
-        ] {
+        for (rgb, expect) in [([0u8, 0, 0], -3.0_f32), ([255, 255, 255], 1.0)] {
             let png = encode_solid_png(256, 256, rgb);
             let out = preprocess_gemma4v(&png, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
             // Spot-check a handful of positions across the patch tensor.
@@ -1417,7 +1404,7 @@ mod tests {
         // This locks "vertex-aligned" sampling; image::Triangle would
         // produce a different center pixel.
         let mut src: RgbImage = ImageBuffer::new(2, 2);
-        src.put_pixel(0, 0, Rgb([0, 0, 0]));     // top-left = 0
+        src.put_pixel(0, 0, Rgb([0, 0, 0])); // top-left = 0
         src.put_pixel(1, 0, Rgb([100, 100, 100])); // top-right = 100
         src.put_pixel(0, 1, Rgb([200, 200, 200])); // bot-left = 200
         src.put_pixel(1, 1, Rgb([255, 255, 255])); // bot-right = 255
@@ -1728,10 +1715,7 @@ mod tests {
         // 100 is not a multiple of stride=32.
         let err = preprocess_qwen3vl(&png, &cfg, 100).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("must be a positive multiple"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("must be a positive multiple"), "got: {msg}");
     }
 
     #[test]
@@ -1747,8 +1731,8 @@ mod tests {
             spatial_merge_size: 2,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
-            image_min_pixels: 64 * 64,         // 4096 (≤ canvas area)
-            image_max_pixels: 768u64.pow(2),   // 589824
+            image_min_pixels: 64 * 64,       // 4096 (≤ canvas area)
+            image_max_pixels: 768u64.pow(2), // 589824
         };
         let out = preprocess_qwen3vl(&png, &cfg, 768).unwrap();
         // Smart-resize for 64×64 input with min_pixels=4096 stays at
@@ -1829,7 +1813,10 @@ mod tests {
         let cfg = qwen3vl_test_cfg();
         let err = preprocess_qwen3vl(&[1, 2, 3, 4, 5], &cfg, 768).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("guess_format") || msg.contains("not supported"), "got: {msg}");
+        assert!(
+            msg.contains("guess_format") || msg.contains("not supported"),
+            "got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------

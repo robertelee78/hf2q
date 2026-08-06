@@ -82,12 +82,9 @@ fn citations_in_source(src: &str) -> Vec<String> {
         .collect()
 }
 
-fn audit_catalog_file(
-    file_path: &str,
-    arch_cpp_src: &str,
-) -> Result<usize, String> {
-    let src = std::fs::read_to_string(file_path)
-        .map_err(|e| format!("read {}: {}", file_path, e))?;
+fn audit_catalog_file(file_path: &str, arch_cpp_src: &str) -> Result<usize, String> {
+    let src =
+        std::fs::read_to_string(file_path).map_err(|e| format!("read {}: {}", file_path, e))?;
     let arch_lines: Vec<&str> = arch_cpp_src.lines().collect();
 
     let mut checked = 0usize;
@@ -98,7 +95,10 @@ fn audit_catalog_file(
         if line_no == 0 || line_no > arch_lines.len() {
             return Err(format!(
                 "{}: citation {:?} points at line {} but llama-arch.cpp has {} lines",
-                file_path, cite, line_no, arch_lines.len()
+                file_path,
+                cite,
+                line_no,
+                arch_lines.len()
             ));
         }
         let found = arch_lines[line_no - 1];
@@ -127,8 +127,7 @@ fn qwen35_catalog_citations_resolve_in_upstream_llama_arch_cpp() {
         eprintln!("/opt/llama.cpp/src/llama-arch.cpp absent — silent skip");
         return;
     };
-    let checked =
-        audit_catalog_file("src/arch/entries/qwen35.rs", &arch_src).expect("audit");
+    let checked = audit_catalog_file("src/arch/entries/qwen35.rs", &arch_src).expect("audit");
     // Most qwen35.rs linear-attn catalog entries cite llama-arch.cpp with a
     // named LLM_TENSOR_* constant. Loosest invariant: at least one named
     // constant resolves — any zero-check would pass trivially even on an
@@ -146,8 +145,7 @@ fn qwen35moe_catalog_citations_resolve_in_upstream_llama_arch_cpp() {
         eprintln!("/opt/llama.cpp/src/llama-arch.cpp absent — silent skip");
         return;
     };
-    let checked =
-        audit_catalog_file("src/arch/entries/qwen35moe.rs", &arch_src).expect("audit");
+    let checked = audit_catalog_file("src/arch/entries/qwen35moe.rs", &arch_src).expect("audit");
     assert!(
         checked >= 1,
         "expected ≥ 1 resolved llama-arch.cpp citation in qwen35moe.rs, got {}",
@@ -157,10 +155,8 @@ fn qwen35moe_catalog_citations_resolve_in_upstream_llama_arch_cpp() {
 
 #[test]
 fn parse_llama_arch_citation_handles_canonical_form() {
-    let (line, ident) = parse_llama_arch_citation(
-        "llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM",
-    )
-    .expect("parse");
+    let (line, ident) =
+        parse_llama_arch_citation("llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM").expect("parse");
     assert_eq!(line, 449);
     assert_eq!(ident, "LLM_TENSOR_NEXTN_ENORM");
 }
@@ -177,8 +173,7 @@ fn parse_llama_arch_citation_handles_variant_forms() {
 
     // LLM_KV_* (metadata keys) also supported.
     let (line, ident) =
-        parse_llama_arch_citation("llama-arch.cpp:194 LLM_KV_NEXTN_PREDICT_LAYERS")
-            .expect("parse");
+        parse_llama_arch_citation("llama-arch.cpp:194 LLM_KV_NEXTN_PREDICT_LAYERS").expect("parse");
     assert_eq!(line, 194);
     assert_eq!(ident, "LLM_KV_NEXTN_PREDICT_LAYERS");
 }

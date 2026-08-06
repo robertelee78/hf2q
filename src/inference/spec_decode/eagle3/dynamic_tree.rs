@@ -168,21 +168,21 @@ impl ExpandedTree {
         let n = self.len();
         ensure!(n >= 1, "tree is empty");
         ensure!(
-            self.parents.len() == n
-                && self.depths.len() == n
-                && self.cum_log_probs.len() == n,
+            self.parents.len() == n && self.depths.len() == n && self.cum_log_probs.len() == n,
             "tree vec lengths inconsistent"
         );
-        ensure!(self.parents[0].is_none(), "root (index 0) must have no parent");
+        ensure!(
+            self.parents[0].is_none(),
+            "root (index 0) must have no parent"
+        );
         ensure!(self.depths[0] == 0, "root depth must be 0");
         ensure!(
             self.cum_log_probs[0] == 0.0_f64,
             "root cum_log_prob must be exactly 0.0"
         );
         for i in 1..n {
-            let p = self.parents[i].ok_or_else(|| {
-                anyhow!("non-root node {} must have a parent", i)
-            })?;
+            let p =
+                self.parents[i].ok_or_else(|| anyhow!("non-root node {} must have a parent", i))?;
             ensure!(
                 p < i,
                 "parents[{}] = {} violates topological order (parent must precede child)",
@@ -516,8 +516,12 @@ pub fn expand_dynamic_tree_with_cache<D: CacheControlDrafter>(
         depths,
         cum_log_probs: cum,
     };
-    out.validate()
-        .map_err(|e| anyhow!("expand_dynamic_tree_with_cache produced invalid tree: {}", e))?;
+    out.validate().map_err(|e| {
+        anyhow!(
+            "expand_dynamic_tree_with_cache produced invalid tree: {}",
+            e
+        )
+    })?;
     Ok(out)
 }
 
@@ -638,8 +642,7 @@ mod tests {
         };
         let inner = MockDrafter::default();
         let mut mock = CacheTrackingMock::new(inner);
-        let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg)
-            .expect("expand");
+        let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg).expect("expand");
         assert_eq!(tree.len(), 1);
         assert_eq!(mock.cache_len(), 0);
         assert!(mock.rollback_history.is_empty());
@@ -662,8 +665,7 @@ mod tests {
             log_prob_slope: 0.0,
         };
         let mut mock = CacheTrackingMock::new(inner);
-        let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg)
-            .expect("expand");
+        let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg).expect("expand");
         assert_eq!(tree.len(), 5);
         // Phase E6 tree-mask design: orchestrator no longer issues
         // rollbacks. Cache grows monotonically with each expansion.
@@ -697,8 +699,7 @@ mod tests {
             log_prob_slope: -1.0,
         };
         let mut mock = CacheTrackingMock::new(inner);
-        let tree = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
-            .expect("expand");
+        let tree = expand_dynamic_tree_with_cache(0, &mut mock, &cfg).expect("expand");
         assert_eq!(tree.len(), 6);
         // Cache grows monotonically; never rolls back during expansion.
         assert!(
@@ -779,8 +780,7 @@ mod tests {
             log_prob_slope: -1.0,
         };
         let mut mock = CacheTrackingMock::new(inner);
-        let _ = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
-            .expect("expand");
+        let _ = expand_dynamic_tree_with_cache(0, &mut mock, &cfg).expect("expand");
         assert!(
             mock.rollback_history.is_empty(),
             "orchestrator should not call rollback in tree-mask design"
@@ -829,7 +829,7 @@ mod tests {
         // the best root-child would interleave with root's siblings
         // (correct EAGLE-2 behavior, but not "fixed square" semantics).
         let cfg = DynamicTreeConfig {
-            budget: 5, // root + 4 children
+            budget: 5,    // root + 4 children
             max_depth: 1, // no grandchildren — every child stays at depth 1
             top_k: 4,
         };
@@ -930,15 +930,30 @@ mod tests {
         let d = ScriptedDrafter {
             scripts: vec![
                 vec![
-                    DraftCandidate { token: 100, log_prob: -0.1 },  // A
-                    DraftCandidate { token: 200, log_prob: -2.0 },  // B
+                    DraftCandidate {
+                        token: 100,
+                        log_prob: -0.1,
+                    }, // A
+                    DraftCandidate {
+                        token: 200,
+                        log_prob: -2.0,
+                    }, // B
                 ],
                 vec![
-                    DraftCandidate { token: 110, log_prob: -0.5 },  // A1
-                    DraftCandidate { token: 120, log_prob: -1.0 },  // A2
+                    DraftCandidate {
+                        token: 110,
+                        log_prob: -0.5,
+                    }, // A1
+                    DraftCandidate {
+                        token: 120,
+                        log_prob: -1.0,
+                    }, // A2
                 ],
                 vec![
-                    DraftCandidate { token: 111, log_prob: -0.5 },  // A1_1
+                    DraftCandidate {
+                        token: 111,
+                        log_prob: -0.5,
+                    }, // A1_1
                 ],
             ],
             call_count: 0,
@@ -972,7 +987,10 @@ mod tests {
             );
         }
         // Verify NO node with token 200 (B) exists.
-        assert!(!tree.tokens.contains(&200), "B (low-prob sibling) should NOT have been admitted ahead of A's grandchildren");
+        assert!(
+            !tree.tokens.contains(&200),
+            "B (low-prob sibling) should NOT have been admitted ahead of A's grandchildren"
+        );
     }
 
     #[test]
@@ -996,7 +1014,9 @@ mod tests {
         tree.validate().expect("hand-built tree must validate");
 
         let prefix_len = 5;
-        let mask = tree.build_tree_mask(prefix_len).expect("build_tree_mask ok");
+        let mask = tree
+            .build_tree_mask(prefix_len)
+            .expect("build_tree_mask ok");
         let q = tree.len();
         let mask_stride = prefix_len + q;
         assert_eq!(mask.len(), q * mask_stride);
@@ -1066,14 +1086,22 @@ mod tests {
                 _top_k: usize,
             ) -> Result<Vec<DraftCandidate>> {
                 Ok(vec![
-                    DraftCandidate { token: 10, log_prob: -1.0 },
-                    DraftCandidate { token: 11, log_prob: -0.5 },
+                    DraftCandidate {
+                        token: 10,
+                        log_prob: -1.0,
+                    },
+                    DraftCandidate {
+                        token: 11,
+                        log_prob: -0.5,
+                    },
                 ])
             }
         }
         let cfg = DynamicTreeConfig::default();
         let mut d = BadDrafter;
-        let err = expand_dynamic_tree(0, &mut d, &cfg).unwrap_err().to_string();
+        let err = expand_dynamic_tree(0, &mut d, &cfg)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("sorted descending"), "got: {err}");
     }
 

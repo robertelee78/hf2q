@@ -207,16 +207,18 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
     let row_bytes = row_blocks * BLOCK_BYTES;
     // ADR-036 Layer A: per-row parallelism via rayon.
     let mut out = vec![0u8; n_rows * row_bytes];
-    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
-        let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
-        let mut tmp = Vec::with_capacity(row_bytes);
-        match imatrix {
-            None => quantize_row_ref(row_src, &mut tmp),
-            Some(qw) => quantize_row_impl(row_src, qw, &mut tmp),
-        }
-        debug_assert_eq!(tmp.len(), row_bytes);
-        dst.copy_from_slice(&tmp);
-    });
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, dst)| {
+            let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
+            let mut tmp = Vec::with_capacity(row_bytes);
+            match imatrix {
+                None => quantize_row_ref(row_src, &mut tmp),
+                Some(qw) => quantize_row_impl(row_src, qw, &mut tmp),
+            }
+            debug_assert_eq!(tmp.len(), row_bytes);
+            dst.copy_from_slice(&tmp);
+        });
 
     out
 }
@@ -245,19 +247,23 @@ mod tests {
             for &row_idx in *rows {
                 let f32_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_f32.bin", name, row_idx);
                 let q6k_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_q6k.bin", name, row_idx);
-                let f32_bytes = std::fs::read(&f32_path)
-                    .unwrap_or_else(|_| panic!("{} must exist", f32_path));
-                let canonical = std::fs::read(&q6k_path)
-                    .unwrap_or_else(|_| panic!("{} must exist", q6k_path));
+                let f32_bytes =
+                    std::fs::read(&f32_path).unwrap_or_else(|_| panic!("{} must exist", f32_path));
+                let canonical =
+                    std::fs::read(&q6k_path).unwrap_or_else(|_| panic!("{} must exist", q6k_path));
                 let n_blocks = n_per_row / 256;
                 assert_eq!(f32_bytes.len(), n_per_row * 4);
                 assert_eq!(canonical.len(), n_blocks * BLOCK_BYTES);
-                let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+                let f32: Vec<f32> = f32_bytes
+                    .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 let q6k = quantize(&f32, *n_per_row, None);
-                let diff: usize = q6k.iter().zip(canonical.iter())
-                    .filter(|(a, b)| a != b).count();
+                let diff: usize = q6k
+                    .iter()
+                    .zip(canonical.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
                 if diff > 0 {
                     println!("{} row {}: {} bytes differ", name, row_idx, diff);
                 }
@@ -265,8 +271,12 @@ mod tests {
                 grand_total += q6k.len();
             }
         }
-        println!("\nQ6_K BROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
-            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+        println!(
+            "\nQ6_K BROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
+            grand_total_diff,
+            grand_total,
+            100.0 * grand_total_diff as f64 / grand_total as f64
+        );
     }
 
     /// One-off bisection harness for the Qwen 3.5 lm_head Q6_K block 1199 residual.
@@ -293,21 +303,30 @@ mod tests {
         println!("hf2q row149 block7: ql[..8]={}", ql_hex);
         println!("hf2q row149 block7: scales i8 = {:?}", scales_i8);
         println!("hf2q row149 block7: scales u8 = {:?}", scales_u8);
-        println!("hf2q row149 block7: d (f16) = {:02x} {:02x}", blk7[208], blk7[209]);
+        println!(
+            "hf2q row149 block7: d (f16) = {:02x} {:02x}",
+            blk7[208], blk7[209]
+        );
         // Canonical reference: scales u8 = [81, 87, 68, 164, 145, 72, 104, 196, 67, 50, 170, 100, 195, 160, 200, 128]
-        let canon: Vec<u8> = vec![81, 87, 68, 164, 145, 72, 104, 196, 67, 50, 170, 100, 195, 160, 200, 128];
+        let canon: Vec<u8> = vec![
+            81, 87, 68, 164, 145, 72, 104, 196, 67, 50, 170, 100, 195, 160, 200, 128,
+        ];
         for ib in 0..16 {
             if scales_u8[ib] != canon[ib] {
-                println!("  MISMATCH ib={} hf2q={} canon={} delta={}",
-                    ib, scales_u8[ib], canon[ib],
-                    scales_u8[ib] as i32 - canon[ib] as i32);
+                println!(
+                    "  MISMATCH ib={} hf2q={} canon={} delta={}",
+                    ib,
+                    scales_u8[ib],
+                    canon[ib],
+                    scales_u8[ib] as i32 - canon[ib] as i32
+                );
             }
         }
     }
 
     fn fixture_path(name: &str) -> PathBuf {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set by cargo test");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo test");
         PathBuf::from(manifest)
             .join("tests/fixtures/ggml_quants")
             .join(name)
@@ -367,4 +386,3 @@ mod tests {
         assert_eq!(got, expected, "Q6_K im byte-cmp failed");
     }
 }
-
