@@ -24,6 +24,7 @@
 //! is why the full JSON-acceptance test suite below has no fixture cost.
 
 use super::parser::{Grammar, GretElement, GretType};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Position + Stack types
@@ -375,7 +376,9 @@ pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
 /// unchanged (the wave-2.4 baseline).
 #[derive(Debug, Clone)]
 pub struct GrammarRuntime {
-    pub grammar: Grammar,
+    /// Immutable parsed grammar shared by all speculative candidate probes.
+    /// Runtime clones copy only this `Arc` plus their small mutable stack set.
+    pub grammar: Arc<Grammar>,
     pub stacks: Stacks,
     pub partial_utf8: PartialUtf8,
     /// Trigger gate.  When `true`, `accept_bytes`/`is_dead`/`is_accepted`
@@ -385,6 +388,15 @@ pub struct GrammarRuntime {
     /// at construction (the default for `GrammarKind::ResponseFormat`
     /// runtimes).
     awaiting_trigger: bool,
+    /// Optional byte marker for a lazy tool grammar.  When configured,
+    /// `accept_bytes` watches the unconstrained preamble stream for this
+    /// marker and advances the grammar with any body bytes carried by the
+    /// SAME token.  That last detail matters for tokenizers which merge an
+    /// open marker and the first body prefix into one token.
+    lazy_trigger: Option<Vec<u8>>,
+    /// At most `lazy_trigger.len() - 1` trailing bytes retained so a marker
+    /// split across adjacent tokens can still be recognized.
+    lazy_trigger_tail: Vec<u8>,
 }
 
 impl GrammarRuntime {
@@ -432,10 +444,12 @@ impl GrammarRuntime {
             }
         }
         Some(Self {
-            grammar,
+            grammar: Arc::new(grammar),
             stacks,
             partial_utf8: PartialUtf8::default(),
             awaiting_trigger: false,
+            lazy_trigger: None,
+            lazy_trigger_tail: Vec::new(),
         })
     }
 
@@ -469,6 +483,22 @@ impl GrammarRuntime {
     /// ```
     pub fn set_awaiting_trigger(&mut self, value: bool) {
         self.awaiting_trigger = value;
+        if !value {
+            self.lazy_trigger_tail.clear();
+        }
+    }
+
+    /// Suspend the grammar until `marker` appears in accepted token bytes.
+    ///
+    /// Unlike the legacy splitter-only trigger, this keeps grammar state
+    /// synchronized when one token decodes to `marker + body-prefix`, and
+    /// when the marker spans token boundaries.  The output splitter remains
+    /// responsible for routing SSE fields; this method owns only grammar
+    /// state.
+    pub fn set_lazy_trigger(&mut self, marker: &[u8]) {
+        self.awaiting_trigger = true;
+        self.lazy_trigger = (!marker.is_empty()).then(|| marker.to_vec());
+        self.lazy_trigger_tail.clear();
     }
 
     /// Flip the trigger gate to `false`.  Called by the engine when the
@@ -502,6 +532,7 @@ impl GrammarRuntime {
     /// termination check.
     pub fn trigger(&mut self) {
         self.awaiting_trigger = false;
+        self.lazy_trigger_tail.clear();
     }
 
     /// Feed one Unicode code point. Returns `true` if any stacks remain
@@ -523,11 +554,23 @@ impl GrammarRuntime {
     /// `/opt/llama.cpp/src/llama-grammar.cpp:1382-1439`.
     pub fn accept_bytes(&mut self, bytes: &[u8]) -> bool {
         if self.awaiting_trigger {
-            // Self-gate: no advance while suspended.  Return `true`
-            // (alive) so callers that test the return value treat
-            // the runtime as still-viable.  This is the apply+accept
-            // single-boolean atomicity invariant from research-report.md
-            // Q2.
+            let Some(marker) = self.lazy_trigger.as_deref() else {
+                // Legacy explicit-trigger mode: no advance while suspended.
+                return true;
+            };
+
+            let mut scan = std::mem::take(&mut self.lazy_trigger_tail);
+            scan.extend_from_slice(bytes);
+            if let Some(marker_start) = scan.windows(marker.len()).position(|w| w == marker) {
+                let body_start = marker_start + marker.len();
+                let body_suffix = scan[body_start..].to_vec();
+                self.trigger();
+                return self.accept_bytes(&body_suffix);
+            }
+
+            let keep = marker.len().saturating_sub(1).min(scan.len());
+            self.lazy_trigger_tail
+                .extend_from_slice(&scan[scan.len().saturating_sub(keep)..]);
             return true;
         }
         let mut i = 0;
@@ -1078,6 +1121,40 @@ mod tests {
         // Post-trigger: the grammar is intact; the literal matches.
         assert!(rt.accept_bytes(b"abc"));
         assert!(rt.is_accepted());
+    }
+
+    #[test]
+    fn lazy_marker_accepts_body_suffix_carried_by_trigger_token() {
+        let mut rt = runtime_from("root ::= \"call:read_file\"\n", "root");
+        rt.set_lazy_trigger(b"<|tool_call>");
+
+        assert!(rt.accept_bytes(b"preamble<|tool_call>call:read"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.accept_bytes(b"_file"));
+        assert!(rt.is_accepted());
+    }
+
+    #[test]
+    fn lazy_marker_matches_across_token_boundaries_without_replaying_prefix() {
+        let mut rt = runtime_from("root ::= \"call:f{}\"\n", "root");
+        rt.set_lazy_trigger(b"<|tool_call>");
+
+        assert!(rt.accept_bytes(b"plain text <|tool"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_bytes(b"_call>call:f"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.accept_bytes(b"{}"));
+        assert!(rt.is_accepted());
+    }
+
+    #[test]
+    fn lazy_marker_retains_only_a_bounded_partial_match_tail() {
+        let mut rt = runtime_from("root ::= \"x\"\n", "root");
+        rt.set_lazy_trigger(b"<tool_call>");
+
+        assert!(rt.accept_bytes(&vec![b'a'; 64 * 1024]));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.lazy_trigger_tail.len() < b"<tool_call>".len());
     }
 
     /// Multi-tool-call regression guard.  llama.cpp does NOT reset

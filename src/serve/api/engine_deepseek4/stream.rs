@@ -281,7 +281,7 @@ pub fn generate_stream(
         progress.finish_prefill(prefill_duration);
         release_completed_prefill_scratch();
         let sampler = sampler_config(params);
-        let mut runtime = grammar_runtime(params)?;
+        let mut runtime = grammar_runtime(params, registration)?;
         let mut reasoning = registration.and_then(|registration| {
             registry::make_reasoning_splitter(registration, params.reasoning_forced_open)
         });

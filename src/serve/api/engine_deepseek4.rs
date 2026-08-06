@@ -160,6 +160,13 @@ impl Deepseek4LoadedModel {
             .unwrap_or(1);
         let mut model =
             Deepseek4Model::load_from_gguf(&gguf).context("load native DeepSeek-V4 model")?;
+        tracing::info!(
+            logical_weight_bytes = model.weights.resident_bytes(),
+            file_backed_weight_bytes = model.weights.file_backed_bytes(),
+            anonymous_weight_bytes = model.weights.anonymous_bytes(),
+            mapped_weight_segments = model.weights.mapped_segment_count(),
+            "DeepSeek-V4 weight residency established"
+        );
         let requested_context = std::env::var("HF2Q_DEEPSEEK_MAX_SEQ_LEN")
             .ok()
             .map(|value| {

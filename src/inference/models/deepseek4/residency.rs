@@ -75,6 +75,9 @@ pub struct RawMatrixRef<'a> {
 pub struct Deepseek4Weights {
     tensors: HashMap<String, ResidentTensor>,
     resident_bytes: u64,
+    file_backed_bytes: u64,
+    anonymous_bytes: u64,
+    mapped_segment_count: usize,
     _device: MlxDevice,
 }
 
@@ -99,6 +102,21 @@ impl Deepseek4Weights {
 
         let mut tensors = HashMap::with_capacity(specs.len());
         let mut resident_bytes = 0_u64;
+        let mut file_backed_bytes = 0_u64;
+        let mut anonymous_bytes = 0_u64;
+        let map_raw_weights = std::env::var("HF2Q_DEEPSEEK_MMAP_WEIGHTS").as_deref() != Ok("0");
+        let mapped_tensor_data = map_raw_weights
+            .then(|| {
+                gguf.map_tensor_data(&device)
+                    .map_err(|source| WeightResidencyError::Load {
+                        name: "GGUF tensor data".to_string(),
+                        source,
+                    })
+            })
+            .transpose()?;
+        let mapped_segment_count = mapped_tensor_data
+            .as_ref()
+            .map_or(0, |mapping| mapping.segment_count());
         for spec in specs {
             let info = gguf.tensor_info(&spec.name).ok_or_else(|| {
                 WeightResidencyError::MissingAfterCatalog {
@@ -106,6 +124,16 @@ impl Deepseek4Weights {
                 }
             })?;
             let buffer = match spec.role {
+                TensorRole::RawMatrix | TensorRole::IntegerLookupI32 if map_raw_weights => {
+                    mapped_tensor_data
+                        .as_ref()
+                        .expect("mapped tensor data exists when mmap weights are enabled")
+                        .load_tensor(&spec.name)
+                        .map_err(|source| WeightResidencyError::Load {
+                            name: spec.name.clone(),
+                            source,
+                        })?
+                }
                 TensorRole::RawMatrix | TensorRole::IntegerLookupI32 => gguf
                     .load_tensor(&spec.name, &device)
                     .map_err(|source| WeightResidencyError::Load {
@@ -121,7 +149,7 @@ impl Deepseek4Weights {
                 }
             };
             validate_loaded_buffer(&spec.name, spec.role, info.byte_len, &buffer)?;
-            let bytes = u64::try_from(buffer.byte_len()).map_err(|_| {
+            let bytes = u64::try_from(buffer.data_byte_len()).map_err(|_| {
                 WeightResidencyError::ByteOverflow {
                     name: spec.name.clone(),
                 }
@@ -131,6 +159,19 @@ impl Deepseek4Weights {
                     name: spec.name.clone(),
                 }
             })?;
+            if buffer.is_file_backed() {
+                file_backed_bytes = file_backed_bytes.checked_add(bytes).ok_or_else(|| {
+                    WeightResidencyError::ByteOverflow {
+                        name: spec.name.clone(),
+                    }
+                })?;
+            } else {
+                anonymous_bytes = anonymous_bytes.checked_add(bytes).ok_or_else(|| {
+                    WeightResidencyError::ByteOverflow {
+                        name: spec.name.clone(),
+                    }
+                })?;
+            }
             tensors.insert(
                 spec.name,
                 ResidentTensor {
@@ -144,6 +185,9 @@ impl Deepseek4Weights {
         Ok(Self {
             tensors,
             resident_bytes,
+            file_backed_bytes,
+            anonymous_bytes,
+            mapped_segment_count,
             _device: device,
         })
     }
@@ -156,10 +200,25 @@ impl Deepseek4Weights {
         self.tensors.is_empty()
     }
 
-    /// Sum of actual Metal buffer lengths, including F32 expansion only for
-    /// elementwise state.
+    /// Sum of logical Metal tensor bytes, including F32 expansion only for
+    /// elementwise state and excluding page-alignment padding.
     pub fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+    }
+
+    /// Immutable raw weight bytes served directly from the GGUF mapping.
+    pub fn file_backed_bytes(&self) -> u64 {
+        self.file_backed_bytes
+    }
+
+    /// Weight bytes copied or expanded into anonymous Metal allocations.
+    pub fn anonymous_bytes(&self) -> u64 {
+        self.anonymous_bytes
+    }
+
+    /// Number of shared Metal resources spanning the file-backed tensors.
+    pub fn mapped_segment_count(&self) -> usize {
+        self.mapped_segment_count
     }
 
     pub fn tensor(
@@ -276,7 +335,7 @@ fn validate_loaded_buffer(
         name: name.to_string(),
     })?;
     let actual =
-        u64::try_from(buffer.byte_len()).map_err(|_| WeightResidencyError::ByteOverflow {
+        u64::try_from(buffer.data_byte_len()).map_err(|_| WeightResidencyError::ByteOverflow {
             name: name.to_string(),
         })?;
     if actual != expected {

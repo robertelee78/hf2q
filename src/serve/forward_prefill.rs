@@ -22,6 +22,34 @@ use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
 
+/// Restore the logical decode cursor for an LCP snapshot.
+///
+/// Sliding layers normally use a physical ring, so their next write cursor is
+/// reduced modulo the ring capacity. Long-resume snapshots are different:
+/// their sliding-layer buffers are deliberately allocated as linear storage
+/// and indexed by absolute token position. Keep the legacy packed-cache
+/// `seq_len` capped to its physical ring, but preserve the absolute
+/// `write_pos` so the production hybrid cache resumes at position `k` rather
+/// than overwriting position `k % sliding_window`.
+fn restored_kv_cursor(
+    k: usize,
+    is_sliding: bool,
+    cache_capacity: usize,
+    linear_sliding_resume: bool,
+) -> (usize, usize) {
+    if !is_sliding {
+        return (k, k);
+    }
+
+    let capacity = cache_capacity.max(1);
+    let write_pos = if linear_sliding_resume {
+        k
+    } else {
+        k % capacity
+    };
+    (write_pos, k.min(capacity))
+}
+
 /// Per-position embedding override for soft-token injection
 /// (Phase 2c Task #17, iter-97).
 ///
@@ -613,6 +641,10 @@ impl MlxModelWeights {
         // `k` tokens have already been written) and `seq_len =
         // min(k, sliding_window)` (the kernel's "valid populated
         // slots" count, capped by the ring capacity).
+        let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+            && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+            && (crate::debug::INVESTIGATION_ENV.use_dense
+                || crate::debug::INVESTIGATION_ENV.hybrid_kv);
         match restored_lcp {
             None => {
                 for cache in self.kv_caches.iter_mut() {
@@ -622,14 +654,8 @@ impl MlxModelWeights {
             }
             Some(k) => {
                 for cache in self.kv_caches.iter_mut() {
-                    if cache.is_sliding {
-                        let sw = cache.capacity.max(1);
-                        cache.write_pos = k % sw;
-                        cache.seq_len = k.min(sw);
-                    } else {
-                        cache.write_pos = k;
-                        cache.seq_len = k;
-                    }
+                    (cache.write_pos, cache.seq_len) =
+                        restored_kv_cursor(k, cache.is_sliding, cache.capacity, kv_lcp_long_resume);
                 }
             }
         }
@@ -704,10 +730,6 @@ impl MlxModelWeights {
         // `/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal:490-491,914-915`),
         // so linear sliding buffers + logical-position masking compose
         // identically for both legs.
-        let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
-            && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-            && (crate::debug::INVESTIGATION_ENV.use_dense
-                || crate::debug::INVESTIGATION_ENV.hybrid_kv);
         let sliding_layer_capacity = if kv_lcp_long_resume {
             sw.max(seq_len + max_decode_tokens)
         } else {
@@ -6149,6 +6171,33 @@ impl MlxModelWeights {
         self.leg_hb_encoded = prior_leg_hb;
 
         result
+    }
+}
+
+#[cfg(test)]
+mod lcp_cursor_tests {
+    use super::restored_kv_cursor;
+
+    #[test]
+    fn sliding_ring_resume_wraps_the_physical_cursor() {
+        assert_eq!(restored_kv_cursor(6_597, true, 1_024, false), (453, 1_024));
+    }
+
+    #[test]
+    fn sliding_linear_resume_preserves_the_absolute_cursor() {
+        assert_eq!(restored_kv_cursor(6_597, true, 1_024, true), (6_597, 1_024));
+    }
+
+    #[test]
+    fn full_attention_resume_is_always_linear() {
+        assert_eq!(
+            restored_kv_cursor(6_597, false, 16_384, false),
+            (6_597, 6_597)
+        );
+        assert_eq!(
+            restored_kv_cursor(6_597, false, 16_384, true),
+            (6_597, 6_597)
+        );
     }
 }
 

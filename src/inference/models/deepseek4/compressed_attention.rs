@@ -40,9 +40,13 @@ use super::Deepseek4Model;
 const SPARSE_FLASH_MIN_TOP_K: usize = 384;
 /// The dense-mask flash kernel wins while the compressed history is short;
 /// gathered sparse flash becomes faster once ratio-four history reaches this
-/// measured crossover (roughly 24K raw tokens). Keeping the decision on the
-/// compressed count makes it independent of prompt chunk size.
-const SPARSE_PREFILL_MIN_COMPRESSED: usize = 6_144;
+/// measured crossover. Heads-as-rows packing moved the crossover from 6,144
+/// compressed entries to 1,024 (roughly 4K raw tokens): at 2K raw entries the
+/// two paths are effectively tied, while at 4K dense attention measured 0.98 s
+/// per transaction versus about 0.69 s for packed sparse attention. Keeping
+/// the decision on the compressed count makes it independent of prompt chunk
+/// size.
+const SPARSE_PREFILL_MIN_COMPRESSED: usize = 1_024;
 
 fn use_gathered_sparse_prefill(ratio: u32, valid_compressed: usize) -> bool {
     ratio == 4 && valid_compressed >= SPARSE_PREFILL_MIN_COMPRESSED
@@ -409,7 +413,7 @@ impl Deepseek4Model {
             indices.with_shape(vec![1, rows, attention_width])?
         } else {
             indices
-                .slice_view(indices.byte_offset(), rows * attention_width)
+                .slice_view(0, rows * attention_width)
                 .with_shape(vec![1, rows, attention_width])?
         };
         let use_sparse_prefill_flash =

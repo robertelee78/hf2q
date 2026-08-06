@@ -50,7 +50,10 @@ use crate::serve::load_info::{
 use crate::core::provenance::{self, Provenance};
 use crate::serve::multi_seq_kv::SlotId;
 
-use super::engine::{effective_repetition_penalty, LoadOptions, SamplingParams};
+use super::engine::{
+    effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
+    LoadOptions, SamplingParams, ToolCallPolicy,
+};
 
 /// Canonical Qwen3 chat-template stop tokens.
 ///
@@ -959,9 +962,11 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
 /// only needs the parameters that affect the cached *response shape*
 /// even under greedy decode (max_tokens early-stop, stop_strings).
 ///
-/// Wedge-4 follow-up will widen the key as Qwen3.5/3.6 picks up grammar
-/// / logit_bias / tool-call policies.  The conservative MVP key keeps
-/// false-positive hits structurally impossible.
+/// Grammar, logit-bias, logprobs, and effective repetition-penalty
+/// requests bypass exact prompt replay through `is_greedy_eligible`, so
+/// they do not belong in this deliberately narrow key.  Tool-call policy
+/// affects response routing after KV restoration rather than the cached
+/// prompt state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridPromptCacheKey {
     pub max_tokens: usize,
@@ -1019,8 +1024,8 @@ impl HybridPromptCacheKey {
 /// them into one type would require either a sum-type with two unrelated
 /// payloads (engine.rs has rejected that for clarity reasons in
 /// neighboring iter docs) or a forced commit to one shape on both
-/// arches.  Wedge-4 will revisit the unification question once both
-/// arches have shipped real wire-up.
+/// arches. Both families now have real wire-up, and their distinct cache
+/// contracts remain explicit rather than hidden behind a lossy abstraction.
 #[derive(Debug)]
 pub struct HybridPromptCache {
     cached_prompt_tokens: Vec<u32>,
@@ -1133,8 +1138,11 @@ fn is_greedy_eligible(params: &SamplingParams) -> bool {
     !(params.temperature > 0.0
         || params.top_k > 0
         || params.top_p < 1.0
-        || params.repetition_penalty != 1.0
-        || params.seed.is_some())
+        || effective_repetition_penalty(params) != 1.0
+        || params.seed.is_some()
+        || params.logprobs
+        || !params.logit_bias.is_empty()
+        || params.grammar.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,11 +1292,8 @@ fn alloc_kv_cache_for_request(
 /// Sample the next token from a `[vocab_size]` logits slice using
 /// `sampler_pure::sample_token` for non-greedy modes.
 ///
-/// Wedge-3 keeps the wired sampler surface narrow: temperature / top_p /
-/// top_k / repetition_penalty pass through to `SamplerPureParams`.
-/// `logit_bias`, grammar enforcement, and seed-driven RNG are deferred
-/// to Wedge-4 (the Qwen35 MVP doesn't currently surface those — the
-/// chat handler short-circuits grammar use to Gemma-only).
+/// Legacy unconstrained sampler retained for call sites that do not yet
+/// consume request grammar or logit-bias state.
 fn sample_logits_qwen35(logits: &mut [f32], params: &SamplingParams, generated: &[u32]) -> u32 {
     let sp = SamplerPureParams {
         temperature: params.temperature as f64,
@@ -1319,6 +1324,70 @@ fn sample_logits_qwen35_with_logprob(
         max_tokens: params.max_tokens,
     };
     sampler_pure::sample_token_with_logprob(logits, &sp, generated)
+}
+
+fn sample_logits_qwen35_constrained(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    generated: &[u32],
+    runtime: Option<&super::grammar::GrammarRuntime>,
+    want_logprobs: bool,
+) -> (u32, Option<f32>) {
+    for (&token, &bias) in &params.logit_bias {
+        if let Some(logit) = logits.get_mut(token as usize) {
+            *logit += bias;
+        }
+    }
+    let sampler = SamplerPureParams {
+        temperature: params.temperature as f64,
+        top_p: params.top_p as f64,
+        top_k: params.top_k,
+        min_p: params.min_p as f64,
+        repetition_penalty: effective_repetition_penalty(params),
+        max_tokens: params.max_tokens,
+    };
+    sample_logits_with_grammar(
+        logits,
+        &sampler,
+        generated,
+        runtime,
+        params.token_bytes.as_deref().map(Vec::as_slice),
+        want_logprobs,
+    )
+}
+
+fn advance_qwen35_grammar(
+    runtime: &mut Option<super::grammar::GrammarRuntime>,
+    params: &SamplingParams,
+    token: u32,
+) {
+    if let (Some(runtime), Some(token_bytes)) = (runtime.as_mut(), params.token_bytes.as_deref()) {
+        if let Some(bytes) = token_bytes.get(token as usize) {
+            if !bytes.is_empty() {
+                runtime.accept_bytes(bytes);
+            }
+        }
+    }
+}
+
+fn qwen35_grammar_terminal_token(
+    runtime: Option<&super::grammar::GrammarRuntime>,
+    params: &SamplingParams,
+    token: u32,
+) -> bool {
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    if runtime.is_dead() {
+        return true;
+    }
+    runtime.is_accepted()
+        && params.token_bytes.as_deref().is_some_and(|token_bytes| {
+            token_bytes
+                .get(token as usize)
+                .map(|bytes| bytes.is_empty())
+                .unwrap_or(true)
+        })
 }
 
 /// ADR-017 Phase B-hybrid.1 — build the LcpKey for a Qwen35 request.
@@ -1401,6 +1470,18 @@ fn build_lcp_key_for_qwen35_chunk(
 /// want more entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY=10g`.
 pub fn qwen35_lcp_registry_byte_budget() -> u64 {
     crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+}
+
+fn qwen35_reported_cached_tokens(
+    prompt_len: usize,
+    prompt_cache_hit: bool,
+    lcp_resume_start: usize,
+) -> usize {
+    if prompt_cache_hit {
+        prompt_len
+    } else {
+        lcp_resume_start.min(prompt_len)
+    }
 }
 
 /// `true` when the running text ends with any of the registered stop
@@ -1486,6 +1567,7 @@ pub fn generate_qwen35_once(
     } else {
         None
     };
+    let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
     let device =
         MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
@@ -1976,21 +2058,23 @@ pub fn generate_qwen35_once(
         // sampling-mode we apply the sampler to the prefill logits so
         // user temperature affects the very first generated token (same
         // contract as Gemma's `generate_once`).
-        if want_logprobs {
-            // ADR-020 AC#7 — bypass greedy fast-path; need full logits
-            // for log_softmax.  Token selection identical at T=0.
-            let mut logits = prefill_logits.clone();
-            let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
-            next_token = tok;
-            if let Some(v) = logprobs_vec.as_mut() {
-                v.push(lp);
-            }
-        } else if is_greedy {
+        if is_greedy {
             next_token = greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
         } else {
             let mut logits = prefill_logits.clone();
-            next_token = sample_logits_qwen35(&mut logits, params, &[]);
+            let (token, logprob) = sample_logits_qwen35_constrained(
+                &mut logits,
+                params,
+                &[],
+                grammar_runtime.as_ref(),
+                want_logprobs,
+            );
+            next_token = token;
+            if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+                values.push(logprob);
+            }
         }
+        advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
 
         // Snapshot + cache update.  The snapshot captures KV state AFTER
         // the prefill (current_len[0] == prompt_len for full-attn slots;
@@ -2129,27 +2213,7 @@ pub fn generate_qwen35_once(
             }
             let decode_positions = vec![pos; 4];
 
-            next_token = if want_logprobs {
-                // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
-                        &[next_token],
-                        &decode_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| {
-                        format!("forward_gpu_last_logits decode step {step} (logprobs)")
-                    })?;
-                let mut logits = logits_full;
-                let (tok, lp) =
-                    sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
-                if let Some(v) = logprobs_vec.as_mut() {
-                    v.push(lp);
-                }
-                tok
-            } else if is_greedy {
+            next_token = if is_greedy {
                 qwen.model
                     // ADR-040 Phase B4d (2026-05-30) — forward_gpu_greedy
                     // now accepts SlotId.  Single-seq engine path:
@@ -2170,10 +2234,25 @@ pub fn generate_qwen35_once(
                     )
                     .with_context(|| format!("forward_gpu_last_logits decode step {step}"))?;
                 let mut logits = logits_full;
-                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+                let (token, logprob) = sample_logits_qwen35_constrained(
+                    &mut logits,
+                    params,
+                    &generated_tokens,
+                    grammar_runtime.as_ref(),
+                    want_logprobs,
+                );
+                if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+                    values.push(logprob);
+                }
+                token
             };
+            advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
 
             if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            if qwen35_grammar_terminal_token(grammar_runtime.as_ref(), params, next_token) {
                 finish_reason = "stop";
                 break;
             }
@@ -2242,7 +2321,11 @@ pub fn generate_qwen35_once(
         finish_reason,
         prefill_duration,
         decode_duration,
-        cached_tokens: if prompt_cache_hit { prompt_len } else { 0 },
+        cached_tokens: qwen35_reported_cached_tokens(
+            prompt_len,
+            prompt_cache_hit,
+            lcp_resume_start,
+        ),
         logprobs: logprobs_vec,
     })
 }
@@ -2618,8 +2701,9 @@ pub fn generate_qwen35_once_slot_aware(
 // the two stay auditable side-by-side. Hoists that function's decode-loop
 // locals so the SlotAware worker (`super::engine::worker_run_slot_aware`)
 // can interleave N slots across ticks. DELIBERATELY simpler than the
-// Gemma 4 tail: Qwen35 has no grammar runtime / token-bytes / live
-// reasoning splitter / tool-call splitter in the loop, computes
+// Gemma 4 tail: this legacy slot-aware Qwen35 path has no grammar runtime /
+// token-bytes / live reasoning splitter / tool-call splitter in the loop,
+// computes
 // `reasoning_tokens` POST-HOC at end-of-decode, and POPS+clears on a
 // first-token EOS — all preserved exactly here.
 //
@@ -4418,6 +4502,15 @@ pub fn generate_stream_qwen35_once_extended(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
     let is_greedy = is_greedy_eligible(params);
+    let mut grammar_runtime = match grammar_runtime_for_request(params, registration) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send!(GenerationEvent::Error(format!(
+                "qwen35 stream grammar initialization failed: {error:#}"
+            )));
+            return;
+        }
+    };
 
     // Wedge-4e: any extension present ⇒ vision-augmented prefill path.
     // When ALL extensions are empty/None, the legacy text-only stream
@@ -4799,8 +4892,16 @@ pub fn generate_stream_qwen35_once_extended(
             next_token = greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
         } else {
             let mut logits = prefill_logits.clone();
-            next_token = sample_logits_qwen35(&mut logits, params, &[]);
+            next_token = sample_logits_qwen35_constrained(
+                &mut logits,
+                params,
+                &[],
+                grammar_runtime.as_ref(),
+                false,
+            )
+            .0;
         }
+        advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
         // Prompt-cache snapshot is ONLY taken on the text-only path —
         // the vision path's bypass-on-read above means there's no key
         // collision risk, but it's also not productive to snapshot a
@@ -4905,6 +5006,7 @@ pub fn generate_stream_qwen35_once_extended(
         body: &mut String,
         tc_index: &mut usize,
         saw_tc: &mut bool,
+        tool_call_policy: super::engine::ToolCallPolicy,
         registration: Option<&ModelRegistration>,
         events: &tokio::sync::mpsc::Sender<GenerationEvent>,
         text: &str,
@@ -4961,7 +5063,7 @@ pub fn generate_stream_qwen35_once_extended(
                     if super::engine::emit_streaming_tool_call_close(
                         parsed,
                         body_dump,
-                        params_tool_call_policy_for_qwen35_stream(),
+                        tool_call_policy,
                         tc_index,
                         saw_tc,
                         &sink,
@@ -4984,6 +5086,7 @@ pub fn generate_stream_qwen35_once_extended(
         body: &mut String,
         tc_index: &mut usize,
         saw_tc: &mut bool,
+        tool_call_policy: super::engine::ToolCallPolicy,
         registration: Option<&ModelRegistration>,
         events: &tokio::sync::mpsc::Sender<GenerationEvent>,
         fragment: &str,
@@ -5012,6 +5115,7 @@ pub fn generate_stream_qwen35_once_extended(
                             body,
                             tc_index,
                             saw_tc,
+                            tool_call_policy,
                             registration,
                             events,
                             &text,
@@ -5028,6 +5132,7 @@ pub fn generate_stream_qwen35_once_extended(
                 body,
                 tc_index,
                 saw_tc,
+                tool_call_policy,
                 registration,
                 events,
                 fragment,
@@ -5041,12 +5146,18 @@ pub fn generate_stream_qwen35_once_extended(
     let mut accumulated_text = String::new();
     let mut reasoning_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
 
     let first_text = qwen
         .tokenizer
         .decode(&[next_token], false)
         .unwrap_or_default();
     let mut is_eos_first = qwen.eos_token_ids.contains(&next_token);
+    if !is_eos_first && qwen35_grammar_terminal_token(grammar_runtime.as_ref(), params, next_token)
+    {
+        is_eos_first = true;
+        finish_reason = "stop";
+    }
     if !is_eos_first && !first_text.is_empty() {
         accumulated_text.push_str(&first_text);
         if !emit_fragment_qwen35(
@@ -5055,6 +5166,7 @@ pub fn generate_stream_qwen35_once_extended(
             &mut tool_call_body,
             &mut tool_call_index,
             &mut saw_tool_call,
+            params.tool_call_policy,
             registration,
             events,
             &first_text,
@@ -5066,6 +5178,9 @@ pub fn generate_stream_qwen35_once_extended(
         }
     }
     completion_tokens += 1;
+    if !is_eos_first {
+        generated_tokens.push(next_token);
+    }
     if reasoning_splitter
         .as_ref()
         .map(|s| s.in_reasoning())
@@ -5106,7 +5221,15 @@ pub fn generate_stream_qwen35_once_extended(
                 ) {
                     Ok(logits) => {
                         let mut tmp = logits;
-                        Ok(sample_logits_qwen35(&mut tmp, params, &[next_token]))
+                        let token = sample_logits_qwen35_constrained(
+                            &mut tmp,
+                            params,
+                            &generated_tokens,
+                            grammar_runtime.as_ref(),
+                            false,
+                        )
+                        .0;
+                        Ok(token)
                     }
                     Err(e) => Err(e),
                 }
@@ -5120,11 +5243,17 @@ pub fn generate_stream_qwen35_once_extended(
                     return;
                 }
             };
+            advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
             if qwen.eos_token_ids.contains(&next_token) {
                 finish_reason = "stop";
                 break;
             }
+            if qwen35_grammar_terminal_token(grammar_runtime.as_ref(), params, next_token) {
+                finish_reason = "stop";
+                break;
+            }
             completion_tokens += 1;
+            generated_tokens.push(next_token);
             let fragment = qwen
                 .tokenizer
                 .decode(&[next_token], false)
@@ -5136,6 +5265,7 @@ pub fn generate_stream_qwen35_once_extended(
                 &mut tool_call_body,
                 &mut tool_call_index,
                 &mut saw_tool_call,
+                params.tool_call_policy,
                 registration,
                 events,
                 &fragment,
@@ -5184,6 +5314,7 @@ pub fn generate_stream_qwen35_once_extended(
                         &mut tool_call_body,
                         &mut tool_call_index,
                         &mut saw_tool_call,
+                        params.tool_call_policy,
                         registration,
                         events,
                         &tail,
@@ -5216,6 +5347,12 @@ pub fn generate_stream_qwen35_once_extended(
                     }
                 }
                 ToolCallEvent::ToolCallText(t) => {
+                    if params.tool_call_policy.enforces_body_grammar() {
+                        send!(GenerationEvent::Error(
+                            "tool_call_truncated_under_constrained".to_string()
+                        ));
+                        return;
+                    }
                     // End-of-stream mid-tool-call (no close marker
                     // observed): re-emit residual as Content with the
                     // open marker re-prepended for diagnostic clarity —
@@ -5244,18 +5381,27 @@ pub fn generate_stream_qwen35_once_extended(
         }
     }
 
+    if matches!(params.tool_call_policy, ToolCallPolicy::Constrained) && !saw_tool_call {
+        send!(GenerationEvent::Error(
+            "tool_call_no_call_under_constrained".to_string()
+        ));
+        return;
+    }
+
     if saw_tool_call {
         finish_reason = "tool_calls";
     }
 
     let decode_duration = decode_start.elapsed();
+    let cached_tokens =
+        qwen35_reported_cached_tokens(prompt_len, prompt_cache_hit, lcp_resume_start);
     let stats = StreamStats {
         prefill_time_secs: Some(prefill_duration.as_secs_f64()),
         decode_time_secs: Some(decode_duration.as_secs_f64()),
         total_time_secs: Some((prefill_duration + decode_duration).as_secs_f64()),
         time_to_first_token_ms: Some(prefill_duration.as_secs_f64() * 1000.0),
         prefill_tokens_per_sec: Some(if prefill_duration.as_secs_f64() > 0.0 {
-            prompt_len as f64 / prefill_duration.as_secs_f64()
+            prompt_len.saturating_sub(cached_tokens) as f64 / prefill_duration.as_secs_f64()
         } else {
             0.0
         }),
@@ -5266,11 +5412,7 @@ pub fn generate_stream_qwen35_once_extended(
         }),
         gpu_sync_count: Some(mlx_native::sync_count().saturating_sub(pre_syncs)),
         gpu_dispatch_count: Some(mlx_native::dispatch_count().saturating_sub(pre_dispatches)),
-        cached_prompt_tokens: if prompt_cache_hit {
-            Some(prompt_len)
-        } else {
-            None
-        },
+        cached_prompt_tokens: (cached_tokens > 0).then_some(cached_tokens),
         reasoning_tokens: if reasoning_token_count > 0 {
             Some(reasoning_token_count)
         } else {
@@ -6205,7 +6347,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
     })
 }
 
-/// Default tool-call policy for the Wedge-3 streaming arm.
+/// Default tool-call policy for the legacy slot-aware streaming arm.
 ///
 /// Wedge-3 ships `tool_choice=auto` semantics from the Qwen35 worker
 /// arm — the chat handler at `handlers.rs::prepare_chat_generation_core`
@@ -6217,11 +6359,11 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
 /// branch.  This is consistent with Gemma's pre-W-B3 behavior — the
 /// content-fallback path under Auto.
 ///
-/// Wedge-4 follow-up: thread `params.tool_call_policy` through
-/// `route_content_qwen35` so Constrained / AutoLazyGrammar policies
-/// surface their loud-error semantics on Qwen35 too.  For MVP, Auto is
-/// the only policy a Qwen35 chat request reaches today (the upstream
-/// grammar plumbing is Gemma-only).
+/// The canonical fifo-serial stream threads the request's actual policy
+/// through the grammar-aware sampler and tool-call router.  This helper
+/// remains only for the older slot-aware stream, whose decode loop is
+/// intentionally still unconstrained; callers must not treat that path as
+/// equivalent to the canonical agentic-serving path.
 fn params_tool_call_policy_for_qwen35_stream() -> super::engine::ToolCallPolicy {
     super::engine::ToolCallPolicy::Auto
 }
@@ -6280,6 +6422,54 @@ mod tests {
             max_tokens: 16,
             ..SamplingParams::default()
         }
+    }
+
+    #[test]
+    fn gpu_greedy_gate_rejects_cpu_sampling_features() {
+        assert!(is_greedy_eligible(&greedy_params()));
+
+        let mut repetition = greedy_params();
+        repetition.repetition_penalty = 1.05;
+        assert!(!is_greedy_eligible(&repetition));
+
+        let mut biased = greedy_params();
+        biased.logit_bias.insert(7, 2.0);
+        assert!(!is_greedy_eligible(&biased));
+
+        let mut grammar = greedy_params();
+        grammar.grammar =
+            Some(crate::serve::api::grammar::parse("root ::= \"a\"\n").expect("test grammar"));
+        assert!(!is_greedy_eligible(&grammar));
+    }
+
+    #[test]
+    fn constrained_sampler_rejects_higher_invalid_logit() {
+        let grammar = crate::serve::api::grammar::parse("root ::= \"a\"\n").expect("test grammar");
+        let mut params = greedy_params();
+        params.grammar = Some(grammar);
+        params.token_bytes = Some(std::sync::Arc::new(vec![b"x".to_vec(), b"a".to_vec()]));
+        let runtime = grammar_runtime_for_request(&params, None)
+            .expect("runtime build")
+            .expect("grammar runtime");
+        let mut logits = vec![100.0, 1.0];
+
+        let (token, logprob) =
+            sample_logits_qwen35_constrained(&mut logits, &params, &[], Some(&runtime), false);
+
+        assert_eq!(token, 1);
+        assert_eq!(logprob, None);
+    }
+
+    #[test]
+    fn cached_token_reporting_includes_partial_lcp_resume() {
+        assert_eq!(qwen35_reported_cached_tokens(17_132, false, 16_384), 16_384);
+        assert_eq!(qwen35_reported_cached_tokens(17_132, true, 16_384), 17_132);
+        assert_eq!(qwen35_reported_cached_tokens(17_132, false, 0), 0);
+    }
+
+    #[test]
+    fn cached_token_reporting_clamps_defensively_to_prompt_length() {
+        assert_eq!(qwen35_reported_cached_tokens(128, false, 256), 128);
     }
 
     fn sampling_params_with_temperature() -> SamplingParams {

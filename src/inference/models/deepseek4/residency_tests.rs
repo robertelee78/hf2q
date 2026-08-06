@@ -317,10 +317,17 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
     assert_eq!(weights.len(), specs.len());
     assert!(!weights.is_empty());
     assert_eq!(weights.resident_bytes(), expected_bytes);
+    assert_eq!(
+        weights.file_backed_bytes() + weights.anonymous_bytes(),
+        weights.resident_bytes()
+    );
+    assert!(weights.file_backed_bytes() > weights.anonymous_bytes());
+    assert_eq!(weights.mapped_segment_count(), 1);
 
     let embedding = weights.raw_matrix("token_embd.weight").unwrap();
     assert_eq!(embedding.dtype(), DType::U8);
-    assert_eq!(embedding.byte_len(), 32 * 84);
+    assert_eq!(embedding.data_byte_len(), 32 * 84);
+    assert!(embedding.is_file_backed());
     let embedding_ref = weights.raw_matrix_ref("token_embd.weight").unwrap();
     assert_eq!(embedding_ref.ggml_type, mlx_native::GgmlType::Q2_K);
     assert_eq!(embedding_ref.shape, &[32, 256]);
@@ -336,7 +343,8 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
 
     let lookup = weights.i32_lookup("blk.0.ffn_gate_tid2eid.weight").unwrap();
     assert_eq!(lookup.dtype(), DType::I32);
-    assert_eq!(lookup.as_slice::<i32>().unwrap()[1], 1);
+    assert!(lookup.is_file_backed());
+    assert_eq!(lookup.as_logical_slice::<i32>().unwrap()[1], 1);
 
     assert!(matches!(
         weights.f32_state("token_embd.weight"),

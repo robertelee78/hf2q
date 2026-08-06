@@ -474,7 +474,7 @@ impl Deepseek4Cache {
                 .chain(snapshot.indexer_kv_state.iter())
                 .chain(snapshot.indexer_score_state.iter())
                 .try_fold(0_u64, |total, buffer| {
-                    u64::try_from(buffer.byte_len())
+                    u64::try_from(buffer.data_byte_len())
                         .ok()
                         .and_then(|bytes| total.checked_add(bytes))
                 })
@@ -678,7 +678,11 @@ fn snapshot_buffer(
     kind: CacheKind,
 ) -> Result<MlxBuffer, CacheError> {
     let mut destination = device
-        .alloc_buffer(source.byte_len(), source.dtype(), source.shape().to_vec())
+        .alloc_buffer(
+            source.data_byte_len(),
+            source.dtype(),
+            source.shape().to_vec(),
+        )
         .map_err(|source| CacheError::SnapshotCopy {
             layer,
             kind,
@@ -705,7 +709,7 @@ fn restore_buffer(
     layer: usize,
     kind: CacheKind,
 ) -> Result<(), CacheError> {
-    if source.byte_len() != destination.byte_len()
+    if source.data_byte_len() != destination.data_byte_len()
         || source.dtype() != destination.dtype()
         || source.shape() != destination.shape()
     {

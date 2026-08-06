@@ -161,21 +161,19 @@ pub(super) fn encode_deepseek_sparse_flash_prefill(
         let query_elements = query_count * heads * head_dim;
         let query = query_token_major
             .slice_view(
-                query_token_major.byte_offset()
-                    + (query_start * heads * head_dim * DType::BF16.size_of()) as u64,
+                (query_start * heads * head_dim * DType::BF16.size_of()) as u64,
                 query_elements,
             )
             .with_shape(vec![1, query_count, heads, head_dim])?;
         let selected = indices
             .slice_view(
-                indices.byte_offset() + (query_start * top_k * DType::I32.size_of()) as u64,
+                (query_start * top_k * DType::I32.size_of()) as u64,
                 query_count * top_k,
             )
             .with_shape(vec![1, query_count, top_k])?;
         let output = output_token_major
             .slice_view(
-                output_token_major.byte_offset()
-                    + (query_start * heads * head_dim * DType::BF16.size_of()) as u64,
+                (query_start * heads * head_dim * DType::BF16.size_of()) as u64,
                 query_elements,
             )
             .with_shape(vec![1, query_count, heads, head_dim])?;
@@ -189,16 +187,12 @@ pub(super) fn encode_deepseek_sparse_flash_prefill(
             .with_shape(vec![query_count, 1, top_k])?;
         let invalid_global = arena
             .invalid_global
-            .slice_view(
-                arena.invalid_global.byte_offset() + (query_start * DType::U32.size_of()) as u64,
-                query_count,
-            )
+            .slice_view((query_start * DType::U32.size_of()) as u64, query_count)
             .with_shape(vec![1, query_count])?;
         let invalid_heads = arena
             .invalid_heads
             .slice_view(
-                arena.invalid_heads.byte_offset()
-                    + (query_start * heads * DType::U32.size_of()) as u64,
+                (query_start * heads * DType::U32.size_of()) as u64,
                 query_count * heads,
             )
             .with_shape(vec![1, query_count, heads])?;

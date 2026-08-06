@@ -435,6 +435,23 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
 
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.position(), 7);
+    let expected_snapshot_bytes: u64 = plan
+        .layers
+        .iter()
+        .map(|layer| {
+            std::iter::once(Some(&layer.window_kv))
+                .chain([
+                    layer.main_kv_state.as_ref(),
+                    layer.main_score_state.as_ref(),
+                    layer.indexer_kv_state.as_ref(),
+                    layer.indexer_score_state.as_ref(),
+                ])
+                .flatten()
+                .map(|buffer| buffer.bytes)
+                .sum::<u64>()
+        })
+        .sum();
+    assert_eq!(snapshot.resident_bytes(), expected_snapshot_bytes);
     assert!(snapshot.resident_bytes() < cache.resident_bytes());
 
     cache.layers_mut()[1]

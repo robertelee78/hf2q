@@ -130,6 +130,32 @@ pub fn serve_batched_route_viable(seq_len: usize, n_attn_heads: usize) -> bool {
     ) <= avail / 6
 }
 
+/// Decide whether Gemma's linear LCP-resume route is preferable to a viable
+/// cold batched prefill.
+///
+/// The two paths have very different throughput. A tiny common prefix must
+/// not force the whole remaining prompt through the linear route when the
+/// batched route can safely process the complete prompt. Keep LCP when the
+/// batched route is unavailable, or when the uncached suffix is small enough
+/// to represent a normal agentic continuation. The 1/32 ratio is deliberately
+/// conservative; the 256-token floor covers short tool-result continuations.
+pub fn gemma_lcp_resume_worthwhile(
+    cached_tokens: usize,
+    prompt_tokens: usize,
+    batched_route_available: bool,
+) -> bool {
+    if cached_tokens == 0 || cached_tokens >= prompt_tokens {
+        return false;
+    }
+    if !batched_route_available {
+        return true;
+    }
+
+    let suffix_tokens = prompt_tokens - cached_tokens;
+    let max_linear_suffix = (prompt_tokens / 32).max(256);
+    suffix_tokens <= max_linear_suffix
+}
+
 // Wave P4.0 — env-gated per-kernel GPU-time profiling.  Enabled via
 // HF2Q_PROFILE_FA / HF2Q_PROFILE_MOE / HF2Q_PROFILE_MM to break out the
 // contribution of each kernel category.  Each adds 2 commit_and_wait per
@@ -6140,7 +6166,7 @@ mod block_diagonal_mask_tests {
 
 #[cfg(test)]
 mod route_viability_tests {
-    use super::batched_route_overhead_bytes as overhead;
+    use super::{batched_route_overhead_bytes as overhead, gemma_lcp_resume_worthwhile};
 
     #[test]
     fn batched_route_overhead_default_config_includes_nofa_scratch() {
@@ -6166,5 +6192,25 @@ mod route_viability_tests {
         assert!(overhead(40 * 1024, 16, false, true) > 10_000_000_000);
         // F16 casts off shaves another 4 B/seq².
         assert_eq!(overhead(1024, 16, false, false), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tiny_lcp_does_not_replace_viable_batched_prefill() {
+        assert!(!gemma_lcp_resume_worthwhile(67, 6600, true));
+        assert!(!gemma_lcp_resume_worthwhile(6000, 6600, true));
+    }
+
+    #[test]
+    fn agentic_suffix_or_unavailable_batched_route_uses_lcp() {
+        assert!(gemma_lcp_resume_worthwhile(6400, 6600, true));
+        assert!(gemma_lcp_resume_worthwhile(67, 6600, false));
+        assert!(gemma_lcp_resume_worthwhile(900, 1000, true));
+    }
+
+    #[test]
+    fn lcp_admission_rejects_non_partial_inputs() {
+        assert!(!gemma_lcp_resume_worthwhile(0, 6600, true));
+        assert!(!gemma_lcp_resume_worthwhile(6600, 6600, true));
+        assert!(!gemma_lcp_resume_worthwhile(6601, 6600, false));
     }
 }

@@ -34,6 +34,98 @@
 //!   UTF-8 decoder).
 
 use super::sampler::GrammarRuntime;
+use std::cell::RefCell;
+
+/// Maximum number of descending-logit candidates checked directly before
+/// falling back to the exhaustive vocabulary mask.
+const GREEDY_PROBE_LIMIT: usize = 64;
+
+thread_local! {
+    /// Reused candidate storage for temperature-zero grammar sampling. A
+    /// 262K-entry Gemma vocabulary is ~4 MiB here and is retained per worker
+    /// thread instead of allocated for every generated tool token.
+    static GREEDY_CANDIDATES: RefCell<Vec<(usize, f32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Select the highest-logit grammar-valid token for temperature-zero decode.
+///
+/// A full grammar mask clones and advances the runtime for every vocabulary
+/// entry. That is needlessly expensive for greedy agentic tool calls: the
+/// model's top candidate is normally already valid. Probe candidates in
+/// descending logit order by repeatedly finding the current argmax, and fall
+/// back to the exhaustive mask after a bounded number of misses. The result is
+/// exactly the same highest-logit valid token as mask-then-argmax; only the
+/// amount of rejected work changes.
+pub fn sample_greedy_valid_token(
+    logits: &mut [f32],
+    previous_tokens: &[u32],
+    repetition_penalty: f64,
+    grammar: &GrammarRuntime,
+    token_bytes: &[Vec<u8>],
+) -> u32 {
+    if repetition_penalty != 1.0 && !previous_tokens.is_empty() {
+        crate::serve::sampler_pure::apply_repetition_penalty(
+            logits,
+            previous_tokens,
+            repetition_penalty,
+        );
+    }
+    if grammar.is_awaiting_trigger() {
+        return crate::serve::sampler_pure::sample_greedy(logits);
+    }
+
+    let selected = GREEDY_CANDIDATES.with(|cell| {
+        let mut candidates = cell.borrow_mut();
+        candidates.clear();
+        candidates.reserve(logits.len());
+        candidates.extend(
+            logits
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, logit)| logit.is_finite()),
+        );
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let compare = |left: &(usize, f32), right: &(usize, f32)| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        };
+        let limit = GREEDY_PROBE_LIMIT.min(candidates.len());
+        if candidates.len() > limit {
+            candidates.select_nth_unstable_by(limit - 1, compare);
+            candidates.truncate(limit);
+        }
+        candidates.sort_unstable_by(compare);
+
+        for &(token, _) in candidates.iter() {
+            let Some(bytes) = token_bytes.get(token) else {
+                return Some(token as u32);
+            };
+            // Empty/special pieces are intentionally valid under the shared
+            // grammar contract; EOS handling remains the decode loop's job.
+            if bytes.is_empty() {
+                return Some(token as u32);
+            }
+            let mut probe = grammar.clone();
+            if probe.accept_bytes(bytes) {
+                return Some(token as u32);
+            }
+            logits[token] = f32::NEG_INFINITY;
+        }
+        None
+    });
+    if let Some(token) = selected {
+        return token;
+    }
+
+    mask_invalid_tokens(grammar, token_bytes, logits);
+    crate::serve::sampler_pure::sample_greedy(logits)
+}
 
 /// Mask tokens whose byte-text would drive the grammar dead.
 ///
@@ -554,5 +646,37 @@ mod tests {
         // tokenizer's special-token registration shape — but assert
         // the table is non-trivial.
         let _ = empty_byte_tokens; // documented presence; not a hard count.
+    }
+
+    #[test]
+    fn greedy_probe_returns_highest_logit_valid_token() {
+        let runtime = rt("root ::= \"a\" | \"b\"\n", "root");
+        let token_bytes = vocab(&["x", "b", "a"]);
+        let mut logits = vec![9.0, 8.0, 7.0];
+        let token = sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes);
+        assert_eq!(
+            token, 1,
+            "invalid top token must yield to highest valid token"
+        );
+    }
+
+    #[test]
+    fn greedy_probe_suspended_runtime_is_unconstrained() {
+        let mut runtime = rt("root ::= \"a\"\n", "root");
+        runtime.set_awaiting_trigger(true);
+        let token_bytes = vocab(&["x", "a"]);
+        let mut logits = vec![9.0, 8.0];
+        let token = sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes);
+        assert_eq!(token, 0);
+        assert_eq!(logits, vec![9.0, 8.0]);
+    }
+
+    #[test]
+    fn greedy_probe_applies_repetition_penalty_before_ranking() {
+        let runtime = rt("root ::= \"a\" | \"b\"\n", "root");
+        let token_bytes = vocab(&["a", "b"]);
+        let mut logits = vec![10.0, 9.0];
+        let token = sample_greedy_valid_token(&mut logits, &[0], 2.0, &runtime, &token_bytes);
+        assert_eq!(token, 1, "penalized prior token must no longer win");
     }
 }

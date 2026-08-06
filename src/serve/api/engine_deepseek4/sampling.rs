@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use mlx_native::MlxBuffer;
 
 use crate::serve::api::engine::{
-    effective_repetition_penalty, GenerationResult, GrammarKind, SamplingParams,
+    arm_lazy_tool_grammar, effective_repetition_penalty, GenerationResult, SamplingParams,
 };
 use crate::serve::api::grammar::GrammarRuntime;
 use crate::serve::api::registry::{self, ModelRegistration, SplitSlot};
@@ -39,7 +39,10 @@ pub(super) fn decode_token_limit(
     )
 }
 
-pub(super) fn grammar_runtime(params: &SamplingParams) -> Result<Option<GrammarRuntime>> {
+pub(super) fn grammar_runtime(
+    params: &SamplingParams,
+    registration: Option<&ModelRegistration>,
+) -> Result<Option<GrammarRuntime>> {
     let Some(grammar) = params.grammar.as_ref() else {
         return Ok(None);
     };
@@ -48,9 +51,7 @@ pub(super) fn grammar_runtime(params: &SamplingParams) -> Result<Option<GrammarR
         .context("grammar has no root rule")?;
     let mut runtime = GrammarRuntime::new(grammar.clone(), root)
         .context("grammar runtime initialization failed")?;
-    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-        runtime.set_awaiting_trigger(true);
-    }
+    arm_lazy_tool_grammar(&mut runtime, params.grammar_kind, registration);
     Ok(Some(runtime))
 }
 
@@ -61,41 +62,13 @@ fn greedy_grammar_token(
     runtime: &GrammarRuntime,
     token_bytes: &[Vec<u8>],
 ) -> u32 {
-    if repetition_penalty != 1.0 && !previous.is_empty() {
-        sampler_pure::apply_repetition_penalty(values, previous, repetition_penalty);
-    }
-    if runtime.is_awaiting_trigger() {
-        return sampler_pure::sample_greedy(values);
-    }
-
-    // Required tool calls run at temperature zero in OpenCode's normal
-    // path. Rank finite logits once and test candidates in score order instead
-    // of cloning the grammar for every vocabulary entry.
-    let mut candidates = values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.is_finite().then_some(index))
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|&left, &right| {
-        values[right]
-            .total_cmp(&values[left])
-            .then_with(|| left.cmp(&right))
-    });
-    for index in candidates {
-        let Some(bytes) = token_bytes.get(index) else {
-            return index as u32;
-        };
-        // Empty/special token pieces are deliberately left unmasked by the
-        // shared grammar contract; EOS handling remains the caller's job.
-        if bytes.is_empty() {
-            return index as u32;
-        }
-        let mut probe = runtime.clone();
-        if probe.accept_bytes(bytes) {
-            return index as u32;
-        }
-    }
-    sampler_pure::sample_greedy(values)
+    crate::serve::api::grammar::mask::sample_greedy_valid_token(
+        values,
+        previous,
+        repetition_penalty,
+        runtime,
+        token_bytes,
+    )
 }
 
 pub(super) fn sample(
@@ -217,7 +190,7 @@ pub fn generate_once(
     progress.finish_prefill(prefill_duration);
     release_completed_prefill_scratch();
     let sampler = sampler_config(params);
-    let mut runtime = grammar_runtime(params)?;
+    let mut runtime = grammar_runtime(params, registration)?;
     let max_tokens = decode_token_limit(
         params.max_tokens,
         prompt_tokens.len(),

@@ -31,14 +31,11 @@ impl Deepseek4Model {
             .checked_mul(row_elements)
             .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
             .context("DeepSeek-V4 output row offset overflow")?;
-        let absolute_offset = state
-            .byte_offset()
-            .checked_add(
-                u64::try_from(row_offset).context("DeepSeek-V4 output row offset exceeds u64")?,
-            )
-            .context("DeepSeek-V4 output row absolute offset overflow")?;
         state
-            .slice_view(absolute_offset, row_elements)
+            .slice_view(
+                u64::try_from(row_offset).context("DeepSeek-V4 output row offset exceeds u64")?,
+                row_elements,
+            )
             .with_shape(vec![1, hc, hidden])
             .context("view DeepSeek-V4 last prompt state")
     }

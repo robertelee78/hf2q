@@ -427,6 +427,86 @@ pub fn effective_repetition_penalty(params: &SamplingParams) -> f64 {
     }
 }
 
+/// Configure an AUTO tool grammar to wake on the model family's native open
+/// marker.  The runtime itself scans accepted token bytes so a token carrying
+/// both the marker and the first body bytes cannot leave the grammar behind.
+pub(super) fn arm_lazy_tool_grammar(
+    runtime: &mut super::grammar::GrammarRuntime,
+    kind: GrammarKind,
+    registration: Option<&super::registry::ModelRegistration>,
+) {
+    if !matches!(kind, GrammarKind::ToolCallBodyAuto) {
+        return;
+    }
+    if let Some(open) = registration.and_then(|registration| registration.tool_open) {
+        runtime.set_lazy_trigger(open.as_bytes());
+    } else {
+        // Defensive compatibility for synthetic/unregistered tests. Real
+        // tool grammars are compiled only for registered model families.
+        runtime.set_awaiting_trigger(true);
+    }
+}
+
+pub(super) fn grammar_runtime_for_request(
+    params: &SamplingParams,
+    registration: Option<&super::registry::ModelRegistration>,
+) -> Result<Option<super::grammar::GrammarRuntime>> {
+    let Some(grammar) = params.grammar.as_ref() else {
+        return Ok(None);
+    };
+    let root = grammar
+        .rule_id("root")
+        .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+    let mut runtime = super::grammar::GrammarRuntime::new(grammar.clone(), root)
+        .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
+    arm_lazy_tool_grammar(&mut runtime, params.grammar_kind, registration);
+    Ok(Some(runtime))
+}
+
+/// Sample from CPU logits while preserving grammar semantics.
+///
+/// Temperature-zero grammar requests use a ranked validity probe instead of
+/// exhaustively cloning the grammar runtime for every vocabulary entry. The
+/// exhaustive mask remains the path for probabilistic sampling and logprobs,
+/// where the full constrained distribution is required.
+pub(super) fn sample_logits_with_grammar(
+    logits: &mut [f32],
+    sampler: &sampler_pure::SamplingParams,
+    previous_tokens: &[u32],
+    runtime: Option<&super::grammar::GrammarRuntime>,
+    token_bytes: Option<&[Vec<u8>]>,
+    want_logprobs: bool,
+) -> (u32, Option<f32>) {
+    if !want_logprobs && sampler.temperature < sampler_pure::SAMPLING_EPS {
+        if let (Some(runtime), Some(token_bytes)) = (runtime, token_bytes) {
+            return (
+                super::grammar::mask::sample_greedy_valid_token(
+                    logits,
+                    previous_tokens,
+                    sampler.repetition_penalty,
+                    runtime,
+                    token_bytes,
+                ),
+                None,
+            );
+        }
+    }
+
+    if let (Some(runtime), Some(token_bytes)) = (runtime, token_bytes) {
+        super::grammar::mask::mask_invalid_tokens(runtime, token_bytes, logits);
+    }
+    if want_logprobs {
+        let (token, logprob) =
+            sampler_pure::sample_token_with_logprob(logits, sampler, previous_tokens);
+        (token, Some(logprob))
+    } else {
+        (
+            sampler_pure::sample_token(logits, sampler, previous_tokens),
+            None,
+        )
+    }
+}
+
 /// Owned soft-token override sent through the worker channel.
 ///
 /// Identical contract to [`SoftTokenInjection`] but owns the
@@ -5520,9 +5600,7 @@ impl Gemma4DecodeState {
                         .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
                     let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-                    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                        rt.set_awaiting_trigger(true);
-                    }
+                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
                     Some(rt)
                 }
                 None => None,
@@ -11196,6 +11274,15 @@ fn generate_once_with_soft_tokens(
         return Ok(cached);
     }
 
+    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
+    let batched_allowed = match serve_batched_env.as_deref() {
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
+            prompt_tokens.len(),
+            loaded.weights.num_attention_heads,
+        ),
+    };
+
     // ── ADR-017 Phase E option (a) — LCP partial-prefix probe ──
     //
     // Two layers (iter-2 observability + iter-3 env-gated resume):
@@ -11232,180 +11319,195 @@ fn generate_once_with_soft_tokens(
         }
         match detected {
             None => None,
-            Some(_k_obs) => {
-                // Q3 auto-disable: compute effective LCP flag. Under default-on
-                // with HF2Q_USE_DENSE=0, effective_kv_lcp_resume emits a
-                // warn-once and returns false. Explicit HF2Q_KV_LCP_RESUME=1
-                // overrides the auto-disable.
-                // "gemma-hybrid-lcp" (2026-08-03): resumable substrates
-                // = dense (HF2Q_USE_DENSE=1) OR production hybrid. The
-                // HB-encoded opt-out regime stays auto-disabled.
-                let lcp_enabled = effective_kv_lcp_resume(
-                    crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
-                    crate::debug::INVESTIGATION_ENV.use_dense
-                        || crate::debug::INVESTIGATION_ENV.hybrid_kv,
-                );
-                if !lcp_enabled {
+            Some(k_obs) => {
+                if !crate::serve::forward_prefill_batched::gemma_lcp_resume_worthwhile(
+                    k_obs,
+                    prompt_tokens.len(),
+                    batched_allowed,
+                ) {
+                    tracing::info!(
+                        cached_tokens = k_obs,
+                        prompt_tokens = prompt_tokens.len(),
+                        suffix_tokens = prompt_tokens.len().saturating_sub(k_obs),
+                        "Gemma4 LCP bypassed because cold batched prefill is faster"
+                    );
                     None
                 } else {
-                    // Capacity check is a re-probe: take_prefix returns
-                    // a fresh `LcpPrefix` (consuming the registry
-                    // entry), and we cross-reference its capacities
-                    // against this request's needs. A failed check
-                    // bails to None AND re-stores nothing — the
-                    // registry entry is already gone (consumed), but
-                    // the post-prefill store path below will re-publish
-                    // a fresh entry from this request's outputs, so
-                    // future hits aren't permanently broken.
-                    let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
-                    match prefix_opt {
-                        None => None,
-                        Some(prefix) => {
-                            // Aggregate capacity check.
-                            let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
-                            let model_sw = loaded.weights.sliding_window.max(1);
-                            let agg_ok = prefix.linear_capacity >= new_linear
-                                && prefix.sliding_window == model_sw;
-                            // Codex audit MED issue #2: per-layer
-                            // cap + is_sliding check BEFORE installing
-                            // the cached Arcs into weights. If any
-                            // layer's cached capacity < required or
-                            // is_sliding mismatches the model's layer
-                            // type, fall through to fresh prefill
-                            // GRACEFULLY (drop cached Arcs; engine
-                            // alloc-fresh on the None path) instead of
-                            // letting forward_prefill bail with a 500
-                            // after the install side-effect.
-                            let per_layer_ok = if !agg_ok {
-                                false
-                            } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
-                                false
-                            } else {
-                                // ADR-017 Phase E.a iter-3.5a — dtype
-                                // invariant added to the per-layer
-                                // check. Model-current `kv_dtype` is
-                                // resolved from `INVESTIGATION_ENV.f16_kv`
-                                // (same source used at every alloc
-                                // site). A cached entry with mismatched
-                                // dtype must NOT be installed: the
-                                // kernel's flash_attn_vec dispatch
-                                // takes dtype as a static branch and
-                                // would silently misread the cached
-                                // bytes.
-                                let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
-                                    mlx_native::DType::F16
+                    // Q3 auto-disable: compute effective LCP flag. Under default-on
+                    // with HF2Q_USE_DENSE=0, effective_kv_lcp_resume emits a
+                    // warn-once and returns false. Explicit HF2Q_KV_LCP_RESUME=1
+                    // overrides the auto-disable.
+                    // "gemma-hybrid-lcp" (2026-08-03): resumable substrates
+                    // = dense (HF2Q_USE_DENSE=1) OR production hybrid. The
+                    // HB-encoded opt-out regime stays auto-disabled.
+                    let lcp_enabled = effective_kv_lcp_resume(
+                        crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
+                        crate::debug::INVESTIGATION_ENV.use_dense
+                            || crate::debug::INVESTIGATION_ENV.hybrid_kv,
+                    );
+                    if !lcp_enabled {
+                        None
+                    } else {
+                        // Capacity check is a re-probe: take_prefix returns
+                        // a fresh `LcpPrefix` (consuming the registry
+                        // entry), and we cross-reference its capacities
+                        // against this request's needs. A failed check
+                        // bails to None AND re-stores nothing — the
+                        // registry entry is already gone (consumed), but
+                        // the post-prefill store path below will re-publish
+                        // a fresh entry from this request's outputs, so
+                        // future hits aren't permanently broken.
+                        let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
+                        match prefix_opt {
+                            None => None,
+                            Some(prefix) => {
+                                // Aggregate capacity check.
+                                let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
+                                let model_sw = loaded.weights.sliding_window.max(1);
+                                let agg_ok = prefix.linear_capacity >= new_linear
+                                    && prefix.sliding_window == model_sw;
+                                // Codex audit MED issue #2: per-layer
+                                // cap + is_sliding check BEFORE installing
+                                // the cached Arcs into weights. If any
+                                // layer's cached capacity < required or
+                                // is_sliding mismatches the model's layer
+                                // type, fall through to fresh prefill
+                                // GRACEFULLY (drop cached Arcs; engine
+                                // alloc-fresh on the None path) instead of
+                                // letting forward_prefill bail with a 500
+                                // after the install side-effect.
+                                let per_layer_ok = if !agg_ok {
+                                    false
+                                } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
+                                    false
                                 } else {
-                                    mlx_native::DType::F32
-                                };
-                                // ADR-017 Phase E.a iter-3.6 follow-up
-                                // (Codex audit LOW #1): align per-layer
-                                // sliding required_cap with the alloc
-                                // formula. When LONG_RESUME=1, sliding
-                                // layers were allocated with
-                                // `max(sw, new_linear)`; the per-layer
-                                // check must demand ≥ same value, not
-                                // just `model_sw`. Today the aggregate
-                                // `prefix.linear_capacity >= new_linear`
-                                // saves us, but a future refactor could
-                                // admit an undersized sliding snapshot.
-                                // "gemma-hybrid-lcp": long-resume admits
-                                // dense OR production hybrid (kernel
-                                // mask_type=2 verified for both legs).
-                                let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
-                                    && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                                    && (crate::debug::INVESTIGATION_ENV.use_dense
-                                        || crate::debug::INVESTIGATION_ENV.hybrid_kv);
-                                prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
-                                    let layer = &loaded.weights.layers[li];
-                                    let layer_is_ring = matches!(
-                                        layer.layer_type,
-                                        crate::serve::config::LayerType::Sliding
-                                    );
-                                    let required_cap = if layer_is_ring {
-                                        if lr_long {
-                                            model_sw.max(new_linear)
-                                        } else {
-                                            model_sw
-                                        }
+                                    // ADR-017 Phase E.a iter-3.5a — dtype
+                                    // invariant added to the per-layer
+                                    // check. Model-current `kv_dtype` is
+                                    // resolved from `INVESTIGATION_ENV.f16_kv`
+                                    // (same source used at every alloc
+                                    // site). A cached entry with mismatched
+                                    // dtype must NOT be installed: the
+                                    // kernel's flash_attn_vec dispatch
+                                    // takes dtype as a static branch and
+                                    // would silently misread the cached
+                                    // bytes.
+                                    let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+                                        mlx_native::DType::F16
                                     } else {
-                                        new_linear
+                                        mlx_native::DType::F32
                                     };
-                                    // "gemma-hybrid-lcp" (2026-08-03):
-                                    // the per-layer check runs on the
-                                    // DENSE leg (prefill SDPA reads it);
-                                    // the dense fields live behind
-                                    // `arc.dense()` in the enum payload.
-                                    let d = arc.dense();
-                                    let dense_ok = d.capacity >= required_cap
-                                        && d.is_sliding == layer_is_ring
-                                        && d.dtype == model_kv_dtype;
-                                    // Regime-consistency: under the
-                                    // production hybrid regime the entry
-                                    // MUST carry the hybrid leg per
-                                    // layer — a dense-only entry under
-                                    // hybrid would leave the decode cache
-                                    // unrestored (silent zero-prefix; the
-                                    // class this sub-iter exists to close).
-                                    let regime_ok = if crate::debug::INVESTIGATION_ENV.hybrid_kv {
-                                        match arc.hybrid() {
-                                            Some(h) => {
-                                                h.capacity >= required_cap
-                                                    && h.is_sliding == layer_is_ring
+                                    // ADR-017 Phase E.a iter-3.6 follow-up
+                                    // (Codex audit LOW #1): align per-layer
+                                    // sliding required_cap with the alloc
+                                    // formula. When LONG_RESUME=1, sliding
+                                    // layers were allocated with
+                                    // `max(sw, new_linear)`; the per-layer
+                                    // check must demand ≥ same value, not
+                                    // just `model_sw`. Today the aggregate
+                                    // `prefix.linear_capacity >= new_linear`
+                                    // saves us, but a future refactor could
+                                    // admit an undersized sliding snapshot.
+                                    // "gemma-hybrid-lcp": long-resume admits
+                                    // dense OR production hybrid (kernel
+                                    // mask_type=2 verified for both legs).
+                                    let lr_long = crate::debug::INVESTIGATION_ENV
+                                        .kv_lcp_long_resume
+                                        && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                                        && (crate::debug::INVESTIGATION_ENV.use_dense
+                                            || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+                                    prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
+                                        let layer = &loaded.weights.layers[li];
+                                        let layer_is_ring = matches!(
+                                            layer.layer_type,
+                                            crate::serve::config::LayerType::Sliding
+                                        );
+                                        let required_cap = if layer_is_ring {
+                                            if lr_long {
+                                                model_sw.max(new_linear)
+                                            } else {
+                                                model_sw
                                             }
-                                            None => false,
-                                        }
-                                    } else {
-                                        true
-                                    };
-                                    dense_ok && regime_ok
-                                })
-                            };
-                            if !per_layer_ok {
-                                // Drop the cached Arcs (registry already
-                                // consumed); fall through to fresh
-                                // prefill. Log so operators can see
-                                // capacity misses.
-                                tracing::debug!(
-                                    "lcp_resume: capacity check failed (agg_ok={}, \
+                                        } else {
+                                            new_linear
+                                        };
+                                        // "gemma-hybrid-lcp" (2026-08-03):
+                                        // the per-layer check runs on the
+                                        // DENSE leg (prefill SDPA reads it);
+                                        // the dense fields live behind
+                                        // `arc.dense()` in the enum payload.
+                                        let d = arc.dense();
+                                        let dense_ok = d.capacity >= required_cap
+                                            && d.is_sliding == layer_is_ring
+                                            && d.dtype == model_kv_dtype;
+                                        // Regime-consistency: under the
+                                        // production hybrid regime the entry
+                                        // MUST carry the hybrid leg per
+                                        // layer — a dense-only entry under
+                                        // hybrid would leave the decode cache
+                                        // unrestored (silent zero-prefix; the
+                                        // class this sub-iter exists to close).
+                                        let regime_ok = if crate::debug::INVESTIGATION_ENV.hybrid_kv
+                                        {
+                                            match arc.hybrid() {
+                                                Some(h) => {
+                                                    h.capacity >= required_cap
+                                                        && h.is_sliding == layer_is_ring
+                                                }
+                                                None => false,
+                                            }
+                                        } else {
+                                            true
+                                        };
+                                        dense_ok && regime_ok
+                                    })
+                                };
+                                if !per_layer_ok {
+                                    // Drop the cached Arcs (registry already
+                                    // consumed); fall through to fresh
+                                    // prefill. Log so operators can see
+                                    // capacity misses.
+                                    tracing::debug!(
+                                        "lcp_resume: capacity check failed (agg_ok={}, \
                                      per_layer_ok={}, prefix.linear_cap={}, \
                                      new_linear={}, prefix.sw={}, model_sw={}) — \
                                      falling back to fresh prefill",
-                                    agg_ok,
-                                    per_layer_ok,
-                                    prefix.linear_capacity,
-                                    new_linear,
-                                    prefix.sliding_window,
-                                    model_sw,
-                                );
-                                drop(prefix);
-                                None
-                            } else {
-                                let k = prefix.k;
-                                // "gemma-hybrid-lcp" (2026-08-03): split the
-                                // enum payload into the dense-leg Arc install
-                                // (`weights.dense_kvs`, consumed by
-                                // forward_prefill's restored_lcp branch) and
-                                // the hybrid-leg OWNED install
-                                // (`weights.hybrid_kv`, mutated in place by
-                                // the per-token hybrid encode for positions
-                                // [k..seq_len)). Arc::try_unwrap on the
-                                // hybrid leg mirrors the dense path's
-                                // exclusivity precondition (take_prefix
-                                // leaves strong_count == 1); on violation we
-                                // bail to fresh prefill GRACEFULLY (the
-                                // capacity-fail branch's exact semantics —
-                                // never a 500 from a cache hit).
-                                let mut dense_arcs: Vec<
-                                    std::sync::Arc<
-                                        crate::inference::models::gemma4::DenseKvBuffers,
-                                    >,
-                                > = Vec::with_capacity(prefix.dense_kvs.len());
-                                let mut hybrid_owned: Vec<
-                                    crate::inference::models::gemma4::HybridKvBuffers,
-                                > = Vec::new();
-                                let mut install_ok = true;
-                                for arc in prefix.dense_kvs.into_iter() {
-                                    match std::sync::Arc::try_unwrap(arc) {
+                                        agg_ok,
+                                        per_layer_ok,
+                                        prefix.linear_capacity,
+                                        new_linear,
+                                        prefix.sliding_window,
+                                        model_sw,
+                                    );
+                                    drop(prefix);
+                                    None
+                                } else {
+                                    let k = prefix.k;
+                                    // "gemma-hybrid-lcp" (2026-08-03): split the
+                                    // enum payload into the dense-leg Arc install
+                                    // (`weights.dense_kvs`, consumed by
+                                    // forward_prefill's restored_lcp branch) and
+                                    // the hybrid-leg OWNED install
+                                    // (`weights.hybrid_kv`, mutated in place by
+                                    // the per-token hybrid encode for positions
+                                    // [k..seq_len)). Arc::try_unwrap on the
+                                    // hybrid leg mirrors the dense path's
+                                    // exclusivity precondition (take_prefix
+                                    // leaves strong_count == 1); on violation we
+                                    // bail to fresh prefill GRACEFULLY (the
+                                    // capacity-fail branch's exact semantics —
+                                    // never a 500 from a cache hit).
+                                    let mut dense_arcs: Vec<
+                                        std::sync::Arc<
+                                            crate::inference::models::gemma4::DenseKvBuffers,
+                                        >,
+                                    > = Vec::with_capacity(prefix.dense_kvs.len());
+                                    let mut hybrid_owned: Vec<
+                                        crate::inference::models::gemma4::HybridKvBuffers,
+                                    > = Vec::new();
+                                    let mut install_ok = true;
+                                    for arc in prefix.dense_kvs.into_iter() {
+                                        match std::sync::Arc::try_unwrap(arc) {
                                         Ok(layer) => match layer {
                                             crate::inference::models::gemma4::GemmaLcpLayerKv::Dense(
                                                 d,
@@ -11430,28 +11532,29 @@ fn generate_once_with_soft_tokens(
                                             break;
                                         }
                                     }
-                                }
-                                if !install_ok {
-                                    drop(dense_arcs);
-                                    drop(hybrid_owned);
-                                    None
-                                } else {
-                                    let has_hybrid = !hybrid_owned.is_empty();
-                                    // Install the per-layer Arcs into the
-                                    // model. After this assignment, the
-                                    // engine holds the only Arcs (registry
-                                    // dropped its set in `take_prefix`,
-                                    // strong_count == 1 per layer).
-                                    loaded.weights.dense_kvs = Some(dense_arcs);
-                                    if has_hybrid {
-                                        loaded.weights.hybrid_kv = Some(hybrid_owned);
                                     }
-                                    tracing::debug!(
-                                        "lcp_resume: ENGAGED — K={} of N={} (per-layer cap ok)",
-                                        k,
-                                        prompt_tokens.len(),
-                                    );
-                                    Some(k)
+                                    if !install_ok {
+                                        drop(dense_arcs);
+                                        drop(hybrid_owned);
+                                        None
+                                    } else {
+                                        let has_hybrid = !hybrid_owned.is_empty();
+                                        // Install the per-layer Arcs into the
+                                        // model. After this assignment, the
+                                        // engine holds the only Arcs (registry
+                                        // dropped its set in `take_prefix`,
+                                        // strong_count == 1 per layer).
+                                        loaded.weights.dense_kvs = Some(dense_arcs);
+                                        if has_hybrid {
+                                            loaded.weights.hybrid_kv = Some(hybrid_owned);
+                                        }
+                                        tracing::debug!(
+                                            "lcp_resume: ENGAGED — K={} of N={} (per-layer cap ok)",
+                                            k,
+                                            prompt_tokens.len(),
+                                        );
+                                        Some(k)
+                                    }
                                 }
                             }
                         }
@@ -11545,9 +11648,7 @@ fn generate_once_with_soft_tokens(
             // open marker.  Mirrors llama.cpp `grammar_lazy = false` for
             // `tool_choice == REQUIRED` at common/chat.cpp:898-913,
             // 1177-1200, 1399-1416.
-            if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                rt.set_awaiting_trigger(true);
-            }
+            arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
             Some(rt)
         }
         None => None,
@@ -11602,19 +11703,14 @@ fn generate_once_with_soft_tokens(
                 }
             }
         }
-        // Grammar mask: zero out tokens that would drive the runtime
-        // dead.  Self-gates on `runtime.is_awaiting_trigger()` —
-        // suspended runtimes mask zero tokens (preamble freedom for
-        // ToolCallBody-kind grammars before the open marker fires).
-        if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
-            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-        }
-        if want_logprobs {
-            let (tok, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, generated);
-            Ok((tok, Some(lp)))
-        } else {
-            Ok((sampler_pure::sample_token(&mut logits, sp, generated), None))
-        }
+        Ok(sample_logits_with_grammar(
+            &mut logits,
+            sp,
+            generated,
+            runtime,
+            token_bytes_ref,
+            want_logprobs,
+        ))
     };
     // ADR-020 AC#7 — per-completion-token logprob accumulator.
     // Length tracks `completion_tokens` and is moved into
@@ -11651,25 +11747,14 @@ fn generate_once_with_soft_tokens(
     // A 92K-token opencode first turn allocated ~120 GB transient on
     // 2026-08-03 and died in Metal with a command-buffer error — no
     // user should need to know BATCHED=0 exists.
-    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
-    let batched_allowed = match serve_batched_env.as_deref() {
-        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
-        None => {
-            let viable = crate::serve::forward_prefill_batched::serve_batched_route_viable(
-                prompt_tokens.len(),
-                loaded.weights.num_attention_heads,
-            );
-            if !viable {
-                eprintln!(
-                    "[hf2q batched prefill] auto-fallback to linear route: \
-                     seq_len={} O(n²) mask overhead exceeds the available- \
-                     memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
-                    prompt_tokens.len()
-                );
-            }
-            viable
-        }
-    };
+    if serve_batched_env.is_none() && !batched_allowed && resume_lcp.is_none() {
+        eprintln!(
+            "[hf2q batched prefill] auto-fallback to linear route: \
+             seq_len={} O(n²) mask overhead exceeds the available- \
+             memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+            prompt_tokens.len()
+        );
+    }
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
     let prefill_argmax = if use_batched_serve {
         loaded
@@ -11964,7 +12049,7 @@ fn generate_once_with_soft_tokens(
         finish_reason,
         prefill_duration,
         decode_duration,
-        cached_tokens: 0, // iter-96: 0 on cache miss; > 0 on hit (handled by fast-path return earlier)
+        cached_tokens: resume_lcp.unwrap_or(0),
         logprobs: logprobs_acc,
     };
 
@@ -12113,13 +12198,16 @@ fn generate_once_with_soft_tokens(
             if prefill_safe {
                 if let Some(payload) = payload {
                     let lcp_key = build_lcp_key_for_request(loaded, params);
-                    // ADR-017 Phase E.a iter-3.5d — multi-turn chat
-                    // headroom. Snapshot global-layer buffers were
-                    // allocated with capacity = sliding_window (not
-                    // prompt_len + max_decode_tokens). Report the
-                    // larger value here so the probe-side capacity check
-                    // admits future turns whose prompts grow toward sw.
-                    let linear_capacity = sliding_window.max(prompt_len + params.max_tokens.max(1));
+                    // Report the capacity actually allocated in the
+                    // snapshot. Long-resume snapshots carry additional
+                    // multi-turn headroom; recomputing only
+                    // prompt_len+max_tokens here discarded that headroom
+                    // and made every longer follow-up fail admission.
+                    let linear_capacity = payload
+                        .iter()
+                        .map(|layer| layer.dense().capacity)
+                        .min()
+                        .expect("Gemma LCP payload is non-empty");
                     match loaded.lcp_registry.store(
                         lcp_key,
                         prompt_tokens.to_vec(),
@@ -12467,9 +12555,7 @@ fn generate_gemma4_once_slot_aware(
                         .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
                     let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-                    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                        rt.set_awaiting_trigger(true);
-                    }
+                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
                     Some(rt)
                 }
                 None => None,
@@ -13128,9 +13214,7 @@ fn generate_stream_gemma4_once_slot_aware(
                                     return;
                                 }
                             };
-                        if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                            rt.set_awaiting_trigger(true);
-                        }
+                        arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
                         Some(rt)
                     }
                     None => None,
@@ -14208,9 +14292,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                         .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
                     let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-                    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                        rt.set_awaiting_trigger(true);
-                    }
+                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
                     Some(rt)
                 }
                 None => None,
@@ -16056,6 +16138,15 @@ fn generate_stream_once(
         return;
     }
 
+    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
+    let batched_allowed = match serve_batched_env.as_deref() {
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
+            prompt_tokens.len(),
+            loaded.weights.num_attention_heads,
+        ),
+    };
+
     // ── ADR-017 Phase E option (a) — streaming-path LCP probe ──
     //
     // Mirrors `generate_once_with_soft_tokens`'s probe + iter-3
@@ -16073,140 +16164,155 @@ fn generate_stream_once(
         }
         match detected {
             None => None,
-            Some(_k_obs) => {
-                // Q3 auto-disable: mirrors the non-streaming gate. The shared
-                // std::sync::Once inside warn_lcp_resume_without_dense ensures
-                // exactly one log line per process across both probe sites.
-                // "gemma-hybrid-lcp" (2026-08-03): resumable substrates
-                // = dense (HF2Q_USE_DENSE=1) OR production hybrid. The
-                // HB-encoded opt-out regime stays auto-disabled.
-                let lcp_enabled = effective_kv_lcp_resume(
-                    crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
-                    crate::debug::INVESTIGATION_ENV.use_dense
-                        || crate::debug::INVESTIGATION_ENV.hybrid_kv,
-                );
-                if !lcp_enabled {
+            Some(k_obs) => {
+                if !crate::serve::forward_prefill_batched::gemma_lcp_resume_worthwhile(
+                    k_obs,
+                    prompt_tokens.len(),
+                    batched_allowed,
+                ) {
+                    tracing::info!(
+                        cached_tokens = k_obs,
+                        prompt_tokens = prompt_tokens.len(),
+                        suffix_tokens = prompt_tokens.len().saturating_sub(k_obs),
+                        "Gemma4 streaming LCP bypassed because cold batched prefill is faster"
+                    );
                     None
                 } else {
-                    let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
-                    match prefix_opt {
-                        None => None,
-                        Some(prefix) => {
-                            let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
-                            let model_sw = loaded.weights.sliding_window.max(1);
-                            let agg_ok = prefix.linear_capacity >= new_linear
-                                && prefix.sliding_window == model_sw;
-                            // Per-layer cap + is_sliding check (same
-                            // shape as non-streaming probe site).
-                            let per_layer_ok = if !agg_ok {
-                                false
-                            } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
-                                false
-                            } else {
-                                // ADR-017 Phase E.a iter-3.5a — dtype
-                                // invariant added to the per-layer
-                                // check. Model-current `kv_dtype` is
-                                // resolved from `INVESTIGATION_ENV.f16_kv`
-                                // (same source used at every alloc
-                                // site). A cached entry with mismatched
-                                // dtype must NOT be installed: the
-                                // kernel's flash_attn_vec dispatch
-                                // takes dtype as a static branch and
-                                // would silently misread the cached
-                                // bytes.
-                                let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
-                                    mlx_native::DType::F16
+                    // Q3 auto-disable: mirrors the non-streaming gate. The shared
+                    // std::sync::Once inside warn_lcp_resume_without_dense ensures
+                    // exactly one log line per process across both probe sites.
+                    // "gemma-hybrid-lcp" (2026-08-03): resumable substrates
+                    // = dense (HF2Q_USE_DENSE=1) OR production hybrid. The
+                    // HB-encoded opt-out regime stays auto-disabled.
+                    let lcp_enabled = effective_kv_lcp_resume(
+                        crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
+                        crate::debug::INVESTIGATION_ENV.use_dense
+                            || crate::debug::INVESTIGATION_ENV.hybrid_kv,
+                    );
+                    if !lcp_enabled {
+                        None
+                    } else {
+                        let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
+                        match prefix_opt {
+                            None => None,
+                            Some(prefix) => {
+                                let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
+                                let model_sw = loaded.weights.sliding_window.max(1);
+                                let agg_ok = prefix.linear_capacity >= new_linear
+                                    && prefix.sliding_window == model_sw;
+                                // Per-layer cap + is_sliding check (same
+                                // shape as non-streaming probe site).
+                                let per_layer_ok = if !agg_ok {
+                                    false
+                                } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
+                                    false
                                 } else {
-                                    mlx_native::DType::F32
-                                };
-                                // ADR-017 Phase E.a iter-3.6 follow-up
-                                // (Codex audit LOW #1): align per-layer
-                                // sliding required_cap with the alloc
-                                // formula. When LONG_RESUME=1, sliding
-                                // layers were allocated with
-                                // `max(sw, new_linear)`; the per-layer
-                                // check must demand ≥ same value, not
-                                // just `model_sw`. Today the aggregate
-                                // `prefix.linear_capacity >= new_linear`
-                                // saves us, but a future refactor could
-                                // admit an undersized sliding snapshot.
-                                // "gemma-hybrid-lcp": long-resume admits
-                                // dense OR production hybrid (kernel
-                                // mask_type=2 verified for both legs).
-                                let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
-                                    && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                                    && (crate::debug::INVESTIGATION_ENV.use_dense
-                                        || crate::debug::INVESTIGATION_ENV.hybrid_kv);
-                                prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
-                                    let layer = &loaded.weights.layers[li];
-                                    let layer_is_ring = matches!(
-                                        layer.layer_type,
-                                        crate::serve::config::LayerType::Sliding
-                                    );
-                                    let required_cap = if layer_is_ring {
-                                        if lr_long {
-                                            model_sw.max(new_linear)
-                                        } else {
-                                            model_sw
-                                        }
+                                    // ADR-017 Phase E.a iter-3.5a — dtype
+                                    // invariant added to the per-layer
+                                    // check. Model-current `kv_dtype` is
+                                    // resolved from `INVESTIGATION_ENV.f16_kv`
+                                    // (same source used at every alloc
+                                    // site). A cached entry with mismatched
+                                    // dtype must NOT be installed: the
+                                    // kernel's flash_attn_vec dispatch
+                                    // takes dtype as a static branch and
+                                    // would silently misread the cached
+                                    // bytes.
+                                    let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+                                        mlx_native::DType::F16
                                     } else {
-                                        new_linear
+                                        mlx_native::DType::F32
                                     };
-                                    // "gemma-hybrid-lcp" (2026-08-03):
-                                    // the per-layer check runs on the
-                                    // DENSE leg (prefill SDPA reads it);
-                                    // the dense fields live behind
-                                    // `arc.dense()` in the enum payload.
-                                    let d = arc.dense();
-                                    let dense_ok = d.capacity >= required_cap
-                                        && d.is_sliding == layer_is_ring
-                                        && d.dtype == model_kv_dtype;
-                                    // Regime-consistency: under the
-                                    // production hybrid regime the entry
-                                    // MUST carry the hybrid leg per
-                                    // layer — a dense-only entry under
-                                    // hybrid would leave the decode cache
-                                    // unrestored (silent zero-prefix; the
-                                    // class this sub-iter exists to close).
-                                    let regime_ok = if crate::debug::INVESTIGATION_ENV.hybrid_kv {
-                                        match arc.hybrid() {
-                                            Some(h) => {
-                                                h.capacity >= required_cap
-                                                    && h.is_sliding == layer_is_ring
+                                    // ADR-017 Phase E.a iter-3.6 follow-up
+                                    // (Codex audit LOW #1): align per-layer
+                                    // sliding required_cap with the alloc
+                                    // formula. When LONG_RESUME=1, sliding
+                                    // layers were allocated with
+                                    // `max(sw, new_linear)`; the per-layer
+                                    // check must demand ≥ same value, not
+                                    // just `model_sw`. Today the aggregate
+                                    // `prefix.linear_capacity >= new_linear`
+                                    // saves us, but a future refactor could
+                                    // admit an undersized sliding snapshot.
+                                    // "gemma-hybrid-lcp": long-resume admits
+                                    // dense OR production hybrid (kernel
+                                    // mask_type=2 verified for both legs).
+                                    let lr_long = crate::debug::INVESTIGATION_ENV
+                                        .kv_lcp_long_resume
+                                        && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                                        && (crate::debug::INVESTIGATION_ENV.use_dense
+                                            || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+                                    prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
+                                        let layer = &loaded.weights.layers[li];
+                                        let layer_is_ring = matches!(
+                                            layer.layer_type,
+                                            crate::serve::config::LayerType::Sliding
+                                        );
+                                        let required_cap = if layer_is_ring {
+                                            if lr_long {
+                                                model_sw.max(new_linear)
+                                            } else {
+                                                model_sw
                                             }
-                                            None => false,
-                                        }
-                                    } else {
-                                        true
-                                    };
-                                    dense_ok && regime_ok
-                                })
-                            };
-                            if !per_layer_ok {
-                                tracing::debug!(
+                                        } else {
+                                            new_linear
+                                        };
+                                        // "gemma-hybrid-lcp" (2026-08-03):
+                                        // the per-layer check runs on the
+                                        // DENSE leg (prefill SDPA reads it);
+                                        // the dense fields live behind
+                                        // `arc.dense()` in the enum payload.
+                                        let d = arc.dense();
+                                        let dense_ok = d.capacity >= required_cap
+                                            && d.is_sliding == layer_is_ring
+                                            && d.dtype == model_kv_dtype;
+                                        // Regime-consistency: under the
+                                        // production hybrid regime the entry
+                                        // MUST carry the hybrid leg per
+                                        // layer — a dense-only entry under
+                                        // hybrid would leave the decode cache
+                                        // unrestored (silent zero-prefix; the
+                                        // class this sub-iter exists to close).
+                                        let regime_ok = if crate::debug::INVESTIGATION_ENV.hybrid_kv
+                                        {
+                                            match arc.hybrid() {
+                                                Some(h) => {
+                                                    h.capacity >= required_cap
+                                                        && h.is_sliding == layer_is_ring
+                                                }
+                                                None => false,
+                                            }
+                                        } else {
+                                            true
+                                        };
+                                        dense_ok && regime_ok
+                                    })
+                                };
+                                if !per_layer_ok {
+                                    tracing::debug!(
                                     "lcp_resume (streaming): capacity check failed — falling back"
                                 );
-                                drop(prefix);
-                                None
-                            } else {
-                                let k = prefix.k;
-                                // "gemma-hybrid-lcp" (2026-08-03): split
-                                // enum payload into dense-leg Arc install +
-                                // hybrid-leg OWNED install (mirrors the
-                                // non-streaming site; Arc exclusivity
-                                // precondition + graceful bail on
-                                // contention).
-                                let mut dense_arcs: Vec<
-                                    std::sync::Arc<
-                                        crate::inference::models::gemma4::DenseKvBuffers,
-                                    >,
-                                > = Vec::with_capacity(prefix.dense_kvs.len());
-                                let mut hybrid_owned: Vec<
-                                    crate::inference::models::gemma4::HybridKvBuffers,
-                                > = Vec::new();
-                                let mut install_ok = true;
-                                for arc in prefix.dense_kvs.into_iter() {
-                                    match std::sync::Arc::try_unwrap(arc) {
+                                    drop(prefix);
+                                    None
+                                } else {
+                                    let k = prefix.k;
+                                    // "gemma-hybrid-lcp" (2026-08-03): split
+                                    // enum payload into dense-leg Arc install +
+                                    // hybrid-leg OWNED install (mirrors the
+                                    // non-streaming site; Arc exclusivity
+                                    // precondition + graceful bail on
+                                    // contention).
+                                    let mut dense_arcs: Vec<
+                                        std::sync::Arc<
+                                            crate::inference::models::gemma4::DenseKvBuffers,
+                                        >,
+                                    > = Vec::with_capacity(prefix.dense_kvs.len());
+                                    let mut hybrid_owned: Vec<
+                                        crate::inference::models::gemma4::HybridKvBuffers,
+                                    > = Vec::new();
+                                    let mut install_ok = true;
+                                    for arc in prefix.dense_kvs.into_iter() {
+                                        match std::sync::Arc::try_unwrap(arc) {
                                         Ok(layer) => match layer {
                                             crate::inference::models::gemma4::GemmaLcpLayerKv::Dense(
                                                 d,
@@ -16231,23 +16337,24 @@ fn generate_stream_once(
                                             break;
                                         }
                                     }
-                                }
-                                if !install_ok {
-                                    drop(dense_arcs);
-                                    drop(hybrid_owned);
-                                    None
-                                } else {
-                                    let has_hybrid = !hybrid_owned.is_empty();
-                                    loaded.weights.dense_kvs = Some(dense_arcs);
-                                    if has_hybrid {
-                                        loaded.weights.hybrid_kv = Some(hybrid_owned);
                                     }
-                                    tracing::debug!(
-                                        "lcp_resume (streaming): ENGAGED — K={} of N={}",
-                                        k,
-                                        prompt_tokens.len(),
-                                    );
-                                    Some(k)
+                                    if !install_ok {
+                                        drop(dense_arcs);
+                                        drop(hybrid_owned);
+                                        None
+                                    } else {
+                                        let has_hybrid = !hybrid_owned.is_empty();
+                                        loaded.weights.dense_kvs = Some(dense_arcs);
+                                        if has_hybrid {
+                                            loaded.weights.hybrid_kv = Some(hybrid_owned);
+                                        }
+                                        tracing::debug!(
+                                            "lcp_resume (streaming): ENGAGED — K={} of N={}",
+                                            k,
+                                            prompt_tokens.len(),
+                                        );
+                                        Some(k)
+                                    }
                                 }
                             }
                         }
@@ -16566,9 +16673,7 @@ fn generate_stream_once(
                     // `ToolCallBodyRequired` keeps the eager gate
                     // (`awaiting_trigger=false`); only `ToolCallBodyAuto`
                     // suspends until ToolCallSplitter sees the open marker.
-                    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
-                        rt.set_awaiting_trigger(true);
-                    }
+                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
                     Some(rt)
                 }
                 None => {
@@ -16606,25 +16711,14 @@ fn generate_stream_once(
     // A 92K-token opencode first turn allocated ~120 GB transient on
     // 2026-08-03 and died in Metal with a command-buffer error — no
     // user should need to know BATCHED=0 exists.
-    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
-    let batched_allowed = match serve_batched_env.as_deref() {
-        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
-        None => {
-            let viable = crate::serve::forward_prefill_batched::serve_batched_route_viable(
-                prompt_tokens.len(),
-                loaded.weights.num_attention_heads,
-            );
-            if !viable {
-                eprintln!(
-                    "[hf2q batched prefill] auto-fallback to linear route: \
-                     seq_len={} O(n²) mask overhead exceeds the available- \
-                     memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
-                    prompt_tokens.len()
-                );
-            }
-            viable
-        }
-    };
+    if serve_batched_env.is_none() && !batched_allowed && resume_lcp.is_none() {
+        eprintln!(
+            "[hf2q batched prefill] auto-fallback to linear route: \
+             seq_len={} O(n²) mask overhead exceeds the available- \
+             memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+            prompt_tokens.len()
+        );
+    }
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
     let next_token_result = if use_batched_serve {
         loaded
@@ -16672,14 +16766,14 @@ fn generate_stream_once(
                 }
             }
         }
-        // Wave 2.6 W-α5 Q2: mask + accept are UNCONDITIONAL.  For
-        // `ToolCallBody`-kind runtimes the gate is armed (no-op);
-        // for `ResponseFormat`-kind it enforces from token 0 — the
-        // wave-2.5 audit fix for the response_format regression.
-        if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-        }
-        let tok = sampler_pure::sample_token(&mut logits, sp, &[]);
+        let (tok, _) = sample_logits_with_grammar(
+            &mut logits,
+            sp,
+            &[],
+            grammar_runtime.as_ref(),
+            token_bytes_ref,
+            false,
+        );
         if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
             let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
             if !bytes.is_empty() {
@@ -16788,21 +16882,14 @@ fn generate_stream_once(
                         }
                     }
                 }
-                // Wave 2.6 W-α5 Q2: mask + accept UNCONDITIONAL.  The
-                // runtime self-gates on `is_awaiting_trigger()`.  When
-                // suspended (ToolCallBody pre-trigger), mask is a no-op
-                // and the model emits preamble freely; once
-                // `route_content` sees the open marker and calls
-                // `runtime.trigger()`, every subsequent step enforces.
-                // ResponseFormat-kind runtimes were never suspended and
-                // enforce from the first token.  This collapses the
-                // wave-2.5 4-line `if grammar_active.load { mask }` /
-                // separate `accept` paired pattern into 2 lines that are
-                // structurally correct.
-                if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-                }
-                let tok = sampler_pure::sample_token(&mut logits, sp, &generated_tokens);
+                let (tok, _) = sample_logits_with_grammar(
+                    &mut logits,
+                    sp,
+                    &generated_tokens,
+                    grammar_runtime.as_ref(),
+                    token_bytes_ref,
+                    false,
+                );
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
                     let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
                     if !bytes.is_empty() {
@@ -16815,6 +16902,24 @@ fn generate_stream_once(
             };
 
             if loaded.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            // A completed grammar has no printable continuation. The sampler
+            // can select an empty-byte special token (commonly `<pad>`) when
+            // every printable candidate is masked. Stop before decoding or
+            // emitting that transport-only token; tool-call SSE must contain
+            // only tool deltas.
+            if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead())
+                || grammar_runtime.as_ref().is_some_and(|rt| {
+                    rt.is_accepted()
+                        && token_bytes_ref.is_some_and(|tb| {
+                            tb.get(next_token as usize)
+                                .map(|bytes| bytes.is_empty())
+                                .unwrap_or(true)
+                        })
+                })
+            {
                 finish_reason = "stop";
                 break;
             }
@@ -16848,30 +16953,6 @@ fn generate_stream_once(
             if hit_stop_string(&accumulated_text, &params.stop_strings) {
                 finish_reason = "stop";
                 break;
-            }
-            // Grammar-driven termination — see generate_once for full doc.
-            // Streaming variant: we can't pop the trailing token cleanly
-            // because the fragment was already emitted to the SSE stream;
-            // accept the small wart.  Iter-96+ candidate: hold back the
-            // last fragment until next-step grammar state is known so it
-            // can be suppressed pre-emit.
-            if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
-                finish_reason = "stop";
-                break;
-            }
-            if let Some(rt) = grammar_runtime.as_ref() {
-                if rt.is_accepted() {
-                    if let Some(tb) = token_bytes_ref {
-                        let bytes = tb
-                            .get(next_token as usize)
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]);
-                        if bytes.is_empty() {
-                            finish_reason = "stop";
-                            break;
-                        }
-                    }
-                }
             }
         }
     }
@@ -16961,7 +17042,8 @@ fn generate_stream_once(
         total_time_secs: Some((prefill_duration + decode_duration).as_secs_f64()),
         time_to_first_token_ms: Some(prefill_duration.as_secs_f64() * 1000.0),
         prefill_tokens_per_sec: Some(if prefill_duration.as_secs_f64() > 0.0 {
-            prompt_len as f64 / prefill_duration.as_secs_f64()
+            prompt_len.saturating_sub(resume_lcp.unwrap_or(0)) as f64
+                / prefill_duration.as_secs_f64()
         } else {
             0.0
         }),
@@ -16972,7 +17054,7 @@ fn generate_stream_once(
         }),
         gpu_sync_count: Some(mlx_native::sync_count().saturating_sub(pre_syncs)),
         gpu_dispatch_count: Some(mlx_native::dispatch_count().saturating_sub(pre_dispatches)),
-        cached_prompt_tokens: None,
+        cached_prompt_tokens: resume_lcp,
         reasoning_tokens: if reasoning_token_count > 0 {
             Some(reasoning_token_count)
         } else {
@@ -17019,7 +17101,7 @@ fn generate_stream_once(
         finish_reason,
         prefill_duration,
         decode_duration,
-        cached_tokens: 0,
+        cached_tokens: resume_lcp.unwrap_or(0),
         logprobs: None,
     };
 
@@ -17091,15 +17173,17 @@ fn generate_stream_once(
                 !has_sliding_layer || prompt_tokens.len() <= sliding_window || kv_lcp_long_resume;
             if prefill_safe {
                 let lcp_key = build_lcp_key_for_request(loaded, params);
-                // iter-3.5d headroom (mirrors non-streaming site).
-                let linear_capacity =
-                    sliding_window.max(prompt_tokens.len() + params.max_tokens.max(1));
                 // Codex Phase-2b 2026-05-06: surface store errors instead
                 // of `let _ = ...` so EntryExceedsBudget / EmptyPrompt /
                 // EmptyPayload aren't swallowed silently. Mantra: no fallback.
                 // "gemma-hybrid-lcp": store gated on the payload build
                 // (None = fail-safe skip).
                 if let Some(payload) = payload {
+                    let linear_capacity = payload
+                        .iter()
+                        .map(|layer| layer.dense().capacity)
+                        .min()
+                        .expect("Gemma LCP payload is non-empty");
                     if let Err(e) = loaded.lcp_registry.store(
                         lcp_key,
                         prompt_tokens.to_vec(),
