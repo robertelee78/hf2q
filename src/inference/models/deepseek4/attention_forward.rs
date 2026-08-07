@@ -3,7 +3,7 @@ use super::attention::{append_prefill_window_indices, window_indices};
 use super::attention_weights::AttentionWeightsRef;
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::forward_support::{
-    alloc, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
+    alloc, alloc_host_input, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
     BatchedGroupedOutputArena,
 };
 use super::prefill_flash_attention::{encode_deepseek_flash_prefill, DeepseekPrefillFlashArena};
@@ -290,9 +290,7 @@ impl Deepseek4Model {
             })
             .transpose()?;
         let prefill_flash = use_matrix_prefill
-            .then(|| {
-                DeepseekPrefillFlashArena::new(&device, rows, heads, head_dim, compact_raw_kv_len)
-            })
+            .then(|| DeepseekPrefillFlashArena::new(&device, rows, head_dim, compact_raw_kv_len))
             .transpose()?;
 
         let hc_params = rms_params(&device, self.cfg.rms_norm_eps, hc_hidden, "HC RMS params")?;
@@ -300,7 +298,7 @@ impl Deepseek4Model {
             rms_params(&device, self.cfg.rms_norm_eps, hidden, "hidden RMS params")?;
         let rank_params = rms_params(&device, self.cfg.rms_norm_eps, q_rank, "rank RMS params")?;
         let head_params = rms_params(&device, self.cfg.rms_norm_eps, head_dim, "head RMS params")?;
-        let mut positions = alloc(&device, DType::U32, vec![rows], "RoPE positions")?;
+        let mut positions = alloc_host_input(&device, DType::U32, vec![rows], "RoPE positions")?;
         for (offset, position) in positions
             .as_logical_mut_slice::<u32>()?
             .iter_mut()
@@ -317,7 +315,7 @@ impl Deepseek4Model {
             self.cfg.yarn_beta_fast,
             self.cfg.yarn_beta_slow,
         )?;
-        let mut frequency_buffer = alloc(
+        let mut frequency_buffer = alloc_host_input(
             &device,
             DType::F32,
             vec![frequencies.len()],
@@ -335,7 +333,7 @@ impl Deepseek4Model {
             .first()
             .context("DeepSeek-V4 window index row missing")?
             .len();
-        let mut indices = alloc(
+        let mut indices = alloc_host_input(
             &device,
             DType::I32,
             vec![1, rows, index_width],
@@ -529,10 +527,6 @@ impl Deepseek4Model {
                 &kv_rope,
                 &kv_rope_params,
             )?;
-
-            // Official DeepSeek-V4 QAT applies block-64 E4M3/E8M0 fake
-            // quantization to the non-RoPE KV prefix in every attention
-            // layer, including the ratio-zero prefix/suffix layers.
             session.barrier_between(&[&kv_rope], &[&kv_rope]);
             dispatch_deepseek_mxfp8_fake_quant_bf16(
                 session.encoder_mut(),
@@ -547,7 +541,17 @@ impl Deepseek4Model {
                 },
             )?;
 
-            let kv_cache_input = &kv_rope;
+            let window_source_start = layer_span.map(|span| span.window_source_start).unwrap_or(0);
+            let window_write_count = layer_span
+                .map(|span| span.window_write_count)
+                .unwrap_or(rows);
+            let window_cache_view = (window_source_start > 0).then(|| {
+                kv_rope.slice_view(
+                    (window_source_start * head_dim * DType::BF16.size_of()) as u64,
+                    window_write_count * head_dim,
+                )
+            });
+            let window_cache_input = window_cache_view.as_ref().unwrap_or(&kv_rope);
             if let Some(prefix) = raw_prefix.as_ref() {
                 session.barrier_between(&[&layer_cache.window_kv], &[prefix]);
                 dispatch_kv_cache_copy(
@@ -563,7 +567,7 @@ impl Deepseek4Model {
                     false,
                 )?;
             }
-            let mut window_write_inputs = vec![kv_cache_input];
+            let mut window_write_inputs = vec![window_cache_input];
             if let Some(prefix) = raw_prefix.as_ref() {
                 window_write_inputs.push(prefix);
             }
@@ -572,7 +576,7 @@ impl Deepseek4Model {
                 session.encoder_mut(),
                 registry,
                 device.metal_device(),
-                kv_cache_input,
+                window_cache_input,
                 &layer_cache.window_kv,
                 u32::try_from(
                     layer_span
@@ -582,7 +586,8 @@ impl Deepseek4Model {
                 )
                 .context("DeepSeek-V4 window write slot exceeds u32")?,
                 head_dim as u32,
-                rows_u32,
+                u32::try_from(window_write_count)
+                    .context("DeepSeek-V4 window write count exceeds u32")?,
                 window_capacity as u32,
                 true,
             )?;

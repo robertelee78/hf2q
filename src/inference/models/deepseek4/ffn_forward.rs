@@ -13,10 +13,11 @@ use mlx_native::ops::deepseek_moe_routing::{
     dispatch_deepseek_moe_hash_route, dispatch_deepseek_moe_sanitize_indices,
     dispatch_deepseek_moe_score_route, DEEPSEEK_MOE_EXPERTS, DEEPSEEK_MOE_TOP_K,
 };
-use mlx_native::{DType, GraphExecutor, MlxBuffer};
+use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 
 use super::forward_support::{
-    alloc, alloc_persistent, expert_matmul, raw_matmul, rms_params, ExpertMatmulRoute,
+    alloc, alloc_host_input, alloc_persistent, expert_matmul, raw_matmul, rms_params,
+    ExpertMatmulRoute,
 };
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
@@ -57,7 +58,15 @@ impl Deepseek4Model {
         in_flight: Option<&mut SubmissionChain>,
         shared_session: Option<&mut GraphSession<'_>>,
     ) -> Result<MlxBuffer> {
-        self.forward_ffn_rows(state, &[token_id], layer, in_flight, shared_session)
+        self.forward_ffn_rows(
+            state,
+            &[token_id],
+            layer,
+            in_flight,
+            shared_session,
+            None,
+            None,
+        )
     }
 
     /// Run one verifier FFN layer for a complete prompt in layer-major order.
@@ -68,6 +77,8 @@ impl Deepseek4Model {
         layer: usize,
         in_flight: Option<&mut SubmissionChain>,
         shared_session: Option<&mut GraphSession<'_>>,
+        reusable_output_state: Option<MlxBuffer>,
+        mut id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
     ) -> Result<MlxBuffer> {
         if layer >= self.cfg.num_hidden_layers as usize {
             bail!(
@@ -191,11 +202,24 @@ impl Deepseek4Model {
         let shared_activated = alloc(&device, DType::F32, vec![rows, inter], "shared activation")?;
         let shared_down = alloc(&device, DType::F32, vec![rows, hidden], "shared output")?;
         let ffn_output = alloc(&device, DType::F32, vec![rows, hidden], "FFN output")?;
-        let output_state =
-            alloc_persistent(&device, DType::F32, vec![rows, hc, hidden], "FFN HC output")?;
+        let output_shape = vec![rows, hc, hidden];
+        let output_state = if let Some(output_state) = reusable_output_state {
+            if output_state.dtype() != DType::F32 || output_state.shape() != output_shape {
+                bail!(
+                    "DeepSeek-V4 reusable FFN output must be F32 {:?}, got {} {:?}",
+                    output_shape,
+                    output_state.dtype(),
+                    output_state.shape()
+                );
+            }
+            output_state
+        } else {
+            alloc_persistent(&device, DType::F32, output_shape, "FFN HC output")?
+        };
         let hc_params = rms_params(&device, self.cfg.rms_norm_eps, hc_hidden, "FFN HC params")?;
         let hidden_params = rms_params(&device, self.cfg.rms_norm_eps, hidden, "FFN norm params")?;
-        let mut routing_token_ids = alloc(&device, DType::I32, vec![rows], "MoE token IDs")?;
+        let mut routing_token_ids =
+            alloc_host_input(&device, DType::I32, vec![rows], "MoE token IDs")?;
         for (destination, &token_id) in routing_token_ids
             .as_logical_mut_slice::<i32>()?
             .iter_mut()
@@ -339,6 +363,9 @@ impl Deepseek4Model {
                 inter,
                 hidden,
                 routed_projection,
+                id_mm_scratch
+                    .as_deref_mut()
+                    .map(|scratch| &mut scratch[0]),
                 "routed gate",
             )?;
             expert_matmul(
@@ -355,6 +382,9 @@ impl Deepseek4Model {
                 inter,
                 hidden,
                 routed_projection,
+                id_mm_scratch
+                    .as_deref_mut()
+                    .map(|scratch| &mut scratch[1]),
                 "routed up",
             )?;
             raw_matmul(
@@ -407,22 +437,45 @@ impl Deepseek4Model {
                 rows,
             )?;
             split_profile_stage(session, "DeepSeek-V4 FFN activations")?;
-            expert_matmul(
-                session,
-                registry,
-                &device,
-                &routed_activated,
-                &down_experts,
-                &safe_indices,
-                &routed_down,
-                routed_rows,
-                1,
-                experts,
-                hidden,
-                inter,
-                ExpertMatmulRoute::Auto,
-                "routed down",
-            )?;
+            if rows > MM_ID_ROUTING_THRESHOLD as usize && id_mm_scratch.is_some() {
+                expert_matmul(
+                    session,
+                    registry,
+                    &device,
+                    &routed_activated,
+                    &down_experts,
+                    &safe_indices,
+                    &routed_down,
+                    rows,
+                    top_k,
+                    experts,
+                    hidden,
+                    inter,
+                    ExpertMatmulRoute::SlottedMm,
+                    id_mm_scratch
+                        .as_deref_mut()
+                        .map(|scratch| &mut scratch[0]),
+                    "routed down",
+                )?;
+            } else {
+                expert_matmul(
+                    session,
+                    registry,
+                    &device,
+                    &routed_activated,
+                    &down_experts,
+                    &safe_indices,
+                    &routed_down,
+                    routed_rows,
+                    1,
+                    experts,
+                    hidden,
+                    inter,
+                    ExpertMatmulRoute::Auto,
+                    None,
+                    "routed down",
+                )?;
+            }
             raw_matmul(
                 session,
                 registry,

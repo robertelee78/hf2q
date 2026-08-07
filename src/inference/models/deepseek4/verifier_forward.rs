@@ -2,13 +2,16 @@
 
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
-use mlx_native::{GraphExecutor, MlxBuffer};
+use mlx_native::{
+    DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::forward_support::{
-    begin_decode_pool_token, begin_prefill_pool_layer, end_decode_pool_token,
-    end_prefill_pool_layer,
+    alloc_persistent, begin_decode_pool_token, begin_prefill_pool_layer,
+    begin_prefill_submission_inputs, end_decode_pool_token, end_prefill_pool_layer,
+    end_prefill_submission_inputs,
 };
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
 use super::Deepseek4Model;
@@ -44,6 +47,56 @@ fn prefill_windows_for_resident_bytes(resident_bytes: u64) -> usize {
         LARGE_MODEL_MATRIX_PREFILL_WINDOWS
     } else {
         DEFAULT_MATRIX_PREFILL_WINDOWS
+    }
+}
+
+fn graph_reorder_enabled() -> Result<bool> {
+    let Some(value) = std::env::var_os("HF2Q_DEEPSEEK_GRAPH_REORDER") else {
+        return Ok(true);
+    };
+    match value
+        .to_str()
+        .context("HF2Q_DEEPSEEK_GRAPH_REORDER is not valid UTF-8")?
+    {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        value => anyhow::bail!("HF2Q_DEEPSEEK_GRAPH_REORDER must be 0 or 1 (got {value})"),
+    }
+}
+
+fn graph_layers_per_command_buffer(
+    layers: usize,
+    graph_reorder: bool,
+    requires_single_layer: bool,
+) -> Result<usize> {
+    let Some(value) = std::env::var_os("HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB") else {
+        return Ok(default_graph_layers_per_command_buffer(
+            layers,
+            graph_reorder,
+            requires_single_layer,
+        ));
+    };
+    let value = value
+        .to_str()
+        .context("HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB is not valid UTF-8")?
+        .parse::<usize>()
+        .context("HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB must be a positive integer")?;
+    anyhow::ensure!(
+        (1..=layers).contains(&value),
+        "HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB must be in 1..={layers}"
+    );
+    Ok(value)
+}
+
+fn default_graph_layers_per_command_buffer(
+    layers: usize,
+    graph_reorder: bool,
+    requires_single_layer: bool,
+) -> usize {
+    if graph_reorder && !requires_single_layer {
+        layers.min(4)
+    } else {
+        1
     }
 }
 
@@ -168,23 +221,139 @@ impl Deepseek4Model {
         let layers = self.cfg.num_hidden_layers as usize;
         let executor = GraphExecutor::new(self.ctx.device().clone());
         let profile_timing = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_TIMING").is_some();
+        let graph_diag = std::env::var("HF2Q_DEEPSEEK_GRAPH_DIAG").as_deref() == Ok("1");
+        let dump_intermediates = std::env::var_os("HF2Q_DEEPSEEK_DUMP_LAYER_DIR").is_some()
+            || std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
+        let graph_reorder = graph_reorder_enabled()?;
+        let graph_layers_per_command_buffer =
+            graph_layers_per_command_buffer(layers, graph_reorder, profile_timing || dump_intermediates)?;
+        if graph_layers_per_command_buffer > 1 {
+            anyhow::ensure!(
+                graph_reorder,
+                "multi-layer DeepSeek-V4 graphs require HF2Q_DEEPSEEK_GRAPH_REORDER=1"
+            );
+            anyhow::ensure!(
+                retained_reference_pipeline_enabled(),
+                "multi-layer DeepSeek-V4 graphs require retained Metal command-buffer references"
+            );
+            anyhow::ensure!(
+                !profile_timing,
+                "multi-layer DeepSeek-V4 graphs are incompatible with per-layer timing"
+            );
+            anyhow::ensure!(
+                !dump_intermediates,
+                "multi-layer DeepSeek-V4 graphs are incompatible with intermediate state dumps"
+            );
+        }
+        let device = self.ctx.device().clone();
+        let rows = token_ids.len();
+        let hc = self.cfg.hyper_connection_count as usize;
+        let hidden = self.cfg.hidden_size as usize;
+        let mut id_mm_scratch = if rows > MM_ID_ROUTING_THRESHOLD as usize {
+            let rows = u32::try_from(rows).context("DeepSeek-V4 prefill rows exceed u32")?;
+            Some([
+                IdMmScratch::alloc(self.ctx.device(), self.cfg.num_experts, rows)
+                    .context("allocate DeepSeek-V4 gate/down mm_id scratch")?,
+                IdMmScratch::alloc(self.ctx.device(), self.cfg.num_experts, rows)
+                    .context("allocate DeepSeek-V4 up mm_id scratch")?,
+            ])
+        } else {
+            None
+        };
+        // Each layer fully overwrites its output after reading the preceding
+        // layer's state. Alternating two persistent buffers preserves that
+        // dependency while avoiding 43 fresh, CPU-zeroed Metal allocations
+        // for every prompt chunk.
+        let reusable_states = [
+            alloc_persistent(
+                &device,
+                DType::F32,
+                vec![rows, hc, hidden],
+                "prefill state ping",
+            )?,
+            alloc_persistent(
+                &device,
+                DType::F32,
+                vec![rows, hc, hidden],
+                "prefill state pong",
+            )?,
+        ];
         let mut state = None;
+        if graph_layers_per_command_buffer > 1 {
+            for start in (0..layers).step_by(graph_layers_per_command_buffer) {
+                let end = (start + graph_layers_per_command_buffer).min(layers);
+                begin_prefill_submission_inputs();
+                let group_result: Result<()> = (|| {
+                    let mut session = executor.begin_recorded().with_context(|| {
+                        format!("begin DeepSeek-V4 recorded prefill layers {start}..{end}")
+                    })?;
+                    for layer in start..end {
+                        begin_prefill_pool_layer();
+                        let layer_result = self.encode_verifier_layer_prefill(
+                            token_ids,
+                            layer,
+                            state.as_ref(),
+                            cache,
+                            span,
+                            reusable_states[layer % reusable_states.len()].clone(),
+                            id_mm_scratch.as_mut(),
+                            &mut session,
+                        );
+                        if layer_result.is_ok() && layer + 1 < end {
+                            session.barrier();
+                        }
+                        end_prefill_pool_layer();
+                        state = Some(layer_result?);
+                    }
+                    let (reordered, barriers) = session.finish_with_reorder().with_context(|| {
+                        format!("reorder DeepSeek-V4 prefill layers {start}..{end}")
+                    })?;
+                    if graph_diag {
+                        eprintln!(
+                            "[GRAPH_REORDER] layers={start}..{end} reordered={reordered} barriers={barriers}"
+                        );
+                    }
+                    Ok(())
+                })();
+                end_prefill_submission_inputs();
+                if let Err(error) = &group_result {
+                    eprintln!("[GRAPH_REORDER] layers={start}..{end} failed: {error:#}");
+                }
+                group_result?;
+            }
+            return state.context("DeepSeek-V4 multi-layer graph encoded zero layers");
+        }
         for layer in 0..layers {
             begin_prefill_pool_layer();
             let layer_start = std::time::Instant::now();
             let layer_result: Result<MlxBuffer> = (|| {
-                let mut session = executor
-                    .begin()
-                    .with_context(|| format!("begin DeepSeek-V4 prefill layer {layer}"))?;
+                let record_graph = (layer == 0 && graph_diag) || graph_reorder;
+                let mut session = if record_graph {
+                    executor.begin_recorded()
+                } else {
+                    executor.begin()
+                }
+                .with_context(|| format!("begin DeepSeek-V4 prefill layer {layer}"))?;
                 let next_state = self.encode_verifier_layer_prefill(
                     token_ids,
                     layer,
                     state.as_ref(),
                     cache,
                     span,
+                    reusable_states[layer % reusable_states.len()].clone(),
+                    id_mm_scratch.as_mut(),
                     &mut session,
                 )?;
-                if profile_timing {
+                if graph_reorder {
+                    let (reordered, barriers) = session
+                        .finish_with_reorder()
+                        .with_context(|| format!("reorder DeepSeek-V4 prefill layer {layer}"))?;
+                    if graph_diag {
+                        eprintln!(
+                            "[GRAPH_REORDER] layer={layer} reordered={reordered} barriers={barriers}"
+                        );
+                    }
+                } else if profile_timing {
                     let (encode_ns, wait_ns) = session
                         .finish_with_timing(layer_start)
                         .with_context(|| format!("execute DeepSeek-V4 prefill layer {layer}"))?;
@@ -205,6 +374,11 @@ impl Deepseek4Model {
                 )?;
                 Ok(next_state)
             })();
+            if graph_reorder {
+                if let Err(error) = &layer_result {
+                    eprintln!("[GRAPH_REORDER] layer={layer} failed: {error:#}");
+                }
+            }
             let reset_start = std::time::Instant::now();
             end_prefill_pool_layer();
             if profile_timing {
@@ -226,6 +400,8 @@ impl Deepseek4Model {
         state: Option<&MlxBuffer>,
         cache: &mut Deepseek4Cache,
         span: &CacheSpan,
+        output_state: MlxBuffer,
+        id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
         session: &mut GraphSession<'_>,
     ) -> Result<MlxBuffer> {
         let dump_attention = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
@@ -281,8 +457,16 @@ impl Deepseek4Model {
                 })
                 .with_context(|| format!("profile DeepSeek-V4 layer-{layer} attention"))?;
         }
-        self.forward_ffn_rows(&attention, token_ids, layer, None, Some(session))
-            .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
+        self.forward_ffn_rows(
+            &attention,
+            token_ids,
+            layer,
+            None,
+            Some(session),
+            Some(output_state),
+            id_mm_scratch,
+        )
+        .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
     }
 
     /// Execute all verifier blocks for one token.
@@ -593,10 +777,19 @@ impl Deepseek4Model {
 #[cfg(test)]
 mod prompt_chunk_tests {
     use super::{
-        matrix_prefill_chunk_len, prefill_windows_for_resident_bytes,
+        default_graph_layers_per_command_buffer, matrix_prefill_chunk_len,
+        prefill_windows_for_resident_bytes,
         DEFAULT_MATRIX_PREFILL_WINDOWS, LARGE_MODEL_MATRIX_PREFILL_WINDOWS,
         LARGE_MODEL_RESIDENT_BYTES, MIN_MATRIX_APPEND_TOKENS,
     };
+
+    #[test]
+    fn reordered_prefill_defaults_to_four_layers_without_breaking_diagnostics() {
+        assert_eq!(default_graph_layers_per_command_buffer(43, true, false), 4);
+        assert_eq!(default_graph_layers_per_command_buffer(2, true, false), 2);
+        assert_eq!(default_graph_layers_per_command_buffer(43, false, false), 1);
+        assert_eq!(default_graph_layers_per_command_buffer(43, true, true), 1);
+    }
 
     #[test]
     fn long_prompts_continue_matrix_prefill_after_the_first_chunk() {

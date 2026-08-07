@@ -1,13 +1,12 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
 - **Status:** Accepted for hf2q 0.1.1
-- **Updated:** 2026-08-06 — file-backed GGUF weights removed the anonymous
-  100 GiB copy; packing eight physical heads into each D=512 sparse-attention
-  tile raised the exact 120K cold-prefill gate to 331.53 tok/s. The required
-  tool call remained exact, the next turn reused 99.91% of its prefix with
-  1.289 s TTFT, and the process completed without the former memory-pressure
-  kill. The final `mlx-native` 0.10.2 view-semantics revalidation reused 6,254
-  of 6,262 prompt tokens with 235 ms cached TTFT
+- **Updated:** 2026-08-06 — the completion candidate passed matched llama.cpp
+  parity, the full agentic tool gate, and the exact 120K context-cache gate.
+  The 119,808-token cold request reached 373.19 tok/s and made the exact tool
+  call; its tool-result turn reused 119,800 of 119,907 prompt tokens (99.91%)
+  and evaluated only 107 suffix tokens in 1.113 s TTFT. The process then shut
+  down cleanly without the former memory-pressure kill
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -32,6 +31,13 @@ invoke the pinned llama.cpp build as an oracle.
 Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
 evidence.
+
+That conversion/release boundary does not restrict the server to hf2q-produced
+files. `hf2q serve` does not require an hf2q provenance receipt and may load an
+externally produced or downloaded GGUF when its architecture, tensor catalog,
+quantization types, tokenizer, and template are explicitly supported. Unknown
+or incompatible model-family layouts still fail closed; producer identity by
+itself is never a serving rejection reason.
 
 The accepted runtime executes prompts in bounded 2,048-token matrix
 transactions, 16 times wider than the 128-token physical attention
@@ -452,21 +458,382 @@ changes. The measured candidate is
 |---|---|
 | Source identity | Official revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062`; 73-file bundle SHA-256 `a8544e6469f8f392e72f953e9a2b4ee33a23c50a859f47dd354d37ab0093993d` |
 | Artifact identity | 107,431,343,104 bytes (100.05 GiB); SHA-256 `914e9de7f6bad70d795179fedf68ac4336880c93c3a8c7c09ad019f0b28f6bc4` |
-| Native dependency | Exact crates.io pin `mlx-native =0.10.2`, published from implementation commit `9b496c475f2200eb968bafc861dba6f65dade0e6`; registry checksum and downloaded crate SHA-256 `e1d02b2f8f401bf6afe100144884b5d76c2c1154ee7c9a79299856f4aee0506e` |
+| Native dependency | Exact crates.io pin `mlx-native =0.10.3`, released from main commit `9f2210c8f03484a9c1122ef6a2bcf3be4226f29a` with implementation head `43d4b43b2cce1e9289561f45b9f6433437714028`; registry checksum and independently downloaded crate SHA-256 `1db3a6e739a199c7e9a7820a49718d549f6b03a77241f461cffb3ad085cb833d` |
 | Quant plan | 1,328 verifier tensors: 172 Q2_K, 86 Q3_K, 532 Q8_0, 535 F32, and 3 I32; 4,705 DSpark tensors explicitly excluded from the base artifact |
 | Conversion bound | Rust-native row-aligned streaming; maximum working vector bound 4,798,873,600 bytes; no external converter or inference process |
 | Arithmetic coherence | Greedy `What is 2+2? Reply with only number.` returned exactly `4` |
 | Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. The source-argument regression also returned `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result` byte-for-byte in one `emit_source` call (4 s response), proving the formerly truncated `<` syntax through the real model. A real OpenCode two-turn run issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
 | Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
-| Prefix reuse | The current checked-in gate used a 6,262-token prompt and reused 6,254 tokens on repeated, automatic, SSE, and post-tool turns. Cold TTFT was 12.380 s and cached TTFT was 235 ms; every required/automatic tool, source-argument, tool-result, unary, and SSE assertion passed. |
+| Prefix reuse | The current checked-in gate used a 6,262-token prompt and reused 6,254 tokens on repeated, automatic, SSE, and post-tool turns. Cold TTFT was 9.564 s and cached TTFT was 227 ms; every required/automatic tool, source-argument, tool-result, unary, and SSE assertion passed. |
 | Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and the 120K cache gate. It advertises 524,288 tokens and demand-allocates 131K initially. Memory/port preflight now refuses an unsafe 100 GiB load before model mapping. A prompt crossing the initial 131K allocation and a near-512K physical allocation remain unproven on this 128 GiB host. |
 | Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; llama.cpp build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
-| 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 361.384 s TTFT (331.525 tok/s); decode was 21.742 tok/s. The same source-bound prompt and artifact under llama.cpp build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.07x the reference prompt rate and 1.11x its decode rate for this run. |
-| 120K continuation cache | Appending the real tool result produced a 119,907-token request that reused 119,800 tokens (99.91%), evaluated only a 107-token suffix, returned its first semantic event in 1.289 s, and emitted the exact requested sentinel. |
+| 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 321.034 s TTFT (373.194 tok/s); decode was 23.869 tok/s. The same source-bound prompt and artifact under llama.cpp build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.33x the reference prompt rate and 1.22x its decode rate for these source-bound runs. |
+| 120K continuation cache | Appending the real tool result produced a 119,907-token request that reused 119,800 tokens (99.91%), evaluated only a 107-token suffix, returned its first semantic event in 1.113 s, and emitted the exact requested sentinel. |
 | 98K OpenCode-scale revalidation | A fresh 97,127-token required-tool request completed cold prefill in 424.522 s (228.79 tok/s). Its 97,214-token tool-result turn restored the compact recovery anchor, reused 97,119 tokens (99.90%), evaluated a 95-token suffix in 1.378 s TTFT, and completed in 2 s. |
-| Before/after control | The earlier identical-class hf2q run required 594.575 s for 119,808 tokens (201.502 tok/s). The accepted path reduced cold-prefill time by 39.2% and increased its token rate by 64.5%. At the shorter exact 26,024-token gate, the threshold retune improved 388.846 tok/s to 497.277 tok/s while retaining the exact tool call; the cached continuation reused 26,016 tokens and reached 927 ms TTFT. |
+| Before/after control | The earlier identical-class hf2q run required 594.575 s for 119,808 tokens (201.502 tok/s). The completion candidate reduced cold-prefill time by 46.0% and increased its token rate by 85.2%. At the shorter exact 26,024-token gate, the threshold retune improved 388.846 tok/s to 497.277 tok/s while retaining the exact tool call; the cached continuation reused 26,016 tokens and reached 927 ms TTFT. |
 | Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
 | Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate. A later OpenCode session falsified the steady-state claim when macOS killed hf2q at 108,840 MB after the shared transient arena retained cold-prefill buckets. The split-arena build releases prefill scratch before decode; the new file-backed build released 4,933,917,968 transient bytes after the 120K prefill, remained alive through its cached continuation, reported 2.0 GiB RSS, and shut down cleanly. Eagerly allocating the full 524,288-token cache beside this artifact still OOMs, so demand growth remains required. Only one 100 GiB-class runtime was resident during every comparison. |
+
+### Completion-audit performance ledger (accepted candidate, 2026-08-06)
+
+The tighter completion gate uses the reproduced 107,431,343,168-byte artifact
+with SHA-256
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d` and
+llama.cpp commit `15586e2d7165570fb3aa7c26e0d442e289ef69de`. On the first clean
+cooled three-trial matched run, llama.cpp medians were 674.458 prompt tok/s and
+31.955 decode tok/s; hf2q medians were 620.321 prompt tok/s and 33.984 decode
+tok/s. Every deterministic reasoning/answer transcript matched exactly. Decode
+passed; prefill reached 91.97% and remained an acceptance failure.
+
+The accepted lower-level candidate already generalizes batched GGML MM/MV,
+explicit token-major input strides, slotted expert-down output, and pooled
+scratch. The current completion candidate removes the remaining dense D=512
+query/output permutations: the `mlx-native` flash primitive accepts native
+token-major `[B,Q,H,D]` Q/O strides while K/V keep their existing layout. The
+16x512 and unaligned 13x517 tests are BF16 bit-exact against the former
+head-major path. On the isolated first-cool exact prompt, throughput rose from
+651.391 to 658.294 tok/s, GPU time fell by 71 ms, and transient scratch fell by
+approximately 403 MiB. This is a measured 1.06% improvement, not yet H4
+acceptance; a second identical request measured 624.892 tok/s and preserved the
+repeat-run drift under audit.
+
+Exact layer timing localized that drift to GPU execution rather than CPU graph
+encoding. On two identical 4,987-token requests, chunk GPU intervals changed
+from 2,598.870/2,923.858/1,490.944 ms to
+2,605.862/3,068.827/1,603.322 ms. Source-bound crossover accounting corrects
+the original interpretation: chunk 1 has about 512 valid compressed entries
+and uses dense flash; chunks 2 and 3 reach at least 1,024 entries and use
+gathered sparse flash. The gathered chunks grew by 5.0% and 7.5%, while the
+dense chunk was flat. Encoding and commit residuals remained small. This ruled
+out dense-path residency as the whole explanation, but the later Metal System
+Trace below supersedes the inference that gathered GPU arithmetic is the
+primary wall-clock deficit.
+
+The sparse adapter nevertheless had a separately measured gather cost. A
+packed BF16x4 gather changed the production-tile adapter from 1.449 to 0.816 ms
+and the complete sparse path from 4.106 to 3.450 ms at Q=256. Across
+Q=64/128/256/512/1,024, adapter time fell 43.7% at the production tile and
+complete sparse-path time fell about 16%. That isolated win did not survive a
+quiet same-binary full-model A/B. Packed-gather trials measured
+654.980/616.345/622.019 prompt tok/s; the fresh scalar arm measured
+644.114/621.784/624.185 prompt tok/s. All six transcripts were exact. The
+packed median, 622.019 tok/s, was slightly below the scalar median, 624.185
+tok/s, so the shader, dispatch seam, and tests were removed from the landing
+diff. An earlier 112.186 tok/s scalar sample was excluded because an unrelated
+`/opt/repo-to-cve` build and XProtect activity contaminated the host.
+
+Follow-up hypotheses measured and rejected or removed from the landing diff:
+
+- Gathering only the ratio-128 compressed-attention rows before the dense
+  projection was tested behind a fail-closed diagnostic toggle. Same-binary
+  ABBA trials produced 608.998 prompt tok/s for gather versus 616.924 for the
+  existing dense path. Gather was 1.28% slower and has been removed.
+- CPU-side `encode_layer()` work across all 43 layers and three chunks consumed
+  about 211 ms of an 8.146 s prefill, an approximately 2.6% upper bound even if
+  perfect overlap removed all of it. Layer pipelining alone therefore cannot
+  explain or close the measured 8.03% reference gap.
+- One all-layer command buffer page-faulted; naive asynchronous scratch reuse
+  page-faulted; duplicated full scratch arenas exhausted memory. A corrected
+  host/GPU lifetime split proved safe graph submission. It did not remove the
+  separate repeat-run residency decay, but the later heartbeat RCA cleared
+  that confounder. The unsafe arena variants were removed; the dependency-
+  reordered, retained-reference path is accepted at depth four below.
+- Retaining at most 5 GiB of prefill scratch between requests did not remove
+  the slowdown. Two exact trials measured 614.184 and 593.865 prompt tok/s
+  while retaining 3,938,691,698 bytes and leaving only 13% free memory. The
+  diagnostic was rejected and removed because it reduced safety margin without
+  improving throughput.
+- Lowering the ratio-four gathered-sparse crossover from 1,024 to 512
+  compressed entries preserved the exact 1-through-64 transcript, but the
+  first clean 4,987-token trial measured only 593.882 prompt tok/s and 33.856
+  decode tok/s. This was below the predeclared 648 prompt-tok/s immediate
+  rejection floor. The threshold and its diagnostic logging were restored to
+  the accepted default after the single falsification run.
+- A Q2_K/top-six tensor-API gate/up fusion reused the routed map and input tile
+  while retaining separate F32 outputs for DeepSeek's exact asymmetric-clamp
+  activation. Full-tile and alignment-tail tests were bit-identical to two
+  production tensor `mm_id` projections. At a production-width synthetic M5
+  shape (256 tokens, 32 resident experts, N=2,048, K=4,096), however, the
+  current two-pass median was 2.339 ms and the fused median was 3.078 ms
+  (0.760x). Two live cooperative accumulators reduced occupancy more than
+  shared staging saved. The kernel, dispatcher, and tests were removed.
+- Reducing the production packed D512 flash kernel from eight simdgroups to
+  four preserved BF16 bit identity against the existing one-head-per-tile
+  reference. It was nevertheless about 2x slower across Q=64 through Q=1,024;
+  at Q=256 and a 640-entry attention width, NSG=4 measured 5.512 ms versus
+  2.669 ms for NSG=8. The explicit-NSG spike was removed and the llama-derived
+  NSG=8 geometry remains authoritative.
+- Keeping every 2,048-token transaction on dense masked flash matched the
+  exact 1-through-64 transcript with zero cached tokens, but reached only
+  615.146 prompt tok/s and 33.865 decode tok/s. That missed the predeclared
+  624.185 prompt-tok/s scalar floor and the 674.458 llama.cpp median. The
+  all-dense route was rejected; one final mixed-route spike isolates chunk 2
+  before closing this routing hypothesis.
+- Routing chunk 2 through dense flash while leaving chunk 3 gathered produced
+  three exact, zero-cache-credit trials at 625.484/625.724/625.436 prompt
+  tok/s and 33.855/33.886/33.898 decode tok/s. The 625.484 median was only
+  0.21% above the clean 624.185 scalar median and remained 7.26% below the
+  674.458 llama.cpp prompt median. That noise-sized short-shape result does
+  not justify changing long-context routing, so the 1,024-entry crossover was
+  restored and the routing hypothesis is closed.
+- A packed F16 heads-as-rows variant was bit-identical to the existing F16
+  one-head-per-tile reference, but it did not outperform packed BF16. At
+  Q=256 and width 640 they measured 2.667 and 2.664 ms; across Q=64 through
+  Q=1,024 the F16/BF16 speed ratio stayed between 0.98x and 1.01x. The F16
+  dispatcher extension and benchmark wiring were removed rather than add a
+  conversion and model-quality risk without a speed result.
+- Doubling the gathered sparse query tile from 256 to 512 rows preserved the
+  exact transcript and produced a 658.512 prompt-tok/s first long request, but
+  the two cooled follow-ups fell to 623.076 and 623.007 tok/s. The 623.076
+  median missed the 630 tok/s acceptance floor and did not justify another
+  160 MiB of transient gathered KV. The 256-row tile was restored.
+- Tightening mlx-native's dependency ranges from the entire parent Metal
+  allocation to each slice's exact logical byte window passed new disjoint-
+  sibling and overlapping-sibling tracker tests, plus the existing D512
+  bit-identity gate. It did not improve the exact full-model workload. The
+  old-range arm measured 647.074/643.362/588.671 prompt tok/s; the exact-range
+  arm measured 653.990/632.829/607.175 tok/s. All six transcripts were exact,
+  both arms reported 385 GPU synchronizations and 302,850 dispatches per
+  trial, and the exact-range median was 1.64% lower. Arm-order sustained-load
+  drift was larger than the candidate delta, so this cannot support a speed
+  claim. The range spike was removed from the landing diff; any future
+  correctness cleanup must be justified independently of DeepSeek H4.
+- Raising the matrix transaction from 16 to 20 physical windows changed the
+  exact 4,987-token prompt from 2,048/2,048/883 rows to 2,560/2,427. This
+  safely reduced GPU synchronizations from 385 to 342 and dispatches from
+  302,850 to 300,076, while preserving all six exact transcripts. It did not
+  improve sustained throughput: the 2,048-row arm measured
+  653.593/645.593/613.829 prompt tok/s, while the 2,560-row arm measured
+  659.968/602.231/570.344. The wider first run was followed by a much steeper
+  sustained-load collapse, and its 602.231 median was 6.72% below the
+  2,048-row median. The default remains 2,048; fewer command buffers are not a
+  win when the larger Metal workload drives worse steady-state behavior.
+- Source verification closed the proposed activation-quant bypass. DeepSeek's
+  official `inference/model.py` at verified revision `2b2bebc` explicitly
+  applies block-64 FP8 simulation to every main non-RoPE KV row to match QAT,
+  and applies normalized Hadamard rotation plus block-32 FP4 simulation to the
+  lightning-indexer query and compressed KV. llama.cpp's pinned DeepSeek-V4
+  graph visibly applies the Hadamard transforms but has no equivalent runtime
+  fake-quant operation. hf2q must retain the official arithmetic; removing it
+  merely to win a benchmark would violate the coherence-first contract.
+- The prompt cache planner stated that a matrix transaction retains only its
+  final physical 128-row window, but the encoder passed all 2,048 rows to one
+  parallel circular-copy dispatch. Sixteen source rows consequently targeted
+  each cache slot without an ordering guarantee. The accepted correction adds
+  explicit `window_source_start` and `window_write_count` bounds and copies
+  only the newest non-overlapping suffix. A 2,048-row hosted test proves the
+  exact 1,920-row skip and 128-row write. On the real 4,987-token oracle, the
+  pre-fix arm measured 657.377/641.241/592.672 prompt tok/s and the bounded
+  arm measured 657.211/629.829/600.777; all six transcripts were exact. This
+  lands as a cache-correctness fix, not as a throughput claim.
+- A follow-up Metal spike fused KV tail RoPE, required MXFP8 simulation, and
+  the bounded cache write. A 137-row wrapped-cache test was BF16 bit-identical
+  to the three-operation chain, and the production path reduced reported GPU
+  dispatches from 302,850 to 290,982. It nevertheless made sustained prefill
+  worse: the bounded control measured 658.091/640.947/607.926 prompt tok/s,
+  while fusion measured 655.515/603.950/575.113. The fused median regressed
+  5.77%; decode improved only from 33.928 to 34.167 tok/s at the median. The
+  kernel, dispatcher, and model wiring were removed. This is further evidence
+  that reducing dispatch count by making each M5 workload denser can worsen
+  sustained prefill.
+
+#### Metal System Trace and fresh-buffer initialization RCA
+
+A sanitized Metal System Trace of the exact 4,987-token request changed the
+working hypothesis from slower GPU arithmetic to poorer host/submission
+continuity. During prefill, pinned llama.cpp occupied 6.982789 seconds of a
+7.496751-second GPU submission span: 0.513962 seconds idle and 93.14% union
+utilization. hf2q occupied only 6.869377 seconds of a 7.757780-second span:
+0.888403 seconds idle and 88.55% utilization. hf2q therefore completed about
+113.4 ms less GPU work but accumulated about 374.4 ms more idle time, producing
+the observed approximately 261.0 ms wall-clock loss. Decode showed the
+opposite shape: llama.cpp occupied 4.033765 of 5.113851 seconds (78.88%), while
+hf2q occupied 3.637267 of 3.822293 seconds (95.16%). The checked-in
+`aggregate_decode_mst.py` reports clipped phase windows, union busy time,
+overlap, idle time, utilization, and gap distributions; its units are GPU
+submissions, not an invented kernel-dispatch count.
+
+The trace also established an operator-security rule. `xctrace` can attach the
+target process environment to raw trace metadata, including inherited
+credentials. Trace-launched servers now receive a minimal `env -i`
+environment, the trace trial must be last so the model unloads before trace
+packaging, and retained evidence contains only the four required GPU-schema
+XML exports after a credential-pattern scan. Raw trace bundles and raw TOC
+dumps are not retained or printed.
+
+Per-layer timing separated host encoding from GPU waits. Across the three
+prefill chunks, all 129 layer encodes consumed 217.609 ms in total; the first
+chunk's layer 0 accounted for 132.221 ms of first-shape setup. GPU waits were
+2,618.319, 2,937.359, and 1,506.513 ms, while all pool resets together were
+under 0.23 ms. The synchronous 64-row startup warmup does not establish the
+2,048-row, multi-gigabyte transient high-water. Existing deeper command-buffer
+pipeline experiments nevertheless remain rejected because they failed
+sustained-load or memory-safety gates; this trace does not revive them without
+a different lifetime design.
+
+The sanitized encoder list makes that submission difference structural rather
+than speculative. hf2q used 129 compute encoders for prefill, exactly three
+2,048/2,048/891-row chunks times 43 layers. Pinned llama.cpp used six compute
+encoders over the same prompt, two per chunk, before its output work began.
+The runtimes therefore do not merely choose different kernel shapes: hf2q
+forces 43 CPU/GPU rendezvous points per chunk while llama.cpp lifetime-plans a
+whole chunk graph and partitions it into two command buffers.
+
+Hoisting hf2q's two reusable full-state buffers cannot close that gap. A
+temporary allocation-timing build measured the six chunk-local allocations at
+5.654/5.603, 7.612/6.224, and 2.886/3.116 ms, about 31.1 ms total in a
+7.991-second exact-output prefill. The instrumentation was removed after the
+measurement. Reusing maximum-sized state buffers across chunks therefore has
+only an approximately 0.4% upper bound and is not the next implementation
+target.
+
+The accepted submission design differs from the rejected naive pipelines.
+DeepSeek's transient arena mixes GPU-produced scratch with CPU-written RMS
+parameters, positions, frequencies, attention indices, validity flags, and MoE
+token IDs. Resetting and reissuing that mixed arena while a command buffer is
+pending can overwrite inputs before the GPU reads them; retaining a complete
+arena per in-flight layer reproduces the prior multi-gigabyte OOM. The safe
+graph path gives CPU-written inputs a submission-lifetime arena, reuses only
+hostile-fill-proven GPU scratch between layers, preserves retained buffer
+references, reorders the dependency graph before commit, and inserts explicit
+layer barriers inside one ordered command buffer.
+
+The first depth-two gate proved the lifetime mechanism but rejected shallow
+grouping as a performance result. Three exact, zero-cache-credit trials
+measured 669.898/631.328/633.317 prompt tok/s and
+33.895/33.892/33.867 decode tok/s. The 633.317 prompt median is only 0.07%
+above the accepted 632.861 baseline, while GPU synchronizations fell from 385
+to 322 and dispatches stayed at 302,850. The server released 3,936,241,088
+bytes of prefill scratch, remained alive with no throttled pages, and shut down
+cleanly. Therefore reducing one rendezvous per adjacent layer pair is not by
+itself the missing speedup. Deeper groups remain a separate falsification of
+whether the observed idle is amortized only at chunk scale; they must reuse
+the same bounded scratch design and stop immediately on any command-buffer or
+memory fault.
+
+Depth four preserved exact output and bounded memory while reducing total
+synchronizations to 289. A later same-candidate consecutive set measured
+677.684/638.907/640.949 prompt tok/s and a 33.900 decode median. The repeat-run
+stall later proved to be Metal residency preparation rather than grouping, so
+that decayed median cannot reject the safe graph path. Depth 43 reduced
+synchronizations further to 259 but its exact first trial reached 677.373
+prompt tok/s and 33.890 decode tok/s, no improvement over depth four's exact
+677.096 safety trial. Four layers per command buffer is therefore the accepted
+default: it removes 96 layer rendezvous from the three-chunk prompt without the
+lifetime and command-buffer risk of an all-layer submission. The graph reorder
+and retained-reference checks fail closed; incompatible layer-timing or dump
+diagnostics fall back to one layer.
+
+Two-request stage profiling then separated arithmetic from residency idle.
+With the profiler enabled, total prefill wall time grew by about 456 ms between
+the identical requests. Summed GPU intervals were nevertheless stable:
+gate/up changed -0.238 ms, expert/shared down -0.691 ms, ratio-four sparse
+attention -0.600 ms, ratio-four cache/indexer +0.659 ms, and the remaining
+named buckets changed by roughly one millisecond or less. This instrumentation
+adds many synchronization points and is not a throughput benchmark, but it
+falsifies a thermal slowdown inside a specific MoE, attention, or indexer
+kernel as the explanation for the residual wall-time drift.
+
+Source comparison exposed a residency-preparation difference below hf2q's
+model graph. Pinned llama.cpp commits each Metal residency set, immediately
+calls `requestResidency`, and refreshes active sets from a five-millisecond
+keep-alive loop. `mlx-native` commits pending membership and attaches its set
+to the command queue but has no `requestResidency` call. Apple's API contract
+says that `requestResidency` asks Metal to perform preparatory residency work
+and should ideally run after the set commit, well before a consuming command
+buffer. This is an optimization gap, not an inference-correctness defect.
+
+The first gated implementation requested residency synchronously before every
+bounded prompt chunk. A quiet same-binary A/B measured the untreated control at
+668.235/630.826/625.513 prompt tok/s and the candidate at
+669.034/630.801/632.584 prompt tok/s. All six transcripts were exact, but the
+0.28% median change was noise-sized; per-chunk preparation was removed.
+
+Lower-level timing then isolated the repeat-run loss. On the first long
+request, the first 4,096-token chunk spent 2,676.927 ms wall time and
+2,591.656 ms GPU time, leaving 85.271 ms outside GPU execution. On the next
+request, the same chunk spent 3,092.863 ms wall time and 2,573.018 ms GPU time,
+leaving 519.845 ms outside GPU execution even though the GPU work was faster.
+Inside the first reordered layer group, command-buffer wall time grew from
+225.642 to 706.790 ms while GPU time changed from 225.327 to 233.018 ms: the
+pre-GPU residual grew from 0.315 to 473.772 ms. The same request made three
+fresh pool allocations totaling 3,918,088,192 bytes in 2.301 ms, and retaining
+the complete 3.96 GiB scratch high-water still left a 426.565 ms first-group
+residual. Disabling residency sets also preserved the collapse. These spikes
+falsify Rust allocation, scratch lifetime, kernel arithmetic, and residency-set
+membership as the cause; Metal was preparing the inactive weight resources at
+the first consuming command buffer.
+
+Pinned llama.cpp supplies the missing lifecycle contract. Its Metal backend
+refreshes active residency sets every five milliseconds and keeps that work
+alive for three minutes after graph execution. The accepted `mlx-native`
+boundary now owns the same family-neutral policy: each live residency set has
+a weak-owned background heartbeat, every command-buffer commit refreshes a
+180-second counter, and the heartbeat serializes `requestResidency` with
+membership mutation. The thread exits after the final residency-set owner is
+dropped. `MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS=0` disables the policy for a
+controlled diagnostic; invalid or absent values use 180 seconds. No
+DeepSeek-specific runtime call or product fallback is involved.
+
+The two-request spike returned exact transcripts at 677.673 and 675.923 prompt
+tok/s. The second request's first-group pre-GPU residual fell from 473.772 to
+2.487 ms while its 4.59 GiB transient prefill scratch was still released before
+decode. Focused residency and graph tests passed before the full gate.
+
+Fresh-allocation profiling then found 77 pooled allocations requesting
+3,635,345,664 bytes and spending 182.287 ms in CPU allocation/clearing. An
+eight-thread clearing spike preserved exact output but measured
+654.977/622.899/623.142 prompt tok/s versus the zeroed control's
+660.326/623.350/624.618; its median was 0.24% slower and the spike was removed.
+A diagnostic that skipped fresh clearing measured
+669.223/633.288/632.911 prompt tok/s, a 1.39% median gain, establishing a real
+but bounded opportunity.
+
+Coherence was proved before making that behavior explicit. The zero-filled
+control and a hostile `0xA5` fresh-fill candidate each dumped every prefill
+chunk and decode step for artifact
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`.
+All 11,954 files and the final transcript were byte-identical. This matches the
+pool's existing contract: reused buffers are not cleared between arena cycles,
+so DeepSeek's transient graph already must fully produce every consumed byte.
+
+The accepted boundary is therefore an explicit `mlx-native`
+`MlxBufferPool::alloc_uninitialized` operation. Default `alloc` and
+`alloc_batch` keep zero-on-fresh behavior; only hf2q's DeepSeek-V4 prefill and
+decode transient arenas opt in. Qwen, Gemma, persistent allocations, and
+inactive DeepSeek allocation paths are unchanged until they have equivalent
+whole-graph producer-coverage proof. Focused allocator tests and all 94 hosted
+DeepSeek tests passed. The real release build returned the exact transcript in
+three zero-cache trials at 670.921/632.703/632.861 prompt tok/s and
+33.888/33.889/33.891 decode tok/s. The 632.861 prompt median is 1.32% above the
+matched 624.618 zero-filled control; decode is unchanged. The diagnostic
+environment switches were removed. This gain is accepted, but it does not
+close H4 because the pinned llama.cpp prefill median remains higher.
+
+The earlier attribution to ordinary sustained-load GPU DVFS is rejected by the
+GPU-interval and first-group measurements above. The final clean-registry
+paired gate used the same artifact, 4,987-token prompt, greedy
+temperature-zero/seed-42 settings, exact transcript oracle, zero prompt-cache
+credit, and 60-second gaps before and between three trials. Pinned llama.cpp
+commit `15586e2d7165570fb3aa7c26e0d442e289ef69de` measured
+673.497/672.744/674.711 prompt tok/s and
+31.810/31.855/31.821 decode tok/s. The hf2q build pinned to the verified
+`mlx-native` 0.10.3 registry archive measured
+674.026/674.785/676.812 prompt tok/s and
+34.054/33.885/33.958 decode tok/s. Every transcript was exact; hf2q therefore
+passed this cold-prefix gate at 1.0019x llama.cpp prefill and 1.0672x decode.
+The complete source-bound receipt is retained under
+`hf2q-deepseek-parity.XXXXXX.1PXRWahgxc`; it records artifact, binary, hf2q
+patch, the clean mlx-native source state, and implementation hashes.
+
+The parity harness now cools between measured trials as well as before and
+between runtime arms. External source reviews, including Kimi and Claude,
+supply testable hypotheses only; source inspection plus exact hf2q
+measurements decide whether a change lands. Packed gather, scratch retention,
+and the 512-entry sparse crossover are failed experiments and are not present
+in the landing code. The accepted mlx-native changes were published as 0.10.3,
+hf2q is pinned to its verified registry checksum, and locked check, release
+build, and full hosted-safe tests passed after removing the local path patch.
 
 The performance result comes from two measured defaults. Decode groups two
 verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two

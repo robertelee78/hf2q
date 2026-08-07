@@ -6,7 +6,13 @@ use super::{CacheError, Deepseek4Cache};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayerCacheSpan {
     pub layer_index: usize,
+    /// First row in the prompt transaction that must be persisted. When a
+    /// transaction is wider than the circular window, older rows are useful
+    /// to the current attention calculation but must not race newer rows for
+    /// the same physical cache slots.
+    pub window_source_start: usize,
     pub window_write_start: usize,
+    pub window_write_count: usize,
     pub window_valid_after: usize,
     pub compressed_write_start: usize,
     pub compressed_count: usize,
@@ -53,6 +59,9 @@ impl Deepseek4Cache {
             .iter()
             .map(|layer| {
                 let ratio = layer.compress_ratio as usize;
+                let window_capacity = layer.window_kv.shape[0];
+                let window_write_count = token_count.min(window_capacity);
+                let window_source_start = token_count - window_write_count;
                 let compressed_before = if ratio == 0 {
                     0
                 } else {
@@ -65,8 +74,11 @@ impl Deepseek4Cache {
                     usize::from(layer.compress_ratio == 4) * compressed_valid_after;
                 LayerCacheSpan {
                     layer_index: layer.layer_index,
-                    window_write_start: self.next_position % layer.window_kv.shape[0],
-                    window_valid_after: end.min(layer.window_kv.shape[0]),
+                    window_source_start,
+                    window_write_start: (self.next_position + window_source_start)
+                        % window_capacity,
+                    window_write_count,
+                    window_valid_after: end.min(window_capacity),
                     compressed_write_start: compressed_before,
                     compressed_count,
                     compressed_valid_after,
