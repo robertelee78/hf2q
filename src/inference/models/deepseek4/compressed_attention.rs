@@ -28,7 +28,7 @@ use super::compressed_attention_common::{
 use super::compressed_attention_indexer::{encode_ratio_four_indexer, RatioFourIndexerArena};
 use super::compressed_attention_main::{encode_main_compressor, MainCompressorArena};
 use super::compressed_attention_weights::CompressedAttentionWeightsRef;
-use super::forward_support::alloc;
+use super::forward_support::{alloc, alloc_host_input};
 use super::prefill_flash_attention::{
     encode_deepseek_flash_prefill, encode_deepseek_sparse_flash_prefill, DeepseekPrefillFlashArena,
     DeepseekSparsePrefillFlashArena,
@@ -77,14 +77,14 @@ impl SparseFlashDecodeArena {
             vec![1, top_k],
             "compressed gathered flash mask",
         )?;
-        let mut invalid_global = alloc(
+        let mut invalid_global = alloc_host_input(
             device,
             DType::U32,
             vec![1],
             "compressed gathered flash global validity",
         )?;
         invalid_global.as_logical_mut_slice::<u32>()?.fill(0);
-        let mut invalid_heads = alloc(
+        let mut invalid_heads = alloc_host_input(
             device,
             DType::U32,
             vec![DEEPSEEK_SPARSE_HEADS],
@@ -294,7 +294,8 @@ impl Deepseek4Model {
                 )
             })
             .transpose()?;
-        let mut positions = alloc(&device, DType::U32, vec![rows], "compressed positions")?;
+        let mut positions =
+            alloc_host_input(&device, DType::U32, vec![rows], "compressed positions")?;
         for (offset, position) in positions
             .as_logical_mut_slice::<u32>()?
             .iter_mut()
@@ -303,7 +304,7 @@ impl Deepseek4Model {
             *position = u32::try_from(start_position + offset)
                 .context("DeepSeek-V4 compressed position exceeds u32")?;
         }
-        let mut compressed_positions = alloc(
+        let mut compressed_positions = alloc_host_input(
             &device,
             DType::U32,
             vec![compressed_count.max(1)],
@@ -333,7 +334,7 @@ impl Deepseek4Model {
             self.cfg.yarn_beta_fast,
             self.cfg.yarn_beta_slow,
         )?;
-        let mut frequency_buffer = alloc(
+        let mut frequency_buffer = alloc_host_input(
             &device,
             DType::F32,
             vec![frequencies.len()],
@@ -400,7 +401,7 @@ impl Deepseek4Model {
                     plan.indexer_output_offset,
                 )
             };
-        let mut indices = alloc(
+        let mut indices = alloc_host_input(
             &device,
             DType::I32,
             vec![1, rows, storage_stride],
@@ -420,13 +421,7 @@ impl Deepseek4Model {
             use_matrix_prefill && use_gathered_sparse_prefill(ratio, valid_compressed);
         let prefill_flash = (use_matrix_prefill && !use_sparse_prefill_flash)
             .then(|| {
-                DeepseekPrefillFlashArena::new(
-                    &device,
-                    rows,
-                    heads,
-                    head_dim,
-                    compact_prefill_kv_len,
-                )
+                DeepseekPrefillFlashArena::new(&device, rows, head_dim, compact_prefill_kv_len)
             })
             .transpose()?;
         let sparse_prefill_flash = use_sparse_prefill_flash
@@ -513,7 +508,18 @@ impl Deepseek4Model {
                     block_size: 64,
                 },
             )?;
-            let kv_cache_input = &kv_rope;
+
+            let window_source_start = layer_span.map(|span| span.window_source_start).unwrap_or(0);
+            let window_write_count = layer_span
+                .map(|span| span.window_write_count)
+                .unwrap_or(rows);
+            let window_cache_view = (window_source_start > 0).then(|| {
+                kv_rope.slice_view(
+                    (window_source_start * head_dim * DType::BF16.size_of()) as u64,
+                    window_write_count * head_dim,
+                )
+            });
+            let window_cache_input = window_cache_view.as_ref().unwrap_or(&kv_rope);
             if let Some(prefix) = raw_prefix.as_ref() {
                 session.barrier_between(&[&layer_cache.window_kv], &[prefix]);
                 dispatch_kv_cache_copy(
@@ -529,7 +535,7 @@ impl Deepseek4Model {
                     false,
                 )?;
             }
-            let mut window_write_inputs = vec![kv_cache_input];
+            let mut window_write_inputs = vec![window_cache_input];
             if let Some(prefix) = raw_prefix.as_ref() {
                 window_write_inputs.push(prefix);
             }
@@ -538,15 +544,18 @@ impl Deepseek4Model {
                 session.encoder_mut(),
                 registry,
                 device.metal_device(),
-                kv_cache_input,
+                window_cache_input,
                 &layer_cache.window_kv,
-                layer_span
-                    .map(|span| span.window_write_start)
-                    .or_else(|| layer_step.map(|step| step.window_write_slot))
-                    .context("DeepSeek-V4 compressed window write slot is missing")?
-                    as u32,
+                u32::try_from(
+                    layer_span
+                        .map(|span| span.window_write_start)
+                        .or_else(|| layer_step.map(|step| step.window_write_slot))
+                        .context("DeepSeek-V4 compressed window write slot is missing")?,
+                )
+                .context("DeepSeek-V4 compressed window write slot exceeds u32")?,
                 head_dim as u32,
-                rows as u32,
+                u32::try_from(window_write_count)
+                    .context("DeepSeek-V4 compressed window write count exceeds u32")?,
                 window_capacity as u32,
                 true,
             )?;

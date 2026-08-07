@@ -16,7 +16,8 @@ use mlx_native::ops::deepseek_moe_routing::{
 use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 
 use super::forward_support::{
-    alloc, alloc_persistent, expert_matmul, raw_matmul, rms_params, ExpertMatmulRoute,
+    alloc, alloc_host_input, alloc_persistent, expert_matmul, raw_matmul, rms_params,
+    ExpertMatmulRoute,
 };
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
@@ -217,7 +218,8 @@ impl Deepseek4Model {
         };
         let hc_params = rms_params(&device, self.cfg.rms_norm_eps, hc_hidden, "FFN HC params")?;
         let hidden_params = rms_params(&device, self.cfg.rms_norm_eps, hidden, "FFN norm params")?;
-        let mut routing_token_ids = alloc(&device, DType::I32, vec![rows], "MoE token IDs")?;
+        let mut routing_token_ids =
+            alloc_host_input(&device, DType::I32, vec![rows], "MoE token IDs")?;
         for (destination, &token_id) in routing_token_ids
             .as_logical_mut_slice::<i32>()?
             .iter_mut()

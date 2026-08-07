@@ -39,6 +39,11 @@ thread_local! {
     // session. Separate arenas let serving release prefill scratch after TTFT
     // while preserving the small steady-state decode working set.
     static PREFILL_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+    // Multi-layer recorded prefill may recycle GPU-only scratch between
+    // layers, but CPU-written parameters must remain unique until the grouped
+    // command buffer completes.
+    static PREFILL_SUBMISSION_INPUT_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+    static PREFILL_SUBMISSION_INPUTS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static DECODE_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
     static TRANSIENT_POOL_PHASE: Cell<TransientPoolPhase> = const { Cell::new(TransientPoolPhase::Inactive) };
 }
@@ -49,6 +54,31 @@ pub(super) fn begin_prefill_pool_layer() {
 
 pub(super) fn end_prefill_pool_layer() {
     end_transient_pool_cycle(TransientPoolPhase::Prefill);
+}
+
+pub(super) fn begin_prefill_submission_inputs() {
+    debug_assert_eq!(
+        TRANSIENT_POOL_PHASE.with(Cell::get),
+        TransientPoolPhase::Inactive,
+        "DeepSeek-V4 prefill submission inputs must begin between layer cycles"
+    );
+    PREFILL_SUBMISSION_INPUTS_ACTIVE.with(|active| {
+        debug_assert!(!active.get(), "nested DeepSeek-V4 prefill input submission");
+        active.set(true);
+    });
+}
+
+pub(super) fn end_prefill_submission_inputs() {
+    debug_assert_eq!(
+        TRANSIENT_POOL_PHASE.with(Cell::get),
+        TransientPoolPhase::Inactive,
+        "DeepSeek-V4 prefill submission inputs must end between layer cycles"
+    );
+    PREFILL_SUBMISSION_INPUTS_ACTIVE.with(|active| {
+        debug_assert!(active.get(), "inactive DeepSeek-V4 prefill input submission");
+        active.set(false);
+    });
+    PREFILL_SUBMISSION_INPUT_POOL.with(|pool| pool.borrow_mut().reset());
 }
 
 pub(super) fn begin_decode_pool_token() {
@@ -94,6 +124,13 @@ fn pool_stats(pool: &RefCell<MlxBufferPool>) -> TransientScratchStats {
     }
 }
 
+fn add_stats(left: TransientScratchStats, right: TransientScratchStats) -> TransientScratchStats {
+    TransientScratchStats {
+        free_buffers: left.free_buffers.saturating_add(right.free_buffers),
+        free_bytes: left.free_bytes.saturating_add(right.free_bytes),
+    }
+}
+
 fn release_pool(pool: &RefCell<MlxBufferPool>) -> TransientScratchStats {
     let mut pool = pool.borrow_mut();
     debug_assert_eq!(
@@ -110,7 +147,10 @@ fn release_pool(pool: &RefCell<MlxBufferPool>) -> TransientScratchStats {
 }
 
 pub(crate) fn prefill_scratch_stats() -> TransientScratchStats {
-    PREFILL_POOL.with(pool_stats)
+    add_stats(
+        PREFILL_POOL.with(pool_stats),
+        PREFILL_SUBMISSION_INPUT_POOL.with(pool_stats),
+    )
 }
 
 pub(crate) fn decode_scratch_stats() -> TransientScratchStats {
@@ -123,7 +163,14 @@ pub(crate) fn release_prefill_scratch() -> TransientScratchStats {
         TransientPoolPhase::Inactive,
         "cannot release DeepSeek-V4 prefill scratch during a graph"
     );
-    PREFILL_POOL.with(release_pool)
+    debug_assert!(
+        !PREFILL_SUBMISSION_INPUTS_ACTIVE.with(Cell::get),
+        "cannot release active DeepSeek-V4 prefill submission inputs"
+    );
+    add_stats(
+        PREFILL_POOL.with(release_pool),
+        PREFILL_SUBMISSION_INPUT_POOL.with(release_pool),
+    )
 }
 
 pub(crate) fn release_decode_scratch() -> TransientScratchStats {
@@ -148,17 +195,58 @@ pub(super) fn alloc(
     let bytes = elements
         .checked_mul(dtype.size_of())
         .with_context(|| format!("DeepSeek-V4 {label} byte size overflow"))?;
+    // DeepSeek-V4 transient graph outputs fully cover these buffers before
+    // any consumer reads them. ADR-042 records the hostile-fill proof: all
+    // 11,954 prefill/decode state dumps were byte-identical for artifact
+    // 936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d.
+    // Keep this opt-in at the family boundary; other model families retain
+    // mlx-native's zero-on-fresh default until they have equivalent proof.
     match TRANSIENT_POOL_PHASE.with(Cell::get) {
         TransientPoolPhase::Prefill => PREFILL_POOL
-            .with(|pool| pool.borrow_mut().alloc(device, bytes, dtype, shape))
+            .with(|pool| {
+                pool.borrow_mut()
+                    .alloc_uninitialized(device, bytes, dtype, shape)
+            })
             .with_context(|| format!("allocate pooled DeepSeek-V4 prefill {label}")),
         TransientPoolPhase::Decode => DECODE_POOL
-            .with(|pool| pool.borrow_mut().alloc(device, bytes, dtype, shape))
+            .with(|pool| {
+                pool.borrow_mut()
+                    .alloc_uninitialized(device, bytes, dtype, shape)
+            })
             .with_context(|| format!("allocate pooled DeepSeek-V4 decode {label}")),
         TransientPoolPhase::Inactive => device
             .alloc_buffer(bytes, dtype, shape)
             .with_context(|| format!("allocate DeepSeek-V4 {label}")),
     }
+}
+
+pub(super) fn alloc_host_input(
+    device: &MlxDevice,
+    dtype: DType,
+    shape: Vec<usize>,
+    label: &str,
+) -> Result<MlxBuffer> {
+    if !PREFILL_SUBMISSION_INPUTS_ACTIVE.with(Cell::get) {
+        return alloc(device, dtype, shape, label);
+    }
+    debug_assert_eq!(
+        TRANSIENT_POOL_PHASE.with(Cell::get),
+        TransientPoolPhase::Prefill,
+        "DeepSeek-V4 grouped prefill input allocated outside a layer cycle"
+    );
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+        .with_context(|| format!("DeepSeek-V4 {label} shape overflow"))?;
+    let bytes = elements
+        .checked_mul(dtype.size_of())
+        .with_context(|| format!("DeepSeek-V4 {label} byte size overflow"))?;
+    PREFILL_SUBMISSION_INPUT_POOL
+        .with(|pool| {
+            pool.borrow_mut()
+                .alloc_uninitialized(device, bytes, dtype, shape)
+        })
+        .with_context(|| format!("allocate pooled DeepSeek-V4 prefill input {label}"))
 }
 
 pub(super) fn alloc_persistent(
@@ -185,7 +273,7 @@ pub(super) fn rms_params(
     dim: usize,
     label: &str,
 ) -> Result<MlxBuffer> {
-    let mut params = alloc(device, DType::F32, vec![2], label)?;
+    let mut params = alloc_host_input(device, DType::F32, vec![2], label)?;
     params
         .as_logical_mut_slice::<f32>()?
         .copy_from_slice(&[epsilon, dim as f32]);
@@ -719,6 +807,48 @@ mod tests {
         end_decode_pool_token();
 
         assert_eq!(second_ptr, first_ptr);
+    }
+
+    #[test]
+    fn grouped_prefill_keeps_host_inputs_unique_while_recycling_gpu_scratch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        release_prefill_scratch();
+
+        begin_prefill_submission_inputs();
+        begin_prefill_pool_layer();
+        let first_input =
+            alloc_host_input(&device, DType::U32, vec![257], "first grouped input").unwrap();
+        let first_input_ptr = first_input.contents_ptr();
+        let first_scratch = alloc(&device, DType::F32, vec![257], "first grouped scratch").unwrap();
+        let first_scratch_ptr = first_scratch.contents_ptr();
+        drop((first_input, first_scratch));
+        end_prefill_pool_layer();
+
+        begin_prefill_pool_layer();
+        let second_input =
+            alloc_host_input(&device, DType::U32, vec![257], "second grouped input").unwrap();
+        let second_input_ptr = second_input.contents_ptr();
+        let second_scratch =
+            alloc(&device, DType::F32, vec![257], "second grouped scratch").unwrap();
+        let second_scratch_ptr = second_scratch.contents_ptr();
+        drop((second_input, second_scratch));
+        end_prefill_pool_layer();
+
+        assert_ne!(second_input_ptr, first_input_ptr);
+        assert_eq!(second_scratch_ptr, first_scratch_ptr);
+        end_prefill_submission_inputs();
+
+        begin_prefill_submission_inputs();
+        begin_prefill_pool_layer();
+        let reused_input =
+            alloc_host_input(&device, DType::U32, vec![257], "reused grouped input").unwrap();
+        assert_eq!(reused_input.contents_ptr(), second_input_ptr);
+        drop(reused_input);
+        end_prefill_pool_layer();
+        end_prefill_submission_inputs();
+        release_prefill_scratch();
     }
 
     #[test]

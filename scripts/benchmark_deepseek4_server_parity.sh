@@ -24,6 +24,7 @@ LLAMA_SERVER_BIN=${LLAMA_SERVER_BIN:-/opt/llama.cpp/build/bin/llama-server}
 LLAMA_CPP_DIR=${LLAMA_CPP_DIR:-/opt/llama.cpp}
 LLAMA_CPP_COMMIT=${LLAMA_CPP_COMMIT:-15586e2d7165570fb3aa7c26e0d442e289ef69de}
 MLX_NATIVE_COMMIT=${MLX_NATIVE_COMMIT:-}
+MLX_NATIVE_DIR=${MLX_NATIVE_DIR:-/opt/mlx-native}
 MODEL_ID=${MODEL_ID:-Deepseek v4 Flash 0731 Source}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-18080}
@@ -37,9 +38,14 @@ TRIAL_COOLDOWN_SECONDS=${TRIAL_COOLDOWN_SECONDS:-60}
 MAX_CACHE_CREDIT=${MAX_CACHE_CREDIT:-32}
 MAX_PROMPT_TOKEN_DELTA=${MAX_PROMPT_TOKEN_DELTA:-2}
 OUTPUT_DIR=${OUTPUT_DIR:-$(mktemp -d -t hf2q-deepseek-parity.XXXXXX)}
+METAL_TRACE_TRIAL=${METAL_TRACE_TRIAL:-0}
+METAL_TRACE_SECONDS=${METAL_TRACE_SECONDS:-20}
+HF2Q_DEEPSEEK_GRAPH_REORDER=${HF2Q_DEEPSEEK_GRAPH_REORDER:-1}
+HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB=${HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB:-4}
+MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS=${MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS:-180}
 
 for command in awk cat curl date dirname git grep jq kill lsof mkdir mktemp \
-  pgrep sed shasum sleep stat; do
+  env pgrep sed shasum sleep stat; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -47,7 +53,10 @@ for command in awk cat curl date dirname git grep jq kill lsof mkdir mktemp \
 done
 for setting in PORT CONTEXT_LEN RUNS MAX_TOKENS CONTEXT_CHARS \
   INITIAL_COOLDOWN_SECONDS COOLDOWN_SECONDS MAX_CACHE_CREDIT \
-  TRIAL_COOLDOWN_SECONDS MAX_PROMPT_TOKEN_DELTA; do
+  TRIAL_COOLDOWN_SECONDS MAX_PROMPT_TOKEN_DELTA METAL_TRACE_TRIAL \
+  METAL_TRACE_SECONDS HF2Q_DEEPSEEK_GRAPH_REORDER \
+  HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB \
+  MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS; do
     value=${!setting}
     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
         echo "$setting must be a non-negative integer (got: $value)" >&2
@@ -59,11 +68,44 @@ if (( PORT < 1 || PORT > 65535 || CONTEXT_LEN < 1024 || RUNS < 3 || \
     echo "invalid parity settings: port=$PORT ctx=$CONTEXT_LEN runs=$RUNS max_tokens=$MAX_TOKENS context_chars=$CONTEXT_CHARS" >&2
     exit 2
 fi
+if (( HF2Q_DEEPSEEK_GRAPH_REORDER > 1 || \
+      HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB < 1 || \
+      HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB > 43 )); then
+    echo "invalid hf2q graph settings: reorder=$HF2Q_DEEPSEEK_GRAPH_REORDER layers_per_cb=$HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB" >&2
+    exit 2
+fi
+if (( HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB > 1 && \
+      HF2Q_DEEPSEEK_GRAPH_REORDER != 1 )); then
+    echo "multi-layer hf2q graph benchmarking requires HF2Q_DEEPSEEK_GRAPH_REORDER=1" >&2
+    exit 2
+fi
+if (( METAL_TRACE_TRIAL > RUNS )); then
+    echo "METAL_TRACE_TRIAL must be zero or name an existing trial" >&2
+    exit 2
+fi
+if (( METAL_TRACE_TRIAL > 0 )); then
+    command -v xcrun >/dev/null || {
+        echo "xcrun is required when METAL_TRACE_TRIAL is enabled" >&2
+        exit 2
+    }
+    if (( METAL_TRACE_SECONDS < 5 )); then
+        echo "METAL_TRACE_SECONDS must be at least 5" >&2
+        exit 2
+    fi
+    if (( METAL_TRACE_TRIAL != RUNS )); then
+        echo "METAL_TRACE_TRIAL must be the final trial so the 100 GiB model can unload before xctrace packages the trace" >&2
+        exit 2
+    fi
+fi
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -f "$RECEIPT" ]] || { echo "schema-v2 conversion receipt not found: $RECEIPT" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not executable: $HF2Q_BIN" >&2; exit 3; }
 [[ -x "$LLAMA_SERVER_BIN" ]] || { echo "llama-server not executable: $LLAMA_SERVER_BIN" >&2; exit 3; }
+[[ -d "$MLX_NATIVE_DIR/.git" || -f "$MLX_NATIVE_DIR/.git" ]] || {
+    echo "mlx-native git worktree not found: $MLX_NATIVE_DIR" >&2
+    exit 3
+}
 
 artifact_sha=$(jq -er '.output.sha256' "$RECEIPT")
 converter_commit=$(jq -er '.converter.git_commit' "$RECEIPT")
@@ -92,6 +134,10 @@ if ! [[ "$MLX_NATIVE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
     echo "MLX_NATIVE_COMMIT must identify the exact mlx-native implementation" >&2
     exit 3
 fi
+if [[ "$(git -C "$MLX_NATIVE_DIR" rev-parse HEAD)" != "$MLX_NATIVE_COMMIT" ]]; then
+    echo "mlx-native HEAD does not match MLX_NATIVE_COMMIT=$MLX_NATIVE_COMMIT" >&2
+    exit 3
+fi
 if ! grep -aFq "$runtime_commit" "$HF2Q_BIN"; then
     echo "hf2q binary does not embed requested runtime commit $runtime_commit" >&2
     exit 3
@@ -113,6 +159,16 @@ if [[ "$actual_sha" != "$artifact_sha" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR/requests" "$OUTPUT_DIR/responses" "$OUTPUT_DIR/logs"
+if (( METAL_TRACE_TRIAL > 0 )); then
+    mkdir -p "$OUTPUT_DIR/traces"
+fi
+git -C "$ROOT_DIR" status --porcelain=v2 >"$OUTPUT_DIR/hf2q-status.txt"
+git -C "$ROOT_DIR" diff --binary >"$OUTPUT_DIR/hf2q.patch"
+git -C "$MLX_NATIVE_DIR" status --porcelain=v2 >"$OUTPUT_DIR/mlx-native-status.txt"
+git -C "$MLX_NATIVE_DIR" diff --binary >"$OUTPUT_DIR/mlx-native.patch"
+hf2q_binary_sha=$(shasum -a 256 "$HF2Q_BIN" | awk '{print $1}')
+hf2q_patch_sha=$(shasum -a 256 "$OUTPUT_DIR/hf2q.patch" | awk '{print $1}')
+mlx_native_patch_sha=$(shasum -a 256 "$OUTPUT_DIR/mlx-native.patch" | awk '{print $1}')
 rows_file="$OUTPUT_DIR/measurements.jsonl"
 : >"$rows_file"
 context_file="$OUTPUT_DIR/context.txt"
@@ -193,7 +249,18 @@ assert_no_runtime() {
 }
 
 server_pid=""
-stop_server() {
+trace_pid=""
+stop_trace() {
+    if [[ -z "$trace_pid" ]]; then
+        return
+    fi
+    if kill -0 "$trace_pid" 2>/dev/null; then
+        kill -INT "$trace_pid" 2>/dev/null || true
+    fi
+    wait "$trace_pid" 2>/dev/null || true
+    trace_pid=""
+}
+stop_server_process() {
     if [[ -z "$server_pid" ]]; then
         return
     fi
@@ -210,7 +277,54 @@ stop_server() {
     wait "$server_pid" 2>/dev/null || true
     server_pid=""
 }
+stop_server() {
+    stop_trace
+    stop_server_process
+}
 trap stop_server EXIT INT TERM
+
+start_trace() {
+    local runtime=$1
+    local trial=$2
+    local trace="$OUTPUT_DIR/traces/${runtime}-trial-${trial}.trace"
+    if [[ -e "$trace" ]]; then
+        echo "refusing to overwrite existing trace: $trace" >&2
+        exit 4
+    fi
+    echo "$runtime trial $trial: starting ${METAL_TRACE_SECONDS}s Metal System Trace" >&2
+    xcrun xctrace record --no-prompt \
+      --template "Metal System Trace" \
+      --time-limit "${METAL_TRACE_SECONDS}s" \
+      --output "$trace" \
+      --attach "$server_pid" \
+      >"$OUTPUT_DIR/logs/${runtime}-trial-${trial}-xctrace.stdout" \
+      2>"$OUTPUT_DIR/logs/${runtime}-trial-${trial}-xctrace.stderr" &
+    trace_pid=$!
+    sleep 2
+    if ! kill -0 "$trace_pid" 2>/dev/null; then
+        wait "$trace_pid" 2>/dev/null || true
+        trace_pid=""
+        echo "Metal System Trace failed to start for $runtime trial $trial" >&2
+        sed -n '1,120p' "$OUTPUT_DIR/logs/${runtime}-trial-${trial}-xctrace.stderr" >&2
+        exit 4
+    fi
+}
+
+finish_trace() {
+    local runtime=$1
+    local trial=$2
+    if [[ -z "$trace_pid" ]]; then
+        return
+    fi
+    if ! wait "$trace_pid"; then
+        trace_pid=""
+        echo "Metal System Trace failed for $runtime trial $trial" >&2
+        sed -n '1,120p' "$OUTPUT_DIR/logs/${runtime}-trial-${trial}-xctrace.stderr" >&2
+        exit 4
+    fi
+    trace_pid=""
+    echo "$runtime trial $trial: Metal trace complete" >&2
+}
 
 wait_ready() {
     local runtime=$1
@@ -312,14 +426,28 @@ run_arm() {
       CHECK_ONLY=1 PORT="$PORT" "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh"
 
     echo "starting $runtime..." >&2
+    local -a runtime_env=(
+      env -i
+      "HOME=$HOME"
+      "PATH=$PATH"
+      "TMPDIR=${TMPDIR:-/tmp}"
+      "LANG=${LANG:-C.UTF-8}"
+      "LC_ALL=${LC_ALL:-C.UTF-8}"
+      "USER=${USER:-}"
+      "LOGNAME=${LOGNAME:-}"
+    )
     if [[ "$runtime" == "hf2q" ]]; then
-        MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN="$CONTEXT_LEN" \
+        "${runtime_env[@]}" \
+          MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN="$CONTEXT_LEN" \
+          HF2Q_DEEPSEEK_GRAPH_REORDER="$HF2Q_DEEPSEEK_GRAPH_REORDER" \
+          HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB="$HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB" \
+          MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS="$MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS" \
           REP_PENALTY=1.0 HOST="$HOST" PORT="$PORT" \
           "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh" \
           >"$OUTPUT_DIR/logs/${runtime}.stdout" \
           2>"$OUTPUT_DIR/logs/${runtime}.stderr" &
     else
-        "$LLAMA_SERVER_BIN" \
+        "${runtime_env[@]}" "$LLAMA_SERVER_BIN" \
           --model "$MODEL" --alias "$MODEL_ID" \
           --host "$HOST" --port "$PORT" \
           --ctx-size "$CONTEXT_LEN" --batch-size 2048 --ubatch-size 2048 \
@@ -341,7 +469,14 @@ run_arm() {
         response="$OUTPUT_DIR/responses/${runtime}-trial-${trial}.json"
         row="$OUTPUT_DIR/responses/${runtime}-trial-${trial}-timing.json"
         [[ -f "$request" ]] || make_request "Cold-prefix parity trial $trial" "$request"
+        if (( trial == METAL_TRACE_TRIAL )); then
+            start_trace "$runtime" "$trial"
+        fi
         post_request "$request" "$response"
+        if (( trial == METAL_TRACE_TRIAL )); then
+            stop_server_process
+            finish_trace "$runtime" "$trial"
+        fi
         if [[ "$runtime" == "hf2q" ]]; then
             record_hf2q "$trial" "$response" "$row"
         else
@@ -369,6 +504,9 @@ echo "artifact: $artifact_sha" >&2
 echo "converter commit: $converter_commit" >&2
 echo "hf2q runtime commit: $runtime_commit" >&2
 echo "mlx-native implementation commit: $MLX_NATIVE_COMMIT" >&2
+echo "hf2q binary SHA-256: $hf2q_binary_sha" >&2
+echo "hf2q patch SHA-256: $hf2q_patch_sha" >&2
+echo "mlx-native patch SHA-256: $mlx_native_patch_sha" >&2
 printf '%s\n' "$llama_version" >"$OUTPUT_DIR/llama-version.txt"
 jq '{schema_version, source, converter, quant_selector, output, excluded_dspark, peak_chunk_bound}' \
   "$RECEIPT" >"$OUTPUT_DIR/conversion-receipt.json"
@@ -419,6 +557,9 @@ jq -s --arg artifact_sha "$artifact_sha" \
   --arg converter_commit "$converter_commit" \
   --arg hf2q_runtime_commit "$runtime_commit" \
   --arg mlx_native_commit "$MLX_NATIVE_COMMIT" \
+  --arg hf2q_binary_sha "$hf2q_binary_sha" \
+  --arg hf2q_patch_sha "$hf2q_patch_sha" \
+  --arg mlx_native_patch_sha "$mlx_native_patch_sha" \
   --arg llama_cpp_commit "$LLAMA_CPP_COMMIT" '
   def median:
     sort as $values
@@ -452,6 +593,9 @@ jq -s --arg artifact_sha "$artifact_sha" \
       converter_commit: $converter_commit,
       hf2q_runtime_commit: $hf2q_runtime_commit,
       mlx_native_commit: $mlx_native_commit,
+      hf2q_binary_sha256: $hf2q_binary_sha,
+      hf2q_patch_sha256: $hf2q_patch_sha,
+      mlx_native_patch_sha256: $mlx_native_patch_sha,
       llama_cpp_commit: $llama_cpp_commit,
       sampling: {
         temperature: 0,
@@ -459,6 +603,11 @@ jq -s --arg artifact_sha "$artifact_sha" \
         repetition_penalty: 1.0,
         enable_thinking: false
       },
+      hf2q_graph: {
+        reorder: $hf2q_graph_reorder,
+        layers_per_command_buffer: $hf2q_graph_layers_per_cb
+      },
+      mlx_native_residency_keep_alive_seconds: $mlx_native_residency_keep_alive_seconds,
       cooldown_seconds: {
         initial: $initial_cooldown,
         inter_arm: $inter_arm_cooldown,
@@ -476,6 +625,9 @@ jq -s --arg artifact_sha "$artifact_sha" \
 ' --argjson initial_cooldown "$INITIAL_COOLDOWN_SECONDS" \
   --argjson inter_arm_cooldown "$COOLDOWN_SECONDS" \
   --argjson inter_trial_cooldown "$TRIAL_COOLDOWN_SECONDS" \
+  --argjson hf2q_graph_reorder "$HF2Q_DEEPSEEK_GRAPH_REORDER" \
+  --argjson hf2q_graph_layers_per_cb "$HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB" \
+  --argjson mlx_native_residency_keep_alive_seconds "$MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS" \
   "$rows_file" >"$OUTPUT_DIR/summary.json"
 
 cat "$OUTPUT_DIR/summary.json"

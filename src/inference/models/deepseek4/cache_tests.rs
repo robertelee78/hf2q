@@ -374,7 +374,9 @@ fn prefill_transactions_cross_window_and_compression_boundaries() {
 
     let boundary = cache.plan_prefill(2).unwrap();
     assert_eq!(boundary.start_position, 127);
+    assert_eq!(boundary.layers[0].window_source_start, 0);
     assert_eq!(boundary.layers[0].window_write_start, 127);
+    assert_eq!(boundary.layers[0].window_write_count, 2);
     assert_eq!(boundary.layers[0].window_valid_after, 128);
     assert_eq!(boundary.layers[0].compressed_write_start, 31);
     assert_eq!(boundary.layers[0].compressed_count, 1);
@@ -386,7 +388,9 @@ fn prefill_transactions_cross_window_and_compression_boundaries() {
 
     let next = cache.plan_prefill(128).unwrap();
     assert_eq!(next.start_position, 129);
+    assert_eq!(next.layers[0].window_source_start, 0);
     assert_eq!(next.layers[0].window_write_start, 1);
+    assert_eq!(next.layers[0].window_write_count, 128);
     assert_eq!(next.layers[0].compressed_write_start, 32);
     assert_eq!(next.layers[0].compressed_count, 32);
     assert_eq!(next.layers[0].compressed_valid_after, 64);
@@ -395,10 +399,28 @@ fn prefill_transactions_cross_window_and_compression_boundaries() {
 
     let wider_than_window = cache.plan_prefill(129).unwrap();
     assert_eq!(wider_than_window.start_position, 129);
-    assert_eq!(wider_than_window.layers[0].window_write_start, 1);
+    assert_eq!(wider_than_window.layers[0].window_source_start, 1);
+    assert_eq!(wider_than_window.layers[0].window_write_start, 2);
+    assert_eq!(wider_than_window.layers[0].window_write_count, 128);
     assert_eq!(wider_than_window.layers[0].window_valid_after, 128);
     assert_eq!(wider_than_window.layers[0].compressed_count, 32);
     assert_eq!(wider_than_window.layers[1].compressed_count, 1);
+}
+
+#[test]
+fn wide_prefill_persists_only_the_newest_non_overlapping_window() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 4096).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+
+    let span = cache.plan_prefill_start0(2048).unwrap();
+    for layer in &span.layers {
+        assert_eq!(layer.window_source_start, 1920);
+        assert_eq!(layer.window_write_start, 0);
+        assert_eq!(layer.window_write_count, 128);
+        assert_eq!(layer.window_valid_after, 128);
+    }
 }
 
 #[test]
