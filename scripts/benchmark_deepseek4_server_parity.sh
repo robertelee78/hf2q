@@ -23,6 +23,7 @@ HF2Q_BIN=${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}
 LLAMA_SERVER_BIN=${LLAMA_SERVER_BIN:-/opt/llama.cpp/build/bin/llama-server}
 LLAMA_CPP_DIR=${LLAMA_CPP_DIR:-/opt/llama.cpp}
 LLAMA_CPP_COMMIT=${LLAMA_CPP_COMMIT:-15586e2d7165570fb3aa7c26e0d442e289ef69de}
+MLX_NATIVE_COMMIT=${MLX_NATIVE_COMMIT:-}
 MODEL_ID=${MODEL_ID:-Deepseek v4 Flash 0731 Source}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-18080}
@@ -85,6 +86,10 @@ if [[ "$(stat -f '%z' "$MODEL")" != "$(jq -er '.output.size' "$RECEIPT")" ]]; th
 fi
 if ! [[ "$runtime_commit" =~ ^[0-9a-f]{40}$ ]]; then
     echo "HF2Q_RUNTIME_COMMIT must be an exact lowercase 40-hex commit" >&2
+    exit 3
+fi
+if ! [[ "$MLX_NATIVE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "MLX_NATIVE_COMMIT must identify the exact mlx-native implementation" >&2
     exit 3
 fi
 if ! grep -aFq "$runtime_commit" "$HF2Q_BIN"; then
@@ -363,6 +368,7 @@ echo "evidence directory: $OUTPUT_DIR" >&2
 echo "artifact: $artifact_sha" >&2
 echo "converter commit: $converter_commit" >&2
 echo "hf2q runtime commit: $runtime_commit" >&2
+echo "mlx-native implementation commit: $MLX_NATIVE_COMMIT" >&2
 printf '%s\n' "$llama_version" >"$OUTPUT_DIR/llama-version.txt"
 jq '{schema_version, source, converter, quant_selector, output, excluded_dspark, peak_chunk_bound}' \
   "$RECEIPT" >"$OUTPUT_DIR/conversion-receipt.json"
@@ -412,6 +418,7 @@ done
 jq -s --arg artifact_sha "$artifact_sha" \
   --arg converter_commit "$converter_commit" \
   --arg hf2q_runtime_commit "$runtime_commit" \
+  --arg mlx_native_commit "$MLX_NATIVE_COMMIT" \
   --arg llama_cpp_commit "$LLAMA_CPP_COMMIT" '
   def median:
     sort as $values
@@ -444,6 +451,7 @@ jq -s --arg artifact_sha "$artifact_sha" \
       artifact_sha256: $artifact_sha,
       converter_commit: $converter_commit,
       hf2q_runtime_commit: $hf2q_runtime_commit,
+      mlx_native_commit: $mlx_native_commit,
       llama_cpp_commit: $llama_cpp_commit,
       sampling: {
         temperature: 0,
