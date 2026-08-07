@@ -8,9 +8,12 @@ use mlx_native::ops::dense_gemm::{dispatch_dense_matvec_f32, DenseGemmF16Params}
 use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::quantized_matmul_ggml::{
-    quantized_matmul_q2_k_batched_mv, GgmlQuantizedMatmulParams, GgmlType,
+    quantized_matmul_ggml_batched_mv, GgmlBatchedQuantizedMatmulInputStrides,
+    GgmlBatchedQuantizedMatmulParams, GgmlQuantizedMatmulParams, GgmlType, MM_ROUTING_THRESHOLD,
 };
-use mlx_native::ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams;
+use mlx_native::ops::quantized_matmul_id_ggml::{
+    GgmlQuantizedMatmulIdParams, IdMmScratch,
+};
 use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
 
@@ -311,21 +314,26 @@ pub(super) fn grouped_output_a(
         .checked_div(block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
-    if weight.ggml_type == GgmlType::Q2_K {
+    if matches!(weight.ggml_type, GgmlType::Q2_K | GgmlType::Q8_0) {
         session.barrier_between(&[input, weight.buffer], &[output]);
-        return quantized_matmul_q2_k_batched_mv(
+        return quantized_matmul_ggml_batched_mv(
             session.encoder_mut(),
             registry,
             device,
             input,
             weight.buffer,
             output,
-            u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
-            1,
-            u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
-            u32::try_from(group_width).context("DeepSeek-V4 output-A group width exceeds u32")?,
+            &GgmlBatchedQuantizedMatmulParams {
+                batch: u32::try_from(groups)
+                    .context("DeepSeek-V4 output-A groups exceed u32")?,
+                m: 1,
+                n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+                k: u32::try_from(group_width)
+                    .context("DeepSeek-V4 output-A group width exceeds u32")?,
+                ggml_type: weight.ggml_type,
+            },
         )
-        .context("encode batched DeepSeek-V4 Q2_K output-A projection");
+        .context("encode batched DeepSeek-V4 output-A matvec");
     }
     for group in 0..groups {
         let input_view = input
@@ -397,9 +405,8 @@ impl BatchedGroupedOutputArena {
 }
 
 /// Apply independently-quantized output-A groups with a true `m=rows`
-/// matrix dispatch. Attention arrives token-major, so the two existing
-/// permutation kernels make every group's rows contiguous without changing
-/// projection arithmetic.
+/// matrix dispatch. Q8_0 consumes token-major attention through explicit
+/// input strides; other formats retain the group-major input permutation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn grouped_output_a_batched(
     session: &mut GraphSession<'_>,
@@ -440,54 +447,89 @@ pub(super) fn grouped_output_a_batched(
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
 
-    session.barrier_between(&[input], &[&arena.input_group_major]);
-    permute_021_f32(
-        session.encoder_mut(),
-        registry,
-        device.metal_device(),
-        input,
-        &arena.input_group_major,
-        rows,
-        groups,
-        group_width,
-    )?;
-    for group in 0..groups {
-        let input_view = arena
-            .input_group_major
-            .slice_view(
-                u64::try_from(group * rows * group_width * DType::F32.size_of())
-                    .context("DeepSeek-V4 batched output-A input offset exceeds u64")?,
-                rows * group_width,
+    if weight.ggml_type == GgmlType::Q8_0 && rows > MM_ROUTING_THRESHOLD as usize {
+        let input_row_bytes = groups
+            .checked_mul(group_width)
+            .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .context("DeepSeek-V4 output-A token-major row stride overflow")?;
+        let input_group_bytes = group_width
+            .checked_mul(DType::F32.size_of())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .context("DeepSeek-V4 output-A token-major group stride overflow")?;
+        session.barrier_between(&[input, weight.buffer], &[&arena.output_group_major]);
+        session
+            .quantized_matmul_ggml_batched_mm_strided_input(
+                registry,
+                device,
+                input,
+                weight.buffer,
+                &arena.output_group_major,
+                &GgmlBatchedQuantizedMatmulParams {
+                    batch: u32::try_from(groups)
+                        .context("DeepSeek-V4 output-A groups exceed u32")?,
+                    m: u32::try_from(rows).context("DeepSeek-V4 output-A rows exceed u32")?,
+                    n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+                    k: u32::try_from(group_width)
+                        .context("DeepSeek-V4 output-A group width exceeds u32")?,
+                    ggml_type: weight.ggml_type,
+                },
+                &GgmlBatchedQuantizedMatmulInputStrides {
+                    row_bytes: input_row_bytes,
+                    batch_bytes: input_group_bytes,
+                },
             )
-            .with_shape(vec![rows, group_width])?;
-        let weight_view = weight.buffer.slice_view(
-            u64::try_from(group * rank * row_bytes)
-                .context("DeepSeek-V4 batched output-A weight offset exceeds u64")?,
-            rank * row_bytes,
-        );
-        let output_view = arena
-            .output_group_major
-            .slice_view(
-                u64::try_from(group * rows * rank * DType::F32.size_of())
-                    .context("DeepSeek-V4 batched output-A output offset exceeds u64")?,
-                rows * rank,
-            )
-            .with_shape(vec![rows, rank])?;
-        session.barrier_between(&[&input_view, &weight_view], &[&output_view]);
-        session.quantized_matmul_ggml(
+            .context("encode strided native-batched DeepSeek-V4 Q8_0 output-A projection")?;
+    } else {
+        session.barrier_between(&[input], &[&arena.input_group_major]);
+        permute_021_f32(
+            session.encoder_mut(),
             registry,
-            device,
-            &input_view,
-            &weight_view,
-            &output_view,
-            &GgmlQuantizedMatmulParams {
-                m: u32::try_from(rows).context("DeepSeek-V4 output-A rows exceed u32")?,
-                n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
-                k: u32::try_from(group_width)
-                    .context("DeepSeek-V4 output-A group width exceeds u32")?,
-                ggml_type: weight.ggml_type,
-            },
+            device.metal_device(),
+            input,
+            &arena.input_group_major,
+            rows,
+            groups,
+            group_width,
         )?;
+        for group in 0..groups {
+            let input_view = arena
+                .input_group_major
+                .slice_view(
+                    u64::try_from(group * rows * group_width * DType::F32.size_of())
+                        .context("DeepSeek-V4 batched output-A input offset exceeds u64")?,
+                    rows * group_width,
+                )
+                .with_shape(vec![rows, group_width])?;
+            let weight_view = weight.buffer.slice_view(
+                u64::try_from(group * rank * row_bytes)
+                    .context("DeepSeek-V4 batched output-A weight offset exceeds u64")?,
+                rank * row_bytes,
+            );
+            let output_view = arena
+                .output_group_major
+                .slice_view(
+                    u64::try_from(group * rows * rank * DType::F32.size_of())
+                        .context("DeepSeek-V4 batched output-A output offset exceeds u64")?,
+                    rows * rank,
+                )
+                .with_shape(vec![rows, rank])?;
+            session.barrier_between(&[&input_view, &weight_view], &[&output_view]);
+            session.quantized_matmul_ggml(
+                registry,
+                device,
+                &input_view,
+                &weight_view,
+                &output_view,
+                &GgmlQuantizedMatmulParams {
+                    m: u32::try_from(rows).context("DeepSeek-V4 output-A rows exceed u32")?,
+                    n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+                    k: u32::try_from(group_width)
+                        .context("DeepSeek-V4 output-A group width exceeds u32")?,
+                    ggml_type: weight.ggml_type,
+                },
+            )?;
+        }
     }
     session.barrier_between(&[&arena.output_group_major], &[output]);
     permute_021_f32(
@@ -508,6 +550,7 @@ pub(super) fn grouped_output_a_batched(
 pub(super) enum ExpertMatmulRoute {
     Auto,
     ForceMv,
+    SlottedMm,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,6 +568,7 @@ pub(super) fn expert_matmul(
     n: usize,
     k: usize,
     route: ExpertMatmulRoute,
+    scratch: Option<&mut IdMmScratch>,
     label: &str,
 ) -> Result<()> {
     if weight.shape != [experts, n, k] {
@@ -552,28 +596,60 @@ pub(super) fn expert_matmul(
     let expert_stride =
         u64::try_from(expert_stride).context("DeepSeek-V4 expert stride exceeds u64")?;
     session.barrier_between(&[input, weight.buffer, safe_ids], &[output]);
-    let dispatch = match route {
-        ExpertMatmulRoute::Auto => GraphSession::quantized_matmul_id_ggml,
-        ExpertMatmulRoute::ForceMv => GraphSession::quantized_matmul_id_ggml_mv,
+    let params = GgmlQuantizedMatmulIdParams {
+        n_tokens,
+        top_k,
+        n,
+        k,
+        n_experts,
+        expert_stride,
+        ggml_type: weight.ggml_type,
     };
-    dispatch(
-        session,
-        registry,
-        device,
-        input,
-        weight.buffer,
-        safe_ids,
-        output,
-        &GgmlQuantizedMatmulIdParams {
-            n_tokens,
-            top_k,
-            n,
-            k,
-            n_experts,
-            expert_stride,
-            ggml_type: weight.ggml_type,
-        },
-    )
+    match (route, scratch) {
+        (ExpertMatmulRoute::Auto, Some(scratch)) => session
+            .quantized_matmul_id_ggml_pooled(
+                registry,
+                device,
+                input,
+                weight.buffer,
+                safe_ids,
+                output,
+                scratch,
+                &params,
+            ),
+        (ExpertMatmulRoute::Auto, None) => session.quantized_matmul_id_ggml(
+            registry,
+            device,
+            input,
+            weight.buffer,
+            safe_ids,
+            output,
+            &params,
+        ),
+        (ExpertMatmulRoute::ForceMv, _) => session.quantized_matmul_id_ggml_mv(
+            registry,
+            device,
+            input,
+            weight.buffer,
+            safe_ids,
+            output,
+            &params,
+        ),
+        (ExpertMatmulRoute::SlottedMm, Some(scratch)) => session
+            .quantized_matmul_id_ggml_pooled_slotted(
+                registry,
+                device,
+                input,
+                weight.buffer,
+                safe_ids,
+                output,
+                scratch,
+                &params,
+            ),
+        (ExpertMatmulRoute::SlottedMm, None) => {
+            bail!("DeepSeek-V4 {label} slotted mm_id requires caller-owned scratch")
+        }
+    }
     .with_context(|| format!("encode DeepSeek-V4 {label}"))
 }
 

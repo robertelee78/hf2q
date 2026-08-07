@@ -2,12 +2,14 @@
 
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
-use mlx_native::{GraphExecutor, MlxBuffer};
+use mlx_native::{
+    DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::forward_support::{
-    begin_decode_pool_token, begin_prefill_pool_layer, end_decode_pool_token,
+    alloc_persistent, begin_decode_pool_token, begin_prefill_pool_layer, end_decode_pool_token,
     end_prefill_pool_layer,
 };
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
@@ -168,6 +170,39 @@ impl Deepseek4Model {
         let layers = self.cfg.num_hidden_layers as usize;
         let executor = GraphExecutor::new(self.ctx.device().clone());
         let profile_timing = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_TIMING").is_some();
+        let device = self.ctx.device().clone();
+        let rows = token_ids.len();
+        let hc = self.cfg.hyper_connection_count as usize;
+        let hidden = self.cfg.hidden_size as usize;
+        let mut id_mm_scratch = if rows > MM_ID_ROUTING_THRESHOLD as usize {
+            let rows = u32::try_from(rows).context("DeepSeek-V4 prefill rows exceed u32")?;
+            Some([
+                IdMmScratch::alloc(self.ctx.device(), self.cfg.num_experts, rows)
+                    .context("allocate DeepSeek-V4 gate/down mm_id scratch")?,
+                IdMmScratch::alloc(self.ctx.device(), self.cfg.num_experts, rows)
+                    .context("allocate DeepSeek-V4 up mm_id scratch")?,
+            ])
+        } else {
+            None
+        };
+        // Each layer fully overwrites its output after reading the preceding
+        // layer's state. Alternating two persistent buffers preserves that
+        // dependency while avoiding 43 fresh, CPU-zeroed Metal allocations
+        // for every prompt chunk.
+        let reusable_states = [
+            alloc_persistent(
+                &device,
+                DType::F32,
+                vec![rows, hc, hidden],
+                "prefill state ping",
+            )?,
+            alloc_persistent(
+                &device,
+                DType::F32,
+                vec![rows, hc, hidden],
+                "prefill state pong",
+            )?,
+        ];
         let mut state = None;
         for layer in 0..layers {
             begin_prefill_pool_layer();
@@ -182,6 +217,8 @@ impl Deepseek4Model {
                     state.as_ref(),
                     cache,
                     span,
+                    reusable_states[layer % reusable_states.len()].clone(),
+                    id_mm_scratch.as_mut(),
                     &mut session,
                 )?;
                 if profile_timing {
@@ -226,6 +263,8 @@ impl Deepseek4Model {
         state: Option<&MlxBuffer>,
         cache: &mut Deepseek4Cache,
         span: &CacheSpan,
+        output_state: MlxBuffer,
+        id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
         session: &mut GraphSession<'_>,
     ) -> Result<MlxBuffer> {
         let dump_attention = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
@@ -281,8 +320,16 @@ impl Deepseek4Model {
                 })
                 .with_context(|| format!("profile DeepSeek-V4 layer-{layer} attention"))?;
         }
-        self.forward_ffn_rows(&attention, token_ids, layer, None, Some(session))
-            .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
+        self.forward_ffn_rows(
+            &attention,
+            token_ids,
+            layer,
+            None,
+            Some(session),
+            Some(output_state),
+            id_mm_scratch,
+        )
+        .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
     }
 
     /// Execute all verifier blocks for one token.
