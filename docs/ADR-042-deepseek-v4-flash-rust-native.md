@@ -33,6 +33,13 @@ Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
 evidence.
 
+That conversion/release boundary does not restrict the server to hf2q-produced
+files. `hf2q serve` does not require an hf2q provenance receipt and may load an
+externally produced or downloaded GGUF when its architecture, tensor catalog,
+quantization types, tokenizer, and template are explicitly supported. Unknown
+or incompatible model-family layouts still fail closed; producer identity by
+itself is never a serving rejection reason.
+
 The accepted runtime executes prompts in bounded 2,048-token matrix
 transactions, 16 times wider than the 128-token physical attention
 window. Attention reads each transaction's compact KV source while only the
@@ -467,6 +474,42 @@ changes. The measured candidate is
 | Before/after control | The earlier identical-class hf2q run required 594.575 s for 119,808 tokens (201.502 tok/s). The accepted path reduced cold-prefill time by 39.2% and increased its token rate by 64.5%. At the shorter exact 26,024-token gate, the threshold retune improved 388.846 tok/s to 497.277 tok/s while retaining the exact tool call; the cached continuation reused 26,016 tokens and reached 927 ms TTFT. |
 | Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
 | Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate. A later OpenCode session falsified the steady-state claim when macOS killed hf2q at 108,840 MB after the shared transient arena retained cold-prefill buckets. The split-arena build releases prefill scratch before decode; the new file-backed build released 4,933,917,968 transient bytes after the 120K prefill, remained alive through its cached continuation, reported 2.0 GiB RSS, and shut down cleanly. Eagerly allocating the full 524,288-token cache beside this artifact still OOMs, so demand growth remains required. Only one 100 GiB-class runtime was resident during every comparison. |
+
+### Completion-audit performance ledger (in progress, 2026-08-06)
+
+The tighter completion gate uses the reproduced 107,431,343,168-byte artifact
+with SHA-256
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d` and
+llama.cpp commit `15586e2d7165570fb3aa7c26e0d442e289ef69de`. On the first clean
+three-trial matched run, llama.cpp medians were 667.218 prompt tok/s and 31.942
+decode tok/s; hf2q medians were 621.615 prompt tok/s and 32.578 decode tok/s.
+Every deterministic reasoning/answer transcript matched exactly. Decode passed;
+prefill reached 93.17% and remained an acceptance failure.
+
+The current implementation candidate adds generalized batched GGML MM/MV,
+explicit token-major input strides, slotted expert-down output, and pooled
+scratch. Exact packed-versus-strided Q8 tests pass bit-for-bit, including a
+negative test that rejects a non-32-byte-aligned row stride. The DeepSeek Q2_K
+and batched MM/MV focused suites are green. These are implementation proofs,
+not yet a performance acceptance result; the candidate requires a fresh
+thermally controlled matched run.
+
+Two follow-up hypotheses were measured and rejected:
+
+- Gathering only the ratio-128 compressed-attention rows before the dense
+  projection was tested behind a fail-closed diagnostic toggle. Same-binary
+  ABBA trials produced 608.998 prompt tok/s for gather versus 616.924 for the
+  existing dense path. Gather was 1.28% slower and has been removed.
+- CPU-side `encode_layer()` work across all 43 layers and three chunks consumed
+  about 211 ms of an 8.146 s prefill, an approximately 2.6% upper bound even if
+  perfect overlap removed all of it. Layer pipelining alone therefore cannot
+  explain or close the measured 6.83% reference gap.
+
+A later grouped run showed material within-arm thermal decay in both runtimes,
+so its median is not accepted as a comparison. The parity harness now cools
+between measured trials as well as before and between runtime arms. External
+source reviews, including Kimi and Claude, supply testable hypotheses only;
+source inspection plus exact hf2q measurements decide whether a change lands.
 
 The performance result comes from two measured defaults. Decode groups two
 verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two
