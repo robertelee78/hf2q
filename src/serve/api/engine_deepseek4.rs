@@ -1,8 +1,9 @@
 //! Native DeepSeek-V4-Flash serving adapter.
 //!
-//! The worker owns one fixed-capacity cache and the exact token sequence
-//! committed into it. Growing OpenAI transcripts reuse that live prefix and
-//! prefill only the rendered suffix; divergent/compacted transcripts reset.
+//! The worker owns one demand-grown cache and the exact token sequence
+//! committed into it. Growing OpenAI transcripts reuse that live prefix across
+//! capacity changes and prefill only the rendered suffix;
+//! divergent/compacted transcripts reset.
 
 mod progress;
 mod sampling;
@@ -286,29 +287,29 @@ impl Deepseek4LoadedModel {
         }
 
         let previous = self.cache.capacity();
-        // Drop the context-linear allocation before creating its larger
-        // replacement. A one-window placeholder keeps the model in a valid,
-        // resettable state if the larger allocation is rejected by Metal.
-        let placeholder_capacity = self.model.cfg.sliding_window as usize;
-        let placeholder = self
-            .model
-            .allocate_cache(placeholder_capacity)
-            .context("allocate DeepSeek-V4 cache-growth placeholder")?;
-        let old = std::mem::replace(&mut self.cache, placeholder);
-        drop(old);
-        self.committed_tokens.clear();
-        self.live_logits = None;
-        self.turn_anchor = None;
-        self.turn_anchor_tokens.clear();
-
-        self.cache = self.model.allocate_cache(target).with_context(|| {
+        let migration_started = Instant::now();
+        let source_cache_bytes = self.cache.resident_bytes();
+        let migrated_tokens = self.cache.position();
+        let mut grown = self.model.allocate_cache(target).with_context(|| {
             format!("grow DeepSeek-V4 cache from {previous} to {target} tokens")
         })?;
+        grown
+            .migrate_from(&self.cache, self.turn_anchor.as_mut())
+            .with_context(|| {
+                format!("migrate DeepSeek-V4 live cache from {previous} to {target} tokens")
+            })?;
+        let target_cache_bytes = grown.resident_bytes();
+        let old = std::mem::replace(&mut self.cache, grown);
+        drop(old);
         tracing::info!(
             previous_cache_context = previous,
             allocated_cache_context = target,
             serving_context = self.context_limit(),
-            "DeepSeek-V4 cache capacity grown for request"
+            migrated_tokens,
+            source_cache_bytes,
+            target_cache_bytes,
+            migration_elapsed_ms = migration_started.elapsed().as_secs_f64() * 1000.0,
+            "DeepSeek-V4 cache capacity grown without prefix reset"
         );
         Ok(true)
     }
@@ -419,25 +420,41 @@ impl Deepseek4LoadedModel {
         );
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 
-        let reuse = prefer_matrix_prefill(
-            prompt_tokens.len(),
-            select_prefix_reuse(
-                prompt_tokens,
-                &self.committed_tokens,
-                if self.cache.is_poisoned() {
-                    usize::MAX
-                } else {
-                    self.cache.position()
-                },
-                &self.turn_anchor_tokens,
-                self.turn_anchor
-                    .as_ref()
-                    .map_or(0, Deepseek4CacheSnapshot::position),
-            ),
+        let cache_poisoned = self.cache.is_poisoned();
+        let live_position = self.cache.position();
+        let selectable_live_position = if cache_poisoned {
+            usize::MAX
+        } else {
+            live_position
+        };
+        let anchor_position = self
+            .turn_anchor
+            .as_ref()
+            .map_or(0, Deepseek4CacheSnapshot::position);
+        let selected_reuse = select_prefix_reuse(
+            prompt_tokens,
+            &self.committed_tokens,
+            selectable_live_position,
+            &self.turn_anchor_tokens,
+            anchor_position,
         );
+        let reuse = prefer_matrix_prefill(prompt_tokens.len(), selected_reuse);
+        if matches!(reuse, PrefixReuse::Reset) {
+            progress.cache_reset_diagnostic(
+                self.committed_tokens.len(),
+                live_position,
+                common_prefix_len(prompt_tokens, &self.committed_tokens),
+                self.turn_anchor_tokens.len(),
+                anchor_position,
+                common_prefix_len(prompt_tokens, &self.turn_anchor_tokens),
+                cache_poisoned,
+                selected_reuse != reuse,
+                cache_grew,
+            );
+        }
         let reset_from_scratch = matches!(reuse, PrefixReuse::Reset);
         let (cached_tokens, cache_action) = match reuse {
-            PrefixReuse::Live(count) => (count, "live"),
+            PrefixReuse::Live(count) => (count, if cache_grew { "grow-live" } else { "live" }),
             PrefixReuse::RecoveryAnchor(count) => {
                 let snapshot = self
                     .turn_anchor
@@ -448,7 +465,14 @@ impl Deepseek4LoadedModel {
                     .context("restore DeepSeek-V4 prompt-boundary cache")?;
                 self.committed_tokens.clone_from(&self.turn_anchor_tokens);
                 self.live_logits = None;
-                (count, "recovery-anchor")
+                (
+                    count,
+                    if cache_grew {
+                        "grow-recovery-anchor"
+                    } else {
+                        "recovery-anchor"
+                    },
+                )
             }
             PrefixReuse::Reset => {
                 self.reset_live_cache()?;
@@ -575,6 +599,13 @@ enum PrefixReuse {
     Reset,
 }
 
+fn common_prefix_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn prefer_matrix_prefill(prompt_len: usize, reuse: PrefixReuse) -> PrefixReuse {
     let cached = match reuse {
         PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor(count) => count,
@@ -661,8 +692,9 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        balance_fresh_three_chunk_prefill, cache_capacity_for_request, prefer_matrix_prefill,
-        select_prefix_reuse, should_retain_decode_scratch, PrefixReuse, TransientScratchStats,
+        balance_fresh_three_chunk_prefill, cache_capacity_for_request, common_prefix_len,
+        prefer_matrix_prefill, select_prefix_reuse, should_retain_decode_scratch, PrefixReuse,
+        TransientScratchStats,
     };
 
     #[test]
@@ -708,6 +740,13 @@ mod tests {
             select_prefix_reuse(&[1, 2, 3, 4, 5], &[1, 2, 3, 4], 4, &[1, 2], 2),
             PrefixReuse::Live(4)
         );
+    }
+
+    #[test]
+    fn reset_diagnostics_measure_the_exact_divergence_point() {
+        assert_eq!(common_prefix_len(&[1, 2, 3, 4], &[1, 2, 9, 4]), 2);
+        assert_eq!(common_prefix_len(&[1, 2], &[1, 2, 3]), 2);
+        assert_eq!(common_prefix_len(&[1], &[2]), 0);
     }
 
     #[test]

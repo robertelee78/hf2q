@@ -1,11 +1,11 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
-- **Status:** Accepted for hf2q 0.1.1
-- **Updated:** 2026-08-07 — the bounded adaptive prefill candidate passed the
-  current matched llama.cpp gate at 1.0105x prompt and 1.0772x decode speed
-  with exact output on every trial. The full agentic tool/SSE gate and 119K
-  context-cache gate also passed; the long continuation reused 119,813 of
-  119,916 prompt tokens (99.91%) and evaluated its suffix in 1.132 s TTFT
+- **Status:** Accepted for hf2q 0.1.1; cache growth revalidated 2026-08-08
+- **Updated:** 2026-08-08 — an operator OpenCode run first falsified destructive
+  131,072-to-262,144 cache growth. The corrected candidate then migrated
+  119,909 live tokens in 101.9 ms, retained 119,848 of 119,943 prompt tokens
+  (99.92%), returned the exact tool-result sentinel in 1.321 s TTFT, and added
+  no swap while crossing the same physical boundary
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -380,11 +380,18 @@ position rolls back. The compact snapshot is therefore context-independent
 (17,842,176 bytes for the official 43-layer schedule) instead of duplicating
 the entire live cache. At the trained one-million-token limit a fully grown
 live allocation is 7,232,045,056 bytes. Operators must still leave sufficient
-unified-memory headroom for Metal scratch. The previously validated 131,072-
-token gate remains the performance baseline until a larger real prompt crosses
-the first growth boundary. Matrix prefill remains at the measured 2,048-token
-transaction while physical capacity is 131K and drops to 1,024 tokens after
-growth unless an operator supplies an explicit benchmark override.
+unified-memory headroom for Metal scratch.
+
+The original growth implementation dropped the old allocation and cleared the
+live token ledger, logits, and recovery anchor before allocating the larger
+cache. That made every capacity change a full transcript replay. The corrected
+design must allocate a strictly prefix-compatible destination, copy the live
+window/compressed/indexer/recurrent state, rebind only the matching compact
+recovery snapshot, and swap only after every copy succeeds. Allocation or copy
+failure leaves the old cache and all serving ledgers usable. Matrix prefill
+remains at the measured 2,048-token transaction while physical capacity is
+131K and drops to 1,024 tokens after growth unless an operator supplies an
+explicit benchmark override.
 
 Tool definitions are rendered by the owned 0731 encoder. Grammar-constrained
 generation emits one official `<｜DSML｜tool_calls>` envelope containing one or
@@ -935,10 +942,52 @@ short-output smoke test is not an acceptance substitute.
 The near-boundary companion is
 `scripts/test_deepseek4_long_context_cache.sh`. It calibrates with the server's
 actual tokenizer, constructs a 116K-125K prompt, requires a valid tool call,
-then appends its tool result and fails unless almost the entire prefix is
-reported as cached with bounded continuation TTFT. This is the release guard
-against the original agentic failure mode: recomputing the whole conversation
-on every turn.
+then appends its tool result with a 16,384-token generation reservation. That
+reservation deliberately crosses the initial 131,072-token physical capacity;
+the gate fails unless almost the entire prefix remains cached with bounded
+continuation TTFT. This is the release guard against both the original
+every-turn replay and destructive demand growth.
+
+### Cache-growth boundary revalidation (2026-08-08)
+
+An operator OpenCode transcript exposed a release-gate hole in main at
+`1349ec6f`: the first 131,072-to-262,144 physical-cache growth logged
+`cache="grow-reset"`, credited zero cached tokens, and replayed the complete
+129,015-token transcript. The old implementation discarded the source cache
+and its serving ledgers before installing the larger allocation. A later
+same-capacity reset in the same operator session had no growth event and is
+not attributed to this defect without prefix-divergence evidence.
+
+The corrected candidate was built from that base with release-binary SHA-256
+`af3b571c1215497773d0f0f12a9baeca80c15921d8f3335ba50431e2e449031f` and
+served the exact accepted schema-v2 artifact on the M5 Max. Its isolated
+boundary receipt is
+`hf2q-ds4-growth.XXXXXX.GEgGT5Y6n5` under the host temporary directory.
+
+| Phase | Prompt | Cached | TTFT | Result |
+|---|---:|---:|---:|---|
+| calibration | 27,320 | 0 | — | exact required tool; 580.747 prompt tok/s |
+| cold long prompt | 119,856 | 0 | 359.402 s | exact required tool; 333.487 prompt tok/s |
+| forced-growth continuation | 119,943 | 119,848 | 1.321 s | exact terminal sentinel; no extra tool call |
+
+The continuation reserved 16,384 generation tokens, forcing a 262,144-token
+physical allocation. hf2q migrated cache position 119,909 in 101.865 ms from
+a 919,617,536-byte source to a 1,821,392,896-byte destination, then evaluated
+only the 95-token suffix. Swap moved from 3,520.06 MiB before the run to
+3,504.00 MiB after growth. The server shut down cleanly after the receipt.
+
+The same candidate then passed `scripts/test_deepseek4_agentic.sh` in a fresh
+server process. Required and automatic tools, unary and SSE responses,
+source-shaped arguments, and tool-result continuation were exact. The cached
+turn reused 6,333 of 6,341 prompt tokens and reduced TTFT from 9.796 seconds
+to 227 ms. That receipt is `hf2q-ds4-agentic.XXXXXX.zDLrp8abZX` under the host
+temporary directory.
+
+Verbose reset diagnostics now report only token counts, cache positions,
+common-prefix lengths, poison state, growth state, and matrix-prefill policy.
+They do not log prompt text, decoded content, tool names, or arguments. This
+distinguishes an incompatible transcript rewrite from a future cache defect
+without exposing operator data.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

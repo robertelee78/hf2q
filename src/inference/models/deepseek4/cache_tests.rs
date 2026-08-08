@@ -527,6 +527,206 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
 }
 
 #[test]
+fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
+    let mut cfg = config(vec![0, 4, 128]);
+    cfg.max_position_embeddings = 256;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let source_plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let target_plan = Deepseek4CachePlan::for_context(&cfg, 256).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut source = Deepseek4Cache::allocate(&source_plan, MlxDevice::new().unwrap()).unwrap();
+    let mut target = Deepseek4Cache::allocate(&target_plan, MlxDevice::new().unwrap()).unwrap();
+
+    let source_attention_len = source.layers()[1]
+        .attention_kv
+        .as_slice::<u16>()
+        .unwrap()
+        .len();
+    source.layers_mut()[1]
+        .attention_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[source_attention_len - 1] = 0x2345;
+    let source_indexer_len = source.layers()[1]
+        .indexer_kv
+        .as_ref()
+        .unwrap()
+        .as_slice::<u16>()
+        .unwrap()
+        .len();
+    source.layers_mut()[1]
+        .indexer_kv
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<u16>()
+        .unwrap()[source_indexer_len - 1] = 0x6789;
+    source.layers_mut()[1]
+        .main_kv_state
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<f32>()
+        .unwrap()[1] = 7.5;
+    for expected in 0..11 {
+        source.commit_step(expected).unwrap();
+    }
+
+    target.migrate_from(&source, None).unwrap();
+    assert_eq!(source.position(), 11);
+    assert_eq!(source.capacity(), 128);
+    assert_eq!(target.position(), 11);
+    assert_eq!(target.capacity(), 256);
+    assert_eq!(
+        target.layers()[1].attention_kv.as_slice::<u16>().unwrap()[source_attention_len - 1],
+        0x2345
+    );
+    assert!(
+        target.layers()[1].attention_kv.as_slice::<u16>().unwrap()[source_attention_len..]
+            .iter()
+            .all(|value| *value == 0)
+    );
+    assert_eq!(
+        target.layers()[1]
+            .indexer_kv
+            .as_ref()
+            .unwrap()
+            .as_slice::<u16>()
+            .unwrap()[source_indexer_len - 1],
+        0x6789
+    );
+    assert!(target.layers()[1]
+        .indexer_kv
+        .as_ref()
+        .unwrap()
+        .as_slice::<u16>()
+        .unwrap()[source_indexer_len..]
+        .iter()
+        .all(|value| *value == 0));
+    assert_eq!(
+        target.layers()[1]
+            .main_kv_state
+            .as_ref()
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()[1],
+        7.5
+    );
+}
+
+#[test]
+fn compatible_growth_rebinds_and_restores_the_recovery_anchor() {
+    let mut cfg = config(vec![4, 128]);
+    cfg.max_position_embeddings = 256;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let source_plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let target_plan = Deepseek4CachePlan::for_context(&cfg, 256).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut source = Deepseek4Cache::allocate(&source_plan, MlxDevice::new().unwrap()).unwrap();
+    let mut target = Deepseek4Cache::allocate(&target_plan, MlxDevice::new().unwrap()).unwrap();
+
+    source.layers_mut()[0]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0x1234;
+    source.layers_mut()[0]
+        .indexer_kv
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<u16>()
+        .unwrap()[2] = 0x5678;
+    source.layers_mut()[0]
+        .main_kv_state
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<f32>()
+        .unwrap()[1] = 9.25;
+    for expected in 0..7 {
+        source.commit_step(expected).unwrap();
+    }
+    let mut snapshot = source.snapshot().unwrap();
+
+    source.layers_mut()[0]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0xabcd;
+    source.layers_mut()[0]
+        .main_kv_state
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<f32>()
+        .unwrap()[1] = -1.0;
+    source.commit_step(7).unwrap();
+
+    target.migrate_from(&source, Some(&mut snapshot)).unwrap();
+    assert_eq!(target.position(), 8);
+    target.restore(&snapshot).unwrap();
+    assert_eq!(target.position(), 7);
+    assert_eq!(
+        target.layers()[0].window_kv.as_slice::<u16>().unwrap()[3],
+        0x1234
+    );
+    assert_eq!(
+        target.layers()[0]
+            .indexer_kv
+            .as_ref()
+            .unwrap()
+            .as_slice::<u16>()
+            .unwrap()[2],
+        0x5678
+    );
+    assert_eq!(
+        target.layers()[0]
+            .main_kv_state
+            .as_ref()
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()[1],
+        9.25
+    );
+}
+
+#[test]
+fn incompatible_or_poisoned_growth_leaves_the_destination_unchanged() {
+    let mut source_cfg = config(vec![4]);
+    source_cfg.max_position_embeddings = 256;
+    source_cfg.head_dim = 8;
+    source_cfg.index_head_dim = 4;
+    let mut target_cfg = source_cfg.clone();
+    target_cfg.index_head_dim = 8;
+    let source_plan = Deepseek4CachePlan::for_context(&source_cfg, 128).unwrap();
+    let target_plan = Deepseek4CachePlan::for_context(&target_cfg, 256).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut source = Deepseek4Cache::allocate(&source_plan, MlxDevice::new().unwrap()).unwrap();
+    let mut target = Deepseek4Cache::allocate(&target_plan, MlxDevice::new().unwrap()).unwrap();
+    target.layers_mut()[0]
+        .attention_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[0] = 0xbeef;
+
+    assert!(matches!(
+        target.migrate_from(&source, None),
+        Err(CacheError::MigrationPlanMismatch {
+            layer: 0,
+            kind: CacheKind::IndexerKv
+        })
+    ));
+    assert_eq!(
+        target.layers()[0].attention_kv.as_slice::<u16>().unwrap()[0],
+        0xbeef
+    );
+
+    source.poison();
+    assert!(matches!(
+        target.migrate_from(&source, None),
+        Err(CacheError::Poisoned)
+    ));
+    assert_eq!(
+        target.layers()[0].attention_kv.as_slice::<u16>().unwrap()[0],
+        0xbeef
+    );
+}
+
+#[test]
 fn restore_rejects_a_snapshot_from_a_different_cache_plan() {
     let mut cfg = config(vec![4]);
     cfg.max_position_embeddings = 128;

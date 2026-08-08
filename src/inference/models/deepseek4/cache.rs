@@ -140,6 +140,40 @@ pub enum CacheError {
     },
     #[error("layer {layer} {kind:?} cache snapshot shape or dtype does not match")]
     SnapshotBufferMismatch { layer: usize, kind: CacheKind },
+    #[error(
+        "DeepSeek-V4 cache growth requires a larger context: source {source_context}, target {target_context}"
+    )]
+    MigrationContext {
+        source_context: usize,
+        target_context: usize,
+    },
+    #[error(
+        "DeepSeek-V4 cache growth layer count {target_layers} does not match source {source_layers}"
+    )]
+    MigrationLayerCount {
+        source_layers: usize,
+        target_layers: usize,
+    },
+    #[error("layer {layer} {kind:?} cache growth plan is not prefix-compatible")]
+    MigrationPlanMismatch { layer: usize, kind: CacheKind },
+    #[error("DeepSeek-V4 cache-growth snapshot does not match the source cache plan")]
+    MigrationSnapshotPlanMismatch,
+    #[error(
+        "DeepSeek-V4 cache-growth snapshot position {snapshot_position} exceeds source position {source_position}"
+    )]
+    MigrationSnapshotPosition {
+        snapshot_position: usize,
+        source_position: usize,
+    },
+    #[error("failed to copy layer {layer} {kind:?} during cache growth: {source}")]
+    MigrationCopy {
+        layer: usize,
+        kind: CacheKind,
+        #[source]
+        source: MlxError,
+    },
+    #[error("layer {layer} {kind:?} cache growth buffer shape or dtype does not match")]
+    MigrationBufferMismatch { layer: usize, kind: CacheKind },
 }
 
 pub struct LayerCache {
@@ -425,6 +459,84 @@ impl Deepseek4Cache {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Copy a valid live prefix into a larger, prefix-compatible cache.
+    ///
+    /// The source remains untouched until every destination copy succeeds, so
+    /// callers can discard the partially populated destination and continue
+    /// serving from the old cache after an allocation or copy failure. The
+    /// optional compact rollback snapshot is rebound only after all live bytes
+    /// have migrated; this keeps recovery-anchor restore exact across the
+    /// capacity boundary without accepting unrelated old-plan snapshots.
+    pub fn migrate_from(
+        &mut self,
+        source: &Deepseek4Cache,
+        snapshot: Option<&mut Deepseek4CacheSnapshot>,
+    ) -> Result<(), CacheError> {
+        if source.poisoned {
+            return Err(CacheError::Poisoned);
+        }
+        validate_growth_plans(&source.plan, &self.plan)?;
+        if let Some(snapshot) = snapshot.as_ref() {
+            if snapshot.plan != source.plan {
+                return Err(CacheError::MigrationSnapshotPlanMismatch);
+            }
+            if snapshot.next_position > source.next_position {
+                return Err(CacheError::MigrationSnapshotPosition {
+                    snapshot_position: snapshot.next_position,
+                    source_position: source.next_position,
+                });
+            }
+        }
+
+        for (layer_index, (source_layer, destination_layer)) in
+            source.layers.iter().zip(self.layers.iter_mut()).enumerate()
+        {
+            copy_buffer_prefix(
+                &source_layer.attention_kv,
+                &mut destination_layer.attention_kv,
+                layer_index,
+                CacheKind::AttentionKv,
+            )?;
+            copy_optional_buffer_prefix(
+                source_layer.indexer_kv.as_ref(),
+                destination_layer.indexer_kv.as_mut(),
+                layer_index,
+                CacheKind::IndexerKv,
+            )?;
+            copy_optional_buffer_prefix(
+                source_layer.main_kv_state.as_ref(),
+                destination_layer.main_kv_state.as_mut(),
+                layer_index,
+                CacheKind::MainKvState,
+            )?;
+            copy_optional_buffer_prefix(
+                source_layer.main_score_state.as_ref(),
+                destination_layer.main_score_state.as_mut(),
+                layer_index,
+                CacheKind::MainScoreState,
+            )?;
+            copy_optional_buffer_prefix(
+                source_layer.indexer_kv_state.as_ref(),
+                destination_layer.indexer_kv_state.as_mut(),
+                layer_index,
+                CacheKind::IndexerKvState,
+            )?;
+            copy_optional_buffer_prefix(
+                source_layer.indexer_score_state.as_ref(),
+                destination_layer.indexer_score_state.as_mut(),
+                layer_index,
+                CacheKind::IndexerScoreState,
+            )?;
+        }
+
+        self.next_position = source.next_position;
+        self.poisoned = false;
+        if let Some(snapshot) = snapshot {
+            snapshot.plan = self.plan.clone();
+        }
+        Ok(())
     }
 
     /// Capture exact prompt-boundary rollback state before generation mutates
@@ -757,4 +869,153 @@ fn copy_buffer(
     }
     destination.copy_from_slice(source);
     Ok(())
+}
+
+fn validate_growth_plans(
+    source: &Deepseek4CachePlan,
+    target: &Deepseek4CachePlan,
+) -> Result<(), CacheError> {
+    if target.context_length <= source.context_length {
+        return Err(CacheError::MigrationContext {
+            source_context: source.context_length,
+            target_context: target.context_length,
+        });
+    }
+    if source.layers.len() != target.layers.len() {
+        return Err(CacheError::MigrationLayerCount {
+            source_layers: source.layers.len(),
+            target_layers: target.layers.len(),
+        });
+    }
+    for (layer_index, (source, target)) in
+        source.layers.iter().zip(target.layers.iter()).enumerate()
+    {
+        if source.layer_index != target.layer_index
+            || source.compress_ratio != target.compress_ratio
+            || !buffer_plan_is_prefix(&source.attention_kv, &target.attention_kv)
+        {
+            return Err(CacheError::MigrationPlanMismatch {
+                layer: layer_index,
+                kind: CacheKind::AttentionKv,
+            });
+        }
+        if source.window_kv != target.window_kv {
+            return Err(CacheError::MigrationPlanMismatch {
+                layer: layer_index,
+                kind: CacheKind::WindowKv,
+            });
+        }
+        if !optional_buffer_plan_is_prefix(
+            source.compressed_kv.as_ref(),
+            target.compressed_kv.as_ref(),
+        ) {
+            return Err(CacheError::MigrationPlanMismatch {
+                layer: layer_index,
+                kind: CacheKind::CompressedKv,
+            });
+        }
+        if !optional_buffer_plan_is_prefix(source.indexer_kv.as_ref(), target.indexer_kv.as_ref()) {
+            return Err(CacheError::MigrationPlanMismatch {
+                layer: layer_index,
+                kind: CacheKind::IndexerKv,
+            });
+        }
+        for (kind, source, target) in [
+            (
+                CacheKind::MainKvState,
+                source.main_kv_state.as_ref(),
+                target.main_kv_state.as_ref(),
+            ),
+            (
+                CacheKind::MainScoreState,
+                source.main_score_state.as_ref(),
+                target.main_score_state.as_ref(),
+            ),
+            (
+                CacheKind::IndexerKvState,
+                source.indexer_kv_state.as_ref(),
+                target.indexer_kv_state.as_ref(),
+            ),
+            (
+                CacheKind::IndexerScoreState,
+                source.indexer_score_state.as_ref(),
+                target.indexer_score_state.as_ref(),
+            ),
+        ] {
+            if source != target {
+                return Err(CacheError::MigrationPlanMismatch {
+                    layer: layer_index,
+                    kind,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn buffer_plan_is_prefix(source: &CacheBufferPlan, target: &CacheBufferPlan) -> bool {
+    source.dtype == target.dtype
+        && !source.shape.is_empty()
+        && source.shape.len() == target.shape.len()
+        && source.shape[1..] == target.shape[1..]
+        && source.shape[0] <= target.shape[0]
+        && source.bytes <= target.bytes
+}
+
+fn optional_buffer_plan_is_prefix(
+    source: Option<&CacheBufferPlan>,
+    target: Option<&CacheBufferPlan>,
+) -> bool {
+    match (source, target) {
+        (Some(source), Some(target)) => buffer_plan_is_prefix(source, target),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn copy_buffer_prefix(
+    source: &MlxBuffer,
+    destination: &mut MlxBuffer,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    if source.dtype() != destination.dtype()
+        || source.shape().is_empty()
+        || source.shape().len() != destination.shape().len()
+        || source.shape()[1..] != destination.shape()[1..]
+        || source.shape()[0] > destination.shape()[0]
+        || source.data_byte_len() > destination.data_byte_len()
+    {
+        return Err(CacheError::MigrationBufferMismatch { layer, kind });
+    }
+    let source = source
+        .as_slice::<u8>()
+        .map_err(|source| CacheError::MigrationCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    let destination =
+        destination
+            .as_mut_slice::<u8>()
+            .map_err(|source| CacheError::MigrationCopy {
+                layer,
+                kind,
+                source,
+            })?;
+    destination[..source.len()].copy_from_slice(source);
+    Ok(())
+}
+
+fn copy_optional_buffer_prefix(
+    source: Option<&MlxBuffer>,
+    destination: Option<&mut MlxBuffer>,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    match (source, destination) {
+        (Some(source), Some(destination)) => copy_buffer_prefix(source, destination, layer, kind),
+        (None, None) => Ok(()),
+        _ => Err(CacheError::MigrationBufferMismatch { layer, kind }),
+    }
 }

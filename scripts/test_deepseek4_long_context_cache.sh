@@ -5,8 +5,9 @@ set -euo pipefail
 # server.  A short calibration prompt is extended to approximately 120K
 # actual tokenizer tokens.  That calibrated prompt is intentionally a cache
 # miss; a tool result is then appended as the next agentic turn.  The final
-# request must reuse nearly the whole long prefix instead of prefilling the
-# conversation again.
+# request reserves enough generation headroom to cross the initial 131,072
+# physical-cache boundary and must still reuse nearly the whole long prefix
+# instead of prefilling the conversation again.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_URL=${BASE_URL:-http://127.0.0.1:8080}
@@ -27,6 +28,10 @@ MAX_CACHED_RESPONSE_MS=${MAX_CACHED_RESPONSE_MS:-30000}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-600}
 MAX_TOKENS=${MAX_TOKENS:-128}
+# The long prompt itself fits the initial 131,072-token cache. Reserving this
+# continuation budget deliberately crosses that physical boundary so the gate
+# proves lossless cache growth rather than only same-capacity prefix reuse.
+CONTINUATION_MAX_TOKENS=${CONTINUATION_MAX_TOKENS:-16384}
 SENTINEL=${SENTINEL:-HF2Q_DEEPSEEK_LONG_CONTEXT_CACHE_OK}
 
 for command in awk curl date dirname jq mktemp rm sed; do
@@ -38,7 +43,7 @@ done
 for setting in TARGET_PROMPT_TOKENS MIN_LONG_PROMPT_TOKENS \
   MAX_LONG_PROMPT_TOKENS CALIBRATION_CHARS MAX_GROWTH_TTFT_MS \
   MAX_CACHED_TTFT_MS MAX_CACHED_RESPONSE_MS CURL_CONNECT_TIMEOUT_SECONDS \
-  CURL_MAX_TIME_SECONDS MAX_TOKENS; do
+  CURL_MAX_TIME_SECONDS MAX_TOKENS CONTINUATION_MAX_TOKENS; do
   value=${!setting}
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "$setting must be a positive integer (got: $value)" >&2
@@ -212,7 +217,8 @@ fi
 # Append the model's real tool call and a small tool result.  This is the
 # normal second half of an OpenCode turn, and must reuse the ~120K prefix.
 jq -n --slurpfile base "$long_request" --slurpfile prior "$long_response" \
-  --arg sentinel "$SENTINEL" '
+  --arg sentinel "$SENTINEL" \
+  --argjson continuation_max_tokens "$CONTINUATION_MAX_TOKENS" '
     $base[0]
     | .messages += [
         {
@@ -227,6 +233,7 @@ jq -n --slurpfile base "$long_request" --slurpfile prior "$long_response" \
         }
       ]
     | .tool_choice = "auto"
+    | .max_tokens = $continuation_max_tokens
   ' >"$continuation_request"
 
 continuation_started=$(epoch_ms)
@@ -269,6 +276,7 @@ jq -n \
   --argjson growth_response_ms "$growth_response_ms" \
   --argjson continuation_prompt_tokens "$continuation_prompt_tokens" \
   --argjson continuation_cached_tokens "$continuation_cached_tokens" \
+  --argjson continuation_max_tokens "$CONTINUATION_MAX_TOKENS" \
   --argjson continuation_ttft_ms "$continuation_ttft_ms" \
   --argjson continuation_response_ms "$continuation_response_ms" '{
     status: "pass",
@@ -282,6 +290,7 @@ jq -n \
     tool_result_continuation: {
       prompt_tokens: $continuation_prompt_tokens,
       cached_tokens: $continuation_cached_tokens,
+      requested_max_tokens: $continuation_max_tokens,
       suffix_tokens: ($continuation_prompt_tokens - $continuation_cached_tokens),
       cached_percent: (
         if $continuation_prompt_tokens == 0 then 0

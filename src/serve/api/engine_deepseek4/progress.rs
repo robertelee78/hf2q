@@ -75,6 +75,35 @@ impl RequestProgress {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cache_reset_diagnostic(
+        &self,
+        live_tokens: usize,
+        live_position: usize,
+        live_common_prefix_tokens: usize,
+        recovery_tokens: usize,
+        recovery_position: usize,
+        recovery_common_prefix_tokens: usize,
+        cache_poisoned: bool,
+        matrix_prefill_forced: bool,
+        cache_grew: bool,
+    ) {
+        tracing::info!(
+            request_id = self.id,
+            prompt_tokens = self.prompt_tokens,
+            live_tokens,
+            live_position,
+            live_common_prefix_tokens,
+            recovery_tokens,
+            recovery_position,
+            recovery_common_prefix_tokens,
+            cache_poisoned,
+            matrix_prefill_forced,
+            cache_grew,
+            "DeepSeek-V4 prefix reuse rejected"
+        );
+    }
+
     pub(super) fn advance_prefill(&mut self, tokens: usize) {
         self.prefill_completed_tokens = self
             .prefill_completed_tokens
