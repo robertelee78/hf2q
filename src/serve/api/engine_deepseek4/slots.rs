@@ -23,11 +23,120 @@ use super::sampling::{
     decode_token_limit, grammar_runtime, sample, sampler_config, split_reasoning,
 };
 use super::stream::StreamRouter;
-use super::{release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard};
+use super::{
+    release_completed_prefill_scratch, Deepseek4LoadedModel, Deepseek4ResumablePrefill,
+    Deepseek4ResumablePrefillAdvance, RequestScratchGuard,
+};
 
 pub(crate) struct Deepseek4SlotCompletion {
     pub(crate) result: GenerationResult,
     pub(crate) semantic_ttft: Duration,
+}
+
+pub(crate) enum Deepseek4PrefillAdvance {
+    Pending {
+        state: Deepseek4PrefillState,
+        advanced_tokens: usize,
+    },
+    Ready {
+        state: Deepseek4SlotState,
+        advanced_tokens: usize,
+    },
+}
+
+pub(crate) struct Deepseek4PrefillState {
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    stream: bool,
+    request_started: Instant,
+    prefill_started: Instant,
+    progress: RequestProgress,
+    scratch_guard: RequestScratchGuard,
+    plan: Deepseek4ResumablePrefill,
+}
+
+impl Deepseek4PrefillState {
+    pub(crate) fn begin(
+        loaded: &mut Deepseek4LoadedModel,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        stream: bool,
+    ) -> Result<Self> {
+        let scratch_guard = RequestScratchGuard::new();
+        let request_started = Instant::now();
+        let mut progress = RequestProgress::start(
+            if stream {
+                "slot-stream-yielding-prefill"
+            } else {
+                "slot-unary-yielding-prefill"
+            },
+            prompt_tokens.len(),
+            params.max_tokens,
+        );
+        let plan = loaded.begin_resumable_cold_prefill(
+            &prompt_tokens,
+            params.max_tokens,
+            &mut progress,
+        )?;
+        Ok(Self {
+            prompt_tokens,
+            params,
+            stream,
+            request_started,
+            prefill_started: Instant::now(),
+            progress,
+            scratch_guard,
+            plan,
+        })
+    }
+
+    pub(crate) fn advance(
+        mut self,
+        loaded: &mut Deepseek4LoadedModel,
+        registration: Option<&ModelRegistration>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Deepseek4PrefillAdvance> {
+        match loaded.advance_resumable_cold_prefill(
+            &self.prompt_tokens,
+            &mut self.plan,
+            &cancelled,
+            &mut self.progress,
+        )? {
+            Deepseek4ResumablePrefillAdvance::Pending { advanced_tokens } => {
+                Ok(Deepseek4PrefillAdvance::Pending {
+                    state: self,
+                    advanced_tokens,
+                })
+            }
+            Deepseek4ResumablePrefillAdvance::Ready {
+                logits,
+                cached_tokens,
+                advanced_tokens,
+            } => {
+                let prefill_duration = self.prefill_started.elapsed();
+                self.progress.finish_prefill(prefill_duration);
+                release_completed_prefill_scratch();
+                self.progress.start_decode();
+                let state = Deepseek4SlotState::from_prefill(
+                    self.prompt_tokens,
+                    self.params,
+                    logits,
+                    cached_tokens,
+                    self.stream,
+                    self.request_started,
+                    prefill_duration,
+                    self.progress,
+                    self.scratch_guard,
+                    loaded,
+                    registration,
+                )?;
+                Ok(Deepseek4PrefillAdvance::Ready {
+                    state,
+                    advanced_tokens,
+                })
+            }
+        }
+    }
 }
 
 pub(crate) struct Deepseek4SlotState {
@@ -77,6 +186,35 @@ impl Deepseek4SlotState {
         progress.finish_prefill(prefill_duration);
         release_completed_prefill_scratch();
         progress.start_decode();
+        Self::from_prefill(
+            prompt_tokens,
+            params,
+            logits,
+            cached_tokens,
+            stream,
+            request_started,
+            prefill_duration,
+            progress,
+            scratch_guard,
+            loaded,
+            registration,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prefill(
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        logits: MlxBuffer,
+        cached_tokens: usize,
+        stream: bool,
+        request_started: Instant,
+        prefill_duration: Duration,
+        progress: RequestProgress,
+        scratch_guard: RequestScratchGuard,
+        loaded: &Deepseek4LoadedModel,
+        registration: Option<&ModelRegistration>,
+    ) -> Result<Self> {
         let max_tokens = decode_token_limit(
             params.max_tokens,
             prompt_tokens.len(),

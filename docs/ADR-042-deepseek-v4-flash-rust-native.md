@@ -999,18 +999,30 @@ agent conversations through the canonical slot-aware launcher. Each slot
 advertised the complete 524,288-token serving context; no context or KV stride
 was divided by four. All four conversations passed required and automatic
 tool choice, unary and SSE tool-call encoding, tool-result continuation, and
-source-shaped arguments. The final powered cold wave completed in 49 seconds,
-cached turns reused at least 6,370/6,378 tokens with maximum cached TTFT
-227.68 ms, cached SSE completed in 8-9 seconds, and the four-agent tool-result
-wave completed in 25-26 seconds.
+source-shaped arguments. Two powered gates passed. Cached turns reused at
+least 6,677/6,685 tokens with maximum cached TTFT 268.68 ms, cached unary/SSE
+turns completed in 6-13 seconds, and every four-agent tool-result turn
+completed within 20-32 seconds. Exact server-side cold-cohort makespans were
+53.86 and 52.32 seconds (53.09-second median); client-observed semantic walls
+were 52-55 seconds.
 
 The matched llama.cpp server completed its corresponding cold four-request
-wave in 50.71 seconds on the same artifact and host, but reported four
-8,192-token slots from a 32,768-token configured context. hf2q therefore met
-the matched wall-clock bar while providing 524,288 logical tokens to every
-slot. The scheduling policy uses an eight-token decode quantum and bounded
-admission waves: DeepSeek prefill remains synchronous, so new requests wait
-while an admitted wave decodes instead of starving an existing stream.
+wave in about 54.1 seconds on the same artifact and host with `--kv-unified`,
+`--parallel 4`, and 131,072 logical tokens per slot. Its 524,288-token unified
+allocation did not fit beside the 100 GiB artifact on this 128 GiB host. hf2q
+therefore met the matched wall-clock bar while providing 524,288 logical
+tokens to every slot through demand-grown physical admission.
+
+The accepted scheduling policy uses an eight-token decode quantum and
+resumable cold prefill at atomic cache+ledger commit boundaries. At most two
+cold requests alternate complete matrix transactions through the one shared
+prefill scratch arena. Decode-ready members are parked until the bounded cold
+cohort completes prefill, preventing early responses from producing cached
+traffic that delays the remaining cold agents. Once the cohort drains,
+longest-prefix continuations run before unrelated cold work can evict a
+retained agent cache. A paired long-row graph exceeded Metal memory, and a
+batched-output-head-only spike did not improve the cold tail; neither failed
+experiment is present in the landing code.
 
 The slot-aware long-cache falsifier first exposed an affinity defect: a
 tool-result continuation matched the native recovery anchor but not the raw

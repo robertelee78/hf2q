@@ -103,7 +103,7 @@ The canonical launcher configurations resolve to:
 |---|---:|---:|---:|---:|---:|---:|
 | Gemma 4 Ara | 262,144 | 15,440 | 560 MiB | 4.434 GiB | 17.737 GiB | 35.474 GiB |
 | Qwen 3.6 APEX, TQ | 262,144 | 10,400 | 256 MiB | 2.868 GiB | 11.474 GiB | 22.947 GiB |
-| DeepSeek-V4 Flash | 524,288 | 6,880 | 32 MiB | 3.443 GiB | 13.772 GiB | 27.545 GiB |
+| DeepSeek-V4 Flash | 524,288 | 6,880 | 48 MiB | 3.459 GiB | 13.835 GiB | 27.670 GiB |
 
 These are KV/recurrent high-water bounds, not whole-process forecasts; model
 weights and transient compute scratch are separate. Gemma and Qwen therefore
@@ -146,15 +146,28 @@ canonical launchers configure four slots by default without dividing context.
 |---|---:|---|
 | Gemma 4 | 262,144 | 6,780/6,787 minimum prefix reuse; maximum cached TTFT 143.58 ms; the 24,200-token multi-slot suffix completed in 13.843 s (1,830.7 tok/s internal), versus 13.789 s / about 1,733 tok/s for the matched llama.cpp request shape. |
 | Qwen 3.6 | 262,144 | 6,684/6,684 minimum prefix reuse on a fresh persistent-KV directory; four native ChatML tool/result conversations, SSE, and source arguments passed. |
-| DeepSeek-V4 | 524,288 | Final powered gate: 6,370/6,378 minimum prefix reuse; maximum cached TTFT 227.68 ms; cached SSE completed in 8-9 s and the four-agent tool-result wave in 25-26 s. The cold four-agent makespan was 49 s, versus 50.71 s for matched llama.cpp, whose tested build divided 32,768 configured tokens into four 8,192-token slots. |
+| DeepSeek-V4 | 524,288 | Two powered gates passed: 6,677/6,685 minimum prefix reuse; maximum cached TTFT 268.68 ms; cached unary/SSE turns completed in 6-13 s and every tool-result turn completed within 20-32 s. Exact server-side cold-cohort makespans were 53.86 s and 52.32 s (53.09 s median), versus about 54.1 s for matched llama.cpp with four unified 131,072-token slots. llama.cpp's 524,288-token unified allocation did not fit beside the 100 GiB artifact on this 128 GiB host; hf2q retained 524,288 logical tokens per slot under demand-grown physical admission. |
 
-DeepSeek uses a bounded decode quantum of eight tokens. Admissions occur in
-bounded waves because its prefill graph is not yet chunk-resumable: once a
-wave starts decoding, later requests wait until that wave completes instead of
-running a long synchronous prefill that starves an existing SSE stream. Within
-the wave, every slot retains independent cache, sampler, grammar, and tool
-state. This is an explicit scheduling policy, not a claim of fused DeepSeek
-verification.
+DeepSeek uses a bounded decode quantum of eight tokens and resumable cold
+prefill at the verifier's atomic cache-commit boundary. At most two cold slots
+alternate complete matrix transactions through one scratch arena. Decode-ready
+members remain parked until the bounded cold cohort has finished prefill, then
+the cohort decodes fairly. That barrier prevents an early agent from creating
+cached continuation work that steals the remaining cold agents' deadline.
+After the cold cohort drains, cache-bearing requests take precedence over
+unrelated cold requests so a retained agent slot cannot be evicted between a
+tool call and its result. Within every wave, each slot retains independent
+cache, token ledger, sampler, grammar, and tool state. This is an explicit
+scheduling policy, not a claim of fused DeepSeek verification.
+
+The cross-family contract is the full logical context per slot, physical
+high-water admission, retained-session affinity, and fair bounded decode—not
+the DeepSeek cohort width itself. Gemma 4 and Qwen 3.6 keep their measured fast
+prefill paths and the generic 512-token scheduler quantum because their exact
+four-agent gates already meet the latency and coherence contract. A cold-cohort
+barrier may be enabled for either family only after a source-bound gate proves
+the same cold-prefill cascade; copying DeepSeek's constant without that
+evidence would delay first semantic output.
 
 The slot-aware DeepSeek long-cache gate additionally forced the initial
 131,072-token physical cache to grow to 262,144. A first spike selected a fresh

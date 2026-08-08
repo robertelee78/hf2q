@@ -1017,6 +1017,10 @@ pub struct InflightBatchedScheduler {
     /// high-water plus the caller-evaluated prompt extent; the unused
     /// generation reservation never becomes permanent residency.
     slot_committed_on_release: Vec<Option<u64>>,
+    /// Maximum logical prompt progress a driver may consume in one prefill
+    /// step. Families with their own atomic matrix transaction choose the
+    /// actual value at or below this bound and report it exactly.
+    prefill_chunk_tokens: u32,
 }
 
 impl InflightBatchedScheduler {
@@ -1065,7 +1069,12 @@ impl InflightBatchedScheduler {
             slot_high_water_bytes: vec![fixed_kv_bytes_per_slot; max_slots as usize],
             slot_reserved_bytes: vec![0; max_slots as usize],
             slot_committed_on_release: vec![None; max_slots as usize],
+            prefill_chunk_tokens: DEFAULT_PREFILL_CHUNK_TOKENS,
         }
+    }
+
+    pub fn set_prefill_chunk_tokens(&mut self, tokens: u32) {
+        self.prefill_chunk_tokens = tokens.max(1);
     }
 
     /// Read the configured shared physical KV budget. `0` is unbounded.
@@ -1563,7 +1572,7 @@ impl Scheduler for InflightBatchedScheduler {
                 };
                 Ok(SchedulerStep::Mixed {
                     prefill: self.in_flight[idx].handle,
-                    n_prefill_tokens: tokens_remaining.min(DEFAULT_PREFILL_CHUNK_TOKENS),
+                    n_prefill_tokens: tokens_remaining.min(self.prefill_chunk_tokens),
                     decode_handles,
                 })
             }
@@ -1576,7 +1585,7 @@ impl Scheduler for InflightBatchedScheduler {
                 };
                 Ok(SchedulerStep::Prefill {
                     handle: self.in_flight[idx].handle,
-                    n_tokens: tokens_remaining.min(DEFAULT_PREFILL_CHUNK_TOKENS),
+                    n_tokens: tokens_remaining.min(self.prefill_chunk_tokens),
                 })
             }
             (None, false) => Ok(SchedulerStep::Decode {

@@ -11,7 +11,9 @@ mod slots;
 mod stream;
 
 pub use sampling::generate_once;
-pub(super) use slots::{Deepseek4SlotCompletion, Deepseek4SlotState};
+pub(super) use slots::{
+    Deepseek4PrefillAdvance, Deepseek4PrefillState, Deepseek4SlotCompletion, Deepseek4SlotState,
+};
 pub use stream::generate_stream;
 
 use std::path::PathBuf;
@@ -91,6 +93,23 @@ pub(super) fn release_completed_prefill_scratch() {
     if stats.free_bytes > 0 {
         log_scratch("release", "prefill-complete", release_prefill_scratch());
     }
+}
+
+struct Deepseek4ResumablePrefill {
+    cursor: usize,
+    recovery_position: usize,
+    window_multiplier: usize,
+}
+
+enum Deepseek4ResumablePrefillAdvance {
+    Pending {
+        advanced_tokens: usize,
+    },
+    Ready {
+        logits: MlxBuffer,
+        cached_tokens: usize,
+        advanced_tokens: usize,
+    },
 }
 
 /// Fail-safe cleanup for early returns. Successful requests keep a bounded
@@ -455,6 +474,180 @@ impl Deepseek4LoadedModel {
         Ok(())
     }
 
+    fn prefill_window_multiplier(&self, token_count: usize) -> Result<usize> {
+        let explicit_prefill_windows = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_WINDOWS").is_some();
+        let mut window_multiplier = self.model.matrix_prefill_window_multiplier()?;
+        if !explicit_prefill_windows && self.cache.capacity() > INITIAL_CACHE_LENGTH {
+            window_multiplier = window_multiplier.min(8);
+        } else if !explicit_prefill_windows {
+            window_multiplier = balance_fresh_three_chunk_prefill(
+                self.cache.position(),
+                token_count,
+                self.model.cfg.sliding_window as usize,
+                window_multiplier,
+            );
+        }
+        Ok(window_multiplier)
+    }
+
+    fn begin_resumable_cold_prefill(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        progress: &mut RequestProgress,
+    ) -> Result<Deepseek4ResumablePrefill> {
+        anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
+        anyhow::ensure!(
+            prompt_tokens.len() >= self.model.cfg.sliding_window as usize,
+            "DeepSeek-V4 resumable prefill requires at least one native window"
+        );
+        anyhow::ensure!(
+            prompt_tokens.len() <= self.context_limit(),
+            "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
+            prompt_tokens.len(),
+            self.context_limit()
+        );
+        let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
+        progress.cache_reset_diagnostic(
+            self.committed_tokens.len(),
+            self.cache.position(),
+            common_prefix_len(prompt_tokens, &self.committed_tokens),
+            self.turn_anchor_tokens.len(),
+            self.turn_anchor
+                .as_ref()
+                .map_or(0, Deepseek4CacheSnapshot::position),
+            common_prefix_len(prompt_tokens, &self.turn_anchor_tokens),
+            self.cache.is_poisoned(),
+            false,
+            cache_grew,
+        );
+        self.reset_live_cache()?;
+        progress.plan_prefill(
+            0,
+            prompt_tokens.len(),
+            if cache_grew { "grow-reset" } else { "reset" },
+        );
+        let window_multiplier = self.prefill_window_multiplier(prompt_tokens.len())?;
+        Ok(Deepseek4ResumablePrefill {
+            cursor: 0,
+            recovery_position: prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS),
+            window_multiplier,
+        })
+    }
+
+    fn advance_resumable_cold_prefill(
+        &mut self,
+        prompt_tokens: &[u32],
+        plan: &mut Deepseek4ResumablePrefill,
+        cancelled: &impl Fn() -> bool,
+        progress: &mut RequestProgress,
+    ) -> Result<Deepseek4ResumablePrefillAdvance> {
+        anyhow::ensure!(
+            self.cache.position() == plan.cursor && self.committed_tokens.len() == plan.cursor,
+            "DeepSeek-V4 paused prefill cursor {} disagrees with cache {} / token ledger {}",
+            plan.cursor,
+            self.cache.position(),
+            self.committed_tokens.len()
+        );
+        anyhow::ensure!(
+            self.live_logits.is_none(),
+            "DeepSeek-V4 paused prefill published live logits before completion"
+        );
+        anyhow::ensure!(
+            !cancelled(),
+            "DeepSeek-V4 generation cancelled during prefill"
+        );
+
+        let segment_end = if plan.cursor < plan.recovery_position {
+            plan.recovery_position
+        } else {
+            prompt_tokens.len()
+        };
+        let remaining = segment_end.saturating_sub(plan.cursor);
+        anyhow::ensure!(
+            remaining > 0,
+            "DeepSeek-V4 resumable prefill made no progress"
+        );
+        let batch = matrix_prefill_chunk_len(
+            self.cache.position(),
+            remaining,
+            self.model.cfg.sliding_window as usize,
+            plan.window_multiplier,
+        );
+        if batch == 0 {
+            anyhow::ensure!(
+                remaining <= RECOVERY_TAIL_TOKENS,
+                "DeepSeek-V4 resumable prefill selected an empty chunk at cursor {} with {} tokens remaining (window={}, multiplier={})",
+                plan.cursor,
+                remaining,
+                self.model.cfg.sliding_window,
+                plan.window_multiplier
+            );
+            let start = plan.cursor;
+            let mut state = None;
+            for &token in &prompt_tokens[start..segment_end] {
+                anyhow::ensure!(
+                    !cancelled(),
+                    "DeepSeek-V4 generation cancelled during recovery-tail prefill"
+                );
+                state = Some(
+                    self.model
+                        .forward_verifier_one(token, &mut self.cache)
+                        .context("execute DeepSeek-V4 resumable recovery-tail token")?,
+                );
+                self.committed_tokens.push(token);
+                plan.cursor += 1;
+                progress.advance_prefill(1);
+            }
+            let state = state.context("DeepSeek-V4 recovery-tail prefill produced no state")?;
+            anyhow::ensure!(
+                !cancelled(),
+                "DeepSeek-V4 generation cancelled after committed recovery-tail prefill"
+            );
+            if plan.cursor < prompt_tokens.len() {
+                drop(state);
+                return Ok(Deepseek4ResumablePrefillAdvance::Pending {
+                    advanced_tokens: remaining,
+                });
+            }
+            let (logits, cached_tokens) = self.finish_prefill(state, 0)?;
+            return Ok(Deepseek4ResumablePrefillAdvance::Ready {
+                logits,
+                cached_tokens,
+                advanced_tokens: remaining,
+            });
+        }
+        let end = plan.cursor.saturating_add(batch);
+        let state = self
+            .model
+            .forward_verifier_prefill(&prompt_tokens[plan.cursor..end], &mut self.cache)
+            .context("execute DeepSeek-V4 resumable matrix prefill chunk")?;
+        self.committed_tokens
+            .extend_from_slice(&prompt_tokens[plan.cursor..end]);
+        plan.cursor = end;
+        progress.advance_prefill(batch);
+        anyhow::ensure!(
+            !cancelled(),
+            "DeepSeek-V4 generation cancelled after committed prefill chunk"
+        );
+
+        if plan.cursor == plan.recovery_position {
+            self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
+        }
+        if plan.cursor < prompt_tokens.len() {
+            drop(state);
+            return Ok(Deepseek4ResumablePrefillAdvance::Pending {
+                advanced_tokens: batch,
+            });
+        }
+        let (logits, cached_tokens) = self.finish_prefill(state, 0)?;
+        Ok(Deepseek4ResumablePrefillAdvance::Ready {
+            logits,
+            cached_tokens,
+            advanced_tokens: batch,
+        })
+    }
+
     fn append_prompt_tokens(
         &mut self,
         tokens: &[u32],
@@ -466,26 +659,7 @@ impl Deepseek4LoadedModel {
         }
         let mut state = None;
         let mut offset = 0;
-        let explicit_prefill_windows = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_WINDOWS").is_some();
-        let mut window_multiplier = self.model.matrix_prefill_window_multiplier()?;
-        if !explicit_prefill_windows && self.cache.capacity() > INITIAL_CACHE_LENGTH {
-            // A grown context-linear cache leaves less unified-memory scratch
-            // than the initial 131K allocation. Preserve the measured 2K
-            // transaction for ordinary agent sessions, but halve it after a
-            // real request crosses the first capacity boundary.
-            window_multiplier = window_multiplier.min(8);
-        } else if !explicit_prefill_windows {
-            // A fresh prompt just above two full transactions otherwise leaves
-            // a severely underfilled third matrix (4,987 -> 2,048/2,048/891).
-            // Keep the same three transactions but balance their row counts.
-            // Longer OpenCode contexts retain the measured 2,048-token path.
-            window_multiplier = balance_fresh_three_chunk_prefill(
-                self.cache.position(),
-                tokens.len(),
-                self.model.cfg.sliding_window as usize,
-                window_multiplier,
-            );
-        }
+        let window_multiplier = self.prefill_window_multiplier(tokens.len())?;
         while offset < tokens.len() {
             let batch = matrix_prefill_chunk_len(
                 self.cache.position(),

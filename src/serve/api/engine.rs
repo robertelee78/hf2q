@@ -31,6 +31,7 @@
 //! behavior (ADR-009 dense-KV, ADR-010 Q8 rerank, chat-template priority
 //! order) is preserved by construction.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -5576,6 +5577,13 @@ impl SlotReply {
             }
         }
     }
+
+    fn client_closed(&self) -> bool {
+        match self {
+            Self::Unary(_) => false,
+            Self::Stream { events, .. } => events.is_closed(),
+        }
+    }
 }
 
 /// Per-request family-aware streaming state for the generic Gemma/Qwen slot
@@ -6590,15 +6598,55 @@ fn worker_run_slot_aware(
     }
 }
 
-type Deepseek4Slot = (
-    super::engine_deepseek4::Deepseek4SlotState,
-    SlotReply,
-    SlotHandle,
-);
+enum Deepseek4SlotWork {
+    Prefill(super::engine_deepseek4::Deepseek4PrefillState),
+    Decode {
+        state: super::engine_deepseek4::Deepseek4SlotState,
+        cold_wave: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4ColdCohortPhase {
+    Idle,
+    Filling,
+    Draining,
+}
+
+fn deepseek4_cold_cohort_should_drain(
+    cohort_full: bool,
+    active_prefills: usize,
+    cold_waiting: bool,
+) -> bool {
+    cohort_full || (active_prefills == 0 && !cold_waiting)
+}
+
+fn deepseek4_cold_cohort_blocks_decode(
+    phase: Deepseek4ColdCohortPhase,
+    active_prefills: usize,
+) -> bool {
+    phase != Deepseek4ColdCohortPhase::Idle && active_prefills > 0
+}
+
+type Deepseek4Slot = (Deepseek4SlotWork, SlotReply, SlotHandle);
+
+struct Deepseek4PendingSeed {
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    reply: SlotReply,
+    handle: SlotHandle,
+    admitted_prompt_tokens: u32,
+}
 
 const DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV: &str = "HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM";
 const DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 8;
 const MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 64;
+/// Keep at most two independent cold conversations in the prefill/decode
+/// pipeline. Their matrix chunks execute sequentially through one scratch
+/// arena; this is not the paired layer-major graph that exceeded the M5 Max
+/// memory envelope. The bound keeps the oldest agents responsive without
+/// making the fourth agent wait behind three whole cold requests.
+const DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS: usize = 2;
 
 fn parse_deepseek4_slot_decode_quantum(raw: Option<&str>) -> std::result::Result<usize, String> {
     let Some(raw) = raw else {
@@ -6632,6 +6680,7 @@ fn deepseek4_slot_decode_quantum() -> usize {
 fn preferred_deepseek_session(
     sessions: &[super::engine_deepseek4::Deepseek4Session],
     active_slots: &[Option<Deepseek4Slot>],
+    reserved_slots: &[bool],
     last_used: &[u64],
     prompt_tokens: &[u32],
 ) -> SlotId {
@@ -6643,13 +6692,162 @@ fn preferred_deepseek_session(
         .iter()
         .map(super::engine_deepseek4::Deepseek4Session::is_empty)
         .collect();
-    let active: Vec<bool> = active_slots.iter().map(Option::is_some).collect();
+    let active: Vec<bool> = active_slots
+        .iter()
+        .zip(reserved_slots)
+        .map(|(slot, reserved)| slot.is_some() || *reserved)
+        .collect();
     choose_full_context_slot(
         &reusable_prefix_lengths,
         &empty_sessions,
         &active,
         last_used,
     )
+}
+
+fn deepseek4_request_reuse_score(
+    request: &Request,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    unavailable_slots: &[bool],
+) -> Option<usize> {
+    let prompt_tokens = match request {
+        Request::Generate { prompt_tokens, .. } | Request::GenerateStream { prompt_tokens, .. } => {
+            prompt_tokens
+        }
+        _ => return None,
+    };
+    Some(
+        sessions
+            .iter()
+            .zip(unavailable_slots)
+            .filter(|(_, unavailable)| !**unavailable)
+            .map(|(session, _)| session.reusable_prefix_len(prompt_tokens))
+            .max()
+            .unwrap_or(0),
+    )
+}
+
+fn choose_deepseek4_request_index(reuse_scores: &[Option<usize>], prefer_cached: bool) -> usize {
+    if let Some(index) = reuse_scores.iter().position(Option::is_none) {
+        return index;
+    }
+    if prefer_cached {
+        let mut best_index = None;
+        let mut best_score = 0;
+        for (index, score) in reuse_scores.iter().enumerate() {
+            let score = score.unwrap_or(0);
+            if score > best_score {
+                best_index = Some(index);
+                best_score = score;
+            }
+        }
+        if let Some(index) = best_index {
+            return index;
+        }
+    }
+    if let Some(index) = reuse_scores
+        .iter()
+        .position(|score| matches!(score, Some(0)))
+    {
+        return index;
+    }
+    let mut best_index = 0;
+    let mut best_score = 0;
+    for (index, score) in reuse_scores.iter().enumerate() {
+        let score = score.unwrap_or(0);
+        if score > best_score {
+            best_index = index;
+            best_score = score;
+        }
+    }
+    best_index
+}
+
+fn pop_preferred_deepseek4_request(
+    pending: &mut VecDeque<Request>,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    unavailable_slots: &[bool],
+    prefer_cached: bool,
+) -> Option<(Request, Option<usize>)> {
+    let reuse_scores: Vec<Option<usize>> = pending
+        .iter()
+        .map(|request| deepseek4_request_reuse_score(request, sessions, unavailable_slots))
+        .collect();
+    let index = choose_deepseek4_request_index(&reuse_scores, prefer_cached);
+    let request = pending.remove(index)?;
+    let score = deepseek4_request_reuse_score(&request, sessions, unavailable_slots);
+    Some((request, score))
+}
+
+fn pop_control_deepseek4_request(
+    pending: &mut VecDeque<Request>,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    unavailable_slots: &[bool],
+) -> Option<(Request, Option<usize>, usize)> {
+    if let Some(index) = pending.iter().position(|request| {
+        deepseek4_request_reuse_score(request, sessions, unavailable_slots).is_none()
+    }) {
+        return pending.remove(index).map(|request| (request, None, 0));
+    }
+    None
+}
+
+fn pop_cold_deepseek4_request(
+    pending: &mut VecDeque<Request>,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    unavailable_slots: &[bool],
+) -> Option<(Request, Option<usize>, usize)> {
+    let index = pending.iter().position(|request| {
+        matches!(
+            deepseek4_request_reuse_score(request, sessions, unavailable_slots),
+            Some(0)
+        )
+    })?;
+    pending.remove(index).map(|request| (request, Some(0), 0))
+}
+
+fn deepseek4_cold_cohort_active(slots: &[Option<Deepseek4Slot>]) -> usize {
+    slots
+        .iter()
+        .filter(|slot| {
+            slot.as_ref().is_some_and(|(work, _, _)| {
+                matches!(
+                    work,
+                    Deepseek4SlotWork::Prefill(_)
+                        | Deepseek4SlotWork::Decode {
+                            cold_wave: true,
+                            ..
+                        }
+                )
+            })
+        })
+        .count()
+}
+
+fn deepseek4_cold_prefill_active(slots: &[Option<Deepseek4Slot>]) -> usize {
+    slots
+        .iter()
+        .filter(|slot| {
+            slot.as_ref()
+                .is_some_and(|(work, _, _)| matches!(work, Deepseek4SlotWork::Prefill(_)))
+        })
+        .count()
+}
+
+fn next_deepseek4_prefill_handle(
+    slots: &[Option<Deepseek4Slot>],
+    after: Option<SlotId>,
+) -> Option<SlotHandle> {
+    if slots.is_empty() {
+        return None;
+    }
+    let start = after.map_or(0, |slot| (slot.0 as usize + 1) % slots.len());
+    (0..slots.len()).find_map(|offset| {
+        let index = (start + offset) % slots.len();
+        slots[index].as_ref().and_then(|(work, _, handle)| {
+            matches!(work, Deepseek4SlotWork::Prefill(_)).then_some(*handle)
+        })
+    })
 }
 
 fn choose_full_context_slot(
@@ -6686,12 +6884,12 @@ fn choose_full_context_slot(
 }
 
 /// DeepSeek-V4 full-context slot worker. Each physical slot retains independent
-/// compressed KV and recurrent state. Requests are admitted in bounded waves:
-/// once any slot in a wave starts decoding, newly arriving requests wait until
-/// that wave completes. DeepSeek prefill is not yet chunk-resumable, so this
-/// prevents a late multi-thousand-token prefill from starving an older streamed
-/// decode on the single model worker. Within a wave, each slot advances by a
-/// bounded decode quantum before the next slot runs.
+/// compressed KV and recurrent state. Cold matrix prefill yields only after an
+/// atomic cache+ledger commit. A bounded cold cohort fills at most two active
+/// prefills at a time, parks decode-ready members, and starts fair decode only
+/// after the cohort is fully prefetched. This prevents early responders from
+/// flooding the remaining cold agents with continuation work. No more than one
+/// prefill transaction owns the shared scratch arena at any instant.
 #[allow(clippy::too_many_arguments)]
 fn run_slot_aware_deepseek4(
     mut model: super::engine_deepseek4::Deepseek4LoadedModel,
@@ -6703,6 +6901,11 @@ fn run_slot_aware_deepseek4(
     kv_bytes_per_token: u64,
 ) {
     let decode_quantum = deepseek4_slot_decode_quantum();
+    // DeepSeek's verifier owns an architecture-specific atomic matrix chunk
+    // (normally 4K/2K/1K depending on cache shape). The worker reports exact
+    // consumed rows after each transaction; the generic 512-token cap would
+    // misdescribe that indivisible unit.
+    scheduler.set_prefill_chunk_tokens(u32::MAX);
     let mut sessions = match model.take_slot_sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -6712,14 +6915,17 @@ fn run_slot_aware_deepseek4(
         }
     };
     let mut slots: Vec<Option<Deepseek4Slot>> = (0..sessions.len()).map(|_| None).collect();
+    let mut reserved_slots = vec![false; sessions.len()];
     let mut last_used = vec![0_u64; sessions.len()];
     let mut clock = 1_u64;
-    let mut pending: Option<Request> = None;
+    let mut pending = VecDeque::new();
     let mut admission_open = true;
+    let mut last_prefill_slot = None;
+    let mut cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
     tracing::info!(
         slots = sessions.len(),
         decode_quantum,
-        admission_policy = "bounded-wave",
+        admission_policy = "two-prefill-cold-cohort-then-fair-decode-waves",
         "DeepSeek-V4 full-context session worker started"
     );
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
@@ -6729,33 +6935,92 @@ fn run_slot_aware_deepseek4(
     };
 
     'worker: loop {
-        while admission_open && slots.iter().any(Option::is_none) {
-            let request = match pending.take() {
-                Some(request) => request,
-                None => match rx.try_recv() {
-                    Ok(request) => request,
+        while pending.len() < sessions.len() {
+            match rx.try_recv() {
+                Ok(request) => pending.push_back(request),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+            }
+        }
+        if let Some(index) = pending
+            .iter()
+            .position(|request| matches!(request, Request::Shutdown))
+        {
+            let _ = pending.remove(index);
+            break 'worker;
+        }
+
+        let mut wave_seeds = Vec::with_capacity(sessions.len());
+        let cold_prefill_active = deepseek4_cold_prefill_active(&slots);
+        let mut cold_wave_seeds = 0_usize;
+        while admission_open
+            && slots.iter().any(Option::is_none)
+            && wave_seeds.len() < sessions.len()
+        {
+            while pending.len() < sessions.len() {
+                match rx.try_recv() {
+                    Ok(request) => pending.push_back(request),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
-                },
+                }
+            }
+            let selected = match cold_cohort_phase {
+                Deepseek4ColdCohortPhase::Filling => pop_control_deepseek4_request(
+                    &mut pending,
+                    &sessions,
+                    &reserved_slots,
+                )
+                .or_else(|| {
+                    (cold_prefill_active + cold_wave_seeds < DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS)
+                        .then(|| {
+                            pop_cold_deepseek4_request(&mut pending, &sessions, &reserved_slots)
+                        })
+                        .flatten()
+                }),
+                Deepseek4ColdCohortPhase::Draining => {
+                    pop_control_deepseek4_request(&mut pending, &sessions, &reserved_slots)
+                }
+                Deepseek4ColdCohortPhase::Idle => {
+                    pop_preferred_deepseek4_request(&mut pending, &sessions, &reserved_slots, true)
+                        .map(|(request, reuse)| (request, reuse, 0))
+                }
+            };
+            let Some((request, reuse_score, _cached_suffix)) = selected else {
+                break;
             };
             match request {
                 Request::Generate {
                     prompt_tokens,
                     params,
                     reply,
-                } => admit_deepseek4_slot(
-                    &mut model,
-                    &mut sessions,
-                    &mut slots,
-                    &last_used,
-                    &mut scheduler,
-                    registration.as_ref(),
-                    shared_kv_budget_bytes,
-                    kv_bytes_per_token,
-                    prompt_tokens,
-                    params,
-                    SlotReply::Unary(reply),
-                ),
+                } => {
+                    if let Some(seed) = prepare_deepseek4_slot(
+                        &mut model,
+                        &mut sessions,
+                        &slots,
+                        &reserved_slots,
+                        &last_used,
+                        &mut scheduler,
+                        registration.as_ref(),
+                        shared_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        params,
+                        SlotReply::Unary(reply),
+                    ) {
+                        reserved_slots[seed.handle.slot_id.0 as usize] = true;
+                        wave_seeds.push(seed);
+                        if matches!(reuse_score, Some(0)) {
+                            cold_cohort_phase = Deepseek4ColdCohortPhase::Filling;
+                            cold_wave_seeds += 1;
+                            if cold_prefill_active + cold_wave_seeds
+                                >= DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Request::GenerateStream {
                     prompt_tokens,
                     params,
@@ -6766,10 +7031,11 @@ fn run_slot_aware_deepseek4(
                     ..
                 } => {
                     if soft_tokens.is_empty() {
-                        admit_deepseek4_slot(
+                        if let Some(seed) = prepare_deepseek4_slot(
                             &mut model,
                             &mut sessions,
-                            &mut slots,
+                            &slots,
+                            &reserved_slots,
                             &last_used,
                             &mut scheduler,
                             registration.as_ref(),
@@ -6778,7 +7044,19 @@ fn run_slot_aware_deepseek4(
                             prompt_tokens,
                             params,
                             SlotReply::deepseek_stream(events, cancellation_counter, admission),
-                        );
+                        ) {
+                            reserved_slots[seed.handle.slot_id.0 as usize] = true;
+                            wave_seeds.push(seed);
+                            if matches!(reuse_score, Some(0)) {
+                                cold_cohort_phase = Deepseek4ColdCohortPhase::Filling;
+                                cold_wave_seeds += 1;
+                                if cold_prefill_active + cold_wave_seeds
+                                    >= DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS
+                                {
+                                    break;
+                                }
+                            }
+                        }
                     } else {
                         slot_fire_done(
                             SlotReply::deepseek_stream(events, cancellation_counter, admission),
@@ -6807,13 +7085,43 @@ fn run_slot_aware_deepseek4(
             }
             publish(&scheduler, &scheduler_stats_snapshot);
         }
+        if !wave_seeds.is_empty() {
+            seed_deepseek4_wave(
+                &mut model,
+                &mut sessions,
+                &mut slots,
+                &mut scheduler,
+                registration.as_ref(),
+                kv_bytes_per_token,
+                wave_seeds,
+            );
+            reserved_slots.fill(false);
+            publish(&scheduler, &scheduler_stats_snapshot);
+        }
+        if cold_cohort_phase == Deepseek4ColdCohortPhase::Filling {
+            let cohort_full = slots.iter().all(Option::is_some);
+            let cold_waiting = pending.iter().any(|request| {
+                matches!(
+                    deepseek4_request_reuse_score(request, &sessions, &reserved_slots),
+                    Some(0)
+                )
+            });
+            if deepseek4_cold_cohort_should_drain(
+                cohort_full,
+                deepseek4_cold_prefill_active(&slots),
+                cold_waiting,
+            ) {
+                cold_cohort_phase = Deepseek4ColdCohortPhase::Draining;
+                admission_open = false;
+            }
+        }
         if slots.iter().any(Option::is_some) {
             admission_open = false;
         }
 
         match scheduler.step() {
             Ok(SchedulerStep::Idle) => match rx.blocking_recv() {
-                Some(request) => pending = Some(request),
+                Some(request) => pending.push_back(request),
                 None => break 'worker,
             },
             Ok(SchedulerStep::Decode { handles }) => {
@@ -6829,16 +7137,83 @@ fn run_slot_aware_deepseek4(
                     kv_bytes_per_token,
                     decode_quantum,
                 );
-                if slots.iter().all(Option::is_none) {
+                if cold_cohort_phase == Deepseek4ColdCohortPhase::Draining
+                    && deepseek4_cold_cohort_active(&slots) == 0
+                {
+                    cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
+                    admission_open = true;
+                } else if cold_cohort_phase == Deepseek4ColdCohortPhase::Idle
+                    && slots.iter().all(Option::is_none)
+                {
                     admission_open = true;
                 }
                 publish(&scheduler, &scheduler_stats_snapshot);
             }
-            Ok(SchedulerStep::Prefill { .. }) | Ok(SchedulerStep::Mixed { .. }) => {
-                tracing::error!(
-                    "DeepSeek-V4 SlotAware scheduler exposed prefill after synchronous seed"
+            Ok(SchedulerStep::Prefill { handle, .. }) => {
+                let handle =
+                    next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
+                last_prefill_slot = Some(handle.slot_id);
+                advance_deepseek4_prefill(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    handle,
+                    kv_bytes_per_token,
                 );
-                break 'worker;
+                if cold_cohort_phase == Deepseek4ColdCohortPhase::Filling
+                    && slots.iter().any(Option::is_none)
+                {
+                    admission_open = true;
+                }
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
+            Ok(SchedulerStep::Mixed {
+                prefill,
+                decode_handles,
+                ..
+            }) => {
+                let cohort_barrier = deepseek4_cold_cohort_blocks_decode(
+                    cold_cohort_phase,
+                    deepseek4_cold_prefill_active(&slots),
+                );
+                if !cohort_barrier {
+                    decode_batch_deepseek4(
+                        &mut model,
+                        &mut sessions,
+                        &mut slots,
+                        &mut last_used,
+                        &mut clock,
+                        &mut scheduler,
+                        registration.as_ref(),
+                        &decode_handles,
+                        kv_bytes_per_token,
+                        decode_quantum,
+                    );
+                }
+                let prefill =
+                    next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(prefill);
+                last_prefill_slot = Some(prefill.slot_id);
+                advance_deepseek4_prefill(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    prefill,
+                    kv_bytes_per_token,
+                );
+                if cold_cohort_phase == Deepseek4ColdCohortPhase::Filling
+                    && slots.iter().any(Option::is_none)
+                {
+                    admission_open = true;
+                } else if cold_cohort_phase == Deepseek4ColdCohortPhase::Idle
+                    && slots.iter().all(Option::is_none)
+                {
+                    admission_open = true;
+                }
+                publish(&scheduler, &scheduler_stats_snapshot);
             }
             Err(error) => {
                 tracing::error!(?error, "DeepSeek-V4 SlotAware scheduler step failed");
@@ -6854,10 +7229,11 @@ fn run_slot_aware_deepseek4(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn admit_deepseek4_slot(
+fn prepare_deepseek4_slot(
     model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
     sessions: &mut [super::engine_deepseek4::Deepseek4Session],
-    slots: &mut [Option<Deepseek4Slot>],
+    slots: &[Option<Deepseek4Slot>],
+    reserved_slots: &[bool],
     last_used: &[u64],
     scheduler: &mut InflightBatchedScheduler,
     registration: Option<&super::registry::ModelRegistration>,
@@ -6866,8 +7242,9 @@ fn admit_deepseek4_slot(
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
     mut reply: SlotReply,
-) {
-    let preferred = preferred_deepseek_session(sessions, slots, last_used, &prompt_tokens);
+) -> Option<Deepseek4PendingSeed> {
+    let preferred =
+        preferred_deepseek_session(sessions, slots, reserved_slots, last_used, &prompt_tokens);
     let needed = if shared_kv_budget_bytes == 0 || kv_bytes_per_token == 0 {
         0
     } else {
@@ -6892,7 +7269,7 @@ fn admit_deepseek4_slot(
                 reply,
                 anyhow::anyhow!("DeepSeek-V4 full-context slot admit failed: {error}"),
             );
-            return;
+            return None;
         }
     };
 
@@ -6910,7 +7287,7 @@ fn admit_deepseek4_slot(
                     "DeepSeek-V4 full-context slot admit returned no physical slot for a nonzero decode budget"
                 ),
             );
-            return;
+            return None;
         }
         reply.accept_stream_admission();
         let slot_index = preferred.0 as usize;
@@ -6938,29 +7315,154 @@ fn admit_deepseek4_slot(
                 sessions[slot_index].swap_with_loaded(model);
             }
         }
-        return;
+        return None;
     };
 
     reply.accept_stream_admission();
-    let slot_index = handle.slot_id.0 as usize;
-    sessions[slot_index].swap_with_loaded(model);
-    let is_stream = matches!(&reply, SlotReply::Stream { .. });
-    let seed = super::engine_deepseek4::Deepseek4SlotState::prefill_seed(
-        model,
+    Some(Deepseek4PendingSeed {
         prompt_tokens,
         params,
-        registration,
-        is_stream,
-        || match &reply {
-            SlotReply::Unary(_) => false,
-            SlotReply::Stream { events, .. } => events.is_closed(),
-        },
-    );
+        reply,
+        handle,
+        admitted_prompt_tokens: admitted.prompt_tokens,
+    })
+}
+
+fn seed_deepseek4_wave(
+    model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    kv_bytes_per_token: u64,
+    seeds: Vec<Deepseek4PendingSeed>,
+) {
+    for seed in seeds {
+        seed_deepseek4_single(
+            model,
+            sessions,
+            slots,
+            scheduler,
+            registration,
+            kv_bytes_per_token,
+            seed,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_deepseek4_single(
+    model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    kv_bytes_per_token: u64,
+    seed: Deepseek4PendingSeed,
+) {
+    let Deepseek4PendingSeed {
+        prompt_tokens,
+        params,
+        reply,
+        handle,
+        admitted_prompt_tokens,
+    } = seed;
+    let slot_index = handle.slot_id.0 as usize;
+    let resumable_cold = sessions[slot_index].reusable_prefix_len(&prompt_tokens) == 0
+        && prompt_tokens.len() >= model.model.cfg.sliding_window as usize;
     sessions[slot_index].swap_with_loaded(model);
-    match seed {
-        Ok(state) => {
-            scheduler.advance_after_prefill(handle, admitted.prompt_tokens);
-            slots[slot_index] = Some((state, reply, handle));
+    let is_stream = matches!(&reply, SlotReply::Stream { .. });
+    let result = if resumable_cold {
+        super::engine_deepseek4::Deepseek4PrefillState::begin(
+            model,
+            prompt_tokens,
+            params,
+            is_stream,
+        )
+        .map(Deepseek4SlotWork::Prefill)
+    } else {
+        super::engine_deepseek4::Deepseek4SlotState::prefill_seed(
+            model,
+            prompt_tokens,
+            params,
+            registration,
+            is_stream,
+            || reply.client_closed(),
+        )
+        .map(|state| Deepseek4SlotWork::Decode {
+            state,
+            cold_wave: false,
+        })
+    };
+    sessions[slot_index].swap_with_loaded(model);
+    match result {
+        Ok(work) => {
+            if matches!(work, Deepseek4SlotWork::Decode { .. }) {
+                scheduler.advance_after_prefill(handle, admitted_prompt_tokens);
+            }
+            slots[slot_index] = Some((work, reply, handle));
+        }
+        Err(error) => {
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                sessions[slot_index].committed_tokens().len(),
+                kv_bytes_per_token,
+            );
+            let _ = sessions[slot_index].reset();
+            scheduler.release(handle);
+            fire_deepseek4_error(reply, error);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_deepseek4_prefill(
+    model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+) {
+    let slot_index = handle.slot_id.0 as usize;
+    let Some((work, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take) else {
+        return;
+    };
+    if installed != handle {
+        slots[slot_index] = Some((work, reply, installed));
+        return;
+    }
+    let Deepseek4SlotWork::Prefill(state) = work else {
+        slots[slot_index] = Some((work, reply, installed));
+        return;
+    };
+
+    sessions[slot_index].swap_with_loaded(model);
+    let result = state.advance(model, registration, || reply.client_closed());
+    sessions[slot_index].swap_with_loaded(model);
+    match result {
+        Ok(super::engine_deepseek4::Deepseek4PrefillAdvance::Pending {
+            state,
+            advanced_tokens,
+        }) => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            slots[slot_index] = Some((Deepseek4SlotWork::Prefill(state), reply, handle));
+        }
+        Ok(super::engine_deepseek4::Deepseek4PrefillAdvance::Ready {
+            state,
+            advanced_tokens,
+        }) => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            slots[slot_index] = Some((
+                Deepseek4SlotWork::Decode {
+                    state,
+                    cold_wave: true,
+                },
+                reply,
+                handle,
+            ));
         }
         Err(error) => {
             record_retained_slot_kv(
@@ -6990,14 +7492,22 @@ fn decode_batch_deepseek4(
 ) {
     for &handle in handles {
         let slot_index = handle.slot_id.0 as usize;
-        let Some((mut state, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
+        let Some((work, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
         else {
             continue;
         };
         if installed != handle {
-            slots[slot_index] = Some((state, reply, installed));
+            slots[slot_index] = Some((work, reply, installed));
             continue;
         }
+        let Deepseek4SlotWork::Decode {
+            mut state,
+            cold_wave,
+        } = work
+        else {
+            slots[slot_index] = Some((work, reply, installed));
+            continue;
+        };
         if let SlotReply::Stream { events, cancel, .. } = &reply {
             if events.is_closed() {
                 state.cancelled();
@@ -7100,7 +7610,11 @@ fn decode_batch_deepseek4(
                 Err(error) => fire_deepseek4_error(reply, error),
             }
         } else {
-            slots[slot_index] = Some((state, reply, handle));
+            slots[slot_index] = Some((
+                Deepseek4SlotWork::Decode { state, cold_wave },
+                reply,
+                handle,
+            ));
         }
     }
 }
@@ -20313,6 +20827,60 @@ mod tests {
                 "invalid quantum {invalid:?} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn deepseek_queue_preserves_warm_agent_affinity_between_bounded_cold_cohorts() {
+        assert_eq!(
+            choose_deepseek4_request_index(&[Some(12_000), None, Some(24_000)], true),
+            1,
+            "shutdown and other control work must not wait behind generation"
+        );
+        assert_eq!(
+            choose_deepseek4_request_index(&[Some(0), Some(0), Some(0)], true),
+            0,
+            "equally cold requests remain FIFO"
+        );
+        assert_eq!(
+            choose_deepseek4_request_index(&[Some(12_000), Some(8_000), Some(24_000)], true),
+            2,
+            "the longest reusable prefix wins"
+        );
+        assert_eq!(
+            choose_deepseek4_request_index(&[Some(0), Some(12_000), Some(8_000)], true),
+            1,
+            "a retained continuation must run before unrelated work can evict its slot"
+        );
+        assert_eq!(
+            choose_deepseek4_request_index(&[Some(0), Some(0)], true),
+            0,
+            "cached preference falls back to FIFO cold work when no continuation arrives"
+        );
+    }
+
+    #[test]
+    fn deepseek_cold_cohort_parks_decode_until_bounded_prefill_finishes() {
+        assert!(!deepseek4_cold_cohort_should_drain(false, 2, true));
+        assert!(!deepseek4_cold_cohort_should_drain(false, 1, false));
+        assert!(deepseek4_cold_cohort_should_drain(false, 0, false));
+        assert!(deepseek4_cold_cohort_should_drain(true, 2, true));
+
+        assert!(deepseek4_cold_cohort_blocks_decode(
+            Deepseek4ColdCohortPhase::Filling,
+            1
+        ));
+        assert!(deepseek4_cold_cohort_blocks_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            2
+        ));
+        assert!(!deepseek4_cold_cohort_blocks_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            0
+        ));
+        assert!(!deepseek4_cold_cohort_blocks_decode(
+            Deepseek4ColdCohortPhase::Idle,
+            2
+        ));
     }
 
     #[test]
