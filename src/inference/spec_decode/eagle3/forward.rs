@@ -346,6 +346,11 @@ pub fn dispatch_eagle3_hidden_norm(
     cfg: &Eagle3DrafterConfig,
     seq_len: u32,
 ) -> Result<MlxBuffer> {
+    // The production encoder uses MTLDispatchTypeConcurrent. The FC
+    // projection that normally produces `fc_output_gpu` may therefore still
+    // be running when this RMSNorm is encoded unless the RAW edge is made
+    // explicit. CPU-uploaded unit inputs hid this dependency historically.
+    encoder.memory_barrier();
     dispatch_eagle3_rms_norm_seq_x_hidden(
         encoder,
         registry,
@@ -465,6 +470,9 @@ pub fn dispatch_eagle3_concat_2x_hidden(
             vec![seq_len as usize, 2 * hidden_usize],
         )
         .map_err(|e| anyhow!("alloc concat output: {e}"))?;
+    // Both normalized branches are GPU-produced in the full drafter chain.
+    // Order their writes before the concurrent concat readers.
+    encoder.memory_barrier();
     // Marker — concat dispatch is appended below.
     // Copy embeds → dst columns [0, hidden).
     dispatch_feature_concat_f32(
@@ -492,6 +500,11 @@ pub fn dispatch_eagle3_concat_2x_hidden(
         dst_stride,
     )
     .context("dispatch_feature_concat_f32 hidden branch")?;
+    // The two concat dispatches write disjoint columns and may overlap, but
+    // every Q/K/V projection that follows reads the complete destination.
+    // One barrier here preserves that useful Q/K/V overlap without forcing a
+    // redundant barrier before each projection.
+    encoder.memory_barrier();
     Ok(dst)
 }
 
@@ -6087,46 +6100,64 @@ mod tests {
             Some(t) => t,
             None => return,
         };
-        // Reference: unbatched variant.
-        let logits_ref = dispatch_eagle3_drafter_forward(
-            &device,
-            &mut registry,
-            &target_aux_gpu,
-            &embeds_gpu,
-            &tensors,
-            &cfg,
-            1,
-            0,
-        )
-        .expect("unbatched");
-        // New cache-aware variant.
-        let mut cache =
-            DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("cache");
-        let logits_cache = dispatch_eagle3_drafter_forward_with_kv_cache(
-            &device,
-            &mut registry,
-            &target_aux_gpu,
-            &embeds_gpu,
-            &tensors,
-            &cfg,
-            1,
-            0,
-            &mut cache,
-            None,
-        )
-        .expect("with cache");
-        assert_eq!(logits_ref.len(), logits_cache.len());
-        for (i, (a, b)) in logits_ref.iter().zip(logits_cache.iter()).enumerate() {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "logits drift at idx {}: ref={} cache={}",
-                i,
-                a,
-                b,
-            );
+        // Ordinary suites execute once. Release verification can run a
+        // substantial same-process soak without paying cargo/test-process
+        // startup for every repetition.
+        let repetitions = std::env::var("HF2Q_EAGLE3_EQUIVALENCE_REPETITIONS")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("HF2Q_EAGLE3_EQUIVALENCE_REPETITIONS must be an integer")
+            })
+            .unwrap_or(1);
+        assert!(
+            (1..=1000).contains(&repetitions),
+            "HF2Q_EAGLE3_EQUIVALENCE_REPETITIONS must be in 1..=1000"
+        );
+        for repetition in 0..repetitions {
+            // Reference: unbatched variant.
+            let logits_ref = dispatch_eagle3_drafter_forward(
+                &device,
+                &mut registry,
+                &target_aux_gpu,
+                &embeds_gpu,
+                &tensors,
+                &cfg,
+                1,
+                0,
+            )
+            .expect("unbatched");
+            // New cache-aware variant.
+            let mut cache =
+                DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("cache");
+            let logits_cache = dispatch_eagle3_drafter_forward_with_kv_cache(
+                &device,
+                &mut registry,
+                &target_aux_gpu,
+                &embeds_gpu,
+                &tensors,
+                &cfg,
+                1,
+                0,
+                &mut cache,
+                None,
+            )
+            .expect("with cache");
+            assert_eq!(logits_ref.len(), logits_cache.len());
+            for (i, (a, b)) in logits_ref.iter().zip(logits_cache.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "logits drift at repetition {} idx {}: ref={} cache={}",
+                    repetition,
+                    i,
+                    a,
+                    b,
+                );
+            }
+            assert_eq!(cache.len(), 1);
         }
-        assert_eq!(cache.len(), 1);
     }
 
     #[test]
