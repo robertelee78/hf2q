@@ -205,12 +205,20 @@ such as OpenCode. Point the client's OpenAI-compatible base URL at
 (normally the GGUF file stem):
 
 ```bash
-HF2Q_DEEPSEEK_MAX_SEQ_LEN=131072 hf2q serve \
-  --model ./out/DeepSeek-V4-Flash-0731-Q2_K_S.gguf \
-  --port 8080
+./scripts/serve_deepseek4_opencode.sh
+
+# A different explicitly supported GGUF can be served without hf2q provenance:
+MODEL=./out/DeepSeek-V4-Flash-0731.gguf PORT=8090 \
+  ./scripts/serve_deepseek4_opencode.sh
 
 curl http://127.0.0.1:8080/v1/models
 ```
+
+On the target M5 Max host, the launcher defaults to the schema-v2,
+source-bound `deepseek4-agentic-q2` reproduction that passed the strict
+coherence, throughput, tool-use, and long-prefix cache gates. It enables
+operator progress telemetry and rejects unsafe port or memory state before
+mapping the approximately 100 GiB model.
 
 Unary and streaming chat completions support reasoning content, OpenAI tools,
 required/automatic tool choice, parallel DSML invokes, cancellation, and usage

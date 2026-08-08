@@ -899,6 +899,13 @@ as a speedup. It remains over the historical 159.953-217.5 tok/s llama.cpp
 long-prompt observations, while the current strict matched performance claim
 is limited to the cooled three-trial gate above.
 
+The canonical OpenCode launcher defaults to that same schema-v2 reproduced
+artifact, not the earlier schema-v1 mixed artifact or the rejected plain
+Q2_K_S artifact. `MODEL` remains an explicit operator override because serving
+supports compatible external GGUFs independent of producer identity. This
+keeps the turnkey path bound to the exact source receipt and artifact hash used
+by the accepted gates without turning provenance into a runtime restriction.
+
 The parity harness now cools between measured trials as well as before and
 between runtime arms. External source reviews, including Kimi and Claude,
 supply testable hypotheses only; source inspection plus exact hf2q

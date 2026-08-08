@@ -48,7 +48,10 @@
 #   CHECK_ONLY=1 scripts/serve_deepseek4_opencode.sh        # preflight only
 set -euo pipefail
 
-MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
+# The default is the schema-v2, source-bound reproduction used by the strict
+# coherence/performance gate. Operators may still set MODEL to any explicitly
+# supported DeepSeek-V4 GGUF; serving is not restricted by producer identity.
+MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2-repro.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 CONTEXT_LEN="${CONTEXT_LEN:-524288}"
