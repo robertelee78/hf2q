@@ -257,6 +257,136 @@ fn route_stream_fragment(
     Ok(())
 }
 
+/// Per-request DeepSeek stream protocol state, separated from the verifier
+/// loop so SlotAware can interleave several generations without losing DSML
+/// tool-call framing, reasoning boundaries, or semantic-TTFT accounting.
+pub(super) struct StreamRouter {
+    reasoning: Option<ReasoningSplitter>,
+    tools: Option<ToolCallSplitter>,
+    tool_body: String,
+    pending_content_whitespace: String,
+    tool_index: usize,
+    saw_tool: bool,
+    request_started: Instant,
+    first_visible_at: Option<Duration>,
+}
+
+impl StreamRouter {
+    pub(super) fn new(
+        registration: Option<&ModelRegistration>,
+        reasoning_forced_open: bool,
+        request_started: Instant,
+    ) -> Self {
+        Self {
+            reasoning: registration.and_then(|registration| {
+                registry::make_reasoning_splitter(registration, reasoning_forced_open)
+            }),
+            tools: registration.and_then(ToolCallSplitter::from_registration),
+            tool_body: String::new(),
+            pending_content_whitespace: String::new(),
+            tool_index: 0,
+            saw_tool: false,
+            request_started,
+            first_visible_at: None,
+        }
+    }
+
+    pub(super) fn push(
+        &mut self,
+        fragment: &str,
+        decoded_running: &str,
+        runtime: &mut Option<GrammarRuntime>,
+        registration: Option<&ModelRegistration>,
+        events: &mpsc::Sender<GenerationEvent>,
+    ) -> Result<()> {
+        trigger_tool_grammar_on_raw_marker(decoded_running, runtime, registration)?;
+        route_stream_fragment(
+            fragment,
+            &mut self.reasoning,
+            &mut self.tools,
+            &mut self.tool_body,
+            &mut self.pending_content_whitespace,
+            &mut self.tool_index,
+            &mut self.saw_tool,
+            runtime,
+            registration,
+            events,
+            self.request_started,
+            &mut self.first_visible_at,
+        )
+    }
+
+    pub(super) fn finish(
+        &mut self,
+        runtime: &mut Option<GrammarRuntime>,
+        registration: Option<&ModelRegistration>,
+        events: &mpsc::Sender<GenerationEvent>,
+    ) -> Result<bool> {
+        if let Some(splitter) = self.reasoning.as_mut() {
+            if let Some((slot, text)) = splitter.finish() {
+                match slot {
+                    SplitSlot::Reasoning => send_visible(
+                        events,
+                        GenerationEvent::Delta {
+                            kind: DeltaKind::Reasoning,
+                            text,
+                        },
+                        self.request_started,
+                        &mut self.first_visible_at,
+                    )?,
+                    SplitSlot::Content => route_tool_content(
+                        text,
+                        &mut self.tools,
+                        &mut self.tool_body,
+                        &mut self.pending_content_whitespace,
+                        &mut self.tool_index,
+                        &mut self.saw_tool,
+                        runtime,
+                        registration,
+                        events,
+                        self.request_started,
+                        &mut self.first_visible_at,
+                    )?,
+                }
+            }
+        }
+        if let Some(splitter) = self.tools.as_mut() {
+            if let Some(event) = splitter.finish() {
+                match event {
+                    ToolCallEvent::Content(text) => emit_or_buffer_content(
+                        text,
+                        &mut self.pending_content_whitespace,
+                        events,
+                        self.request_started,
+                        &mut self.first_visible_at,
+                    )?,
+                    ToolCallEvent::ToolCallText(text) => {
+                        self.tool_body.push_str(&text);
+                        anyhow::bail!("DeepSeek-V4 generation ended inside a DSML tool block");
+                    }
+                    ToolCallEvent::ToolCallOpen | ToolCallEvent::ToolCallClose => {}
+                }
+            }
+        }
+        if !self.saw_tool && !self.pending_content_whitespace.is_empty() {
+            send_visible(
+                events,
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: std::mem::take(&mut self.pending_content_whitespace),
+                },
+                self.request_started,
+                &mut self.first_visible_at,
+            )?;
+        }
+        Ok(self.saw_tool)
+    }
+
+    pub(super) fn first_visible_at(&self) -> Option<Duration> {
+        self.first_visible_at
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_stream(
     loaded: &mut Deepseek4LoadedModel,

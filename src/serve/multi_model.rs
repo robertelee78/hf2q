@@ -155,6 +155,10 @@ pub struct EngineConfig {
     /// as an `anyhow::Error` and `cmd_serve` aborts startup with a
     /// non-zero exit code (fail-loud per ADR-040 §7 mantra).
     pub engine_mode: crate::serve::api::engine::EngineMode,
+    /// Aggregate physical KV-cache budget for SlotAware full-context slots.
+    /// Logical context capacity is independent of this value. `None`/zero
+    /// preserves the unbounded legacy behavior.
+    pub kv_cache_budget_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for EngineConfig {
@@ -170,6 +174,7 @@ impl std::fmt::Debug for EngineConfig {
             // scheduler-policy selection so operator log greps + test
             // assertions see what mode the engine spawn will request.
             .field("engine_mode", &self.engine_mode)
+            .field("kv_cache_budget_bytes", &self.kv_cache_budget_bytes)
             .finish()
     }
 }

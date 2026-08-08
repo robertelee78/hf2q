@@ -109,6 +109,34 @@ pub(super) fn allocate_buffer(
         })
 }
 
+/// Reserve append-only KV storage without zero-filling or registering the
+/// whole virtual range in Metal's residency set. The DeepSeek cache cursor and
+/// per-layer visibility bounds guarantee that every observable row has been
+/// written before a kernel may read it. Recurrent compressor state must use
+/// [`allocate_buffer`] because reset initializes values that future steps read.
+pub(super) fn allocate_overwrite_buffer(
+    device: &MlxDevice,
+    layer: usize,
+    kind: CacheKind,
+    plan: &CacheBufferPlan,
+) -> Result<MlxBuffer, CacheError> {
+    let bytes = usize::try_from(plan.bytes).map_err(|_| CacheError::AddressSpace {
+        layer,
+        kind,
+        bytes: plan.bytes,
+    })?;
+    // SAFETY: attention/indexer KV rows are hidden by `next_position` and the
+    // layer cache-step valid counts until the corresponding encode operation
+    // has overwritten them. This helper is never used for compressor state.
+    unsafe { device.alloc_buffer_for_overwrite(bytes, plan.dtype, plan.shape.clone()) }.map_err(
+        |source| CacheError::Allocate {
+            layer,
+            kind,
+            source,
+        },
+    )
+}
+
 pub(super) fn allocate_optional(
     device: &MlxDevice,
     layer: usize,

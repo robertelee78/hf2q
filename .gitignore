@@ -53,6 +53,7 @@ logs/
 # Data artifacts — local databases and lock files
 *.rvf
 *.rvf.lock
+*.rvf.idmap.json
 ruvector.db
 
 # Local profiling data and scratch docs

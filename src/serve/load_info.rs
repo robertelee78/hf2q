@@ -325,40 +325,27 @@ pub struct LoadInfo {
     /// future iter may unify).
     pub tq_kv_active: bool,
 
-    /// **ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1)** — exact per-token KV
-    /// byte cost when the architecture is heterogeneous in shape across
-    /// layers (e.g. Gemma 4: sliding layers use `num_key_value_heads ×
-    /// head_dim`, full-attention layers use `num_global_key_value_heads
-    /// × global_head_dim`).
+    /// Exact token-linear physical KV cost for the active architecture path.
     ///
     /// When `Some(n)`, [`Self::kv_bytes_per_token`] returns `n` verbatim
     /// instead of the flattened `n_layers × n_kv_heads × head_dim × 4 × 2`
-    /// scalar formula. When `None`, the flattened formula is used (the
-    /// homogeneous-architecture path: Qwen3.5/3.6 keep one
-    /// `(n_kv_heads, head_dim)` shape across all layers).
-    ///
-    /// Builders populate this with `sum_over_layers(n_kv_heads_l ×
-    /// head_dim_l × dtype_bytes × 2)`, computed against the architecture
-    /// config's per-layer accessors (e.g. for Gemma 4 the configured
-    /// `config.layer_types` + `config.num_kv_heads_for_layer(i)` +
-    /// `config.head_dim_for_layer(i)` at `src/serve/config.rs:346-353`).
-    ///
-    /// Pre-iter-A5c, Gemma 4 flattened to the SLIDING shape (8×256) —
-    /// for canonical 30-layer Gemma 4 27B with 5 full-attn layers
-    /// (2×512) this OVER-counts by ~9% (61_440 vs exact 56_320 elements
-    /// per token) — safe upper bound (false-rejects borderline
-    /// requests) but not the operator-honest exact value the ADR
-    /// promises. iter-A5c closes this gap.
+    /// fallback. Fixed recurrent state and sliding-window rings are allocated
+    /// with the slot scaffold; this value covers only cursor-visible storage
+    /// that grows with the request's logical context.
     pub kv_bytes_per_token_override: Option<u64>,
+
+    /// Physical KV bytes committed for each slot when its family scaffold is
+    /// provisioned, independent of logical context length. This includes
+    /// Gemma sliding rings and Qwen DeltaNet recurrent/conv state.
+    pub kv_fixed_bytes_per_slot_override: Option<u64>,
 }
 
 impl LoadInfo {
-    /// **ADR-040 §3.5 iter-A5b** — operator-honest upper bound on
-    /// per-token KV bytes for this loaded model.
+    /// Token-linear physical KV bytes retained by this loaded model.
     ///
     /// The formula mirrors [`estimate_kv_tokens`] (used for the load
     /// banner), generalised to the production
-    /// "K + V, F32-equivalent worst case" shape so the engine seam can
+    /// legacy F32 K+V shape so the engine seam can
     /// compute `kv_bytes_needed = (prompt_tokens + max_tokens) *
     /// kv_bytes_per_token()` at admit time without needing per-arch
     /// model state.
@@ -369,16 +356,8 @@ impl LoadInfo {
     /// n_layers × n_kv_heads × head_dim × dtype_bytes × 2  (K and V)
     /// ```
     ///
-    /// where `dtype_bytes = 4` (F32) is the conservative upper bound
-    /// that matches the legacy [`estimate_kv_tokens`] formula. Real
-    /// production KV may live in F16 (`HF2Q_F16_KV`), packed U8 (TQ,
-    /// ADR-007), or hybrid Full/Sliding allocations (Gemma 4 sliding
-    /// layers cap at `sliding_window`, not `max_seq_len`) — every one
-    /// of those is at-most-equal to this F32-flat estimate. Using the
-    /// upper bound means [`AdmitError::SlotBudgetExceeded`] rejects
-    /// requests whose maximum possible KV would exceed the per-slot
-    /// budget — operator-honest false-reject of borderline cases,
-    /// never a false-accept that would surface as mid-decode OOM.
+    /// where `dtype_bytes = 4` (F32). Family builders MUST set the override
+    /// for hybrid, packed, recurrent, or mixed-layer cache layouts.
     ///
     /// Returns `0` when any of `n_layers`, `n_key_value_heads`, or
     /// `head_dim` is zero (the synthetic-fixture / test-loader path);
@@ -386,28 +365,8 @@ impl LoadInfo {
     /// [`crate::serve::scheduler::AdmitRequest::kv_bytes_needed`]'s
     /// `0`-means-disabled semantics).
     ///
-    /// # Why F32 not the actual KV dtype
-    ///
-    /// `LoadInfo` does not currently carry the per-layer KV dtype
-    /// (TQ + hybrid arches have heterogeneous dtypes per layer — see
-    /// `inference/models/gemma4/kv_cache.rs` `MlxKvCache` (TQ U8 +
-    /// F32 norms) vs `DenseKvBuffers` (F16 or F32 per `HF2Q_F16_KV`)).
-    /// Threading the per-layer dtype vector through the engine seam
-    /// would re-litigate the bytes-vs-tokens decision documented at
-    /// `serve/scheduler.rs` iter-A5 header. F32 is the largest dtype
-    /// reachable in production today; using it as the upper bound is
-    /// the simplest operator-honest choice that does not require
-    /// per-arch math at the engine seam.
-    ///
-    /// # iter-A5c (cfa-A5b CRITICAL #1) — exact per-layer math
-    ///
-    /// For heterogeneous architectures (Gemma 4 sliding vs full layers
-    /// have DIFFERENT `(n_kv_heads, head_dim)` shapes), the loader
-    /// populates [`Self::kv_bytes_per_token_override`] with the EXACT
-    /// per-layer sum and that value short-circuits the scalar formula
-    /// below. Without the override we would over-count canonical Gemma
-    /// 4 27B by ~9% (flattened 30×8×256 vs exact 25×8×256 + 5×2×512)
-    /// — safe upper bound but not operator-honest exact.
+    /// Family-specific layout math is computed at load time and stored in
+    /// [`Self::kv_bytes_per_token_override`], keeping the scheduler generic.
     pub fn kv_bytes_per_token(&self) -> u64 {
         if let Some(exact) = self.kv_bytes_per_token_override {
             return exact;
@@ -424,6 +383,11 @@ impl LoadInfo {
             .saturating_mul(hd)
             .saturating_mul(4)
             .saturating_mul(2)
+    }
+
+    /// Fixed physical KV floor already resident for every provisioned slot.
+    pub fn kv_fixed_bytes_per_slot(&self) -> u64 {
+        self.kv_fixed_bytes_per_slot_override.unwrap_or(0)
     }
 
     /// **ADR-040 §3.5 iter-A5b** — compute the KV byte cost a request
@@ -447,72 +411,207 @@ impl LoadInfo {
     }
 }
 
-/// **ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1)** — exact per-token KV byte
-/// cost for a Gemma 4 config, summed across the heterogeneous per-layer
-/// `(num_kv_heads, head_dim)` shape.
-///
-/// Gemma 4 carries two distinct KV shapes:
-/// - **Sliding** layers: `num_key_value_heads × head_dim` (canonical
-///   27B: 8 × 256).
-/// - **Full**-attention layers: `num_global_key_value_heads ×
-///   global_head_dim` (canonical 27B: 2 × 512).
-///
-/// The flattened scalar formula at [`LoadInfo::kv_bytes_per_token`] uses
-/// only the sliding shape (the values stored on `LoadInfo` today via
-/// `GemmaLoadedModel::build_load_info`), over-counting canonical 30-layer
-/// Gemma 4 27B by ~9% (61_440 vs exact 56_320 elements per token). The
-/// over-count is a SAFE upper bound (false-rejects borderline requests,
-/// never under-counts → no false-accept that would surface as mid-decode
-/// OOM), but ADR-040 §3.5 promises the EXACT per-token cost so the engine
-/// seam admit-time check matches the actual KV allocation shape — that's
-/// what this helper computes from
-/// [`crate::serve::config::Gemma4Config::layer_types`] +
-/// `num_kv_heads_for_layer` + `head_dim_for_layer`.
-///
-/// The dtype used is F32 (4 bytes) for K and V — same conservative dtype
-/// upper bound as the flattened formula, mirroring the rationale at
-/// [`LoadInfo::kv_bytes_per_token`] (`LoadInfo` does not carry per-layer
-/// KV dtype; TQ-packed slots actually use U8 + F32 norms but the F32-
-/// equivalent worst case keeps the engine seam dtype-agnostic and never
-/// false-accepts on a TQ-on load that later drops to F32 for a
-/// non-TQ-eligible layer).
-///
-/// Saturating-arithmetic throughout — see
-/// [`LoadInfo::kv_bytes_for_request`] for the symmetric overflow story.
-pub fn gemma4_exact_kv_bytes_per_token(cfg: &crate::serve::config::Gemma4Config) -> u64 {
+/// Token-linear physical KV bytes for Gemma 4's active slot-aware path.
+/// Sliding layers are fixed-size rings; only full-attention rows grow with
+/// logical context. The formula mirrors the selected cache allocator.
+pub fn gemma4_slot_kv_bytes_per_token(cfg: &crate::serve::config::Gemma4Config) -> u64 {
+    use crate::debug::investigation_env::INVESTIGATION_ENV;
     use crate::serve::config::LayerType;
-    let mut total: u64 = 0;
-    for (i, layer_type) in cfg.layer_types.iter().enumerate() {
-        // Defense-in-depth: the per-layer accessors derive from
-        // `layer_types[i]`, but pinning the branch here keeps the
-        // intent local to this helper.
-        let (nkv, hd) = match layer_type {
-            LayerType::Sliding => (cfg.num_key_value_heads as u64, cfg.head_dim as u64),
-            LayerType::Full => (
-                cfg.num_global_key_value_heads as u64,
-                cfg.global_head_dim as u64,
-            ),
-        };
-        // Cross-check against the public per-layer accessors — if the
-        // per-layer accessor ever diverges from the (LayerType ⇒ shape)
-        // mapping above, the debug_assert! catches the drift before it
-        // can corrupt the budget calculation. In release builds the
-        // helper still uses the local mapping (the public accessor IS
-        // the same logic per `src/serve/config.rs:346-353`).
-        debug_assert_eq!(
-            cfg.num_kv_heads_for_layer(i) as u64,
-            nkv,
-            "L{i}: num_kv_heads_for_layer drift vs LayerType mapping"
-        );
-        debug_assert_eq!(
-            cfg.head_dim_for_layer(i) as u64,
-            hd,
-            "L{i}: head_dim_for_layer drift vs LayerType mapping"
-        );
-        // Per-layer per-token bytes: nkv × hd × 4 (F32) × 2 (K + V).
-        total = total.saturating_add(nkv.saturating_mul(hd).saturating_mul(4).saturating_mul(2));
+
+    cfg.layer_types
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| matches!(kind, LayerType::Full))
+        .fold(0u64, |total, (layer_idx, _)| {
+            let nkv = cfg.num_kv_heads_for_layer(layer_idx) as u64;
+            let hd = cfg.head_dim_for_layer(layer_idx) as u64;
+            let norms = (hd / 256).max(1);
+            let elems = nkv.saturating_mul(hd);
+            let norm_bytes = nkv.saturating_mul(norms).saturating_mul(4);
+            let layer_bytes = if INVESTIGATION_ENV.use_dense {
+                let dtype_bytes = if INVESTIGATION_ENV.f16_kv { 2 } else { 4 };
+                elems.saturating_mul(dtype_bytes).saturating_mul(2)
+            } else if INVESTIGATION_ENV.tq_codebook_bits == 0 {
+                elems
+                    .saturating_div(2)
+                    .saturating_mul(2)
+                    .saturating_add(norm_bytes.saturating_mul(2))
+            } else if INVESTIGATION_ENV.hybrid_kv {
+                let full_f16_v = std::env::var("HF2Q_FULL_F16_KV")
+                    .ok()
+                    .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+                let v_bytes = if full_f16_v {
+                    elems.saturating_mul(2)
+                } else {
+                    elems.saturating_add(norm_bytes)
+                };
+                let xlen_bytes = if std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1") {
+                    elems.saturating_mul(4)
+                } else {
+                    0
+                };
+                elems
+                    .saturating_mul(2)
+                    .saturating_add(v_bytes)
+                    .saturating_add(xlen_bytes)
+            } else {
+                elems
+                    .saturating_mul(2)
+                    .saturating_add(norm_bytes.saturating_mul(2))
+            };
+            total.saturating_add(layer_bytes)
+        })
+}
+
+/// Fixed per-slot Gemma KV bytes committed at SlotAware provisioning.
+pub fn gemma4_fixed_kv_bytes_per_slot(cfg: &crate::serve::config::Gemma4Config) -> u64 {
+    use crate::debug::investigation_env::INVESTIGATION_ENV;
+    use crate::serve::config::LayerType;
+
+    let (live_scaffold, active_anchor) = cfg
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| matches!(kind, LayerType::Sliding))
+        .fold((0u64, 0u64), |(total, anchor), (layer_idx, _)| {
+            let nkv = cfg.num_kv_heads_for_layer(layer_idx) as u64;
+            let hd = cfg.head_dim_for_layer(layer_idx) as u64;
+            let norms = (hd / 256).max(1);
+            let elems = nkv.saturating_mul(hd);
+            let norm_bytes = nkv.saturating_mul(norms).saturating_mul(4);
+            // The HB scaffold is mandatory even when another path is active.
+            let mut per_position = elems
+                .saturating_mul(2)
+                .saturating_add(norm_bytes.saturating_mul(2));
+            let mut active_per_position = 0u64;
+            if INVESTIGATION_ENV.hybrid_kv {
+                let full_f16_v = std::env::var("HF2Q_FULL_F16_KV")
+                    .ok()
+                    .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+                active_per_position = active_per_position
+                    .saturating_add(elems.saturating_mul(2))
+                    .saturating_add(if full_f16_v {
+                        elems.saturating_mul(2)
+                    } else {
+                        elems.saturating_add(norm_bytes)
+                    });
+                if std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1") {
+                    active_per_position =
+                        active_per_position.saturating_add(elems.saturating_mul(4));
+                }
+            }
+            if INVESTIGATION_ENV.use_dense {
+                let dtype_bytes = if INVESTIGATION_ENV.f16_kv { 2 } else { 4 };
+                active_per_position = active_per_position
+                    .saturating_add(elems.saturating_mul(dtype_bytes).saturating_mul(2));
+            }
+            if INVESTIGATION_ENV.tq_codebook_bits == 0 {
+                active_per_position = active_per_position
+                    .saturating_add(elems)
+                    .saturating_add(norm_bytes.saturating_mul(2));
+            }
+            per_position = per_position.saturating_add(active_per_position);
+            let window = cfg.sliding_window as u64;
+            (
+                total.saturating_add(per_position.saturating_mul(window)),
+                anchor.saturating_add(active_per_position.saturating_mul(window)),
+            )
+        });
+
+    // A live slot owns the mandatory HB ring plus the selected active ring.
+    // Prompt-boundary replacement constructs the new active-ring anchor before
+    // dropping the old one, so admission must cover two anchors transiently.
+    round_up_bytes(
+        live_scaffold.saturating_add(active_anchor.saturating_mul(2)),
+        16 * 1024 * 1024,
+    )
+}
+
+/// Token-linear physical KV bytes for Qwen3.5/3.6.
+/// Gated-DeltaNet state is fixed-size; full-attention (and optional MTP)
+/// cache rows are the only context-linear storage.
+pub fn qwen35_slot_kv_bytes_per_token(
+    cfg: &crate::inference::models::qwen35::Qwen35Config,
+    tq_kv_active: bool,
+) -> u64 {
+    use crate::inference::models::qwen35::Qwen35LayerKind;
+    let full_layers = cfg
+        .layer_types
+        .iter()
+        .filter(|kind| matches!(kind, Qwen35LayerKind::FullAttention))
+        .count() as u64
+        + u64::from(cfg.mtp_num_hidden_layers > 0);
+    let nkv = u64::from(cfg.num_key_value_heads);
+    let hd = u64::from(cfg.head_dim);
+    let per_layer = if tq_kv_active {
+        let norms = (hd / 256).max(1);
+        nkv.saturating_mul(hd)
+            .saturating_add(nkv.saturating_mul(norms).saturating_mul(4))
+            .saturating_mul(2)
+    } else {
+        nkv.saturating_mul(hd).saturating_mul(4).saturating_mul(2)
+    };
+    full_layers.saturating_mul(per_layer)
+}
+
+/// Fixed per-slot Qwen DeltaNet state committed at cache construction.
+pub fn qwen35_fixed_kv_bytes_per_slot(cfg: &crate::inference::models::qwen35::Qwen35Config) -> u64 {
+    use crate::inference::models::qwen35::Qwen35LayerKind;
+    let linear_layers = cfg
+        .layer_types
+        .iter()
+        .filter(|kind| matches!(kind, Qwen35LayerKind::LinearAttention))
+        .count() as u64;
+    let conv_channels = u64::from(
+        2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+            + cfg.linear_num_value_heads * cfg.linear_value_head_dim,
+    );
+    let conv = conv_channels
+        .saturating_mul(u64::from(
+            cfg.linear_conv_kernel_dim.saturating_sub(1).max(1),
+        ))
+        .saturating_mul(4)
+        .saturating_mul(2);
+    let recurrent = u64::from(cfg.linear_key_head_dim)
+        .saturating_mul(u64::from(cfg.linear_value_head_dim))
+        .saturating_mul(u64::from(cfg.linear_num_value_heads))
+        .saturating_mul(4)
+        .saturating_mul(2);
+    let live_scaffold = linear_layers.saturating_mul(conv.saturating_add(recurrent));
+    // Each prompt anchor owns one copy of the current (not scratch) conv and
+    // recurrent state. Anchor replacement briefly retains old + new, which is
+    // exactly another full live-scaffold equivalent. Round to a 16 MiB page /
+    // metadata boundary; the canonical Qwen3.6 artifact becomes 256 MiB.
+    round_up_bytes(live_scaffold.saturating_mul(2), 16 * 1024 * 1024)
+}
+
+/// Fixed DeepSeek-V4 window/compressor state plus the compact recovery anchor.
+pub fn deepseek4_fixed_kv_bytes_per_slot(
+    cfg: &crate::inference::models::deepseek4::Deepseek4Config,
+    linear_bytes_per_token: u64,
+) -> u64 {
+    use crate::inference::models::deepseek4::cache::Deepseek4CachePlan;
+
+    let context = cfg.sliding_window.max(1) as usize;
+    let live_plan = match Deepseek4CachePlan::for_context(cfg, context) {
+        Ok(plan) => plan,
+        Err(_) => return 0,
+    };
+    let context_linear = (context as u64).saturating_mul(linear_bytes_per_token);
+    let live_fixed = live_plan.resident_bytes.saturating_sub(context_linear);
+    // The recovery snapshot duplicates exactly the circular window and
+    // compressor state represented by `live_fixed`.
+    round_up_bytes(live_fixed.saturating_mul(2), 16 * 1024 * 1024)
+}
+
+fn round_up_bytes(value: u64, quantum: u64) -> u64 {
+    if value == 0 || quantum == 0 {
+        return value;
     }
-    total
+    value
+        .saturating_add(quantum.saturating_sub(1))
+        .saturating_div(quantum)
+        .saturating_mul(quantum)
 }
 
 /// Implemented by each loaded-model variant to produce the shared load
@@ -1455,6 +1554,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         };
 
         let cloned = info.clone();
@@ -1505,6 +1605,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         }
     }
 
@@ -1742,6 +1843,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         };
         assert_eq!(info.arch_family, ArchFamily::Gemma4);
         assert_eq!(info.quant_label, Some("Q6_K".to_string()));
@@ -1961,7 +2063,7 @@ mod tests {
             rope_theta_sliding: 10_000.0,
             rope_theta_global: 1_000_000.0,
             sliding_window: 1024,
-            max_position_embeddings: 131_072,
+            max_position_embeddings: 262_144,
             final_logit_softcapping: None,
             attention_bias: false,
             attention_k_eq_v: true,
@@ -1972,34 +2074,136 @@ mod tests {
         }
     }
 
-    /// **CRITICAL #1 GOLDEN** — exact per-layer sum for canonical Gemma 4
-    /// 27B differs from the flattened scalar.
-    ///
-    /// Per-token elements (F32, K+V):
-    /// - 25 sliding layers × 8 KV heads × 256 head_dim × 4 (F32) × 2
-    ///   (K+V) = 409_600 bytes
-    /// - 5 full layers × 2 KV heads × 512 head_dim × 4 × 2 = 40_960 bytes
-    /// - Sum: 450_560 bytes per token.
-    ///
-    /// The flattened scalar (30 × 8 × 256 × 4 × 2 = 491_520 bytes/token)
-    /// OVER-counts by 40_960 bytes (~9%). The over-count is a safe upper
-    /// bound — it false-rejects borderline requests, never false-accepts —
-    /// but iter-A5c ships the exact value so the admit-time check matches
-    /// the actual KV allocation shape at `gemma4/model.rs:1247-1257`.
+    fn canonical_qwen36_27b_config() -> crate::inference::models::qwen35::Qwen35Config {
+        use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
+        Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 5_120,
+            num_hidden_layers: 64,
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 48,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            layer_types: default_layer_types(64, 4),
+            partial_rotary_factor: 0.25,
+            rope_theta: 1e7,
+            rotary_dim: 64,
+            mrope_section: [11, 11, 10, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 262_144,
+            vocab_size: 248_320,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            intermediate_size: Some(17_408),
+            moe: None,
+        }
+    }
+
+    /// Exact shape read from the canonical local Qwen3.6 APEX GGUF used by
+    /// `serve_qwen36_opencode.sh`: 40 blocks, interval 4, 10 full-attention
+    /// and 30 DeltaNet layers, two KV heads, 256-wide K/V rows.
+    fn canonical_qwen36_apex_40_config() -> crate::inference::models::qwen35::Qwen35Config {
+        use crate::inference::models::qwen35::{
+            default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
+        };
+        Qwen35Config {
+            variant: Qwen35Variant::Moe,
+            hidden_size: 2_048,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            head_dim: 256,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 32,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            layer_types: default_layer_types(40, 4),
+            partial_rotary_factor: 0.25,
+            rope_theta: 1e7,
+            rotary_dim: 64,
+            mrope_section: [11, 11, 10, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 262_144,
+            vocab_size: 248_320,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            intermediate_size: None,
+            moe: Some(Qwen35MoeConfig {
+                moe_intermediate_size: 512,
+                num_experts: 256,
+                num_experts_per_tok: 8,
+                shared_expert_intermediate_size: 512,
+            }),
+        }
+    }
+
     #[test]
-    fn a5c_gemma4_exact_kv_bytes_per_token_matches_per_layer_sum() {
+    fn qwen36_slot_kv_bytes_per_token_counts_only_full_attention_tq_rows() {
+        let cfg = canonical_qwen36_27b_config();
+        // 16 full layers. Per layer: two packed U8 tensors of 4*256 bytes
+        // plus two F32 norm tensors of 4*1 elements = 2,080 bytes/token.
+        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, true), 33_280);
+        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, false), 131_072);
+        assert!(
+            (cfg.max_position_embeddings as u64 + 8_192)
+                * super::qwen35_slot_kv_bytes_per_token(&cfg, true)
+                < 9 * 1024 * 1024 * 1024,
+            "one full Qwen TQ slot must fit the canonical shared budget"
+        );
+    }
+
+    #[test]
+    fn qwen36_apex_full_context_np4_and_np8_fit_shared_budget() {
+        let cfg = canonical_qwen36_apex_40_config();
+        let linear = super::qwen35_slot_kv_bytes_per_token(&cfg, true);
+        let fixed = super::qwen35_fixed_kv_bytes_per_slot(&cfg);
+        let full_slot =
+            fixed.saturating_add(u64::from(cfg.max_position_embeddings).saturating_mul(linear));
+        let budget = 48 * 1024 * 1024 * 1024_u64;
+        assert_eq!(linear, 10_400);
+        assert_eq!(fixed, 256 * 1024 * 1024);
+        assert_eq!(full_slot, 2_994_733_056);
+        assert!(full_slot.saturating_mul(4) < budget);
+        assert!(full_slot.saturating_mul(8) < budget);
+    }
+
+    /// Production-default Gemma charges only full-attention rows in their
+    /// actual F16-K + U8-V + F32-norm representation. Sliding rings are
+    /// fixed-size scaffold memory and do not grow with logical context.
+    #[test]
+    fn gemma4_slot_kv_bytes_per_token_matches_hybrid_full_layers() {
         let cfg = canonical_gemma4_27b_config();
-        let exact = super::gemma4_exact_kv_bytes_per_token(&cfg);
-        let expected_sliding: u64 = 25 * 8 * 256 * 4 * 2;
-        let expected_full: u64 = 5 * 2 * 512 * 4 * 2;
-        let expected: u64 = expected_sliding + expected_full;
+        let exact = super::gemma4_slot_kv_bytes_per_token(&cfg);
+        // Per full layer: F16 K 2*512*2 + U8 V 2*512 +
+        // F32 V norms 2*(512/256)*4 = 3,088 bytes.
+        let expected: u64 = 5 * 3_088;
         assert_eq!(
             exact, expected,
-            "Gemma 4 27B exact: 25 sliding (8×256) + 5 full (2×512) × 4 × 2 = {expected}",
+            "Gemma hybrid token-linear cost must include only five full layers",
         );
-        assert_eq!(
-            exact, 450_560,
-            "Gemma 4 27B canonical per-token bytes = 450 KiB-minus-1"
+        assert_eq!(exact, 15_440);
+        let full_request_tokens = cfg.max_position_embeddings as u64 + 8_192;
+        assert!(
+            full_request_tokens * exact < 4 * 1024 * 1024 * 1024,
+            "a full logical slot must not be rejected using all-layer F32 fiction"
+        );
+        let fixed = super::gemma4_fixed_kv_bytes_per_slot(&cfg);
+        assert_eq!(fixed, 560 * 1024 * 1024);
+        let full_slot = fixed.saturating_add(full_request_tokens.saturating_mul(exact));
+        assert!(
+            full_slot.saturating_mul(8) < 48 * 1024 * 1024 * 1024,
+            "eight full logical Gemma slots fit the canonical shared physical budget"
         );
     }
 
@@ -2009,7 +2213,7 @@ mod tests {
     #[test]
     fn a5c_load_info_kv_bytes_per_token_uses_override_when_present() {
         let cfg = canonical_gemma4_27b_config();
-        let exact = super::gemma4_exact_kv_bytes_per_token(&cfg);
+        let exact = super::gemma4_slot_kv_bytes_per_token(&cfg);
         // Construct a LoadInfo mimicking `GemmaLoadedModel::build_load_info`
         // shape: stores the SLIDING (n_kv_heads, head_dim) but the
         // override holds the exact per-layer sum.
@@ -2047,6 +2251,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: Some(exact),
+            kv_fixed_bytes_per_slot_override: Some(super::gemma4_fixed_kv_bytes_per_slot(&cfg)),
         };
         // Override wins over the flattened formula.
         assert_eq!(
@@ -2057,7 +2262,7 @@ mod tests {
         // Flat formula sanity-check — if the implementation accidentally
         // ignored the override, this would be the answer it returned, and
         // it differs from `exact` by exactly the (full - sliding) shape
-        // delta documented in `gemma4_exact_kv_bytes_per_token`.
+        // delta documented in `gemma4_slot_kv_bytes_per_token`.
         let flat: u64 = 30 * 8 * 256 * 4 * 2;
         assert_ne!(
             exact, flat,
@@ -2074,16 +2279,14 @@ mod tests {
         );
     }
 
-    /// **CRITICAL #1 GOLDEN** — falsifier for the flat path: when override
-    /// is `None`, the homogeneous-arch formula still runs (Qwen3.5/3.6
-    /// behaviour preserved verbatim).
+    /// The legacy flat fallback remains for synthetic/unknown homogeneous
+    /// architectures. Real Qwen loads install a family-specific override.
     #[test]
     fn a5c_load_info_kv_bytes_per_token_falls_back_to_flat_when_no_override() {
         let info = golden_qwen35moe_info();
         assert!(
             info.kv_bytes_per_token_override.is_none(),
-            "Qwen35 golden fixture MUST NOT carry an override — Qwen35 layers \
-             are homogeneous and the flat formula is exact"
+            "golden legacy fixture intentionally exercises the fallback"
         );
         let flat: u64 = 64 * 4 * 128 * 4 * 2;
         assert_eq!(
@@ -2101,7 +2304,7 @@ mod tests {
     #[test]
     fn a5c_load_info_override_distinct_from_flat_falsifies_regression() {
         let cfg = canonical_gemma4_27b_config();
-        let exact = super::gemma4_exact_kv_bytes_per_token(&cfg);
+        let exact = super::gemma4_slot_kv_bytes_per_token(&cfg);
         // Synthesize an override-carrying info with a deliberately
         // distinct exact value to prove the getter doesn't accidentally
         // run the flat formula.

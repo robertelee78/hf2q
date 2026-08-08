@@ -33,5 +33,5 @@ pub mod tokenizer;
 pub use kv_cache::{
     DecodeRegime, DenseKvBuffers, GemmaLcpLayerKv, HbKvBuffers, HybridKvBuffers, MlxKvCache,
 };
-pub use model::MlxModelWeights;
+pub use model::{MlxModelWeights, MultiSeqPrefillOutput};
 pub use profile::{KernelTypeProfile, ProfileAccumulator, TokenProfile};

@@ -7,9 +7,11 @@
 
 mod progress;
 mod sampling;
+mod slots;
 mod stream;
 
 pub use sampling::generate_once;
+pub(super) use slots::{Deepseek4SlotCompletion, Deepseek4SlotState};
 pub use stream::generate_stream;
 
 use std::path::PathBuf;
@@ -148,6 +150,101 @@ pub struct Deepseek4LoadedModel {
     /// official encoder can rewrite that tail when it drops old reasoning.
     turn_anchor: Option<Deepseek4CacheSnapshot>,
     turn_anchor_tokens: Vec<u32>,
+    /// Full-logical-context agent sessions provisioned only for SlotAware.
+    slot_sessions: Option<Vec<Deepseek4Session>>,
+}
+
+/// One retained DeepSeek-V4 agent context. The model/Metal execution state is
+/// shared, but each slot owns independent KV, compressor state, recovery
+/// anchor, and exact rendered-token identity.
+pub(super) struct Deepseek4Session {
+    cache: Deepseek4Cache,
+    committed_tokens: Vec<u32>,
+    live_logits: Option<MlxBuffer>,
+    turn_anchor: Option<Deepseek4CacheSnapshot>,
+    turn_anchor_tokens: Vec<u32>,
+}
+
+impl Deepseek4Session {
+    /// Start with the same bounded cache shape as the proven SerialFifo path,
+    /// while keeping append-only KV lazy so four idle slots do not register
+    /// their complete initial arenas as resident.
+    /// `Deepseek4LoadedModel::ensure_cache_capacity` grows this session in
+    /// 131K-token steps when its request needs more space, up to the complete
+    /// per-slot logical context. Logical context is therefore independent of
+    /// slot count without making short turns pay 524K-shaped Metal strides.
+    pub(super) fn new(loaded: &Deepseek4LoadedModel) -> Result<Self> {
+        let initial_capacity = loaded.context_limit().min(INITIAL_CACHE_LENGTH);
+        let cache = loaded
+            .model
+            .allocate_logical_cache(initial_capacity)
+            .with_context(|| {
+                format!("allocate initial {initial_capacity}-token DeepSeek-V4 agent slot cache")
+            })?;
+        Ok(Self {
+            cache,
+            committed_tokens: Vec::new(),
+            live_logits: None,
+            turn_anchor: None,
+            turn_anchor_tokens: Vec::new(),
+        })
+    }
+
+    pub(super) fn committed_tokens(&self) -> &[u32] {
+        &self.committed_tokens
+    }
+
+    /// Return the longest prefix this retained slot can safely resume for the
+    /// rendered prompt. DeepSeek's native encoder may rewrite the generated
+    /// reasoning/tool tail on the next turn, so scheduler affinity must
+    /// consider the prompt-boundary recovery anchor as well as the exact live
+    /// decode ledger. Selecting an empty slot when the anchor matches would
+    /// discard the entire agent context before capacity growth can migrate it.
+    pub(super) fn reusable_prefix_len(&self, prompt_tokens: &[u32]) -> usize {
+        let live = (!self.cache.is_poisoned()
+            && self.cache.position() == self.committed_tokens.len()
+            && !self.committed_tokens.is_empty()
+            && prompt_tokens.starts_with(&self.committed_tokens))
+        .then_some(self.committed_tokens.len())
+        .unwrap_or(0);
+        let recovery = self
+            .turn_anchor
+            .as_ref()
+            .filter(|anchor| {
+                anchor.position() == self.turn_anchor_tokens.len()
+                    && !self.turn_anchor_tokens.is_empty()
+                    && prompt_tokens.len() > self.turn_anchor_tokens.len()
+                    && prompt_tokens.starts_with(&self.turn_anchor_tokens)
+            })
+            .map_or(0, |_| self.turn_anchor_tokens.len());
+        live.max(recovery)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.committed_tokens.is_empty() && self.turn_anchor_tokens.is_empty()
+    }
+
+    pub(super) fn reset(&mut self) -> Result<()> {
+        self.cache
+            .reset()
+            .context("reset DeepSeek-V4 agent slot cache")?;
+        self.committed_tokens.clear();
+        self.live_logits = None;
+        self.turn_anchor = None;
+        self.turn_anchor_tokens.clear();
+        Ok(())
+    }
+
+    /// Swap this slot into the single model execution surface. The staging
+    /// state in `loaded` is swapped back after the request/tick, so no KV bytes
+    /// are copied and every slot retains its own compressor state.
+    pub(super) fn swap_with_loaded(&mut self, loaded: &mut Deepseek4LoadedModel) {
+        std::mem::swap(&mut self.cache, &mut loaded.cache);
+        std::mem::swap(&mut self.committed_tokens, &mut loaded.committed_tokens);
+        std::mem::swap(&mut self.live_logits, &mut loaded.live_logits);
+        std::mem::swap(&mut self.turn_anchor, &mut loaded.turn_anchor);
+        std::mem::swap(&mut self.turn_anchor_tokens, &mut loaded.turn_anchor_tokens);
+    }
 }
 
 impl Deepseek4LoadedModel {
@@ -256,7 +353,32 @@ impl Deepseek4LoadedModel {
             live_logits: None,
             turn_anchor: None,
             turn_anchor_tokens: Vec::new(),
+            slot_sessions: None,
         })
+    }
+
+    pub(super) fn provision_slot_sessions(&mut self, max_slots: u32) -> Result<()> {
+        anyhow::ensure!(max_slots > 0, "DeepSeek-V4 max_slots must be nonzero");
+        let mut sessions = Vec::with_capacity(max_slots as usize);
+        for slot in 0..max_slots {
+            sessions.push(
+                Deepseek4Session::new(self)
+                    .with_context(|| format!("reserve DeepSeek-V4 logical slot {slot}"))?,
+            );
+        }
+        tracing::info!(
+            max_slots,
+            logical_context_per_slot = self.context_limit(),
+            "DeepSeek-V4 full-context agent slots reserved"
+        );
+        self.slot_sessions = Some(sessions);
+        Ok(())
+    }
+
+    pub(super) fn take_slot_sessions(&mut self) -> Result<Vec<Deepseek4Session>> {
+        self.slot_sessions
+            .take()
+            .context("DeepSeek-V4 SlotAware sessions were not provisioned")
     }
 
     fn context_limit(&self) -> usize {
@@ -264,7 +386,7 @@ impl Deepseek4LoadedModel {
             .unwrap_or(self.model.cfg.max_position_embeddings as usize)
     }
 
-    fn reset_live_cache(&mut self) -> Result<()> {
+    pub(super) fn reset_live_cache(&mut self) -> Result<()> {
         self.cache
             .reset()
             .context("reset DeepSeek-V4 serving cache")?;
@@ -290,7 +412,7 @@ impl Deepseek4LoadedModel {
         let migration_started = Instant::now();
         let source_cache_bytes = self.cache.resident_bytes();
         let migrated_tokens = self.cache.position();
-        let mut grown = self.model.allocate_cache(target).with_context(|| {
+        let mut grown = self.model.allocate_logical_cache(target).with_context(|| {
             format!("grow DeepSeek-V4 cache from {previous} to {target} tokens")
         })?;
         grown
@@ -683,8 +805,13 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
             kv_cache_budget_bytes,
             kv_spill_active,
             tq_kv_active: false,
-            // Context-linear live cache. Recovery rollback is a fixed ~17 MiB.
+            // Context-linear compressed/indexer rows. Circular window,
+            // compressor state, and compact recovery rollback are fixed.
             kv_bytes_per_token_override: Some(6_880),
+            kv_fixed_bytes_per_slot_override: Some(load_info::deepseek4_fixed_kv_bytes_per_slot(
+                &self.model.cfg,
+                6_880,
+            )),
         }
     }
 }

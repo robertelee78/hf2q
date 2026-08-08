@@ -2,9 +2,7 @@
 
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
-use mlx_native::{
-    DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD,
-};
+use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache::{CacheSpan, Deepseek4Cache};
@@ -225,8 +223,11 @@ impl Deepseek4Model {
         let dump_intermediates = std::env::var_os("HF2Q_DEEPSEEK_DUMP_LAYER_DIR").is_some()
             || std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
         let graph_reorder = graph_reorder_enabled()?;
-        let graph_layers_per_command_buffer =
-            graph_layers_per_command_buffer(layers, graph_reorder, profile_timing || dump_intermediates)?;
+        let graph_layers_per_command_buffer = graph_layers_per_command_buffer(
+            layers,
+            graph_reorder,
+            profile_timing || dump_intermediates,
+        )?;
         if graph_layers_per_command_buffer > 1 {
             anyhow::ensure!(
                 graph_reorder,
@@ -305,9 +306,10 @@ impl Deepseek4Model {
                         end_prefill_pool_layer();
                         state = Some(layer_result?);
                     }
-                    let (reordered, barriers) = session.finish_with_reorder().with_context(|| {
-                        format!("reorder DeepSeek-V4 prefill layers {start}..{end}")
-                    })?;
+                    let (reordered, barriers) =
+                        session.finish_with_reorder().with_context(|| {
+                            format!("reorder DeepSeek-V4 prefill layers {start}..{end}")
+                        })?;
                     if graph_diag {
                         eprintln!(
                             "[GRAPH_REORDER] layers={start}..{end} reordered={reordered} barriers={barriers}"
@@ -778,9 +780,8 @@ impl Deepseek4Model {
 mod prompt_chunk_tests {
     use super::{
         default_graph_layers_per_command_buffer, matrix_prefill_chunk_len,
-        prefill_windows_for_resident_bytes,
-        DEFAULT_MATRIX_PREFILL_WINDOWS, LARGE_MODEL_MATRIX_PREFILL_WINDOWS,
-        LARGE_MODEL_RESIDENT_BYTES, MIN_MATRIX_APPEND_TOKENS,
+        prefill_windows_for_resident_bytes, DEFAULT_MATRIX_PREFILL_WINDOWS,
+        LARGE_MODEL_MATRIX_PREFILL_WINDOWS, LARGE_MODEL_RESIDENT_BYTES, MIN_MATRIX_APPEND_TOKENS,
     };
 
     #[test]

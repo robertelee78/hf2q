@@ -474,6 +474,7 @@ impl LoadInfoBuilder for Qwen3VlTextLoadedModel {
             // layers; the flattened scalar formula is EXACT for this
             // arch. `None` means "no override".
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         }
     }
 }

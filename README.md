@@ -197,14 +197,26 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"gemma4","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-### DeepSeek-V4 agentic serving
+### Full-context agentic serving
 
-The native DeepSeek-V4 worker is intended for OpenAI-compatible coding clients
-such as OpenCode. Point the client's OpenAI-compatible base URL at
-`http://127.0.0.1:8080/v1` and select the model ID returned by `/v1/models`
-(normally the GGUF file stem):
+The native Gemma 4, Qwen 3.6, and DeepSeek-V4 workers are intended for
+OpenAI-compatible coding clients such as OpenCode. Their canonical launchers
+default to four independent agent slots. Every slot receives the complete
+configured logical context; model weights are shared, while KV, recurrent
+state, token ledgers, template state, and tool-call state remain isolated per
+conversation. One shared physical KV budget governs demand-grown residency—it
+never divides the advertised context by the slot count.
+
+Start the launcher for the model family you want to serve:
 
 ```bash
+# Gemma 4 (default port 8082)
+./scripts/serve_gemma4_opencode.sh
+
+# Qwen 3.6 (default port 8081)
+./scripts/serve_qwen36_opencode.sh
+
+# DeepSeek-V4 (default port 8080)
 ./scripts/serve_deepseek4_opencode.sh
 
 # A different explicitly supported GGUF can be served without hf2q provenance:
@@ -213,6 +225,16 @@ MODEL=./out/DeepSeek-V4-Flash-0731.gguf PORT=8090 \
 
 curl http://127.0.0.1:8080/v1/models
 ```
+
+Point the client's OpenAI-compatible base URL at the selected launcher's
+`http://127.0.0.1:<port>/v1` endpoint and select the model ID returned by
+`/v1/models` (normally the GGUF file stem). Set `MAX_SLOTS=1` for one agent or
+`MAX_SLOTS=8` for an eight-slot hardware experiment; four is the
+release-validated default. DeepSeek's `CONTEXT_LEN` override changes the full
+logical context of each slot; Gemma and Qwen use the context declared by their
+GGUF. `KV_CACHE_BUDGET_BYTES` independently caps aggregate physical KV
+high-water. Requests that cannot safely fit wait or fail explicitly instead of
+silently receiving a shorter context.
 
 On the target M5 Max host, the launcher defaults to the schema-v2,
 source-bound `deepseek4-agentic-q2` reproduction that passed the strict
@@ -225,8 +247,10 @@ required/automatic tool choice, parallel DSML invokes, cancellation, and usage
 telemetry. Growing transcripts reuse the live native KV/recurrent prefix;
 DeepSeek's old-reasoning canonicalization restores a prompt-tail checkpoint, so
 normal agent turns do not prefill the full context again. DeepSeek serving is
-currently serialized (`fifo_serial`); embeddings, multimodal messages, and the
-slot-aware scheduler fail explicitly rather than selecting another runtime.
+slot-aware and uses bounded admission/decode waves so several agents make
+progress without duplicating model weights. Embeddings and multimodal messages
+remain unsupported for DeepSeek and fail explicitly rather than selecting
+another family or runtime.
 
 For MoE models, pass an APEX tier instead of a standard ftype:
 

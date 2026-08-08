@@ -40,7 +40,9 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::inference::models::gemma4::{MlxModelWeights, ProfileAccumulator};
+use crate::inference::models::gemma4::{
+    MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator,
+};
 use crate::serve::config::Gemma4Config;
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
@@ -370,6 +372,17 @@ pub struct SamplingParams {
     /// `registry::prompt_seeds_reasoning_open` on the rendered prompt;
     /// `false` (the default) = pre-iter-230 behavior.
     pub reasoning_forced_open: bool,
+
+    // --- Internal prompt-layout metadata (not a sampling parameter) ---
+    /// Exact token length of the family-rendered conversation before the
+    /// template appends its generation cue. The HTTP handler accepts this
+    /// boundary only when it is an exact prefix of the actual prompt.
+    /// Gemma's slot worker uses it to checkpoint KV before the rewriteable
+    /// cue; other model families ignore it.
+    ///
+    /// This deliberately does not participate in `PromptCacheKey`: it
+    /// describes prompt layout, not generation semantics.
+    pub stable_prompt_prefix_tokens: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -397,6 +410,7 @@ impl Default for SamplingParams {
             grammar_kind: GrammarKind::default(),
             tool_call_policy: ToolCallPolicy::Auto,
             reasoning_forced_open: false,
+            stable_prompt_prefix_tokens: None,
         }
     }
 }
@@ -787,6 +801,12 @@ pub enum EngineSpawnError {
         cause: String,
     },
 
+    #[error(
+        "DeepSeek-V4 full-context slot reservation failed \
+         (max_slots={max_slots}). Cause: {cause}"
+    )]
+    Deepseek4SlotAwareProvisionFailed { max_slots: u32, cause: String },
+
     /// **ADR-040 Phase C iter-C2c-cont** — `EngineMode::SlotAware`
     /// spawn for Gemma 4 reached the SIBLING `MultiSeqHybridKvBuffers`
     /// scaffold provisioning step (the PRODUCTION-DEFAULT KV path per
@@ -969,22 +989,14 @@ pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 4;
 /// with `HF2Q_BATCHED_BODY=1`, 2026-06-24 — see ADR §0.13 queen-led audit),
 /// coherence-proven e2e, 202 tok/s aggregate.
 ///
-/// KV-memory accounting (ADR-040 `iter-F-kvcap`, 2026-06-24): the multi-seq
-/// `SlotAware` scaffold splits the full-attention context budget across slots
-/// — each of `max_slots` slots gets `max_position_embeddings / max_slots` of
-/// global-layer context (the llama.cpp `-c`÷`-np` convention) via
-/// `layer_type_to_alloc_params_per_slot` (`kv_cache.rs`). The 25 sliding
-/// layers stay at the 1024 ring window (per-slot-independent). So the total
-/// full-attention KV is ≈ ONE full-context sequence regardless of N (constant,
-/// not linear): at N=8 each slot holds 262144/8 = 32k of global context →
-/// global layers ~4 GB total (8 × 5 × nkv=2 × hd=512 × cap=32768 ×
-/// [2 B F16-K + 1 B TQ-HB-V]); the whole multi-seq KV is ~5-6 GB, and "8×32k"
-/// is now literal. Total at N=8 ≈ 16.4 GB weights + ~6 GB KV ≈ 22 GB → fits
-/// the 128 GB M5 Max with vast headroom, and now also fits a 64 GB machine.
-/// (Pre-`iter-F-kvcap` each slot eagerly held the full 262k → ~45 GB at N=8,
-/// the ~10×-too-large figure Worker C caught.) `max_slots=1` is identity
-/// (max/1 = max) so SerialFifo / single-seq is unchanged. Over-budget spawns
-/// still fail CLOSED with an `alloc_*_kv_for_layer` `Result` error (not UB).
+/// KV-memory accounting (corrected 2026-08-08): every slot has the complete
+/// configured logical context. Full-attention arenas are virtually reserved
+/// without zero-filling or Metal residency registration, so unused pages do
+/// not become physical at spawn. The serving scheduler accounts aggregate
+/// per-slot physical high-water usage and queues or rejects work when the
+/// shared budget is exhausted; it never responds to pressure by reducing a
+/// slot's context limit. Sliding-window rings remain small, ordinary resident
+/// allocations because their wraparound semantics require initialized state.
 /// This is the gate the live `SlotAware` spawn checks; the
 /// spec-decode drafter (unwired, API-scaffold only per §6.1.55-F5) must
 /// gate on [`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`] (= 4) when
@@ -1129,20 +1141,22 @@ where
 pub enum EngineAdmitError {
     /// The request's projected KV byte cost
     /// (`(prompt_tokens + max_tokens) × kv_bytes_per_token`) exceeds the
-    /// per-slot KV budget configured at engine spawn time
-    /// (`kv_cache_budget_bytes / max_slots`). Maps to HTTP 429 +
+    /// shared physical KV budget configured at engine spawn time. The
+    /// logical model context is not divided by `max_slots`. Maps to HTTP 429 +
     /// `Retry-After: 1` upstream via
     /// [`crate::serve::api::schema::ApiError::slot_budget_exceeded`].
     ///
     /// Distinct from
     /// [`crate::serve::scheduler::AdmitError::QueueFull`] (transient
     /// — capacity will free) because this is operator-actionable on
-    /// the REQUEST: reducing `max_tokens` or shortening the prompt is
-    /// the fix.
+    /// physical residency: another retained slot may need recycling, or the
+    /// operator may raise the aggregate budget.
     #[error(
-        "ADR-040 §3.5 A5: slot_budget_exceeded — needed_bytes={needed_bytes}, \
-         budget_bytes={budget_bytes}. Reduce max_tokens or use a shorter \
-         prompt; per-slot budget = kv_cache_budget_bytes / max_slots."
+        "ADR-040: slot_budget_exceeded — needed_bytes={needed_bytes}, \
+         budget_bytes={budget_bytes}. Shared physical KV budget exceeded; \
+         logical context was not divided by slot count. Wait for or recycle \
+         another slot, reduce max_tokens or shorten the prompt, or raise the \
+         shared KV budget."
     )]
     SlotBudgetExceeded {
         needed_bytes: u64,
@@ -1387,6 +1401,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             // arch facts so `kv_bytes_per_token` returns 0 anyway).
             per_slot_kv_budget_bytes: 0,
             kv_bytes_per_token_cached: 0,
+            kv_fixed_bytes_per_slot_cached: 0,
             scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                 policy: SchedulerPolicy::FifoSerial,
                 in_flight_slots: 0,
@@ -1439,6 +1454,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             // (enforcement disabled).
             per_slot_kv_budget_bytes: 0,
             kv_bytes_per_token_cached: 0,
+            kv_fixed_bytes_per_slot_cached: 0,
             scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                 policy: SchedulerPolicy::FifoSerial,
                 in_flight_slots: 0,
@@ -1507,8 +1523,75 @@ pub(crate) fn make_synthetic_engine_over_budget(
             max_slots: 1,
             per_slot_kv_budget_bytes,
             kv_bytes_per_token_cached,
+            kv_fixed_bytes_per_slot_cached: 0,
             scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                 policy: SchedulerPolicy::FifoSerial,
+                in_flight_slots: 0,
+                queue_capacity: 8,
+                admitted_total: 0,
+                rejected_429_total: 0,
+                completed_total: 0,
+            })),
+        }),
+    }
+}
+
+/// Synthetic SlotAware engine whose individual-request preflight fits but
+/// whose worker rejects aggregate retained-slot pressure. This pins the
+/// admission acknowledgement between the scheduler and HTTP/SSE boundary.
+#[cfg(test)]
+pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) -> Engine {
+    let (tx, mut rx) = mpsc::channel::<Request>(8);
+    let handle = std::thread::Builder::new()
+        .name("hf2q-engine-aggregate-stream-test".into())
+        .spawn(move || {
+            while let Some(req) = rx.blocking_recv() {
+                match req {
+                    Request::GenerateStream {
+                        events, admission, ..
+                    } => reject_stream_before_sse(
+                        events,
+                        admission,
+                        anyhow::anyhow!(
+                            "slot_budget_exceeded: aggregate retained-slot pressure \
+                             (needed_bytes=2000, budget_bytes=1000)"
+                        ),
+                    ),
+                    Request::Shutdown => break,
+                    _ => {}
+                }
+            }
+        })
+        .expect("spawn aggregate stream-admission test worker");
+
+    Engine {
+        inner: Arc::new(EngineInner {
+            tx,
+            worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("aggregate-stream-pressure-test-model"),
+            arch,
+            model_id: "aggregate-stream-pressure-test-model".into(),
+            context_length: Some(524_288),
+            quant_type: None,
+            hidden_size: 0,
+            vocab_size: 0,
+            eos_token_ids: vec![],
+            tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
+            chat_template: Arc::new(String::new()),
+            registration: None,
+            token_bytes: std::sync::OnceLock::new(),
+            kv_spill_descriptor: None,
+            tq_packed_descriptor: None,
+            mode: EngineMode::SlotAware { max_slots: 4 },
+            max_slots: 4,
+            // Individual request: (10 prompt + 1 completion) * 1 = 11,
+            // so handler-side single-request preflight passes. The worker's
+            // aggregate scheduler result above is the only rejection.
+            per_slot_kv_budget_bytes: 1_000,
+            kv_bytes_per_token_cached: 1,
+            kv_fixed_bytes_per_slot_cached: 0,
+            scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                policy: SchedulerPolicy::InflightBatched,
                 in_flight_slots: 0,
                 queue_capacity: 8,
                 admitted_total: 0,
@@ -1593,6 +1676,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
             // error comes from the worker reply (see comment above).
             per_slot_kv_budget_bytes: 0,
             kv_bytes_per_token_cached: 0,
+            kv_fixed_bytes_per_slot_cached: 0,
             scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                 policy: SchedulerPolicy::FifoSerial,
                 in_flight_slots: 0,
@@ -1694,7 +1778,8 @@ struct EngineInner {
     /// stored field + fail-fast rejection of unwired modes.
     ///
     /// At iter-1.5 the only mode that survives validation in
-    /// `spawn_with_mode` is `SerialFifo`; `SlotAware` is rejected with
+    /// `spawn_with_mode` is `SerialFifo`; `SlotAware` provisions independent
+    /// family-specific full-context cache sessions.
     /// [`EngineSpawnError::ModeNotYetWired`] at the API boundary.
     mode: EngineMode,
 
@@ -1703,25 +1788,24 @@ struct EngineInner {
     ///
     /// Populated at spawn time from [`EngineMode`]:
     /// - `SerialFifo` ⇒ `1` (ADR-005 Phase 2 single-in-flight contract).
-    /// - `SlotAware { max_slots }` ⇒ `max_slots` (gated at
-    ///   `spawn_with_mode` until iter-2b lifts the rejection).
+    /// - `SlotAware { max_slots }` ⇒ `max_slots`.
     ///
     /// Read by future `/metrics` / `/v1/models` extensions (Phase C3).
-    /// Iter-2a only positions the field; the SlotAware runtime that
-    /// actually exercises `max_slots > 1` lands at iter-2b/2c.
+    /// Each slot retains the model's full logical context; this count changes
+    /// concurrency and physical residency, never the advertised context.
     max_slots: u32,
-    /// **ADR-040 §3.5 iter-A5b** — per-slot KV byte budget. Computed
-    /// at spawn time as `kv_cache_budget_bytes / max_slots` (`0`
-    /// means enforcement disabled, preserving pre-A5
-    /// byte-equivalence). Read by [`Engine::try_admit_budget`] +
+    /// **ADR-040 full-context slots** — shared physical KV byte budget.
+    /// `0` means enforcement disabled. The historical field name is retained
+    /// for internal/API compatibility; the value is never divided by slot
+    /// count. Read by [`Engine::try_admit_budget`] +
     /// surfaced to the worker thread for the scheduler-side
     /// `FifoSchedulerAdapter::new_with_kv_budget`/
     /// `InflightBatchedScheduler::new_with_kv_budget` constructor.
     ///
     /// `0` semantics match
     /// [`crate::serve::scheduler::FifoSchedulerAdapter::per_slot_kv_budget_bytes`]:
-    /// no enforcement at any admit path. Under SerialFifo this is
-    /// `kv_cache_budget_bytes.unwrap_or(0) / 1` so an operator who
+    /// no enforcement at any admit path. Under SerialFifo the shared pool has
+    /// one consumer, so an operator who
     /// does NOT pass `--kv-cache-budget-bytes` retains the pre-A5
     /// "unbounded" semantics verbatim.
     per_slot_kv_budget_bytes: u64,
@@ -1731,6 +1815,7 @@ struct EngineInner {
     /// short-circuits to "do not enforce" (same opt-out as
     /// `per_slot_kv_budget_bytes == 0`).
     kv_bytes_per_token_cached: u64,
+    kv_fixed_bytes_per_slot_cached: u64,
     /// **ADR-040 Phase C iter-2a (C2b) — scheduler stats snapshot**
     /// (dossier §2.2). The actual scheduler lives on the worker thread
     /// (Shape A); after each `release` the worker writes a snapshot of
@@ -1774,11 +1859,12 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         kv_spill_active: false,
         tq_kv_active: false,
         kv_bytes_per_token_override: None,
+        kv_fixed_bytes_per_slot_override: None,
     })
 }
 
 /// The request protocol the worker thread drains.
-enum Request {
+pub(super) enum Request {
     Warmup {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -1801,6 +1887,11 @@ enum Request {
         params: SamplingParams,
         events: mpsc::Sender<super::sse::GenerationEvent>,
         cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+        /// Slot-aware workers acknowledge only after the scheduler has
+        /// reserved physical KV capacity. The handler awaits this before
+        /// committing an HTTP 200/SSE body, so aggregate memory pressure is
+        /// returned as an ordinary HTTP 429.
+        admission: Option<oneshot::Sender<Result<()>>>,
         /// Per-position embedding overrides for the multimodal vision
         /// path (Phase 2c iter-211 W79). Empty slice ⇒ identity over
         /// the text-only `forward_prefill` path (the prefill function
@@ -2038,6 +2129,10 @@ pub struct GemmaLoadedModel {
     pub tokenizer: Tokenizer,
     pub chat_template: String,
     pub eos_token_ids: Vec<u32>,
+    /// GGUF-declared padding token. Padding is not semantic model output;
+    /// if it wins generation after a completed grammar, stop before it can
+    /// pollute the canonical response or prompt-cache replay.
+    pub padding_token_id: Option<u32>,
     pub load_duration: Duration,
     /// Single-slot prompt cache (Phase 2a Task #7 / Decision #24, iter-96).
     /// Owned by the worker thread; lives across requests.  See
@@ -2968,7 +3063,21 @@ impl LoadedModel {
     }
 }
 
+#[inline]
+fn gemma_generation_stop_token(
+    eos_token_ids: &[u32],
+    padding_token_id: Option<u32>,
+    token_id: u32,
+) -> bool {
+    eos_token_ids.contains(&token_id) || padding_token_id == Some(token_id)
+}
+
 impl GemmaLoadedModel {
+    #[inline]
+    fn is_generation_stop_token(&self, token_id: u32) -> bool {
+        gemma_generation_stop_token(&self.eos_token_ids, self.padding_token_id, token_id)
+    }
+
     /// Perform the full Gemma 4 model-load pipeline: open GGUF, load weights
     /// into mlx-native, load the tokenizer, resolve the chat template, read
     /// the context length from metadata.
@@ -3218,6 +3327,7 @@ impl GemmaLoadedModel {
         // what Gemma 4 uses; other models will be generalized alongside
         // per-model registration (Decision #21 — lands with tool calling).
         let eos_token_ids: Vec<u32> = vec![1, 106];
+        let padding_token_id = gguf.metadata_u32("tokenizer.ggml.padding_token_id");
 
         let load_duration = load_start.elapsed();
         // ADR-018 C3: legacy `tracing::info!("Engine load: {} layers, ctx_len={:?}, load_time={:.1}s", ...)`
@@ -3239,6 +3349,7 @@ impl GemmaLoadedModel {
             tokenizer,
             chat_template,
             eos_token_ids,
+            padding_token_id,
             load_duration,
             prompt_cache: PromptCache::new(),
             live_prefix_tokens: Vec::new(),
@@ -3650,27 +3761,14 @@ impl LoadInfoBuilder for GemmaLoadedModel {
                         .as_deref(),
                     Some("dense_all")
                 ),
-            // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Gemma 4
-            // layers are heterogeneous in KV-cache shape: sliding
-            // layers carry `num_key_value_heads × head_dim` (canonical
-            // 8 × 256) while full-attention layers carry
-            // `num_global_key_value_heads × global_head_dim`
-            // (canonical 2 × 512). The flattened scalar formula on
-            // `LoadInfo::kv_bytes_per_token` (n_layers × n_kv_heads ×
-            // head_dim × dtype_bytes × 2) over-counts by ~9% for
-            // canonical 30-layer 27B (61_440 elem vs exact 56_320 elem
-            // per token) — a safe upper bound that false-rejects
-            // borderline requests, never under-counts. iter-A5c replaces
-            // the over-count with the EXACT per-layer sum so the engine
-            // seam admit-time check matches the actual KV allocation
-            // shape (`gemma4/model.rs:1247-1257`:
-            // `head_dim_for_layer(i) * num_kv_heads_for_layer(i) *
-            // capacity` per layer, with capacity differing between
-            // sliding_window and max_position_embeddings — capacity is
-            // the per-token multiplier that lives in
-            // `kv_bytes_for_request`, the SHAPE is what differs per
-            // layer and must be summed here).
-            kv_bytes_per_token_override: Some(load_info::gemma4_exact_kv_bytes_per_token(
+            // Sliding layers are fixed 1K rings allocated with the slot
+            // scaffold. Charge aggregate admission only for context-linear
+            // full-attention rows, using the selected dense/packed/hybrid
+            // storage layout rather than an all-layer F32 fiction.
+            kv_bytes_per_token_override: Some(load_info::gemma4_slot_kv_bytes_per_token(
+                &self.config,
+            )),
+            kv_fixed_bytes_per_slot_override: Some(load_info::gemma4_fixed_kv_bytes_per_slot(
                 &self.config,
             )),
         }
@@ -3894,17 +3992,15 @@ impl Engine {
         let queue_capacity_u32 = queue_capacity.max(1) as u32;
         let initial_mode = EngineMode::SerialFifo;
         let initial_max_slots: u32 = 1;
-        // ADR-040 §3.5 iter-A5b — per-slot KV byte budget. Under
-        // SerialFifo `max_slots = 1` so `kv_cache_budget_bytes / 1`
-        // = `kv_cache_budget_bytes`; `None` ⇒ `0` ⇒ enforcement
+        // ADR-040 §3.5 iter-A5b — physical KV byte budget. Under
+        // SerialFifo there is one slot; `None` ⇒ `0` ⇒ enforcement
         // disabled (pre-A5 byte-equivalence preserved for operators
         // who do not set `--kv-cache-budget-bytes`). The same field
         // also flows to the worker thread so the scheduler-side
         // FifoSchedulerAdapter::new_with_kv_budget enforces at admit.
-        let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes
-            .map(|b| b / u64::from(initial_max_slots.max(1)))
-            .unwrap_or(0);
+        let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes.unwrap_or(0);
         let initial_kv_bytes_per_token_cached: u64 = info.kv_bytes_per_token();
+        let initial_kv_fixed_bytes_per_slot_cached: u64 = info.kv_fixed_bytes_per_slot();
         let scheduler_stats_snapshot = Arc::new(Mutex::new(SchedulerStats {
             policy: SchedulerPolicy::FifoSerial,
             in_flight_slots: 0,
@@ -3919,6 +4015,7 @@ impl Engine {
         let worker_registration = registration.clone();
         let worker_per_slot_budget = initial_per_slot_kv_budget_bytes;
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
+        let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
         let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine".into())
             .spawn(move || {
@@ -3931,6 +4028,7 @@ impl Engine {
                     worker_stats_handle,
                     worker_per_slot_budget,
                     worker_kv_bytes_per_token,
+                    worker_kv_fixed_bytes_per_slot,
                 )
             })
             .expect("spawn hf2q-engine thread");
@@ -3957,6 +4055,7 @@ impl Engine {
                 max_slots: initial_max_slots,
                 per_slot_kv_budget_bytes: initial_per_slot_kv_budget_bytes,
                 kv_bytes_per_token_cached: initial_kv_bytes_per_token_cached,
+                kv_fixed_bytes_per_slot_cached: initial_kv_fixed_bytes_per_slot_cached,
                 scheduler_stats_snapshot,
             }),
         }
@@ -4105,188 +4204,201 @@ impl Engine {
         max_slots: u32,
     ) -> std::result::Result<Self, EngineSpawnError> {
         match loaded {
-                LoadedModel::Gemma(mut g) => {
-                    if max_slots == 0 {
-                        // EngineMode::SlotAware is constructed by callers
-                        // who guarantee max_slots >= 1; this is a defensive
-                        // rejection at the API boundary so a `max_slots = 0`
-                        // never reaches `provision_multi_seq_kv_for_slot_aware`.
-                        return Err(EngineSpawnError::ModeNotYetWired {
-                            iter_landed: "C2c",
-                            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+            LoadedModel::Gemma(mut g) => {
+                if max_slots == 0 {
+                    // EngineMode::SlotAware is constructed by callers
+                    // who guarantee max_slots >= 1; this is a defensive
+                    // rejection at the API boundary so a `max_slots = 0`
+                    // never reaches `provision_multi_seq_kv_for_slot_aware`.
+                    return Err(EngineSpawnError::ModeNotYetWired {
+                        iter_landed: "C2c",
+                        iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
                                             — require max_slots >= 1",
-                        });
-                    }
-                    // Provision per-layer multi-seq KV scaffolds BEFORE
-                    // moving the loaded model into the worker thread; if
-                    // provisioning fails, surface the typed error before
-                    // any thread is spawned.
-                    //
-                    // iter-C2c-cont (2026-05-30): two phases provision
-                    // BOTH the HB-encoded scaffold (always) AND the
-                    // hybrid F16-K + TQ-HB-V scaffold (when
-                    // HF2Q_HYBRID_KV=1 — the production default per H10
-                    // falsification §6.1.11). On allocator failure we
-                    // distinguish which regime failed by inspecting the
-                    // `multi_seq_kv` field's populated state: if it's
-                    // still None, the HB phase (Phase 1) failed; if it
-                    // IS populated and we still got an error, the
-                    // hybrid phase (Phase 2) failed. Both surfaces emit
-                    // their own typed variant for operator-grep
-                    // disambiguation.
-                    if let Err(e) = g.provision_multi_seq_kv_for_slot_aware(max_slots) {
-                        // Hybrid phase failure: HB phase already
-                        // populated `multi_seq_kv` (Phase 1 invariant).
-                        // Surface the iter-C2c-cont-named typed error
-                        // distinct from the C2c HB-phase variant so
-                        // operator log greps + per-regime debug paths
-                        // route to the right pin pointer.
-                        if g.multi_seq_kv.is_some() {
-                            return Err(
-                                EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed {
-                                    max_slots,
-                                    cause: e.to_string(),
-                                },
-                            );
-                        }
-                        // HB phase failure: same shape as pre-iter-C2c-
-                        // cont. Preserves H22_gemma4_spawn_fail_variant_
-                        // carries_max_slots_and_cause + the C2c error-
-                        // surface contract verbatim.
-                        return Err(EngineSpawnError::Gemma4SlotAwareProvisionFailed {
+                    });
+                }
+                // Provision per-layer multi-seq KV scaffolds BEFORE
+                // moving the loaded model into the worker thread; if
+                // provisioning fails, surface the typed error before
+                // any thread is spawned.
+                //
+                // iter-C2c-cont (2026-05-30): two phases provision
+                // BOTH the HB-encoded scaffold (always) AND the
+                // hybrid F16-K + TQ-HB-V scaffold (when
+                // HF2Q_HYBRID_KV=1 — the production default per H10
+                // falsification §6.1.11). On allocator failure we
+                // distinguish which regime failed by inspecting the
+                // `multi_seq_kv` field's populated state: if it's
+                // still None, the HB phase (Phase 1) failed; if it
+                // IS populated and we still got an error, the
+                // hybrid phase (Phase 2) failed. Both surfaces emit
+                // their own typed variant for operator-grep
+                // disambiguation.
+                if let Err(e) = g.provision_multi_seq_kv_for_slot_aware(max_slots) {
+                    // Hybrid phase failure: HB phase already
+                    // populated `multi_seq_kv` (Phase 1 invariant).
+                    // Surface the iter-C2c-cont-named typed error
+                    // distinct from the C2c HB-phase variant so
+                    // operator log greps + per-regime debug paths
+                    // route to the right pin pointer.
+                    if g.multi_seq_kv.is_some() {
+                        return Err(EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed {
                             max_slots,
                             cause: e.to_string(),
                         });
                     }
-                    let loaded = LoadedModel::Gemma(g);
-                    let engine = Self::spawn_inner_with_slot_aware(
-                        loaded,
-                        queue_capacity,
-                        kv_cache_budget_bytes,
+                    // HB phase failure: same shape as pre-iter-C2c-
+                    // cont. Preserves H22_gemma4_spawn_fail_variant_
+                    // carries_max_slots_and_cause + the C2c error-
+                    // surface contract verbatim.
+                    return Err(EngineSpawnError::Gemma4SlotAwareProvisionFailed {
                         max_slots,
-                    );
-                    Ok(engine)
+                        cause: e.to_string(),
+                    });
                 }
-                LoadedModel::Qwen35(mut q) => {
-                    // ADR-040 Phase C iter-2d (C2d) — Qwen35 SlotAware
-                    // engine activation. Mirrors the Gemma 4 arm above:
-                    // spawn-time multi-seq KV provisioning via the A2a
-                    // `HybridKvCache::new(.., n_seqs = max_slots)`
-                    // allocator; the worker thread still serves SlotId(0)
-                    // through the existing single-seq forward path and
-                    // surfaces typed `MultiSeqError::Capability
-                    // Unsupported` for SlotId(N>0) admissions —
-                    // kernel-level slot routing through the prompt-cache
-                    // restore + spec-decode + hybrid persistor surfaces
-                    // is iter-C2d-cont (gated on R4 + R4-bis per
-                    // ADR-040 §6 + §6.1.22). B4b (decode-side slot
-                    // threading) already shipped 2026-05-24 — the
-                    // forward-path kernels accept SlotId(N>0) but the
-                    // per-request `alloc_kv_cache_for_request` allocates
-                    // `n_seqs=1` HybridKvCache instances per call (the
-                    // persistent multi-seq cache is provisioned here as
-                    // scaffolding; the worker hot path uses it once
-                    // iter-C2d-cont lifts the per-request alloc into
-                    // the persistent cache + slot-aware prompt-cache
-                    // restore lands).
-                    if max_slots == 0 {
-                        // Defensive: EngineMode::SlotAware callers
-                        // guarantee max_slots >= 1, but pin the boundary
-                        // so the provisioner never sees zero.
-                        return Err(EngineSpawnError::ModeNotYetWired {
-                            iter_landed: "C2d",
-                            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                let loaded = LoadedModel::Gemma(g);
+                let engine = Self::spawn_inner_with_slot_aware(
+                    loaded,
+                    queue_capacity,
+                    kv_cache_budget_bytes,
+                    max_slots,
+                );
+                Ok(engine)
+            }
+            LoadedModel::Qwen35(mut q) => {
+                // ADR-040 Phase C iter-2d (C2d) — Qwen35 SlotAware
+                // engine activation. Mirrors the Gemma 4 arm above:
+                // spawn-time multi-seq KV provisioning via the A2a
+                // `HybridKvCache::new(.., n_seqs = max_slots)`
+                // allocator; the worker thread still serves SlotId(0)
+                // through the existing single-seq forward path and
+                // surfaces typed `MultiSeqError::Capability
+                // Unsupported` for SlotId(N>0) admissions —
+                // kernel-level slot routing through the prompt-cache
+                // restore + spec-decode + hybrid persistor surfaces
+                // is iter-C2d-cont (gated on R4 + R4-bis per
+                // ADR-040 §6 + §6.1.22). B4b (decode-side slot
+                // threading) already shipped 2026-05-24 — the
+                // forward-path kernels accept SlotId(N>0) but the
+                // per-request `alloc_kv_cache_for_request` allocates
+                // `n_seqs=1` HybridKvCache instances per call (the
+                // persistent multi-seq cache is provisioned here as
+                // scaffolding; the worker hot path uses it once
+                // iter-C2d-cont lifts the per-request alloc into
+                // the persistent cache + slot-aware prompt-cache
+                // restore lands).
+                if max_slots == 0 {
+                    // Defensive: EngineMode::SlotAware callers
+                    // guarantee max_slots >= 1, but pin the boundary
+                    // so the provisioner never sees zero.
+                    return Err(EngineSpawnError::ModeNotYetWired {
+                        iter_landed: "C2d",
+                        iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
                                             — require max_slots >= 1",
-                        });
-                    }
-                    if let Err(e) = q.provision_multi_seq_kv_for_slot_aware(max_slots) {
-                        // Wrap into a typed spawn error so callers can
-                        // distinguish "Qwen35 SlotAware provisioning
-                        // failed" from "ModeNotYetWired" without
-                        // string-matching anyhow.
-                        return Err(EngineSpawnError::Qwen35SlotAwareProvisionFailed {
-                            max_slots,
-                            cause: e.to_string(),
-                        });
-                    }
-                    let loaded = LoadedModel::Qwen35(q);
-                    let engine = Self::spawn_inner_with_slot_aware(
-                        loaded,
-                        queue_capacity,
-                        kv_cache_budget_bytes,
-                        max_slots,
-                    );
-                    Ok(engine)
+                    });
                 }
-                LoadedModel::Qwen3VlText(mut v) => {
-                    // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
-                    // SlotAware engine activation. Direct mirror of
-                    // C2c §6.1.21 (Gemma 4) + C2d §6.1.22 (Qwen35) for
-                    // the Qwen3-VL text-LM family.  Pre-C2e this arm
-                    // returned `ModeNotYetWired { iter_required: "C2e
-                    // (...)"}`; iter-C2e flips it to `Ok(Engine)` via
-                    // Path B: spawn-time witness provisioning + worker
-                    // arms typed-clamped at SlotId(N>0).
-                    //
-                    // Path B (witness + typed worker-arm deferral)
-                    // chosen because Qwen3-VL today runs the iter-9b
-                    // naive O(N²) re-prefill loop in
-                    // `engine_qwen3vl::generate_qwen3vl_text_once`
-                    // with no persistent KV cache; the real per-step
-                    // KV cache is upstream-blocked on iter-228a (the
-                    // 501-sentinel arms of `worker_run` for streaming
-                    // / embed / vision-augmented requests).
-                    // Path A (full activation with worker hot-path
-                    // routing through a persistent cache) is gated on
-                    // iter-228a + iter-C2e-cont landing — those iters
-                    // ship the persistent KV scaffold + the four
-                    // worker-arm lift mirrors of C2d-cont-kernel
-                    // iter-{1,2,3,4} §6.1.27-6.1.30 for the Qwen3-VL
-                    // architecture.
-                    //
-                    // The four worker arms (Generate / GenerateStream /
-                    // Embed / GenerateWithSoftTokens) surface typed
-                    // `MultiSeqError::CapabilityUnsupported` at
-                    // SlotId(N>0) with an operator-grep'able label
-                    // naming `iter-C2e-cont per ADR-040 §6.1.52`
-                    // (post iter-228a worker-hot-path lift) AND
-                    // `iter-228a` (the upstream-blocker for the
-                    // persistent KV cache itself).
-                    if max_slots == 0 {
-                        // Defensive: EngineMode::SlotAware callers
-                        // guarantee max_slots >= 1, but pin the
-                        // boundary so the provisioner never sees zero.
-                        return Err(EngineSpawnError::ModeNotYetWired {
-                            iter_landed: "C2e",
-                            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                if let Err(e) = q.provision_multi_seq_kv_for_slot_aware(max_slots) {
+                    // Wrap into a typed spawn error so callers can
+                    // distinguish "Qwen35 SlotAware provisioning
+                    // failed" from "ModeNotYetWired" without
+                    // string-matching anyhow.
+                    return Err(EngineSpawnError::Qwen35SlotAwareProvisionFailed {
+                        max_slots,
+                        cause: e.to_string(),
+                    });
+                }
+                let loaded = LoadedModel::Qwen35(q);
+                let engine = Self::spawn_inner_with_slot_aware(
+                    loaded,
+                    queue_capacity,
+                    kv_cache_budget_bytes,
+                    max_slots,
+                );
+                Ok(engine)
+            }
+            LoadedModel::Qwen3VlText(mut v) => {
+                // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
+                // SlotAware engine activation. Direct mirror of
+                // C2c §6.1.21 (Gemma 4) + C2d §6.1.22 (Qwen35) for
+                // the Qwen3-VL text-LM family.  Pre-C2e this arm
+                // returned `ModeNotYetWired { iter_required: "C2e
+                // (...)"}`; iter-C2e flips it to `Ok(Engine)` via
+                // Path B: spawn-time witness provisioning + worker
+                // arms typed-clamped at SlotId(N>0).
+                //
+                // Path B (witness + typed worker-arm deferral)
+                // chosen because Qwen3-VL today runs the iter-9b
+                // naive O(N²) re-prefill loop in
+                // `engine_qwen3vl::generate_qwen3vl_text_once`
+                // with no persistent KV cache; the real per-step
+                // KV cache is upstream-blocked on iter-228a (the
+                // 501-sentinel arms of `worker_run` for streaming
+                // / embed / vision-augmented requests).
+                // Path A (full activation with worker hot-path
+                // routing through a persistent cache) is gated on
+                // iter-228a + iter-C2e-cont landing — those iters
+                // ship the persistent KV scaffold + the four
+                // worker-arm lift mirrors of C2d-cont-kernel
+                // iter-{1,2,3,4} §6.1.27-6.1.30 for the Qwen3-VL
+                // architecture.
+                //
+                // The four worker arms (Generate / GenerateStream /
+                // Embed / GenerateWithSoftTokens) surface typed
+                // `MultiSeqError::CapabilityUnsupported` at
+                // SlotId(N>0) with an operator-grep'able label
+                // naming `iter-C2e-cont per ADR-040 §6.1.52`
+                // (post iter-228a worker-hot-path lift) AND
+                // `iter-228a` (the upstream-blocker for the
+                // persistent KV cache itself).
+                if max_slots == 0 {
+                    // Defensive: EngineMode::SlotAware callers
+                    // guarantee max_slots >= 1, but pin the
+                    // boundary so the provisioner never sees zero.
+                    return Err(EngineSpawnError::ModeNotYetWired {
+                        iter_landed: "C2e",
+                        iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
                                             — require max_slots >= 1",
-                        });
-                    }
-                    if let Err(e) = v.provision_multi_seq_kv_for_slot_aware(max_slots) {
-                        // Wrap into a typed spawn error so callers can
-                        // distinguish "Qwen3-VL SlotAware provisioning
-                        // failed" from "ModeNotYetWired" without
-                        // string-matching anyhow. Mirrors C2d's
-                        // Qwen35SlotAwareProvisionFailed shape.
-                        return Err(EngineSpawnError::Qwen3VLSlotAwareProvisionFailed {
-                            max_slots,
-                            cause: e.to_string(),
-                        });
-                    }
-                    let loaded = LoadedModel::Qwen3VlText(v);
-                    let engine = Self::spawn_inner_with_slot_aware(
-                        loaded,
-                        queue_capacity,
-                        kv_cache_budget_bytes,
-                        max_slots,
-                    );
-                    Ok(engine)
+                    });
                 }
-                LoadedModel::Deepseek4(_) => Err(EngineSpawnError::ModeNotYetWired {
-                    iter_landed: "deepseek4-agentic-serving",
-                    iter_required: "DeepSeek-V4 currently supports Legacy single-session mode; \
-                                    SlotAware scheduling needs per-slot recurrent and compressed-KV state",
-                }),
+                if let Err(e) = v.provision_multi_seq_kv_for_slot_aware(max_slots) {
+                    // Wrap into a typed spawn error so callers can
+                    // distinguish "Qwen3-VL SlotAware provisioning
+                    // failed" from "ModeNotYetWired" without
+                    // string-matching anyhow. Mirrors C2d's
+                    // Qwen35SlotAwareProvisionFailed shape.
+                    return Err(EngineSpawnError::Qwen3VLSlotAwareProvisionFailed {
+                        max_slots,
+                        cause: e.to_string(),
+                    });
+                }
+                let loaded = LoadedModel::Qwen3VlText(v);
+                let engine = Self::spawn_inner_with_slot_aware(
+                    loaded,
+                    queue_capacity,
+                    kv_cache_budget_bytes,
+                    max_slots,
+                );
+                Ok(engine)
+            }
+            LoadedModel::Deepseek4(mut d) => {
+                if max_slots == 0 {
+                    return Err(EngineSpawnError::ModeNotYetWired {
+                        iter_landed: "deepseek4-agentic-serving",
+                        iter_required: "caller bug: DeepSeek-V4 SlotAware requires max_slots >= 1",
+                    });
+                }
+                if let Err(error) = d.provision_slot_sessions(max_slots) {
+                    return Err(EngineSpawnError::Deepseek4SlotAwareProvisionFailed {
+                        max_slots,
+                        cause: error.to_string(),
+                    });
+                }
+                Ok(Self::spawn_inner_with_slot_aware(
+                    LoadedModel::Deepseek4(d),
+                    queue_capacity,
+                    kv_cache_budget_bytes,
+                    max_slots,
+                ))
+            }
         }
     }
 
@@ -4439,13 +4551,20 @@ impl Engine {
 
         let queue_capacity_u32 = queue_capacity.max(1) as u32;
         let initial_mode = EngineMode::SlotAware { max_slots };
-        // Per ADR-040 §3.5: per-slot budget = total / max_slots. The
-        // SlotAware path is the FIRST callsite where this division
-        // matters (SerialFifo divides by 1).
-        let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes
-            .map(|b| b / u64::from(max_slots.max(1)))
-            .unwrap_or(0);
+        // Full-context slots share one physical KV budget. Slot count changes
+        // concurrency, never an agent's logical context limit. The scheduler
+        // charges persistent per-slot high-water growth against this total.
+        let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes.unwrap_or(0);
         let initial_kv_bytes_per_token_cached: u64 = info.kv_bytes_per_token();
+        let initial_kv_fixed_bytes_per_slot_cached: u64 = info.kv_fixed_bytes_per_slot();
+        tracing::info!(
+            max_slots,
+            logical_context_tokens_per_slot = ?info.max_context_length,
+            shared_physical_kv_budget_bytes = initial_per_slot_kv_budget_bytes,
+            kv_bytes_per_token = initial_kv_bytes_per_token_cached,
+            kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached,
+            "full-context agent slots configured; logical context is not divided by slot count"
+        );
 
         // Seed SchedulerStats with the InflightBatched policy so a
         // pre-admit /metrics scrape reports the configured shape.
@@ -4462,6 +4581,7 @@ impl Engine {
         let worker_registration = registration.clone();
         let worker_per_slot_budget = initial_per_slot_kv_budget_bytes;
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
+        let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
         let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine-slotaware".into())
             .spawn(move || {
@@ -4474,6 +4594,7 @@ impl Engine {
                     worker_stats_handle,
                     worker_per_slot_budget,
                     worker_kv_bytes_per_token,
+                    worker_kv_fixed_bytes_per_slot,
                 )
             })
             .expect("spawn hf2q-engine-slotaware thread");
@@ -4500,6 +4621,7 @@ impl Engine {
                 max_slots,
                 per_slot_kv_budget_bytes: initial_per_slot_kv_budget_bytes,
                 kv_bytes_per_token_cached: initial_kv_bytes_per_token_cached,
+                kv_fixed_bytes_per_slot_cached: initial_kv_fixed_bytes_per_slot_cached,
                 scheduler_stats_snapshot,
             }),
         }
@@ -4530,8 +4652,9 @@ impl Engine {
         self.inner.max_slots
     }
 
-    /// **ADR-040 §3.5 iter-A5b** — per-slot KV byte budget configured
-    /// at spawn time (`kv_cache_budget_bytes / max_slots`).
+    /// **ADR-040 full-context slots** — shared physical KV byte budget
+    /// configured at spawn time. The historical method name is retained for
+    /// compatibility; the returned value is not divided by `max_slots`.
     ///
     /// `0` means enforcement is disabled (operator did not set
     /// `--kv-cache-budget-bytes`, or the synthetic-fixture
@@ -4590,7 +4713,8 @@ impl Engine {
         }
         let needed = u64::from(prompt_tokens)
             .saturating_add(u64::from(max_tokens))
-            .saturating_mul(per_token);
+            .saturating_mul(per_token)
+            .saturating_add(self.inner.kv_fixed_bytes_per_slot_cached);
         if needed > budget {
             return Err(EngineAdmitError::SlotBudgetExceeded {
                 needed_bytes: needed,
@@ -5078,20 +5202,32 @@ impl Engine {
         deepstack: Option<DeepstackData>,
         positions_flat: Option<Vec<i32>>,
     ) -> Result<()> {
+        let (admission, admission_rx) = if matches!(self.inner.mode, EngineMode::SlotAware { .. }) {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let req = Request::GenerateStream {
             prompt_tokens,
             params,
             events: events_tx,
             cancellation_counter,
+            admission,
             soft_tokens,
             deepstack,
             positions_flat,
         };
         match self.inner.tx.try_send(req) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
             Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!("engine worker is gone"),
         }
+        if let Some(rx) = admission_rx {
+            rx.await
+                .context("slot-aware stream admission reply dropped")??;
+        }
+        Ok(())
     }
 
     /// Enqueue a pooled-embedding request (ADR-005 Task #8, iter-92).
@@ -5396,7 +5532,227 @@ enum SlotReply {
     Stream {
         events: mpsc::Sender<super::sse::GenerationEvent>,
         cancel: Option<Arc<std::sync::atomic::AtomicU64>>,
+        admission: Option<oneshot::Sender<Result<()>>>,
+        /// Family-aware OpenAI stream routing for Gemma 4 and Qwen 3.5/3.6.
+        /// DeepSeek-V4 owns an equivalent DSML router in its decode state and
+        /// therefore installs `None` here.
+        router: Option<SlotStreamRouter>,
     },
+}
+
+impl SlotReply {
+    fn family_stream(
+        events: mpsc::Sender<super::sse::GenerationEvent>,
+        cancel: Option<Arc<std::sync::atomic::AtomicU64>>,
+        admission: Option<oneshot::Sender<Result<()>>>,
+        registration: Option<&super::registry::ModelRegistration>,
+        params: &SamplingParams,
+    ) -> Self {
+        Self::Stream {
+            events,
+            cancel,
+            admission,
+            router: Some(SlotStreamRouter::new(registration, params)),
+        }
+    }
+
+    fn deepseek_stream(
+        events: mpsc::Sender<super::sse::GenerationEvent>,
+        cancel: Option<Arc<std::sync::atomic::AtomicU64>>,
+        admission: Option<oneshot::Sender<Result<()>>>,
+    ) -> Self {
+        Self::Stream {
+            events,
+            cancel,
+            admission,
+            router: None,
+        }
+    }
+
+    fn accept_stream_admission(&mut self) {
+        if let Self::Stream { admission, .. } = self {
+            if let Some(tx) = admission.take() {
+                let _ = tx.send(Ok(()));
+            }
+        }
+    }
+}
+
+/// Per-request family-aware streaming state for the generic Gemma/Qwen slot
+/// loop.  A slot may interleave with peers, so these splitters and tool-call
+/// accumulators cannot remain stack locals in a whole-request driver.
+struct SlotStreamRouter {
+    registration: Option<super::registry::ModelRegistration>,
+    reasoning: Option<super::registry::ReasoningSplitter>,
+    tools: Option<super::registry::ToolCallSplitter>,
+    tool_body: String,
+    tool_index: usize,
+    tool_emitter: Option<ToolCallStreamEmitter>,
+    saw_tool_call: bool,
+    policy: ToolCallPolicy,
+    accumulated_text_len: usize,
+}
+
+impl SlotStreamRouter {
+    fn new(
+        registration: Option<&super::registry::ModelRegistration>,
+        params: &SamplingParams,
+    ) -> Self {
+        Self {
+            registration: registration.cloned(),
+            reasoning: registration.and_then(|registration| {
+                super::registry::make_reasoning_splitter(registration, params.reasoning_forced_open)
+            }),
+            tools: registration.and_then(super::registry::ToolCallSplitter::from_registration),
+            tool_body: String::new(),
+            tool_index: 0,
+            tool_emitter: None,
+            saw_tool_call: false,
+            policy: params.tool_call_policy,
+            accumulated_text_len: 0,
+        }
+    }
+
+    fn emit(
+        &mut self,
+        events: &mpsc::Sender<super::sse::GenerationEvent>,
+        fragment: &str,
+    ) -> Result<(), ()> {
+        if fragment.is_empty() {
+            return Ok(());
+        }
+        self.accumulated_text_len = self.accumulated_text_len.saturating_add(fragment.len());
+        let classified = if let Some(splitter) = self.reasoning.as_mut() {
+            splitter.feed(fragment)
+        } else {
+            vec![(super::registry::SplitSlot::Content, fragment.to_string())]
+        };
+        let sink = EventSink::new(events);
+        for (slot, text) in classified {
+            match slot {
+                super::registry::SplitSlot::Reasoning => {
+                    if !text.is_empty()
+                        && sink
+                            .blocking_send(super::sse::GenerationEvent::Delta {
+                                kind: super::sse::DeltaKind::Reasoning,
+                                text,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::SplitSlot::Content => self.emit_content(&sink, &text)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_content(&mut self, events: &EventSink<'_>, text: &str) -> Result<(), ()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some(splitter) = self.tools.as_mut() else {
+            return events
+                .blocking_send(super::sse::GenerationEvent::Delta {
+                    kind: super::sse::DeltaKind::Content,
+                    text: text.to_string(),
+                })
+                .map_err(|_| ());
+        };
+        let registration = self.registration.as_ref();
+        for event in splitter.feed(text) {
+            match event {
+                super::registry::ToolCallEvent::Content(text) => {
+                    if !text.is_empty()
+                        && events
+                            .blocking_send(super::sse::GenerationEvent::Delta {
+                                kind: super::sse::DeltaKind::Content,
+                                text,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallOpen => {
+                    self.tool_body.clear();
+                    self.tool_emitter = Some(ToolCallStreamEmitter::new(
+                        registration.map(|registration| registration.family),
+                        self.tool_index,
+                    ));
+                }
+                super::registry::ToolCallEvent::ToolCallText(text) => {
+                    self.tool_body.push_str(&text);
+                    if let Some(emitter) = self.tool_emitter.as_mut() {
+                        emitter.advance(&self.tool_body, events)?;
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallClose => {
+                    let body = std::mem::take(&mut self.tool_body);
+                    let mut emitter = self.tool_emitter.take().unwrap_or_else(|| {
+                        ToolCallStreamEmitter::new(
+                            registration.map(|registration| registration.family),
+                            self.tool_index,
+                        )
+                    });
+                    emitter.finalize(
+                        body,
+                        registration,
+                        self.policy,
+                        &mut self.tool_index,
+                        &mut self.saw_tool_call,
+                        events,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain splitter tails and enforce the same truncated/required-call
+    /// checks as the serial streaming driver. Returns the OpenAI terminal
+    /// finish reason override when a structured tool call was emitted.
+    fn finish(
+        &mut self,
+        events: &mpsc::Sender<super::sse::GenerationEvent>,
+        completion_tokens: usize,
+    ) -> Result<Option<&'static str>, ()> {
+        let sink = EventSink::new(events);
+        if let Some(splitter) = self.reasoning.as_mut() {
+            if let Some((slot, tail)) = splitter.finish() {
+                match slot {
+                    super::registry::SplitSlot::Reasoning => {
+                        if !tail.is_empty()
+                            && sink
+                                .blocking_send(super::sse::GenerationEvent::Delta {
+                                    kind: super::sse::DeltaKind::Reasoning,
+                                    text: tail,
+                                })
+                                .is_err()
+                        {
+                            return Err(());
+                        }
+                    }
+                    super::registry::SplitSlot::Content => self.emit_content(&sink, &tail)?,
+                }
+            }
+        }
+        match finalize_streaming_tool_state(
+            self.tools.as_mut(),
+            self.policy,
+            self.saw_tool_call,
+            self.registration.as_ref(),
+            completion_tokens,
+            self.accumulated_text_len,
+            &sink,
+        ) {
+            FinalizeStreamingAction::Continue => Ok(self.saw_tool_call.then_some("tool_calls")),
+            FinalizeStreamingAction::ClientDropped | FinalizeStreamingAction::ErrorEmitted => {
+                Err(())
+            }
+        }
+    }
 }
 
 /// What one per-arch `decode_tick_*` produced for one slot this tick.
@@ -5435,7 +5791,16 @@ struct TickOutcome {
 /// single slot (N=1) is byte-identical to the serial reference.
 struct Gemma4DecodeState {
     slot_id: SlotId,
+    /// Exact family-rendered prompt tokens whose KV entries are live in this
+    /// physical slot.  This is the cache identity; raw chat messages are not.
+    prompt_tokens: Vec<u32>,
     prompt_len: usize,
+    /// Exact prefix reused at admission. Zero denotes a cold prefill.
+    cached_tokens: usize,
+    /// Number of token positions whose KV entries have been written. The
+    /// generated token selected by the latest forward is not valid until it is
+    /// fed through the next decode forward.
+    valid_tokens: usize,
     max_decode_tokens: usize,
     /// `Some` ⇒ slow sampling path (any non-greedy field set); `None` ⇒
     /// greedy fast-path (reuse the forward's on-GPU argmax).
@@ -5461,6 +5826,10 @@ struct Gemma4DecodeState {
     next_token: u32,
     generated_tokens: Vec<u32>,
     decoded_text: String,
+    /// Classification of the prefill-selected first fragment. Streaming must
+    /// route that fragment before decode tick one; otherwise a tool opener can
+    /// be lost even though the final unary transcript remains parseable.
+    seed_is_reasoning: bool,
     finish_reason: &'static str,
     prefill_duration: Duration,
     decode_started: Instant,
@@ -5500,10 +5869,24 @@ impl Gemma4DecodeState {
         mut multi_seq_kv_mlx: Option<
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
         >,
-    ) -> Result<Self> {
+        cached_tokens: usize,
+    ) -> Result<(
+        Self,
+        Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>,
+    )> {
         let max_decode_tokens = params.max_tokens.max(1);
 
-        // Per-slot reset at ENTRY — mirror of the serial ref
+        if cached_tokens > prompt_tokens.len() {
+            anyhow::bail!(
+                "Gemma4DecodeState::prefill_seed: cached prefix {cached_tokens} exceeds prompt {}",
+                prompt_tokens.len()
+            );
+        }
+
+        // A cold admission owns the slot and resets its cursor. A compatible
+        // continuation keeps the exact live prefix and processes only the
+        // appended suffix. Soft-token prompts deliberately remain cold until
+        // their embedding identity is represented in the ledger.
         // `generate_gemma4_once_slot_aware` (engine.rs:10386-10412). The
         // persistent multi-seq KV may carry stale bytes from a prior
         // request on this slot OR from spawn-time provisioning (the FIRST
@@ -5512,36 +5895,137 @@ impl Gemma4DecodeState {
         // prefill reads provisioned garbage and diverges from SerialFifo.
         // Resets HB + hybrid (production-default regime); dense/mlx are
         // off-default and their forward paths defense-in-depth on absence.
-        for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
-            buf.reset_for_slot(slot_id).map_err(|e| {
-                anyhow::anyhow!(
-                    "Gemma4DecodeState::prefill_seed: reset_for_slot at entry L{layer_idx}: {e}"
-                )
-            })?;
-        }
-        if let Some(hybrid) = multi_seq_kv_hybrid.as_deref_mut() {
-            for (layer_idx, buf) in hybrid.iter_mut().enumerate() {
+        if cached_tokens == 0 {
+            for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
                 buf.reset_for_slot(slot_id).map_err(|e| {
                     anyhow::anyhow!(
-                        "Gemma4DecodeState::prefill_seed: reset_for_slot at entry (hybrid) \
-                         L{layer_idx}: {e}"
+                        "Gemma4DecodeState::prefill_seed: reset_for_slot at entry L{layer_idx}: {e}"
                     )
                 })?;
+            }
+            if let Some(hybrid) = multi_seq_kv_hybrid.as_deref_mut() {
+                for (layer_idx, buf) in hybrid.iter_mut().enumerate() {
+                    buf.reset_for_slot(slot_id).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Gemma4DecodeState::prefill_seed: reset_for_slot at entry (hybrid) \
+                             L{layer_idx}: {e}"
+                        )
+                    })?;
+                }
             }
         }
 
         let prefill_started = Instant::now();
-        let first_decode_token = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
-            prompt_tokens,
-            soft_tokens,
-            max_decode_tokens,
-            &mut loaded.ctx,
-            slot_id,
-            multi_seq_kv,
-            multi_seq_kv_hybrid.as_deref_mut(),
-            multi_seq_kv_dense.as_deref_mut(),
-            multi_seq_kv_mlx.as_deref_mut(),
-        )?;
+        let stable_boundary = params
+            .stable_prompt_prefix_tokens
+            .filter(|_| soft_tokens.is_empty() && multi_seq_kv_hybrid.is_some());
+        if let Some(boundary) = stable_boundary {
+            anyhow::ensure!(
+                boundary > 0 && boundary < prompt_tokens.len(),
+                "Gemma stable prompt boundary {boundary} must satisfy 0 < boundary < prompt_len {}",
+                prompt_tokens.len()
+            );
+            anyhow::ensure!(
+                cached_tokens <= boundary,
+                "Gemma cached prefix {cached_tokens} extends beyond stable prompt boundary {boundary}"
+            );
+        }
+
+        let (first_decode_token, prompt_anchor) = if let Some(boundary) = stable_boundary {
+            // Advance only to the exact pre-generation boundary, checkpoint
+            // the sliding ring there, then process the rewriteable generation
+            // cue. This avoids heuristic ring rewind on the next tool turn.
+            if cached_tokens < boundary {
+                if cached_tokens == 0 {
+                    let _ = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+                        &prompt_tokens[..boundary],
+                        &[],
+                        max_decode_tokens,
+                        &mut loaded.ctx,
+                        slot_id,
+                        multi_seq_kv,
+                        multi_seq_kv_hybrid.as_deref_mut(),
+                        multi_seq_kv_dense.as_deref_mut(),
+                        multi_seq_kv_mlx.as_deref_mut(),
+                    )?;
+                } else {
+                    let _ = loaded
+                        .weights
+                        .forward_prefill_with_soft_tokens_slot_aware_resume(
+                            &prompt_tokens[..boundary],
+                            &[],
+                            max_decode_tokens,
+                            &mut loaded.ctx,
+                            slot_id,
+                            multi_seq_kv,
+                            multi_seq_kv_hybrid.as_deref_mut(),
+                            multi_seq_kv_dense.as_deref_mut(),
+                            multi_seq_kv_mlx.as_deref_mut(),
+                            cached_tokens,
+                        )?;
+                }
+                clear_gemma4_self_mounts(loaded);
+            }
+            let anchor =
+                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    multi_seq_kv_hybrid
+                        .as_deref()
+                        .expect("stable Gemma boundary requires hybrid KV"),
+                    slot_id,
+                    boundary,
+                )?;
+            let first_decode_token = loaded
+                .weights
+                .forward_prefill_with_soft_tokens_slot_aware_resume(
+                    prompt_tokens,
+                    &[],
+                    max_decode_tokens,
+                    &mut loaded.ctx,
+                    slot_id,
+                    multi_seq_kv,
+                    multi_seq_kv_hybrid.as_deref_mut(),
+                    multi_seq_kv_dense.as_deref_mut(),
+                    multi_seq_kv_mlx.as_deref_mut(),
+                    boundary,
+                )?;
+            (first_decode_token, Some(anchor))
+        } else if cached_tokens == 0 {
+            (
+                loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+                    prompt_tokens,
+                    soft_tokens,
+                    max_decode_tokens,
+                    &mut loaded.ctx,
+                    slot_id,
+                    multi_seq_kv,
+                    multi_seq_kv_hybrid.as_deref_mut(),
+                    multi_seq_kv_dense.as_deref_mut(),
+                    multi_seq_kv_mlx.as_deref_mut(),
+                )?,
+                None,
+            )
+        } else {
+            if !soft_tokens.is_empty() {
+                anyhow::bail!("Gemma 4 live-prefix resume does not accept soft-token prompts");
+            }
+            (
+                loaded
+                    .weights
+                    .forward_prefill_with_soft_tokens_slot_aware_resume(
+                        prompt_tokens,
+                        soft_tokens,
+                        max_decode_tokens,
+                        &mut loaded.ctx,
+                        slot_id,
+                        multi_seq_kv,
+                        multi_seq_kv_hybrid.as_deref_mut(),
+                        multi_seq_kv_dense.as_deref_mut(),
+                        multi_seq_kv_mlx.as_deref_mut(),
+                        cached_tokens,
+                    )?,
+                None,
+            )
+        };
         let prefill_duration = prefill_started.elapsed();
         if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
             eprintln!(
@@ -5555,23 +6039,29 @@ impl Gemma4DecodeState {
 
         // State construction extracted to `from_first_token` (shared with the
         // iter-G(a) batched admit path, which supplies the multi-seq first token).
-        Self::from_first_token(
-            loaded,
-            prompt_tokens,
-            params,
-            registration,
-            slot_id,
-            first_decode_token,
-            prefill_duration,
-        )
+        Ok((
+            Self::from_first_token(
+                loaded,
+                prompt_tokens,
+                params,
+                registration,
+                slot_id,
+                first_decode_token,
+                None,
+                prefill_duration,
+                cached_tokens,
+            )?,
+            prompt_anchor,
+        ))
     }
 
     /// ADR-040 iter-G(a) — build the Gemma4DecodeState from an already-computed
     /// prefill first token. Extracted from `prefill_seed` so the cross-slot
     /// batched-admit path (one multi-seq forward → N first tokens) reuses the
-    /// identical sampler/grammar/tool-call/reasoning/EOS construction. GREEDY
-    /// only is batched (sample_logits==false), so `logits_view()` (read here only
-    /// under `if sample_logits`) is never touched for batched callers.
+    /// identical sampler/grammar/tool-call/reasoning/EOS construction. A
+    /// multi-sequence caller supplies its own final logits row so grammar,
+    /// logit bias, logprobs, and sampling remain request-local; a serial caller
+    /// reads the model's current logits buffer.
     #[allow(clippy::too_many_arguments)]
     fn from_first_token(
         loaded: &mut GemmaLoadedModel,
@@ -5580,7 +6070,9 @@ impl Gemma4DecodeState {
         registration: Option<&super::registry::ModelRegistration>,
         slot_id: SlotId,
         first_decode_token: u32,
+        first_logits: Option<&[f32]>,
         prefill_duration: std::time::Duration,
+        cached_tokens: usize,
     ) -> Result<Self> {
         let max_decode_tokens = params.max_tokens.max(1);
         // Sampler / grammar / logprobs config — mirror of serial ref
@@ -5631,7 +6123,18 @@ impl Gemma4DecodeState {
         let token_bytes_ref: Option<&[Vec<u8>]> = token_bytes.as_deref().map(|v| &v[..]);
         let mut next_token = if sample_logits {
             let sp = sampler_params.as_ref().expect("sample_logits gate");
-            let mut logits: Vec<f32> = loaded.weights.logits_view()?.to_vec();
+            let mut logits: Vec<f32> = match first_logits {
+                Some(logits) => {
+                    anyhow::ensure!(
+                        logits.len() >= loaded.weights.vocab_size,
+                        "Gemma batched logits row {} < vocab {}",
+                        logits.len(),
+                        loaded.weights.vocab_size
+                    );
+                    logits[..loaded.weights.vocab_size].to_vec()
+                }
+                None => loaded.weights.logits_view()?.to_vec(),
+            };
             if !params.logit_bias.is_empty() {
                 let v = logits.len();
                 for (&id, &bias) in &params.logit_bias {
@@ -5641,15 +6144,14 @@ impl Gemma4DecodeState {
                     }
                 }
             }
-            if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-            }
-            let (tok, lp_opt) = if want_logprobs {
-                let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
-                (t, Some(lp))
-            } else {
-                (sampler_pure::sample_token(&mut logits, sp, &[]), None)
-            };
+            let (tok, lp_opt) = sample_logits_with_grammar(
+                &mut logits,
+                sp,
+                &[],
+                grammar_runtime.as_ref(),
+                token_bytes_ref,
+                want_logprobs,
+            );
             if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
@@ -5681,9 +6183,11 @@ impl Gemma4DecodeState {
             .decode(&[next_token], false)
             .unwrap_or_default();
         decoded_text.push_str(&first_fragment);
+        let mut seed_is_reasoning = false;
         if let Some(sp) = reasoning_splitter.as_mut() {
             let _ = sp.feed(&first_fragment);
             if sp.in_reasoning() {
+                seed_is_reasoning = true;
                 reasoning_token_count += 1;
             }
         }
@@ -5703,7 +6207,7 @@ impl Gemma4DecodeState {
         // Early EOS / stop on the prefill-emitted first token (serial ref
         // 9151-9157). NOTE gemma4 does NOT pop the first token on EOS (it
         // simply does not push it); divergent from qwen35 which pops+clears.
-        if loaded.eos_token_ids.contains(&next_token) {
+        if loaded.is_generation_stop_token(next_token) {
             finish_reason = "stop";
         } else if hit_stop_string(&decoded_text, &params.stop_strings) {
             finish_reason = "stop";
@@ -5717,7 +6221,10 @@ impl Gemma4DecodeState {
 
         Ok(Gemma4DecodeState {
             slot_id,
+            prompt_tokens: prompt_tokens.to_vec(),
             prompt_len: prompt_tokens.len(),
+            cached_tokens,
+            valid_tokens: prompt_tokens.len(),
             max_decode_tokens,
             sampler_params,
             grammar_runtime,
@@ -5734,16 +6241,37 @@ impl Gemma4DecodeState {
             next_token,
             generated_tokens,
             decoded_text,
+            seed_is_reasoning,
             finish_reason,
             prefill_duration,
             decode_started,
         })
     }
 
+    fn retained_prefix(&self) -> Vec<u32> {
+        self.prompt_tokens
+            .iter()
+            .copied()
+            .chain(self.generated_tokens.iter().copied())
+            .take(self.valid_tokens)
+            .collect()
+    }
+
     /// Whether the slot already terminated during prefill-seed (first token
     /// was EOS/stop), so the loop should skip decode ticks and finish now.
     fn finished_at_seed(&self) -> bool {
         self.finish_reason != "length"
+    }
+
+    /// The first semantic fragment was selected by prefill, before the first
+    /// decode tick. Unary replies already retain it in `decoded_text`; SSE
+    /// callers must emit it explicitly at admission.
+    fn seed_tick(&self) -> TickOutcome {
+        TickOutcome {
+            fragment: self.decoded_text.clone(),
+            is_reasoning: self.seed_is_reasoning,
+            finished: self.finished_at_seed(),
+        }
     }
 
     /// Advance this slot by exactly one decode token — mirror of the serial
@@ -5780,6 +6308,7 @@ impl Gemma4DecodeState {
             multi_seq_kv_dense.as_deref_mut(),
             multi_seq_kv_mlx.as_deref_mut(),
         )?;
+        self.valid_tokens = self.valid_tokens.saturating_add(1);
 
         // ADR-040 S1c-2: the post-forward half (sample/grammar/stop/accumulate)
         // is `decode_tick_finalize`, shared with the batched-head path. Read the
@@ -5816,22 +6345,14 @@ impl Gemma4DecodeState {
                     }
                 }
             }
-            if let (Some(rt), Some(tb)) = (self.grammar_runtime.as_ref(), token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-            }
-            let (tok, lp_opt) = if self.want_logprobs {
-                let (t, lp) = sampler_pure::sample_token_with_logprob(
-                    &mut logits,
-                    sp,
-                    &self.generated_tokens,
-                );
-                (t, Some(lp))
-            } else {
-                (
-                    sampler_pure::sample_token(&mut logits, sp, &self.generated_tokens),
-                    None,
-                )
-            };
+            let (tok, lp_opt) = sample_logits_with_grammar(
+                &mut logits,
+                sp,
+                &self.generated_tokens,
+                self.grammar_runtime.as_ref(),
+                token_bytes_ref,
+                self.want_logprobs,
+            );
             if let (Some(acc), Some(lp_val)) = (self.logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
@@ -5847,7 +6368,7 @@ impl Gemma4DecodeState {
         };
 
         // EOS before push/decode (serial ref 9228-9231): suppress the token.
-        if loaded.eos_token_ids.contains(&self.next_token) {
+        if loaded.is_generation_stop_token(self.next_token) {
             self.finish_reason = "stop";
             return Ok(TickOutcome {
                 fragment: String::new(),
@@ -5957,6 +6478,7 @@ impl Gemma4DecodeState {
             multi_seq_kv_dense.as_deref_mut(),
             multi_seq_kv_mlx.as_deref_mut(),
         )?;
+        self.valid_tokens = self.valid_tokens.saturating_add(1);
         let hs = loaded.weights.hidden_size;
         let hidden: Vec<f32> = loaded
             .weights
@@ -5995,7 +6517,7 @@ impl Gemma4DecodeState {
             finish_reason: self.finish_reason,
             prefill_duration: self.prefill_duration,
             decode_duration,
-            cached_tokens: 0,
+            cached_tokens: self.cached_tokens,
             logprobs: self.logprobs_acc,
         }
     }
@@ -6020,11 +6542,13 @@ fn worker_run_slot_aware(
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    kv_fixed_bytes_per_slot: u64,
 ) {
-    let scheduler = InflightBatchedScheduler::new_with_kv_budget(
+    let scheduler = InflightBatchedScheduler::new_with_kv_budget_and_floor(
         queue_capacity,
         max_slots,
         per_slot_kv_budget_bytes,
+        kv_fixed_bytes_per_slot,
     );
     match loaded {
         LoadedModel::Gemma(g) => run_slot_aware_gemma4(
@@ -6054,38 +6578,605 @@ fn worker_run_slot_aware(
         LoadedModel::Qwen3VlText(_) => {
             run_slot_aware_qwen3vl_unsupported(rx);
         }
-        LoadedModel::Deepseek4(_) => {
-            tracing::error!(
-                "DeepSeek-V4 reached SlotAware worker despite spawn-time rejection; \
-                 rejecting requests through the unsupported worker"
-            );
-            run_slot_aware_qwen3vl_unsupported(rx);
+        LoadedModel::Deepseek4(d) => run_slot_aware_deepseek4(
+            d,
+            rx,
+            registration,
+            scheduler,
+            scheduler_stats_snapshot,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token,
+        ),
+    }
+}
+
+type Deepseek4Slot = (
+    super::engine_deepseek4::Deepseek4SlotState,
+    SlotReply,
+    SlotHandle,
+);
+
+const DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV: &str = "HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM";
+const DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 8;
+const MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 64;
+
+fn parse_deepseek4_slot_decode_quantum(raw: Option<&str>) -> std::result::Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM);
+    };
+    let quantum = raw.parse::<usize>().map_err(|_| {
+        format!(
+            "{DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV} must be an integer in 1..={MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM}, got {raw:?}"
+        )
+    })?;
+    if !(1..=MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM).contains(&quantum) {
+        return Err(format!(
+            "{DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV} must be in 1..={MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM}, got {quantum}"
+        ));
+    }
+    Ok(quantum)
+}
+
+fn deepseek4_slot_decode_quantum() -> usize {
+    let raw = std::env::var(DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV).ok();
+    parse_deepseek4_slot_decode_quantum(raw.as_deref()).unwrap_or_else(|error| {
+        tracing::warn!(
+            error,
+            fallback = DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM,
+            "invalid DeepSeek-V4 slot decode quantum"
+        );
+        DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM
+    })
+}
+
+fn preferred_deepseek_session(
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    active_slots: &[Option<Deepseek4Slot>],
+    last_used: &[u64],
+    prompt_tokens: &[u32],
+) -> SlotId {
+    let reusable_prefix_lengths: Vec<usize> = sessions
+        .iter()
+        .map(|session| session.reusable_prefix_len(prompt_tokens))
+        .collect();
+    let empty_sessions: Vec<bool> = sessions
+        .iter()
+        .map(super::engine_deepseek4::Deepseek4Session::is_empty)
+        .collect();
+    let active: Vec<bool> = active_slots.iter().map(Option::is_some).collect();
+    choose_full_context_slot(
+        &reusable_prefix_lengths,
+        &empty_sessions,
+        &active,
+        last_used,
+    )
+}
+
+fn choose_full_context_slot(
+    reusable_prefix_lengths: &[usize],
+    empty_sessions: &[bool],
+    active: &[bool],
+    last_used: &[u64],
+) -> SlotId {
+    if let Some((index, _)) = reusable_prefix_lengths
+        .iter()
+        .enumerate()
+        .filter(|(index, prefix_len)| !active[*index] && **prefix_len > 0)
+        .max_by_key(|(_, prefix_len)| **prefix_len)
+    {
+        return SlotId(index as u32);
+    }
+    if let Some(index) = empty_sessions
+        .iter()
+        .enumerate()
+        .find(|(index, is_empty)| !active[*index] && **is_empty)
+        .map(|(index, _)| index)
+    {
+        return SlotId(index as u32);
+    }
+    SlotId(
+        last_used
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !active[*index])
+            .min_by_key(|(_, stamp)| **stamp)
+            .map(|(index, _)| index as u32)
+            .unwrap_or(0),
+    )
+}
+
+/// DeepSeek-V4 full-context slot worker. Each physical slot retains independent
+/// compressed KV and recurrent state. Requests are admitted in bounded waves:
+/// once any slot in a wave starts decoding, newly arriving requests wait until
+/// that wave completes. DeepSeek prefill is not yet chunk-resumable, so this
+/// prevents a late multi-thousand-token prefill from starving an older streamed
+/// decode on the single model worker. Within a wave, each slot advances by a
+/// bounded decode quantum before the next slot runs.
+#[allow(clippy::too_many_arguments)]
+fn run_slot_aware_deepseek4(
+    mut model: super::engine_deepseek4::Deepseek4LoadedModel,
+    mut rx: mpsc::Receiver<Request>,
+    registration: Option<super::registry::ModelRegistration>,
+    mut scheduler: InflightBatchedScheduler,
+    scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
+    shared_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+) {
+    let decode_quantum = deepseek4_slot_decode_quantum();
+    let mut sessions = match model.take_slot_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::error!("DeepSeek-V4 SlotAware loop cannot start: {error:#}");
+            drain_with_startup_error(rx, "DeepSeek-V4 full-context sessions absent");
+            return;
+        }
+    };
+    let mut slots: Vec<Option<Deepseek4Slot>> = (0..sessions.len()).map(|_| None).collect();
+    let mut last_used = vec![0_u64; sessions.len()];
+    let mut clock = 1_u64;
+    let mut pending: Option<Request> = None;
+    let mut admission_open = true;
+    tracing::info!(
+        slots = sessions.len(),
+        decode_quantum,
+        admission_policy = "bounded-wave",
+        "DeepSeek-V4 full-context session worker started"
+    );
+    let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
+        if let Ok(mut stats) = snap.lock() {
+            *stats = sched.stats();
+        }
+    };
+
+    'worker: loop {
+        while admission_open && slots.iter().any(Option::is_none) {
+            let request = match pending.take() {
+                Some(request) => request,
+                None => match rx.try_recv() {
+                    Ok(request) => request,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                },
+            };
+            match request {
+                Request::Generate {
+                    prompt_tokens,
+                    params,
+                    reply,
+                } => admit_deepseek4_slot(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &last_used,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    shared_kv_budget_bytes,
+                    kv_bytes_per_token,
+                    prompt_tokens,
+                    params,
+                    SlotReply::Unary(reply),
+                ),
+                Request::GenerateStream {
+                    prompt_tokens,
+                    params,
+                    events,
+                    cancellation_counter,
+                    admission,
+                    soft_tokens,
+                    ..
+                } => {
+                    if soft_tokens.is_empty() {
+                        admit_deepseek4_slot(
+                            &mut model,
+                            &mut sessions,
+                            &mut slots,
+                            &last_used,
+                            &mut scheduler,
+                            registration.as_ref(),
+                            shared_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            params,
+                            SlotReply::deepseek_stream(events, cancellation_counter, admission),
+                        );
+                    } else {
+                        slot_fire_done(
+                            SlotReply::deepseek_stream(events, cancellation_counter, admission),
+                            Err(anyhow::anyhow!(
+                                "DeepSeek-V4 does not accept multimodal soft tokens"
+                            )),
+                            false,
+                        );
+                    }
+                }
+                Request::Warmup { reply } => {
+                    let _ = reply.send(Ok(()));
+                }
+                Request::Embed { reply, .. } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "DeepSeek-V4 embeddings are not supported"
+                    )));
+                }
+                Request::GenerateWithSoftTokens { reply, .. } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "DeepSeek-V4 does not accept multimodal soft tokens"
+                    )));
+                }
+                Request::Shutdown => break 'worker,
+                _ => {}
+            }
+            publish(&scheduler, &scheduler_stats_snapshot);
+        }
+        if slots.iter().any(Option::is_some) {
+            admission_open = false;
+        }
+
+        match scheduler.step() {
+            Ok(SchedulerStep::Idle) => match rx.blocking_recv() {
+                Some(request) => pending = Some(request),
+                None => break 'worker,
+            },
+            Ok(SchedulerStep::Decode { handles }) => {
+                decode_batch_deepseek4(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &mut last_used,
+                    &mut clock,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    &handles,
+                    kv_bytes_per_token,
+                    decode_quantum,
+                );
+                if slots.iter().all(Option::is_none) {
+                    admission_open = true;
+                }
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
+            Ok(SchedulerStep::Prefill { .. }) | Ok(SchedulerStep::Mixed { .. }) => {
+                tracing::error!(
+                    "DeepSeek-V4 SlotAware scheduler exposed prefill after synchronous seed"
+                );
+                break 'worker;
+            }
+            Err(error) => {
+                tracing::error!(?error, "DeepSeek-V4 SlotAware scheduler step failed");
+                break 'worker;
+            }
         }
     }
+
+    tracing::info!(
+        slots = sessions.len(),
+        "DeepSeek-V4 full-context session worker exited"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_deepseek4_slot(
+    model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    last_used: &[u64],
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    shared_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    mut reply: SlotReply,
+) {
+    let preferred = preferred_deepseek_session(sessions, slots, last_used, &prompt_tokens);
+    let needed = if shared_kv_budget_bytes == 0 || kv_bytes_per_token == 0 {
+        0
+    } else {
+        (prompt_tokens.len() as u64)
+            .saturating_add(params.max_tokens as u64)
+            .saturating_mul(kv_bytes_per_token)
+    };
+    let admitted = match scheduler.admit(AdmitRequest {
+        prompt_tokens: prompt_tokens.len() as u32,
+        max_tokens: params.max_tokens as u32,
+        kv_bytes_needed: needed,
+        prompt_kv_bytes: if needed == 0 {
+            0
+        } else {
+            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+        },
+        preferred_slot: Some(preferred),
+    }) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            fire_deepseek4_error(
+                reply,
+                anyhow::anyhow!("DeepSeek-V4 full-context slot admit failed: {error}"),
+            );
+            return;
+        }
+    };
+
+    let Some(handle) = admitted.handle else {
+        // The bounded-wave worker only calls `admit` while one of its
+        // physical sessions is idle, so the scheduler's only valid
+        // handle-less success is CompletedAtAdmit (`max_tokens == 0`). Do
+        // not silently run an ordinary queued request outside scheduler KV
+        // admission if those invariants ever drift.
+        if admitted.max_tokens != 0 {
+            let _ = scheduler.cancel_queued(admitted.request_id);
+            fire_deepseek4_error(
+                reply,
+                anyhow::anyhow!(
+                    "DeepSeek-V4 full-context slot admit returned no physical slot for a nonzero decode budget"
+                ),
+            );
+            return;
+        }
+        reply.accept_stream_admission();
+        let slot_index = preferred.0 as usize;
+        sessions[slot_index].swap_with_loaded(model);
+        match reply {
+            SlotReply::Unary(reply) => {
+                let result = super::engine_deepseek4::generate_once(
+                    model,
+                    &prompt_tokens,
+                    &params,
+                    registration,
+                );
+                sessions[slot_index].swap_with_loaded(model);
+                let _ = reply.send(result);
+            }
+            SlotReply::Stream { events, cancel, .. } => {
+                super::engine_deepseek4::generate_stream(
+                    model,
+                    &prompt_tokens,
+                    &params,
+                    &events,
+                    registration,
+                    cancel.as_deref(),
+                );
+                sessions[slot_index].swap_with_loaded(model);
+            }
+        }
+        return;
+    };
+
+    reply.accept_stream_admission();
+    let slot_index = handle.slot_id.0 as usize;
+    sessions[slot_index].swap_with_loaded(model);
+    let is_stream = matches!(&reply, SlotReply::Stream { .. });
+    let seed = super::engine_deepseek4::Deepseek4SlotState::prefill_seed(
+        model,
+        prompt_tokens,
+        params,
+        registration,
+        is_stream,
+        || match &reply {
+            SlotReply::Unary(_) => false,
+            SlotReply::Stream { events, .. } => events.is_closed(),
+        },
+    );
+    sessions[slot_index].swap_with_loaded(model);
+    match seed {
+        Ok(state) => {
+            scheduler.advance_after_prefill(handle, admitted.prompt_tokens);
+            slots[slot_index] = Some((state, reply, handle));
+        }
+        Err(error) => {
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                sessions[slot_index].committed_tokens().len(),
+                kv_bytes_per_token,
+            );
+            let _ = sessions[slot_index].reset();
+            scheduler.release(handle);
+            fire_deepseek4_error(reply, error);
+        }
+    }
+}
+
+fn decode_batch_deepseek4(
+    model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    last_used: &mut [u64],
+    clock: &mut u64,
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    handles: &[SlotHandle],
+    kv_bytes_per_token: u64,
+    decode_quantum: usize,
+) {
+    for &handle in handles {
+        let slot_index = handle.slot_id.0 as usize;
+        let Some((mut state, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
+        else {
+            continue;
+        };
+        if installed != handle {
+            slots[slot_index] = Some((state, reply, installed));
+            continue;
+        }
+        if let SlotReply::Stream { events, cancel, .. } = &reply {
+            if events.is_closed() {
+                state.cancelled();
+                if let Some(counter) = cancel {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                record_retained_slot_kv(
+                    scheduler,
+                    handle,
+                    sessions[slot_index].committed_tokens().len(),
+                    kv_bytes_per_token,
+                );
+                let _ = sessions[slot_index].reset();
+                scheduler.release(handle);
+                continue;
+            }
+        }
+
+        sessions[slot_index].swap_with_loaded(model);
+        let events = match &reply {
+            SlotReply::Unary(_) => None,
+            SlotReply::Stream { events, .. } => Some(events),
+        };
+        let mut completed_ticks = 0_usize;
+        let mut tick_error = None;
+        let mut client_closed = false;
+        for _ in 0..decode_quantum {
+            if let SlotReply::Stream { events, cancel, .. } = &reply {
+                if events.is_closed() {
+                    state.cancelled();
+                    if let Some(counter) = cancel {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    client_closed = true;
+                    break;
+                }
+            }
+            match state.tick(model, registration, events) {
+                Ok(()) => {
+                    completed_ticks = completed_ticks.saturating_add(1);
+                    if state.is_finished() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = model.reset_live_cache();
+                    tick_error = Some(error);
+                    break;
+                }
+            }
+        }
+        sessions[slot_index].swap_with_loaded(model);
+
+        let finished = state.is_finished();
+        for tick_index in 0..completed_ticks {
+            if finished && tick_index + 1 == completed_ticks {
+                record_retained_slot_kv(
+                    scheduler,
+                    handle,
+                    sessions[slot_index].committed_tokens().len(),
+                    kv_bytes_per_token,
+                );
+            }
+            scheduler.advance_after_decode(handle);
+        }
+        if client_closed {
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                sessions[slot_index].committed_tokens().len(),
+                kv_bytes_per_token,
+            );
+            let _ = sessions[slot_index].reset();
+            scheduler.release(handle);
+            continue;
+        }
+        if let Some(error) = tick_error {
+            state.failed(&error);
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                sessions[slot_index].committed_tokens().len(),
+                kv_bytes_per_token,
+            );
+            let _ = sessions[slot_index].reset();
+            scheduler.release(handle);
+            fire_deepseek4_error(reply, error);
+            continue;
+        }
+        if finished {
+            let completion = state.finish(registration, events);
+            if completion.is_err() {
+                let _ = sessions[slot_index].reset();
+            }
+            scheduler.release(handle);
+            last_used[slot_index] = *clock;
+            *clock = clock.saturating_add(1);
+            match completion {
+                Ok(completion) => fire_deepseek4_completion(reply, completion),
+                Err(error) => fire_deepseek4_error(reply, error),
+            }
+        } else {
+            slots[slot_index] = Some((state, reply, handle));
+        }
+    }
+}
+
+fn fire_deepseek4_completion(
+    reply: SlotReply,
+    completion: super::engine_deepseek4::Deepseek4SlotCompletion,
+) {
+    match reply {
+        SlotReply::Unary(reply) => {
+            let _ = reply.send(Ok(completion.result));
+        }
+        SlotReply::Stream { events, .. } => {
+            let result = completion.result;
+            let prefill_seconds = result.prefill_duration.as_secs_f64();
+            let decode_seconds = result.decode_duration.as_secs_f64();
+            let _ = events.blocking_send(super::sse::GenerationEvent::Done {
+                finish_reason: result.finish_reason,
+                prompt_tokens: result.prompt_tokens,
+                completion_tokens: result.completion_tokens,
+                stats: super::sse::StreamStats {
+                    prefill_time_secs: Some(prefill_seconds),
+                    decode_time_secs: Some(decode_seconds),
+                    total_time_secs: Some(prefill_seconds + decode_seconds),
+                    time_to_first_token_ms: Some(completion.semantic_ttft.as_secs_f64() * 1000.0),
+                    prefill_tokens_per_sec: Some(
+                        result.prompt_tokens.saturating_sub(result.cached_tokens) as f64
+                            / prefill_seconds.max(f64::EPSILON),
+                    ),
+                    decode_tokens_per_sec: Some(
+                        result.completion_tokens as f64 / decode_seconds.max(f64::EPSILON),
+                    ),
+                    cached_prompt_tokens: Some(result.cached_tokens),
+                    reasoning_tokens: result.reasoning_tokens,
+                    ..super::sse::StreamStats::default()
+                },
+            });
+        }
+    }
+}
+
+fn fire_deepseek4_error(reply: SlotReply, error: anyhow::Error) {
+    slot_fire_done(reply, Err(error), false);
 }
 
 /// Per-token reply routing shared by both arches: a unary slot accumulates;
 /// a stream slot emits a `Delta`. Returns `true` if a stream client has
 /// disconnected (the loop then evicts the slot + bumps the cancel counter).
-fn slot_emit_token(reply: &SlotReply, tick: &TickOutcome) -> bool {
+fn slot_emit_token(reply: &mut SlotReply, tick: &TickOutcome) -> bool {
     match reply {
         SlotReply::Unary(_) => false,
-        SlotReply::Stream { events, cancel } => {
+        SlotReply::Stream {
+            events,
+            cancel,
+            router,
+            ..
+        } => {
             if tick.fragment.is_empty() {
                 return false;
             }
-            let kind = if tick.is_reasoning {
-                super::sse::DeltaKind::Reasoning
+            let sent = if let Some(router) = router.as_mut() {
+                router.emit(events, &tick.fragment)
             } else {
-                super::sse::DeltaKind::Content
+                let kind = if tick.is_reasoning {
+                    super::sse::DeltaKind::Reasoning
+                } else {
+                    super::sse::DeltaKind::Content
+                };
+                events
+                    .blocking_send(super::sse::GenerationEvent::Delta {
+                        kind,
+                        text: tick.fragment.clone(),
+                    })
+                    .map_err(|_| ())
             };
-            if events
-                .blocking_send(super::sse::GenerationEvent::Delta {
-                    kind,
-                    text: tick.fragment.clone(),
-                })
-                .is_err()
-            {
+            if sent.is_err() {
                 tracing::info!("SSE stream dropped by client; evicting slot mid-decode");
                 if let Some(c) = cancel {
                     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6105,26 +7196,115 @@ fn slot_fire_done(reply: SlotReply, gr: Result<GenerationResult>, client_dropped
         SlotReply::Unary(tx) => {
             let _ = tx.send(gr);
         }
-        SlotReply::Stream { events, .. } => {
+        SlotReply::Stream {
+            events,
+            mut router,
+            admission,
+            ..
+        } => {
             if client_dropped {
                 return;
             }
             match gr {
-                Ok(r) => {
+                Ok(mut r) => {
+                    if let Some(tx) = admission {
+                        let _ = tx.send(Ok(()));
+                    }
+                    if let Some(router) = router.as_mut() {
+                        match router.finish(&events, r.completion_tokens) {
+                            Ok(Some(finish_reason)) => r.finish_reason = finish_reason,
+                            Ok(None) => {}
+                            Err(()) => return,
+                        }
+                    }
                     let _ = events.blocking_send(super::sse::GenerationEvent::Done {
                         finish_reason: r.finish_reason,
                         prompt_tokens: r.prompt_tokens,
                         completion_tokens: r.completion_tokens,
-                        stats: super::sse::StreamStats::default(),
+                        stats: slot_stream_stats(&r),
                     });
                 }
                 Err(e) => {
+                    if let Some(tx) = admission {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
                     let _ =
                         events.blocking_send(super::sse::GenerationEvent::Error(format!("{e:#}")));
                 }
             }
         }
     }
+}
+
+/// Reject a slot-aware stream before the handler commits to SSE. Serial FIFO
+/// callers have no admission channel and retain the historical in-stream
+/// error event.
+fn reject_stream_before_sse(
+    events: mpsc::Sender<super::sse::GenerationEvent>,
+    admission: Option<oneshot::Sender<Result<()>>>,
+    error: anyhow::Error,
+) {
+    if let Some(tx) = admission {
+        let _ = tx.send(Err(error));
+    } else {
+        let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!("{error:#}")));
+    }
+}
+
+/// Preserve the same usage and timing contract for SlotAware SSE responses as
+/// unary responses.  In particular, a full-context slot cache hit must not be
+/// flattened back to `cached_tokens = 0` at the stream boundary.
+fn slot_stream_stats(result: &GenerationResult) -> super::sse::StreamStats {
+    let prefill_seconds = result.prefill_duration.as_secs_f64();
+    let decode_seconds = result.decode_duration.as_secs_f64();
+    let prefill_work_tokens = result.prompt_tokens.saturating_sub(result.cached_tokens);
+
+    super::sse::StreamStats {
+        prefill_time_secs: Some(prefill_seconds),
+        decode_time_secs: Some(decode_seconds),
+        total_time_secs: Some(prefill_seconds + decode_seconds),
+        time_to_first_token_ms: Some(prefill_seconds * 1000.0),
+        prefill_tokens_per_sec: (prefill_seconds > 0.0)
+            .then_some(prefill_work_tokens as f64 / prefill_seconds),
+        decode_tokens_per_sec: (decode_seconds > 0.0)
+            .then_some(result.completion_tokens as f64 / decode_seconds),
+        cached_prompt_tokens: Some(result.cached_tokens),
+        reasoning_tokens: result.reasoning_tokens,
+        ..super::sse::StreamStats::default()
+    }
+}
+
+/// Replay a deterministic per-slot response without mutating live KV. Unary
+/// callers receive the same `GenerationResult`; streaming callers route the
+/// cached family-native tool markers through the normal OpenAI delta splitter.
+fn replay_slot_prompt_cache(mut reply: SlotReply, result: GenerationResult) {
+    let mut dropped = false;
+    if let SlotReply::Stream { events, .. } = &reply {
+        if let Some(reasoning) = result
+            .reasoning_text
+            .as_ref()
+            .filter(|text| !text.is_empty())
+        {
+            dropped = events
+                .blocking_send(super::sse::GenerationEvent::Delta {
+                    kind: super::sse::DeltaKind::Reasoning,
+                    text: reasoning.clone(),
+                })
+                .is_err();
+        }
+    }
+    if !dropped && !result.text.is_empty() {
+        dropped = slot_emit_token(
+            &mut reply,
+            &TickOutcome {
+                fragment: result.text.clone(),
+                is_reasoning: false,
+                finished: true,
+            },
+        );
+    }
+    slot_fire_done(reply, Ok(result), dropped);
 }
 
 /// Drain loop for the Qwen3-VL text arch under SlotAware: it has no
@@ -6142,14 +7322,19 @@ fn run_slot_aware_qwen3vl_unsupported(mut rx: mpsc::Receiver<Request>) {
                      this model."
                 )));
             }
-            Request::GenerateStream { events, .. } => {
-                let _ = events.blocking_send(super::sse::GenerationEvent::Error(
-                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL text-LM \
+            Request::GenerateStream {
+                events, admission, ..
+            } => {
+                reject_stream_before_sse(
+                    events,
+                    admission,
+                    anyhow::anyhow!(
+                        "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL text-LM \
                      has no SlotAware batched-decode path (M1 targets are gemma4 + \
                      qwen35moe per ADR-040 §0.5). Use --scheduler serial-fifo for \
                      this model."
-                        .to_string(),
-                ));
+                    ),
+                );
             }
             Request::Warmup { reply } => {
                 let _ = reply.send(Ok(()));
@@ -6231,6 +7416,11 @@ impl Drop for Gemma4KvGuard<'_> {
 /// `release`).
 type Gemma4Slot = (Gemma4DecodeState, SlotReply, SlotHandle);
 
+struct Gemma4PromptAnchor {
+    prompt_tokens: Vec<u32>,
+    kv: crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor,
+}
+
 /// ADR-040 Phase F M1 (F1) — Gemma 4 SlotAware admit-while-decoding loop.
 ///
 /// One worker thread, up to `max_slots` concurrent requests. Each tick:
@@ -6261,6 +7451,8 @@ fn run_slot_aware_gemma4(
     };
     let n_slots = guard.kv.first().map(|b| b.n_seqs).unwrap_or(0) as usize;
     let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
+    let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
+    let mut prompt_anchors: Vec<Option<Gemma4PromptAnchor>> = (0..n_slots).map(|_| None).collect();
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -6282,6 +7474,11 @@ fn run_slot_aware_gemma4(
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
         && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
+    let cross_slot_coalesce = std::env::var("HF2Q_ADMIT_COALESCE_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|micros| Duration::from_micros(micros.min(100_000)))
+        .unwrap_or_default();
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -6305,28 +7502,47 @@ fn run_slot_aware_gemma4(
                     break;
                 }
                 let mut reqs: Vec<Request> = Vec::with_capacity(n_free);
+                let all_slots_idle = slots.iter().all(Option::is_none);
+                let mut coalesce_deadline: Option<Instant> = None;
                 while reqs.len() < n_free {
                     let req = match pending.take() {
                         Some(r) => r,
                         None => match rx.try_recv() {
                             Ok(r) => r,
-                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                if all_slots_idle && !reqs.is_empty() {
+                                    let deadline = *coalesce_deadline.get_or_insert_with(|| {
+                                        Instant::now() + cross_slot_coalesce
+                                    });
+                                    if Instant::now() < deadline {
+                                        std::thread::sleep(Duration::from_micros(100));
+                                        continue;
+                                    }
+                                }
+                                break;
+                            }
                             Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
                         },
                     };
                     reqs.push(req);
+                    if all_slots_idle && coalesce_deadline.is_none() {
+                        coalesce_deadline = Some(Instant::now() + cross_slot_coalesce);
+                    }
                 }
                 if reqs.is_empty() {
                     break;
                 }
                 let mut batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
+                let mut stable_batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
                 for req in reqs {
                     match req {
                         Request::Generate {
                             prompt_tokens,
                             params,
                             reply,
-                        } if params_is_greedy(&params) && params.max_tokens > 0 => {
+                        } if params.max_tokens > 0
+                            && params.stable_prompt_prefix_tokens.is_none() =>
+                        {
                             batch.push((prompt_tokens, params, SlotReply::Unary(reply)));
                         }
                         Request::GenerateStream {
@@ -6334,16 +7550,47 @@ fn run_slot_aware_gemma4(
                             params,
                             events,
                             cancellation_counter,
+                            admission,
                             ..
-                        } if params_is_greedy(&params) && params.max_tokens > 0 => {
-                            batch.push((
-                                prompt_tokens,
-                                params,
-                                SlotReply::Stream {
-                                    events,
-                                    cancel: cancellation_counter,
-                                },
-                            ));
+                        } if params.max_tokens > 0
+                            && params.stable_prompt_prefix_tokens.is_none() =>
+                        {
+                            let reply = SlotReply::family_stream(
+                                events,
+                                cancellation_counter,
+                                admission,
+                                registration.as_ref(),
+                                &params,
+                            );
+                            batch.push((prompt_tokens, params, reply));
+                        }
+                        Request::Generate {
+                            prompt_tokens,
+                            params,
+                            reply,
+                        } if params.max_tokens > 0
+                            && params.stable_prompt_prefix_tokens.is_some() =>
+                        {
+                            stable_batch.push((prompt_tokens, params, SlotReply::Unary(reply)));
+                        }
+                        Request::GenerateStream {
+                            prompt_tokens,
+                            params,
+                            events,
+                            cancellation_counter,
+                            admission,
+                            ..
+                        } if params.max_tokens > 0
+                            && params.stable_prompt_prefix_tokens.is_some() =>
+                        {
+                            let reply = SlotReply::family_stream(
+                                events,
+                                cancellation_counter,
+                                admission,
+                                registration.as_ref(),
+                                &params,
+                            );
+                            stable_batch.push((prompt_tokens, params, reply));
                         }
                         Request::Generate {
                             prompt_tokens,
@@ -6354,6 +7601,8 @@ fn run_slot_aware_gemma4(
                                 &mut guard,
                                 &mut scheduler,
                                 &mut slots,
+                                &mut retained_tokens,
+                                &mut prompt_anchors,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -6370,12 +7619,22 @@ fn run_slot_aware_gemma4(
                             params,
                             events,
                             cancellation_counter,
+                            admission,
                             ..
                         } => {
+                            let reply = SlotReply::family_stream(
+                                events,
+                                cancellation_counter,
+                                admission,
+                                registration.as_ref(),
+                                &params,
+                            );
                             admit_gemma4_slot(
                                 &mut guard,
                                 &mut scheduler,
                                 &mut slots,
+                                &mut retained_tokens,
+                                &mut prompt_anchors,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -6383,10 +7642,7 @@ fn run_slot_aware_gemma4(
                                 prompt_tokens,
                                 Vec::new(),
                                 params,
-                                SlotReply::Stream {
-                                    events,
-                                    cancel: cancellation_counter,
-                                },
+                                reply,
                             );
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
@@ -6401,6 +7657,8 @@ fn run_slot_aware_gemma4(
                                 &mut guard,
                                 &mut scheduler,
                                 &mut slots,
+                                &mut retained_tokens,
+                                &mut prompt_anchors,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -6442,6 +7700,8 @@ fn run_slot_aware_gemma4(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
+                        &mut retained_tokens,
+                        &mut prompt_anchors,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -6455,6 +7715,42 @@ fn run_slot_aware_gemma4(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            per_slot_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            Vec::new(),
+                            params,
+                            reply,
+                        );
+                        publish(&scheduler, &scheduler_stats_snapshot);
+                    }
+                }
+                if stable_batch.len() >= 2 {
+                    admit_gemma4_slots_stable_batched(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        &mut retained_tokens,
+                        &mut prompt_anchors,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        stable_batch,
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                } else {
+                    for (prompt_tokens, params, reply) in stable_batch {
+                        admit_gemma4_slot(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_anchors,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -6491,6 +7787,8 @@ fn run_slot_aware_gemma4(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_anchors,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -6507,12 +7805,22 @@ fn run_slot_aware_gemma4(
                         params,
                         events,
                         cancellation_counter,
+                        admission,
                         ..
                     } => {
+                        let reply = SlotReply::family_stream(
+                            events,
+                            cancellation_counter,
+                            admission,
+                            registration.as_ref(),
+                            &params,
+                        );
                         admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_anchors,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -6520,10 +7828,7 @@ fn run_slot_aware_gemma4(
                             prompt_tokens,
                             Vec::new(),
                             params,
-                            SlotReply::Stream {
-                                events,
-                                cancel: cancellation_counter,
-                            },
+                            reply,
                         );
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
@@ -6547,6 +7852,8 @@ fn run_slot_aware_gemma4(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_anchors,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -6626,8 +7933,10 @@ fn run_slot_aware_gemma4(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
+                    &mut retained_tokens,
                     registration.as_ref(),
                     &handles,
+                    kv_bytes_per_token,
                 );
                 crate::inference::models::gemma4::batched_body::host_phases::add(
                     crate::inference::models::gemma4::batched_body::host_phases::Phase::DecodeBatchTotal,
@@ -6649,8 +7958,10 @@ fn run_slot_aware_gemma4(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
+                    &mut retained_tokens,
                     registration.as_ref(),
                     &decode_handles,
+                    kv_bytes_per_token,
                 );
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
@@ -6743,6 +8054,8 @@ fn admit_gemma4_slot(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -6753,7 +8066,7 @@ fn admit_gemma4_slot(
     // into `SoftTokenInjection` slices for the prefill below.
     soft_token_data: Vec<SoftTokenData>,
     params: SamplingParams,
-    reply: SlotReply,
+    mut reply: SlotReply,
 ) {
     // Build borrowed injection slices from the owned data — same shape as
     // the legacy SoftTokens arm (engine.rs:8212-8218). Empty ⇒ identity
@@ -6765,6 +8078,11 @@ fn admit_gemma4_slot(
             embeddings: &d.embeddings,
         })
         .collect();
+    let preferred = if soft_tokens.is_empty() {
+        preferred_gemma4_slot(retained_tokens, prompt_anchors, slots, &prompt_tokens)
+    } else {
+        None
+    };
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
@@ -6776,6 +8094,12 @@ fn admit_gemma4_slot(
         prompt_tokens: prompt_tokens.len() as u32,
         max_tokens: params.max_tokens as u32,
         kv_bytes_needed: needed_bytes,
+        prompt_kv_bytes: if needed_bytes == 0 {
+            0
+        } else {
+            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+        },
+        preferred_slot: preferred.map(|preference| preference.slot),
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
@@ -6784,19 +8108,20 @@ fn admit_gemma4_slot(
             budget_bytes,
         }) => {
             let gr = Err(anyhow::anyhow!(
-                "slot_budget_exceeded: ADR-040 Phase F M1 — per-slot KV budget exceeded \
-                 (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}). Reduce \
-                 max_tokens or use a shorter prompt."
+                "slot_budget_exceeded: ADR-040 full-context slots — shared physical KV \
+                 budget exceeded (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
+                 logical context was not divided by slot count."
             ));
             slot_fire_done(reply, gr, false);
             return;
         }
         Err(e) => {
-            let gr = Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e:?}"));
+            let gr = Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e}"));
             slot_fire_done(reply, gr, false);
             return;
         }
     };
+    reply.accept_stream_admission();
     let Some(handle) = admitted.handle else {
         // `handle: None` == the scheduler's CompletedAtAdmit outcome
         // (`max_tokens == 0`): no physical slot allocated, no scheduler
@@ -6821,6 +8146,72 @@ fn admit_gemma4_slot(
         return;
     };
 
+    let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
+    let cached_tokens = selected_preference
+        .map(|preference| preference.cached_tokens)
+        .unwrap_or(0);
+    tracing::info!(
+        slot = handle.slot_id.0,
+        prompt_tokens = prompt_tokens.len(),
+        retained_tokens = retained_tokens[handle.slot_id.0 as usize].len(),
+        anchor_tokens = prompt_anchors[handle.slot_id.0 as usize]
+            .as_ref()
+            .map_or(0, |anchor| anchor.prompt_tokens.len()),
+        retained_common_prefix_tokens =
+            common_token_prefix(&retained_tokens[handle.slot_id.0 as usize], &prompt_tokens,),
+        anchor_common_prefix_tokens =
+            prompt_anchors[handle.slot_id.0 as usize]
+                .as_ref()
+                .map_or(0, |anchor| common_token_prefix(
+                    &anchor.prompt_tokens,
+                    &prompt_tokens
+                )),
+        cached_tokens,
+        cache = if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
+            "prompt-anchor"
+        } else if cached_tokens > 0 {
+            "live"
+        } else {
+            "reset"
+        },
+        "Gemma4 slot admission planned"
+    );
+    if cached_tokens == 0 {
+        retained_tokens[handle.slot_id.0 as usize].clear();
+        prompt_anchors[handle.slot_id.0 as usize] = None;
+    } else if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
+        let restore_result = (|| -> Result<()> {
+            let anchor = prompt_anchors[handle.slot_id.0 as usize]
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Gemma prompt anchor disappeared before restore"))?;
+            let hybrid = guard.hybrid.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Gemma prompt anchor requires the production hybrid KV cache")
+            })?;
+            crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
+                hybrid,
+                handle.slot_id,
+                &anchor.kv,
+                cached_tokens,
+            )?;
+            anyhow::ensure!(
+                cached_tokens <= anchor.kv.prompt_len() && cached_tokens < prompt_tokens.len(),
+                "Gemma prompt anchor length {} incompatible with reusable prefix {} for request {}",
+                anchor.kv.prompt_len(),
+                cached_tokens,
+                prompt_tokens.len()
+            );
+            Ok(())
+        })();
+        if let Err(e) = restore_result {
+            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            retained_tokens[handle.slot_id.0 as usize].clear();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(e), false);
+            return;
+        }
+    }
+
     // Restore the per-prefill self-mount fresh state (None) before this
     // slot's prefill, so a prior slot's leftover slice-view does not poison
     // this slot's consume-gate (forward_prefill.rs:699/2344; precedent at
@@ -6838,12 +8229,15 @@ fn admit_gemma4_slot(
         guard.hybrid.as_mut(),
         guard.dense.as_mut(),
         guard.mlx.as_mut(),
+        cached_tokens,
     );
-    let state = match seed {
-        Ok(s) => s,
+    let (state, stable_anchor) = match seed {
+        Ok(seed) => seed,
         Err(e) => {
             // Prefill failed: reset the slot's KV, release, fire error.
-            reset_gemma4_slot(guard, handle.slot_id);
+            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            retained_tokens[handle.slot_id.0 as usize].clear();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
             if let Ok(mut g) = scheduler_stats_snapshot.lock() {
                 *g = scheduler.stats();
@@ -6852,6 +8246,26 @@ fn admit_gemma4_slot(
             return;
         }
     };
+
+    if let Some(kv) = stable_anchor {
+        let boundary = kv.prompt_len();
+        tracing::debug!(
+            slot = handle.slot_id.0,
+            prompt_tokens = prompt_tokens.len(),
+            stable_prefix_tokens = boundary,
+            anchor_bytes = kv.total_bytes(),
+            "Gemma stable pre-generation checkpoint committed"
+        );
+        prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
+            prompt_tokens: prompt_tokens[..boundary].to_vec(),
+            kv,
+        });
+    } else {
+        // Never retain a post-generation-cue snapshot. Without an exact
+        // handler-derived boundary, the next turn must use a physically live
+        // prefix or start cold.
+        prompt_anchors[handle.slot_id.0 as usize] = None;
+    }
 
     // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
     // per-prefill self-mounts AGAIN, now AFTER prefill_seed, to enforce the
@@ -6873,23 +8287,30 @@ fn admit_gemma4_slot(
     // scheduler's Prefilling phase to Decoding immediately.
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
 
-    if state.finished_at_seed() {
-        // First (prefill-emitted) token already terminated. Emit the decoded
-        // first-token text (stream) then fire the terminal reply; no decode
-        // tick. For gemma4, on first-token EOS the token is NOT pushed but
-        // its text WAS appended (serial ref 9151-9155 only strips on stop-
-        // string); emit whatever decoded_text holds.
-        let seed_tick = TickOutcome {
-            fragment: state.decoded_text.clone(),
-            is_reasoning: false,
-            finished: true,
-        };
-        let dropped = slot_emit_token(&reply, &seed_tick);
-        scheduler.advance_after_decode(handle);
-        reset_gemma4_slot(guard, handle.slot_id);
+    // Prefill has already selected completion token zero. Route it before the
+    // first decode tick so a native Gemma tool opener is not omitted from SSE.
+    let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
+    if seed_dropped {
+        reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+        retained_tokens[handle.slot_id.0 as usize].clear();
         scheduler.release(handle);
         let gr = Ok(state.finish(registration));
-        slot_fire_done(reply, gr, dropped);
+        slot_fire_done(reply, gr, true);
+        return;
+    }
+
+    if state.finished_at_seed() {
+        retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
+        record_retained_slot_kv(
+            scheduler,
+            handle,
+            retained_tokens[handle.slot_id.0 as usize].len(),
+            kv_bytes_per_token,
+        );
+        scheduler.advance_after_decode(handle);
+        scheduler.release(handle);
+        let gr = Ok(state.finish(registration));
+        slot_fire_done(reply, gr, false);
         return;
     }
 
@@ -6897,27 +8318,14 @@ fn admit_gemma4_slot(
     slots[slot_idx] = Some((state, reply, handle));
 }
 
-/// ADR-040 iter-G(a) — is this request GREEDY (`sample_logits == false`)? Only
-/// greedy text requests are cross-slot batchable: the multi-seq forward returns
-/// per-seq ARGMAX first tokens (not per-seq logits), and `from_first_token`
-/// reads `logits_view()` ONLY under `sample_logits`. Mirror of the predicate in
-/// `prefill_seed`/`from_first_token`.
-fn params_is_greedy(p: &SamplingParams) -> bool {
-    !(p.temperature > 0.0
-        || p.top_k > 0
-        || p.top_p < 1.0
-        || p.repetition_penalty != 1.0
-        || !p.logit_bias.is_empty()
-        || p.grammar.is_some()
-        || p.logprobs)
-}
-
-/// ADR-040 iter-G(a) — cross-slot BATCHED admit. Prefills N greedy text requests
+/// ADR-040 iter-G(a) — cross-slot BATCHED admit. Prefills N text requests
 /// in ONE multi-seq forward (`forward_prefill_batched_multi_seq`) instead of N
 /// sequential single-seq prefills — the short-prompt N-concurrent TTFT lever.
-/// Caller guarantees every request is greedy text with `max_tokens > 0` and the
-/// hybrid-KV multi-seq regime is supported (capability-gated). All-or-nothing on
-/// the forward; per-request admit failures fall back to the single path.
+/// The forward returns one independent post-softcap logits row per sequence, so
+/// native tool grammars and sampling remain request-local. Caller guarantees
+/// text with `max_tokens > 0` and the hybrid-KV multi-seq regime is supported
+/// (capability-gated). All-or-nothing on the forward; per-request admit failures
+/// fall back to the single path.
 ///
 /// `ITER_GA_BATCHED_ADMIT_COUNT` counts forwards with N>=2 (E2E test signal).
 pub(crate) static ITER_GA_BATCHED_ADMIT_COUNT: std::sync::atomic::AtomicUsize =
@@ -6928,6 +8336,8 @@ fn admit_gemma4_slots_batched(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -6949,6 +8359,12 @@ fn admit_gemma4_slots_batched(
             prompt_tokens: prompt_tokens.len() as u32,
             max_tokens: params.max_tokens as u32,
             kv_bytes_needed: needed_bytes,
+            prompt_kv_bytes: if needed_bytes == 0 {
+                0
+            } else {
+                (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+            },
+            preferred_slot: None,
         };
         match scheduler.admit(admit_req) {
             Ok(a) => match a.handle {
@@ -6984,6 +8400,8 @@ fn admit_gemma4_slots_batched(
                 guard,
                 scheduler,
                 slots,
+                retained_tokens,
+                prompt_anchors,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
@@ -6997,10 +8415,16 @@ fn admit_gemma4_slots_batched(
         return;
     }
 
+    for (_, _, _, reply) in &mut admitted {
+        reply.accept_stream_admission();
+    }
+
     // 2. Per-slot entry reset (kv + hybrid) + clear self-mounts (mirror
     //    prefill_seed's entry reset + the iter-F-prefill-determinism pre-clear).
     for (handle, _, _, _) in &admitted {
-        reset_gemma4_slot(guard, handle.slot_id);
+        reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token);
+        retained_tokens[handle.slot_id.0 as usize].clear();
+        prompt_anchors[handle.slot_id.0 as usize] = None;
     }
     clear_gemma4_self_mounts(guard.model);
 
@@ -7030,13 +8454,14 @@ fn admit_gemma4_slots_batched(
     let prefill_duration = prefill_started.elapsed();
     clear_gemma4_self_mounts(guard.model);
 
-    let tokens = match forward {
+    let output = match forward {
         Ok(t) => t,
         Err(e) => {
             // All-or-nothing: reset + release + error every reserved slot.
             let msg = format!("ADR-040 iter-G(a) multi-seq prefill failed: {e}");
             for (handle, _, _, reply) in admitted {
-                reset_gemma4_slot(guard, handle.slot_id);
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(anyhow::anyhow!("{msg}")), false);
             }
@@ -7055,9 +8480,19 @@ fn admit_gemma4_slots_batched(
     }
 
     // 4. Install each slot — identical tail to admit_gemma4_slot.
-    for ((handle, prompt_tokens, params, reply), first_token) in
-        admitted.into_iter().zip(tokens.into_iter())
+    for ((handle, prompt_tokens, params, mut reply), (first_token, first_logits)) in
+        admitted.into_iter().zip(
+            output
+                .first_tokens
+                .into_iter()
+                .zip(output.logits.into_iter()),
+        )
     {
+        // The multi-sequence fast path sees only the final rendered prompt,
+        // not an exact pre-generation boundary. Never manufacture a
+        // rewindable checkpoint after the cue; boundary-bearing requests are
+        // routed through `admit_gemma4_slot` above.
+        prompt_anchors[handle.slot_id.0 as usize] = None;
         let state = match Gemma4DecodeState::from_first_token(
             guard.model,
             &prompt_tokens,
@@ -7065,29 +8500,42 @@ fn admit_gemma4_slots_batched(
             registration,
             handle.slot_id,
             first_token,
+            Some(&first_logits),
             prefill_duration,
+            0,
         ) {
             Ok(s) => s,
             Err(e) => {
-                reset_gemma4_slot(guard, handle.slot_id);
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[handle.slot_id.0 as usize].clear();
+                prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
             }
         };
         scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-        if state.finished_at_seed() {
-            let seed_tick = TickOutcome {
-                fragment: state.decoded_text.clone(),
-                is_reasoning: false,
-                finished: true,
-            };
-            let dropped = slot_emit_token(&reply, &seed_tick);
-            scheduler.advance_after_decode(handle);
-            reset_gemma4_slot(guard, handle.slot_id);
+        let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
+        if seed_dropped {
+            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            retained_tokens[handle.slot_id.0 as usize].clear();
             scheduler.release(handle);
             let gr = Ok(state.finish(registration));
-            slot_fire_done(reply, gr, dropped);
+            slot_fire_done(reply, gr, true);
+            continue;
+        }
+        if state.finished_at_seed() {
+            retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                retained_tokens[handle.slot_id.0 as usize].len(),
+                kv_bytes_per_token,
+            );
+            scheduler.advance_after_decode(handle);
+            scheduler.release(handle);
+            let gr = Ok(state.finish(registration));
+            slot_fire_done(reply, gr, false);
             continue;
         }
         let slot_idx = handle.slot_id.0 as usize;
@@ -7095,6 +8543,406 @@ fn admit_gemma4_slots_batched(
     }
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
+    }
+}
+
+/// Batch exact Gemma agentic continuations without weakening the native
+/// pre-generation boundary contract. Every request keeps its own full logical
+/// slot and exact prompt anchor; only the appended suffix transformer body is
+/// shared. Cold or incompatible requests go through the proven single-request
+/// path instead of receiving guessed cache credit.
+pub(crate) static GEMMA4_STABLE_RESUME_BATCH_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn admit_gemma4_slots_stable_batched(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
+) {
+    let fallback_single =
+        |guard: &mut Gemma4KvGuard<'_>,
+         scheduler: &mut InflightBatchedScheduler,
+         slots: &mut [Option<Gemma4Slot>],
+         retained_tokens: &mut [Vec<u32>],
+         prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+         requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>| {
+            for (prompt_tokens, params, reply) in requests {
+                admit_gemma4_slot(
+                    guard,
+                    scheduler,
+                    slots,
+                    retained_tokens,
+                    prompt_anchors,
+                    registration,
+                    scheduler_stats_snapshot,
+                    per_slot_kv_budget_bytes,
+                    kv_bytes_per_token,
+                    prompt_tokens,
+                    Vec::new(),
+                    params,
+                    reply,
+                );
+            }
+        };
+
+    // Plan against both installed and newly reserved slots. Without the
+    // second bitmap, two similar conversations could select the same longest
+    // anchor before the scheduler reservation becomes visible in `slots`.
+    let mut selected = vec![false; slots.len()];
+    let mut planned = Vec::with_capacity(requests.len());
+    for (prompt_tokens, params, reply) in requests {
+        let Some(boundary) = params.stable_prompt_prefix_tokens else {
+            fallback_single(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                vec![(prompt_tokens, params, reply)],
+            );
+            continue;
+        };
+        let preference = preferred_gemma4_slot_excluding(
+            retained_tokens,
+            prompt_anchors,
+            slots,
+            &prompt_tokens,
+            &selected,
+        );
+        let Some(preference) = preference.filter(|p| {
+            p.cached_tokens > 0
+                && p.cached_tokens <= boundary
+                && boundary > 0
+                && boundary < prompt_tokens.len()
+        }) else {
+            fallback_single(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                vec![(prompt_tokens, params, reply)],
+            );
+            continue;
+        };
+        selected[preference.slot.0 as usize] = true;
+        planned.push((prompt_tokens, params, reply, preference, boundary));
+    }
+
+    if planned.len() < 2 {
+        let requests = planned
+            .into_iter()
+            .map(|(prompt, params, reply, _, _)| (prompt, params, reply))
+            .collect();
+        fallback_single(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            requests,
+        );
+        return;
+    }
+
+    let mut admitted = Vec::with_capacity(planned.len());
+    for (prompt_tokens, params, reply, preference, boundary) in planned {
+        let needed_bytes = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+            0
+        } else {
+            (prompt_tokens.len() as u64)
+                .saturating_add(params.max_tokens as u64)
+                .saturating_mul(kv_bytes_per_token)
+        };
+        let admit = scheduler.admit(AdmitRequest {
+            prompt_tokens: prompt_tokens.len() as u32,
+            max_tokens: params.max_tokens as u32,
+            kv_bytes_needed: needed_bytes,
+            prompt_kv_bytes: if needed_bytes == 0 {
+                0
+            } else {
+                (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+            },
+            preferred_slot: Some(preference.slot),
+        });
+        match admit {
+            Ok(a) if a.handle.is_some_and(|h| h.slot_id == preference.slot) => {
+                admitted.push((
+                    a.handle.expect("checked Some"),
+                    prompt_tokens,
+                    params,
+                    reply,
+                    preference,
+                    boundary,
+                ));
+            }
+            Ok(a) => {
+                if let Some(handle) = a.handle {
+                    scheduler.release(handle);
+                }
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!(
+                        "Gemma stable resume could not reserve exact cache slot {}",
+                        preference.slot.0
+                    )),
+                    false,
+                );
+            }
+            Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            }) => slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "slot_budget_exceeded: shared physical KV budget exceeded \
+                     (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
+                     logical context was not divided by slot count"
+                )),
+                false,
+            ),
+            Err(e) => slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!("Gemma stable resume admit failed: {e}")),
+                false,
+            ),
+        }
+    }
+
+    if admitted.len() < 2 {
+        for (handle, prompt, params, reply, _, _) in admitted {
+            scheduler.release(handle);
+            fallback_single(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                vec![(prompt, params, reply)],
+            );
+        }
+        return;
+    }
+
+    for (_, _, _, reply, _, _) in &mut admitted {
+        reply.accept_stream_admission();
+    }
+
+    // Restore every exact anchor before mutating any suffix. A failed restore
+    // aborts the complete batch so no peer is left with partially advanced KV.
+    let restore_result = (|| -> Result<()> {
+        let hybrid = guard
+            .hybrid
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume requires hybrid KV"))?;
+        for (handle, prompt, _, _, preference, _) in &admitted {
+            if preference.restore_prompt_anchor {
+                let anchor = prompt_anchors[handle.slot_id.0 as usize]
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Gemma prompt anchor disappeared"))?;
+                crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
+                    hybrid,
+                    handle.slot_id,
+                    &anchor.kv,
+                    preference.cached_tokens,
+                )?;
+            }
+            anyhow::ensure!(
+                preference.cached_tokens < prompt.len(),
+                "Gemma stable cached prefix must leave a suffix"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = restore_result {
+        fail_gemma4_stable_batch(
+            guard,
+            scheduler,
+            retained_tokens,
+            prompt_anchors,
+            admitted,
+            kv_bytes_per_token,
+            e,
+        );
+        return;
+    }
+
+    clear_gemma4_self_mounts(guard.model);
+    let prefill_started = Instant::now();
+    let max_decode = admitted
+        .iter()
+        .map(|(_, _, params, _, _, _)| params.max_tokens.max(1))
+        .max()
+        .unwrap_or(1);
+
+    // Phase one advances only requests that have an appended conversation
+    // suffix before their exact native generation cue.
+    let boundary_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
+        .iter()
+        .filter_map(|(handle, prompt, _, _, preference, boundary)| {
+            (preference.cached_tokens < *boundary).then(|| {
+                (
+                    prompt[preference.cached_tokens..*boundary].to_vec(),
+                    handle.slot_id,
+                    preference.cached_tokens,
+                )
+            })
+        })
+        .collect();
+    let forward_result = (|| -> Result<MultiSeqPrefillOutput> {
+        let scaffold = guard
+            .hybrid
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume lost hybrid KV"))?;
+        if !boundary_seqs.is_empty() {
+            let _ = guard.model.weights.forward_prefill_batched_multi_seq_live(
+                &boundary_seqs,
+                scaffold,
+                max_decode,
+                &mut guard.model.ctx,
+            )?;
+            clear_gemma4_self_mounts(guard.model);
+        }
+
+        for (handle, prompt, _, _, _, boundary) in &admitted {
+            let anchor =
+                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    scaffold,
+                    handle.slot_id,
+                    *boundary,
+                )?;
+            prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
+                prompt_tokens: prompt[..*boundary].to_vec(),
+                kv: anchor,
+            });
+        }
+
+        let cue_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
+            .iter()
+            .map(|(handle, prompt, _, _, _, boundary)| {
+                (prompt[*boundary..].to_vec(), handle.slot_id, *boundary)
+            })
+            .collect();
+        guard.model.weights.forward_prefill_batched_multi_seq_live(
+            &cue_seqs,
+            scaffold,
+            max_decode,
+            &mut guard.model.ctx,
+        )
+    })();
+    clear_gemma4_self_mounts(guard.model);
+
+    let output = match forward_result {
+        Ok(output) => output,
+        Err(e) => {
+            fail_gemma4_stable_batch(
+                guard,
+                scheduler,
+                retained_tokens,
+                prompt_anchors,
+                admitted,
+                kv_bytes_per_token,
+                e,
+            );
+            return;
+        }
+    };
+    let prefill_duration = prefill_started.elapsed();
+    GEMMA4_STABLE_RESUME_BATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        requests = admitted.len(),
+        suffix_tokens = boundary_seqs.iter().map(|(s, _, _)| s.len()).sum::<usize>(),
+        elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
+        "Gemma4 stable agent suffixes prefilled in one multi-slot body"
+    );
+
+    for ((handle, prompt, params, mut reply, preference, _), (first_token, first_logits)) in
+        admitted.into_iter().zip(
+            output
+                .first_tokens
+                .into_iter()
+                .zip(output.logits.into_iter()),
+        )
+    {
+        let state = match Gemma4DecodeState::from_first_token(
+            guard.model,
+            &prompt,
+            &params,
+            registration,
+            handle.slot_id,
+            first_token,
+            Some(&first_logits),
+            prefill_duration,
+            preference.cached_tokens,
+        ) {
+            Ok(state) => state,
+            Err(e) => {
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[handle.slot_id.0 as usize].clear();
+                prompt_anchors[handle.slot_id.0 as usize] = None;
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
+        scheduler.advance_after_prefill(handle, prompt.len() as u32);
+        if slot_emit_token(&mut reply, &state.seed_tick()) {
+            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            retained_tokens[handle.slot_id.0 as usize].clear();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Ok(state.finish(registration)), true);
+        } else if state.finished_at_seed() {
+            retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                retained_tokens[handle.slot_id.0 as usize].len(),
+                kv_bytes_per_token,
+            );
+            scheduler.advance_after_decode(handle);
+            scheduler.release(handle);
+            slot_fire_done(reply, Ok(state.finish(registration)), false);
+        } else {
+            slots[handle.slot_id.0 as usize] = Some((state, reply, handle));
+        }
+    }
+    if let Ok(mut stats) = scheduler_stats_snapshot.lock() {
+        *stats = scheduler.stats();
+    }
+}
+
+fn fail_gemma4_stable_batch(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    admitted: Vec<(
+        SlotHandle,
+        Vec<u32>,
+        SamplingParams,
+        SlotReply,
+        Gemma4SlotPreference,
+        usize,
+    )>,
+    kv_bytes_per_token: u64,
+    error: anyhow::Error,
+) {
+    let message = format!("Gemma stable multi-slot prefill failed: {error:#}");
+    for (handle, _, _, reply, _, _) in admitted {
+        reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+        retained_tokens[handle.slot_id.0 as usize].clear();
+        prompt_anchors[handle.slot_id.0 as usize] = None;
+        scheduler.release(handle);
+        slot_fire_done(reply, Err(anyhow::anyhow!(message.clone())), false);
     }
 }
 
@@ -7124,6 +8972,8 @@ fn embed_gemma4_inline(
         max_tokens: 1, // ≥1 so the scheduler allocates a physical slot
         // (max_tokens==0 → CompletedAtAdmit/no handle).
         kv_bytes_needed: needed_bytes,
+        prompt_kv_bytes: needed_bytes,
+        preferred_slot: None,
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
@@ -7155,7 +9005,7 @@ fn embed_gemma4_inline(
         handle.slot_id,
     );
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-    reset_gemma4_slot(guard, handle.slot_id);
+    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
     scheduler.release(handle);
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
@@ -7192,8 +9042,10 @@ fn decode_batch_gemma4(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
+    kv_bytes_per_token: u64,
 ) {
     // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
     // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
@@ -7229,12 +9081,6 @@ fn decode_batch_gemma4(
     // persistent multi-seq scaffolds; decode re-mounts a fresh slice-view.
     let _hp_gather = std::time::Instant::now();
     clear_gemma4_self_mounts(guard.model);
-
-    // ADR-040 iter-F-batched-determinism — env-gated per-tick trace
-    // (HF2Q_DECODE_TRACE=1) to make the staggered batched non-determinism
-    // observable: logs each tick's batch composition (N, per-slot pos+token)
-    // and each slot's output token. Off by default (zero cost in production).
-    let trace = std::env::var("HF2Q_DECODE_TRACE").is_ok();
 
     // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
     // for each slot whose body ran; `hidden_rows` is their final hidden states
@@ -7292,15 +9138,6 @@ fn decode_batch_gemma4(
         }
         if captured.is_empty() {
             return;
-        }
-        if trace {
-            let comp: Vec<String> = sids
-                .iter()
-                .zip(positions.iter())
-                .zip(tokens.iter())
-                .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t))
-                .collect();
-            eprintln!("[DECTRACE] BATCHED N={} [{}]", sids.len(), comp.join(" "));
         }
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::GatherMisc,
@@ -7361,11 +9198,20 @@ fn decode_batch_gemma4(
             std::sync::atomic::Ordering::Relaxed,
         );
         match body_res {
-            Ok(h) => hidden_rows = h,
+            Ok(h) => {
+                hidden_rows = h;
+                // The batched body wrote one input token for every captured
+                // slot. The scalar capture path updates this in
+                // `decode_tick_capture`; keep the ledger identical here.
+                for (_, _, state, _) in &mut captured {
+                    state.valid_tokens = state.valid_tokens.saturating_add(1);
+                }
+            }
             Err(e) => {
                 let msg = format!("{e}");
                 for (handle, _slot_idx, _state, reply) in captured.drain(..) {
-                    reset_gemma4_slot(guard, handle.slot_id);
+                    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                    retained_tokens[handle.slot_id.0 as usize].clear();
                     scheduler.release(handle);
                     slot_fire_done(
                         reply,
@@ -7401,7 +9247,8 @@ fn decode_batch_gemma4(
                 }
                 Err(e) => {
                     // Body forward error: evict this slot with a typed error.
-                    reset_gemma4_slot(guard, handle.slot_id);
+                    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                    retained_tokens[handle.slot_id.0 as usize].clear();
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(e), false);
                 }
@@ -7432,7 +9279,8 @@ fn decode_batch_gemma4(
                 // producible); evict each. anyhow::Error isn't Clone, carry msg.
                 let msg = format!("{e}");
                 for (handle, _slot_idx, _state, reply) in captured {
-                    reset_gemma4_slot(guard, handle.slot_id);
+                    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                    retained_tokens[handle.slot_id.0 as usize].clear();
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
                 }
@@ -7448,7 +9296,7 @@ fn decode_batch_gemma4(
 
     // Pass 2 — finalize each slot from its logits row.
     let _hp_sample = std::time::Instant::now();
-    for (i, (handle, slot_idx, mut state, reply)) in captured.into_iter().enumerate() {
+    for (i, (handle, slot_idx, mut state, mut reply)) in captured.into_iter().enumerate() {
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
         let normed_row = &head.normed[i * hs..(i + 1) * hs];
         // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
@@ -7464,9 +9312,7 @@ fn decode_batch_gemma4(
             .gpu_sample
             .as_ref()
             .filter(|gs| gs.overflow[i] == 0 && (gs.cand_count[i] as usize) <= gs.cap);
-        let top1_val: f32;
         let greedy_result = if let Some(gs) = gpu_s {
-            top1_val = gs.top1_val[i];
             let cnt = (gs.cand_count[i] as usize).min(gs.cap);
             let cands = &gs.cand_ids[i * gs.cap..i * gs.cap + cnt];
             guard.model.weights.finalize_token_from_gpu_candidates(
@@ -7476,7 +9322,6 @@ fn decode_batch_gemma4(
             )
         } else {
             let (ti, tv) = argmax_f32(logits_row);
-            top1_val = tv;
             guard
                 .model
                 .weights
@@ -7485,7 +9330,8 @@ fn decode_batch_gemma4(
         let greedy_token = match greedy_result {
             Ok(t) => t,
             Err(e) => {
-                reset_gemma4_slot(guard, handle.slot_id);
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[handle.slot_id.0 as usize].clear();
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -7495,17 +9341,12 @@ fn decode_batch_gemma4(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::ArgmaxFinalize,
             _hp_am.elapsed().as_nanos() as u64,
         );
-        if trace {
-            eprintln!(
-                "[DECTRACE]   out s{} top1_val={:.4} -> tok{}",
-                handle.slot_id.0, top1_val, greedy_token
-            );
-        }
         let _hp_dt = std::time::Instant::now();
         let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
             Ok(t) => t,
             Err(e) => {
-                reset_gemma4_slot(guard, handle.slot_id);
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[handle.slot_id.0 as usize].clear();
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -7516,11 +9357,23 @@ fn decode_batch_gemma4(
             _hp_dt.elapsed().as_nanos() as u64,
         );
 
-        let client_dropped = slot_emit_token(&reply, &tick);
+        let client_dropped = slot_emit_token(&mut reply, &tick);
+        if tick.finished && !client_dropped {
+            retained_tokens[slot_idx] = state.retained_prefix();
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                retained_tokens[slot_idx].len(),
+                kv_bytes_per_token,
+            );
+        }
         scheduler.advance_after_decode(handle);
 
         if tick.finished || client_dropped {
-            reset_gemma4_slot(guard, handle.slot_id);
+            if client_dropped {
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[slot_idx].clear();
+            }
             scheduler.release(handle);
             let gr = Ok(state.finish(registration));
             slot_fire_done(reply, gr, client_dropped);
@@ -7563,7 +9416,48 @@ fn clear_gemma4_self_mounts(g: &mut GemmaLoadedModel) {
     g.weights.leg_hb_encoded = None;
 }
 
-fn reset_gemma4_slot(guard: &mut Gemma4KvGuard<'_>, slot_id: SlotId) {
+fn reset_gemma4_slot(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+) {
+    let slot_id = handle.slot_id;
+    let slot_idx = slot_id.0 as usize;
+    let mut live_tokens = guard
+        .kv
+        .iter()
+        .filter_map(|buf| buf.seq_lens.get(slot_idx).copied())
+        .max()
+        .unwrap_or(0) as usize;
+    if let Some(buffers) = guard.hybrid.as_ref() {
+        live_tokens = live_tokens.max(
+            buffers
+                .iter()
+                .filter_map(|buf| buf.seq_lens.get(slot_idx).copied())
+                .max()
+                .unwrap_or(0) as usize,
+        );
+    }
+    if let Some(buffers) = guard.dense.as_ref() {
+        live_tokens = live_tokens.max(
+            buffers
+                .iter()
+                .filter_map(|buf| buf.seq_lens.get(slot_idx).copied())
+                .max()
+                .unwrap_or(0) as usize,
+        );
+    }
+    if let Some(buffers) = guard.mlx.as_ref() {
+        live_tokens = live_tokens.max(
+            buffers
+                .iter()
+                .filter_map(|buf| buf.seq_lens.get(slot_idx).copied())
+                .max()
+                .unwrap_or(0) as usize,
+        );
+    }
+    record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
     for (layer_idx, buf) in guard.kv.iter_mut().enumerate() {
         if let Err(e) = buf.reset_for_slot(slot_id) {
             tracing::warn!(
@@ -7584,6 +9478,45 @@ fn reset_gemma4_slot(guard: &mut Gemma4KvGuard<'_>, slot_id: SlotId) {
     }
 }
 
+fn record_retained_slot_kv(
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    retained_tokens: usize,
+    kv_bytes_per_token: u64,
+) {
+    scheduler.record_slot_high_water(
+        handle,
+        (retained_tokens as u64).saturating_mul(kv_bytes_per_token),
+    );
+}
+
+/// Commit the cursor-visible Qwen KV extent before invalidating a slot.
+/// Overwrite-backed tails remain physically resident after cursor reset, so
+/// releasing without this measurement would undercount pages touched by a
+/// cancelled or failed request.
+fn reset_qwen35_slot(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+) {
+    let live_tokens = guard
+        .kv
+        .as_ref()
+        .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok())
+        .unwrap_or(0) as usize;
+    record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+    if let Some(kv) = guard.kv.as_mut() {
+        if let Err(error) = kv.reset_for_slot(handle.slot_id) {
+            tracing::warn!(
+                slot = handle.slot_id.0,
+                %error,
+                "Qwen35 SlotAware exit reset failed"
+            );
+        }
+    }
+}
+
 /// Answer every pending request with a typed startup error so callers do
 /// not hang when a SlotAware loop cannot start (e.g. KV scaffold absent).
 fn drain_with_startup_error(mut rx: mpsc::Receiver<Request>, why: &str) {
@@ -7595,11 +9528,17 @@ fn drain_with_startup_error(mut rx: mpsc::Receiver<Request>, why: &str) {
                      could not start: {why}"
                 )));
             }
-            Request::GenerateStream { events, .. } => {
-                let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!(
-                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
-                     could not start: {why}"
-                )));
+            Request::GenerateStream {
+                events, admission, ..
+            } => {
+                reject_stream_before_sse(
+                    events,
+                    admission,
+                    anyhow::anyhow!(
+                        "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
+                         could not start: {why}"
+                    ),
+                );
             }
             Request::Warmup { reply } => {
                 let _ = reply.send(Ok(()));
@@ -7669,6 +9608,125 @@ type Qwen35Slot = (
     SlotHandle,
 );
 
+struct Qwen35PromptAnchor {
+    prompt_tokens: Vec<u32>,
+    kv: crate::inference::models::qwen35::kv_cache::HybridKvSlotAnchor,
+    prefill_logits: Vec<f32>,
+}
+
+/// Find the idle physical slot whose live token ledger is the longest exact
+/// prefix of this already-rendered family prompt. Exact token identity keeps
+/// template/tool semantics outside the cache layer: a different native chat
+/// encoding simply does not match and receives a cold slot.
+fn longest_exact_idle_prefix<T>(
+    retained_tokens: &[Vec<u32>],
+    active_slots: &[Option<T>],
+    prompt_tokens: &[u32],
+) -> Option<(SlotId, usize)> {
+    retained_tokens
+        .iter()
+        .zip(active_slots.iter())
+        .enumerate()
+        .filter(|(_, (prefix, active))| {
+            active.is_none()
+                && !prefix.is_empty()
+                && prefix.len() < prompt_tokens.len()
+                && prompt_tokens.starts_with(prefix)
+        })
+        .max_by_key(|(_, (prefix, _))| prefix.len())
+        .map(|(index, (prefix, _))| (SlotId(index as u32), prefix.len()))
+}
+
+#[derive(Clone, Copy)]
+struct Gemma4SlotPreference {
+    slot: SlotId,
+    cached_tokens: usize,
+    restore_prompt_anchor: bool,
+}
+
+fn preferred_gemma4_slot(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    active_slots: &[Option<Gemma4Slot>],
+    prompt_tokens: &[u32],
+) -> Option<Gemma4SlotPreference> {
+    preferred_gemma4_slot_excluding(
+        retained_tokens,
+        prompt_anchors,
+        active_slots,
+        prompt_tokens,
+        &vec![false; active_slots.len()],
+    )
+}
+
+fn preferred_gemma4_slot_excluding(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    active_slots: &[Option<Gemma4Slot>],
+    prompt_tokens: &[u32],
+    excluded_slots: &[bool],
+) -> Option<Gemma4SlotPreference> {
+    // A Gemma checkpoint captures the sliding-ring state at the exact prompt
+    // boundary.  It is valid both for an identical retry (rewind one token to
+    // reproduce logits) and for a normal agentic continuation whose native
+    // rendered prompt starts with that boundary.  Requiring equality here
+    // made every tool-result turn cold even though the checkpoint was valid.
+    if let Some(preference) = prompt_anchors
+        .iter()
+        .zip(active_slots)
+        .enumerate()
+        .filter_map(|(index, (anchor, active))| {
+            if active.is_some() || excluded_slots.get(index).copied().unwrap_or(true) {
+                return None;
+            }
+            let anchor = anchor.as_ref()?;
+            let cached_tokens =
+                gemma_prompt_anchor_cached_tokens(&anchor.prompt_tokens, prompt_tokens)?;
+            Some(Gemma4SlotPreference {
+                slot: SlotId(index as u32),
+                cached_tokens,
+                restore_prompt_anchor: true,
+            })
+        })
+        .max_by_key(|preference| preference.cached_tokens)
+    {
+        return Some(preference);
+    }
+    retained_tokens
+        .iter()
+        .zip(active_slots)
+        .enumerate()
+        .filter(|(index, (prefix, active))| {
+            !excluded_slots.get(*index).copied().unwrap_or(true)
+                && active.is_none()
+                && !prefix.is_empty()
+                && prefix.len() < prompt_tokens.len()
+                && prompt_tokens.starts_with(prefix)
+        })
+        .max_by_key(|(_, (prefix, _))| prefix.len())
+        .map(|(index, (prefix, _))| Gemma4SlotPreference {
+            slot: SlotId(index as u32),
+            cached_tokens: prefix.len(),
+            restore_prompt_anchor: false,
+        })
+}
+
+fn gemma_prompt_anchor_cached_tokens(
+    anchor_prompt_tokens: &[u32],
+    prompt_tokens: &[u32],
+) -> Option<usize> {
+    if anchor_prompt_tokens.is_empty() || !prompt_tokens.starts_with(anchor_prompt_tokens) {
+        return None;
+    }
+    if anchor_prompt_tokens.len() == prompt_tokens.len() {
+        // An exact retry needs one prompt token replayed to regenerate logits.
+        return anchor_prompt_tokens.len().checked_sub(1);
+    }
+    // A continuation has a real suffix, so the complete checkpoint KV is
+    // reusable and the suffix itself produces next-token logits.
+    Some(anchor_prompt_tokens.len())
+}
+
 /// ADR-040 Phase F M1 (F1) — Qwen35 SlotAware admit-while-decoding loop.
 /// Same shape as `run_slot_aware_gemma4`; single shared `HybridKvCache`.
 #[allow(clippy::too_many_arguments)]
@@ -7691,6 +9749,9 @@ fn run_slot_aware_qwen35(
     };
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
     let mut slots: Vec<Option<Qwen35Slot>> = (0..n_slots).map(|_| None).collect();
+    let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
+    let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
+    let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -7723,6 +9784,9 @@ fn run_slot_aware_qwen35(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
+                        &mut retained_tokens,
+                        &mut prompt_caches,
+                        &mut prompt_anchors,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -7738,22 +9802,30 @@ fn run_slot_aware_qwen35(
                     params,
                     events,
                     cancellation_counter,
+                    admission,
                     ..
                 } => {
+                    let reply = SlotReply::family_stream(
+                        events,
+                        cancellation_counter,
+                        admission,
+                        registration.as_ref(),
+                        &params,
+                    );
                     admit_qwen35_slot(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
+                        &mut retained_tokens,
+                        &mut prompt_caches,
+                        &mut prompt_anchors,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
                         prompt_tokens,
                         params,
-                        SlotReply::Stream {
-                            events,
-                            cancel: cancellation_counter,
-                        },
+                        reply,
                     );
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
@@ -7841,8 +9913,12 @@ fn run_slot_aware_qwen35(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
+                    &mut retained_tokens,
+                    &mut prompt_caches,
+                    &mut prompt_anchors,
                     registration.as_ref(),
                     &handles,
+                    kv_bytes_per_token,
                 );
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
@@ -7856,8 +9932,12 @@ fn run_slot_aware_qwen35(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
+                    &mut retained_tokens,
+                    &mut prompt_caches,
+                    &mut prompt_anchors,
                     registration.as_ref(),
                     &decode_handles,
+                    kv_bytes_per_token,
                 );
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
@@ -7878,14 +9958,41 @@ fn admit_qwen35_slot(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
-    reply: SlotReply,
+    mut reply: SlotReply,
 ) {
+    if let Some(result) = prompt_caches
+        .iter()
+        .find_map(|cache| cache.lookup(&prompt_tokens, &params))
+    {
+        reply.accept_stream_admission();
+        replay_slot_prompt_cache(reply, result);
+        return;
+    }
+    let anchor_preferred = prompt_anchors
+        .iter()
+        .zip(retained_tokens.iter())
+        .zip(slots.iter())
+        .enumerate()
+        .find(|(_, ((anchor, retained), active))| {
+            active.is_none()
+                && anchor
+                    .as_ref()
+                    .map(|anchor| anchor.prompt_tokens == prompt_tokens)
+                    .unwrap_or(false)
+                && retained.starts_with(&prompt_tokens)
+        })
+        .map(|(index, _)| (SlotId(index as u32), prompt_tokens.len()));
+    let preferred = anchor_preferred
+        .or_else(|| longest_exact_idle_prefix(retained_tokens, slots, &prompt_tokens));
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
@@ -7897,6 +10004,12 @@ fn admit_qwen35_slot(
         prompt_tokens: prompt_tokens.len() as u32,
         max_tokens: params.max_tokens as u32,
         kv_bytes_needed: needed_bytes,
+        prompt_kv_bytes: if needed_bytes == 0 {
+            0
+        } else {
+            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+        },
+        preferred_slot: preferred.map(|(slot, _)| slot),
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
@@ -7907,8 +10020,9 @@ fn admit_qwen35_slot(
             slot_fire_done(
                 reply,
                 Err(anyhow::anyhow!(
-                    "slot_budget_exceeded: ADR-040 Phase F M1 — per-slot KV budget \
-                     exceeded (needed_bytes={needed_bytes}, budget_bytes={budget_bytes})."
+                    "slot_budget_exceeded: ADR-040 full-context slots — shared physical KV \
+                     budget exceeded (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
+                     logical context was not divided by slot count."
                 )),
                 false,
             );
@@ -7917,12 +10031,13 @@ fn admit_qwen35_slot(
         Err(e) => {
             slot_fire_done(
                 reply,
-                Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e:?}")),
+                Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e}")),
                 false,
             );
             return;
         }
     };
+    reply.accept_stream_admission();
     let Some(handle) = admitted.handle else {
         // CompletedAtAdmit (`max_tokens == 0`): mirror the SerialFifo arm's
         // fallback — run the legacy non-slot-aware `generate_qwen35_once`
@@ -7937,21 +10052,71 @@ fn admit_qwen35_slot(
         return;
     };
 
+    let anchor_hit = anchor_preferred
+        .map(|(slot, _)| slot == handle.slot_id)
+        .unwrap_or(false);
+    let cached_tokens = if anchor_hit {
+        prompt_tokens.len()
+    } else {
+        preferred
+            .filter(|(slot, _)| *slot == handle.slot_id)
+            .map(|(_, tokens)| tokens)
+            .unwrap_or(0)
+    };
+    if cached_tokens == 0 {
+        retained_tokens[handle.slot_id.0 as usize].clear();
+        prompt_anchors[handle.slot_id.0 as usize] = None;
+    }
+
+    let cached_prefill_logits = if anchor_hit {
+        let slot_idx = handle.slot_id.0 as usize;
+        let anchor = prompt_anchors[slot_idx]
+            .as_ref()
+            .expect("anchor_preferred matched an existing Qwen prompt anchor");
+        if let Err(e) = guard
+            .kv
+            .as_mut()
+            .expect("kv Some during loop")
+            .restore_slot_anchor(handle.slot_id, &anchor.kv)
+        {
+            reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+            retained_tokens[slot_idx].clear();
+            prompt_anchors[slot_idx] = None;
+            scheduler.release(handle);
+            slot_fire_done(
+                reply,
+                Err(e.context("Qwen35 slot-local prompt-boundary restore")),
+                false,
+            );
+            return;
+        }
+        tracing::info!(
+            slot = handle.slot_id.0,
+            prompt_tokens = prompt_tokens.len(),
+            checkpoint_bytes = anchor.kv.total_bytes(),
+            "Qwen35 slot-local prompt-boundary cache hit"
+        );
+        Some(anchor.prefill_logits.clone())
+    } else {
+        None
+    };
+
     let seed = super::engine_qwen35::Qwen35DecodeState::prefill_seed(
         guard.model,
         &prompt_tokens,
         &params,
+        registration,
         guard.kv.as_mut().expect("kv Some during loop"),
         handle.slot_id,
+        cached_tokens,
+        cached_prefill_logits.as_deref(),
     );
-    let state = match seed {
+    let (state, prefill_logits) = match seed {
         Ok(s) => s,
         Err(e) => {
-            let _ = guard
-                .kv
-                .as_mut()
-                .expect("kv Some during loop")
-                .reset_for_slot(handle.slot_id);
+            reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+            retained_tokens[handle.slot_id.0 as usize].clear();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
             if let Ok(mut g) = scheduler_stats_snapshot.lock() {
                 *g = scheduler.stats();
@@ -7961,25 +10126,89 @@ fn admit_qwen35_slot(
         }
     };
 
+    if !anchor_hit {
+        let slot_idx = handle.slot_id.0 as usize;
+        let anchor = guard
+            .kv
+            .as_ref()
+            .expect("kv Some during loop")
+            .snapshot_slot_anchor(handle.slot_id, prompt_tokens.len());
+        match anchor {
+            Ok(kv) => {
+                tracing::info!(
+                    slot = handle.slot_id.0,
+                    prompt_tokens = prompt_tokens.len(),
+                    checkpoint_bytes = kv.total_bytes(),
+                    "Qwen35 slot-local prompt boundary captured"
+                );
+                prompt_anchors[slot_idx] = Some(Qwen35PromptAnchor {
+                    prompt_tokens: prompt_tokens.clone(),
+                    kv,
+                    prefill_logits,
+                });
+            }
+            Err(e) => {
+                reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(e.context("Qwen35 slot-local prompt-boundary capture")),
+                    false,
+                );
+                return;
+            }
+        }
+    }
+
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
 
-    if state.finished_at_seed() {
-        // Stream: emit the seed text. finish() owns the assembled result.
-        let tick = TickOutcome {
+    // `prefill_seed` has already sampled completion token zero. Unary replies
+    // retain it inside `state`; live SSE must route it now, before decode tick
+    // one. Qwen commonly encodes `<tool_call>` as that seed token, so omitting
+    // it makes every later body fragment look like ordinary content even
+    // though the assembled unary result parses correctly.
+    let seed_dropped = slot_emit_token(
+        &mut reply,
+        &TickOutcome {
             fragment: state.seed_fragment(),
             is_reasoning: false,
-            finished: true,
-        };
-        let dropped = slot_emit_token(&reply, &tick);
-        scheduler.advance_after_decode(handle);
-        let _ = guard
+            finished: state.finished_at_seed(),
+        },
+    );
+    if seed_dropped {
+        let slot_idx = handle.slot_id.0 as usize;
+        reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+        retained_tokens[slot_idx].clear();
+        prompt_anchors[slot_idx] = None;
+        scheduler.release(handle);
+        let result = Ok(state.finish(guard.model, registration));
+        slot_fire_done(reply, result, true);
+        return;
+    }
+
+    if state.finished_at_seed() {
+        let valid_tokens = guard
             .kv
-            .as_mut()
+            .as_ref()
             .expect("kv Some during loop")
-            .reset_for_slot(handle.slot_id);
+            .sequence_len_for_slot(handle.slot_id)
+            .unwrap_or(0) as usize;
+        retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix(valid_tokens);
+        record_retained_slot_kv(
+            scheduler,
+            handle,
+            retained_tokens[handle.slot_id.0 as usize].len(),
+            kv_bytes_per_token,
+        );
+        scheduler.advance_after_decode(handle);
         scheduler.release(handle);
         let gr = Ok(state.finish(guard.model, registration));
-        slot_fire_done(reply, gr, dropped);
+        if let Ok(result) = gr.as_ref() {
+            prompt_caches[handle.slot_id.0 as usize].store(&prompt_tokens, &params, result);
+        }
+        slot_fire_done(reply, gr, false);
         return;
     }
 
@@ -8009,6 +10238,8 @@ fn embed_qwen35_inline(
         prompt_tokens: prompt_tokens.len() as u32,
         max_tokens: 1,
         kv_bytes_needed: needed_bytes,
+        prompt_kv_bytes: needed_bytes,
+        preferred_slot: None,
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
@@ -8033,11 +10264,10 @@ fn embed_qwen35_inline(
         handle.slot_id,
     );
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-    let _ = guard
-        .kv
-        .as_mut()
-        .expect("kv Some during loop")
-        .reset_for_slot(handle.slot_id);
+    if result.is_ok() {
+        record_retained_slot_kv(scheduler, handle, prompt_tokens.len(), kv_bytes_per_token);
+    }
+    reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
     scheduler.release(handle);
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
@@ -8078,6 +10308,12 @@ fn generate_qwen35_soft_tokens_inline(
         prompt_tokens: prompt_tokens.len() as u32,
         max_tokens: params.max_tokens as u32,
         kv_bytes_needed: needed_bytes,
+        prompt_kv_bytes: if needed_bytes == 0 {
+            0
+        } else {
+            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+        },
+        preferred_slot: None,
     };
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
@@ -8154,15 +10390,17 @@ fn generate_qwen35_soft_tokens_inline(
     };
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
     if let Ok(ref gr) = result {
+        record_retained_slot_kv(
+            scheduler,
+            handle,
+            gr.prompt_tokens.saturating_add(gr.completion_tokens),
+            kv_bytes_per_token,
+        );
         for _ in 0..gr.completion_tokens {
             scheduler.advance_after_decode(handle);
         }
     }
-    let _ = guard
-        .kv
-        .as_mut()
-        .expect("kv Some during loop")
-        .reset_for_slot(handle.slot_id);
+    reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
     scheduler.release(handle);
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
@@ -8174,15 +10412,19 @@ fn decode_batch_qwen35(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
+    kv_bytes_per_token: u64,
 ) {
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
         let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
             continue;
         };
-        let (mut state, reply, installed) = slot;
+        let (mut state, mut reply, installed) = slot;
         if installed != handle {
             slots[slot_idx] = Some((state, reply, installed));
             continue;
@@ -8192,11 +10434,9 @@ fn decode_batch_qwen35(
             match state.decode_tick(guard.model, guard.kv.as_mut().expect("kv Some during loop")) {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = guard
-                        .kv
-                        .as_mut()
-                        .expect("kv Some during loop")
-                        .reset_for_slot(handle.slot_id);
+                    reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+                    retained_tokens[slot_idx].clear();
+                    prompt_anchors[slot_idx] = None;
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(e), false);
                     continue;
@@ -8208,17 +10448,41 @@ fn decode_batch_qwen35(
             finished: qtick.finished,
         };
 
-        let client_dropped = slot_emit_token(&reply, &tick);
+        let client_dropped = slot_emit_token(&mut reply, &tick);
+        if tick.finished && !client_dropped {
+            let valid_tokens = guard
+                .kv
+                .as_ref()
+                .expect("kv Some during loop")
+                .sequence_len_for_slot(handle.slot_id)
+                .unwrap_or(0) as usize;
+            retained_tokens[slot_idx] = state.retained_prefix(valid_tokens);
+            record_retained_slot_kv(
+                scheduler,
+                handle,
+                retained_tokens[slot_idx].len(),
+                kv_bytes_per_token,
+            );
+        }
         scheduler.advance_after_decode(handle);
 
         if tick.finished || client_dropped {
-            let _ = guard
-                .kv
-                .as_mut()
-                .expect("kv Some during loop")
-                .reset_for_slot(handle.slot_id);
+            if client_dropped {
+                reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+            }
             scheduler.release(handle);
+            let (cache_prompt, cache_params) = {
+                let (prompt, params) = state.prompt_cache_identity();
+                (prompt.to_vec(), params.clone())
+            };
             let gr = Ok(state.finish(guard.model, registration));
+            if !client_dropped {
+                if let Ok(result) = gr.as_ref() {
+                    prompt_caches[slot_idx].store(&cache_prompt, &cache_params, result);
+                }
+            }
             slot_fire_done(reply, gr, client_dropped);
         } else {
             slots[slot_idx] = Some((state, reply, handle));
@@ -8235,13 +10499,15 @@ fn worker_run(
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    kv_fixed_bytes_per_slot: u64,
 ) {
     tracing::info!(
         model = %loaded.model_id(),
         ?mode,
         queue_capacity,
-        per_slot_kv_budget_bytes,
+        shared_physical_kv_budget_bytes = per_slot_kv_budget_bytes,
         kv_bytes_per_token,
+        kv_fixed_bytes_per_slot,
         "hf2q-engine worker thread started"
     );
 
@@ -8268,6 +10534,7 @@ fn worker_run(
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
             kv_bytes_per_token,
+            kv_fixed_bytes_per_slot,
         );
         return;
     }
@@ -8299,8 +10566,8 @@ fn worker_run(
     // `Box<dyn Scheduler>` for narrative consistency; the concrete-
     // adapter shape used here is the implementation realisation that
     // honors §2.9's "advance lives on concrete type" pin.
-    // ADR-040 §3.5 iter-A5b — scheduler-side per-slot KV budget
-    // wiring.  `per_slot_kv_budget_bytes == 0` means "enforcement
+    // ADR-040 §0.0 — scheduler-side shared physical KV budget wiring.
+    // The legacy field name remains wire-compatible. A zero value means "enforcement
     // disabled" (preserves pre-A5 byte-equivalence for operators who
     // do not set `--kv-cache-budget-bytes`).  The wrap helper
     // `new_with_kv_budget` accepts `0` and is byte-equivalent to
@@ -8314,15 +10581,19 @@ fn worker_run(
     // (byte-equivalence H23 pin); the only addition is the
     // `WorkerScheduler::Inflight` arm for SlotAware.
     let mut scheduler: WorkerScheduler = match mode {
-        EngineMode::SerialFifo => WorkerScheduler::Fifo(FifoSchedulerAdapter::new_with_kv_budget(
-            queue_capacity,
-            per_slot_kv_budget_bytes,
-        )),
+        EngineMode::SerialFifo => {
+            WorkerScheduler::Fifo(FifoSchedulerAdapter::new_with_kv_budget_and_floor(
+                queue_capacity,
+                per_slot_kv_budget_bytes,
+                kv_fixed_bytes_per_slot,
+            ))
+        }
         EngineMode::SlotAware { max_slots } => {
-            WorkerScheduler::Inflight(InflightBatchedScheduler::new_with_kv_budget(
+            WorkerScheduler::Inflight(InflightBatchedScheduler::new_with_kv_budget_and_floor(
                 queue_capacity,
                 max_slots,
                 per_slot_kv_budget_bytes,
+                kv_fixed_bytes_per_slot,
             ))
         }
     };
@@ -8401,6 +10672,12 @@ fn worker_run(
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
                     kv_bytes_needed: needed_bytes_admit,
+                    prompt_kv_bytes: if needed_bytes_admit == 0 {
+                        0
+                    } else {
+                        (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+                    },
+                    preferred_slot: None,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -8825,6 +11102,7 @@ fn worker_run(
                 params,
                 events,
                 cancellation_counter,
+                mut admission,
                 soft_tokens,
                 deepstack,
                 positions_flat,
@@ -8869,16 +11147,30 @@ fn worker_run(
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
                     kv_bytes_needed: needed_bytes_admit,
+                    prompt_kv_bytes: if needed_bytes_admit == 0 {
+                        0
+                    } else {
+                        (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+                    },
+                    preferred_slot: None,
                 };
                 let admitted = match scheduler.admit(admit_req) {
-                    Ok(slot) => slot,
+                    Ok(slot) => {
+                        if let Some(tx) = admission.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                        slot
+                    }
                     Err(AdmitError::QueueFull { .. }) => {
-                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(
-                            "ADR-040 C2b: scheduler admit returned \
+                        reject_stream_before_sse(
+                            events,
+                            admission,
+                            anyhow::anyhow!(
+                                "queue_full: ADR-040 C2b scheduler admit returned \
                                  QueueFull for GenerateStream (mpsc \
                                  backpressure should have rejected upstream)."
-                                .to_string(),
-                        ));
+                            ),
+                        );
                         continue;
                     }
                     // ADR-040 §3.5 iter-A5b — surfaces a typed-prefix error
@@ -8890,21 +11182,28 @@ fn worker_run(
                         needed_bytes,
                         budget_bytes,
                     }) => {
-                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!(
-                            "slot_budget_exceeded: ADR-040 §3.5 A5b — \
-                                 per-slot KV budget exceeded for GenerateStream \
+                        reject_stream_before_sse(
+                            events,
+                            admission,
+                            anyhow::anyhow!(
+                                "slot_budget_exceeded: ADR-040 §3.5 A5b — \
+                                 shared physical KV budget exceeded for GenerateStream \
                                  (needed_bytes={}, budget_bytes={}). Reduce \
                                  max_tokens or use a shorter prompt.",
-                            needed_bytes, budget_bytes
-                        )));
+                                needed_bytes,
+                                budget_bytes
+                            ),
+                        );
                         continue;
                     }
                     Err(e) => {
-                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!(
-                            "ADR-040 C2b: scheduler admit failed for \
-                                 GenerateStream: {:?}",
-                            e
-                        )));
+                        reject_stream_before_sse(
+                            events,
+                            admission,
+                            anyhow::anyhow!(
+                                "ADR-040 C2b: scheduler admit failed for GenerateStream: {e}"
+                            ),
+                        );
                         continue;
                     }
                 };
@@ -9437,6 +11736,8 @@ fn worker_run(
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: 0,
                     kv_bytes_needed: needed_bytes_admit,
+                    prompt_kv_bytes: needed_bytes_admit,
+                    preferred_slot: None,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -9458,7 +11759,7 @@ fn worker_run(
                     }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "slot_budget_exceeded: ADR-040 §3.5 A5b — Embed \
-                             prompt exceeds per-slot KV budget (needed_bytes={}, \
+                             prompt exceeds shared physical KV budget (needed_bytes={}, \
                              budget_bytes={}). Reduce prompt length.",
                             needed_bytes,
                             budget_bytes
@@ -9800,6 +12101,12 @@ fn worker_run(
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
                     kv_bytes_needed: needed_bytes_admit,
+                    prompt_kv_bytes: if needed_bytes_admit == 0 {
+                        0
+                    } else {
+                        (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+                    },
+                    preferred_slot: None,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -9820,7 +12127,7 @@ fn worker_run(
                     }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "slot_budget_exceeded: ADR-040 §3.5 A5b — scheduler rejected \
-                             GenerateWithSoftTokens — per-slot KV budget \
+                             GenerateWithSoftTokens — shared physical KV budget \
                              exceeded (needed_bytes={}, budget_bytes={}). \
                              Reduce max_tokens or use a shorter prompt.",
                             needed_bytes,
@@ -11264,6 +13571,23 @@ fn gemma_live_resume_prefix_len(live: &[u32], prompt: &[u32]) -> usize {
     common_token_prefix(live, prompt).min(prompt.len().saturating_sub(1))
 }
 
+fn gemma_retained_live_prefix_tokens(
+    prompt_tokens: &[u32],
+    generated_tokens: &[u32],
+    physical_decode_writes: usize,
+) -> Vec<u32> {
+    prompt_tokens
+        .iter()
+        .copied()
+        .chain(
+            generated_tokens
+                .iter()
+                .copied()
+                .take(physical_decode_writes),
+        )
+        .collect()
+}
+
 fn gemma_live_batched_append_allowed(
     serve_batched_env: Option<&str>,
     suffix_tokens: usize,
@@ -11285,16 +13609,16 @@ fn gemma_live_batched_append_allowed(
 ///
 /// The ledger is committed only after a successful request and is cleared by
 /// the caller before any new GPU mutation. The live dense and hybrid buffers
-/// already contain the prompt KV at positions `[0, k)`; decode only wrote at
-/// later absolute positions because this path requires long-resume's linear
-/// sliding storage. Capacity and regime checks fail closed to the existing
-/// snapshot/fresh-prefill paths.
+/// already contain the retained prompt plus every generated token that was
+/// fed through a decode tick. The ledger mirrors those physical positions,
+/// so a tool-result turn can match through the assistant tool call instead of
+/// stopping at the old generation prompt. Capacity and regime checks fail
+/// closed to the existing snapshot/fresh-prefill paths.
 fn gemma_live_prefix_resume(
     loaded: &GemmaLoadedModel,
     prompt_tokens: &[u32],
     max_tokens: usize,
     has_soft_tokens: bool,
-    batched_allowed: bool,
 ) -> Option<usize> {
     if has_soft_tokens
         || loaded.live_prefix_tokens.is_empty()
@@ -11306,13 +13630,7 @@ fn gemma_live_prefix_resume(
     }
 
     let k = gemma_live_resume_prefix_len(&loaded.live_prefix_tokens, prompt_tokens);
-    if k == 0
-        || !crate::serve::forward_prefill_batched::gemma_lcp_resume_worthwhile(
-            k,
-            prompt_tokens.len(),
-            batched_allowed,
-        )
-    {
+    if k == 0 {
         return None;
     }
 
@@ -11447,13 +13765,8 @@ fn generate_once_with_soft_tokens(
     //      partial-prefill resume entry point. Otherwise (any gate
     //      fails) the path falls back to the pre-iter-3 wholesale
     //      reset + fresh allocation.
-    let live_resume = gemma_live_prefix_resume(
-        loaded,
-        prompt_tokens,
-        max_tokens,
-        !soft_tokens.is_empty(),
-        batched_allowed,
-    );
+    let live_resume =
+        gemma_live_prefix_resume(loaded, prompt_tokens, max_tokens, !soft_tokens.is_empty());
     // Fail closed before this request mutates any KV bytes. Only a fully
     // successful request below republishes a live recovery anchor.
     loaded.live_prefix_tokens.clear();
@@ -12060,7 +14373,7 @@ fn generate_once_with_soft_tokens(
     let mut profiler = ProfileAccumulator::new(0);
 
     // Early EOS check on the prefill-emitted first token.
-    if loaded.eos_token_ids.contains(&next_token) {
+    if loaded.is_generation_stop_token(next_token) {
         finish_reason = "stop";
     } else if hit_stop_string(&decoded_text, &params.stop_strings) {
         finish_reason = "stop";
@@ -12121,7 +14434,7 @@ fn generate_once_with_soft_tokens(
                 greedy_token
             };
 
-            if loaded.eos_token_ids.contains(&next_token) {
+            if loaded.is_generation_stop_token(next_token) {
                 finish_reason = "stop";
                 break;
             }
@@ -12248,10 +14561,15 @@ fn generate_once_with_soft_tokens(
         && crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
         && (crate::debug::INVESTIGATION_ENV.use_dense || crate::debug::INVESTIGATION_ENV.hybrid_kv)
     {
-        loaded.live_prefix_tokens.extend_from_slice(prompt_tokens);
+        loaded.live_prefix_tokens = gemma_retained_live_prefix_tokens(
+            prompt_tokens,
+            &generated_tokens,
+            physical_decode_writes,
+        );
         tracing::info!(
             target: "hf2q::serve::api::engine_gemma4::progress",
             prompt_tokens = prompt_tokens.len(),
+            cached_prefix_tokens = loaded.live_prefix_tokens.len(),
             "Gemma4 live prefix committed"
         );
     }
@@ -12855,7 +15173,7 @@ fn generate_gemma4_once_slot_aware(
 
         // Early EOS / stop_string check on the prefill-emitted first
         // token (mirror of generate_once at engine.rs:7728-7732).
-        if loaded.eos_token_ids.contains(&next_token) {
+        if loaded.is_generation_stop_token(next_token) {
             finish_reason = "stop";
         } else if hit_stop_string(&decoded_text, &params.stop_strings) {
             finish_reason = "stop";
@@ -12921,7 +15239,7 @@ fn generate_gemma4_once_slot_aware(
                     greedy_token
                 };
 
-                if loaded.eos_token_ids.contains(&next_token) {
+                if loaded.is_generation_stop_token(next_token) {
                     finish_reason = "stop";
                     break;
                 }
@@ -13716,7 +16034,7 @@ fn generate_stream_gemma4_once_slot_aware(
             completion_token_count += 1;
 
             let mut decode_err: Option<anyhow::Error> = None;
-            if loaded.eos_token_ids.contains(&next_token) {
+            if loaded.is_generation_stop_token(next_token) {
                 finish_reason = "stop";
             } else if hit_stop_string(&decoded_running, &params.stop_strings) {
                 finish_reason = "stop";
@@ -13791,7 +16109,25 @@ fn generate_stream_gemma4_once_slot_aware(
                         greedy_token
                     };
 
-                    if loaded.eos_token_ids.contains(&next_token) {
+                    if loaded.is_generation_stop_token(next_token) {
+                        finish_reason = "stop";
+                        break;
+                    }
+                    // Match the unary decoder and the shared streaming path:
+                    // once the tool grammar is complete, the sampler can
+                    // select a transport-only special token (Gemma commonly
+                    // yields `<pad>`). Stop before decoding or emitting it;
+                    // otherwise SSE leaks content that unary correctly drops.
+                    if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead())
+                        || grammar_runtime.as_ref().is_some_and(|rt| {
+                            rt.is_accepted()
+                                && token_bytes_ref.is_some_and(|tb| {
+                                    tb.get(next_token as usize)
+                                        .map(|bytes| bytes.is_empty())
+                                        .unwrap_or(true)
+                                })
+                        })
+                    {
                         finish_reason = "stop";
                         break;
                     }
@@ -14575,7 +16911,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
 
         let mut finish_reason: &'static str = "length";
 
-        if loaded.eos_token_ids.contains(&next_token) {
+        if loaded.is_generation_stop_token(next_token) {
             finish_reason = "stop";
         } else if hit_stop_string(&decoded_text, &params.stop_strings) {
             finish_reason = "stop";
@@ -14641,7 +16977,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                     greedy_token
                 };
 
-                if loaded.eos_token_ids.contains(&next_token) {
+                if loaded.is_generation_stop_token(next_token) {
                     finish_reason = "stop";
                     break;
                 }
@@ -16348,13 +18684,8 @@ fn generate_stream_once(
     //
     // Mirrors `generate_once_with_soft_tokens`'s probe + iter-3
     // resume gate. See that site for the full design contract.
-    let live_resume = gemma_live_prefix_resume(
-        loaded,
-        prompt_tokens,
-        max_tokens,
-        !soft_tokens.is_empty(),
-        batched_allowed,
-    );
+    let live_resume =
+        gemma_live_prefix_resume(loaded, prompt_tokens, max_tokens, !soft_tokens.is_empty());
     // A dropped SSE receiver or any later error must not publish partially
     // mutated KV as a future prefix. Commit happens only after Done.
     loaded.live_prefix_tokens.clear();
@@ -17052,7 +19383,7 @@ fn generate_stream_once(
         .tokenizer
         .decode(&[next_token], false)
         .unwrap_or_default();
-    let mut is_eos_first = loaded.eos_token_ids.contains(&next_token);
+    let mut is_eos_first = loaded.is_generation_stop_token(next_token);
     if !is_eos_first && !first_text.is_empty() {
         accumulated_text.push_str(&first_text);
         if emit_fragment(
@@ -17141,7 +19472,7 @@ fn generate_stream_once(
                 greedy_token
             };
 
-            if loaded.eos_token_ids.contains(&next_token) {
+            if loaded.is_generation_stop_token(next_token) {
                 finish_reason = "stop";
                 break;
             }
@@ -17377,10 +19708,15 @@ fn generate_stream_once(
         && crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
         && (crate::debug::INVESTIGATION_ENV.use_dense || crate::debug::INVESTIGATION_ENV.hybrid_kv)
     {
-        loaded.live_prefix_tokens.extend_from_slice(prompt_tokens);
+        loaded.live_prefix_tokens = gemma_retained_live_prefix_tokens(
+            prompt_tokens,
+            &generated_tokens,
+            physical_decode_writes,
+        );
         tracing::info!(
             target: "hf2q::serve::api::engine_gemma4::progress",
             prompt_tokens = prompt_tokens.len(),
+            cached_prefix_tokens = loaded.live_prefix_tokens.len(),
             "Gemma4 streaming live prefix committed"
         );
     }
@@ -17561,6 +19897,27 @@ pub fn render_chat_prompt_with_tools(
     enable_thinking: bool,
     chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<String> {
+    render_chat_prompt_with_tools_generation_prompt(
+        template_str,
+        messages,
+        tools,
+        enable_thinking,
+        chat_template_kwargs,
+        true,
+    )
+}
+
+/// Internal renderer seam used to identify a family template's stable
+/// conversation boundary. Production generation continues to call
+/// [`render_chat_prompt_with_tools`], which always passes `true`.
+pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
+    template_str: &str,
+    messages: &[super::schema::ChatMessage],
+    tools: Option<&[super::schema::Tool]>,
+    enable_thinking: bool,
+    chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    add_generation_prompt: bool,
+) -> Result<String> {
     use super::schema::MessageContent;
 
     // ADR-005 iter-229 Decision 4 step (a): reject renderer-owned keys
@@ -17733,7 +20090,7 @@ pub fn render_chat_prompt_with_tools(
     );
     ctx.insert(
         "add_generation_prompt".into(),
-        serde_json::Value::Bool(true),
+        serde_json::Value::Bool(add_generation_prompt),
     );
     ctx.insert(
         "bos_token".into(),
@@ -17925,6 +20282,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gemma_padding_is_a_generation_stop_without_becoming_eos() {
+        let eos = [1, 106];
+        assert!(gemma_generation_stop_token(&eos, Some(0), 0));
+        assert!(gemma_generation_stop_token(&eos, Some(0), 1));
+        assert!(gemma_generation_stop_token(&eos, Some(0), 106));
+        assert!(!gemma_generation_stop_token(&eos, Some(0), 48));
+        assert!(!gemma_generation_stop_token(&eos, None, 0));
+    }
+
+    #[test]
+    fn deepseek_slot_decode_quantum_is_bounded_and_defaults_to_eight() {
+        assert_eq!(parse_deepseek4_slot_decode_quantum(None), Ok(8));
+        assert_eq!(parse_deepseek4_slot_decode_quantum(Some("1")), Ok(1));
+        assert_eq!(parse_deepseek4_slot_decode_quantum(Some("16")), Ok(16));
+        assert_eq!(parse_deepseek4_slot_decode_quantum(Some("64")), Ok(64));
+        for invalid in ["", "0", "65", "eight"] {
+            assert!(
+                parse_deepseek4_slot_decode_quantum(Some(invalid)).is_err(),
+                "invalid quantum {invalid:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_full_context_slot_affinity_prefers_exact_idle_prefix_then_fresh_then_lru() {
+        assert_eq!(
+            choose_full_context_slot(
+                &[2, 3, 0, 0],
+                &[false, false, true, false],
+                &[false; 4],
+                &[9, 8, 7, 0],
+            ),
+            SlotId(1),
+            "longest valid live or recovery prefix must win"
+        );
+        assert_eq!(
+            choose_full_context_slot(
+                &[2, 3, 0, 0],
+                &[false, false, true, false],
+                &[false, true, false, false],
+                &[9, 8, 7, 0],
+            ),
+            SlotId(0),
+            "an active matching slot cannot be stolen"
+        );
+        assert_eq!(
+            choose_full_context_slot(
+                &[0, 0, 0, 0],
+                &[false, false, true, true],
+                &[false; 4],
+                &[0, 1, 9, 8],
+            ),
+            SlotId(2),
+            "an unused full-context slot must win before overwriting retained state"
+        );
+        assert_eq!(
+            choose_full_context_slot(
+                &[0, 0, 0, 0],
+                &[false; 4],
+                &[false, true, false, false],
+                &[5, 1, 9, 4],
+            ),
+            SlotId(3),
+            "when no prefix or fresh slot fits, reuse the least-recently-used idle slot"
+        );
+        assert_eq!(
+            choose_full_context_slot(
+                &[0, 119_699, 0, 0],
+                &[false, false, true, true],
+                &[false; 4],
+                &[1, 2, 0, 0],
+            ),
+            SlotId(1),
+            "a long recovery-anchor match must beat a fresh slot"
+        );
+    }
+
+    #[test]
     fn gemma_live_resume_rewinds_one_token_on_exact_prompt_match() {
         let prompt = [10, 20, 30, 40];
         assert_eq!(gemma_live_resume_prefix_len(&prompt, &prompt), 3);
@@ -17937,6 +20372,43 @@ mod tests {
             2
         );
         assert_eq!(gemma_live_resume_prefix_len(&[10], &[10]), 0);
+    }
+
+    #[test]
+    fn gemma_live_prefix_tracks_only_physically_written_generation_tokens() {
+        assert_eq!(
+            gemma_retained_live_prefix_tokens(&[10, 20], &[30, 40, 50], 2),
+            vec![10, 20, 30, 40]
+        );
+        assert_eq!(
+            gemma_retained_live_prefix_tokens(&[10, 20], &[30], 0),
+            vec![10, 20]
+        );
+    }
+
+    #[test]
+    fn gemma_prompt_anchor_reuses_exact_retry_and_agentic_continuation() {
+        let anchor = [10, 20, 30, 40];
+        assert_eq!(
+            gemma_prompt_anchor_cached_tokens(&anchor, &anchor),
+            Some(3),
+            "an exact retry replays the last prompt token to reproduce logits"
+        );
+        assert_eq!(
+            gemma_prompt_anchor_cached_tokens(&anchor, &[10, 20, 30, 40, 50, 60]),
+            Some(4),
+            "a tool-result continuation reuses the complete prompt boundary"
+        );
+        assert_eq!(
+            gemma_prompt_anchor_cached_tokens(&anchor[..2], &[10, 20, 99, 40, 50]),
+            Some(2),
+            "a checkpoint before the native generation cue remains an exact prefix"
+        );
+        assert_eq!(
+            gemma_prompt_anchor_cached_tokens(&anchor, &[99, 20, 30, 40, 50]),
+            None,
+            "a conversation with no common rendered prefix cannot reuse the checkpoint"
+        );
     }
 
     #[test]
@@ -18699,6 +21171,38 @@ assistant:
     }
 
     #[test]
+    fn gemma_generation_prompt_boundary_is_an_exact_rendered_prefix() {
+        let msgs = vec![
+            i229_msg("system", "You are an agent."),
+            i229_msg("user", "Fix the bug in foo.rs"),
+        ];
+        let full = render_chat_prompt_with_tools_generation_prompt(
+            GEMMA4_EMBEDDED_TEMPLATE,
+            &msgs,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let stable = render_chat_prompt_with_tools_generation_prompt(
+            GEMMA4_EMBEDDED_TEMPLATE,
+            &msgs,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!stable.is_empty());
+        assert!(full.starts_with(&stable), "stable={stable:?} full={full:?}");
+        assert_eq!(
+            &full[stable.len()..],
+            "<|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    #[test]
     fn iter229_gate3_non_assistant_tool_calls_do_not_define_ids() {
         // tool_calls smuggled onto a user message must not populate the
         // id→name map (gate-3 #1): the later tool message stays "unknown".
@@ -19041,7 +21545,7 @@ assistant:
     }
 
     /// **ADR-040 §3.5 iter-A5b** — synthetic test engine constructor
-    /// with explicit per-slot KV budget + cached per-token bytes. Used
+    /// with an explicit shared physical KV budget + cached per-token bytes. Used
     /// by the iter-A5b tests that exercise `Engine::try_admit_budget`
     /// + the handler-side `slot_budget_exceeded` routing.
     ///
@@ -19087,6 +21591,7 @@ assistant:
                 max_slots: 1,
                 per_slot_kv_budget_bytes,
                 kv_bytes_per_token_cached,
+                kv_fixed_bytes_per_slot_cached: 0,
                 scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                     policy: SchedulerPolicy::FifoSerial,
                     in_flight_slots: 0,
@@ -20744,6 +23249,7 @@ assistant:
                 // ADR-040 §3.5 iter-A5b: synthetic fixtures opt out.
                 per_slot_kv_budget_bytes: 0,
                 kv_bytes_per_token_cached: 0,
+                kv_fixed_bytes_per_slot_cached: 0,
                 scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                     policy: SchedulerPolicy::FifoSerial,
                     in_flight_slots: 0,
@@ -22903,14 +25409,10 @@ assistant:
             );
             return;
         };
-        // Multi-slot qwen35 REQUIRES the F32 full-attn KV path: slot_id>0
-        // with TQ-active KV is the typed Phase B4a-cont deferral
-        // ("TQ encode + TQ SDPA kernels are not yet slot-aware", ADR-040
-        // §6.1.5/§6.1.6, dossier R5) and fails CLOSED — empirically
-        // confirmed by this test's first run 2026-07-01 (build_gated_attn_layer
-        // slot_id=7 typed error). HF2Q_TQ_KV defaults ON, so pin it OFF for
-        // the supported multi-slot configuration this gate proves.
-        std::env::set_var("HF2Q_TQ_KV", "0");
+        // Qwen multi-slot TQ now addresses packed and norms buffers through
+        // zero-copy views of their outer sequence axis. Keep the production
+        // default enabled so this real-model gate proves the supported path.
+        std::env::set_var("HF2Q_TQ_KV", "1");
         let gguf_path = PathBuf::from(gguf);
         assert!(
             gguf_path.exists(),
@@ -23244,7 +25746,8 @@ assistant:
         let ms_tokens = g
             .weights
             .forward_prefill_batched_multi_seq(&seqs, &scaffold, max_decode, &mut g.ctx)
-            .expect("multi-seq cross-slot prefill");
+            .expect("multi-seq cross-slot prefill")
+            .first_tokens;
         g.multi_seq_kv_hybrid = Some(scaffold);
 
         assert_eq!(ms_tokens.len(), n, "multi-seq returned wrong token count");
@@ -23328,7 +25831,8 @@ assistant:
             let toks = g
                 .weights
                 .forward_prefill_batched_multi_seq(&seqs, &scaffold, max_decode, &mut g.ctx)
-                .expect("multi-seq prefill");
+                .expect("multi-seq prefill")
+                .first_tokens;
             g.multi_seq_kv_hybrid = Some(scaffold);
             toks
         };
@@ -23607,7 +26111,8 @@ assistant:
             let toks = g
                 .weights
                 .forward_prefill_batched_multi_seq(&seqs, &scaffold, max_decode, &mut g.ctx)
-                .expect("multi forward");
+                .expect("multi forward")
+                .first_tokens;
             g.multi_seq_kv_hybrid = Some(scaffold);
             toks
         };
@@ -24888,6 +27393,32 @@ mod streaming_prompt_cache_replay_tests {
             cached_tokens: 7,
             logprobs: None,
         }
+    }
+
+    #[test]
+    fn slot_stream_stats_preserve_cached_tokens_and_measured_rates() {
+        let result = GenerationResult {
+            text: "ok".to_string(),
+            reasoning_text: None,
+            prompt_tokens: 6_684,
+            completion_tokens: 40,
+            reasoning_tokens: Some(12),
+            finish_reason: "stop",
+            prefill_duration: Duration::from_millis(250),
+            decode_duration: Duration::from_secs(2),
+            cached_tokens: 6_600,
+            logprobs: None,
+        };
+
+        let stats = slot_stream_stats(&result);
+        assert_eq!(stats.cached_prompt_tokens, Some(6_600));
+        assert_eq!(stats.prefill_time_secs, Some(0.25));
+        assert_eq!(stats.decode_time_secs, Some(2.0));
+        assert_eq!(stats.total_time_secs, Some(2.25));
+        assert_eq!(stats.time_to_first_token_ms, Some(250.0));
+        assert_eq!(stats.prefill_tokens_per_sec, Some(336.0));
+        assert_eq!(stats.decode_tokens_per_sec, Some(20.0));
+        assert_eq!(stats.reasoning_tokens, Some(12));
     }
 
     /// Drain all events the helper produces synchronously.  Helper writes
@@ -28600,6 +31131,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             prompt_tokens: 4,
             max_tokens: 8,
             kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
         };
         let admitted = sched
             .admit(req)
@@ -28638,6 +31171,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
                 prompt_tokens: 4,
                 max_tokens: 8,
                 kv_bytes_needed: 0,
+                prompt_kv_bytes: 0,
+                preferred_slot: None,
             };
             let admitted = sched
                 .admit(req)
@@ -28666,6 +31201,8 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             prompt_tokens: 4,
             max_tokens: 8,
             kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
         });
         match queued {
             Ok(slot) => assert!(
@@ -32568,7 +35105,10 @@ mod adr040_phase_e1_closure_tests {
     /// ENDED at `dc927f39` when the target workload was served
     /// (coherence + capacity + speed bars met — §0 milestone ledger).
     /// ADR-005 iter-230 A1 retargeted this pin from the expired
-    /// `REOPENED` literal to the earned live status. Three invariants:
+    /// `REOPENED` literal to the earned live status. The 2026-08-08
+    /// full-context slot release then superseded that status with the
+    /// stronger three-family workload claim while retaining the same
+    /// evidence/history requirements. Three invariants:
     /// (1) the main doc's first Status line carries the earned state,
     /// (2) the main doc still links the extracted history doc
     /// (navigability after the aeb6e87c split), (3) the history doc
@@ -32590,9 +35130,10 @@ mod adr040_phase_e1_closure_tests {
             .unwrap_or(header.len() - status_idx);
         let status_line = &header[status_idx..status_idx + status_line_end];
         assert!(
-            status_line.contains("TARGET WORKLOAD SERVED"),
+            status_line.contains("FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED"),
             "FALSIFIED: ADR-040 top-of-document Status line does not \
-             carry the earned `TARGET WORKLOAD SERVED` status. If the \
+             carry the earned `FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED` \
+             status. If the \
              status legitimately changed again, retarget this pin WITH \
              a doc-comment era note (as iter-230 A1 did for REOPENED); \
              do not delete it. Line was: {status_line:?}"
@@ -37194,10 +39735,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
             .find(fn_marker)
             .expect("H174: new fn marker present (H84 asserts)");
         // ADR-040 iter-B4c-kernel iter-2C + iter-2D (§6.1.46) — window
-        // bumped from 40K to 80K to accommodate the dense F32 + legacy
+        // bumped from 40K to 90K to accommodate the dense F32 + legacy
         // 4-bit slot routing bodies added between the iter-2A bounds-
         // first preflight and the iter-2A-cont HB-encoded body.
-        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+        let fn_window = &src[fn_idx..(fn_idx + 90_000).min(src.len())];
         // The iter-2A HB-encoded branch typed-error capability literal —
         // the EXACT string a CapabilityUnsupported { capability: "..." }
         // constructor would have used.  iter-2A-cont REMOVES it.
@@ -40940,5 +43481,62 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             !src.contains(&obsolete_serial_noop),
             "the obsolete SerialFifo Qwen35 warmup no-op must not return"
         );
+    }
+
+    #[test]
+    fn full_context_slot_streams_family_tool_calls_as_openai_deltas() {
+        for (model, wire, expected_name) in [
+            (
+                "Gemma4",
+                "<|tool_call>call:read_file{path:<|\"|>/tmp/a.rs<|\"|>}<tool_call|>",
+                "read_file",
+            ),
+            (
+                "Qwen3.6",
+                "<tool_call><function=read_file><parameter=path>\"/tmp/a.rs\"</parameter></function></tool_call>",
+                "read_file",
+            ),
+        ] {
+            let registration = super::super::registry::find_for(model)
+                .unwrap_or_else(|| panic!("registration missing for {model}"));
+            let params = SamplingParams::default();
+            let mut router = SlotStreamRouter::new(Some(&registration), &params);
+            let (events, mut receiver) = tokio::sync::mpsc::channel(32);
+
+            router.emit(&events, wire).expect("slot stream emit");
+            let finish_override = router
+                .finish(&events, 8)
+                .expect("slot stream finalize");
+            assert_eq!(finish_override, Some("tool_calls"));
+            drop(events);
+
+            let mut saw_name = false;
+            let mut arguments = String::new();
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    super::super::sse::GenerationEvent::ToolCallDelta {
+                        name,
+                        arguments: fragment,
+                        ..
+                    } => {
+                        saw_name |= name.as_deref() == Some(expected_name);
+                        if let Some(fragment) = fragment {
+                            arguments.push_str(&fragment);
+                        }
+                    }
+                    super::super::sse::GenerationEvent::Delta { text, .. } => {
+                        assert!(
+                            !text.contains("tool_call") && !text.contains("function="),
+                            "{model} leaked native tool syntax as content: {text:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_name, "{model} omitted the OpenAI function name delta");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&arguments).expect("arguments must concatenate to JSON");
+            assert_eq!(parsed["path"], "/tmp/a.rs");
+        }
     }
 }

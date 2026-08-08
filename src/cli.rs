@@ -857,13 +857,9 @@ pub struct ServeArgs {
     /// backward-compat pledge).
     ///
     /// `inflight_batched` activates ADR-040's slot-aware path
-    /// ([`EngineMode::SlotAware`]). At iter-2a (C2b SHIPPED), this value
-    /// is REJECTED at spawn time with
-    /// [`EngineSpawnError::ModeNotYetWired`] — the SlotAware runtime
-    /// lands in iter-2b (Qwen35 worker arm) + iter-2c (Gemma 4). The CLI
-    /// surface ships now so operator scripts + the systemd unit file can
-    /// reference the flag name today; the engine will start refusing
-    /// `inflight_batched` until the per-family worker arms land.
+    /// ([`EngineMode::SlotAware`]). Supported families provision independent
+    /// full-context cache sessions and interleave active requests. Unsupported
+    /// families fail at spawn rather than silently sharing cache state.
     ///
     /// Also read from `HF2Q_SCHEDULER` if `--scheduler` is absent.
     /// CLI flag wins on conflict (mirrors `--auth-token` semantics).
@@ -887,6 +883,15 @@ pub struct ServeArgs {
     /// Also read from `HF2Q_MAX_SLOTS` if `--max-slots` is absent.
     #[arg(long = "max-slots", value_name = "N")]
     pub max_slots: Option<u32>,
+
+    /// Aggregate physical KV-cache residency budget shared by every
+    /// full-context SlotAware agent. This value never divides or truncates a
+    /// slot's logical context; admission charges each slot's retained
+    /// high-water growth against the shared total. `0` or omission disables
+    /// the physical-budget gate. Also read from
+    /// `HF2Q_KV_CACHE_BUDGET_BYTES`; the CLI flag wins.
+    #[arg(long = "kv-cache-budget-bytes", value_name = "BYTES")]
+    pub kv_cache_budget_bytes: Option<u64>,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to
@@ -913,9 +918,8 @@ pub enum SchedulerArg {
     /// worker thread, serialized FIFO dispatch. Default; byte-equivalent
     /// to pre-ADR-040 (per ADR-040 §3.6).
     FifoSerial,
-    /// ADR-040 Phase C iter-2+ slot-aware path. Rejected at spawn time
-    /// until iter-2b (Qwen35) + iter-2c (Gemma 4) land the per-family
-    /// worker arms.
+    /// ADR-040 slot-aware path: independent full-context sessions with a
+    /// shared physical KV residency ceiling.
     InflightBatched,
 }
 

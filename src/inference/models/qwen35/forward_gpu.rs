@@ -1594,8 +1594,9 @@ impl Qwen35Model {
         // (`slot.k`/`slot.v` byte offset = `N * n_kv_heads * max_seq_len *
         // head_dim * 4`) is implemented at B4a-cont (commit 1d3b13ef)
         // for F32 full-attn paths via `MlxBuffer::slice_view` on the
-        // per-slot region; TQ-active multi-slot deferred to B4a-TQ
-        // (see ADR-040 §6.1.5 + §6.1.6 closure). Bounds checked at the
+        // per-slot region. TQ packed/norm buffers use the same zero-copy
+        // outer-sequence slot views, so F32 and TQ both address SlotId(N)
+        // without copying or rebasing the owning allocation. Bounds checked at the
         // public entry — out-of-range `slot_id` returns an error naming
         // the slot + `kv_cache.n_seqs` per ADR-040 §7 fail-loud mantra.
         slot_id: SlotId,
@@ -1629,10 +1630,9 @@ impl Qwen35Model {
     /// slot-offset wiring shipped in B4a-cont (§6.1.5).  Bounds-checked at
     /// the public entry of `forward_gpu_impl`.
     ///
-    /// TQ-active multi-slot is gated at `build_gated_attn_layer` /
-    /// `apply_gated_attn_layer_decode_into` entry per B4a-cont.1
-    /// (§6.1.6) — slot N>0 with `slot.tq.is_some()` returns a typed
-    /// B4a-TQ error.
+    /// TQ-active multi-slot uses zero-copy views over the packed and norms
+    /// buffers' outer sequence axis. The same slot identity therefore reaches
+    /// cursor state, F32 KV, and TQ KV.
     pub fn forward_gpu_last_logits(
         &self,
         tokens: &[u32],
@@ -2601,11 +2601,10 @@ impl Qwen35Model {
         // the full-attn cache backing `[n_seqs, n_kv_heads,
         // max_seq_len, head_dim]` F32 (per kv_cache.rs:2231-2236).
         //
-        // The B4a-cont scope DOES NOT cover the linear-attn slot
-        // path (Phase A2b), Gemma 4 forward path (Phase B4c, gated
-        // on A3), spec-decode / dflash variants (Phase B4d, gated on
-        // A4), nor TQ-active multi-slot K/V (deferred B4a-TQ; gated
-        // at `apply_sdpa_with_kv_cache` entry).
+        // Later phases extended the same slot identity through linear-attn,
+        // spec-decode/dflash, Gemma 4, and TQ packed/norm KV paths. The owning
+        // buffers keep `[n_seqs, ...]` layout while each dispatch receives a
+        // zero-copy view of exactly one outer-sequence region.
         // 2026-05-03 — top-of-call pool reset. Mirrors `forward_gpu_greedy`'s
         // line-3150 call (which only fires on the greedy temp=0 fast-path).
         // Without this, every `forward_gpu_last_logits` call (sampling-mode
@@ -8774,91 +8773,6 @@ mod tests {
                  offset={slot_0_offset}, slot 1 offset={slot_1_offset})."
             );
         }
-    }
-
-    /// ADR-040 Phase B4a-cont.1 — M2 canonical TQ-active multi-slot gate
-    /// at `build_gated_attn_layer` entry.
-    ///
-    /// Codex /cfa flagged the previous defence-in-depth gates inside
-    /// `write_kv_with_optional_tq_encode` + `dispatch_decode_sdpa_with_
-    /// optional_tq` as too-late: the fused Stage-AB path bypasses
-    /// `apply_sdpa_with_kv_cache`'s entry gate, so slot-N TQ-active
-    /// errors fire ONLY after ops1-4 (4 projections + 2 per-head
-    /// RMSNorm + 2 IMROPE dispatches) have already been encoded into
-    /// an uncommitted command encoder.
-    ///
-    /// M2 lifts the gate to `build_gated_attn_layer` entry (before
-    /// any encoder work).  This test pins that the error message
-    /// names `build_gated_attn_layer` (the canonical entry gate) +
-    /// names the slot id + cites Phase B4a-TQ.  Falsifier: error
-    /// message mentioning `write_kv_with_optional_tq_encode` or
-    /// `dispatch_decode_sdpa_with_optional_tq` instead of
-    /// `build_gated_attn_layer` ⇒ a deeper defence-in-depth gate
-    /// fired first (the canonical entry gate regressed or never
-    /// landed).
-    ///
-    /// Note on fixture: the B4a fixture uses head_dim=32 (a tiny
-    /// synthetic).  The TQ encode kernels normally require head_dim
-    /// ∈ {256, 512}, but `alloc_tq_full_attn_buffers` does NOT
-    /// validate head_dim, and the M2 gate fires on
-    /// `slot.tq.is_some() && slot_id.0 != 0` BEFORE any head_dim-
-    /// dependent kernel constraint — so the synthetic head_dim is
-    /// fine for pinning the gate placement.
-    #[test]
-    fn b4a_cont_1_tq_active_multi_slot_gated_at_build_gated_attn_layer_entry() {
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
-        let cfg = m.cfg.clone();
-        let tokens = vec![5u32, 10, 15, 20];
-        let positions = positions_to_flat(&text_positions(tokens.len() as u32));
-
-        let device = MlxDevice::new().expect("device");
-        let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new_with_options(&cfg, &device, 64, n_seqs, true)
-            .expect("kv n_seqs=4 tq_kv_active=true");
-        // Sanity: TQ buffers were allocated on every full-attn slot.
-        for (i, slot) in kv.full_attn.iter().enumerate() {
-            assert!(
-                slot.tq.is_some(),
-                "M2 fixture sanity: full_attn[{i}].tq must be Some when \
-                 tq_kv_active=true"
-            );
-        }
-
-        // Forward to slot 1 — must error with the M2 canonical gate.
-        let err = m
-            .forward_gpu(&tokens, &positions, &mut kv, SlotId(1))
-            .expect_err(
-                "B4a-cont.1 M2: forward_gpu(SlotId(1)) with TQ-active KV \
-                 must error at the build_gated_attn_layer canonical entry \
-                 gate, not silently proceed to fused-stage-AB encode work.",
-            );
-        let msg = format!("{err:#}");
-
-        // The canonical entry gate must name `build_gated_attn_layer`.
-        // If a defence-in-depth gate (write_kv_with_optional_tq_encode or
-        // dispatch_decode_sdpa_with_optional_tq) fires first, the M2 fix
-        // has regressed (canonical entry gate is no longer the actual
-        // entry for this path).
-        assert!(
-            msg.contains("build_gated_attn_layer"),
-            "B4a-cont.1 M2 FALSIFIED: expected canonical entry gate at \
-             build_gated_attn_layer, but got error message naming a \
-             deeper defence-in-depth gate.  Full message: {msg}"
-        );
-        // Names the slot id (operator can identify the offending slot).
-        assert!(
-            msg.contains("slot_id=1"),
-            "B4a-cont.1 M2: error message must name the requested slot id \
-             (slot_id=1).  Full message: {msg}"
-        );
-        // Cites the future-iter pin (B4a-TQ) per ADR-040 §7 fail-loud mantra.
-        assert!(
-            msg.contains("B4a-TQ"),
-            "B4a-cont.1 M2: error message must cite the deferred Phase \
-             B4a-TQ iter so operators know which kernel work unblocks \
-             multi-slot TQ.  Full message: {msg}"
-        );
     }
 
     // ──────────────────────────────────────────────────────────────────

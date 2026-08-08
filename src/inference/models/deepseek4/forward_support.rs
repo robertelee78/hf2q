@@ -11,9 +11,7 @@ use mlx_native::ops::quantized_matmul_ggml::{
     quantized_matmul_ggml_batched_mv, GgmlBatchedQuantizedMatmulInputStrides,
     GgmlBatchedQuantizedMatmulParams, GgmlQuantizedMatmulParams, GgmlType, MM_ROUTING_THRESHOLD,
 };
-use mlx_native::ops::quantized_matmul_id_ggml::{
-    GgmlQuantizedMatmulIdParams, IdMmScratch,
-};
+use mlx_native::ops::quantized_matmul_id_ggml::{GgmlQuantizedMatmulIdParams, IdMmScratch};
 use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
 
@@ -75,7 +73,10 @@ pub(super) fn end_prefill_submission_inputs() {
         "DeepSeek-V4 prefill submission inputs must end between layer cycles"
     );
     PREFILL_SUBMISSION_INPUTS_ACTIVE.with(|active| {
-        debug_assert!(active.get(), "inactive DeepSeek-V4 prefill input submission");
+        debug_assert!(
+            active.get(),
+            "inactive DeepSeek-V4 prefill input submission"
+        );
         active.set(false);
     });
     PREFILL_SUBMISSION_INPUT_POOL.with(|pool| pool.borrow_mut().reset());
@@ -412,8 +413,7 @@ pub(super) fn grouped_output_a(
             weight.buffer,
             output,
             &GgmlBatchedQuantizedMatmulParams {
-                batch: u32::try_from(groups)
-                    .context("DeepSeek-V4 output-A groups exceed u32")?,
+                batch: u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
                 m: 1,
                 n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
                 k: u32::try_from(group_width)
@@ -694,17 +694,16 @@ pub(super) fn expert_matmul(
         ggml_type: weight.ggml_type,
     };
     match (route, scratch) {
-        (ExpertMatmulRoute::Auto, Some(scratch)) => session
-            .quantized_matmul_id_ggml_pooled(
-                registry,
-                device,
-                input,
-                weight.buffer,
-                safe_ids,
-                output,
-                scratch,
-                &params,
-            ),
+        (ExpertMatmulRoute::Auto, Some(scratch)) => session.quantized_matmul_id_ggml_pooled(
+            registry,
+            device,
+            input,
+            weight.buffer,
+            safe_ids,
+            output,
+            scratch,
+            &params,
+        ),
         (ExpertMatmulRoute::Auto, None) => session.quantized_matmul_id_ggml(
             registry,
             device,

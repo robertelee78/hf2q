@@ -171,19 +171,20 @@ impl ApiError {
         e
     }
 
-    /// **ADR-040 §3.5 iter-A5** — per-slot KV budget exceeded (HTTP 429
+    /// **ADR-040 full-context slots** — shared physical KV budget exceeded
+    /// (HTTP 429
     /// + `Retry-After: 1`).
     ///
     /// Fires when the scheduler's
     /// [`crate::serve::scheduler::AdmitError::SlotBudgetExceeded`]
     /// rejects an admit because the request's
-    /// `AdmitRequest::kv_bytes_needed` exceeds the per-slot KV byte
-    /// budget (`kv_cache_budget_bytes / max_slots`).  Distinct from
+    /// `AdmitRequest::kv_bytes_needed`, together with retained idle-slot
+    /// high-water, exceeds the shared KV byte budget. The logical context
+    /// advertised by each slot is never divided by `max_slots`. Distinct from
     /// [`Self::queue_full`] (transient — capacity will free as
     /// in-flight requests complete) because this is operator-actionable
-    /// on the REQUEST: a single request asks for more KV than any
-    /// single slot can hold; reducing `max_tokens` or shortening the
-    /// prompt is the fix.
+    /// on physical residency: another retained slot may need to finish or be
+    /// recycled, or the operator may raise the shared budget.
     ///
     /// The wire-level shape mirrors `queue_full` (429 + Retry-After: 1)
     /// per ADR-040 §3.5 ("per-slot OOM returns 429 to the admitting
@@ -202,11 +203,11 @@ impl ApiError {
         let mut e = Self::bare(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
-                "Per-slot KV cache budget exceeded for this request \
-                 (needed_bytes={}, budget_bytes={}). Reduce `max_tokens` \
-                 or send a shorter prompt; the per-slot KV budget is \
-                 derived from `kv_cache_budget_bytes / max_slots` \
-                 (ADR-040 §3.5).",
+                "Shared physical KV cache budget exceeded \
+                 (needed_bytes={}, budget_bytes={}). Each agent slot still \
+                 has the model's full logical context; wait for or recycle \
+                 another slot, reduce max_tokens or shorten the prompt, or \
+                 raise `kv_cache_budget_bytes` (ADR-040).",
                 needed_bytes, budget_bytes
             ),
             "server_error",
@@ -2040,7 +2041,7 @@ mod tests {
     /// [`ApiError::capability_unsupported`]. Pins both the status code
     /// + the `code` field + the response shape (status code on the
     /// rendered Response, not just on the struct).
-    /// **ADR-040 §3.5 iter-A5** — the per-slot KV budget exceeded
+    /// **ADR-040 §3.5 iter-A5** — the shared physical KV budget exceeded
     /// helper maps to HTTP 429 + `Retry-After: 1`, mirrors the
     /// `queue_full` wire shape, embeds the needed/budget byte pair in
     /// the body, and surfaces a distinct `slot_budget_exceeded` code

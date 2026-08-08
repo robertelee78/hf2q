@@ -257,17 +257,16 @@ pub enum MultiSeqError {
         /// `0..max_slots`.
         max_slots: u32,
     },
-    /// The per-slot KV budget (ADR-040 §3.5: total
-    /// `kv_cache_budget_bytes` divided equally across slots) cannot
-    /// accommodate the requested append.  Mapped to 429 + Retry-After
-    /// upstream per Decision #19.  `needed_bytes` is the append size
-    /// the caller attempted; `budget_bytes` is the per-slot allotment.
+    /// The shared physical KV budget cannot accommodate the requested
+    /// slot high-water growth. Mapped to 429 + Retry-After upstream per
+    /// Decision #19. `needed_bytes` is the physical high-water requested
+    /// for this full-context slot; `budget_bytes` is the shared ceiling.
     SlotOom {
         /// The slot that ran out of budget.
         slot: SlotId,
         /// Bytes the append would have needed.
         needed_bytes: u64,
-        /// Per-slot budget remaining.
+        /// Shared physical budget ceiling.
         budget_bytes: u64,
     },
     /// The cache was constructed with a [`MultiSeqLayout`] variant that

@@ -639,6 +639,14 @@ pub struct MultiSeqPrefillState {
     /// Per-seq start offset `O_i` into the concatenated T-token stream
     /// (exclusive prefix-sum of `seq_lens`; `O_0 == 0`).
     pub seq_offsets: Vec<usize>,
+    /// Absolute logical position of the first token in each sequence's
+    /// contribution. Cold multi-sequence prefill uses zero for every entry;
+    /// resumed prefill uses the exact cached-prefix length for that slot.
+    pub start_positions: Vec<usize>,
+    /// Physical KV slot selected by each sequence. This is redundant with
+    /// `slot_views_hybrid` for writes, but is required by mlx-native's
+    /// batched hybrid-attention kernel when it reads the full shared slab.
+    pub slot_ids: Vec<crate::serve::multi_seq_kv::SlotId>,
     /// Per-seq × per-layer hybrid-KV slot-views. Outer index = sequence,
     /// inner index = layer. Each `HybridKvBuffers` is a `slice_view` bundle
     /// sharing the `multi_seq_kv_hybrid` scaffold's Metal buffers at that
@@ -646,9 +654,28 @@ pub struct MultiSeqPrefillState {
     /// in the slot's scaffold region. Built by the wrapper via
     /// `build_slot_view_hybrid` (the iter-G(b) slot-view primitive, per-seq).
     pub slot_views_hybrid: Vec<Vec<HybridKvBuffers>>,
+    /// Per-layer views over the complete multi-slot hybrid scaffold. Used
+    /// only by resumed multi-sequence attention; per-query `slot_ids` select
+    /// an isolated slot region inside these shared buffers.
+    pub full_views_hybrid: Vec<HybridKvBuffers>,
     /// Filled by the head delta: each seq's first decoded (greedy argmax)
     /// token. Length `== seq_lens.len()` on return. Empty until the head runs.
     pub out_first_tokens: Vec<u32>,
+    /// Final post-softcap logits for every sequence head row. These are kept
+    /// separate because tool grammars, logit bias, logprobs, and probabilistic
+    /// sampling must be applied independently per request after the shared
+    /// transformer-body pass. Returning only argmax tokens would silently
+    /// weaken native tool semantics for batched agent requests.
+    pub out_logits: Vec<Vec<f32>>,
+}
+
+/// Per-request head output from one shared multi-sequence Gemma prefill.
+/// `first_tokens[i]` is the exact GPU argmax of `logits[i]`; callers may use
+/// the logits instead when request-local sampling or grammar constraints are
+/// active.
+pub struct MultiSeqPrefillOutput {
+    pub first_tokens: Vec<u32>,
+    pub logits: Vec<Vec<f32>>,
 }
 // ADR-031 Phase B foundation — compile-time Send+Sync assertion.
 //

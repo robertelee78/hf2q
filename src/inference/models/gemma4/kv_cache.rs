@@ -221,6 +221,30 @@ pub struct MultiSeqHbKvBuffers {
     pub seq_lens: Vec<u32>,
 }
 
+/// Allocate persistent multi-slot KV storage without committing every page of
+/// a full-context logical stride at server startup.
+///
+/// Sliding-window rings stay on the ordinary zeroed, residency-managed path:
+/// they are small and may wrap over previously written positions. Full
+/// attention is cursor-masked; every position below the cursor is written
+/// before attention can read it, so untouched tail pages are not observable.
+fn alloc_multi_seq_kv_storage(
+    dev: &MlxDevice,
+    byte_len: usize,
+    dtype: DType,
+    shape: Vec<usize>,
+    is_ring: bool,
+) -> mlx_native::Result<MlxBuffer> {
+    if is_ring {
+        dev.alloc_buffer(byte_len, dtype, shape)
+    } else {
+        // SAFETY: every full-attention reader is bounded by the per-slot
+        // cursor, which advances only after the producer writes that position.
+        // Reset paths lower the cursor and never expose the unwritten tail.
+        unsafe { dev.alloc_buffer_for_overwrite(byte_len, dtype, shape) }
+    }
+}
+
 /// ADR-040 Phase A3a iter-3 — unified [`MultiSeqHbKvBuffers`] allocator.
 ///
 /// **Why this helper exists** (dossier H8):
@@ -291,34 +315,16 @@ pub fn alloc_hb_kv_for_layer(
     let norms_bytes = norms_elems * std::mem::size_of::<f32>();
     let norms_shape = vec![n, nkv, cap, norms_per_pos];
 
-    let mut k_packed = dev
-        .alloc_buffer(packed_bytes, DType::U8, packed_shape.clone())
-        .map_err(|e| anyhow!("hb_kv L{layer_idx} K packed: {e}"))?;
-    let mut k_norms = dev
-        .alloc_buffer(norms_bytes, DType::F32, norms_shape.clone())
-        .map_err(|e| anyhow!("hb_kv L{layer_idx} K norms: {e}"))?;
-    let mut v_packed = dev
-        .alloc_buffer(packed_bytes, DType::U8, packed_shape)
+    let k_packed =
+        alloc_multi_seq_kv_storage(dev, packed_bytes, DType::U8, packed_shape.clone(), is_ring)
+            .map_err(|e| anyhow!("hb_kv L{layer_idx} K packed: {e}"))?;
+    let k_norms =
+        alloc_multi_seq_kv_storage(dev, norms_bytes, DType::F32, norms_shape.clone(), is_ring)
+            .map_err(|e| anyhow!("hb_kv L{layer_idx} K norms: {e}"))?;
+    let v_packed = alloc_multi_seq_kv_storage(dev, packed_bytes, DType::U8, packed_shape, is_ring)
         .map_err(|e| anyhow!("hb_kv L{layer_idx} V packed: {e}"))?;
-    let mut v_norms = dev
-        .alloc_buffer(norms_bytes, DType::F32, norms_shape)
+    let v_norms = alloc_multi_seq_kv_storage(dev, norms_bytes, DType::F32, norms_shape, is_ring)
         .map_err(|e| anyhow!("hb_kv L{layer_idx} V norms: {e}"))?;
-
-    // Zero-init mirrors `alloc_tq_full_attn_buffers` discipline
-    // (Qwen35 `kv_cache.rs:2460-2471`): defend against StorageModeShared
-    // returning recycled non-zero memory (ADR-015 iter61a).
-    if let Ok(s) = k_packed.as_mut_slice::<u8>() {
-        s.fill(0);
-    }
-    if let Ok(s) = v_packed.as_mut_slice::<u8>() {
-        s.fill(0);
-    }
-    if let Ok(s) = k_norms.as_mut_slice::<f32>() {
-        s.fill(0.0);
-    }
-    if let Ok(s) = v_norms.as_mut_slice::<f32>() {
-        s.fill(0.0);
-    }
 
     Ok(MultiSeqHbKvBuffers {
         n_seqs,
@@ -374,31 +380,28 @@ pub fn layer_type_to_alloc_params(
 /// ADR-040 Phase F `iter-F-kvcap` — per-slot (continuous-batching) variant of
 /// [`layer_type_to_alloc_params`].
 ///
-/// The multi-seq (`SlotAware`) KV scaffold allocates a `max_slots × capacity`
-/// buffer per layer, so the **full-attention** layers' per-slot `capacity`
-/// must be the per-slot context budget, not the model's whole
-/// `max_position_embeddings`. This mirrors the llama.cpp `-c` (total context)
-/// ÷ `-np` (parallel slots) convention: each of `max_slots` slots gets
-/// `max_position_embeddings / max_slots` of full-attention context, so the
-/// total full-attention KV is ≈ one full-context sequence regardless of
-/// `max_slots` (constant, not linear in N) and the operator request "N slots ×
-/// (max/N) ctx" is literal.
+/// The multi-seq (`SlotAware`) KV scaffold reserves a `max_slots × capacity`
+/// virtual buffer per layer. Every slot receives the model's complete logical
+/// context capacity. Untouched full-attention pages are left uncommitted by
+/// [`alloc_multi_seq_kv_storage`], so logical addressability no longer implies
+/// eager physical residency. Aggregate physical KV use is governed by the
+/// serving admission policy, not by silently shrinking each slot.
+///
+/// Full-attention storage carries one non-addressable guard position beyond
+/// the model context. On the M5 Max, Gemma's production shape at exactly
+/// 262,144 positions makes each F16 K layer exactly 1 GiB; the slot-aware
+/// Metal path produced divergent decode while otherwise identical capacities
+/// 32K, 64K, 128K, 262,143, and 262,145 were coherent. Padding the physical
+/// head stride by one position removes that exact-power boundary without
+/// changing the advertised context or admitting token 262,145. This is storage
+/// padding, not extra logical context.
 ///
 /// **Sliding layers are unchanged** — they are ring buffers capped at
 /// `sliding_window` (already per-slot-independent and small); dividing them
 /// would corrupt the ring-window semantics.
 ///
-/// **`max_slots == 1` is identity** — `max/1 == max`, so the single-slot
-/// multi-seq path and (by construction) the single-seq `SerialFifo` path that
-/// routes through [`layer_type_to_alloc_params`] keep the full context: this
-/// change is a no-op for N=1 and only splits the budget when N>1.
-///
-/// Full-attention layers are linear (`is_ring=false`), so `capacity` is only
-/// the buffer/stride size — never part of the attention arithmetic (which sums
-/// over positions `0..seq_len`). Shrinking it therefore changes only how much
-/// context a slot can hold, not the values computed for a sequence that fits;
-/// this is what keeps the slot-aware decode byte-identical to a serial
-/// reference whose full-attention buffer is sized differently.
+/// `max_slots` is retained in the signature because it remains part of the
+/// allocation-policy call site, but it does not alter logical capacity.
 pub fn layer_type_to_alloc_params_per_slot(
     layer_type: crate::serve::config::LayerType,
     sliding_window: usize,
@@ -408,7 +411,10 @@ pub fn layer_type_to_alloc_params_per_slot(
     use crate::serve::config::LayerType;
     match layer_type {
         LayerType::Sliding => (true, sliding_window),
-        LayerType::Full => (false, max_position_embeddings.div_ceil(max_slots.max(1))),
+        LayerType::Full => {
+            let _ = max_slots;
+            (false, max_position_embeddings.saturating_add(1))
+        }
     }
 }
 
@@ -644,6 +650,55 @@ fn gemma4_copy_buffer_slot_region(
         .map_err(|e| anyhow!("fork_seq: as_mut_slice<u8>: {e}"))?;
     let src_off = src_idx * per_slot_bytes;
     bytes.copy_within(src_off..src_off + per_slot_bytes, dst_idx * per_slot_bytes);
+    Ok(())
+}
+
+/// Copy only cursor-visible rows between overwrite-backed non-ring slots.
+/// Buffer shape is `[n_seqs, heads, capacity, inner]` or
+/// `[n_seqs, heads, capacity]`; each head's live prefix is contiguous but
+/// heads are separated by the full capacity stride.
+fn gemma4_copy_buffer_slot_prefix(
+    buf: &mut MlxBuffer,
+    src_idx: usize,
+    dst_idx: usize,
+    n_seqs: usize,
+    live_tokens: usize,
+) -> Result<()> {
+    let shape = buf.shape().to_vec();
+    anyhow::ensure!(
+        matches!(shape.len(), 3 | 4) && shape[0] == n_seqs,
+        "Gemma fork prefix expected [n_seqs, heads, capacity, ...], got {:?}",
+        shape
+    );
+    anyhow::ensure!(
+        src_idx < n_seqs && dst_idx < n_seqs && live_tokens <= shape[2],
+        "Gemma fork prefix outside allocation: src={src_idx} dst={dst_idx} live_tokens={live_tokens} n_seqs={n_seqs} capacity={}",
+        shape[2]
+    );
+    if live_tokens == 0 {
+        return Ok(());
+    }
+    let inner_elements = shape.get(3).copied().unwrap_or(1);
+    let bytes_per_position = inner_elements
+        .checked_mul(buf.dtype().size_of())
+        .ok_or_else(|| anyhow!("Gemma fork prefix byte extent overflow"))?;
+    let head_stride = shape[2]
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("Gemma fork prefix head stride overflow"))?;
+    let slot_stride = shape[1]
+        .checked_mul(head_stride)
+        .ok_or_else(|| anyhow!("Gemma fork prefix slot stride overflow"))?;
+    let copy_bytes = live_tokens
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("Gemma fork prefix copy extent overflow"))?;
+    let bytes = buf
+        .as_mut_slice::<u8>()
+        .map_err(|error| anyhow!("Gemma fork prefix as_mut_slice<u8>: {error}"))?;
+    for head in 0..shape[1] {
+        let src_start = src_idx * slot_stride + head * head_stride;
+        let dst_start = dst_idx * slot_stride + head * head_stride;
+        bytes.copy_within(src_start..src_start + copy_bytes, dst_start);
+    }
     Ok(())
 }
 
@@ -1119,6 +1174,277 @@ pub struct MultiSeqHybridKvBuffers {
     pub seq_lens: Vec<u32>,
 }
 
+/// Prompt-boundary checkpoint for one Gemma agent slot.
+///
+/// Full-attention rows are append-only, so decoding after the prompt cannot
+/// alter them. Sliding layers are rings: decode overwrites prompt rows after
+/// wrap, so an exact retry with different generation policy must restore the
+/// small fixed-size ring. This checkpoint therefore scales with
+/// `sliding_window`, not with the model's 262K logical context.
+pub struct GemmaHybridSlotAnchor {
+    prompt_len: usize,
+    layers: Vec<Option<GemmaHybridSlidingLayerAnchor>>,
+}
+
+struct GemmaHybridSlidingLayerAnchor {
+    k: Vec<u8>,
+    v_packed: Vec<u8>,
+    v_norms: Option<Vec<u8>>,
+    bf16_xlen_k: Option<Vec<u8>>,
+    bf16_xlen_v: Option<Vec<u8>>,
+}
+
+impl GemmaHybridSlotAnchor {
+    pub fn prompt_len(&self) -> usize {
+        self.prompt_len
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|layer| {
+                layer.k.len()
+                    + layer.v_packed.len()
+                    + layer.v_norms.as_ref().map_or(0, Vec::len)
+                    + layer.bf16_xlen_k.as_ref().map_or(0, Vec::len)
+                    + layer.bf16_xlen_v.as_ref().map_or(0, Vec::len)
+            })
+            .sum()
+    }
+}
+
+fn gemma4_copy_slot_region_out(
+    buf: &MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "{name}: slot {slot_idx} outside {n_seqs}"
+    );
+    let bytes = buf
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("{name}: as_slice<u8>: {e}"))?;
+    anyhow::ensure!(
+        bytes.len() % n_seqs == 0,
+        "{name}: byte length {} not divisible by n_seqs={n_seqs}",
+        bytes.len()
+    );
+    let per_slot = bytes.len() / n_seqs;
+    let start = slot_idx * per_slot;
+    Ok(bytes[start..start + per_slot].to_vec())
+}
+
+fn gemma4_copy_slot_region_in(
+    src: &[u8],
+    dst: &mut MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) -> Result<()> {
+    anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "{name}: slot {slot_idx} outside {n_seqs}"
+    );
+    let bytes = dst
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("{name}: as_mut_slice<u8>: {e}"))?;
+    anyhow::ensure!(
+        bytes.len() % n_seqs == 0,
+        "{name}: byte length {} not divisible by n_seqs={n_seqs}",
+        bytes.len()
+    );
+    let per_slot = bytes.len() / n_seqs;
+    anyhow::ensure!(
+        src.len() == per_slot,
+        "{name}: checkpoint bytes {} != slot bytes {per_slot}",
+        src.len()
+    );
+    let start = slot_idx * per_slot;
+    bytes[start..start + per_slot].copy_from_slice(src);
+    Ok(())
+}
+
+/// Capture one slot immediately after prompt prefill and before decode.
+pub fn snapshot_gemma_hybrid_slot_anchor(
+    scaffold: &[MultiSeqHybridKvBuffers],
+    slot: crate::serve::multi_seq_kv::SlotId,
+    prompt_len: usize,
+) -> Result<GemmaHybridSlotAnchor> {
+    anyhow::ensure!(
+        prompt_len > 0,
+        "Gemma slot anchor requires a non-empty prompt"
+    );
+    let mut layers = Vec::with_capacity(scaffold.len());
+    for (layer_idx, buf) in scaffold.iter().enumerate() {
+        let slot_idx = slot.0 as usize;
+        let n_seqs = buf.n_seqs as usize;
+        anyhow::ensure!(
+            slot_idx < n_seqs,
+            "Gemma slot anchor L{layer_idx}: slot {} outside n_seqs={n_seqs}",
+            slot.0
+        );
+        if !buf.is_sliding {
+            layers.push(None);
+            continue;
+        }
+        let k = gemma4_copy_slot_region_out(
+            &buf.k,
+            slot_idx,
+            n_seqs,
+            &format!("Gemma slot anchor L{layer_idx} K"),
+        )?;
+        let v_packed = gemma4_copy_slot_region_out(
+            &buf.v_packed,
+            slot_idx,
+            n_seqs,
+            &format!("Gemma slot anchor L{layer_idx} V"),
+        )?;
+        let v_norms = if buf.v_norms.byte_len() == 4 {
+            None
+        } else {
+            Some(gemma4_copy_slot_region_out(
+                &buf.v_norms,
+                slot_idx,
+                n_seqs,
+                &format!("Gemma slot anchor L{layer_idx} V norms"),
+            )?)
+        };
+        let bf16_xlen_k = buf
+            .bf16_xlen_k
+            .as_ref()
+            .map(|buffer| {
+                gemma4_copy_slot_region_out(
+                    buffer,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor L{layer_idx} xlen K"),
+                )
+            })
+            .transpose()?;
+        let bf16_xlen_v = buf
+            .bf16_xlen_v
+            .as_ref()
+            .map(|buffer| {
+                gemma4_copy_slot_region_out(
+                    buffer,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor L{layer_idx} xlen V"),
+                )
+            })
+            .transpose()?;
+        layers.push(Some(GemmaHybridSlidingLayerAnchor {
+            k,
+            v_packed,
+            v_norms,
+            bf16_xlen_k,
+            bf16_xlen_v,
+        }));
+    }
+    Ok(GemmaHybridSlotAnchor { prompt_len, layers })
+}
+
+/// Restore one idle slot to a captured prompt boundary.
+pub fn restore_gemma_hybrid_slot_anchor(
+    scaffold: &mut [MultiSeqHybridKvBuffers],
+    slot: crate::serve::multi_seq_kv::SlotId,
+    anchor: &GemmaHybridSlotAnchor,
+    resume_len: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        resume_len <= anchor.prompt_len,
+        "Gemma slot anchor resume length {resume_len} exceeds checkpoint {}",
+        anchor.prompt_len
+    );
+    anyhow::ensure!(
+        scaffold.len() == anchor.layers.len(),
+        "Gemma slot anchor layer count mismatch: live={} saved={}",
+        scaffold.len(),
+        anchor.layers.len()
+    );
+    for (layer_idx, (buf, saved)) in scaffold.iter_mut().zip(&anchor.layers).enumerate() {
+        let slot_idx = slot.0 as usize;
+        let n_seqs = buf.n_seqs as usize;
+        anyhow::ensure!(
+            slot_idx < n_seqs,
+            "Gemma slot anchor restore L{layer_idx}: slot {} outside n_seqs={n_seqs}",
+            slot.0
+        );
+        match (buf.is_sliding, saved) {
+            (false, None) => {}
+            (true, Some(saved)) => {
+                gemma4_copy_slot_region_in(
+                    &saved.k,
+                    &mut buf.k,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor restore L{layer_idx} K"),
+                )?;
+                gemma4_copy_slot_region_in(
+                    &saved.v_packed,
+                    &mut buf.v_packed,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor restore L{layer_idx} V"),
+                )?;
+                match (&saved.v_norms, buf.v_norms.byte_len() == 4) {
+                    (Some(bytes), false) => gemma4_copy_slot_region_in(
+                        bytes,
+                        &mut buf.v_norms,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} V norms"),
+                    )?,
+                    (None, true) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: V-norm layout changed"
+                    ),
+                }
+                match (&saved.bf16_xlen_k, buf.bf16_xlen_k.as_mut()) {
+                    (Some(bytes), Some(dst)) => gemma4_copy_slot_region_in(
+                        bytes,
+                        dst,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} xlen K"),
+                    )?,
+                    (None, None) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: xlen K layout changed"
+                    ),
+                }
+                match (&saved.bf16_xlen_v, buf.bf16_xlen_v.as_mut()) {
+                    (Some(bytes), Some(dst)) => gemma4_copy_slot_region_in(
+                        bytes,
+                        dst,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} xlen V"),
+                    )?,
+                    (None, None) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: xlen V layout changed"
+                    ),
+                }
+            }
+            _ => {
+                anyhow::bail!("Gemma slot anchor restore L{layer_idx}: sliding/full layout changed")
+            }
+        }
+        // A later native chat turn can rewrite the prompt's trailing
+        // generation cue.  The restored ring is still exact through the LCP;
+        // rewind the logical cursor so suffix prefill overwrites the changed
+        // cue instead of treating checkpoint-tail rows as live future KV.
+        buf.seq_lens[slot_idx] = resume_len.min(u32::MAX as usize) as u32;
+    }
+    Ok(())
+}
+
 impl crate::serve::kv_persist::lcp_registry::ByteSized for MultiSeqHybridKvBuffers {
     /// Exact byte count: F16/F32 K + (U8|F16) V + (F32|dummy) V-norms +
     /// optional BF16 xlen K + optional BF16 xlen V.  Used by the
@@ -1186,8 +1512,7 @@ pub fn alloc_multi_seq_hybrid_kv_for_layer(
     // `MlxBuffer::slice_view`.
     let k_elems = n * nkv * cap * hd;
     let k_bytes = k_elems * 2;
-    let k = dev
-        .alloc_buffer(k_bytes, DType::F16, vec![n, nkv, cap, hd])
+    let k = alloc_multi_seq_kv_storage(dev, k_bytes, DType::F16, vec![n, nkv, cap, hd], is_ring)
         .map_err(|e| anyhow!("multi-seq hybrid F16 K L{layer_idx}: {e}"))?;
 
     // V: honour `HF2Q_FULL_F16_KV` exactly like the legacy allocator
@@ -1202,9 +1527,9 @@ pub fn alloc_multi_seq_hybrid_kv_for_layer(
     let (v_packed, v_norms) = if full_f16_v {
         let v_elems = n * nkv * cap * hd;
         let v_bytes = v_elems * 2;
-        let v_f16 = dev
-            .alloc_buffer(v_bytes, DType::F16, vec![n, nkv, cap, hd])
-            .map_err(|e| anyhow!("multi-seq hybrid F16 V L{layer_idx}: {e}"))?;
+        let v_f16 =
+            alloc_multi_seq_kv_storage(dev, v_bytes, DType::F16, vec![n, nkv, cap, hd], is_ring)
+                .map_err(|e| anyhow!("multi-seq hybrid F16 V L{layer_idx}: {e}"))?;
         // Dummy norms buffer — same 4-byte shape as the legacy
         // allocator emits when full_f16_v is set; kernel's
         // v_is_f16 function constant skips the read entirely.  The
@@ -1218,14 +1543,24 @@ pub fn alloc_multi_seq_hybrid_kv_for_layer(
     } else {
         let v_packed_elems = n * nkv * cap * hd;
         let v_packed_bytes = v_packed_elems; // U8 = 1 byte/elem
-        let v_p = dev
-            .alloc_buffer(v_packed_bytes, DType::U8, vec![n, nkv, cap, hd])
-            .map_err(|e| anyhow!("multi-seq hybrid V packed L{layer_idx}: {e}"))?;
+        let v_p = alloc_multi_seq_kv_storage(
+            dev,
+            v_packed_bytes,
+            DType::U8,
+            vec![n, nkv, cap, hd],
+            is_ring,
+        )
+        .map_err(|e| anyhow!("multi-seq hybrid V packed L{layer_idx}: {e}"))?;
         let v_norms_elems = n * nkv * cap * norms_per_pos;
         let v_norms_bytes = v_norms_elems * std::mem::size_of::<f32>();
-        let v_n = dev
-            .alloc_buffer(v_norms_bytes, DType::F32, vec![n, nkv, cap, norms_per_pos])
-            .map_err(|e| anyhow!("multi-seq hybrid V norms L{layer_idx}: {e}"))?;
+        let v_n = alloc_multi_seq_kv_storage(
+            dev,
+            v_norms_bytes,
+            DType::F32,
+            vec![n, nkv, cap, norms_per_pos],
+            is_ring,
+        )
+        .map_err(|e| anyhow!("multi-seq hybrid V norms L{layer_idx}: {e}"))?;
         (v_p, v_n)
     };
 
@@ -1237,12 +1572,22 @@ pub fn alloc_multi_seq_hybrid_kv_for_layer(
     let (bf16_xlen_k, bf16_xlen_v) = if xlen_mode {
         let xlen_elems = n * nkv * cap * hd;
         let xlen_bytes = xlen_elems * 2;
-        let bk = dev
-            .alloc_buffer(xlen_bytes, DType::BF16, vec![n, nkv, cap, hd])
-            .map_err(|e| anyhow!("multi-seq hybrid bf16 xlen K L{layer_idx}: {e}"))?;
-        let bv = dev
-            .alloc_buffer(xlen_bytes, DType::BF16, vec![n, nkv, cap, hd])
-            .map_err(|e| anyhow!("multi-seq hybrid bf16 xlen V L{layer_idx}: {e}"))?;
+        let bk = alloc_multi_seq_kv_storage(
+            dev,
+            xlen_bytes,
+            DType::BF16,
+            vec![n, nkv, cap, hd],
+            is_ring,
+        )
+        .map_err(|e| anyhow!("multi-seq hybrid bf16 xlen K L{layer_idx}: {e}"))?;
+        let bv = alloc_multi_seq_kv_storage(
+            dev,
+            xlen_bytes,
+            DType::BF16,
+            vec![n, nkv, cap, hd],
+            is_ring,
+        )
+        .map_err(|e| anyhow!("multi-seq hybrid bf16 xlen V L{layer_idx}: {e}"))?;
         (Some(bk), Some(bv))
     } else {
         (None, None)
@@ -1400,14 +1745,17 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs).map_err(|e| {
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: gemma4_leak_static_str(format!(
-                    "fork_seq: MultiSeqHybridKvBuffers k copy failed ({e})"
-                )),
-            }
-        })?;
-        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs).map_err(
+        let live_tokens = self.seq_lens[src_idx] as usize;
+        gemma4_copy_buffer_slot_prefix(&mut self.k, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHybridKvBuffers k copy failed ({e})"
+                    )),
+                },
+            )?;
+        gemma4_copy_buffer_slot_prefix(&mut self.v_packed, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
             |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                 capability: gemma4_leak_static_str(format!(
                     "fork_seq: MultiSeqHybridKvBuffers v_packed copy failed ({e})"
@@ -1419,33 +1767,40 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
         // with byte_len=4 shared across slots).  Detection: byte_len
         // < n_seqs ⇒ structurally cannot be a per-slot buffer.
         if self.v_norms.byte_len() >= n_seqs {
-            gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs).map_err(
-                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+            gemma4_copy_buffer_slot_prefix(
+                &mut self.v_norms,
+                src_idx,
+                dst_idx,
+                n_seqs,
+                live_tokens,
+            )
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                     capability: gemma4_leak_static_str(format!(
                         "fork_seq: MultiSeqHybridKvBuffers v_norms copy failed ({e})"
                     )),
-                },
-            )?;
+                }
+            })?;
         }
         // Optional BF16 xlen K/V (HF2Q_DFLASH_XLEN_SDPA=1 path).  Same
         // n_seqs outermost layout per `alloc_multi_seq_hybrid_kv_for_layer:1019-1031`.
         if let Some(ref mut bk) = self.bf16_xlen_k {
-            gemma4_copy_buffer_slot_region(bk, src_idx, dst_idx, n_seqs).map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+            gemma4_copy_buffer_slot_prefix(bk, src_idx, dst_idx, n_seqs, live_tokens).map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                     capability: gemma4_leak_static_str(format!(
                         "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_k copy failed ({e})"
                     )),
-                }
-            })?;
+                },
+            )?;
         }
         if let Some(ref mut bv) = self.bf16_xlen_v {
-            gemma4_copy_buffer_slot_region(bv, src_idx, dst_idx, n_seqs).map_err(|e| {
-                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+            gemma4_copy_buffer_slot_prefix(bv, src_idx, dst_idx, n_seqs, live_tokens).map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                     capability: gemma4_leak_static_str(format!(
                         "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_v copy failed ({e})"
                     )),
-                }
-            })?;
+                },
+            )?;
         }
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
@@ -1661,8 +2016,7 @@ pub fn alloc_multi_seq_dense_kv_for_layer(
     // contiguous slab Phase B4c can address via `MlxBuffer::slice_view`.
     let k_elems = n * nkv * cap * hd;
     let k_bytes = k_elems * elem_bytes;
-    let k = dev
-        .alloc_buffer(k_bytes, dtype, vec![n, nkv, cap, hd])
+    let k = alloc_multi_seq_kv_storage(dev, k_bytes, dtype, vec![n, nkv, cap, hd], is_ring)
         .map_err(|e| anyhow!("multi-seq dense K L{layer_idx}: {e}"))?;
 
     // Dense V: same shape + dtype as K (ADR-017 Phase E.a iter-3.5a
@@ -1670,8 +2024,7 @@ pub fn alloc_multi_seq_dense_kv_for_layer(
     // dtype).
     let v_elems = n * nkv * cap * hd;
     let v_bytes = v_elems * elem_bytes;
-    let v = dev
-        .alloc_buffer(v_bytes, dtype, vec![n, nkv, cap, hd])
+    let v = alloc_multi_seq_kv_storage(dev, v_bytes, dtype, vec![n, nkv, cap, hd], is_ring)
         .map_err(|e| anyhow!("multi-seq dense V L{layer_idx}: {e}"))?;
 
     Ok(MultiSeqDenseKvBuffers {
@@ -1812,20 +2165,23 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs).map_err(|e| {
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: gemma4_leak_static_str(format!(
-                    "fork_seq: MultiSeqDenseKvBuffers k copy failed ({e})"
-                )),
-            }
-        })?;
-        gemma4_copy_buffer_slot_region(&mut self.v, src_idx, dst_idx, n_seqs).map_err(|e| {
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: gemma4_leak_static_str(format!(
-                    "fork_seq: MultiSeqDenseKvBuffers v copy failed ({e})"
-                )),
-            }
-        })?;
+        let live_tokens = self.seq_lens[src_idx] as usize;
+        gemma4_copy_buffer_slot_prefix(&mut self.k, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqDenseKvBuffers k copy failed ({e})"
+                    )),
+                },
+            )?;
+        gemma4_copy_buffer_slot_prefix(&mut self.v, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqDenseKvBuffers v copy failed ({e})"
+                    )),
+                },
+            )?;
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
         Ok(())
@@ -2066,9 +2422,14 @@ pub fn alloc_multi_seq_mlx_kv_for_layer(
     let hd_half = hd / 2;
     let k_packed_elems = n * nkv * cap * hd_half;
     let k_packed_bytes = k_packed_elems; // U8 = 1 byte/elem.
-    let k_packed = dev
-        .alloc_buffer(k_packed_bytes, DType::U8, vec![n, nkv, cap, hd_half])
-        .map_err(|e| anyhow!("multi-seq MLX K packed L{layer_idx}: {e}"))?;
+    let k_packed = alloc_multi_seq_kv_storage(
+        dev,
+        k_packed_bytes,
+        DType::U8,
+        vec![n, nkv, cap, hd_half],
+        is_ring,
+    )
+    .map_err(|e| anyhow!("multi-seq MLX K packed L{layer_idx}: {e}"))?;
 
     // K norms: shape switches on norms_per_pos per the legacy formula
     // at `gemma4/model.rs:1280-1283`.  Dtype F32 = 4 bytes/elem.
@@ -2079,16 +2440,21 @@ pub fn alloc_multi_seq_mlx_kv_for_layer(
     } else {
         vec![n, nkv, cap, norms_per_pos]
     };
-    let k_norms = dev
-        .alloc_buffer(k_norms_bytes, DType::F32, k_norms_shape)
-        .map_err(|e| anyhow!("multi-seq MLX K norms L{layer_idx}: {e}"))?;
+    let k_norms =
+        alloc_multi_seq_kv_storage(dev, k_norms_bytes, DType::F32, k_norms_shape, is_ring)
+            .map_err(|e| anyhow!("multi-seq MLX K norms L{layer_idx}: {e}"))?;
 
     // V packed: same shape + dtype as K packed.
     let v_packed_elems = n * nkv * cap * hd_half;
     let v_packed_bytes = v_packed_elems;
-    let v_packed = dev
-        .alloc_buffer(v_packed_bytes, DType::U8, vec![n, nkv, cap, hd_half])
-        .map_err(|e| anyhow!("multi-seq MLX V packed L{layer_idx}: {e}"))?;
+    let v_packed = alloc_multi_seq_kv_storage(
+        dev,
+        v_packed_bytes,
+        DType::U8,
+        vec![n, nkv, cap, hd_half],
+        is_ring,
+    )
+    .map_err(|e| anyhow!("multi-seq MLX V packed L{layer_idx}: {e}"))?;
 
     // V norms: same shape + dtype as K norms.
     let v_norms_elems = n * nkv * cap * norms_per_pos;
@@ -2098,9 +2464,9 @@ pub fn alloc_multi_seq_mlx_kv_for_layer(
     } else {
         vec![n, nkv, cap, norms_per_pos]
     };
-    let v_norms = dev
-        .alloc_buffer(v_norms_bytes, DType::F32, v_norms_shape)
-        .map_err(|e| anyhow!("multi-seq MLX V norms L{layer_idx}: {e}"))?;
+    let v_norms =
+        alloc_multi_seq_kv_storage(dev, v_norms_bytes, DType::F32, v_norms_shape, is_ring)
+            .map_err(|e| anyhow!("multi-seq MLX V norms L{layer_idx}: {e}"))?;
 
     Ok(MultiSeqMlxKvCache {
         n_seqs,
@@ -2246,34 +2612,39 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
         let src_idx = src.0 as usize;
         let dst_idx = dst.0 as usize;
         let n_seqs = self.n_seqs as usize;
-        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs).map_err(
+        let live_tokens = self.seq_lens[src_idx] as usize;
+        gemma4_copy_buffer_slot_prefix(&mut self.k_packed, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
             |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                 capability: gemma4_leak_static_str(format!(
                     "fork_seq: MultiSeqMlxKvCache k_packed copy failed ({e})"
                 )),
             },
         )?;
-        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs).map_err(
-            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: gemma4_leak_static_str(format!(
-                    "fork_seq: MultiSeqMlxKvCache k_norms copy failed ({e})"
-                )),
-            },
-        )?;
-        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs).map_err(
+        gemma4_copy_buffer_slot_prefix(&mut self.k_norms, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqMlxKvCache k_norms copy failed ({e})"
+                    )),
+                },
+            )?;
+        gemma4_copy_buffer_slot_prefix(&mut self.v_packed, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
             |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
                 capability: gemma4_leak_static_str(format!(
                     "fork_seq: MultiSeqMlxKvCache v_packed copy failed ({e})"
                 )),
             },
         )?;
-        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs).map_err(
-            |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: gemma4_leak_static_str(format!(
-                    "fork_seq: MultiSeqMlxKvCache v_norms copy failed ({e})"
-                )),
-            },
-        )?;
+        gemma4_copy_buffer_slot_prefix(&mut self.v_norms, src_idx, dst_idx, n_seqs, live_tokens)
+            .map_err(
+                |e| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqMlxKvCache v_norms copy failed ({e})"
+                    )),
+                },
+            )?;
         // Cursor copy AFTER buffer copy.
         self.seq_lens[dst_idx] = self.seq_lens[src_idx];
         Ok(())
@@ -3843,15 +4214,14 @@ mod tests {
 
     /// ADR-040 Phase F `iter-F-kvcap` — falsifier for the per-slot allocator
     /// helper [`super::layer_type_to_alloc_params_per_slot`]. Pins the
-    /// continuous-batching mapping (llama.cpp `-c`÷`-np` convention):
+    /// continuous-batching mapping:
     /// - `Sliding` → `(ring=true, sliding_window)` — UNCHANGED vs single-seq
     ///   (ring window is per-slot-independent; must NOT be divided).
-    /// - `Full` → `(ring=false, max_position_embeddings / max_slots)` — the
-    ///   per-slot full-attention budget.
-    /// Also pins the two load-bearing invariants: (a) `max_slots == 1` is
-    /// identity with the single-seq helper (no N=1/SerialFifo regression), and
-    /// (b) total full-attention KV is constant in `max_slots` (`N × max/N ≈
-    /// max`), which is the whole point of the cap.
+    /// - `Full` → `(ring=false, max_position_embeddings + 1)` for every slot;
+    ///   the final physical position is a guard and is never logical context.
+    /// Also pins the load-bearing invariant that adding slots never reduces an
+    /// agent's logical context capacity. Physical residency is accounted by
+    /// high-water usage at admission time.
     #[test]
     fn iter_f_kvcap_per_slot_alloc_params_mapping_pinned() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -3876,30 +4246,9 @@ mod tests {
             );
         }
 
-        // Full splits the budget: max/N per slot (llama.cpp -c ÷ -np).
-        let (is_ring_f8, cap_f8) =
-            super::layer_type_to_alloc_params_per_slot(LayerType::Full, sliding_window, max_pos, 8);
-        assert!(!is_ring_f8, "Full MUST stay linear (is_ring=false)");
-        assert_eq!(
-            cap_f8,
-            max_pos / 8,
-            "Full per-slot capacity at max_slots=8 MUST be max_position_\
-             embeddings/8 = {} (the literal '8×32k')",
-            max_pos / 8
-        );
-
-        // (a) max_slots == 1 is identity with the single-seq helper.
-        let (_, cap_single) =
-            super::layer_type_to_alloc_params(LayerType::Full, sliding_window, max_pos);
-        let (_, cap_n1) =
-            super::layer_type_to_alloc_params_per_slot(LayerType::Full, sliding_window, max_pos, 1);
-        assert_eq!(
-            cap_n1, cap_single,
-            "max_slots=1 MUST be identity with the single-seq helper \
-             (no N=1 / SerialFifo regression): got {cap_n1} vs {cap_single}"
-        );
-
-        // (b) total full-attention KV is constant in max_slots (N × max/N ≈ max).
+        // Full logical capacity is independent of the number of slots. The
+        // slot-aware storage stride has one guard position beyond it.
+        let expected_storage_capacity = max_pos + 1;
         for &n in &[1usize, 2, 4, 8] {
             let (_, per_slot) = super::layer_type_to_alloc_params_per_slot(
                 LayerType::Full,
@@ -3907,11 +4256,11 @@ mod tests {
                 max_pos,
                 n,
             );
-            let total = per_slot * n;
-            assert!(
-                total >= max_pos && total < max_pos + n,
-                "total Full KV (per_slot {per_slot} × {n} slots = {total}) MUST \
-                 stay ≈ one full context ({max_pos}), not grow linearly in N"
+            assert_eq!(
+                per_slot, expected_storage_capacity,
+                "slot count must not shrink logical Full KV capacity or remove \
+                 its physical guard: max_slots={n}, got {per_slot}, \
+                 expected {expected_storage_capacity}"
             );
         }
     }
@@ -4214,6 +4563,18 @@ mod tests {
             "H12 fixture sanity: V norms total = 2 * slot_vn_bytes"
         );
 
+        // Overwrite-backed non-ring tails are not initialized by allocation.
+        // Seed the peer slot before observing it so isolation is explicit.
+        cache.k.as_mut_slice::<u8>().expect("seed K peer")[slot_k_bytes..2 * slot_k_bytes]
+            .fill(0xA7);
+        cache.v_packed.as_mut_slice::<u8>().expect("seed V peer")[slot_v_bytes..2 * slot_v_bytes]
+            .fill(0xB8);
+        cache
+            .v_norms
+            .as_mut_slice::<f32>()
+            .expect("seed norms peer")[(nkv * cap)..2 * (nkv * cap)]
+            .fill(42.25);
+
         // Write deterministic non-zero pattern into slot 0's K
         // (interpret as u8 bytes for fixture simplicity — the kernel
         // writes F16 but byte-level isolation is what we're pinning).
@@ -4253,18 +4614,18 @@ mod tests {
             [(nkv * cap * 1)..2 * (nkv * cap * 1)]
             .to_vec();
 
-        // Sanity: slot 1 is zero-init.
+        // Sanity: slot 1 contains the explicit sentinel.
         assert!(
-            k_slot1_before.iter().all(|&b| b == 0),
-            "H12 fixture sanity: slot 1 K zero-init"
+            k_slot1_before.iter().all(|&b| b == 0xA7),
+            "H12 fixture sanity: slot 1 K sentinel"
         );
         assert!(
-            v_slot1_before.iter().all(|&b| b == 0),
-            "H12 fixture sanity: slot 1 V packed zero-init"
+            v_slot1_before.iter().all(|&b| b == 0xB8),
+            "H12 fixture sanity: slot 1 V packed sentinel"
         );
         assert!(
-            vn_slot1_before.iter().all(|&f| f == 0.0),
-            "H12 fixture sanity: slot 1 V norms zero-init"
+            vn_slot1_before.iter().all(|&f| f == 42.25),
+            "H12 fixture sanity: slot 1 V norms sentinel"
         );
 
         // A3b iter-1 cursor advance on slot 0 (no buffer mutation).
@@ -5175,6 +5536,11 @@ mod tests {
         assert_eq!(cache.k.byte_len(), 2 * slot_k_bytes, "H147: K total");
         assert_eq!(cache.v.byte_len(), 2 * slot_v_bytes, "H147: V total");
 
+        cache.k.as_mut_slice::<u8>().expect("seed K peer")[slot_k_bytes..2 * slot_k_bytes]
+            .fill(0xC3);
+        cache.v.as_mut_slice::<u8>().expect("seed V peer")[slot_v_bytes..2 * slot_v_bytes]
+            .fill(0xD4);
+
         // Write deterministic non-zero pattern into slot 0's K + V
         // (interpret as u8 bytes for fixture simplicity; the kernel
         // writes F32 but byte-level isolation is what we're pinning).
@@ -5197,14 +5563,14 @@ mod tests {
         let v_slot1_before: Vec<u8> =
             cache.v.as_slice::<u8>().expect("V read")[slot_v_bytes..2 * slot_v_bytes].to_vec();
 
-        // Sanity: slot 1 is zero-init.
+        // Sanity: slot 1 contains the explicit sentinel.
         assert!(
-            k_slot1_before.iter().all(|&b| b == 0),
-            "H147 fixture sanity: slot 1 K zero-init"
+            k_slot1_before.iter().all(|&b| b == 0xC3),
+            "H147 fixture sanity: slot 1 K sentinel"
         );
         assert!(
-            v_slot1_before.iter().all(|&b| b == 0),
-            "H147 fixture sanity: slot 1 V zero-init"
+            v_slot1_before.iter().all(|&b| b == 0xD4),
+            "H147 fixture sanity: slot 1 V sentinel"
         );
 
         // A3b iter-2 cursor advance on slot 0 (no buffer mutation).
@@ -5929,6 +6295,15 @@ mod tests {
             "H154: v_norms total"
         );
 
+        for (buffer, start, end, sentinel) in [
+            (&mut cache.k_packed, slot_kp_bytes, 2 * slot_kp_bytes, 0x91),
+            (&mut cache.v_packed, slot_vp_bytes, 2 * slot_vp_bytes, 0xA2),
+            (&mut cache.k_norms, slot_kn_bytes, 2 * slot_kn_bytes, 0xB3),
+            (&mut cache.v_norms, slot_vn_bytes, 2 * slot_vn_bytes, 0xC4),
+        ] {
+            buffer.as_mut_slice::<u8>().expect("seed peer slot")[start..end].fill(sentinel);
+        }
+
         // Write deterministic non-zero pattern into slot 0's region
         // for ALL FOUR buffers (interpret as u8 bytes for fixture
         // simplicity; the kernel writes U8 / F32 but byte-level
@@ -5972,22 +6347,22 @@ mod tests {
             [slot_vn_bytes..2 * slot_vn_bytes]
             .to_vec();
 
-        // Sanity: slot 1 is zero-init for every buffer.
+        // Sanity: slot 1 contains the explicit sentinels.
         assert!(
-            kp_slot1_before.iter().all(|&b| b == 0),
-            "H154 sanity: kp slot1 zero"
+            kp_slot1_before.iter().all(|&b| b == 0x91),
+            "H154 sanity: kp slot1 sentinel"
         );
         assert!(
-            vp_slot1_before.iter().all(|&b| b == 0),
-            "H154 sanity: vp slot1 zero"
+            vp_slot1_before.iter().all(|&b| b == 0xA2),
+            "H154 sanity: vp slot1 sentinel"
         );
         assert!(
-            kn_slot1_before.iter().all(|&b| b == 0),
-            "H154 sanity: kn slot1 zero"
+            kn_slot1_before.iter().all(|&b| b == 0xB3),
+            "H154 sanity: kn slot1 sentinel"
         );
         assert!(
-            vn_slot1_before.iter().all(|&b| b == 0),
-            "H154 sanity: vn slot1 zero"
+            vn_slot1_before.iter().all(|&b| b == 0xC4),
+            "H154 sanity: vn slot1 sentinel"
         );
 
         // A3b iter-3 cursor advance on slot 0 (no buffer mutation).
@@ -6488,11 +6863,10 @@ mod tests {
     }
 
     /// **H160** — Gemma 4 `MultiSeqHybridKvBuffers::fork_seq` cross-
-    /// slot copy returns `Ok(())` AND produces byte-identical K (F16)
-    /// + V packed (U8 default) + V norms (F32) regions between src
-    /// and dst (production-default per H10).
+    /// slot copy returns `Ok(())`, copies only cursor-visible K/V rows,
+    /// and leaves the lazy destination tail untouched.
     #[test]
-    fn h160_multi_seq_hybrid_kv_fork_seq_cross_slot_copies_all_buffers() {
+    fn h160_multi_seq_hybrid_kv_fork_seq_copies_only_live_prefix() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() {
             Some(d) => d,
@@ -6535,7 +6909,13 @@ mod tests {
                 *b = (((i * 31) % 251) + 1) as u8;
             }
         }
-        c.append_for_seq(SlotId(1), 9).unwrap();
+        let live = 5usize;
+        for buf in [&mut c.k, &mut c.v_packed, &mut c.v_norms] {
+            let slot_bytes = buf.byte_len() / n_seqs as usize;
+            let dst = 3 * slot_bytes;
+            buf.as_mut_slice::<u8>().unwrap()[dst..dst + slot_bytes].fill(0xa5);
+        }
+        c.append_for_seq(SlotId(1), live as u32).unwrap();
 
         let src_k = c.k.as_slice::<u8>().unwrap()[slot_k_bytes..2 * slot_k_bytes].to_vec();
         let src_vp =
@@ -6545,21 +6925,53 @@ mod tests {
         c.fork_seq(SlotId(1), SlotId(3))
             .expect("H160: fork must succeed post-A3c");
 
-        // dst (slot 3).
+        // dst (slot 3): each head's live prefix is copied, while the lazy
+        // tail remains the destination sentinel rather than being read from
+        // the source allocation.
         let dst_k = c.k.as_slice::<u8>().unwrap()[3 * slot_k_bytes..4 * slot_k_bytes].to_vec();
         let dst_vp =
             c.v_packed.as_slice::<u8>().unwrap()[3 * slot_vp_bytes..4 * slot_vp_bytes].to_vec();
         let dst_vn =
             c.v_norms.as_slice::<u8>().unwrap()[3 * slot_vn_bytes..4 * slot_vn_bytes].to_vec();
-        assert_eq!(src_k, dst_k, "H160 FALSIFIED: k dst != src");
-        assert_eq!(src_vp, dst_vp, "H160 FALSIFIED: v_packed dst != src");
-        assert_eq!(src_vn, dst_vn, "H160 FALSIFIED: v_norms dst != src");
+        for head in 0..nkv {
+            let k_row = hd * 2;
+            let vp_row = hd;
+            let vn_row = 4;
+            let k_base = head * cap * k_row;
+            let vp_base = head * cap * vp_row;
+            let vn_base = head * cap * vn_row;
+            assert_eq!(
+                &dst_k[k_base..k_base + live * k_row],
+                &src_k[k_base..k_base + live * k_row]
+            );
+            assert!(dst_k[k_base + live * k_row..k_base + cap * k_row]
+                .iter()
+                .all(|&b| b == 0xa5));
+            assert_eq!(
+                &dst_vp[vp_base..vp_base + live * vp_row],
+                &src_vp[vp_base..vp_base + live * vp_row]
+            );
+            assert!(dst_vp[vp_base + live * vp_row..vp_base + cap * vp_row]
+                .iter()
+                .all(|&b| b == 0xa5));
+            assert_eq!(
+                &dst_vn[vn_base..vn_base + live * vn_row],
+                &src_vn[vn_base..vn_base + live * vn_row]
+            );
+            assert!(dst_vn[vn_base + live * vn_row..vn_base + cap * vn_row]
+                .iter()
+                .all(|&b| b == 0xa5));
+        }
 
         // Cursor + src invariance.
-        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 9, "H160: cursor copied");
+        assert_eq!(
+            c.seq_len(SlotId(3)).unwrap(),
+            live as u32,
+            "H160: cursor copied"
+        );
         assert_eq!(
             c.seq_len(SlotId(1)).unwrap(),
-            9,
+            live as u32,
             "H160: src cursor unchanged"
         );
         let src_k_after = c.k.as_slice::<u8>().unwrap()[slot_k_bytes..2 * slot_k_bytes].to_vec();
@@ -6567,10 +6979,10 @@ mod tests {
     }
 
     /// **H161** — Gemma 4 `MultiSeqDenseKvBuffers::fork_seq` cross-
-    /// slot copy returns `Ok(())` AND produces byte-identical K + V
-    /// (F32 default) regions between src and dst.
+    /// slot copy returns `Ok(())`, copies only cursor-visible dense K/V
+    /// rows, and preserves the destination's lazy tail.
     #[test]
-    fn h161_multi_seq_dense_kv_fork_seq_cross_slot_copies_all_buffers() {
+    fn h161_multi_seq_dense_kv_fork_seq_copies_only_live_prefix() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() {
             Some(d) => d,
@@ -6603,7 +7015,10 @@ mod tests {
                 *b = (((i * 41) % 253) + 1) as u8;
             }
         }
-        c.append_for_seq(SlotId(2), 3).unwrap();
+        let live = 3usize;
+        c.k.as_mut_slice::<u8>().unwrap()[..slot_k_bytes].fill(0xa6);
+        c.v.as_mut_slice::<u8>().unwrap()[..slot_v_bytes].fill(0xa6);
+        c.append_for_seq(SlotId(2), live as u32).unwrap();
 
         let src_k = c.k.as_slice::<u8>().unwrap()[2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
         let src_v = c.v.as_slice::<u8>().unwrap()[2 * slot_v_bytes..3 * slot_v_bytes].to_vec();
@@ -6613,8 +7028,24 @@ mod tests {
 
         let dst_k = c.k.as_slice::<u8>().unwrap()[..slot_k_bytes].to_vec();
         let dst_v = c.v.as_slice::<u8>().unwrap()[..slot_v_bytes].to_vec();
-        assert_eq!(src_k, dst_k, "H161 FALSIFIED: k dst != src");
-        assert_eq!(src_v, dst_v, "H161 FALSIFIED: v dst != src");
+        for head in 0..nkv {
+            let row = hd * 4;
+            let base = head * cap * row;
+            assert_eq!(
+                &dst_k[base..base + live * row],
+                &src_k[base..base + live * row]
+            );
+            assert!(dst_k[base + live * row..base + cap * row]
+                .iter()
+                .all(|&b| b == 0xa6));
+            assert_eq!(
+                &dst_v[base..base + live * row],
+                &src_v[base..base + live * row]
+            );
+            assert!(dst_v[base + live * row..base + cap * row]
+                .iter()
+                .all(|&b| b == 0xa6));
+        }
 
         assert_eq!(c.seq_len(SlotId(0)).unwrap(), 3, "H161: cursor copied");
         assert_eq!(
@@ -6628,11 +7059,10 @@ mod tests {
     }
 
     /// **H162** — Gemma 4 `MultiSeqMlxKvCache::fork_seq` cross-slot
-    /// copy returns `Ok(())` AND produces byte-identical k_packed /
-    /// k_norms / v_packed / v_norms regions (4-bit nibble-packed
-    /// layout per ADR-007).
+    /// copy returns `Ok(())`, copies cursor-visible packed/norm rows,
+    /// and preserves the destination's lazy tail.
     #[test]
-    fn h162_multi_seq_mlx_kv_fork_seq_cross_slot_copies_all_buffers() {
+    fn h162_multi_seq_mlx_kv_fork_seq_copies_only_live_prefix() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() {
             Some(d) => d,
@@ -6678,7 +7108,18 @@ mod tests {
                 *b = (((i * 59) % 251) + 1) as u8;
             }
         }
-        c.append_for_seq(SlotId(0), 4).unwrap();
+        let live = 3usize;
+        for buf in [
+            &mut c.k_packed,
+            &mut c.v_packed,
+            &mut c.k_norms,
+            &mut c.v_norms,
+        ] {
+            let slot_bytes = buf.byte_len() / n_seqs as usize;
+            let dst = 3 * slot_bytes;
+            buf.as_mut_slice::<u8>().unwrap()[dst..dst + slot_bytes].fill(0xa7);
+        }
+        c.append_for_seq(SlotId(0), live as u32).unwrap();
 
         let src_kp = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
         let src_vp = c.v_packed.as_slice::<u8>().unwrap()[..slot_vp].to_vec();
@@ -6692,15 +7133,57 @@ mod tests {
         let dst_vp = c.v_packed.as_slice::<u8>().unwrap()[3 * slot_vp..4 * slot_vp].to_vec();
         let dst_kn = c.k_norms.as_slice::<u8>().unwrap()[3 * slot_kn..4 * slot_kn].to_vec();
         let dst_vn = c.v_norms.as_slice::<u8>().unwrap()[3 * slot_vn..4 * slot_vn].to_vec();
-        assert_eq!(src_kp, dst_kp, "H162 FALSIFIED: k_packed dst != src");
-        assert_eq!(src_vp, dst_vp, "H162 FALSIFIED: v_packed dst != src");
-        assert_eq!(src_kn, dst_kn, "H162 FALSIFIED: k_norms dst != src");
-        assert_eq!(src_vn, dst_vn, "H162 FALSIFIED: v_norms dst != src");
+        for head in 0..nkv {
+            let packed_row = hd / 2;
+            let norm_row = 4;
+            let packed_base = head * cap * packed_row;
+            let norm_base = head * cap * norm_row;
+            assert_eq!(
+                &dst_kp[packed_base..packed_base + live * packed_row],
+                &src_kp[packed_base..packed_base + live * packed_row]
+            );
+            assert!(
+                dst_kp[packed_base + live * packed_row..packed_base + cap * packed_row]
+                    .iter()
+                    .all(|&b| b == 0xa7)
+            );
+            assert_eq!(
+                &dst_vp[packed_base..packed_base + live * packed_row],
+                &src_vp[packed_base..packed_base + live * packed_row]
+            );
+            assert!(
+                dst_vp[packed_base + live * packed_row..packed_base + cap * packed_row]
+                    .iter()
+                    .all(|&b| b == 0xa7)
+            );
+            assert_eq!(
+                &dst_kn[norm_base..norm_base + live * norm_row],
+                &src_kn[norm_base..norm_base + live * norm_row]
+            );
+            assert!(
+                dst_kn[norm_base + live * norm_row..norm_base + cap * norm_row]
+                    .iter()
+                    .all(|&b| b == 0xa7)
+            );
+            assert_eq!(
+                &dst_vn[norm_base..norm_base + live * norm_row],
+                &src_vn[norm_base..norm_base + live * norm_row]
+            );
+            assert!(
+                dst_vn[norm_base + live * norm_row..norm_base + cap * norm_row]
+                    .iter()
+                    .all(|&b| b == 0xa7)
+            );
+        }
 
-        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 4, "H162: cursor copied");
+        assert_eq!(
+            c.seq_len(SlotId(3)).unwrap(),
+            live as u32,
+            "H162: cursor copied"
+        );
         assert_eq!(
             c.seq_len(SlotId(0)).unwrap(),
-            4,
+            live as u32,
             "H162: src cursor unchanged"
         );
         let src_kp_after = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();

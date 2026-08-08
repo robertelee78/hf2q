@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-08-08
+
+### Added — full-context multi-agent serving
+
+- Slot-aware serving now gives every Gemma 4, Qwen 3.6, and DeepSeek V4
+  agent the model's full logical context. Context is never divided by the
+  number of concurrent slots; weights remain shared while each slot owns
+  independent, demand-grown KV and recurrent state.
+- Shared physical KV admission accounts for retained slot high-water and
+  active worst-case growth. Requests queue or fail explicitly under physical
+  pressure instead of silently shrinking context or overcommitting unified
+  memory.
+- Prefix-affine scheduling keeps each conversation on the slot with its best
+  reusable native cache state. Normal OpenCode turns prefill only the appended
+  suffix, including DeepSeek recovery anchors across cache-capacity growth.
+- Canonical OpenCode launchers now default to four full-context slots and
+  expose the shared KV budget, scheduler, cache reuse, time-to-first-token,
+  prefill rate, and decode rate in verbose operator telemetry.
+
+### Fixed — native agentic semantics across all three families
+
+- Gemma 4 and Qwen 3.6 use their native GGUF chat templates and tool-call
+  encodings; cross-family or incomplete template state fails closed rather
+  than falling through an approximately compatible formatter.
+- Tool definitions, required and automatic calls, source-shaped arguments,
+  tool-result continuations, unary responses, and SSE streams are covered by
+  realistic four-agent gates for Gemma 4, Qwen 3.6, and DeepSeek V4.
+- DeepSeek's four-slot decoder runs bounded eight-token quanta and bounded
+  admission waves, preserving streamed progress without paying a model-state
+  swap on every generated token.
+
+### Performance and proof
+
+- On the target M5 Max with AC power, four concurrent DeepSeek agent requests
+  completed in 49 seconds versus 50.71 seconds for the matched llama.cpp
+  workload, while hf2q retained a 524,288-token logical context per slot and
+  llama.cpp divided its 32,768-token context into four 8,192-token slots.
+- A DeepSeek continuation after 131,072-to-262,144 cache growth reused
+  119,692 of 119,778 prompt tokens (99.92%) and reached the first semantic
+  stream event in 1.132 seconds.
+- Gemma's matched 24,200-token four-slot continuation sustained about
+  1,831 aggregate prefill tokens/s, slightly ahead of the same GGUF and
+  settings under llama.cpp at about 1,733 tokens/s. Qwen's four-slot gate
+  retained the full 262,144-token logical context per agent with native
+  tool-result continuation.
+- `mlx-native` 0.10.4 supplies the family-neutral lazy overwrite allocation,
+  ring linearization, F16 mask construction, and direct TQ-HB-to-F16 staging
+  primitives used by the bounded full-context paths.
+
 ## [0.1.1] — 2026-08-06
 
 ### Added — DeepSeek V4 Flash agentic conversion and serving
