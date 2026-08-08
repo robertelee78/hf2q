@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-08-08
+
+### Fixed — registry archive verification
+
+- Include the small DeepSeek encoding fixtures, quantizer byte-comparison
+  fixtures, and continuous-batching source audit used by crate-local unit
+  tests. The 0.1.2 runtime archive built and installed correctly, but
+  `cargo test` on the downloaded crate could not compile or complete because
+  those inputs were omitted. No runtime or inference behavior changed; 0.1.3
+  replaces the yanked 0.1.2 package.
+
 ## [0.1.2] — 2026-08-08
 
 ### Added — full-context multi-agent serving
