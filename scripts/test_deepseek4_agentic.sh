@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realistic DeepSeek/OpenCode acceptance gate for an already-running hf2q
-# server. It intentionally fails when tool semantics, prefix reuse, TTFT, SSE,
-# or tool-result continuation are not usable for an agentic coding turn.
+# Realistic OpenCode acceptance gate for an already-running hf2q server.
+# The historical filename is retained for compatibility; Gemma and Qwen use
+# family wrappers that bind their own endpoint/model while sharing the same
+# behavioral contract. It intentionally fails when tool semantics, prefix
+# reuse, TTFT, SSE, or tool-result continuation are not agentic-usable.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_URL=${BASE_URL:-http://127.0.0.1:8080}
@@ -60,7 +62,8 @@ cd "$ROOT_DIR"
 
 jq -n --rawfile repo README.md \
   --argjson max_tokens "$MAX_TOKENS" \
-  --arg model "$MODEL" --arg expected_path "$EXPECTED_PATH" --arg run_id "$RUN_ID" '{
+  --arg model "$MODEL" --arg expected_path "$EXPECTED_PATH" --arg run_id "$RUN_ID" \
+  --arg sentinel "$SENTINEL" '{
     model: $model,
     messages: [
       {
@@ -69,7 +72,7 @@ jq -n --rawfile repo README.md \
       },
       {
         role: "user",
-        content: ("Agentic acceptance run " + $run_id + ". Inspect this Rust repository context and read " + $expected_path + " before making any recommendation. The requested manifest is intentionally not embedded; use read_file with exactly that absolute path. Repository context follows:\n\n" + $repo)
+        content: ("Agentic acceptance run " + $run_id + ". Inspect this Rust repository context and read " + $expected_path + " before making any recommendation. The requested manifest is intentionally not embedded; use read_file with exactly that absolute path. After read_file succeeds, reply with exactly " + $sentinel + " and nothing else. Repository context follows:\n\n" + $repo)
       }
     ],
     tools: [{
@@ -280,7 +283,7 @@ if (( stream_semantic_ms > MAX_CACHED_SEMANTIC_MS )); then
 fi
 
 jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
-  --rawfile cargo Cargo.toml --arg sentinel "$SENTINEL" '
+  --rawfile cargo Cargo.toml '
     $base[0]
     | .messages += [
         {
@@ -291,7 +294,7 @@ jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
         {
           role: "tool",
           tool_call_id: $prior[0].choices[0].message.tool_calls[0].id,
-          content: ("Successful read_file result. Cargo.toml follows:\n" + $cargo + "\nReply with exactly this sentinel and nothing else: " + $sentinel)
+          content: ("Successful read_file result. Cargo.toml follows:\n" + $cargo)
         }
       ]
     | .tool_choice = "auto"

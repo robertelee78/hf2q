@@ -4588,3 +4588,67 @@ open.
 This result is not transferable by assertion. Gemma and DeepSeek require the
 same phase decomposition, exact multi-turn coherence gate, cache-count proof,
 and matched peer measurement before their family status changes.
+
+## Gemma live-prefix and Qwen long-prefix revalidation (2026-08-08)
+
+### Gemma: resident state is the primary serial continuation cache
+
+The prior Gemma long-session design depended on a second dense+hybrid LCP
+snapshot. At roughly 97K tokens that duplicate was estimated near 64 GiB, so
+the canonical 8 GiB registry correctly rejected it. The model nevertheless
+left the valid dense and hybrid KV buffers resident after each fifo-serial
+request. Discarding that state and rebuilding the full context was the defect.
+
+`GemmaLoadedModel` now owns a single live-prefix token ledger. The immediately
+following compatible request compares its rendered tokens with that ledger,
+invalidates the ledger before any mutation, and appends only the uncached
+suffix to the existing dense+hybrid buffers. Exact prompt replay rewinds one
+token so logits remain defined. Success commits the new ledger; mismatch,
+capacity failure, cancellation, or inference error leaves no stale claim.
+The snapshot registry remains useful for shorter or branched prefixes and is
+not treated as a fallback implementation for the serial live path.
+
+The suffix path uses bounded 256-query chunks with absolute query positions.
+Each query attends to the already materialized prior KV plus only causal
+in-chunk KV; sliding and global layers preserve their distinct masks. Setup no
+longer allocates square masks for live resume. Dense and hybrid caches reserve
+16,384 tokens of growth headroom, bounded by the serving limit. These are
+hf2q model-state and orchestration changes; no new mlx-native API was needed.
+
+The real Gemma OpenCode gate passed on
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf` (20,576,631,488 bytes, SHA-256
+`82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`):
+required and automatic tools, unary and SSE, exact source-shaped arguments,
+tool results, and deterministic reuse all passed. The cold request contained
+6,784 prompt tokens. Exact repeat reused 6,784, automatic mode reused 6,783,
+and the tool-result continuation reused 6,780. Its 6,042-token appended suffix
+ran at about 908.6 tok/s and returned the exact sentinel. The earlier
+25,187-token linear cold baseline took about 388 seconds (~65 tok/s); the
+launcher no longer advertises the stale ~1,700 tok/s claim. Cold long-prefill
+optimization remains open and is not concealed by the continuation result.
+
+### Qwen: latest-turn checkpoint retained; mid-store hypothesis rejected
+
+Qwen's family-specific latest-turn checkpoint remains the right serial
+agentic cache. With intermediate stride stores disabled, a 119,728-token
+continuation restored 119,669 tokens (99.95%), processed a 59-token suffix,
+and reached its first semantic token in 857.746 ms. The exact sentinel passed.
+
+The cold-performance hypothesis did not pass. The 119,673-token cold request
+took 184,991.506 ms (~646.9 tok/s), versus the prior recorded 119,769-token
+run at about 176.96 seconds (~676.8 tok/s). Removing intermediate stores did
+not improve the model compute curve within run variance. It is accepted only
+as a simpler serial-agentic checkpoint policy: the one stable latest-turn
+snapshot remains, while `MID_STORES=1` in the launcher explicitly restores
+older stride branch points for branch-heavy workloads. This is not recorded
+as a cold-prefill speedup.
+
+The real Qwen OpenCode gate passed on `APEX-Q5_K_M.gguf`
+(25,043,007,488 bytes, SHA-256
+`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`):
+6,692 prompt tokens cold, 6,688 reused for exact repeat, automatic tool
+selection, and tool-result continuation. Unary, SSE, the exact sentinel, and
+the exact `Formatter<'_>` source argument passed.
+Existing matched llama.cpp evidence still governs the peer claim: Qwen cached
+turns lead, while its measured 5,046-token cold turn remains 2.4% slower and
+therefore open under the project performance contract.

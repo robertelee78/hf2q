@@ -389,14 +389,24 @@ impl Qwen35LoadedModel {
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
 
         // ---- Chat template ----
-        // GGUFs lacking the embedded template (some Qwen3.6 dumps) yield
-        // an empty string here; iter-215 MVP returns 501 before any
-        // template render runs, so empty is acceptable.  Wedge-3 will
-        // require non-empty for the live chat path.
+        // Qwen's ChatML tool protocol is not interchangeable with Gemma's
+        // native turn/call protocol. Prefer the GGUF's vendor template, use
+        // hf2q's pinned Qwen3.6 template only when metadata is absent, and
+        // reject a structurally incompatible template before inference.
+        let template_arch = gguf
+            .metadata_string("general.architecture")
+            .unwrap_or("qwen35moe");
         let chat_template = gguf
             .metadata_string("tokenizer.chat_template")
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "Qwen35 load: no GGUF `tokenizer.chat_template`; using pinned QWEN3_CHATML fallback"
+                );
+                crate::core::chat_templates::QWEN3_CHATML.to_string()
+            });
+        crate::core::chat_templates::validate_tool_chat_template(template_arch, &chat_template)
+            .map_err(|error| anyhow::anyhow!("Qwen3.6 chat template contract: {error}"))?;
 
         // ---- model_id ----
         // Prefer `general.name` (matches Engine::model_id() Gemma path),
@@ -919,7 +929,9 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             chat_template_source: if gguf.metadata_string("tokenizer.chat_template").is_some() {
                 ChatTemplateSource::GgufEmbedded
             } else {
-                ChatTemplateSource::None
+                ChatTemplateSource::HardcodedFallback {
+                    name: "QWEN3_CHATML",
+                }
             },
             provenance: self.provenance.clone(),
             vision_projector: None,

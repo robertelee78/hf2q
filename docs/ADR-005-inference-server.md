@@ -10168,3 +10168,43 @@ and SSE paths now apply request grammar, logit bias, effective repetition
 penalty, and the real tool-call policy; constrained no-call and truncated-call
 outcomes fail closed. The older Qwen slot-aware/vision decode loops remain
 explicitly outside this canonical grammar-aware contract.
+
+## Family-exact tool templates and source arguments (2026-08-08)
+
+The canonical Gemma 4 and Qwen 3.6 artifacts do not share a tool protocol.
+Gemma APEX uses native `<|turn>`, `<|tool_call>`, `call:`, and
+`<|tool_response>` markers. Qwen uses ChatML turns plus `<tool_call>`,
+`<function=...>`, and `<tool_response>` blocks. Treating either family as an
+approximately compatible fallback is a coherence defect.
+
+The server now validates the selected template before inference. Gemma must
+match the structural Gemma marker contract; Qwen35/Qwen35MoE must match the
+Qwen ChatML marker contract. An embedded template remains authoritative. Qwen
+may use the checked-in, byte-pinned `QWEN3_CHATML` template only when GGUF
+metadata omits a template; a malformed or cross-family embedded template
+fails model load instead of silently falling through. The canonical local
+GGUF templates were byte-compared with their checked-in pins: Gemma 12,045
+bytes and Qwen 7,764 bytes, both exact. The full served artifacts are bound by
+SHA-256 as well: Gemma `82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`
+and Qwen `f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`.
+
+Real coding arguments also exposed an independent grammar defect. The Gemma
+and Qwen string productions rejected the raw `<` in Rust source such as
+`fmt::Formatter<'_>`. Neither native family template HTML-escapes JSON string
+values. Their grammars now allow ordinary angle brackets while the enclosing
+production still recognizes the exact family close delimiter. Qwen's nested
+JSON production follows the normal JSON string-character rule for the same
+reason. Focused grammar tests pin both the source-shaped string and nested JSON
+cases.
+
+The shared OpenCode gate now keeps behavioral instructions in the original
+user message. Tool-result content contains data only; it is not trusted as a
+second instruction channel. Family wrappers bind the same unary, SSE,
+required-tool, automatic-tool, tool-result-continuation, prefix-reuse, and
+source-shaped-argument contract to the canonical Gemma and Qwen endpoints.
+
+On the M5 Max, Gemma passed at 6,784 prompt tokens with 6,780 tokens reused on
+the tool-result continuation. Qwen passed at 6,692 prompt tokens with 6,688
+tokens reused. Both returned the exact requested call and accepted
+`fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result`; no source
+truncation or approximately reconstructed argument is accepted by the gate.

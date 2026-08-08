@@ -767,3 +767,42 @@ answer using the returned Paris weather. The tool-disabled companion emitted
 ordinary text and no tool-call deltas. Its recorded-wire fixture is Gemma
 specific; the harness now regression-tests that a Qwen or DeepSeek override
 cannot be compared against Gemma model metadata.
+
+## Template, grammar, and 120K cache revalidation (2026-08-08)
+
+The canonical `APEX-Q5_K_M.gguf` (25,043,007,488 bytes, SHA-256
+`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`)
+embeds the 7,764-byte Qwen ChatML template; it is byte-identical to
+`src/core/chat_templates/qwen3-chatml.jinja`. The Qwen loader now validates
+the native ChatML turn, function, tool-call, and tool-response markers before
+inference. Missing GGUF metadata may use that checked-in exact fallback;
+malformed or cross-family embedded metadata is a load error. This prevents a
+Gemma or DeepSeek tool encoding from being treated as approximately compatible
+Qwen.
+
+Qwen's tool grammar incorrectly banned `<` inside raw string arguments even
+though the native template emits ordinary JSON string bytes without HTML
+escaping. It therefore changed `fmt::Formatter<'_>` into an incomplete source
+argument. Scalar, nested-JSON, and no-schema string rules now allow ordinary
+angle brackets while the enclosing grammar recognizes the exact
+`</parameter>` or `</function>` delimiter. Focused tests pin source-shaped and
+nested JSON values.
+
+The corrected real OpenCode gate passed required and automatic tool use,
+unary, SSE, tool-result continuation, and exact source arguments. Its cold
+request contained 6,686 tokens; repeat, automatic, and continuation requests
+each reused 6,682 tokens. Cold TTFT was 2,855.826 ms and cached TTFT was
+25.023 ms. The final release-build rerun after delimiter hardening contained
+6,692 tokens, reused 6,688, and measured 2,867.204 ms cold TTFT plus
+23.728 ms cached TTFT.
+
+A separate calibrated long-prefix gate used a warm process and cold prefix.
+The 119,673-token cold prompt completed in 184,991.506 ms. The following
+119,728-token request restored 119,669 tokens, processed only 59 new tokens,
+and reached semantic output in 857.746 ms with the exact answer. Disabling
+intermediate stride snapshots did not improve the cold curve versus the prior
+recorded run, so that performance hypothesis is rejected. The canonical
+serial-agentic launcher disables those redundant mid stores by default but
+retains the stable latest-turn checkpoint; `MID_STORES=1` opts into stride
+branch points. This policy change is not a claim that Qwen cold prefill now
+meets the peer-speed requirement.

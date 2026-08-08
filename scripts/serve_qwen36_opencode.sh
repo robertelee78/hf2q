@@ -23,16 +23,16 @@
 #                           Enforced by Qwen35DiskPersistor per cfg subdir
 #                           (23d-γ — pre-fix a single ~100K-token opencode
 #                           session wrote 105 GB unbudgeted).
+#   HF2Q_KV_LCP_DISABLE_MID_STORE=1
+#                           Serial agentic sessions retain one compact
+#                           latest-turn checkpoint at the verified Qwen
+#                           ChatML generation boundary. Intermediate stride
+#                           snapshots are redundant for that workload and are
+#                           disabled by default. Set MID_STORES=1 only for a
+#                           branch-heavy workload that needs older checkpoints.
 #   HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=4096
-#                           Checkpoint granularity (must be ×64). Default
-#                           1024 snapshots every 1024 tokens; at ~100K
-#                           context each snapshot is ~600 MB (full-attn
-#                           TQ grows with position), so prefill spent
-#                           ~1.2 GB of snapshot+disk I/O per 1024
-#                           tokens. 4096 quarters that cost; the resume
-#                           granularity loss is ≤4095 tokens (~2 s at
-#                           ~2K tok/s) on a boundary miss — the right
-#                           trade for long agentic sessions.
+#                           Granularity of optional intermediate checkpoints
+#                           when MID_STORES=1 (must be a multiple of 64).
 #   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
 #                           Loop mitigation (2026-08-03). opencode's
 #                           openai-compatible provider cannot send
@@ -76,13 +76,15 @@
 #                           structural N/A) — a strict downgrade for
 #                           single-user agentic coding.
 #
-# Prefix-cache stack (all engaged by this config):
+# Family contract and prefix-cache stack:
+#   * The loader uses the GGUF-embedded Qwen ChatML template and validates its
+#     native turn, tool-call, and tool-response markers before inference.
 #   1. HybridPromptCache — exact-repeat requests replay in ~2 ms
 #      (greedy-only, single-slot).
-#   2. LCP partial-prefill resume — shared-prefix requests (every
-#      agentic turn) restore configured checkpoints (stride 4096 here).
-#      The earlier stride-1024 fixture measured 9.0× TTFT on a
-#      2.7K-token prompt (2920 ms → 326 ms).
+#   2. The compact latest-turn checkpoint preserves the stable ChatML prefix
+#      immediately before Qwen's temporary generation seed. A 119,728-token
+#      continuation reused 119,669 tokens and reached semantic output in
+#      0.858 s on the target M5 Max.
 #   3. Disk persistence — compact checkpoints survive server restarts
 #      across ordinary per-turn cache-capacity changes (QH35 codec v5,
 #      capacity-independent + substrate-namespaced fingerprint).
@@ -98,12 +100,22 @@ PORT="${PORT:-8081}"
 KV_DIR="${KV_DIR:-$HOME/.cache/hf2q/kv-persist}"
 KV_BUDGET_BYTES="${KV_BUDGET_BYTES:-13743895347}"  # 12.8 GiB
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
+MID_STORES="${MID_STORES:-0}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
     exit 3
+fi
+if [[ "$MID_STORES" != "0" && "$MID_STORES" != "1" ]]; then
+    echo "MID_STORES must be 0 or 1 (got: $MID_STORES)" >&2
+    exit 3
+fi
+if [[ "$MID_STORES" == "1" ]]; then
+    DISABLE_MID_STORE=0
+else
+    DISABLE_MID_STORE=1
 fi
 
 # Refuse before loading the model when another service already owns the port.
@@ -138,6 +150,7 @@ mkdir -p "$KV_DIR"
 exec env \
     HF2Q_QWEN36_AUTOREG=1 \
     HF2Q_KV_LCP_RESUME=1 \
+    HF2Q_KV_LCP_DISABLE_MID_STORE="$DISABLE_MID_STORE" \
     HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE="${STRIDE:-4096}" \
     HF2Q_KV_PERSIST="$KV_DIR" \
     HF2Q_KV_PERSIST_BUDGET_BYTES="$KV_BUDGET_BYTES" \

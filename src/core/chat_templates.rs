@@ -94,6 +94,48 @@ pub fn arch_default_chat_template(arch: &str) -> Option<&'static str> {
     }
 }
 
+/// Verify that a serving template matches the native tool surface wired for
+/// an architecture. This is intentionally structural rather than hash-based:
+/// compatible external GGUFs may carry a newer vendor template, but they must
+/// not silently route Gemma through Qwen markers (or vice versa) while the
+/// registered grammar and parser expect a different wire format.
+pub fn validate_tool_chat_template(arch: &str, template: &str) -> Result<(), String> {
+    let required: &[&str] = match arch {
+        "gemma4" => &[
+            "<|turn>model",
+            "<|tool_call>",
+            "call:",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+        ],
+        "qwen35" | "qwen35moe" => &[
+            "<|im_start|>",
+            "<|im_end|>",
+            "<tool_call>",
+            "<function=",
+            "</function>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+        ],
+        _ => return Ok(()),
+    };
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|marker| !template.contains(marker))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{arch} tokenizer.chat_template is incompatible with its native tool parser; missing markers: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +182,22 @@ mod tests {
         assert_eq!(arch_default_chat_template("qwen2"), None);
         assert_eq!(arch_default_chat_template("gemma4"), None);
         assert_eq!(arch_default_chat_template("llama"), None);
+    }
+
+    #[test]
+    fn native_tool_templates_match_their_registered_family_contracts() {
+        validate_tool_chat_template("qwen35moe", QWEN3_CHATML).expect("pinned Qwen 3.6 template");
+        let gemma =
+            include_str!("../serve/api/test_fixtures/gemma4-apex-embedded-chat-template.jinja");
+        validate_tool_chat_template("gemma4", gemma).expect("pinned Gemma 4 template");
+    }
+
+    #[test]
+    fn cross_family_or_incomplete_tool_templates_fail_closed() {
+        let gemma =
+            include_str!("../serve/api/test_fixtures/gemma4-apex-embedded-chat-template.jinja");
+        assert!(validate_tool_chat_template("qwen35moe", gemma).is_err());
+        assert!(validate_tool_chat_template("gemma4", QWEN3_CHATML).is_err());
+        assert!(validate_tool_chat_template("gemma4", "{{ messages }}").is_err());
     }
 }

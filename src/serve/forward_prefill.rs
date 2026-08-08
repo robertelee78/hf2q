@@ -22,6 +22,58 @@ use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
 
+/// Extra live-KV capacity retained by Gemma's SerialFifo long-resume path.
+///
+/// OpenCode normally asks for up to 8,192 output tokens and then appends the
+/// assistant/tool-result transcript on the following request. Reserving twice
+/// that amount lets the next request reuse the live prompt prefix in place
+/// without duplicating tens of GiB into the bounded LCP snapshot registry.
+/// The reserve is only applied when long-resume already selected linear
+/// sliding-layer storage; legacy ring-cache behavior is unchanged.
+pub(crate) const GEMMA_AGENTIC_LIVE_RESERVE_TOKENS: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GemmaKvCapacityPlan {
+    /// Minimum capacity needed to finish this request safely.
+    pub(crate) required_linear: usize,
+    /// Capacity to use when allocating a fresh long-resume buffer.
+    pub(crate) allocation_linear: usize,
+    /// Sliding-layer counterpart of `required_linear`.
+    pub(crate) required_sliding: usize,
+    /// Sliding-layer counterpart of `allocation_linear`.
+    pub(crate) allocation_sliding: usize,
+}
+
+pub(crate) fn gemma_kv_capacity_plan(
+    seq_len: usize,
+    max_decode_tokens: usize,
+    sliding_window: usize,
+    long_resume: bool,
+) -> GemmaKvCapacityPlan {
+    let required_linear = seq_len + max_decode_tokens;
+    let allocation_linear = if long_resume {
+        seq_len + max_decode_tokens.max(GEMMA_AGENTIC_LIVE_RESERVE_TOKENS)
+    } else {
+        required_linear
+    };
+    let required_sliding = if long_resume {
+        sliding_window.max(required_linear)
+    } else {
+        sliding_window
+    };
+    let allocation_sliding = if long_resume {
+        sliding_window.max(allocation_linear)
+    } else {
+        sliding_window
+    };
+    GemmaKvCapacityPlan {
+        required_linear,
+        allocation_linear,
+        required_sliding,
+        allocation_sliding,
+    }
+}
+
 /// Restore the logical decode cursor for an LCP snapshot.
 ///
 /// Sliding layers normally use a physical ring, so their next write cursor is
@@ -706,8 +758,11 @@ impl MlxModelWeights {
         //   - Global (linear): seq_len + max_decode_tokens. Writes are monotonic.
         // Ring buffer for sliding drops ~5 GB of dense KV at 20k decode on
         // Gemma-4 26B (8×1024×256 per layer vs 8×20022×256).
-        let linear_capacity = seq_len + max_decode_tokens;
         let sw = self.sliding_window;
+        let capacity_plan =
+            gemma_kv_capacity_plan(seq_len, max_decode_tokens, sw, kv_lcp_long_resume);
+        let required_linear_capacity = capacity_plan.required_linear;
+        let linear_capacity = capacity_plan.allocation_linear;
         // ADR-017 Phase E.a iter-3.6 — when `HF2Q_KV_LCP_LONG_RESUME=1`,
         // sliding layers use a LINEAR buffer (cap = max(sw, seq_len +
         // max_decode_tokens)) instead of a ring (cap = sw). Per-token
@@ -730,11 +785,8 @@ impl MlxModelWeights {
         // `/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal:490-491,914-915`),
         // so linear sliding buffers + logical-position masking compose
         // identically for both legs.
-        let sliding_layer_capacity = if kv_lcp_long_resume {
-            sw.max(seq_len + max_decode_tokens)
-        } else {
-            sw
-        };
+        let required_sliding_layer_capacity = capacity_plan.required_sliding;
+        let sliding_layer_capacity = capacity_plan.allocation_sliding;
         // ADR-017 Phase E.a iter-3: dense_kvs_vec source branches on
         // restored_lcp.
         //
@@ -804,9 +856,9 @@ impl MlxModelWeights {
                             .all(|(arc, layer)| {
                                 let layer_is_ring = layer.layer_type == LayerType::Sliding;
                                 let required_cap = if layer_is_ring {
-                                    sliding_layer_capacity
+                                    required_sliding_layer_capacity
                                 } else {
-                                    linear_capacity
+                                    required_linear_capacity
                                 };
                                 arc.capacity >= required_cap && arc.is_sliding == layer_is_ring
                             });
@@ -858,9 +910,9 @@ impl MlxModelWeights {
                         for (layer_idx, layer) in self.layers.iter().enumerate() {
                             let layer_is_ring = layer.layer_type == LayerType::Sliding;
                             let required_cap = if layer_is_ring {
-                                sliding_layer_capacity
+                                required_sliding_layer_capacity
                             } else {
-                                linear_capacity
+                                required_linear_capacity
                             };
                             let cached_arc = cached_iter.next().ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -995,9 +1047,9 @@ impl MlxModelWeights {
                     // required_cap (which is the same formula used by
                     // the alloc branch above).
                     let required_cap = if layer_is_ring {
-                        sliding_layer_capacity
+                        required_sliding_layer_capacity
                     } else {
-                        linear_capacity
+                        required_linear_capacity
                     };
                     let cached_arc = cached_iter.next().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -1017,7 +1069,7 @@ impl MlxModelWeights {
                             required_cap,
                             k_resume,
                             sw,
-                            linear_capacity
+                            required_linear_capacity
                         );
                     }
                     if cached_arc.is_sliding != layer_is_ring {
@@ -1104,9 +1156,9 @@ impl MlxModelWeights {
                             || leftover.iter().zip(self.layers.iter()).any(|(b, layer)| {
                                 let layer_is_ring = layer.layer_type == LayerType::Sliding;
                                 let required = if layer_is_ring {
-                                    sliding_layer_capacity
+                                    required_sliding_layer_capacity
                                 } else {
-                                    linear_capacity
+                                    required_linear_capacity
                                 };
                                 b.capacity < required || b.is_sliding != layer_is_ring
                             });
@@ -1182,7 +1234,11 @@ impl MlxModelWeights {
                         let rebuild = leftover.len() != num_layers
                             || leftover.iter().zip(self.layers.iter()).any(|(b, layer)| {
                                 let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                                let required = if layer_is_ring { sw } else { linear_capacity };
+                                let required = if layer_is_ring {
+                                    sw
+                                } else {
+                                    required_linear_capacity
+                                };
                                 b.capacity < required || b.is_sliding != layer_is_ring
                             });
                         if rebuild {
@@ -6176,7 +6232,35 @@ impl MlxModelWeights {
 
 #[cfg(test)]
 mod lcp_cursor_tests {
-    use super::restored_kv_cursor;
+    use super::{gemma_kv_capacity_plan, restored_kv_cursor, GEMMA_AGENTIC_LIVE_RESERVE_TOKENS};
+
+    #[test]
+    fn live_capacity_headroom_does_not_raise_resume_admission_requirement() {
+        let initial = gemma_kv_capacity_plan(10_909, 4_096, 1_024, true);
+        assert_eq!(initial.required_linear, 15_005);
+        assert_eq!(
+            initial.allocation_linear,
+            10_909 + GEMMA_AGENTIC_LIVE_RESERVE_TOKENS
+        );
+
+        let next = gemma_kv_capacity_plan(10_992, 4_096, 1_024, true);
+        assert_eq!(next.required_linear, 15_088);
+        assert_eq!(
+            next.allocation_linear,
+            10_992 + GEMMA_AGENTIC_LIVE_RESERVE_TOKENS
+        );
+        assert!(initial.allocation_linear >= next.required_linear);
+        assert!(initial.allocation_linear < next.allocation_linear);
+    }
+
+    #[test]
+    fn legacy_capacity_plan_has_no_extra_headroom() {
+        let plan = gemma_kv_capacity_plan(10_909, 4_096, 1_024, false);
+        assert_eq!(plan.required_linear, 15_005);
+        assert_eq!(plan.allocation_linear, 15_005);
+        assert_eq!(plan.required_sliding, 1_024);
+        assert_eq!(plan.allocation_sliding, 1_024);
+    }
 
     #[test]
     fn sliding_ring_resume_wraps_the_physical_cursor() {

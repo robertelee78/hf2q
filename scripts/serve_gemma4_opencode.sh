@@ -16,14 +16,10 @@
 #                           in tests/lcp_partial_prefill_byte_identity.rs::
 #                           gemma_hybrid_long_resume_byte_identity).
 #   HF2Q_KV_LCP_RESUME_CAPACITY=8g
-#                           Registry byte budget. Long-resume snapshots carry
-#                           +4096 tokens of multi-turn headroom per layer
-#                           (~4.5 GB/entry at ~2.5K prompts); the default
-#                           ~5%-of-avail budget rejects them
-#                           (EntryExceedsBudget → silent store skip).
-#                           Envelope: gemma LCP is effective to ~8-16K-token
-#                           contexts with this budget; longer sessions fall
-#                           back to fresh prefill (graceful, correct).
+#                           Registry budget for short or branched-prefix
+#                           snapshots. The normal fifo-serial continuation
+#                           reuses Gemma's already-resident dense+hybrid KV in
+#                           place and does not duplicate a long live prefix.
 #   --mmproj                Gemma 4 vision tower (optional; enables image
 #                           parts in chat completions). Delete the flag for
 #                           a text-only server.
@@ -41,17 +37,25 @@
 #                           values win), only to generated tokens (never the
 #                           prompt), never to the T=0 GPU argmax path.
 #
-# BATCHED PREFILL vs CONTEXT SIZE (auto-routed since 2026-08-03):
-#   The engine picks per request: batched route (~20-47× faster
-#   prefill) engages only when its O(n²) overhead fits 1/6 of
-#   CURRENTLY available RAM. Overhead is config-dependent:
+# FAMILY TEMPLATE AND PREFILL ROUTING:
+#   The loader uses the GGUF-embedded Gemma APEX template and validates its
+#   native turn, tool-call, and tool-response markers before inference.
+#
+#   Cold prompts still auto-route between the existing batched and
+#   linear-memory paths. The batched route engages only when its O(n²)
+#   overhead fits 1/6 of currently available RAM. Overhead is config-dependent:
 #     default (tensor-mm globals): ~72 B/seq² — masks + pf_kq scratch
 #       ⇒ batched envelope ≈ ≤12K tokens on a 128 GB box
 #     HF2Q_GLOBAL_FA=1 (FA globals): ~8 B/seq² — masks only
 #       ⇒ batched envelope ≈ ≤35-40K tokens
-#   Larger prompts auto-fall-back to the linear-memory route
-#   (~1,700 tok/s; a 97K first turn ≈ 60 s once, then LCP resumes
-#   carry later turns) with a stderr notice. No operator action needed.
+#   Larger cold prompts fall back to the linear-memory route. A measured
+#   25,187-token baseline took about 388 seconds on this host, so no stale
+#   ~1,700 tok/s promise is made here.
+#
+#   Normal follow-ups use zero-copy live-prefix reuse and process only the
+#   uncached suffix in bounded 256-query chunks. A real 6,784-token OpenCode
+#   tool turn reused 6,780 tokens and completed a 6,042-token tool-result
+#   suffix at about 909 tok/s with the exact required answer.
 #   Env escapes (neither should be necessary):
 #     HF2Q_SERVE_BATCHED_PREFILL=0  force linear route always
 #     HF2Q_SERVE_BATCHED_PREFILL=1  force batched route always (can
@@ -67,11 +71,12 @@
 #   * HF2Q_F16_KV=1 — the F16 dense-KV opt-in has a KNOWN regression vs
 #     F32 on gemma4 (ADR-009: sourdough 3656→3095). Keep F32 dense.
 #
-# Prefix-cache stack (all engaged by this config):
+# Prefix-cache stack:
 #   1. PromptCache — exact-repeat requests replay instantly (greedy-only).
-#   2. LCP partial-prefill resume — shared-prefix turns resume from cached
-#      dual-leg snapshots (dense for prefill SDPA + hybrid for decode).
-#      Measured: resume at K=516/537 tokens; long-resume at ~2.3K prompts.
+#   2. Live-prefix reuse — the immediately following fifo-serial turn appends
+#      to resident dense+hybrid KV without a second full snapshot.
+#   3. LCP registry — short or branched prefixes may resume from dual-leg
+#      snapshots when they fit the configured byte budget.
 #
 # Usage:
 #   scripts/serve_gemma4_opencode.sh            # foreground (default)

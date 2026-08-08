@@ -41,6 +41,34 @@ use crate::serve::forward_mlx_shared::{
 };
 use crate::serve::multi_seq_kv::SlotId;
 
+/// Bound the live-prefix attention scratch while keeping every dispatch in a
+/// single hybrid-kernel scheduling bucket. The cache-length thresholds mirror
+/// mlx-native's current hybrid NWG/NSG policies.
+const GEMMA_LIVE_QUERY_CHUNK: usize = 256;
+
+fn gemma_live_query_chunk_len(start_pos: usize, remaining: usize) -> usize {
+    let mut len = remaining.min(GEMMA_LIVE_QUERY_CHUNK);
+    for boundary in [512usize, 1024usize] {
+        if start_pos < boundary && start_pos.saturating_add(len) > boundary {
+            len = boundary - start_pos;
+            break;
+        }
+    }
+    len.max(1)
+}
+
+fn gemma_batched_mask_seq_len(seq_len: usize, live_prefix_resume: bool) -> usize {
+    if live_prefix_resume {
+        // Live resume uses the hybrid KV kernel with absolute query positions
+        // and does not consume the cold-prefill square masks. Keep the legacy
+        // setup buffers valid for the shared control flow without allocating
+        // O(suffix²) memory for data that is never read.
+        1
+    } else {
+        seq_len
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auto route viability (2026-08-03)
 // ---------------------------------------------------------------------------
@@ -298,6 +326,25 @@ macro_rules! bucket_finish {
 }
 
 impl MlxModelWeights {
+    /// Batched append against Gemma's already-resident SerialFifo prefix.
+    ///
+    /// This is deliberately separate from speculative verification: the
+    /// production path consumes the hybrid F16-K/TQ-HB-V cache and preserves
+    /// the live dense cache rather than installing DFlash capture state.
+    pub fn forward_prefill_batched_live_resume(
+        &mut self,
+        suffix_tokens: &[u32],
+        max_decode_tokens: usize,
+        start_pos: usize,
+        gpu: &mut GpuContext,
+    ) -> Result<u32> {
+        anyhow::ensure!(
+            start_pos > 0,
+            "batched live resume requires a non-zero prefix"
+        );
+        self.forward_prefill_batched_inner(suffix_tokens, max_decode_tokens, start_pos, true, gpu)
+    }
+
     /// True batched prefill with single-shot dense SDPA over the whole prompt.
     ///
     /// Returns the first decode token (greedy argmax of last-row logits).
@@ -366,10 +413,29 @@ impl MlxModelWeights {
         start_pos: usize,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
+        self.forward_prefill_batched_inner(prompt_tokens, max_decode_tokens, start_pos, false, gpu)
+    }
+
+    fn forward_prefill_batched_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_decode_tokens: usize,
+        start_pos: usize,
+        live_prefix_resume: bool,
+        gpu: &mut GpuContext,
+    ) -> Result<u32> {
         let seq_len = prompt_tokens.len();
         if seq_len == 0 {
             anyhow::bail!("forward_prefill_batched: empty prompt");
         }
+        anyhow::ensure!(
+            !live_prefix_resume || self.multi_seq_prefill.is_none(),
+            "batched live resume is single-sequence only"
+        );
+        anyhow::ensure!(
+            !live_prefix_resume || self.dflash_capture.is_none(),
+            "batched live resume cannot share speculative capture state"
+        );
 
         // Metal-1 — programmatic GPU capture.  Gated on
         // HF2Q_METAL_CAPTURE=path.gputrace.  Requires process env
@@ -536,7 +602,8 @@ impl MlxModelWeights {
         /// tensor-mm (NO_FA) domain; above it globals route through F16
         /// D512 FA (O(seq) memory). See the routing comment above.
         const GLOBAL_NOFA_MAX_SEQ: usize = 8192;
-        let force_global_nofa = std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1")
+        let force_global_nofa = !live_prefix_resume
+            && std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1")
             && seq_len > 64
             && seq_len <= GLOBAL_NOFA_MAX_SEQ
             && self.multi_seq_prefill.is_none();
@@ -588,7 +655,6 @@ impl MlxModelWeights {
         // invariant over cached K,V (RoPE is baked in pre-cache), so ring
         // slot order doesn't affect correctness.
         // -------------------------------------------------------------------
-        let linear_capacity = seq_len + max_decode_tokens;
         let sw = self.sliding_window;
         // ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — LONG_RESUME
         // on the batched route: when the flag chain is on, sliding layers
@@ -601,37 +667,83 @@ impl MlxModelWeights {
         let kv_lcp_long_resume = INVESTIGATION_ENV.kv_lcp_long_resume
             && INVESTIGATION_ENV.kv_lcp_resume
             && (INVESTIGATION_ENV.use_dense || INVESTIGATION_ENV.hybrid_kv);
-        let sliding_layer_capacity = if kv_lcp_long_resume {
-            sw.max(linear_capacity)
+        let prompt_end = start_pos
+            .checked_add(seq_len)
+            .ok_or_else(|| anyhow::anyhow!("batched prompt position overflow"))?;
+        let capacity_plan = crate::serve::forward_prefill::gemma_kv_capacity_plan(
+            prompt_end,
+            max_decode_tokens,
+            sw,
+            kv_lcp_long_resume,
+        );
+        let linear_capacity = capacity_plan.allocation_linear;
+        let sliding_layer_capacity = capacity_plan.allocation_sliding;
+        let dense_kvs_vec: Vec<DenseKvBuffers> = if live_prefix_resume {
+            let live = self
+                .dense_kvs
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("batched live resume has no dense KV"))?;
+            anyhow::ensure!(
+                live.len() == num_layers,
+                "batched live resume dense layer count mismatch: {} != {}",
+                live.len(),
+                num_layers
+            );
+            live.into_iter()
+                .enumerate()
+                .map(|(layer_idx, cache)| {
+                    let layer_is_ring = self.layers[layer_idx].layer_type == LayerType::Sliding;
+                    let required = if layer_is_ring {
+                        capacity_plan.required_sliding
+                    } else {
+                        capacity_plan.required_linear
+                    };
+                    anyhow::ensure!(
+                        cache.capacity >= required,
+                        "batched live resume dense L{layer_idx} capacity {} < required {}",
+                        cache.capacity,
+                        required
+                    );
+                    anyhow::ensure!(
+                        cache.is_sliding == layer_is_ring && cache.dtype == kv_dtype,
+                        "batched live resume dense L{layer_idx} layout mismatch"
+                    );
+                    std::sync::Arc::try_unwrap(cache).map_err(|_| {
+                        anyhow::anyhow!(
+                            "batched live resume dense L{layer_idx} is not exclusively owned"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
         } else {
-            sw
+            let mut fresh = Vec::with_capacity(num_layers);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                let capacity = if layer_is_ring {
+                    sliding_layer_capacity
+                } else {
+                    linear_capacity
+                };
+                let n = nkv * capacity * hd;
+                let k = dev
+                    .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                    .map_err(|e| anyhow::anyhow!("batched dense K L{layer_idx}: {e}"))?;
+                let v = dev
+                    .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                    .map_err(|e| anyhow::anyhow!("batched dense V L{layer_idx}: {e}"))?;
+                fresh.push(DenseKvBuffers {
+                    k,
+                    v,
+                    capacity,
+                    is_sliding: layer_is_ring,
+                    // ADR-017 Phase E.a iter-3.5a — dtype invariant.
+                    dtype: kv_dtype,
+                });
+            }
+            fresh
         };
-        let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let nkv = layer.num_kv_heads;
-            let hd = layer.head_dim;
-            let layer_is_ring = layer.layer_type == LayerType::Sliding;
-            let capacity = if layer_is_ring {
-                sliding_layer_capacity
-            } else {
-                linear_capacity
-            };
-            let n = nkv * capacity * hd;
-            let k = dev
-                .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                .map_err(|e| anyhow::anyhow!("batched dense K L{layer_idx}: {e}"))?;
-            let v = dev
-                .alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                .map_err(|e| anyhow::anyhow!("batched dense V L{layer_idx}: {e}"))?;
-            dense_kvs_vec.push(DenseKvBuffers {
-                k,
-                v,
-                capacity,
-                is_sliding: layer_is_ring,
-                // ADR-017 Phase E.a iter-3.5a — dtype invariant.
-                dtype: kv_dtype,
-            });
-        }
         let max_nh = nh;
         let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
         let tmp_bytes =
@@ -679,6 +791,36 @@ impl MlxModelWeights {
             // is bit-identical to pre-iter-63 for the cmd_generate /
             // parity / engine flows.
             if INVESTIGATION_ENV.hybrid_kv {
+                if live_prefix_resume {
+                    let hybrid = self
+                        .hybrid_kv
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("batched live resume has no hybrid KV"))?;
+                    anyhow::ensure!(
+                        hybrid.len() == num_layers,
+                        "batched live resume hybrid layer count mismatch: {} != {}",
+                        hybrid.len(),
+                        num_layers
+                    );
+                    for (layer_idx, cache) in hybrid.iter().enumerate() {
+                        let layer_is_ring = self.layers[layer_idx].layer_type == LayerType::Sliding;
+                        let required = if layer_is_ring {
+                            capacity_plan.required_sliding
+                        } else {
+                            capacity_plan.required_linear
+                        };
+                        anyhow::ensure!(
+                            cache.capacity >= required,
+                            "batched live resume hybrid L{layer_idx} capacity {} < required {}",
+                            cache.capacity,
+                            required
+                        );
+                        anyhow::ensure!(
+                            cache.is_sliding == layer_is_ring,
+                            "batched live resume hybrid L{layer_idx} layout mismatch"
+                        );
+                    }
+                }
                 // Re-allocate when EITHER:
                 //   (a) cache is None (fresh instance / post-warmup cleanup)
                 //   (b) any non-sliding layer's existing capacity < this
@@ -1043,6 +1185,29 @@ impl MlxModelWeights {
                 }
             }
         }
+        let live_slot_ids: Option<MlxBuffer> = if live_prefix_resume {
+            let mut slots = alloc_u32(seq_len, "pf_live_slot_ids")?;
+            slots
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow::anyhow!("live slot ids write: {e}"))?
+                .fill(0);
+            Some(slots)
+        } else {
+            None
+        };
+        let live_sdpa_tmp: Option<MlxBuffer> = if live_prefix_resume {
+            let chunk_queries = seq_len.min(GEMMA_LIVE_QUERY_CHUNK);
+            let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
+                (chunk_queries * nh) as u32,
+                max_hd as u32,
+            );
+            Some(
+                dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+                    .map_err(|e| anyhow::anyhow!("batched live sdpa tmp: {e}"))?,
+            )
+        } else {
+            None
+        };
         // ADR-040 iter-G(a) — per-token sequence-id buffer for the GPU
         // block-diagonal mask kernel. In multi-seq mode, `pf_seq_id[i]` is the
         // sequence index of token `i`; together with `pf_positions` (= per-seq
@@ -1122,19 +1287,21 @@ impl MlxModelWeights {
                 build_block_diagonal_sdpa_mask_bf16, build_sdpa_mask_bf16, SdpaMaskParams,
             };
 
+            let mask_seq_len = gemma_batched_mask_seq_len(seq_len, live_prefix_resume);
+
             // Pre-allocate the two blk byte buffers (Metal alloc, no kernel
             // dispatch) outside the session so &mut borrow stays confined.
             let blk_sliding_params = BlkParams {
-                seq_len_q: seq_len as u32,
-                seq_len_k: seq_len as u32,
+                seq_len_q: mask_seq_len as u32,
+                seq_len_k: mask_seq_len as u32,
                 bq: 32,
                 bk: 16,
             };
             blk_sliding = alloc_blk_buffer(dev, &blk_sliding_params)
                 .map_err(|e| anyhow::anyhow!("alloc blk_sliding: {e}"))?;
             let blk_global_params = BlkParams {
-                seq_len_q: seq_len as u32,
-                seq_len_k: seq_len as u32,
+                seq_len_q: mask_seq_len as u32,
+                seq_len_k: mask_seq_len as u32,
                 bq: 8,
                 bk: 64,
             };
@@ -1248,8 +1415,8 @@ impl MlxModelWeights {
                     reg,
                     s.encoder_mut(),
                     &SdpaMaskParams {
-                        seq_len_q: seq_len as u32,
-                        seq_len_k: seq_len as u32,
+                        seq_len_q: mask_seq_len as u32,
+                        seq_len_k: mask_seq_len as u32,
                         window_size: Some(self.sliding_window as u32),
                         causal: true,
                         q_abs_offset: 0,
@@ -1262,9 +1429,9 @@ impl MlxModelWeights {
             // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
             // rank-2 broadcast detection (`mask.shape().len() == 2`) fires.
             sliding_mask_f16 = if use_fa_f16 {
-                let mask_elems = (seq_len * seq_len) as usize;
+                let mask_elems = mask_seq_len * mask_seq_len;
                 let m_f16 = dev
-                    .alloc_buffer(mask_elems * 2, DType::F16, vec![seq_len, seq_len])
+                    .alloc_buffer(mask_elems * 2, DType::F16, vec![mask_seq_len, mask_seq_len])
                     .map_err(|e| anyhow::anyhow!("alloc sliding_mask_f16: {e}"))?;
                 s.barrier_between(&[&sliding_mask], &[&m_f16]);
                 mlx_native::ops::elementwise::cast(
@@ -1350,8 +1517,8 @@ impl MlxModelWeights {
                     reg,
                     s.encoder_mut(),
                     &SdpaMaskParams {
-                        seq_len_q: seq_len as u32,
-                        seq_len_k: seq_len as u32,
+                        seq_len_q: mask_seq_len as u32,
+                        seq_len_k: mask_seq_len as u32,
                         window_size: None,
                         causal: true,
                         q_abs_offset: 0,
@@ -1364,9 +1531,9 @@ impl MlxModelWeights {
             // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
             // rank-2 broadcast detection (`mask.shape().len() == 2`) fires.
             global_mask_f16 = if use_fa_f16 {
-                let mask_elems = (seq_len * seq_len) as usize;
+                let mask_elems = mask_seq_len * mask_seq_len;
                 let m_f16 = dev
-                    .alloc_buffer(mask_elems * 2, DType::F16, vec![seq_len, seq_len])
+                    .alloc_buffer(mask_elems * 2, DType::F16, vec![mask_seq_len, mask_seq_len])
                     .map_err(|e| anyhow::anyhow!("alloc global_mask_f16: {e}"))?;
                 s.barrier_between(&[&global_mask], &[&m_f16]);
                 mlx_native::ops::elementwise::cast(
@@ -2032,8 +2199,164 @@ impl MlxModelWeights {
                 // (iter-81 measurement).  Keeping FA_SW for sliding +
                 // routing global through NO_FA saves ~52 ms wall at pp8333
                 // per model.
-                let route_through_nofa = (use_no_fa || force_global_nofa) && !is_sliding;
-                if route_through_nofa {
+                let route_through_nofa =
+                    !live_prefix_resume && (use_no_fa || force_global_nofa) && !is_sliding;
+                if live_prefix_resume {
+                    let hybrid = self.hybrid_kv.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("batched live attention has no hybrid KV")
+                    })?;
+                    let layer_kv = &hybrid[layer_idx];
+                    let cap = layer_kv.capacity;
+                    let is_ring = layer_kv.is_sliding;
+
+                    // Materialize the complete suffix K/V before any query
+                    // attends to it. Each query's absolute position then makes
+                    // the hybrid kernel apply the exact causal/sliding bound.
+                    s.barrier_between(
+                        &[&pf_k_normed, &pf_v_normed],
+                        &[&layer_kv.k, &layer_kv.v_packed, &layer_kv.v_norms],
+                    );
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                        s.encoder_mut(),
+                        reg,
+                        metal_dev,
+                        &pf_k_normed,
+                        &layer_kv.k,
+                        nkv as u32,
+                        hd as u32,
+                        cap as u32,
+                        start_pos as u32,
+                        seq_len as u32,
+                        0,
+                    )
+                    .map_err(|e| anyhow::anyhow!("live hybrid F16 K L{layer_idx}: {e}"))?;
+                    if layer_kv.v_packed.dtype() == DType::F16 {
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
+                            &pf_v_normed,
+                            &layer_kv.v_packed,
+                            nkv as u32,
+                            hd as u32,
+                            cap as u32,
+                            start_pos as u32,
+                            seq_len as u32,
+                            0,
+                        )
+                        .map_err(|e| anyhow::anyhow!("live hybrid F16 V L{layer_idx}: {e}"))?;
+                    } else {
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
+                            &pf_v_normed,
+                            &layer_kv.v_packed,
+                            &layer_kv.v_norms,
+                            nkv as u32,
+                            hd as u32,
+                            cap as u32,
+                            start_pos as u32,
+                            seq_len as u32,
+                            0,
+                            is_ring,
+                            tq_scale_factor_d512,
+                            tq_codebook_bits_prefill,
+                        )
+                        .map_err(|e| anyhow::anyhow!("live hybrid FWHT V L{layer_idx}: {e}"))?;
+                    }
+
+                    let slots = live_slot_ids
+                        .as_ref()
+                        .expect("live slot ids allocated with live resume");
+                    let tmp = live_sdpa_tmp
+                        .as_ref()
+                        .expect("live SDPA tmp allocated with live resume");
+                    let row_elems = nh * hd;
+                    let mut chunk_start = 0usize;
+                    while chunk_start < seq_len {
+                        let chunk_len = gemma_live_query_chunk_len(
+                            start_pos + chunk_start,
+                            seq_len - chunk_start,
+                        );
+                        let chunk_end = chunk_start + chunk_len;
+                        let kv_seq_len = (start_pos + chunk_end) as u32;
+                        let q = pf_q_normed.slice_view(
+                            (chunk_start * row_elems * std::mem::size_of::<f32>()) as u64,
+                            chunk_len * row_elems,
+                        );
+                        let output = pf_sdpa_out.slice_view(
+                            (chunk_start * row_elems * std::mem::size_of::<f32>()) as u64,
+                            chunk_len * row_elems,
+                        );
+                        let slot_chunk = slots.slice_view(
+                            (chunk_start * std::mem::size_of::<u32>()) as u64,
+                            chunk_len,
+                        );
+                        let pos_chunk = pf_positions.slice_view(
+                            (chunk_start * std::mem::size_of::<u32>()) as u64,
+                            chunk_len,
+                        );
+                        let params =
+                            mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
+                                num_heads: nh as u32,
+                                num_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                kv_seq_len,
+                                kv_capacity: cap as u32,
+                                scale: 1.0,
+                                mask_type: if is_sliding { 2 } else { 1 },
+                                sliding_window: if is_sliding { sw as u32 } else { 0 },
+                                softcap: 0.0,
+                                ring_start: 0,
+                                scale_factor_d512: tq_scale_factor_d512,
+                                codebook_bits: tq_codebook_bits_prefill,
+                                fuse_fwht_pre: 0,
+                                nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
+                            };
+                        s.barrier_between(
+                            &[
+                                &q,
+                                &layer_kv.k,
+                                &layer_kv.v_packed,
+                                &layer_kv.v_norms,
+                                tmp,
+                                &slot_chunk,
+                                &pos_chunk,
+                            ],
+                            &[&output, tmp],
+                        );
+                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                            s.encoder_mut(),
+                            reg,
+                            dev,
+                            chunk_len as u32,
+                            &q,
+                            &layer_kv.k,
+                            &layer_kv.v_packed,
+                            &layer_kv.v_norms,
+                            &output,
+                            tmp,
+                            &slot_chunk,
+                            &pos_chunk,
+                            &params,
+                        )
+                        .map_err(|e| anyhow::anyhow!("live hybrid SDPA L{layer_idx}: {e}"))?;
+                        chunk_start = chunk_end;
+                    }
+                    if layer_kv.v_packed.dtype() != DType::F16 {
+                        s.barrier_between(&[&pf_sdpa_out], &[&pf_sdpa_out]);
+                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                            s.encoder_mut(),
+                            reg,
+                            metal_dev,
+                            &pf_sdpa_out,
+                            (seq_len * nh) as u32,
+                            hd as u32,
+                        )
+                        .map_err(|e| anyhow::anyhow!("live hybrid FWHT undo L{layer_idx}: {e}"))?;
+                    }
+                } else if route_through_nofa {
                     // ---- HF2Q_NO_FA path: tensor-mm attention ----
                     //
                     // Mirrors llama.cpp's `-fa 0` fast path (which on M5
@@ -3439,7 +3762,7 @@ impl MlxModelWeights {
                 // the §7.32K seq-bounded global routing). Sliding layers
                 // under FA_SW populated pf_sdpa_out_perm (FA layout bf16)
                 // and need the FA-style O-proj branch.
-                if route_through_nofa {
+                if live_prefix_resume || route_through_nofa {
                     s.barrier_between(
                         &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
                         &[&pf_attn_out],
@@ -3700,7 +4023,12 @@ impl MlxModelWeights {
                         // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V
                         // batched-prefill encode path. F32 K → F16 K (sequence
                         // copy) + V-only TQ-HB sequence encode.
-                        if let Some(ref ms) = self.multi_seq_prefill {
+                        // Live-prefix attention already encoded the suffix
+                        // before SDPA, so repeating it here would add work and
+                        // could overwrite bytes while a later chunk reads.
+                        if live_prefix_resume {
+                            // No-op: hybrid K/V are current through prompt_end.
+                        } else if let Some(ref ms) = self.multi_seq_prefill {
                             // ADR-040 iter-G(a) delta 3 — per-seq KV SCATTER.
                             // The single-seq write copies the whole [0,T) stream
                             // into ONE mounted slot region. Here the T-stream is
@@ -5471,6 +5799,7 @@ impl MlxModelWeights {
             );
         }
         let lcp_snapshots_on = INVESTIGATION_ENV.kv_lcp_resume
+            && !live_prefix_resume
             && lcp_resumable_regime
             && snapshot_safe
             && lcp_fits_budget;
@@ -6166,7 +6495,27 @@ mod block_diagonal_mask_tests {
 
 #[cfg(test)]
 mod route_viability_tests {
-    use super::{batched_route_overhead_bytes as overhead, gemma_lcp_resume_worthwhile};
+    use super::{
+        batched_route_overhead_bytes as overhead, gemma_batched_mask_seq_len,
+        gemma_lcp_resume_worthwhile, gemma_live_query_chunk_len,
+    };
+
+    #[test]
+    fn live_resume_does_not_allocate_suffix_squared_masks() {
+        assert_eq!(gemma_batched_mask_seq_len(1, true), 1);
+        assert_eq!(gemma_batched_mask_seq_len(131_072, true), 1);
+        assert_eq!(gemma_batched_mask_seq_len(131_072, false), 131_072);
+    }
+
+    #[test]
+    fn live_query_chunks_are_bounded_and_do_not_cross_kernel_buckets() {
+        assert_eq!(gemma_live_query_chunk_len(0, 900), 256);
+        assert_eq!(gemma_live_query_chunk_len(500, 900), 12);
+        assert_eq!(gemma_live_query_chunk_len(512, 900), 256);
+        assert_eq!(gemma_live_query_chunk_len(1000, 900), 24);
+        assert_eq!(gemma_live_query_chunk_len(1024, 900), 256);
+        assert_eq!(gemma_live_query_chunk_len(7_000, 17), 17);
+    }
 
     #[test]
     fn batched_route_overhead_default_config_includes_nofa_scratch() {

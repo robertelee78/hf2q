@@ -1947,14 +1947,17 @@ fn gemma4_tool_call_gbnf(
 
     // Gemma 4 primitive rules (shared across all function grammars).
     //
-    // String: `<|"|>` any-safe-char* `<|"|>`. We define gemma4-str-char as
-    // any character that is NOT `<` (the first byte of the 5-byte marker
-    // `<|"|>`). This is conservative but safe — Gemma 4's jinja template
-    // HTML-escapes `<` in string args so valid model outputs never contain
-    // bare `<` inside string values.
+    // String: `<|"|>` any-safe-char* `<|"|>`. Source-shaped tool arguments
+    // routinely contain a bare `<` (`Vec<T>`, `Formatter<'_>`, comparisons),
+    // so rejecting every `<` truncates otherwise valid calls at the sampler.
+    // The staged alternatives below accept `<` and every partial delimiter
+    // prefix while reserving only the exact five-byte `<|"|>` terminator.
+    // A complete delimiter cannot be represented literally inside this
+    // marker-string surface; that is a limitation of the model format itself.
     rules.push((
         "gemma4-str-char".to_string(),
-        r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
+        r##"[^<\\] | [\\] [^\x00-\x1F] | "<" [^|] | "<|" [^"] | "<|\"" [^|] | "<|\"|" [^>]"##
+            .to_string(),
     ));
     rules.push((
         "gemma4-str-val".to_string(),
@@ -2325,9 +2328,13 @@ fn qwen35_tool_call_gbnf(
     // (the `tojson` Jinja filter is used in the template).
     rules.push((
         "qwen35-str-char".to_string(),
-        // Any char that is not `<` (first byte of `</parameter>`).
-        // Conservative but correct: template HTML-escapes `<` in string values.
-        r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
+        // Raw parameters need bare `<` for source code, but an unrestricted
+        // `<` branch can swallow the exact `</parameter>` terminator and then
+        // accept adjacent tool calls as parameter text. These staged mismatch
+        // alternatives reserve only the complete close tag. Partial prefixes
+        // and close-like source text remain valid parameter bytes.
+        r#"[^<\\] | [\\] [^\x00-\x1F] | "<" [^/] | "</" [^p] | "</p" [^a] | "</pa" [^r] | "</par" [^a] | "</para" [^m] | "</param" [^e] | "</parame" [^t] | "</paramet" [^e] | "</paramete" [^r] | "</parameter" [^>]"#
+            .to_string(),
     ));
     rules.push(("qwen35-str-val".to_string(), "qwen35-str-char*".to_string()));
     rules.push((
@@ -2356,10 +2363,9 @@ fn qwen35_tool_call_gbnf(
     // src/serve/mod.rs `build_chat_template_env`), so the value grammar is
     // compact-JSON-shaped:
     //
-    //   * `qwen35-json-char` excludes `<` for the same reason
-    //     `qwen35-str-char` does: a string value must never be able to
-    //     swallow the `</parameter>` close tag.  The model can always
-    //     `\<` escape a literal `<` if it truly needs one.
+    //   * `qwen35-json-char` follows JSON's normal string-character rule.
+    //     A literal `<` is valid JSON and `\<` is not a valid JSON escape;
+    //     the enclosing JSON structure and parameter close tag delimit it.
     //   * `qwen35-json-obj` / `qwen35-json-arr` are mutually recursive
     //     with `qwen35-json-val` (GBNF supports recursion — same idiom as
     //     json_schema.rs's `value`/`object`/`array` primitives).
@@ -2375,7 +2381,7 @@ fn qwen35_tool_call_gbnf(
     // with `EmitterError::UnsupportedSchema` → HTTP 400.
     rules.push((
         "qwen35-json-char".to_string(),
-        r#"[^<"\\\x00-\x1F] | [\\] (["\\/bfnrt] | [u] [0-9a-fA-F]{4})"#.to_string(),
+        r#"[^"\\\x00-\x1F] | [\\] (["\\/bfnrt] | [u] [0-9a-fA-F]{4})"#.to_string(),
     ));
     rules.push((
         "qwen35-json-str".to_string(),
@@ -2514,7 +2520,10 @@ fn qwen35_tool_call_gbnf(
     } else {
         rules.push((
             "qwen35-inner-char".to_string(),
-            r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
+            // No-schema function bodies have the same delimiter ambiguity as
+            // scalar parameters, but reserve `</function>` instead.
+            r#"[^<\\] | [\\] [^\x00-\x1F] | "<" [^/] | "</" [^f] | "</f" [^u] | "</fu" [^n] | "</fun" [^c] | "</func" [^t] | "</funct" [^i] | "</functi" [^o] | "</functio" [^n] | "</function" [^>]"#
+                .to_string(),
         ));
         format!("{} qwen35-inner-char* {}", func_open_lit, func_close_lit)
     };
@@ -4517,6 +4526,54 @@ mod tests {
         assert!(rt.is_accepted(), "not accepted");
     }
 
+    #[test]
+    fn gemma4_string_parameter_accepts_source_code_with_angle_brackets() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"}
+            },
+            "required": ["content"]
+        }"#;
+        let mut runtime = gemma4_runtime("emit_source", schema);
+        let body = r#"call:emit_source{content:<|"|>fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result<|"|>}"#;
+
+        assert!(runtime.accept_bytes(body.as_bytes()));
+        assert!(runtime.is_accepted());
+
+        let parsed = parse_gemma4_tool_call(body).expect("source tool call must parse");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arguments JSON");
+        assert_eq!(
+            arguments["content"],
+            "fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result"
+        );
+    }
+
+    #[test]
+    fn qwen35_string_parameter_accepts_source_code_with_angle_brackets() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"}
+            },
+            "required": ["content"]
+        }"#;
+        let mut runtime = qwen35_runtime("emit_source", schema);
+        let body = "<function=emit_source>\n<parameter=content>\nfn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result\n</parameter>\n</function>";
+
+        assert!(runtime.accept_bytes(body.as_bytes()));
+        assert!(runtime.is_accepted());
+
+        let parsed = parse_qwen35_tool_call(body).expect("source tool call must parse");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arguments JSON");
+        assert_eq!(
+            arguments["content"],
+            "fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result"
+        );
+    }
+
     /// A malformed wrapper prefix (`call_:` with underscore instead of `:`)
     /// must be rejected.
     #[test]
@@ -5166,11 +5223,11 @@ mod tests {
         assert!(rt.is_accepted(), "not accepted at end");
     }
 
-    /// iter-231a structural guard: the JSON-string char rule excludes `<`
-    /// so a structured value can never swallow the `</parameter>` close
-    /// tag (same conservative contract as `qwen35-str-char`).
+    /// JSON string values must preserve source-shaped angle brackets. `<` is
+    /// a valid unescaped JSON character; the enclosing JSON grammar prevents
+    /// it from consuming the parameter close tag.
     #[test]
-    fn iter231a_qwen35_object_param_rejects_angle_bracket_in_json_string() {
+    fn iter231a_qwen35_object_param_accepts_angle_bracket_in_json_string() {
         let schema = r#"{
             "type": "object",
             "properties": {
@@ -5178,13 +5235,9 @@ mod tests {
             }
         }"#;
         let mut rt = qwen35_runtime("configure", schema);
-        // `<` inside a JSON string would let the value eat the close tag.
         let input = b"<function=configure>\n<parameter=config>\n{\"a\":\"<bad\"}\n</parameter>\n</function>";
-        let ok = rt.accept_bytes(input);
-        assert!(
-            !(ok && rt.is_accepted()),
-            "JSON string containing `<` accepted (must reject — close-tag safety)"
-        );
+        assert!(rt.accept_bytes(input));
+        assert!(rt.is_accepted());
     }
 
     /// iter-231a integration: scalar params still compile and run under

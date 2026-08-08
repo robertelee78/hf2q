@@ -101,7 +101,7 @@ make_tool_request() {
   local phase=$3
   jq -n --rawfile context "$context_file" \
     --arg model "$MODEL" --arg path "$EXPECTED_PATH" --arg run_id "$RUN_ID" \
-    --arg phase "$phase" \
+    --arg phase "$phase" --arg sentinel "$SENTINEL" \
     --argjson max_tokens "$MAX_TOKENS" '{
       model: $model,
       messages: [
@@ -114,7 +114,8 @@ make_tool_request() {
           content: (
             $phase + " run " + $run_id +
             ". After reading the repository context below, call inspect_file for exactly " +
-            $path + ". Repository context follows:\n\n" + $context
+            $path + ". After the tool result confirms success, reply with exactly " +
+            $sentinel + " and nothing else. Repository context follows:\n\n" + $context
           )
         }
       ],
@@ -217,7 +218,6 @@ fi
 # Append the model's real tool call and a small tool result.  This is the
 # normal second half of an OpenCode turn, and must reuse the ~120K prefix.
 jq -n --slurpfile base "$long_request" --slurpfile prior "$long_response" \
-  --arg sentinel "$SENTINEL" \
   --argjson continuation_max_tokens "$CONTINUATION_MAX_TOKENS" '
     $base[0]
     | .messages += [
@@ -229,7 +229,7 @@ jq -n --slurpfile base "$long_request" --slurpfile prior "$long_response" \
         {
           role: "tool",
           tool_call_id: $prior[0].choices[0].message.tool_calls[0].id,
-          content: ("File inspection succeeded. Reply with exactly " + $sentinel)
+          content: "File inspection succeeded."
         }
       ]
     | .tool_choice = "auto"

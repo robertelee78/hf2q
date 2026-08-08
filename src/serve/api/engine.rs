@@ -2043,6 +2043,15 @@ pub struct GemmaLoadedModel {
     /// Owned by the worker thread; lives across requests.  See
     /// `PromptCache` doc for the cache contract.
     pub prompt_cache: PromptCache,
+    /// Prompt tokens represented by the live SerialFifo dense+hybrid KV
+    /// buffers after the last successful text request.
+    ///
+    /// This is deliberately a single in-place recovery anchor, not another
+    /// buffer snapshot. Long Gemma snapshots can exceed the bounded LCP
+    /// registry by tens of GiB while the exact prompt KV is already resident
+    /// on `weights`. The next compatible request consumes this ledger before
+    /// mutating those buffers; any miss or failure leaves it empty.
+    pub live_prefix_tokens: Vec<u32>,
     /// ADR-017 Phase E option (a) iter-2 — LCP partial-prefix
     /// observability registry. Detects whether the current request's
     /// prompt shares a non-trivial prefix with a previously-served
@@ -3076,6 +3085,8 @@ impl GemmaLoadedModel {
                 );
                 crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE.to_string()
             });
+        crate::core::chat_templates::validate_tool_chat_template("gemma4", &chat_template)
+            .map_err(|error| anyhow::anyhow!("Gemma4 chat template contract: {error}"))?;
 
         // Load GPU ctx + weights.
         //
@@ -3230,6 +3241,7 @@ impl GemmaLoadedModel {
             eos_token_ids,
             load_duration,
             prompt_cache: PromptCache::new(),
+            live_prefix_tokens: Vec::new(),
             // ADR-017 Phase E.a — LCP registry. Capacity = 1 for v1.
             //
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
@@ -11238,6 +11250,115 @@ fn build_lcp_key_for_request(
     }
 }
 
+fn common_token_prefix(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn gemma_live_resume_prefix_len(live: &[u32], prompt: &[u32]) -> usize {
+    // A full prompt match still needs one token replayed to regenerate the
+    // next-token logits when generation-only policy changed (for example,
+    // OpenCode switching tool_choice from required to auto).
+    common_token_prefix(live, prompt).min(prompt.len().saturating_sub(1))
+}
+
+fn gemma_live_batched_append_allowed(
+    serve_batched_env: Option<&str>,
+    suffix_tokens: usize,
+    n_attention_heads: usize,
+) -> bool {
+    if suffix_tokens < 32 {
+        return false;
+    }
+    match serve_batched_env {
+        Some(value) => !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
+            suffix_tokens,
+            n_attention_heads,
+        ),
+    }
+}
+
+/// Select Gemma's zero-copy SerialFifo recovery anchor.
+///
+/// The ledger is committed only after a successful request and is cleared by
+/// the caller before any new GPU mutation. The live dense and hybrid buffers
+/// already contain the prompt KV at positions `[0, k)`; decode only wrote at
+/// later absolute positions because this path requires long-resume's linear
+/// sliding storage. Capacity and regime checks fail closed to the existing
+/// snapshot/fresh-prefill paths.
+fn gemma_live_prefix_resume(
+    loaded: &GemmaLoadedModel,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    has_soft_tokens: bool,
+    batched_allowed: bool,
+) -> Option<usize> {
+    if has_soft_tokens
+        || loaded.live_prefix_tokens.is_empty()
+        || !crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+        || !crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+        || !(crate::debug::INVESTIGATION_ENV.use_dense || crate::debug::INVESTIGATION_ENV.hybrid_kv)
+    {
+        return None;
+    }
+
+    let k = gemma_live_resume_prefix_len(&loaded.live_prefix_tokens, prompt_tokens);
+    if k == 0
+        || !crate::serve::forward_prefill_batched::gemma_lcp_resume_worthwhile(
+            k,
+            prompt_tokens.len(),
+            batched_allowed,
+        )
+    {
+        return None;
+    }
+
+    let required_capacity = prompt_tokens.len().checked_add(max_tokens.max(1))?;
+    let dense = loaded.weights.dense_kvs.as_ref()?;
+    if dense.len() != loaded.weights.layers.len() {
+        return None;
+    }
+    let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+        mlx_native::DType::F16
+    } else {
+        mlx_native::DType::F32
+    };
+    let dense_ok = dense
+        .iter()
+        .zip(loaded.weights.layers.iter())
+        .all(|(cache, layer)| {
+            let is_sliding = matches!(layer.layer_type, crate::serve::config::LayerType::Sliding);
+            cache.capacity >= required_capacity
+                && cache.is_sliding == is_sliding
+                && cache.dtype == model_kv_dtype
+                && std::sync::Arc::strong_count(cache) == 1
+        });
+    if !dense_ok {
+        return None;
+    }
+
+    if crate::debug::INVESTIGATION_ENV.hybrid_kv {
+        let hybrid = loaded.weights.hybrid_kv.as_ref()?;
+        if hybrid.len() != loaded.weights.layers.len()
+            || !hybrid
+                .iter()
+                .zip(loaded.weights.layers.iter())
+                .all(|(cache, layer)| {
+                    let is_sliding =
+                        matches!(layer.layer_type, crate::serve::config::LayerType::Sliding);
+                    cache.capacity >= required_capacity && cache.is_sliding == is_sliding
+                })
+        {
+            return None;
+        }
+    }
+
+    Some(k)
+}
+
 /// Generate one full response: prefill the prompt, then decode up to
 /// `max_tokens`, halting on EOS or a configured stop string. The decode path
 /// is greedy-argmax (temperature 0). Richer sampling (top-p, top-k, seed,
@@ -11326,7 +11447,29 @@ fn generate_once_with_soft_tokens(
     //      partial-prefill resume entry point. Otherwise (any gate
     //      fails) the path falls back to the pre-iter-3 wholesale
     //      reset + fresh allocation.
-    let resume_lcp: Option<usize> = {
+    let live_resume = gemma_live_prefix_resume(
+        loaded,
+        prompt_tokens,
+        max_tokens,
+        !soft_tokens.is_empty(),
+        batched_allowed,
+    );
+    // Fail closed before this request mutates any KV bytes. Only a fully
+    // successful request below republishes a live recovery anchor.
+    loaded.live_prefix_tokens.clear();
+    let resume_lcp: Option<usize> = if let Some(k) = live_resume {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_gemma4::progress",
+            prompt_tokens = prompt_tokens.len(),
+            cached_tokens = k,
+            suffix_tokens = prompt_tokens.len().saturating_sub(k),
+            "Gemma4 live prefix reuse engaged"
+        );
+        if let Some(sink) = loaded.kv_metrics_sink.as_ref() {
+            sink.record_lcp_probe(Some(k));
+        }
+        Some(k)
+    } else {
         let lcp_key = build_lcp_key_for_request(loaded, params);
         let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
             &mut loaded.lcp_registry,
@@ -11775,8 +11918,29 @@ fn generate_once_with_soft_tokens(
             prompt_tokens.len()
         );
     }
+    let live_batched_resume = live_resume.filter(|&k| {
+        soft_tokens.is_empty()
+            && gemma_live_batched_append_allowed(
+                serve_batched_env.as_deref(),
+                prompt_tokens.len().saturating_sub(k),
+                loaded.weights.num_attention_heads,
+            )
+    });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
-    let prefill_argmax = if use_batched_serve {
+    let prefill_argmax = if let Some(k) = live_batched_resume {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_gemma4::progress",
+            cached_tokens = k,
+            suffix_tokens = prompt_tokens.len().saturating_sub(k),
+            "Gemma4 bounded batched live append engaged"
+        );
+        loaded.weights.forward_prefill_batched_live_resume(
+            &prompt_tokens[k..],
+            max_tokens,
+            k,
+            &mut loaded.ctx,
+        )?
+    } else if use_batched_serve {
         loaded
             .weights
             .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)?
@@ -12078,6 +12242,19 @@ fn generate_once_with_soft_tokens(
     // store happens AFTER all error paths above so a partial / failed
     // generation can never poison the cache.
     loaded.prompt_cache.store(prompt_tokens, params, &result);
+
+    if soft_tokens.is_empty()
+        && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+        && crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+        && (crate::debug::INVESTIGATION_ENV.use_dense || crate::debug::INVESTIGATION_ENV.hybrid_kv)
+    {
+        loaded.live_prefix_tokens.extend_from_slice(prompt_tokens);
+        tracing::info!(
+            target: "hf2q::serve::api::engine_gemma4::progress",
+            prompt_tokens = prompt_tokens.len(),
+            "Gemma4 live prefix committed"
+        );
+    }
 
     // ADR-017 Phase E option (a) iter-3 — record this prompt's
     // post-prefill KV state in the LCP registry so future requests
@@ -16171,7 +16348,29 @@ fn generate_stream_once(
     //
     // Mirrors `generate_once_with_soft_tokens`'s probe + iter-3
     // resume gate. See that site for the full design contract.
-    let resume_lcp: Option<usize> = {
+    let live_resume = gemma_live_prefix_resume(
+        loaded,
+        prompt_tokens,
+        max_tokens,
+        !soft_tokens.is_empty(),
+        batched_allowed,
+    );
+    // A dropped SSE receiver or any later error must not publish partially
+    // mutated KV as a future prefix. Commit happens only after Done.
+    loaded.live_prefix_tokens.clear();
+    let resume_lcp: Option<usize> = if let Some(k) = live_resume {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_gemma4::progress",
+            prompt_tokens = prompt_tokens.len(),
+            cached_tokens = k,
+            suffix_tokens = prompt_tokens.len().saturating_sub(k),
+            "Gemma4 streaming live prefix reuse engaged"
+        );
+        if let Some(sink) = loaded.kv_metrics_sink.as_ref() {
+            sink.record_lcp_probe(Some(k));
+        }
+        Some(k)
+    } else {
         let lcp_key = build_lcp_key_for_request(loaded, params);
         let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
             &mut loaded.lcp_registry,
@@ -16739,8 +16938,29 @@ fn generate_stream_once(
             prompt_tokens.len()
         );
     }
+    let live_batched_resume = live_resume.filter(|&k| {
+        soft_tokens.is_empty()
+            && gemma_live_batched_append_allowed(
+                serve_batched_env.as_deref(),
+                prompt_tokens.len().saturating_sub(k),
+                loaded.weights.num_attention_heads,
+            )
+    });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
-    let next_token_result = if use_batched_serve {
+    let next_token_result = if let Some(k) = live_batched_resume {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_gemma4::progress",
+            cached_tokens = k,
+            suffix_tokens = prompt_tokens.len().saturating_sub(k),
+            "Gemma4 streaming bounded batched live append engaged"
+        );
+        loaded.weights.forward_prefill_batched_live_resume(
+            &prompt_tokens[k..],
+            max_tokens,
+            k,
+            &mut loaded.ctx,
+        )
+    } else if use_batched_serve {
         loaded
             .weights
             .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)
@@ -17151,6 +17371,19 @@ fn generate_stream_once(
     loaded
         .prompt_cache
         .store_with_fragments(prompt_tokens, params, &cache_result, Some(fragments));
+
+    if soft_tokens.is_empty()
+        && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+        && crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+        && (crate::debug::INVESTIGATION_ENV.use_dense || crate::debug::INVESTIGATION_ENV.hybrid_kv)
+    {
+        loaded.live_prefix_tokens.extend_from_slice(prompt_tokens);
+        tracing::info!(
+            target: "hf2q::serve::api::engine_gemma4::progress",
+            prompt_tokens = prompt_tokens.len(),
+            "Gemma4 streaming live prefix committed"
+        );
+    }
 
     // ADR-017 Phase E.a iter-3.5b (streaming origin): mirror the
     // non-streaming snapshot-store site. Take the end-of-prefill
@@ -17690,6 +17923,28 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 mod tests {
     use super::super::schema::{ChatMessage, ContentPart, ImageUrl, MessageContent};
     use super::*;
+
+    #[test]
+    fn gemma_live_resume_rewinds_one_token_on_exact_prompt_match() {
+        let prompt = [10, 20, 30, 40];
+        assert_eq!(gemma_live_resume_prefix_len(&prompt, &prompt), 3);
+    }
+
+    #[test]
+    fn gemma_live_resume_preserves_real_partial_prefix_length() {
+        assert_eq!(
+            gemma_live_resume_prefix_len(&[10, 20, 30, 40], &[10, 20, 99]),
+            2
+        );
+        assert_eq!(gemma_live_resume_prefix_len(&[10], &[10]), 0);
+    }
+
+    #[test]
+    fn gemma_live_batched_append_respects_operator_and_suffix_size() {
+        assert!(!gemma_live_batched_append_allowed(Some("0"), 6_000, 16));
+        assert!(gemma_live_batched_append_allowed(Some("1"), 6_000, 16));
+        assert!(!gemma_live_batched_append_allowed(Some("1"), 31, 16));
+    }
 
     #[test]
     fn sampling_params_default_is_greedy_t0() {
