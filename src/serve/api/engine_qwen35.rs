@@ -816,19 +816,16 @@ impl Qwen35LoadedModel {
     /// is one allocator call vs Gemma 4's N (one per layer).
     ///
     /// **TQ-active path**: honours `self.tq_kv_active` so the multi-seq
-    /// scaffold matches the engine's tq_kv mode. The B4a-cont.1
-    /// `build_gated_attn_layer` canonical entry gate still rejects
-    /// `slot.tq.is_some() && slot_id.0 != 0` (typed
-    /// `B4a-TQ`-cited error) — provisioning the TQ buffers at
-    /// `n_seqs = max_slots` is structurally valid; the kernel-side
-    /// TQ multi-slot dispatch is iter-B4a-TQ scope.
+    /// scaffold matches the engine's TQ mode. Packed and norms buffers use
+    /// `n_seqs = max_slots` as their outer axis; encode, attention, and resume
+    /// dispatches receive zero-copy views of the selected slot region.
     ///
     /// # Errors
     ///
     /// Propagates the first [`HybridKvCache::new_with_options`] error
     /// (`anyhow::Error`); typical causes are zero `max_seq_len` /
     /// zero `n_seqs` (caught earlier by the spawn arm's `max_slots == 0`
-    /// guard) or MlxDevice OOM at production shape × N slots.
+    /// guard) or an invalid Metal virtual allocation.
     pub fn provision_multi_seq_kv_for_slot_aware(&mut self, max_slots: u32) -> anyhow::Result<()> {
         use anyhow::Context;
         if max_slots == 0 {
@@ -841,21 +838,10 @@ impl Qwen35LoadedModel {
         }
         let device = mlx_native::MlxDevice::new()
             .context("ADR-040 C2d: MlxDevice::new for Qwen35 multi-seq KV provisioning")?;
-        // ADR-040 `iter-F-kvcap` convention (M-QWEN port, 2026-07-01):
-        // split the full-attention context budget across slots — each of
-        // `max_slots` slots gets `max_position_embeddings / max_slots`
-        // (the llama.cpp `-c`÷`-np` convention, user-authorized "each
-        // instance should get max/n"). Sizing every slot to the FULL
-        // context (the pre-kvcap behavior this replaces) eagerly
-        // allocates n_seqs × full-ctx KV — for qwen3.6-35B-A3B at
-        // n_seqs=8 with F32 KV that is ~86 GB (10 full-attn layers ×
-        // nkv=2 × ctx 262144 × hd=256 × 4 B × K+V × 8 slots), which
-        // ground provisioning into an hour-long zero-fill on a 128 GB
-        // box (measured 2026-07-01, M-QWEN gate hang). `max_slots=1` is
-        // identity (max/1 = max) so SerialFifo / single-slot sizing is
-        // unchanged — mirrors gemma4's per-slot split in
-        // `layer_type_to_alloc_params_per_slot`.
-        let max_seq_len = self.model.cfg.max_position_embeddings / max_slots;
+        // Every agent slot receives the complete model context. The Qwen KV
+        // allocator reserves full-attention storage lazily, while scheduler
+        // admission governs aggregate physical high-water use.
+        let max_seq_len = self.model.cfg.max_position_embeddings;
         let cache = HybridKvCache::new_with_options(
             &self.model.cfg,
             &device,
@@ -944,16 +930,14 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             // `self.tq_kv_active` was sourced at engine load via
             // `is_tq_active_mode()` (iter-12).
             tq_kv_active: self.tq_kv_active,
-            // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Qwen3.5/3.6
-            // layers carry a single homogeneous `(num_key_value_heads,
-            // head_dim)` shape across all 64 layers (the only per-layer
-            // variability is the full-attn-interval that switches the
-            // KV-cache LAYOUT — linear vs full — but each layer's
-            // (n_kv_heads, head_dim) pair is constant). The flattened
-            // scalar formula at `LoadInfo::kv_bytes_per_token` is
-            // therefore EXACT for Qwen35; `None` means "no override —
-            // use the flat formula".
-            kv_bytes_per_token_override: None,
+            // DeltaNet layers retain fixed recurrent state. Only the
+            // full-attention (and optional MTP) cache grows with context;
+            // TQ mode stores packed U8 K/V plus F32 norms and drops F32 K/V.
+            kv_bytes_per_token_override: Some(load_info::qwen35_slot_kv_bytes_per_token(
+                cfg,
+                self.tq_kv_active,
+            )),
+            kv_fixed_bytes_per_slot_override: Some(load_info::qwen35_fixed_kv_bytes_per_slot(cfg)),
         }
     }
 }
@@ -1265,10 +1249,14 @@ use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 /// `serve/mod.rs:1262-1270` — for text-only Qwen3.5/3.6 we replicate the
 /// absolute-position index across all 4 axes.
 fn prefill_positions_for(prompt_len: usize) -> Vec<i32> {
-    let mut flat = vec![0i32; 4 * prompt_len];
+    prefill_positions_from(0, prompt_len)
+}
+
+fn prefill_positions_from(start: usize, len: usize) -> Vec<i32> {
+    let mut flat = vec![0i32; 4 * len];
     for axis in 0..4 {
-        for t in 0..prompt_len {
-            flat[axis * prompt_len + t] = t as i32;
+        for t in 0..len {
+            flat[axis * len + t] = (start + t) as i32;
         }
     }
     flat
@@ -2465,7 +2453,7 @@ pub fn generate_qwen35_once(
         if is_greedy {
             // Snapshot 1: prompt_cache (full-equality replay, Phase E.b).
             let prompt_snapshot_start = Instant::now();
-            match kv_cache.snapshot(&device) {
+            match kv_cache.snapshot_prefix(&device, prompt_len) {
                 Ok(snap) => {
                     let snapshot_bytes = snap.total_bytes();
                     qwen.prompt_cache
@@ -3078,16 +3066,24 @@ pub(crate) struct Qwen35TickOutcome {
 /// reference.
 pub(crate) struct Qwen35DecodeState {
     slot_id: SlotId,
+    prompt_tokens: Vec<u32>,
     prompt_len: usize,
     max_tokens: usize,
     is_greedy: bool,
     want_logprobs: bool,
     logprobs_vec: Option<Vec<f32>>,
-    prompt_cache_hit: bool,
+    cached_tokens: usize,
     /// Cloned request sampling params — the qwen35 sampling helpers
     /// (`sample_logits_qwen35*`) read temperature/top_p/top_k/rep-penalty/
     /// max_tokens off this each tick (serial ref passes the live `params`).
     params: SamplingParams,
+    /// Request-local grammar state. SlotAware previously dropped this state
+    /// and sampled unconstrained, which made required/automatic tool calls
+    /// diverge from the serial OpenCode path.
+    grammar_runtime: Option<super::grammar::GrammarRuntime>,
+    /// Independent marker detector used only to awaken auto-lazy tool
+    /// grammars. OpenAI SSE routing owns a sibling splitter in `engine.rs`.
+    tool_splitter: Option<ToolCallSplitter>,
     /// The token to feed into the NEXT decode forward.
     next_token: u32,
     generated_tokens: Vec<u32>,
@@ -3112,9 +3108,12 @@ impl Qwen35DecodeState {
         qwen: &mut Qwen35LoadedModel,
         prompt_tokens: &[u32],
         params: &SamplingParams,
+        registration: Option<&ModelRegistration>,
         kv_cache: &mut HybridKvCache,
         slot_id: SlotId,
-    ) -> Result<Self> {
+        cached_tokens: usize,
+        cached_prefill_logits: Option<&[f32]>,
+    ) -> Result<(Self, Vec<f32>)> {
         anyhow::ensure!(
             !prompt_tokens.is_empty(),
             "Qwen35DecodeState::prefill_seed: empty prompt_tokens"
@@ -3127,6 +3126,16 @@ impl Qwen35DecodeState {
             kv_cache.n_seqs,
         );
         let prompt_len = prompt_tokens.len();
+        anyhow::ensure!(
+            cached_tokens <= prompt_len,
+            "Qwen35DecodeState::prefill_seed: cached_tokens={} exceeds prompt_len={}",
+            cached_tokens,
+            prompt_len,
+        );
+        anyhow::ensure!(
+            (cached_tokens == prompt_len) == cached_prefill_logits.is_some(),
+            "Qwen35DecodeState::prefill_seed: a full-prompt cache hit requires prompt-boundary logits, and partial/cold prefill must not supply them"
+        );
         let max_tokens = params.max_tokens.max(1);
         let need_seq = prompt_len + max_tokens + 64;
         if need_seq > kv_cache.max_seq_len as usize {
@@ -3149,10 +3158,26 @@ impl Qwen35DecodeState {
         } else {
             None
         };
+        let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
+        let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
 
-        kv_cache
-            .reset_for_slot(slot_id)
-            .context("ADR-040 Phase F M1: Qwen35 reset_for_slot at entry")?;
+        if cached_tokens == 0 {
+            kv_cache
+                .reset_for_slot(slot_id)
+                .context("ADR-040 full-context slots: Qwen35 cold reset_for_slot at entry")?;
+        } else {
+            let cursor = kv_cache
+                .sequence_len_for_slot(slot_id)
+                .context("ADR-040 full-context slots: read Qwen35 retained cursor")?
+                as usize;
+            anyhow::ensure!(
+                cursor == cached_tokens,
+                "Qwen35DecodeState::prefill_seed: retained token ledger/cache cursor mismatch for slot {} (ledger={}, cursor={}); refusing unsafe resume",
+                slot_id.0,
+                cached_tokens,
+                cursor,
+            );
+        }
 
         // codex M1 review fix (2026-06-24): cross-request prompt-cache RESUME is
         // NOT slot-isolated under SlotAware. `restore_partial(snap, prompt_len)`
@@ -3164,43 +3189,49 @@ impl Qwen35DecodeState {
         // continuous batching is a separate M5 optimization (mirrors the gemma4
         // LCP write-back skip). SerialFifo serves qwen35 via the legacy
         // generate_qwen35_once path (its own prompt-cache), unaffected.
-        let prompt_cache_hit = false;
         let prefill_start = Instant::now();
-        let next_token: u32;
-        if prompt_cache_hit {
-            let snap = qwen
-                .prompt_cache
-                .snapshot()
-                .expect("try_match returned Some implies snapshot Some");
-            kv_cache
-                .restore_partial(snap, prompt_len)
-                .context("ADR-040 Phase F M1: Qwen35 prompt_cache restore_partial")?;
-            next_token = qwen.prompt_cache.first_decoded_token();
-        } else {
-            let positions = prefill_positions_for(prompt_len);
-            let prefill_logits = qwen
-                .model
-                .forward_gpu_last_logits(prompt_tokens, &positions, kv_cache, slot_id)
-                .context("Qwen35Model::forward_gpu_last_logits (slot-aware prefill)")?;
+        let prefill_logits = if let Some(logits) = cached_prefill_logits {
             anyhow::ensure!(
-                prefill_logits.len() == qwen.vocab_size,
-                "qwen35 slot-aware prefill logits len {} != vocab_size {}",
-                prefill_logits.len(),
+                logits.len() == qwen.vocab_size,
+                "qwen35 cached prompt-boundary logits len {} != vocab_size {}",
+                logits.len(),
                 qwen.vocab_size
             );
-            if is_greedy && !want_logprobs {
-                next_token = greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
-            } else {
-                let mut logits = prefill_logits;
-                if let Some(ref mut lps) = logprobs_vec {
-                    let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
-                    lps.push(lp);
-                    next_token = tok;
-                } else {
-                    next_token = sample_logits_qwen35(&mut logits, params, &[]);
-                }
+            logits.to_vec()
+        } else {
+            let suffix = &prompt_tokens[cached_tokens..];
+            anyhow::ensure!(
+                !suffix.is_empty(),
+                "Qwen35DecodeState::prefill_seed: empty suffix without cached prompt-boundary logits"
+            );
+            let positions = prefill_positions_from(cached_tokens, suffix.len());
+            qwen.model
+                .forward_gpu_last_logits(suffix, &positions, kv_cache, slot_id)
+                .context("Qwen35Model::forward_gpu_last_logits (slot-aware prefill)")?
+        };
+        anyhow::ensure!(
+            prefill_logits.len() == qwen.vocab_size,
+            "qwen35 slot-aware prefill logits len {} != vocab_size {}",
+            prefill_logits.len(),
+            qwen.vocab_size
+        );
+        let next_token = if is_greedy && !want_logprobs {
+            greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+        } else {
+            let mut logits = prefill_logits.clone();
+            let (token, logprob) = sample_logits_qwen35_constrained(
+                &mut logits,
+                params,
+                &[],
+                grammar_runtime.as_ref(),
+                want_logprobs,
+            );
+            if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+                values.push(logprob);
             }
-        }
+            token
+        };
+        advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
         let prefill_duration = prefill_start.elapsed();
 
         let decode_start = Instant::now();
@@ -3210,6 +3241,17 @@ impl Qwen35DecodeState {
             .tokenizer
             .decode(&[next_token], false)
             .unwrap_or_default();
+        if let Some(splitter) = tool_splitter.as_mut() {
+            let marker_events = splitter.feed(&decoded_text);
+            if marker_events
+                .iter()
+                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen))
+            {
+                if let Some(runtime) = grammar_runtime.as_mut() {
+                    runtime.trigger();
+                }
+            }
+        }
         let stops = params.stop_strings.clone();
         let mut finish_reason: &'static str = "length";
         // First-token EOS: qwen35 POPS + clears (divergent from gemma4,
@@ -3223,24 +3265,30 @@ impl Qwen35DecodeState {
             finish_reason = "stop";
         }
 
-        Ok(Qwen35DecodeState {
-            slot_id,
-            prompt_len,
-            max_tokens,
-            is_greedy,
-            want_logprobs,
-            logprobs_vec,
-            prompt_cache_hit,
-            params: params.clone(),
-            next_token,
-            generated_tokens,
-            decoded_text,
-            stop_strings: stops,
-            finish_reason,
-            step: 1,
-            prefill_duration,
-            decode_start,
-        })
+        Ok((
+            Qwen35DecodeState {
+                slot_id,
+                prompt_tokens: prompt_tokens.to_vec(),
+                prompt_len,
+                max_tokens,
+                is_greedy,
+                want_logprobs,
+                logprobs_vec,
+                cached_tokens,
+                params: params.clone(),
+                grammar_runtime,
+                tool_splitter,
+                next_token,
+                generated_tokens,
+                decoded_text,
+                stop_strings: stops,
+                finish_reason,
+                step: 1,
+                prefill_duration,
+                decode_start,
+            },
+            prefill_logits,
+        ))
     }
 
     /// Whether the slot already terminated during prefill-seed.
@@ -3253,6 +3301,25 @@ impl Qwen35DecodeState {
     /// decoded_text); on a stop-string hit it is the stop-stripped prefix.
     pub(crate) fn seed_fragment(&self) -> String {
         self.decoded_text.clone()
+    }
+
+    /// Exact input-token prefix represented by the live KV/recurrent state.
+    /// The cache cursor is authoritative because the newest sampled token has
+    /// not necessarily been fed back through the model yet.
+    pub(crate) fn retained_prefix(&self, valid_tokens: usize) -> Vec<u32> {
+        self.prompt_tokens
+            .iter()
+            .chain(self.generated_tokens.iter())
+            .copied()
+            .take(valid_tokens)
+            .collect()
+    }
+
+    /// Exact rendered prompt and generation parameters used by the per-slot
+    /// deterministic replay cache. The cache is response-shaped; live KV
+    /// remains available for longer conversation continuations.
+    pub(crate) fn prompt_cache_identity(&self) -> (&[u32], &SamplingParams) {
+        (&self.prompt_tokens, &self.params)
     }
 
     /// Advance this slot by exactly one decode token — mirror of the serial
@@ -3304,19 +3371,28 @@ impl Qwen35DecodeState {
                 qwen.vocab_size
             );
             let mut logits = logits;
-            if let Some(ref mut lps) = self.logprobs_vec {
-                let (tok, lp) = sample_logits_qwen35_with_logprob(
-                    &mut logits,
-                    &self.params,
-                    &self.generated_tokens,
-                );
-                lps.push(lp);
-                tok
-            } else {
-                sample_logits_qwen35(&mut logits, &self.params, &self.generated_tokens)
+            let (token, logprob) = sample_logits_qwen35_constrained(
+                &mut logits,
+                &self.params,
+                &self.generated_tokens,
+                self.grammar_runtime.as_ref(),
+                self.want_logprobs,
+            );
+            if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
+                values.push(logprob);
             }
+            token
         };
+        advance_qwen35_grammar(&mut self.grammar_runtime, &self.params, tok);
         if qwen.eos_token_ids.contains(&tok) {
+            self.finish_reason = "stop";
+            return Ok(Qwen35TickOutcome {
+                fragment: String::new(),
+                is_reasoning: false,
+                finished: true,
+            });
+        }
+        if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, tok) {
             self.finish_reason = "stop";
             return Ok(Qwen35TickOutcome {
                 fragment: String::new(),
@@ -3327,6 +3403,17 @@ impl Qwen35DecodeState {
         self.generated_tokens.push(tok);
         let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
         self.decoded_text.push_str(&frag);
+        if let Some(splitter) = self.tool_splitter.as_mut() {
+            let marker_events = splitter.feed(&frag);
+            if marker_events
+                .iter()
+                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen))
+            {
+                if let Some(runtime) = self.grammar_runtime.as_mut() {
+                    runtime.trigger();
+                }
+            }
+        }
         if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
             qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
             self.finish_reason = "stop";
@@ -3403,11 +3490,7 @@ impl Qwen35DecodeState {
             finish_reason: self.finish_reason,
             prefill_duration: self.prefill_duration,
             decode_duration,
-            cached_tokens: if self.prompt_cache_hit {
-                self.prompt_len
-            } else {
-                0
-            },
+            cached_tokens: self.cached_tokens,
             logprobs: self.logprobs_vec,
         }
     }
@@ -5387,7 +5470,7 @@ pub fn generate_stream_qwen35_once_extended(
         // requests must not restore. Skip the snapshot entirely on
         // extension paths.
         if is_greedy && !has_extension {
-            match kv_cache.snapshot(&device) {
+            match kv_cache.snapshot_prefix(&device, prompt_len) {
                 Ok(snap) => {
                     qwen.prompt_cache
                         .update(prompt_tokens.to_vec(), snap, next_token, params)
@@ -7018,6 +7101,31 @@ mod tests {
         }
     }
 
+    fn initialized_prompt_cache_snapshot(
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        prompt_len: usize,
+    ) -> HybridKvCacheSnapshot {
+        let mut kv = HybridKvCache::new(cfg, device, 16, 1).expect("kv");
+        for slot in &mut kv.full_attn {
+            for buf in [slot.k.as_mut(), slot.v.as_mut()].into_iter().flatten() {
+                buf.as_mut_slice::<u8>()
+                    .expect("full-attention test buffer")
+                    .fill(0x5a);
+            }
+            slot.current_len[0] = prompt_len as u32;
+        }
+        if let Some(slot) = kv.mtp_slot.as_mut() {
+            for buf in [slot.k.as_mut(), slot.v.as_mut()].into_iter().flatten() {
+                buf.as_mut_slice::<u8>()
+                    .expect("MTP test buffer")
+                    .fill(0xa5);
+            }
+            slot.current_len[0] = prompt_len as u32;
+        }
+        kv.snapshot(device).expect("cursor-bounded snapshot")
+    }
+
     #[test]
     fn gpu_greedy_gate_rejects_cpu_sampling_features() {
         assert!(is_greedy_eligible(&greedy_params()));
@@ -7090,9 +7198,8 @@ mod tests {
     fn hybrid_prompt_cache_invalidates_on_prompt_divergence() {
         let cfg = moe_cfg_40layer_for_cache_test();
         let device = MlxDevice::new().expect("device");
-        let kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("kv");
-        let snap = kv.snapshot(&device).expect("snap");
         let prompt = vec![10u32, 20, 30, 40];
+        let snap = initialized_prompt_cache_snapshot(&cfg, &device, prompt.len());
         let mut cache = HybridPromptCache::new();
         cache.update(prompt.clone(), snap, 99u32, &greedy_params());
         assert!(cache.has_entry());
@@ -7129,9 +7236,8 @@ mod tests {
     fn hybrid_prompt_cache_invalidates_on_genparams_mismatch() {
         let cfg = moe_cfg_40layer_for_cache_test();
         let device = MlxDevice::new().expect("device");
-        let kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("kv");
-        let snap = kv.snapshot(&device).expect("snap");
         let prompt = vec![1u32, 2, 3];
+        let snap = initialized_prompt_cache_snapshot(&cfg, &device, prompt.len());
         let mut cache = HybridPromptCache::new();
         let stored_params = SamplingParams {
             max_tokens: 32,
@@ -7176,9 +7282,8 @@ mod tests {
     fn hybrid_prompt_cache_sampling_mode_bypasses_lookup_and_store() {
         let cfg = moe_cfg_40layer_for_cache_test();
         let device = MlxDevice::new().expect("device");
-        let kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("kv");
-        let snap = kv.snapshot(&device).expect("snap");
         let prompt = vec![1u32, 2, 3];
+        let snap = initialized_prompt_cache_snapshot(&cfg, &device, prompt.len());
 
         // Lookup with sampling-mode bypasses even on a populated cache.
         let mut cache = HybridPromptCache::new();
@@ -7192,8 +7297,7 @@ mod tests {
         );
 
         // Store with sampling-mode is a no-op (cache stays as it was).
-        let kv2 = HybridKvCache::new(&cfg, &device, 16, 1).expect("kv2");
-        let snap2 = kv2.snapshot(&device).expect("snap2");
+        let snap2 = initialized_prompt_cache_snapshot(&cfg, &device, prompt.len());
         let mut cache2 = HybridPromptCache::new();
         cache2.update(
             prompt.clone(),

@@ -66,28 +66,25 @@
 #                           server must 400 on overflow (OpenAI semantics)
 #                           instead of silently rewriting the conversation
 #                           (default "summarize") or truncating it.
-#   --scheduler fifo-serial Production default. Per-stream decode stays
-#                           at full speed (~123 tok/s); concurrent
-#                           requests queue (cap 32 → 429 + Retry-After).
-#                           inflight-batched is NOT recommended here:
-#                           qwen35moe multi-slot requires HF2Q_TQ_KV=0
-#                           (3.94× more KV memory) and slot-aware mode has
-#                           no LCP prefix resume (ADR-040 iter-LCP is
-#                           structural N/A) — a strict downgrade for
-#                           single-user agentic coding.
+#   --scheduler inflight-batched --max-slots 4
+#                           Four independent agent sessions make progress and
+#                           retain separate exact ChatML prefixes. Every slot
+#                           advertises the full model context; no ctx/N math.
+#   HF2Q_TQ_KV=1           TQ K/V stays active for every agent slot. The
+#                           packed/norm buffers carry an outer slot axis and
+#                           zero-copy Metal views select the active agent.
+#   --kv-cache-budget-bytes Shared physical high-water across the full-context
+#                           slots. MAX_SLOTS=8 is the np8-like setting.
 #
 # Family contract and prefix-cache stack:
 #   * The loader uses the GGUF-embedded Qwen ChatML template and validates its
 #     native turn, tool-call, and tool-response markers before inference.
-#   1. HybridPromptCache — exact-repeat requests replay in ~2 ms
-#      (greedy-only, single-slot).
-#   2. The compact latest-turn checkpoint preserves the stable ChatML prefix
-#      immediately before Qwen's temporary generation seed. A 119,728-token
-#      continuation reused 119,669 tokens and reached semantic output in
-#      0.858 s on the target M5 Max.
-#   3. Disk persistence — compact checkpoints survive server restarts
-#      across ordinary per-turn cache-capacity changes (QH35 codec v5,
-#      capacity-independent + substrate-namespaced fingerprint).
+#   1. Exact rendered-token affinity selects the slot holding the longest
+#      matching ChatML prefix.
+#   2. Each agent appends only its suffix to that slot's live TQ KV/recurrent
+#      state; another agent no longer resets the single global cache.
+#   3. Disk persistence remains available to SerialFifo runs. The multi-slot
+#      worker does not claim restart hydration until that path is proven.
 #
 # Usage:
 #   scripts/serve_qwen36_opencode.sh            # foreground (default)
@@ -101,6 +98,8 @@ KV_DIR="${KV_DIR:-$HOME/.cache/hf2q/kv-persist}"
 KV_BUDGET_BYTES="${KV_BUDGET_BYTES:-13743895347}"  # 12.8 GiB
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MID_STORES="${MID_STORES:-0}"
+MAX_SLOTS="${MAX_SLOTS:-4}"
+KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
@@ -110,6 +109,14 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
 fi
 if [[ "$MID_STORES" != "0" && "$MID_STORES" != "1" ]]; then
     echo "MID_STORES must be 0 or 1 (got: $MID_STORES)" >&2
+    exit 3
+fi
+if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); then
+    echo "MAX_SLOTS must be from 1 through 8 (got: $MAX_SLOTS)" >&2
+    exit 3
+fi
+if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 )); then
+    echo "KV_CACHE_BUDGET_BYTES must be a positive integer (got: $KV_CACHE_BUDGET_BYTES)" >&2
     exit 3
 fi
 if [[ "$MID_STORES" == "1" ]]; then
@@ -155,6 +162,7 @@ exec env \
     HF2Q_KV_PERSIST="$KV_DIR" \
     HF2Q_KV_PERSIST_BUDGET_BYTES="$KV_BUDGET_BYTES" \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
+    HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \
     "$HF2Q_BIN" -v serve \
@@ -163,4 +171,6 @@ exec env \
         --port "$PORT" \
         --kv-persist "$KV_DIR" \
         --overflow-policy reject \
-        --scheduler fifo-serial
+        --scheduler inflight-batched \
+        --max-slots "$MAX_SLOTS" \
+        --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"

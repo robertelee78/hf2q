@@ -527,6 +527,42 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
 }
 
 #[test]
+fn compact_snapshot_never_reads_or_copies_rows_beyond_the_cursor() {
+    let mut cfg = config(vec![4]);
+    cfg.max_position_embeddings = 128;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let mut source = Deepseek4Cache::allocate_logical(&plan, device.clone()).unwrap();
+    let mut target = Deepseek4Cache::allocate(&plan, device).unwrap();
+
+    source.layers_mut()[0]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()
+        .fill(0x5a5a);
+    source.layers_mut()[0]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[..8]
+        .fill(0x1234);
+    for expected in 0..1 {
+        source.commit_step(expected).unwrap();
+    }
+
+    let snapshot = source.snapshot().unwrap();
+    target.restore(&snapshot).unwrap();
+    let restored = target.layers()[0].window_kv.as_slice::<u16>().unwrap();
+    assert!(restored[..8].iter().all(|&value| value == 0x1234));
+    assert!(
+        restored[8..].iter().all(|&value| value == 0),
+        "cursor-invisible source tail must remain destination zero state"
+    );
+}
+
+#[test]
 fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
     let mut cfg = config(vec![0, 4, 128]);
     cfg.max_position_embeddings = 256;
@@ -538,16 +574,36 @@ fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
     let mut source = Deepseek4Cache::allocate(&source_plan, MlxDevice::new().unwrap()).unwrap();
     let mut target = Deepseek4Cache::allocate(&target_plan, MlxDevice::new().unwrap()).unwrap();
 
-    let source_attention_len = source.layers()[1]
-        .attention_kv
+    source.layers_mut()[1]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0x2345;
+    source.layers_mut()[1]
+        .compressed_kv
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<u16>()
+        .unwrap()[9] = 0x3456;
+    let compressed_tail = source.layers()[1]
+        .compressed_kv
+        .as_ref()
+        .unwrap()
         .as_slice::<u16>()
         .unwrap()
         .len();
     source.layers_mut()[1]
-        .attention_kv
+        .compressed_kv
+        .as_mut()
+        .unwrap()
         .as_mut_slice::<u16>()
-        .unwrap()[source_attention_len - 1] = 0x2345;
-    let source_indexer_len = source.layers()[1]
+        .unwrap()[compressed_tail - 1] = 0xcafe;
+    source.layers_mut()[1]
+        .indexer_kv
+        .as_mut()
+        .unwrap()
+        .as_mut_slice::<u16>()
+        .unwrap()[5] = 0x6789;
+    let indexer_tail = source.layers()[1]
         .indexer_kv
         .as_ref()
         .unwrap()
@@ -559,7 +615,7 @@ fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
         .as_mut()
         .unwrap()
         .as_mut_slice::<u16>()
-        .unwrap()[source_indexer_len - 1] = 0x6789;
+        .unwrap()[indexer_tail - 1] = 0xbeef;
     source.layers_mut()[1]
         .main_kv_state
         .as_mut()
@@ -576,13 +632,27 @@ fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
     assert_eq!(target.position(), 11);
     assert_eq!(target.capacity(), 256);
     assert_eq!(
-        target.layers()[1].attention_kv.as_slice::<u16>().unwrap()[source_attention_len - 1],
+        target.layers()[1].window_kv.as_slice::<u16>().unwrap()[3],
         0x2345
     );
-    assert!(
-        target.layers()[1].attention_kv.as_slice::<u16>().unwrap()[source_attention_len..]
-            .iter()
-            .all(|value| *value == 0)
+    assert_eq!(
+        target.layers()[1]
+            .compressed_kv
+            .as_ref()
+            .unwrap()
+            .as_slice::<u16>()
+            .unwrap()[9],
+        0x3456
+    );
+    assert_eq!(
+        target.layers()[1]
+            .compressed_kv
+            .as_ref()
+            .unwrap()
+            .as_slice::<u16>()
+            .unwrap()[compressed_tail - 1],
+        0,
+        "uncommitted compressed tail must not migrate"
     );
     assert_eq!(
         target.layers()[1]
@@ -590,17 +660,19 @@ fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
             .as_ref()
             .unwrap()
             .as_slice::<u16>()
-            .unwrap()[source_indexer_len - 1],
+            .unwrap()[5],
         0x6789
     );
-    assert!(target.layers()[1]
-        .indexer_kv
-        .as_ref()
-        .unwrap()
-        .as_slice::<u16>()
-        .unwrap()[source_indexer_len..]
-        .iter()
-        .all(|value| *value == 0));
+    assert_eq!(
+        target.layers()[1]
+            .indexer_kv
+            .as_ref()
+            .unwrap()
+            .as_slice::<u16>()
+            .unwrap()[indexer_tail - 1],
+        0,
+        "uncommitted indexer tail must not migrate"
+    );
     assert_eq!(
         target.layers()[1]
             .main_kv_state

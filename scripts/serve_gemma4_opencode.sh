@@ -26,7 +26,17 @@
 #   --overflow-policy reject
 #                           opencode manages its own compaction; the server
 #                           must 400 on overflow (OpenAI semantics).
-#   --scheduler fifo-serial Production default; concurrent requests queue.
+#   --scheduler inflight-batched --max-slots 4
+#                           Four independent agent sessions make progress.
+#                           Every slot retains Gemma's full model context;
+#                           neither context nor KV capacity is divided by N.
+#   --kv-cache-budget-bytes Shared physical high-water across full-context
+#                           slots. MAX_SLOTS=8 is the np8-like setting.
+#   HF2Q_ADMIT_COALESCE_US=25000
+#                           When every slot is idle, wait at most 25 ms for
+#                           peer agent requests so their appended suffixes can
+#                           share one transformer-body pass. Active decode is
+#                           never delayed for collection.
 #   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
 #                           Loop mitigation (2026-08-03), same knob as
 #                           serve_qwen36_opencode.sh — opencode cannot send
@@ -60,7 +70,8 @@
 #     HF2Q_SERVE_BATCHED_PREFILL=0  force linear route always
 #     HF2Q_SERVE_BATCHED_PREFILL=1  force batched route always (can
 #         reproduce the 2026-08-03 command-buffer OOM — diagnostic only)
-#     BATCHED=0 (this script)        same as the =0 env, kept for compat
+#     BATCHED=0 (this script)        disables both SerialFifo and slot-aware
+#                                    batched prefill for parity diagnostics
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -73,8 +84,8 @@
 #
 # Prefix-cache stack:
 #   1. PromptCache — exact-repeat requests replay instantly (greedy-only).
-#   2. Live-prefix reuse — the immediately following fifo-serial turn appends
-#      to resident dense+hybrid KV without a second full snapshot.
+#   2. Per-slot live-prefix reuse — each agent's next turn appends to its own
+#      resident dense+hybrid KV without displacing another agent.
 #   3. LCP registry — short or branched prefixes may resume from dual-leg
 #      snapshots when they fit the configured byte budget.
 #
@@ -89,11 +100,21 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8082}"
 LCP_CAPACITY="${LCP_CAPACITY:-8g}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
+MAX_SLOTS="${MAX_SLOTS:-4}"
+KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
+    exit 3
+fi
+if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); then
+    echo "MAX_SLOTS must be from 1 through 8 (got: $MAX_SLOTS)" >&2
+    exit 3
+fi
+if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 )); then
+    echo "KV_CACHE_BUDGET_BYTES must be a positive integer (got: $KV_CACHE_BUDGET_BYTES)" >&2
     exit 3
 fi
 
@@ -145,7 +166,10 @@ if [[ -f "$MMPROJ" ]]; then
         HF2Q_KV_LCP_RESUME=1 \
         HF2Q_KV_LCP_LONG_RESUME=1 \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
+        HF2Q_CROSS_SLOT_ADMIT=1 \
+        HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
+        ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -153,18 +177,25 @@ if [[ -f "$MMPROJ" ]]; then
             --host "$HOST" \
             --port "$PORT" \
             --overflow-policy reject \
-            --scheduler fifo-serial
+            --scheduler inflight-batched \
+            --max-slots "$MAX_SLOTS" \
+            --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
 else
     exec env \
         HF2Q_KV_LCP_RESUME=1 \
         HF2Q_KV_LCP_LONG_RESUME=1 \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
+        HF2Q_CROSS_SLOT_ADMIT=1 \
+        HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
+        ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
             --host "$HOST" \
             --port "$PORT" \
             --overflow-policy reject \
-            --scheduler fifo-serial
+            --scheduler inflight-batched \
+            --max-slots "$MAX_SLOTS" \
+            --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
 fi

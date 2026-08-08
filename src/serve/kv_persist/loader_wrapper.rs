@@ -523,6 +523,7 @@ mod tests {
                 // ADR-040 Phase C iter-4 (C4) — test fixture uses
                 // SerialFifo (ADR-005 byte-equivalent path).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+                kv_cache_budget_bytes: None,
             },
         )
     }

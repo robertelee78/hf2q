@@ -4,8 +4,9 @@ use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
 use thiserror::Error;
 
 use super::cache_buffers::{
-    allocate_buffer, allocate_optional, buffer_plan, completed_group_step, compressor_state_plans,
-    fill_state, optional_buffer_plan, validate_request, view_buffer,
+    allocate_buffer, allocate_optional, allocate_overwrite_buffer, buffer_plan,
+    completed_group_step, compressor_state_plans, fill_state, optional_buffer_plan,
+    validate_request, view_buffer,
 };
 use super::Deepseek4Config;
 
@@ -324,15 +325,42 @@ impl Deepseek4CachePlan {
 
 impl Deepseek4Cache {
     pub fn allocate(plan: &Deepseek4CachePlan, device: MlxDevice) -> Result<Self, CacheError> {
+        Self::allocate_impl(plan, device, false)
+    }
+
+    /// Reserve the full logical context while physically committing only KV
+    /// rows that inference writes. Compressor state remains normally
+    /// initialized because it is read across token steps.
+    pub fn allocate_logical(
+        plan: &Deepseek4CachePlan,
+        device: MlxDevice,
+    ) -> Result<Self, CacheError> {
+        Self::allocate_impl(plan, device, true)
+    }
+
+    fn allocate_impl(
+        plan: &Deepseek4CachePlan,
+        device: MlxDevice,
+        lazy_append_storage: bool,
+    ) -> Result<Self, CacheError> {
         let mut layers = Vec::with_capacity(plan.layers.len());
         let mut resident_bytes = 0_u64;
         for layer in &plan.layers {
-            let attention_kv = allocate_buffer(
-                &device,
-                layer.layer_index,
-                CacheKind::AttentionKv,
-                &layer.attention_kv,
-            )?;
+            let attention_kv = if lazy_append_storage {
+                allocate_overwrite_buffer(
+                    &device,
+                    layer.layer_index,
+                    CacheKind::AttentionKv,
+                    &layer.attention_kv,
+                )?
+            } else {
+                allocate_buffer(
+                    &device,
+                    layer.layer_index,
+                    CacheKind::AttentionKv,
+                    &layer.attention_kv,
+                )?
+            };
             let window_kv = view_buffer(
                 &attention_kv,
                 0,
@@ -357,7 +385,16 @@ impl Deepseek4Cache {
                 .indexer_kv
                 .as_ref()
                 .map(|buffer| {
-                    allocate_buffer(&device, layer.layer_index, CacheKind::IndexerKv, buffer)
+                    if lazy_append_storage {
+                        allocate_overwrite_buffer(
+                            &device,
+                            layer.layer_index,
+                            CacheKind::IndexerKv,
+                            buffer,
+                        )
+                    } else {
+                        allocate_buffer(&device, layer.layer_index, CacheKind::IndexerKv, buffer)
+                    }
                 })
                 .transpose()?;
             let main_kv_state = allocate_optional(
@@ -493,15 +530,35 @@ impl Deepseek4Cache {
         for (layer_index, (source_layer, destination_layer)) in
             source.layers.iter().zip(self.layers.iter_mut()).enumerate()
         {
-            copy_buffer_prefix(
-                &source_layer.attention_kv,
-                &mut destination_layer.attention_kv,
+            let layer_plan = &source.plan.layers[layer_index];
+            let window_rows = source.next_position.min(source_layer.window_kv.shape()[0]);
+            let compressed_rows = if layer_plan.compress_ratio == 0 {
+                0
+            } else {
+                source.next_position / layer_plan.compress_ratio as usize
+            };
+            copy_buffer_valid_rows(
+                &source_layer.window_kv,
+                &mut destination_layer.window_kv,
+                window_rows,
                 layer_index,
-                CacheKind::AttentionKv,
+                CacheKind::WindowKv,
             )?;
-            copy_optional_buffer_prefix(
+            copy_optional_buffer_valid_rows(
+                source_layer.compressed_kv.as_ref(),
+                destination_layer.compressed_kv.as_mut(),
+                compressed_rows,
+                layer_index,
+                CacheKind::CompressedKv,
+            )?;
+            copy_optional_buffer_valid_rows(
                 source_layer.indexer_kv.as_ref(),
                 destination_layer.indexer_kv.as_mut(),
+                if layer_plan.compress_ratio == 4 {
+                    compressed_rows
+                } else {
+                    0
+                },
                 layer_index,
                 CacheKind::IndexerKv,
             )?;
@@ -549,9 +606,10 @@ impl Deepseek4Cache {
         let mut resident_bytes = 0_u64;
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let snapshot = LayerCacheSnapshot {
-                window_kv: snapshot_buffer(
+                window_kv: snapshot_buffer_valid_rows(
                     &self._device,
                     &layer.window_kv,
+                    self.next_position.min(layer.window_kv.shape()[0]),
                     layer_index,
                     CacheKind::WindowKv,
                 )?,
@@ -804,6 +862,62 @@ fn snapshot_buffer(
     Ok(destination)
 }
 
+/// Snapshot only cursor-visible rows from overwrite-backed sequence storage.
+/// The destination is normally initialized, so its unread tail is coherent
+/// zero state without ever exposing the source allocation's unwritten bytes.
+fn snapshot_buffer_valid_rows(
+    device: &MlxDevice,
+    source: &MlxBuffer,
+    valid_rows: usize,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<MlxBuffer, CacheError> {
+    if source.shape().is_empty() || valid_rows > source.shape()[0] {
+        return Err(CacheError::SnapshotBufferMismatch { layer, kind });
+    }
+    let mut destination = device
+        .alloc_buffer(
+            source.data_byte_len(),
+            source.dtype(),
+            source.shape().to_vec(),
+        )
+        .map_err(|source| CacheError::SnapshotCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    let row_elements = source.shape()[1..]
+        .iter()
+        .try_fold(1usize, |elements, &dimension| {
+            elements.checked_mul(dimension)
+        })
+        .ok_or(CacheError::ByteOverflow { layer, kind })?;
+    let valid_bytes = valid_rows
+        .checked_mul(row_elements)
+        .and_then(|elements| elements.checked_mul(source.dtype().size_of()))
+        .ok_or(CacheError::ByteOverflow { layer, kind })?;
+    if valid_bytes == 0 {
+        return Ok(destination);
+    }
+    let source_bytes = source
+        .as_slice::<u8>()
+        .map_err(|source| CacheError::SnapshotCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    let destination_bytes =
+        destination
+            .as_mut_slice::<u8>()
+            .map_err(|source| CacheError::SnapshotCopy {
+                layer,
+                kind,
+                source,
+            })?;
+    destination_bytes[..valid_bytes].copy_from_slice(&source_bytes[..valid_bytes]);
+    Ok(destination)
+}
+
 fn snapshot_optional_buffer(
     device: &MlxDevice,
     source: Option<&MlxBuffer>,
@@ -1005,6 +1119,76 @@ fn copy_buffer_prefix(
             })?;
     destination[..source.len()].copy_from_slice(source);
     Ok(())
+}
+
+/// Copy only rows made visible by the cache cursor.
+///
+/// Append-only KV storage may come from `alloc_buffer_for_overwrite`, whose
+/// unwritten tail is not readable. Migration therefore operates on the
+/// logical window/compressed/indexer views and never maps bytes beyond the
+/// row count derived from `next_position`.
+fn copy_buffer_valid_rows(
+    source: &MlxBuffer,
+    destination: &mut MlxBuffer,
+    valid_rows: usize,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    if source.dtype() != destination.dtype()
+        || source.shape().is_empty()
+        || source.shape().len() != destination.shape().len()
+        || source.shape()[1..] != destination.shape()[1..]
+        || valid_rows > source.shape()[0]
+        || valid_rows > destination.shape()[0]
+    {
+        return Err(CacheError::MigrationBufferMismatch { layer, kind });
+    }
+    let row_elements = source.shape()[1..]
+        .iter()
+        .try_fold(1usize, |elements, &dimension| {
+            elements.checked_mul(dimension)
+        })
+        .ok_or(CacheError::ByteOverflow { layer, kind })?;
+    let valid_bytes = valid_rows
+        .checked_mul(row_elements)
+        .and_then(|elements| elements.checked_mul(source.dtype().size_of()))
+        .ok_or(CacheError::ByteOverflow { layer, kind })?;
+    if valid_bytes == 0 {
+        return Ok(());
+    }
+    let source = source
+        .as_slice::<u8>()
+        .map_err(|source| CacheError::MigrationCopy {
+            layer,
+            kind,
+            source,
+        })?;
+    let destination =
+        destination
+            .as_mut_slice::<u8>()
+            .map_err(|source| CacheError::MigrationCopy {
+                layer,
+                kind,
+                source,
+            })?;
+    destination[..valid_bytes].copy_from_slice(&source[..valid_bytes]);
+    Ok(())
+}
+
+fn copy_optional_buffer_valid_rows(
+    source: Option<&MlxBuffer>,
+    destination: Option<&mut MlxBuffer>,
+    valid_rows: usize,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    match (source, destination) {
+        (Some(source), Some(destination)) => {
+            copy_buffer_valid_rows(source, destination, valid_rows, layer, kind)
+        }
+        (None, None) if valid_rows == 0 => Ok(()),
+        _ => Err(CacheError::MigrationBufferMismatch { layer, kind }),
+    }
 }
 
 fn copy_optional_buffer_prefix(

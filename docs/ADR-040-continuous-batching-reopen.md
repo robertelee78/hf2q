@@ -1,11 +1,11 @@
 # ADR-040 — Continuous batching: reopen the ADR-005 carve-out
 
-- **Status**: 🟢 **TARGET WORKLOAD SERVED (2026-07-01)** — coherence bar MET (and re-proven at target scale), capacity bar MET, speed bar MET at short context and within 11% at long context (the one open speed lever = M-SPEED-LC below). The real deployment — **8 concurrent agent connections × ~32k context each** (repo-to-cve, airgapped laptop) — runs on the production default: fused batched `[N,hidden]` decode (§0.16-BATCHED-DEFAULT), cross-slot batched admission prefill (iter-G(a)), slot-aware token-batched prefill (iter-G(b)), O(seq) global-layer long-context routing (§7.32K). Milestone ledger:
+- **Status**: 🟢 **FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED (2026-08-08)** — every configured agent slot receives the complete logical model context; aggregate physical KV is governed by one shared high-water budget. Gemma 4, Qwen 3.6, and DeepSeek-V4 passed real four-agent OpenCode gates with native templates, tools, SSE, tool-result continuation, and retained prefix state. The historical 2026-07-01 8×32K result remains below as provenance for the fused batching work.
 >   - **Decode: campaign CLOSED at practical floor (2026-06-30).** 255 t/s aggregate N=8 short-ctx = **1.14× llama**; GPU-busy at parity; §21–§26 + iter-I/J/K/L/M levers landed; iter-O refuted the residual host gap.
->   - **Long context: 32k/slot × 8 UNLOCKED (§7.32K, 2026-07-01).** The O(seq²) `pf_kq` wall (68.7 GB @32k) closed by seq-bounding the global-layer tensor-mm pin at 8192; FA globals ladder-proven deterministic + concurrency-invariant (8k/16k/32k×8, interleaved A/B fingerprints); the default binary serves 32k×8 zero-fault, byte-stable. Upstream enablers: §7.LCP (int32 dst-offset GPU fault) + §7.S019 (mm_id `short` overflow — non-determinism AND correctness).
+>   - **Long context: historical 32k/slot × 8 proof retained; full-context contract corrected in §0.0 (2026-08-08).** The O(seq²) `pf_kq` wall was closed and 32k×8 was proven coherent in 2026-07-01. The operator contract is now stronger: every slot has the full configured logical context, while one shared physical high-water budget governs aggregate residency. The three-family real-model gate below decides whether that stronger contract ships.
 >   - **Coherence: MET.** Byte-identity to serial reference at N=8 (`n4`/`n8` parity gates), per-stream determinism + concurrency-invariance at 8k/12k/16k/32k. Standing rule (operator, 2026-07-01): **coherence > speed** — no lever ships without the ladder. (Known non-blocking residual: 2×-process GPU-contention decode non-determinism — not the deployment shape; tracked low-severity in the §0.19 history.)
->   - **qwen35moe: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12)** — and it found + fixed 4 real bugs ("correct-by-construction" was wrong): dead-at-HEAD gdn params contract skew; stock SlotAware N>1 fails-closed under default TQ-KV (supported multi-slot config = `HF2Q_TQ_KV=0`; B4a-TQ kernel arc = tracked deferral); missing iter-F-kvcap per-slot split (~86 GB eager alloc); DeltaNet whole-buffer ping-pong swap corrupting N≥2 concurrent state (fixed via per-slot parity). N=8 byte-parity gate GREEN.
->   - **OPEN (speed, tracked = M-SPEED-LC):** N=8 long-context decode is 0.89× llama @8k (159 vs 178 t/s; F16 K vs llama q8 K = 2× K bandwidth). Lever scoped: ONE new batched `flash_attn_vec_tq_hb` kernel in mlx-native (clone-from map in hand; same kernel family unlocks the qwen35 B4a-TQ deferral). Ships only behind the coherence gates.
+>   - **qwen35moe: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12; TQ/full-context correction 2026-08-08, §0.0)** — the earlier proof found four real bugs. The 2026-08-08 correction removes the `HF2Q_TQ_KV=0` restriction: packed and norms allocations already had an outer sequence axis, and zero-copy slot views now route TQ encode, attention, and resume through the requested slot. Full logical context is no longer divided by slot count.
+>   - **OPEN (speed, tracked = M-SPEED-LC):** N=8 long-context decode remains a matched-reference gate. The full-context/TQ correction changes capacity and isolation, not the rule that coherence must pass before a throughput result is accepted.
 >
 >   **Original reopen rationale (2026-06-23, now superseded by the Phase F progress above; preserved for provenance):** 🔴 REOPENED — empirical bench (Gemma-4 Ara `Q5_K_M`, M5 Max, `--scheduler inflight-batched --max-slots 4`): 4 concurrent decodes = **8.1 s** vs 4 sequential = **6.9 s** → **0.85×**. Triangulated (codex code-trace + adversarially-verified web research, see §0) to the SlotAware path running **N independent `batch=1` forward passes that time-slice one GPU** instead of a fused `batch=N` decode — the §1.4 / §3.1 "zero new Metal kernels / SeparateSlots reuses every existing kernel" assumption was the defect. **The fix is specified in §0 (Correction & Phase F)** and is what the Phase F milestones above deliver. Production default stays `EngineMode::SerialFifo` — existing users see no change; the reopening is purely additive.
 
@@ -27,6 +27,158 @@
 ---
 
 ## 0. CORRECTION & PHASE F — Reopening (2026-06-23)
+
+### 0.0 Full-context slot correction (2026-08-08)
+
+The `iter-F-kvcap` decision that divided model context by `max_slots` is
+superseded. It conflated two independent limits:
+
+1. **Logical context capacity** is the maximum prompt-plus-generation length
+   one agent may address. Every slot gets the full configured model context.
+2. **Physical KV residency** is the unified-memory cost of positions actually
+   written across all slots. It is governed by one shared byte budget.
+
+`--max-slots 4 --ctx-size 524288` therefore means four agent slots, each
+logically capable of 524288 tokens. It never means four 131072-token slots.
+The server does not promise that all four slots can simultaneously fill their
+entire logical capacity on finite hardware. When aggregate physical KV demand
+cannot fit, hf2q must queue, reuse/evict an idle slot, spill where the family
+has a proven codec, or reject explicitly. It must not silently shorten any
+slot.
+
+This matches the useful separation in contemporary serving engines: model
+context length, maximum running sequences, and KV byte capacity are distinct
+configuration axes. The earlier comparison to llama.cpp's non-unified
+`n_ctx / n_seq_max` path was incomplete; llama.cpp's unified KV mode gives
+each sequence the full context, while vLLM likewise keeps `max_model_len`,
+`max_num_seqs`, and KV-cache capacity separate.
+
+#### M5 Max allocation spike
+
+The smallest Metal spike on the target 128 GiB M5 Max established a practical
+fixed-stride implementation that preserves the existing fused multi-slot
+kernels:
+
+| stage | logical buffer | physical footprint |
+|---|---:|---:|
+| before allocation | 0 | 4.0 MiB |
+| uninitialized shared allocation | 8 GiB | 4.0 MiB |
+| empty command-buffer commit, resource excluded from residency set | 8 GiB | 4.3 MiB |
+| after touching 256 MiB of pages | 8 GiB | 260.3 MiB |
+
+Registering the same virtual buffer with the Metal residency set was a
+falsifier: the next empty command-buffer commit raised physical footprint to
+8.0 GiB. Full-context KV arenas must therefore use mlx-native's explicit
+overwrite allocation contract, skip eager zero-fill, and remain outside the
+residency set. Recurrent state and scratch that may be read before a complete
+write remain initialized and residency-managed. Code may never read or copy
+an overwrite-backed tail beyond the family cache cursor; snapshots, growth,
+and slot forks are therefore cursor-bounded.
+
+Touched Metal pages do not immediately decommit while the resource remains
+alive. Shared-budget accounting must therefore charge each slot's physical
+high-water mark, not only its current token cursor. Resetting a conversation
+reuses that slot's pages. Growth above its high-water consumes more of the
+aggregate budget.
+
+Admission uses a family-derived affine model: a fixed retained floor per
+provisioned slot plus the bytes for the prompt and requested generation rows.
+The worker passes the evaluated prompt bytes into the scheduler; cancellation
+and error release never reconstruct nonlinear family storage by dividing an
+aggregate estimate. Fixed floors cover initialized rings/recurrent state and
+the transient old-plus-new recovery-anchor overlap. Sliding/window storage is
+charged in that fixed floor; only context-growing rows contribute to the
+per-token slope.
+
+A slot admitted but released before prefill explicitly records zero new
+physical growth. Its worst-case reservation is not evidence that pages were
+written and must not become permanent phantom high-water. Operator load
+telemetry likewise prints mixed-family budgets as shared bytes rather than a
+single approximate token quotient; fixed floors and several full-context
+slots make that quotient undefined.
+
+The canonical launcher configurations resolve to:
+
+| Family | Full logical context/slot | Linear bytes/token | Fixed floor/slot | Full context + 8,192-token reservation | np4 | np8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Gemma 4 Ara | 262,144 | 15,440 | 560 MiB | 4.434 GiB | 17.737 GiB | 35.474 GiB |
+| Qwen 3.6 APEX, TQ | 262,144 | 10,400 | 256 MiB | 2.868 GiB | 11.474 GiB | 22.947 GiB |
+| DeepSeek-V4 Flash | 524,288 | 6,880 | 48 MiB | 3.459 GiB | 13.835 GiB | 27.670 GiB |
+
+These are KV/recurrent high-water bounds, not whole-process forecasts; model
+weights and transient compute scratch are separate. Gemma and Qwen therefore
+fit eight fully populated slots inside their canonical 48 GiB shared KV
+budget. DeepSeek's 100 GiB weights make that aggregate unsafe on a 128 GiB
+host, so its canonical 8 GiB shared budget preserves every slot's 524,288-token
+logical address space while backpressuring aggregate physical growth.
+
+#### Agent-slot lifetime
+
+A physical slot is a retained agent cache, not disposable request scratch.
+The worker keeps, per slot, the exact rendered token ledger, family KV cursors,
+physical high-water, busy/idle state, and last-use order. Admission routes a
+continuation to the idle slot with the longest exact token prefix. A new or
+compacted conversation reuses an idle slot and invalidates its old ledger
+before mutation. Completion makes the slot idle but does not destroy valid KV
+state. This is required for OpenCode turns to avoid full-context re-prefill.
+
+Family chat templates and tool encodings remain family-owned inputs to the
+token ledger. A cache match is valid only after the request has been rendered
+with the exact native Gemma 4, Qwen 3.6, or DeepSeek-V4 encoder and tokenized;
+one family's template or cache state is never a fallback for another.
+
+The real artifacts prove the binding rather than relying on a family-name
+guess: Gemma 4 and Qwen 3.6 report `chat_template_source=GgufEmbedded` and pass
+their template-marker/tool-response validators during load. DeepSeek reports
+`NativeEncoding { name: "DEEPSEEK_V4_FLASH_0731" }`. Missing or incompatible
+family templates fail closed; the fallback templates exist only for GGUFs
+whose metadata genuinely omits a template and remain family-specific.
+
+#### Three-family acceptance evidence (M5 Max, 2026-08-08)
+
+The checked-in `scripts/test_full_context_agent_slots.sh` runs four independent
+OpenCode-shaped conversations concurrently. Each conversation proves a cold
+required tool call, cached repeat, automatic tool selection, SSE tool-call
+reconstruction, tool-result continuation, and a source-shaped argument. The
+canonical launchers configure four slots by default without dividing context.
+
+| Family | Logical context per slot | Four-agent evidence |
+|---|---:|---|
+| Gemma 4 | 262,144 | 6,780/6,787 minimum prefix reuse; maximum cached TTFT 143.58 ms; the 24,200-token multi-slot suffix completed in 13.843 s (1,830.7 tok/s internal), versus 13.789 s / about 1,733 tok/s for the matched llama.cpp request shape. |
+| Qwen 3.6 | 262,144 | 6,684/6,684 minimum prefix reuse on a fresh persistent-KV directory; four native ChatML tool/result conversations, SSE, and source arguments passed. |
+| DeepSeek-V4 | 524,288 | Two powered gates passed: 6,677/6,685 minimum prefix reuse; maximum cached TTFT 268.68 ms; cached unary/SSE turns completed in 6-13 s and every tool-result turn completed within 20-32 s. Exact server-side cold-cohort makespans were 53.86 s and 52.32 s (53.09 s median), versus about 54.1 s for matched llama.cpp with four unified 131,072-token slots. llama.cpp's 524,288-token unified allocation did not fit beside the 100 GiB artifact on this 128 GiB host; hf2q retained 524,288 logical tokens per slot under demand-grown physical admission. |
+
+DeepSeek uses a bounded decode quantum of eight tokens and resumable cold
+prefill at the verifier's atomic cache-commit boundary. At most two cold slots
+alternate complete matrix transactions through one scratch arena. Decode-ready
+members remain parked until the bounded cold cohort has finished prefill, then
+the cohort decodes fairly. That barrier prevents an early agent from creating
+cached continuation work that steals the remaining cold agents' deadline.
+After the cold cohort drains, cache-bearing requests take precedence over
+unrelated cold requests so a retained agent slot cannot be evicted between a
+tool call and its result. Within every wave, each slot retains independent
+cache, token ledger, sampler, grammar, and tool state. This is an explicit
+scheduling policy, not a claim of fused DeepSeek verification.
+
+The cross-family contract is the full logical context per slot, physical
+high-water admission, retained-session affinity, and fair bounded decode—not
+the DeepSeek cohort width itself. Gemma 4 and Qwen 3.6 keep their measured fast
+prefill paths and the generic 512-token scheduler quantum because their exact
+four-agent gates already meet the latency and coherence contract. A cold-cohort
+barrier may be enabled for either family only after a source-bound gate proves
+the same cold-prefill cascade; copying DeepSeek's constant without that
+evidence would delay first semantic output.
+
+The slot-aware DeepSeek long-cache gate additionally forced the initial
+131,072-token physical cache to grow to 262,144. A first spike selected a fresh
+slot and correctly failed (`migrated_tokens=0`, complete replay), revealing
+that affinity considered only the generated live ledger. The corrected
+scheduler also considers the native recovery anchor. The final request
+migrated 119,762 tokens, reused 119,692/119,778 (99.92%), evaluated an 86-token
+suffix, and returned in 1.132 s. That final run occurred on battery power, so it
+is accepted only as a correctness/cache-growth receipt; no throughput claim is
+derived from its 119,700-token cold prefill. Performance claims use the matched
+powered benchmark receipts above.
 
 > This section supersedes the original status header and corrects §1.4 and §3.1.
 > It was written after an empirical bench falsified the implicit "continuous
@@ -354,7 +506,7 @@ Added `slot_aware_n8_per_slot_parity_vs_serial` (the N=8 analogue of the N=4 par
 
 **`iter-F-moe-mvid` — RESOLVED (2026-06-24, in-code fix shipped).** Added `quantized_matmul_id_ggml_mv` to mlx-native (commit `e40eee5`): a byte-identity variant that always routes to the per-token `mv_id` kernel, implemented with zero params-struct churn (private `quantized_matmul_id_ggml_impl(.., force_mv)` gated by `!force_mv &&` on the `mm_id` route; `pub fn` + Session-method wrappers). `batched_body.rs` now calls `quantized_matmul_id_ggml_mv` for both MoE gate_up and down `_id` dispatches, so the batched decode forward stays on `mv_id` for any N. Verified: `slot_aware_n8_per_slot_parity_vs_serial` through the batched body is byte-identical **with NO env override** (correctness no longer depends on `HF2Q_MM_ID_ROUTING_THRESHOLD`), and the full batched-body suite (`slot_aware_n1`/`n4`/`n8`) is **5 passed / 0 failed** at the new rev — the `mv` pin is a no-op at N≤4 (down was already `mv` there) and the fix at N≥5. hf2q git-dep bumped `81f83a1` → `e40eee5`. `mm_id` stays the prefill route (unchanged); it is a measured regression at N≤8 so forcing `mv_id` at decode width costs nothing. The opt-in batched body is now byte-identity-valid at the full N=8 default width.
 
-**`iter-F-kvcap` — RESOLVED (2026-06-24, user-authorized: "each instance should get max/n").** The multi-seq (`SlotAware`) KV scaffold now splits the full-attention context budget across slots — each of `max_slots` slots gets `max_position_embeddings / max_slots` of global-layer context (the llama.cpp `-c`÷`-np` convention), via a new `layer_type_to_alloc_params_per_slot` helper (`kv_cache.rs`) wired into all four multi-seq alloc sites (`engine.rs` Phases 1-4). Sliding (ring) layers are unchanged (per-slot-independent). Effect: total full-attention KV is now **≈ one full-context sequence regardless of N** (constant, not linear) — at N=8 each slot holds 262144/8 = **32k** of global context (so "8×32k" is literal), global KV ~32 GB → **~4 GB**, whole multi-seq KV ~5-6 GB, total at N=8 ≈ 16.4 GB weights + ~6 GB KV ≈ **22 GB** (now fits a 64 GB machine, not just 128 GB). **Validated:** (a) `iter_f_kvcap_per_slot_alloc_params_mapping_pinned` falsifier pins Full→max/N, Sliding unchanged, `max_slots=1` identity, and total-constant-in-N; (b) byte-identity holds on BOTH paths — DEFAULT (5/5) and batched body (5/5), `slot_aware_n1`/`n4`/`n8` — proving the per-slot capacity (262k→32k) is correctness-neutral (for linear full-attn layers `capacity` is only buffer/stride size, never part of the attention sum). `max_slots=1` is identity (max/1 = max) so SerialFifo / single-seq is byte-unchanged. `engine.rs` KV-memory comment updated to the corrected accounting.
+**`iter-F-kvcap` — HISTORICAL, SUPERSEDED by §0.0 (2026-08-08).** The 2026-06-24 implementation divided full-attention context by `max_slots`. Its byte-identity tests proved address isolation only within the shortened capacity; they did not prove the operator contract that every agent retains full logical context. §0.0 replaces that allocation rule with full virtual capacity per slot plus one shared physical high-water budget. This paragraph is retained only as the provenance of the superseded decision.
 
 **Remaining tracked follow-up (does not block the shipped default):**
 - **`iter-F-flashtmp`** — switch the default per-slot flash to the N×-sized `bufs.sdpa_tmp` so the N attention dispatches run GPU-concurrent instead of WAW-serialized (a throughput lever; current serialized path is correct).

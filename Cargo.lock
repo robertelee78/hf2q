@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "hf2q"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2199,9 +2199,9 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1db3a6e739a199c7e9a7820a49718d549f6b03a77241f461cffb3ad085cb833d"
+checksum = "7c29459ec414a3f9f63691992dfc9028d41e6a295b51eb6f6c5ae5700d878413"
 dependencies = [
  "bytemuck",
  "half",

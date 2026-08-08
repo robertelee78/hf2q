@@ -2,12 +2,13 @@
 //! (ADR-040 Phase B iter-1 + iter-1.5 + iter-B3 + iter-2.5 + iter-C2.5 +
 //! **iter-A5**).
 //!
-//! # iter-A5 (this commit) — per-slot OOM + budget enforcement
+//! # Full-context slots — shared physical KV enforcement
 //!
-//! ADR-040 §3.5 — "`kv_cache_budget_bytes` (existing field on
-//! `Engine::spawn`) divides equally across slots in SeparateSlots layout.
-//! Per-slot budget = `total / max_slots`. Per-slot OOM returns 429 to the
-//! admitting handler (Decision #19 contract preserved)."
+//! Every slot advertises the full model context. `kv_cache_budget_bytes` is a
+//! shared physical high-water budget across retained slot arenas; it is never
+//! divided by `max_slots`. A request larger than the whole budget is
+//! structurally rejected. Transient aggregate pressure is surfaced as queue
+//! pressure until the worker owns request-payload promotion end to end.
 //!
 //! iter-A5 implements the **admit-time** half of this contract. The
 //! complementary append-time half (defense-in-depth at the per-model
@@ -20,15 +21,15 @@
 //!
 //! Concretely iter-A5 adds:
 //!
-//! - [`AdmitRequest::kv_bytes_needed`] — caller-computed byte cost the
-//!   request would put on the per-slot KV cache (typically
+//! - [`AdmitRequest::kv_bytes_needed`] — caller-computed physical high-water
+//!   the request would establish for one full-context slot (typically
 //!   `(prompt_tokens + max_tokens) * kv_bytes_per_token`).  `0` means
 //!   "caller did not compute; do not enforce" — preserves byte-equivalence
 //!   for callers that have not yet wired the byte-cost computation
 //!   (today: every caller — Phase C2c will wire it).
 //! - [`FifoSchedulerAdapter::new_with_kv_budget`] +
 //!   [`InflightBatchedScheduler::new_with_kv_budget`] — opt-in
-//!   constructors that take the per-slot byte budget. The 0-budget
+//!   constructors that take the shared physical byte budget. The 0-budget
 //!   default reached via `new` (no env, no flag) preserves
 //!   byte-equivalence.
 //! - [`AdmitError::SlotBudgetExceeded`] — typed admit-time rejection
@@ -53,7 +54,8 @@
 //!    further) so a single scalar would either under-count (false
 //!    accepts) or wildly over-count (false rejects) — neither is
 //!    operator-honest.
-//! 2. Bytes-direct (chosen): scheduler stores `per_slot_kv_budget_bytes:
+//! 2. Bytes-direct (chosen): the legacy-named scheduler field stores the
+//!    aggregate physical pool `per_slot_kv_budget_bytes`:
 //!    u64`; caller passes `kv_bytes_needed: u64` on each `AdmitRequest`.
 //!    Caller (Phase C2c+ for per-arch SlotAware workers) computes the
 //!    byte cost using the per-arch `KvSpillDescriptor` / per-layer
@@ -301,10 +303,11 @@ pub struct AdmitRequest {
     /// Maximum new tokens the request may emit.
     pub max_tokens: u32,
     /// **ADR-040 §3.5 iter-A5** — caller-computed byte cost the request
-    /// would put on the per-slot KV cache, typically
+    /// would establish as that full-context slot's physical high-water,
+    /// typically
     /// `(prompt_tokens + max_tokens) * per_arch_kv_bytes_per_token`.
     ///
-    /// Set to `0` to opt out of per-slot KV-budget enforcement (the
+    /// Set to `0` to opt out of shared physical KV-budget enforcement (the
     /// scheduler treats `0` as "caller did not compute; do not enforce").
     /// Today every caller in `worker_run` passes `0` — byte-equivalence
     /// with pre-A5 is preserved.  Phase C2c (Qwen35 SlotAware) and
@@ -320,6 +323,17 @@ pub struct AdmitRequest {
     /// or explicit `kv_bytes_needed: 0`; iter-A5's worker_run edits add
     /// the explicit field at each of the 4 admit sites.
     pub kv_bytes_needed: u64,
+    /// Caller-evaluated token-linear bytes retained after prompt prefill,
+    /// excluding the scheduler's fixed per-slot scaffold. Keeping this
+    /// explicit avoids reconstructing prompt residency by dividing a
+    /// worst-case reservation, which is invalid for capped/mixed caches.
+    pub prompt_kv_bytes: u64,
+    /// Idle physical slot that already owns the best reusable state for this
+    /// request. Family workers derive this from their exact rendered-token
+    /// ledgers. The scheduler honors it when the slot is available and the
+    /// shared physical KV budget permits the requested growth; otherwise it
+    /// selects another fitting slot and the worker performs a cold prefill.
+    pub preferred_slot: Option<SlotId>,
 }
 
 impl Default for AdmitRequest {
@@ -328,6 +342,8 @@ impl Default for AdmitRequest {
             prompt_tokens: 0,
             max_tokens: 0,
             kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
         }
     }
 }
@@ -395,9 +411,8 @@ pub enum AdmitError {
     },
     /// Scheduler is no longer accepting work (post-shutdown).
     SchedulerStopped,
-    /// **ADR-040 §3.5 iter-A5** — the request's caller-computed KV-byte
-    /// cost (`AdmitRequest::kv_bytes_needed`) exceeds the configured
-    /// per-slot budget (`per_slot_kv_budget_bytes`).  Maps to HTTP 429 +
+    /// The request's caller-computed KV-byte high-water requirement exceeds
+    /// the configured shared physical KV budget. Maps to HTTP 429 +
     /// `Retry-After: 1` upstream per Decision #19, parallel to
     /// `QueueFull`.  Distinct from `QueueFull` so observability +
     /// alerting can differentiate "too many concurrent requests"
@@ -412,7 +427,7 @@ pub enum AdmitError {
     SlotBudgetExceeded {
         /// Bytes the admit attempt would need (from `AdmitRequest::kv_bytes_needed`).
         needed_bytes: u64,
-        /// Per-slot KV budget configured on the scheduler.
+        /// Shared physical KV budget configured on the scheduler.
         budget_bytes: u64,
     },
 }
@@ -426,7 +441,7 @@ impl fmt::Display for AdmitError {
                 in_flight,
             } => write!(
                 f,
-                "queue full (queue_capacity={}, total_admissible={}, in_flight={})",
+                "queue_full: queue full (queue_capacity={}, total_admissible={}, in_flight={})",
                 queue_capacity, total_admissible, in_flight,
             ),
             AdmitError::SchedulerStopped => write!(f, "scheduler stopped"),
@@ -435,8 +450,9 @@ impl fmt::Display for AdmitError {
                 budget_bytes,
             } => write!(
                 f,
-                "per-slot KV budget exceeded (needed_bytes={}, budget_bytes={}) \
-                 — ADR-040 §3.5: reduce max_tokens or request a smaller prompt",
+                "slot_budget_exceeded: shared KV budget exceeded (needed_bytes={}, budget_bytes={}) \
+                 — ADR-040 full-context slots: reduce max_tokens, shorten the prompt, \
+                 or raise the physical KV budget",
                 needed_bytes, budget_bytes,
             ),
         }
@@ -526,13 +542,15 @@ pub struct FifoSchedulerAdapter {
     admitted_total: u64,
     rejected_429_total: u64,
     completed_total: u64,
-    /// **ADR-040 §3.5 iter-A5** — per-slot KV budget in bytes.  `0`
+    /// **ADR-040 §3.5 iter-A5** — physical KV budget in bytes. `0`
     /// disables enforcement (preserves byte-equivalence for pre-A5
-    /// callers).  When > 0, `admit` rejects requests whose
+    /// callers). Under FIFO this is necessarily one slot. When > 0,
+    /// `admit` rejects requests whose
     /// `AdmitRequest::kv_bytes_needed` exceeds this value with
     /// [`AdmitError::SlotBudgetExceeded`] (HTTP 429 + Retry-After
     /// upstream per Decision #19).
     per_slot_kv_budget_bytes: u64,
+    fixed_kv_bytes_per_slot: u64,
 }
 
 /// Per-queued-request state for FIFO.
@@ -573,6 +591,14 @@ impl FifoSchedulerAdapter {
     /// `AdmitRequest::kv_bytes_needed` exceeds `per_slot_kv_budget_bytes`
     /// with [`AdmitError::SlotBudgetExceeded`].
     pub fn new_with_kv_budget(queue_capacity: u32, per_slot_kv_budget_bytes: u64) -> Self {
+        Self::new_with_kv_budget_and_floor(queue_capacity, per_slot_kv_budget_bytes, 0)
+    }
+
+    pub fn new_with_kv_budget_and_floor(
+        queue_capacity: u32,
+        per_slot_kv_budget_bytes: u64,
+        fixed_kv_bytes_per_slot: u64,
+    ) -> Self {
         let queue_capacity = queue_capacity.max(1);
         Self {
             queue_capacity,
@@ -584,6 +610,7 @@ impl FifoSchedulerAdapter {
             rejected_429_total: 0,
             completed_total: 0,
             per_slot_kv_budget_bytes,
+            fixed_kv_bytes_per_slot,
         }
     }
 
@@ -749,9 +776,14 @@ impl Scheduler for FifoSchedulerAdapter {
         SchedulerPolicy::FifoSerial
     }
 
-    fn admit(&mut self, req: AdmitRequest) -> Result<RequestSlot, AdmitError> {
-        // ADR-040 §3.5 iter-A5 — per-slot KV budget check FIRST.  A
-        // request that cannot fit in any single slot's KV budget
+    fn admit(&mut self, mut req: AdmitRequest) -> Result<RequestSlot, AdmitError> {
+        if req.kv_bytes_needed > 0 {
+            req.kv_bytes_needed = req
+                .kv_bytes_needed
+                .saturating_add(self.fixed_kv_bytes_per_slot);
+        }
+        // ADR-040 §3.5 iter-A5 — physical KV budget check FIRST. A
+        // request that cannot fit in the FIFO worker's only slot
         // cannot be served regardless of queue state; rejecting before
         // the queue check is operator-honest (the 429 names the per-
         // request structural problem, not transient capacity).  Budget
@@ -936,6 +968,8 @@ struct InflightSlot {
     admitted_at: Instant,
     prompt_tokens: u32,
     max_tokens: u32,
+    kv_bytes_needed: u64,
+    prompt_kv_bytes: u64,
     phase: SlotPhase,
 }
 
@@ -946,6 +980,9 @@ struct QueuedInflightRequest {
     admitted_at: Instant,
     prompt_tokens: u32,
     max_tokens: u32,
+    kv_bytes_needed: u64,
+    prompt_kv_bytes: u64,
+    preferred_slot: Option<SlotId>,
 }
 
 /// Production continuous-batching scheduler (ADR-040 §3.3).
@@ -963,48 +1000,55 @@ pub struct InflightBatchedScheduler {
     admitted_total: u64,
     rejected_429_total: u64,
     completed_total: u64,
-    /// **ADR-040 §3.5 iter-A5** — per-slot KV budget in bytes.  `0`
-    /// disables enforcement (preserves byte-equivalence for pre-A5
-    /// callers).  When > 0, `admit` rejects requests whose
-    /// `AdmitRequest::kv_bytes_needed` exceeds this value with
-    /// [`AdmitError::SlotBudgetExceeded`] (HTTP 429 + Retry-After
-    /// upstream per Decision #19).
-    ///
-    /// Per ADR-040 §3.5: "per-slot budget = total / max_slots" — the
-    /// engine spawn site is responsible for dividing the operator-
-    /// supplied `kv_cache_budget_bytes` by `max_slots` before handing
-    /// the per-slot value to this constructor.
-    per_slot_kv_budget_bytes: u64,
+    /// Shared physical KV budget across every logical slot. `0` disables
+    /// enforcement. Logical context capacity is independent of this value.
+    total_kv_budget_bytes: u64,
+    fixed_kv_bytes_per_slot: u64,
+    /// Committed physical KV high-water for each slot. Metal shared-buffer
+    /// pages remain resident while the arena lives, so completion cannot
+    /// reduce this value below the largest prefix actually written.
+    slot_high_water_bytes: Vec<u64>,
+    /// Worst-case physical target reserved by the active occupant of each
+    /// slot. This includes its generation budget and protects decode from a
+    /// mid-request OOM without permanently charging unused `max_tokens`.
+    slot_reserved_bytes: Vec<u64>,
+    /// Actual retained high-water reported by a family worker before release.
+    /// When no exact cursor is reported, release keeps the prior measured
+    /// high-water plus the caller-evaluated prompt extent; the unused
+    /// generation reservation never becomes permanent residency.
+    slot_committed_on_release: Vec<Option<u64>>,
+    /// Maximum logical prompt progress a driver may consume in one prefill
+    /// step. Families with their own atomic matrix transaction choose the
+    /// actual value at or below this bound and report it exactly.
+    prefill_chunk_tokens: u32,
 }
 
 impl InflightBatchedScheduler {
     /// Build an InflightBatched scheduler with the given queue cap +
-    /// per-slot concurrency cap and no per-slot KV budget enforcement
-    /// (iter-A5: `per_slot_kv_budget_bytes = 0` preserves
+    /// per-slot concurrency cap and no shared KV budget enforcement
+    /// (`total_kv_budget_bytes = 0` preserves
     /// byte-equivalence with pre-A5 callers).
     pub fn new(queue_capacity: u32, max_slots: u32) -> Self {
         Self::new_with_kv_budget(queue_capacity, max_slots, 0)
     }
 
-    /// **ADR-040 §3.5 iter-A5** — build an InflightBatched scheduler
-    /// with explicit per-slot KV byte budget.  `0` disables enforcement
-    /// (equivalent to [`Self::new`]).  When > 0, `admit` rejects
-    /// requests whose `AdmitRequest::kv_bytes_needed` exceeds
-    /// `per_slot_kv_budget_bytes` with [`AdmitError::SlotBudgetExceeded`].
-    ///
-    /// Per ADR-040 §3.5 ("per-slot budget = total / max_slots") the
-    /// caller — `Engine::spawn` / `spawn_with_mode` at the engine seam
-    /// — is responsible for performing the division.  This constructor
-    /// stores the value verbatim and enforces against it; it does NOT
-    /// re-divide by `max_slots`.  Independence per-slot is structural:
-    /// each admit checks against the same `per_slot_kv_budget_bytes`
-    /// scalar (not an aggregate), so N admits each at exactly the
-    /// per-slot budget all succeed (iter-A5 test
-    /// `inflight_per_slot_budget_independent_per_slot`).
+    /// Build an InflightBatched scheduler with an explicit aggregate physical
+    /// KV byte budget. `0` disables enforcement. Each slot still has the full
+    /// logical context; admission charges only the increase over that slot's
+    /// retained physical high-water mark.
     pub fn new_with_kv_budget(
         queue_capacity: u32,
         max_slots: u32,
-        per_slot_kv_budget_bytes: u64,
+        total_kv_budget_bytes: u64,
+    ) -> Self {
+        Self::new_with_kv_budget_and_floor(queue_capacity, max_slots, total_kv_budget_bytes, 0)
+    }
+
+    pub fn new_with_kv_budget_and_floor(
+        queue_capacity: u32,
+        max_slots: u32,
+        total_kv_budget_bytes: u64,
+        fixed_kv_bytes_per_slot: u64,
     ) -> Self {
         let queue_capacity = queue_capacity.max(1);
         let max_slots = max_slots.max(1);
@@ -1020,29 +1064,145 @@ impl InflightBatchedScheduler {
             admitted_total: 0,
             rejected_429_total: 0,
             completed_total: 0,
-            per_slot_kv_budget_bytes,
+            total_kv_budget_bytes,
+            fixed_kv_bytes_per_slot,
+            slot_high_water_bytes: vec![fixed_kv_bytes_per_slot; max_slots as usize],
+            slot_reserved_bytes: vec![0; max_slots as usize],
+            slot_committed_on_release: vec![None; max_slots as usize],
+            prefill_chunk_tokens: DEFAULT_PREFILL_CHUNK_TOKENS,
         }
     }
 
-    /// **ADR-040 §3.5 iter-A5** — read the configured per-slot KV
-    /// budget (bytes).  `0` means enforcement disabled.
+    pub fn set_prefill_chunk_tokens(&mut self, tokens: u32) {
+        self.prefill_chunk_tokens = tokens.max(1);
+    }
+
+    /// Read the configured shared physical KV budget. `0` is unbounded.
+    pub fn total_kv_budget_bytes(&self) -> u64 {
+        self.total_kv_budget_bytes
+    }
+
+    /// Compatibility accessor for older metrics/tests. In the batched
+    /// scheduler this now returns the shared budget; it is never divided by
+    /// `max_slots`.
     pub fn per_slot_kv_budget_bytes(&self) -> u64 {
-        self.per_slot_kv_budget_bytes
+        self.total_kv_budget_bytes
     }
 
-    /// Allocate a SlotId — prefer a recycled id, otherwise allocate fresh.
-    /// Capped at `max_slots` distinct values.
-    fn alloc_slot_id(&mut self) -> SlotId {
-        if let Some(id) = self.slot_id_free_list.pop() {
-            return id;
+    /// Sum of retained per-slot physical high-water marks.
+    pub fn resident_high_water_bytes(&self) -> u64 {
+        self.slot_high_water_bytes
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Aggregate physical high-water after active worst-case reservations.
+    pub fn reserved_high_water_bytes(&self) -> u64 {
+        self.slot_high_water_bytes
+            .iter()
+            .zip(&self.slot_reserved_bytes)
+            .map(|(&resident, &reserved)| resident.max(reserved))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Choose an idle or fresh slot whose additional physical demand fits the
+    /// shared budget. Best-fit reuse preserves larger arenas for larger
+    /// contexts and avoids needless growth.
+    fn select_available_slot(
+        &self,
+        needed_bytes: u64,
+        preferred_slot: Option<SlotId>,
+    ) -> Option<SlotId> {
+        let reserved_total = self.reserved_high_water_bytes();
+        let fits = |slot: SlotId| {
+            let prior = self.slot_high_water_bytes[slot.0 as usize];
+            let delta = needed_bytes.saturating_sub(prior);
+            self.total_kv_budget_bytes == 0
+                || reserved_total.saturating_add(delta) <= self.total_kv_budget_bytes
+        };
+
+        if let Some(preferred) = preferred_slot.filter(|slot| {
+            ((slot.0 < self.next_fresh_slot_id && self.slot_id_free_list.contains(slot))
+                || (slot.0 == self.next_fresh_slot_id && slot.0 < self.max_slots))
+                && fits(*slot)
+        }) {
+            return Some(preferred);
         }
-        debug_assert!(
-            self.next_fresh_slot_id < self.max_slots,
-            "alloc_slot_id called past max_slots — caller violated in_flight cap invariant"
-        );
-        let id = SlotId(self.next_fresh_slot_id);
-        self.next_fresh_slot_id += 1;
-        id
+
+        // A cold conversation must claim an untouched arena while one is
+        // available. Otherwise staggered agents repeatedly overwrite the
+        // warmest released slot and never establish independent prefixes.
+        // Exact-prefix affinity above still wins for normal continuations.
+        if self.next_fresh_slot_id < self.max_slots {
+            let fresh = SlotId(self.next_fresh_slot_id);
+            if fits(fresh) {
+                return Some(fresh);
+            }
+        }
+
+        self.slot_id_free_list
+            .iter()
+            .copied()
+            .filter(|&slot| fits(slot))
+            .min_by_key(|slot| {
+                let prior = self.slot_high_water_bytes[slot.0 as usize];
+                (needed_bytes.saturating_sub(prior), prior)
+            })
+    }
+
+    /// Claim a slot selected by [`Self::select_available_slot`] and reserve
+    /// its worst-case physical target for the active request.
+    fn claim_slot(&mut self, slot_id: SlotId, needed_bytes: u64) {
+        if slot_id.0 == self.next_fresh_slot_id {
+            self.next_fresh_slot_id += 1;
+        } else if let Some(pos) = self
+            .slot_id_free_list
+            .iter()
+            .position(|&candidate| candidate == slot_id)
+        {
+            self.slot_id_free_list.swap_remove(pos);
+        } else {
+            debug_assert!(false, "claim_slot called for a non-available slot");
+        }
+        let idx = slot_id.0 as usize;
+        self.slot_reserved_bytes[idx] = self.slot_high_water_bytes[idx].max(needed_bytes);
+        self.slot_committed_on_release[idx] = None;
+    }
+
+    /// Record the actual retained KV high-water before a successful release.
+    /// The active reservation remains charged until release, so reporting a
+    /// smaller value cannot make another request overcommit the pool while the
+    /// current request is still running.
+    pub fn record_slot_high_water(&mut self, handle: SlotHandle, retained_bytes: u64) {
+        if !self.in_flight.iter().any(|slot| slot.handle == handle) {
+            return;
+        }
+        let idx = handle.slot_id.0 as usize;
+        let retained_bytes = retained_bytes.saturating_add(self.fixed_kv_bytes_per_slot);
+        self.slot_committed_on_release[idx] =
+            Some(self.slot_high_water_bytes[idx].max(retained_bytes));
+    }
+
+    fn inferred_committed_bytes(&self, slot: &InflightSlot) -> u64 {
+        // Prefill is synchronous in every family worker. If cancellation or
+        // error releases without an exact cursor report, the prompt extent is
+        // still known exactly from the caller-evaluated estimator. Decode
+        // paths report their actual cursor before reset/release.
+        slot.prompt_kv_bytes
+    }
+
+    fn finish_slot_accounting(&mut self, slot_id: SlotId, inferred_committed_bytes: u64) {
+        let idx = slot_id.0 as usize;
+        let committed = self.slot_committed_on_release[idx]
+            .take()
+            // A reservation is a worst-case admission bound, not evidence
+            // that those pages were touched. On cancellation/error, retain
+            // only the previously measured physical high-water unless the
+            // worker explicitly reports a larger committed prefix.
+            .unwrap_or_else(|| self.slot_high_water_bytes[idx].max(inferred_committed_bytes));
+        self.slot_high_water_bytes[idx] = self.slot_high_water_bytes[idx].max(committed);
+        self.slot_reserved_bytes[idx] = 0;
     }
 
     fn total_admissible(&self) -> u32 {
@@ -1098,15 +1258,19 @@ impl InflightBatchedScheduler {
         // defensive; the test
         // `inflight_promote_queued_with_max_tokens_0_does_not_leak`
         // synthesizes the direct-push case to pin the invariant.
-        while let Some(q) = self.queue.pop_front() {
+        while let Some(q) = self.queue.front().cloned() {
             match classify_admit(q.prompt_tokens, q.max_tokens) {
                 InitialAdmitOutcome::CompletedAtAdmit => {
+                    self.queue.pop_front();
                     self.completed_total = self.completed_total.saturating_add(1);
                     continue;
                 }
                 outcome @ (InitialAdmitOutcome::PhaseToPrefilling
                 | InitialAdmitOutcome::PhaseToDecoding) => {
-                    let slot_id = self.alloc_slot_id();
+                    let slot_id =
+                        self.select_available_slot(q.kv_bytes_needed, q.preferred_slot)?;
+                    self.queue.pop_front();
+                    self.claim_slot(slot_id, q.kv_bytes_needed);
                     let generation = self.slot_generations[slot_id.0 as usize];
                     let handle = SlotHandle {
                         slot_id,
@@ -1130,6 +1294,8 @@ impl InflightBatchedScheduler {
                         admitted_at: q.admitted_at,
                         prompt_tokens: q.prompt_tokens,
                         max_tokens: q.max_tokens,
+                        kv_bytes_needed: q.kv_bytes_needed,
+                        prompt_kv_bytes: q.prompt_kv_bytes,
                         phase,
                     });
                     return Some(handle);
@@ -1197,7 +1363,13 @@ impl InflightBatchedScheduler {
         if new_produced >= max_tokens {
             // Auto-release: bump generation, recycle id.
             let slot_id = handle.slot_id;
+            self.in_flight[idx].phase = SlotPhase::Decoding {
+                tokens_produced: new_produced,
+                max_tokens,
+            };
+            let inferred = self.inferred_committed_bytes(&self.in_flight[idx]);
             self.in_flight.remove(idx);
+            self.finish_slot_accounting(slot_id, inferred);
             let gen_idx = slot_id.0 as usize;
             self.slot_generations[gen_idx] = self.slot_generations[gen_idx].saturating_add(1);
             self.slot_id_free_list.push(slot_id);
@@ -1229,16 +1401,22 @@ impl Scheduler for InflightBatchedScheduler {
         SchedulerPolicy::InflightBatched
     }
 
-    fn admit(&mut self, req: AdmitRequest) -> Result<RequestSlot, AdmitError> {
-        // ADR-040 §3.5 iter-A5 — per-slot KV budget check FIRST (same
-        // ordering as the FIFO adapter; see that admit body for the
-        // rationale).  Budget == 0 disables (pre-A5 byte-equivalence).
-        if self.per_slot_kv_budget_bytes > 0 && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
-        {
+    fn admit(&mut self, mut req: AdmitRequest) -> Result<RequestSlot, AdmitError> {
+        if req.kv_bytes_needed > 0 {
+            req.kv_bytes_needed = req
+                .kv_bytes_needed
+                .saturating_add(self.fixed_kv_bytes_per_slot);
+            req.prompt_kv_bytes = req
+                .prompt_kv_bytes
+                .saturating_add(self.fixed_kv_bytes_per_slot);
+        }
+        // One request can never fit if its physical demand exceeds the whole
+        // shared budget. Concurrency pressure below is queueable.
+        if self.total_kv_budget_bytes > 0 && req.kv_bytes_needed > self.total_kv_budget_bytes {
             self.rejected_429_total = self.rejected_429_total.saturating_add(1);
             return Err(AdmitError::SlotBudgetExceeded {
                 needed_bytes: req.kv_bytes_needed,
-                budget_bytes: self.per_slot_kv_budget_bytes,
+                budget_bytes: self.total_kv_budget_bytes,
             });
         }
 
@@ -1273,10 +1451,15 @@ impl Scheduler for InflightBatchedScheduler {
             });
         }
 
-        let public = if in_flight < self.max_slots {
+        let selected_slot = if in_flight < self.max_slots {
+            self.select_available_slot(req.kv_bytes_needed, req.preferred_slot)
+        } else {
+            None
+        };
+        let public = if let Some(slot_id) = selected_slot {
             // Admit directly to in_flight: allocate handle, set phase
             // (honouring iter-2.5 M2 for zero-prompt requests).
-            let slot_id = self.alloc_slot_id();
+            self.claim_slot(slot_id, req.kv_bytes_needed);
             let generation = self.slot_generations[slot_id.0 as usize];
             let handle = SlotHandle {
                 slot_id,
@@ -1300,6 +1483,8 @@ impl Scheduler for InflightBatchedScheduler {
                 admitted_at,
                 prompt_tokens: req.prompt_tokens,
                 max_tokens: req.max_tokens,
+                kv_bytes_needed: req.kv_bytes_needed,
+                prompt_kv_bytes: req.prompt_kv_bytes,
                 phase,
             });
             RequestSlot {
@@ -1309,12 +1494,15 @@ impl Scheduler for InflightBatchedScheduler {
                 prompt_tokens: req.prompt_tokens,
                 max_tokens: req.max_tokens,
             }
-        } else {
+        } else if in_flight >= self.max_slots {
             self.queue.push_back(QueuedInflightRequest {
                 request_id,
                 admitted_at,
                 prompt_tokens: req.prompt_tokens,
                 max_tokens: req.max_tokens,
+                kv_bytes_needed: req.kv_bytes_needed,
+                prompt_kv_bytes: req.prompt_kv_bytes,
+                preferred_slot: req.preferred_slot,
             });
             RequestSlot {
                 request_id,
@@ -1323,6 +1511,38 @@ impl Scheduler for InflightBatchedScheduler {
                 prompt_tokens: req.prompt_tokens,
                 max_tokens: req.max_tokens,
             }
+        } else {
+            // The request fits the shared budget in isolation, but every
+            // available physical slot would grow the aggregate retained
+            // high-water beyond it. The current family workers retain the
+            // request payload outside this pure scheduler, so returning a
+            // queued descriptor here would lose the reply/token payload at
+            // promotion. Surface transient queue pressure instead. The
+            // client can retry after an idle slot with sufficient high-water
+            // becomes reusable; logical context is never reduced.
+            self.admitted_total = self.admitted_total.saturating_sub(1);
+            self.rejected_429_total = self.rejected_429_total.saturating_add(1);
+            let reserved = self.reserved_high_water_bytes();
+            let aggregate_needed = self
+                .slot_id_free_list
+                .iter()
+                .copied()
+                .chain(
+                    (self.next_fresh_slot_id < self.max_slots)
+                        .then_some(SlotId(self.next_fresh_slot_id)),
+                )
+                .map(|slot| {
+                    reserved.saturating_add(
+                        req.kv_bytes_needed
+                            .saturating_sub(self.slot_high_water_bytes[slot.0 as usize]),
+                    )
+                })
+                .min()
+                .unwrap_or_else(|| reserved.saturating_add(req.kv_bytes_needed));
+            return Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes: aggregate_needed,
+                budget_bytes: self.total_kv_budget_bytes,
+            });
         };
         Ok(public)
     }
@@ -1352,7 +1572,7 @@ impl Scheduler for InflightBatchedScheduler {
                 };
                 Ok(SchedulerStep::Mixed {
                     prefill: self.in_flight[idx].handle,
-                    n_prefill_tokens: tokens_remaining.min(DEFAULT_PREFILL_CHUNK_TOKENS),
+                    n_prefill_tokens: tokens_remaining.min(self.prefill_chunk_tokens),
                     decode_handles,
                 })
             }
@@ -1365,7 +1585,7 @@ impl Scheduler for InflightBatchedScheduler {
                 };
                 Ok(SchedulerStep::Prefill {
                     handle: self.in_flight[idx].handle,
-                    n_tokens: tokens_remaining.min(DEFAULT_PREFILL_CHUNK_TOKENS),
+                    n_tokens: tokens_remaining.min(self.prefill_chunk_tokens),
                 })
             }
             (None, false) => Ok(SchedulerStep::Decode {
@@ -1380,7 +1600,9 @@ impl Scheduler for InflightBatchedScheduler {
         let Some(idx) = self.in_flight.iter().position(|s| s.handle == handle) else {
             return;
         };
+        let inferred = self.inferred_committed_bytes(&self.in_flight[idx]);
         self.in_flight.remove(idx);
+        self.finish_slot_accounting(handle.slot_id, inferred);
         let gen_idx = handle.slot_id.0 as usize;
         self.slot_generations[gen_idx] = self.slot_generations[gen_idx].saturating_add(1);
         self.slot_id_free_list.push(handle.slot_id);
@@ -1414,16 +1636,41 @@ mod tests {
             prompt_tokens,
             max_tokens,
             kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
         }
     }
 
     /// iter-A5 helper — admit request with explicit KV byte cost so
-    /// per-slot KV budget tests can pin the SlotBudgetExceeded path.
+    /// physical KV budget tests can pin the SlotBudgetExceeded path.
     fn req_with_kv(prompt_tokens: u32, max_tokens: u32, kv_bytes_needed: u64) -> AdmitRequest {
         AdmitRequest {
             prompt_tokens,
             max_tokens,
             kv_bytes_needed,
+            prompt_kv_bytes: if prompt_tokens == 0 {
+                0
+            } else {
+                kv_bytes_needed
+                    .saturating_mul(u64::from(prompt_tokens))
+                    .saturating_div(u64::from(prompt_tokens).saturating_add(u64::from(max_tokens)))
+            },
+            preferred_slot: None,
+        }
+    }
+
+    fn req_with_kv_parts(
+        prompt_tokens: u32,
+        max_tokens: u32,
+        kv_bytes_needed: u64,
+        prompt_kv_bytes: u64,
+    ) -> AdmitRequest {
+        AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed,
+            prompt_kv_bytes,
+            preferred_slot: None,
         }
     }
 
@@ -1635,6 +1882,8 @@ mod tests {
                     prompt_tokens: 1,
                     max_tokens: 1,
                     kv_bytes_needed: 0,
+                    prompt_kv_bytes: 0,
+                    preferred_slot: None,
                 })
                 .map(|slot| (i, slot.request_id))
             }));
@@ -2223,8 +2472,11 @@ mod tests {
         s.advance_after_decode(a_h); // auto-release
         assert_eq!(s.stats().in_flight_slots, 0);
 
-        // Admit B — gets recycled SlotId with bumped generation.
-        let b = s.admit(req(8, 4)).expect("b");
+        // Explicit cache affinity reuses A's slot. Cold requests otherwise
+        // claim untouched arenas first so independent agents retain prefixes.
+        let mut b_req = req(8, 4);
+        b_req.preferred_slot = Some(a_h.slot_id);
+        let b = s.admit(b_req).expect("b");
         let b_h = handle_of(&b);
         assert_eq!(b_h.slot_id, a_h.slot_id, "B got A's recycled slot id");
         assert_eq!(
@@ -2308,6 +2560,8 @@ mod tests {
                         prompt_tokens: 1,
                         max_tokens: 4,
                         kv_bytes_needed: 0,
+                        prompt_kv_bytes: 0,
+                        preferred_slot: None,
                     })
                     .expect("admit ok")
                 };
@@ -2764,12 +3018,18 @@ mod tests {
             admitted_at: Instant::now(),
             prompt_tokens: 5,
             max_tokens: 0,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
         });
         s.queue.push_back(QueuedInflightRequest {
             request_id: RequestId(99_998),
             admitted_at: Instant::now(),
             prompt_tokens: 7,
             max_tokens: 4, // normal — should be the one promoted
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
         });
         let completed_before = s.stats().completed_total;
         let in_flight_before = s.stats().in_flight_slots;
@@ -2830,9 +3090,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // iter-A5 — per-slot OOM + budget enforcement (ADR-040 §3.5)
+    // iter-A5 — shared physical OOM + budget enforcement (ADR-040 §0.0)
     //
-    // The scheduler tracks the per-slot KV budget in BYTES; callers
+    // The scheduler tracks the aggregate retained KV high-water in bytes; callers
     // compute `AdmitRequest::kv_bytes_needed` per-arch (Phase C2c+
     // wiring) and the scheduler enforces at admit time.  Budget == 0
     // ⇒ enforcement disabled ⇒ byte-equivalent to pre-A5.
@@ -2975,18 +3235,14 @@ mod tests {
     }
 
     #[test]
-    fn inflight_per_slot_budget_independent_per_slot() {
-        // ADR-040 §3.5: per-slot budget is independent per slot, NOT
-        // aggregate.  Build a scheduler with max_slots=4, budget=1 MiB
-        // per slot; admit 4 requests each asking for exactly 1 MiB.
-        // All 4 must admit (each at the per-slot budget; the budget
-        // does not sum across slots).
-        let per_slot = 1024 * 1024;
-        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, per_slot);
+    fn inflight_shared_budget_tracks_persistent_slot_high_water() {
+        let one_mib = 1024 * 1024;
+        let total = 4 * one_mib;
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, total);
         let mut admitted = Vec::new();
         for i in 0..4 {
             let r = s
-                .admit(req_with_kv(64, 16, per_slot))
+                .admit(req_with_kv(64, 16, one_mib))
                 .unwrap_or_else(|e| panic!("slot {} at-budget admit must succeed; got {:?}", i, e));
             assert!(
                 r.handle.is_some(),
@@ -2998,7 +3254,7 @@ mod tests {
         let stats = s.stats();
         assert_eq!(
             stats.admitted_total, 4,
-            "all 4 at-budget admits counted; per-slot budget does not sum"
+            "all four 1 MiB high-water slots fit the 4 MiB shared budget"
         );
         assert_eq!(
             stats.in_flight_slots, 4,
@@ -3006,14 +3262,15 @@ mod tests {
         );
         assert_eq!(
             stats.rejected_429_total, 0,
-            "ZERO 429s — each request fits its own per-slot budget"
+            "ZERO 429s while aggregate resident high-water fits"
         );
+        assert_eq!(s.total_kv_budget_bytes(), total);
+        assert_eq!(s.resident_high_water_bytes(), 0);
+        assert_eq!(s.reserved_high_water_bytes(), total);
 
-        // The 5th admit AT budget queues (in_flight cap reached, queue
-        // accepts) — still NOT a budget rejection because the request
-        // itself fits the per-slot budget.
+        // A fifth request queues while every slot is active.
         let r5 = s
-            .admit(req_with_kv(64, 16, per_slot))
+            .admit(req_with_kv(64, 16, one_mib))
             .expect("5th at-budget admit queues (not a budget violation)");
         assert!(
             r5.handle.is_none(),
@@ -3025,17 +3282,211 @@ mod tests {
             "queueing is not a budget rejection"
         );
 
-        // But an OVER-budget admit IS rejected even when queue has room.
-        match s.admit(req_with_kv(64, 16, per_slot + 1)) {
+        // Releasing a slot does not erase its resident pages. Promotion reuses
+        // that prior 1 MiB high-water without increasing aggregate residency.
+        s.record_slot_high_water(handle_of(&admitted[0]), one_mib);
+        s.release(handle_of(&admitted[0]));
+        let _ = s.step().expect("promote queued request into retained slot");
+        assert_eq!(s.resident_high_water_bytes(), one_mib);
+        assert_eq!(s.reserved_high_water_bytes(), total);
+
+        // A single request larger than the entire physical pool can never run.
+        match s.admit(req_with_kv(64, 16, total + 1)) {
             Err(AdmitError::SlotBudgetExceeded {
                 needed_bytes,
                 budget_bytes,
             }) => {
-                assert_eq!(needed_bytes, per_slot + 1);
-                assert_eq!(budget_bytes, per_slot);
+                assert_eq!(needed_bytes, total + 1);
+                assert_eq!(budget_bytes, total);
             }
             other => panic!("expected SlotBudgetExceeded, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn aggregate_pressure_never_returns_a_payloadless_queued_descriptor() {
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, 4_000);
+        let first = s.admit(req_with_kv(100, 8, 3_000)).expect("first slot");
+
+        // The request fits the pool by itself, but a fresh second slot would
+        // push retained physical high-water to 5,000. A handle-less success
+        // would strand the worker-owned request payload, so this is explicit
+        // transient queue pressure instead.
+        assert!(matches!(
+            s.admit(req_with_kv(100, 8, 2_000)),
+            Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes: 5_000,
+                budget_bytes: 4_000,
+            })
+        ));
+
+        let reusable = handle_of(&first).slot_id;
+        s.record_slot_high_water(handle_of(&first), 3_000);
+        s.release(handle_of(&first));
+        let mut retry = req_with_kv(100, 8, 2_000);
+        retry.preferred_slot = Some(reusable);
+        let admitted = s.admit(retry).expect("idle high-water slot is reusable");
+        assert_eq!(admitted.handle.map(|handle| handle.slot_id), Some(reusable));
+        assert_eq!(s.resident_high_water_bytes(), 3_000);
+    }
+
+    #[test]
+    fn successful_release_commits_actual_kv_and_returns_unused_reservation() {
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 2, 10_000);
+        let first = s
+            .admit(req_with_kv(100, 8_000, 8_000))
+            .expect("worst-case reservation fits");
+        let handle = handle_of(&first);
+        assert_eq!(s.resident_high_water_bytes(), 0);
+        assert_eq!(s.reserved_high_water_bytes(), 8_000);
+
+        s.record_slot_high_water(handle, 2_000);
+        // Reservation remains in force until the active request releases.
+        assert_eq!(s.reserved_high_water_bytes(), 8_000);
+        s.release(handle);
+        assert_eq!(s.resident_high_water_bytes(), 2_000);
+        assert_eq!(s.reserved_high_water_bytes(), 2_000);
+
+        // Returned headroom admits another full-context request. Best-fit
+        // reuse keeps it on the existing arena; logical context was never
+        // divided and only physical pages are accounted.
+        let mut second_request = req_with_kv(100, 6_000, 8_000);
+        second_request.preferred_slot = Some(handle.slot_id);
+        let second = s
+            .admit(second_request)
+            .expect("unused generation reservation was returned");
+        assert!(second.handle.is_some());
+        assert_eq!(s.reserved_high_water_bytes(), 8_000);
+    }
+
+    #[test]
+    fn unmeasured_release_never_commits_generation_reservation() {
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 2, 10_000);
+        let first = s
+            .admit(req_with_kv(100, 8_000, 8_100))
+            .expect("worst-case reservation fits");
+        let handle = handle_of(&first);
+        assert_eq!(s.reserved_high_water_bytes(), 8_100);
+
+        // Models cancellation/error before the worker reports an exact
+        // cursor. The prompt is conservatively charged, but the untouched
+        // generation reservation must not become permanent high-water.
+        s.release(handle);
+        assert_eq!(s.resident_high_water_bytes(), 100);
+        assert_eq!(s.reserved_high_water_bytes(), 100);
+    }
+
+    #[test]
+    fn measured_pre_prefill_release_does_not_charge_prompt_bytes() {
+        let fixed = 256;
+        let mut scheduler =
+            InflightBatchedScheduler::new_with_kv_budget_and_floor(4, 1, 16_384, fixed);
+        let admitted = scheduler
+            .admit(req_with_kv_parts(1_000, 128, 8_000, 7_000))
+            .expect("request fits")
+            .handle
+            .expect("physical slot");
+
+        scheduler.record_slot_high_water(admitted, 0);
+        scheduler.release(admitted);
+
+        assert_eq!(scheduler.resident_high_water_bytes(), fixed);
+        assert_eq!(scheduler.reserved_high_water_bytes(), fixed);
+    }
+
+    #[test]
+    fn fixed_slot_floor_is_charged_once_and_prompt_fallback_is_exact() {
+        let fixed = 256 * 1024 * 1024_u64;
+        let mut s = InflightBatchedScheduler::new_with_kv_budget_and_floor(
+            8,
+            2,
+            4 * 1024 * 1024 * 1024,
+            fixed,
+        );
+        assert_eq!(s.resident_high_water_bytes(), fixed * 2);
+
+        let admitted = s
+            .admit(req_with_kv_parts(100, 8_000, 8_100, 100))
+            .expect("fixed plus dynamic reservation fits");
+        let handle = handle_of(&admitted);
+        assert_eq!(s.reserved_high_water_bytes(), fixed * 2 + 8_100);
+
+        // No explicit cursor report models a cancellation immediately after
+        // synchronous prefill. The prompt demand is retained exactly; the
+        // untouched generation budget is returned and fixed is not doubled.
+        s.release(handle);
+        assert_eq!(s.resident_high_water_bytes(), fixed * 2 + 100);
+        assert_eq!(s.reserved_high_water_bytes(), fixed * 2 + 100);
+    }
+
+    #[test]
+    fn qwen_apex_np8_keeps_full_262k_context_under_shared_48g_budget() {
+        let fixed = 256 * 1024 * 1024_u64;
+        let linear = 10_400_u64;
+        let logical_context = 262_144_u32;
+        let prompt_tokens = logical_context - 1;
+        let dynamic = u64::from(logical_context).saturating_mul(linear);
+        let prompt_dynamic = u64::from(prompt_tokens).saturating_mul(linear);
+        let budget = 48 * 1024 * 1024 * 1024_u64;
+        let mut s = InflightBatchedScheduler::new_with_kv_budget_and_floor(8, 8, budget, fixed);
+
+        for expected_slot in 0..8 {
+            let admitted = s
+                .admit(req_with_kv_parts(prompt_tokens, 1, dynamic, prompt_dynamic))
+                .expect("each full logical context fits the shared pool");
+            assert_eq!(handle_of(&admitted).slot_id, SlotId(expected_slot));
+        }
+        assert_eq!(s.stats().in_flight_slots, 8);
+        assert_eq!(s.reserved_high_water_bytes(), (fixed + dynamic) * 8);
+        assert!(s.reserved_high_water_bytes() < budget);
+    }
+
+    #[test]
+    fn staggered_cold_agents_claim_fresh_slots_before_warm_arenas() {
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, 16_000);
+        let mut claimed = Vec::new();
+        for expected_slot in 0..4 {
+            let admitted = s
+                .admit(req_with_kv(100, 8, 4_000))
+                .expect("staggered cold request fits");
+            let handle = handle_of(&admitted);
+            claimed.push(handle.slot_id);
+            assert_eq!(
+                handle.slot_id,
+                SlotId(expected_slot),
+                "a cold agent must establish an independent arena"
+            );
+            s.record_slot_high_water(handle, 2_000);
+            s.release(handle);
+        }
+        assert_eq!(claimed, vec![SlotId(0), SlotId(1), SlotId(2), SlotId(3)]);
+        assert_eq!(s.resident_high_water_bytes(), 8_000);
+    }
+
+    #[test]
+    fn inflight_prefers_idle_slot_with_reusable_prefix_state() {
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 3, 16_000);
+        let first = s.admit(req_with_kv(100, 8, 4_000)).expect("slot 0");
+        let second = s.admit(req_with_kv(100, 8, 4_000)).expect("slot 1");
+        let third = s.admit(req_with_kv(100, 8, 4_000)).expect("slot 2");
+        let preferred = handle_of(&second).slot_id;
+        s.record_slot_high_water(handle_of(&first), 4_000);
+        s.record_slot_high_water(handle_of(&second), 4_000);
+        s.record_slot_high_water(handle_of(&third), 4_000);
+        s.release(handle_of(&first));
+        s.release(handle_of(&second));
+        s.release(handle_of(&third));
+
+        let mut request = req_with_kv(120, 8, 5_000);
+        request.preferred_slot = Some(preferred);
+        let resumed = s.admit(request).expect("preferred slot fits shared budget");
+        assert_eq!(
+            resumed.handle.map(|handle| handle.slot_id),
+            Some(preferred),
+            "exact-prefix affinity wins over generic best-fit selection"
+        );
+        assert_eq!(s.resident_high_water_bytes(), 12_000);
+        assert_eq!(s.reserved_high_water_bytes(), 13_000);
     }
 
     #[test]
@@ -3046,5 +3497,6 @@ mod tests {
         assert_eq!(r.prompt_tokens, 0);
         assert_eq!(r.max_tokens, 0);
         assert_eq!(r.kv_bytes_needed, 0);
+        assert_eq!(r.preferred_slot, None);
     }
 }

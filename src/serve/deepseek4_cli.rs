@@ -176,11 +176,7 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
         )?;
         let logit_values = logits.as_slice::<f32>()?;
         write_f32_dump("/tmp/hf2q_logits_t0.bin", logit_values)?;
-        let mut indexed = logit_values
-            .iter()
-            .copied()
-            .enumerate()
-            .collect::<Vec<_>>();
+        let mut indexed = logit_values.iter().copied().enumerate().collect::<Vec<_>>();
         indexed.sort_by(|left, right| {
             right
                 .1
@@ -267,10 +263,7 @@ pub(super) fn cmd_generate(args: cli::GenerateArgs, gguf: GgufFile) -> Result<()
 
 fn write_f32_dump(path: &str, values: &[f32]) -> Result<()> {
     let bytes = unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(values),
-        )
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     };
     std::fs::write(path, bytes).with_context(|| format!("write diagnostic dump {path}"))
 }

@@ -3154,6 +3154,7 @@ mod tests {
                     *b = ((i * 31 + bi * 7 + j) % 251) as u8;
                 }
             }
+            slot.current_len[0] = n_tokens as u32;
         }
         {
             let tq = src
@@ -3177,8 +3178,19 @@ mod tests {
                     *b = ((97 + bi * 11 + j) % 251) as u8;
                 }
             }
+            src.mtp_slot.as_mut().expect("mtp").current_len[0] = n_tokens as u32;
         }
-        let full_snap = src.snapshot(&device).expect("full snapshot");
+        for slot in &mut src.full_attn {
+            slot.current_len[0] = max_seq_len;
+        }
+        src.mtp_slot.as_mut().expect("mtp").current_len[0] = max_seq_len;
+        let full_snap = src
+            .snapshot(&device)
+            .expect("fully initialized capacity snapshot");
+        for slot in &mut src.full_attn {
+            slot.current_len[0] = n_tokens as u32;
+        }
+        src.mtp_slot.as_mut().expect("mtp").current_len[0] = n_tokens as u32;
         let snap = src
             .snapshot_prefix(&device, n_tokens)
             .expect("compact prefix snapshot");

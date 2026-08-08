@@ -239,6 +239,7 @@ async fn resolve_engine_for_request(
         // `--scheduler inflight_batched` and `EngineSpawnError::
         // ModeNotYetWired` fires there if the operator requests it.
         engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+        kv_cache_budget_bytes: None,
     };
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
@@ -501,7 +502,7 @@ async fn chat_completions_with_prepared(
                 return queue_full_with_rate_limit_headers(&state);
             }
             // ADR-040 §3.5 iter-A5b — typed-prefix routing for the
-            // per-slot KV budget rejection. The worker_run admit arms
+            // shared physical KV budget rejection. The worker_run admit arms
             // wrap `AdmitError::SlotBudgetExceeded` in an anyhow error
             // whose message starts with `slot_budget_exceeded:`; the
             // handler maps it to HTTP 429 + Retry-After parallel to
@@ -1086,6 +1087,18 @@ where
     if !state.is_ready_for_gen() {
         return Err(ApiError::not_ready().into_response());
     }
+    if req.max_completion_tokens.or(req.max_tokens) == Some(0) {
+        let param = if req.max_completion_tokens.is_some() {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        return Err(ApiError::invalid_request(
+            format!("{param} must be greater than zero"),
+            Some(param.into()),
+        )
+        .into_response());
+    }
 
     // --- Pool-routed engine resolution (iter-209) ---
     // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
@@ -1309,6 +1322,39 @@ where
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
+    // Gemma's native template appends a generation cue whose tokens are
+    // rewritten by the next tool-result turn. A checkpoint taken after that
+    // cue cannot safely be rewound once the sliding ring has advanced. Render
+    // the same request without the cue and accept the boundary only when it is
+    // a strict token prefix of the actual prompt. Overflow rewrites that used
+    // a different message list fail this check and therefore stay cold.
+    let stable_prompt_prefix_tokens = if engine.info().arch_family
+        == crate::serve::load_info::ArchFamily::Gemma4
+        && vision_embeddings.is_empty()
+    {
+        let stable = render_chat_prompt_or_400_with_generation_prompt(
+            engine.chat_template(),
+            &messages_for_render,
+            req_tools,
+            enable_thinking,
+            template_kwargs,
+            false,
+        )?;
+        let stable_encoding = match engine.tokenizer().encode(stable.as_str(), false) {
+            Ok(encoding) => encoding,
+            Err(error) => {
+                tracing::warn!(%error, "stable prompt boundary tokenization failed");
+                return Err(ApiError::internal_error().into_response());
+            }
+        };
+        let stable_tokens = stable_encoding.get_ids();
+        (!stable_tokens.is_empty()
+            && stable_tokens.len() < prompt_tokens.len()
+            && prompt_tokens.starts_with(stable_tokens))
+        .then_some(stable_tokens.len())
+    } else {
+        None
+    };
     // ADR-005 iter-230 B: does the rendered prompt end inside an OPEN
     // reasoning block (template-seeded `<think>\n`)? The generation-
     // prompt tail is template-controlled and messages-independent
@@ -1434,6 +1480,7 @@ where
         grammar_kind: effective_grammar_kind,
         tool_call_policy: tc_policy,
         reasoning_forced_open,
+        stable_prompt_prefix_tokens,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
     // the multimodal preflight produced ViT embeddings, locate the
@@ -1871,7 +1918,7 @@ async fn chat_completions_stream(
     // dropped (client disconnect per Decision #18). Shared atomic lives on
     // ServerMetrics so /metrics surfaces it.
     let cancellation_counter = Some(state.metrics.sse_cancellations_counter_arc());
-    // ADR-040 §3.5 iter-A5b — PRE-STREAM per-slot KV budget check.
+    // ADR-040 §0.0 — pre-stream shared physical KV budget check.
     // Per codex review CRITICAL #2 (handlers.rs:1739-1748 originally
     // string-matched `queue_full` only AND streaming-arm admit
     // happened AFTER generate_stream_with_deepstack returned Ok),
@@ -2286,15 +2333,40 @@ fn render_chat_prompt_or_400(
     enable_thinking: bool,
     template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<String, Response> {
-    engine::render_chat_prompt_with_tools(template, msgs, tools, enable_thinking, template_kwargs)
-        .map_err(|e| {
-            tracing::warn!(error = %e, "chat template render failed");
-            ApiError::invalid_request(
-                format!("chat template render failed: {e:#}"),
-                Some("messages".into()),
-            )
-            .into_response()
-        })
+    render_chat_prompt_or_400_with_generation_prompt(
+        template,
+        msgs,
+        tools,
+        enable_thinking,
+        template_kwargs,
+        true,
+    )
+}
+
+fn render_chat_prompt_or_400_with_generation_prompt(
+    template: &str,
+    msgs: &[super::schema::ChatMessage],
+    tools: Option<&[super::schema::Tool]>,
+    enable_thinking: bool,
+    template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    add_generation_prompt: bool,
+) -> Result<String, Response> {
+    engine::render_chat_prompt_with_tools_generation_prompt(
+        template,
+        msgs,
+        tools,
+        enable_thinking,
+        template_kwargs,
+        add_generation_prompt,
+    )
+    .map_err(|e| {
+        tracing::warn!(error = %e, "chat template render failed");
+        ApiError::invalid_request(
+            format!("chat template render failed: {e:#}"),
+            Some("messages".into()),
+        )
+        .into_response()
+    })
 }
 
 /// TruncateLeft branch helper. Iteratively drop oldest non-system
@@ -7913,6 +7985,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         }
     }
 
@@ -7960,6 +8033,7 @@ mod tests {
             kv_spill_active: true,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         }
     }
 
@@ -10165,8 +10239,8 @@ mod bos_probe_tests {
 #[cfg(test)]
 mod a5d_handler_429_tests {
     use super::super::engine::{
-        make_synthetic_engine_over_budget, make_synthetic_engine_with_slot_budget_exceeded_worker,
-        LoadedArch,
+        make_synthetic_engine_aggregate_stream_pressure, make_synthetic_engine_over_budget,
+        make_synthetic_engine_with_slot_budget_exceeded_worker, LoadedArch,
     };
     use super::super::state::{AppState, ServerConfig};
     use super::*;
@@ -10371,6 +10445,41 @@ mod a5d_handler_429_tests {
             "iter-A5d Critical #2: streaming handler body MUST embed \
              budget_bytes=1048576 verbatim; got: {body_str}"
         );
+    }
+
+    /// An individually valid full-context request can still exceed the shared
+    /// physical budget when peer agents retain touched pages. The slot-aware
+    /// worker acknowledgement must reject that aggregate pressure before SSE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slot_aware_aggregate_pressure_returns_429_before_sse() {
+        let engine = make_synthetic_engine_aggregate_stream_pressure(LoadedArch::Gemma);
+        let state = AppState::new(ServerConfig::default());
+        let req = minimal_request(true, 1);
+        let prepared = build_prepared_context(engine, vec![0u32; 10], 1);
+
+        let response = chat_completions_stream(state, req, prepared).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("application/json"));
+        assert!(!content_type.contains("text/event-stream"));
+        let body = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("collect aggregate-pressure body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("slot_budget_exceeded"), "body={body}");
+        assert!(body.contains("2000"), "body={body}");
+        assert!(body.contains("1000"), "body={body}");
     }
 
     /// **CRITICAL #2 GOLDEN (LOAD-BEARING)** — actual handler call

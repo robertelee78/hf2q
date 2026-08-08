@@ -48,4 +48,15 @@ impl Deepseek4Model {
         let plan = self.cache_plan(context_length)?;
         Deepseek4Cache::allocate(&plan, self.ctx.device().clone())
     }
+
+    /// Reserve a full logical cache whose append-only KV rows are committed
+    /// on first write. Used by multi-agent slots so logical context capacity
+    /// is independent from aggregate physical residency.
+    pub fn allocate_logical_cache(
+        &self,
+        context_length: usize,
+    ) -> Result<Deepseek4Cache, CacheError> {
+        let plan = self.cache_plan(context_length)?;
+        Deepseek4Cache::allocate_logical(&plan, self.ctx.device().clone())
+    }
 }

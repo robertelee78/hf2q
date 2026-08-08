@@ -1,6 +1,7 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
-- **Status:** Accepted for hf2q 0.1.1; cache growth revalidated 2026-08-08
+- **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
+  cache growth revalidated 2026-08-08
 - **Updated:** 2026-08-08 — an operator OpenCode run first falsified destructive
   131,072-to-262,144 cache growth. The corrected candidate then migrated
   119,909 live tokens in 101.9 ms, retained 119,848 of 119,943 prompt tokens
@@ -62,9 +63,10 @@ these paths invokes an external converter, runtime, model, or process.
 The server supports OpenAI-compatible unary and SSE chat completions,
 cancellation, sampling, stop/EOS, reasoning deltas, official DeepSeek DSML,
 required/automatic tool choice, structured tool-call responses, and multiple
-invocations in one DSML block. DeepSeek-V4 embeddings, multimodal inputs, and
-the slot-aware concurrent scheduler are explicitly rejected rather than routed
-to another model family.
+invocations in one DSML block. Slot-aware serving retains one independent
+full-logical-context session per agent while sharing weights and one physical
+KV byte budget. DeepSeek-V4 embeddings and multimodal inputs remain explicitly
+rejected rather than routed to another model family.
 
 For SSE, `time_to_first_token_ms` measures the first API-visible reasoning,
 content, or structured tool-call event. Prefill completion alone is not TTFT:
@@ -347,9 +349,10 @@ loaded from llama.cpp at runtime.
 
 ### Agentic serving and cache contract
 
-The DeepSeek worker owns a single serialized live session. It records the exact
-rendered token sequence corresponding to the native cache position and selects
-the longest safe prefix for each request:
+The SerialFifo DeepSeek worker owns one live session. The slot-aware worker owns
+one such session per configured agent and executes them through the same model
+surface. Each records the exact rendered token sequence corresponding to the
+native cache position and selects the longest safe prefix for each request:
 
 1. reuse the live cache when the new transcript extends it exactly;
 2. restore the prompt-tail recovery checkpoint when canonical reasoning removal
@@ -471,7 +474,7 @@ changes. The measured candidate is
 | Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. The source-argument regression also returned `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result` byte-for-byte in one `emit_source` call (4 s response), proving the formerly truncated `<` syntax through the real model. A real OpenCode two-turn run issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
 | Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
 | Prefix reuse | The current checked-in gate used a 6,262-token prompt and reused 6,254 tokens on repeated, automatic, SSE, and post-tool turns. Cold TTFT was 9.564 s and cached TTFT was 227 ms; every required/automatic tool, source-argument, tool-result, unary, and SSE assertion passed. |
-| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, and the 120K cache gate. It advertises 524,288 tokens and demand-allocates 131K initially. Memory/port preflight now refuses an unsafe 100 GiB load before model mapping. A prompt crossing the initial 131K allocation and a near-512K physical allocation remain unproven on this 128 GiB host. |
+| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, the four-agent full-context gate, and the 120K cache-growth gate. It advertises 524,288 tokens for every slot and demand-allocates 131K initially. Memory/port preflight refuses an unsafe 100 GiB load before model mapping. The 131K-to-262K boundary is proven; a near-512K physical allocation remains unproven on this 128 GiB host. |
 | Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; llama.cpp build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
 | 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 321.034 s TTFT (373.194 tok/s); decode was 23.869 tok/s. The same source-bound prompt and artifact under llama.cpp build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.33x the reference prompt rate and 1.22x its decode rate for these source-bound runs. |
 | 120K continuation cache | Appending the real tool result produced a 119,907-token request that reused 119,800 tokens (99.91%), evaluated only a 107-token suffix, returned its first semantic event in 1.113 s, and emitted the exact requested sentinel. |
@@ -989,6 +992,48 @@ They do not log prompt text, decoded content, tool names, or arguments. This
 distinguishes an incompatible transcript rewrite from a future cache defect
 without exposing operator data.
 
+### Full-context multi-agent revalidation (2026-08-08)
+
+`scripts/test_full_context_agent_slots.sh` passed four concurrent DeepSeek
+agent conversations through the canonical slot-aware launcher. Each slot
+advertised the complete 524,288-token serving context; no context or KV stride
+was divided by four. All four conversations passed required and automatic
+tool choice, unary and SSE tool-call encoding, tool-result continuation, and
+source-shaped arguments. Two powered gates passed. Cached turns reused at
+least 6,677/6,685 tokens with maximum cached TTFT 268.68 ms, cached unary/SSE
+turns completed in 6-13 seconds, and every four-agent tool-result turn
+completed within 20-32 seconds. Exact server-side cold-cohort makespans were
+53.86 and 52.32 seconds (53.09-second median); client-observed semantic walls
+were 52-55 seconds.
+
+The matched llama.cpp server completed its corresponding cold four-request
+wave in about 54.1 seconds on the same artifact and host with `--kv-unified`,
+`--parallel 4`, and 131,072 logical tokens per slot. Its 524,288-token unified
+allocation did not fit beside the 100 GiB artifact on this 128 GiB host. hf2q
+therefore met the matched wall-clock bar while providing 524,288 logical
+tokens to every slot through demand-grown physical admission.
+
+The accepted scheduling policy uses an eight-token decode quantum and
+resumable cold prefill at atomic cache+ledger commit boundaries. At most two
+cold requests alternate complete matrix transactions through the one shared
+prefill scratch arena. Decode-ready members are parked until the bounded cold
+cohort completes prefill, preventing early responses from producing cached
+traffic that delays the remaining cold agents. Once the cohort drains,
+longest-prefix continuations run before unrelated cold work can evict a
+retained agent cache. A paired long-row graph exceeded Metal memory, and a
+batched-output-head-only spike did not improve the cold tail; neither failed
+experiment is present in the landing code.
+
+The slot-aware long-cache falsifier first exposed an affinity defect: a
+tool-result continuation matched the native recovery anchor but not the raw
+generated-token tail, so the scheduler selected a fresh slot and growth
+reported `migrated_tokens=0`. Recovery-anchor-aware affinity corrected the
+selection. The final boundary request grew one retained slot from 131,072 to
+262,144 capacity, migrated 119,762 live tokens, credited 119,692/119,778
+cached tokens (99.92%), evaluated only an 86-token suffix, and returned in
+1.132 seconds. That final correctness run occurred on battery power; its cold
+prefill rate is not used for a performance claim.
+
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
 This section records the rejected 89.65 GiB Q2_K_S artifact and the defects that
@@ -1078,5 +1123,5 @@ current readiness.
 | Required tool call | Real model returned OpenAI `read_file` with arguments `{"path":"/tmp/example.txt"}` and `finish_reason: "tool_calls"`; no raw DSML leaked |
 | Constrained tool performance | Greedy candidate-ranked grammar enforcement improved the same 51-token tool call from 2.9 to 25.4 tok/s while preserving the structured call |
 | SSE tool + cache | Streaming response emitted role, indexed `tool_calls`, `finish_reason: "tool_calls"`, usage, and `[DONE]`; it reused 290 of the 298 rendered tool-prompt tokens |
-| Unsupported surfaces | DeepSeek-V4 embeddings, multimodal injections, and slot-aware scheduling fail explicitly; no alternate family/runtime fallback is selected |
+| Unsupported surfaces | DeepSeek-V4 embeddings and multimodal injections fail explicitly; no alternate family/runtime fallback is selected. Slot-aware text generation is supported with independent full-context sessions and shared physical KV admission. |
 | Full binary regression | 3,814 passed, 0 failed, and 44 ignored in 173.97 s after the matrix-prefill/cache-policy change |

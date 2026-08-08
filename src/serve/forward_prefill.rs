@@ -2978,6 +2978,7 @@ impl MlxModelWeights {
                 && lcp_resumable_regime
                 && snapshot_safe
                 && lcp_fits_budget
+                && !slot_aware
             {
                 // Allocate fresh per-layer buffers + memcpy bytes from
                 // each live `dense_kvs_vec[i]` into the new snapshot.
@@ -3168,7 +3169,7 @@ impl MlxModelWeights {
         // preserved on the snapshot side.
         let hybrid_snapshot_for_lcp: Option<
             Vec<std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>>,
-        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && snapshot_safe {
+        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && snapshot_safe && !slot_aware {
             match self.hybrid_kv.as_ref() {
                 None => None,
                 Some(live_hybrid) => {
@@ -3586,6 +3587,73 @@ impl MlxModelWeights {
         gpu: &mut GpuContext,
         slot_id: SlotId,
         multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+    ) -> Result<u32> {
+        self.forward_prefill_with_soft_tokens_slot_aware_impl(
+            prompt_tokens,
+            soft_tokens,
+            max_decode_tokens,
+            gpu,
+            slot_id,
+            multi_seq_kv_hb,
+            multi_seq_kv_hybrid,
+            multi_seq_kv_dense,
+            multi_seq_kv_mlx,
+            0,
+        )
+    }
+
+    /// Append a prompt suffix to an exact live Gemma slot prefix.
+    /// `cached_tokens` is verified by the worker against both its rendered
+    /// token ledger and the slot cursor before this call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_with_soft_tokens_slot_aware_resume(
+        &mut self,
+        prompt_tokens: &[u32],
+        soft_tokens: &[SoftTokenInjection<'_>],
+        max_decode_tokens: usize,
+        gpu: &mut GpuContext,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+        cached_tokens: usize,
+    ) -> Result<u32> {
+        anyhow::ensure!(
+            cached_tokens > 0 && cached_tokens < prompt_tokens.len(),
+            "Gemma slot resume requires 0 < cached_tokens ({cached_tokens}) < prompt_len ({})",
+            prompt_tokens.len(),
+        );
+        anyhow::ensure!(
+            soft_tokens.is_empty(),
+            "Gemma slot resume does not reuse multimodal soft-token state"
+        );
+        self.forward_prefill_with_soft_tokens_slot_aware_impl(
+            prompt_tokens,
+            soft_tokens,
+            max_decode_tokens,
+            gpu,
+            slot_id,
+            multi_seq_kv_hb,
+            multi_seq_kv_hybrid,
+            multi_seq_kv_dense,
+            multi_seq_kv_mlx,
+            cached_tokens,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill_with_soft_tokens_slot_aware_impl(
+        &mut self,
+        prompt_tokens: &[u32],
+        soft_tokens: &[SoftTokenInjection<'_>],
+        max_decode_tokens: usize,
+        gpu: &mut GpuContext,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
         // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — production-default
         // hybrid F16-K + TQ-HB-V scaffold parameter.  `Option<>` because
         // iter-C2c-cont (§6.1.33) provisions this field IFF the
@@ -3629,6 +3697,7 @@ impl MlxModelWeights {
         //
         // Per H188 pin: ADDITIVE — prior surfaces preserved.
         multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+        cached_tokens: usize,
     ) -> Result<u32> {
         // ── Pre-flight ────────────────────────────────────────────────
         //
@@ -4757,10 +4826,31 @@ impl MlxModelWeights {
             // surface) via the soft_tokens.is_empty() guard.
             let use_batched_slot_prefill = soft_tokens.is_empty()
                 && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() != Ok("0");
-            let result = if use_batched_slot_prefill {
+            let result = if cached_tokens > 0 {
+                anyhow::ensure!(
+                    use_batched_slot_prefill,
+                    "Gemma live slot resume requires text-only batched prefill"
+                );
                 let prior_dense_kvs = self.dense_kvs.take();
                 let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
-                let r = self.forward_prefill_batched(prompt_tokens, max_decode_tokens, 0, gpu);
+                let r = self.forward_prefill_batched_live_resume_slot_mounted(
+                    &prompt_tokens[cached_tokens..],
+                    max_decode_tokens,
+                    cached_tokens,
+                    gpu,
+                );
+                self.dense_kvs = prior_dense_kvs;
+                self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
+                r
+            } else if use_batched_slot_prefill {
+                let prior_dense_kvs = self.dense_kvs.take();
+                let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
+                let r = self.forward_prefill_batched_slot_mounted(
+                    prompt_tokens,
+                    max_decode_tokens,
+                    0,
+                    gpu,
+                );
                 self.dense_kvs = prior_dense_kvs;
                 self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
                 r
@@ -5001,7 +5091,8 @@ impl MlxModelWeights {
         let result = if use_batched_slot_prefill {
             let prior_dense_kvs = self.dense_kvs.take();
             let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
-            let r = self.forward_prefill_batched(prompt_tokens, max_decode_tokens, 0, gpu);
+            let r =
+                self.forward_prefill_batched_slot_mounted(prompt_tokens, max_decode_tokens, 0, gpu);
             self.dense_kvs = prior_dense_kvs;
             self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
             r

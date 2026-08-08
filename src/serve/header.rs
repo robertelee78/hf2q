@@ -180,6 +180,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         };
         let mut buf = Vec::new();
         print_banner(&info, &mut buf, false).expect("print banner");

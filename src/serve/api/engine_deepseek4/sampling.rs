@@ -149,7 +149,7 @@ pub(super) fn sample(
     Ok((token, logprob))
 }
 
-fn split_reasoning(
+pub(super) fn split_reasoning(
     raw: &str,
     registration: Option<&ModelRegistration>,
     forced_open: bool,

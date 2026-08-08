@@ -363,9 +363,7 @@ impl Deepseek4Model {
                 inter,
                 hidden,
                 routed_projection,
-                id_mm_scratch
-                    .as_deref_mut()
-                    .map(|scratch| &mut scratch[0]),
+                id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[0]),
                 "routed gate",
             )?;
             expert_matmul(
@@ -382,9 +380,7 @@ impl Deepseek4Model {
                 inter,
                 hidden,
                 routed_projection,
-                id_mm_scratch
-                    .as_deref_mut()
-                    .map(|scratch| &mut scratch[1]),
+                id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[1]),
                 "routed up",
             )?;
             raw_matmul(
@@ -452,9 +448,7 @@ impl Deepseek4Model {
                     hidden,
                     inter,
                     ExpertMatmulRoute::SlottedMm,
-                    id_mm_scratch
-                        .as_deref_mut()
-                        .map(|scratch| &mut scratch[0]),
+                    id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[0]),
                     "routed down",
                 )?;
             } else {

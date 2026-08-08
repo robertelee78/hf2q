@@ -147,10 +147,8 @@ fn write_kv_with_optional_tq_encode(
     // For `SlotId(0)` the slice_view byte offset is 0 — byte-identical
     // to pre-B4a-cont.  For `SlotId(N>0)` the dispatcher writes into
     // slot N's region of the `[n_seqs, n_kv_heads, max_seq_len,
-    // head_dim]` F32 backing.  TQ-encode shadow path (slot.tq) remains
-    // single-slot today (kernels lack slot-aware indexing) — slot N>0
-    // with TQ-active is gated above this helper, see
-    // `apply_sdpa_with_kv_cache`.
+    // head_dim]` F32 backing. The TQ path applies the same outer-axis
+    // selection through zero-copy packed/norm buffer views.
     slot_id: SlotId,
 ) -> Result<()> {
     // (1) F32 KV cache write — byte-identical to pre-iter-15 when
@@ -201,23 +199,9 @@ fn write_kv_with_optional_tq_encode(
     //       256/512 head_dims via F32). Note: production qwen35 head_dim
     //       is always 256 — non-256 here means a small-fixture test.
     //
-    // ADR-040 Phase B4a-cont: TQ encode kernels
-    // (`dispatch_hadamard_quantize_kv_hb_seq`) do not yet accept a
-    // per-slot byte offset, so multi-slot TQ-active is deferred to a
-    // future iter (B4a-TQ).  `apply_sdpa_with_kv_cache` enforces this:
-    // slot N>0 with `slot.tq.is_some()` errors before reaching this
-    // helper.  The assert below pins that invariant in the helper for
-    // defence-in-depth.
-    if slot.tq.is_some() && slot_id.0 != 0 {
-        return Err(anyhow!(
-            "write_kv_with_optional_tq_encode: slot_id={} with slot.tq.is_some() \
-             is not supported in Phase B4a-cont (TQ encode kernels are not \
-             slot-aware).  Caller routing bug — `apply_sdpa_with_kv_cache` must \
-             gate TQ-active slot N>0 to a typed B4a-TQ error before reaching \
-             this dispatcher.  See ADR-040 §6.1.5.",
-            slot_id.0,
-        ));
-    }
+    // TQ buffers carry `n_seqs` as their outer axis. The called helpers bind
+    // zero-copy views for `slot_id`, so the kernels keep their proven
+    // single-sequence math while reading and writing the correct agent.
     if slot.tq.is_some() && n_tokens > 0 && (head_dim == 256 || head_dim == 512) {
         // RAW barrier between F32 write and TQ encode source reads.
         // Both read k_seq_major/v_seq_major (independent of slot.k/v
@@ -237,7 +221,7 @@ fn write_kv_with_optional_tq_encode(
             8
         };
 
-        slot.encode_seq_tokens_to_tq(
+        slot.encode_seq_tokens_to_tq_for_slot(
             k_seq_major,
             true,
             n_tokens,
@@ -249,12 +233,13 @@ fn write_kv_with_optional_tq_encode(
             false,
             1.0,
             cb_bits,
+            slot_id,
             enc,
             registry,
             device,
         )
         .context("TQ encode K (write_kv_with_optional_tq_encode)")?;
-        slot.encode_seq_tokens_to_tq(
+        slot.encode_seq_tokens_to_tq_for_slot(
             v_seq_major,
             false,
             n_tokens,
@@ -266,6 +251,7 @@ fn write_kv_with_optional_tq_encode(
             false,
             1.0,
             cb_bits,
+            slot_id,
             enc,
             registry,
             device,
@@ -307,25 +293,10 @@ fn dispatch_decode_sdpa_with_optional_tq(
     // For `SlotId(0)` the slice_view byte offset is 0 — byte-identical
     // to pre-B4a-cont.  For `SlotId(N>0)` `flash_attn_vec` reads slot
     // N's region of the `[n_seqs, n_kv_heads, max_seq_len, head_dim]`
-    // F32 backing.  TQ branch (slot.tq.is_some()) is single-slot
-    // today — gated by the caller (`apply_sdpa_with_kv_cache`).
+    // F32 backing. The TQ branch binds packed/norm views for the same slot.
     slot_id: SlotId,
 ) -> Result<()> {
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
-
-    // ADR-040 Phase B4a-cont defence-in-depth: TQ-active multi-slot
-    // is not supported in this iter (kernels are not slot-aware).
-    if slot.tq.is_some() && slot_id.0 != 0 {
-        return Err(anyhow!(
-            "dispatch_decode_sdpa_with_optional_tq: slot_id={} with \
-             slot.tq.is_some() is not supported in Phase B4a-cont \
-             (TQ SDPA kernels are not slot-aware).  Caller routing bug \
-             — `apply_sdpa_with_kv_cache` must gate TQ-active slot N>0 \
-             to a typed B4a-TQ error before reaching this dispatcher. \
-             See ADR-040 §6.1.5.",
-            slot_id.0,
-        ));
-    }
 
     if slot.tq.is_some() && (head_dim == 256 || head_dim == 512) {
         // ── TQ decode chain ──
@@ -372,11 +343,12 @@ fn dispatch_decode_sdpa_with_optional_tq(
             scale_factor_d512: 1.0,
             codebook_bits: cb_bits,
         };
-        slot.dispatch_tq_sdpa(
+        slot.dispatch_tq_sdpa_for_slot(
             q_seq_major,
             out_buf,
             fa_tmp,
             &tq_params,
+            slot_id,
             enc,
             registry,
             device,
@@ -4773,7 +4745,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
 /// - Propagates from `dequant_seq_to_temp_f32_unrotated` and
 ///   `apply_flash_attn_prefill_seq_major_resume`.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     slot: &super::kv_cache::FullAttnKvSlot,
@@ -4785,6 +4757,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
     n_heads: u32,
     n_kv_heads: u32,
     head_dim: u32,
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     if slot.tq.is_none() {
         return Err(anyhow!(
@@ -4801,26 +4774,28 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
         .command_encoder()
         .context("apply_flash_attn_prefill_seq_major_resume_via_tq_cache: dequant encoder")?;
     let temp_k = slot
-        .dequant_seq_to_temp_f32_unrotated(
+        .dequant_seq_to_temp_f32_unrotated_for_slot(
             /*is_k=*/ true,
             kv_seq_len,
             /*start_pos=*/ 0,
             cache_capacity,
             n_kv_heads,
             head_dim,
+            slot_id,
             &mut enc,
             registry,
             device,
         )
         .context("dequant K seq → temp F32 unrotated")?;
     let temp_v = slot
-        .dequant_seq_to_temp_f32_unrotated(
+        .dequant_seq_to_temp_f32_unrotated_for_slot(
             /*is_k=*/ false,
             kv_seq_len,
             /*start_pos=*/ 0,
             cache_capacity,
             n_kv_heads,
             head_dim,
+            slot_id,
             &mut enc,
             registry,
             device,
@@ -4855,6 +4830,36 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
     .context("apply_flash_attn_prefill_seq_major_resume (TQ-decoded path)")
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    slot: &super::kv_cache::FullAttnKvSlot,
+    q_seq_major: &MlxBuffer,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    cache_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
+        device,
+        registry,
+        slot,
+        q_seq_major,
+        seq_len,
+        cur_len,
+        kv_seq_len,
+        cache_capacity,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        SlotId(0),
+    )
+}
+
 /// Maximum resumed query batch routed through the direct byte-packed TQ
 /// vector kernel. The kernel is designed for decode and short batched
 /// verification; larger suffixes retain the tiled dense-prefill bridge.
@@ -4868,7 +4873,7 @@ const QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES: u32 = 32;
 /// prefill case: query i sees K/V through its own absolute position. This
 /// avoids dequantizing the entire cached prefix to F32 on every agentic turn.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn apply_tq_prefill_seq_major_resume_direct(
+pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     slot: &super::kv_cache::FullAttnKvSlot,
@@ -4880,6 +4885,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct(
     n_heads: u32,
     n_kv_heads: u32,
     head_dim: u32,
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     anyhow::ensure!(
         seq_len > 0 && seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES,
@@ -4924,7 +4930,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct(
     slot_ids
         .as_mut_slice::<u32>()
         .map_err(|error| anyhow!("direct TQ prefill slot-id mapping: {error}"))?
-        .fill(0);
+        .fill(slot_id.0);
     let mut sequence_positions = super::decode_pool::pooled_alloc_buffer(
         device,
         (seq_len as usize) * std::mem::size_of::<u32>(),
@@ -4989,6 +4995,37 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct(
     Ok(output)
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_tq_prefill_seq_major_resume_direct(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    slot: &super::kv_cache::FullAttnKvSlot,
+    q_seq_major: &MlxBuffer,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    cache_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    apply_tq_prefill_seq_major_resume_direct_for_slot(
+        device,
+        registry,
+        slot,
+        q_seq_major,
+        seq_len,
+        cur_len,
+        kv_seq_len,
+        cache_capacity,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        SlotId(0),
+    )
+}
+
 // ================================================================
 // KV-cache-aware SDPA
 // ================================================================
@@ -5038,9 +5075,6 @@ pub fn apply_sdpa_with_kv_cache(
     //     `dispatch_decode_sdpa_with_optional_tq` + the resume path
     //     (`apply_flash_attn_prefill_seq_major_resume`),
     // (d) the per-slot cursor write (`slot.current_len[slot_id.0]`).
-    //
-    // TQ-active slot N>0 is gated below with a typed B4a-TQ error
-    // (TQ encode/SDPA kernels are not slot-aware in this iter).
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     let seq = seq_len as usize;
@@ -5063,28 +5097,6 @@ pub fn apply_sdpa_with_kv_cache(
         slot_id.0,
         slot.current_len.len(),
     );
-    // ADR-040 Phase B4a-cont — TQ-active multi-slot gate.  The TQ
-    // encode (`dispatch_hadamard_quantize_kv_hb_seq`) + TQ SDPA
-    // (`flash_attn_vec_tq_hb`) kernels do not yet accept a per-slot
-    // byte offset (their slot K/V buffers are bound at offset 0).
-    // Until those kernels are slot-aware (deferred B4a-TQ iter), TQ-
-    // active slot N>0 must error here rather than silently
-    // corrupting slot 0's TQ region.  Slot 0 with TQ-active remains
-    // byte-identical to pre-B4a-cont.
-    if slot.tq.is_some() && slot_id.0 != 0 {
-        return Err(anyhow!(
-            "apply_sdpa_with_kv_cache: slot_id={} with slot.tq.is_some() \
-             is not supported in Phase B4a-cont.  The TQ encode + TQ SDPA \
-             kernels (dispatch_hadamard_quantize_kv_hb_seq, \
-             flash_attn_vec_tq_hb) are not yet slot-aware (they bind \
-             slot.tq.k_packed / slot.tq.v_packed at byte offset 0).  \
-             Routing slot N>0 through this path would silently corrupt \
-             slot 0's TQ region.  Track in B4a-TQ; until then, allocate \
-             the cache with `tq_kv_active=false` (legacy F32 path is \
-             fully slot-aware in B4a-cont).",
-            slot_id.0,
-        ));
-    }
     let cur_len = slot.current_len[slot_id.0 as usize] as usize;
 
     let kv_write_tokens = (seq).min(max_sl.saturating_sub(cur_len));
@@ -5626,13 +5638,8 @@ pub fn apply_sdpa_with_kv_cache(
                 // bridge, whose matrix kernel amortizes full-prefix dequant.
                 // slot.tq must be Some (alloc invariant: tq_kv_active=true ⇒
                 // both `slot.k.is_none()` AND `slot.tq.is_some()`).
-                //
-                // ADR-040 Phase B4a-cont: TQ-active multi-slot is gated
-                // at the top of `apply_sdpa_with_kv_cache` (typed error
-                // when slot.tq.is_some() && slot_id != 0) — reaching
-                // this branch implies slot_id == 0 by construction.
                 if seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES {
-                    apply_tq_prefill_seq_major_resume_direct(
+                    apply_tq_prefill_seq_major_resume_direct_for_slot(
                         device,
                         registry,
                         slot,
@@ -5644,9 +5651,10 @@ pub fn apply_sdpa_with_kv_cache(
                         n_heads,
                         n_kv_heads,
                         head_dim,
+                        slot_id,
                     )?
                 } else {
-                    apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+                    apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
                         device,
                         registry,
                         slot,
@@ -5658,6 +5666,7 @@ pub fn apply_sdpa_with_kv_cache(
                         n_heads,
                         n_kv_heads,
                         head_dim,
+                        slot_id,
                     )?
                 }
             };
@@ -5836,40 +5845,6 @@ pub fn build_gated_attn_layer(
     // `slot_k_v_region_for_full_attn`.  See ADR-040 §6.1.5.
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
-    // ADR-040 Phase B4a-cont.1 M2 (cfa-finding-B4a-cont.1-M2): canonical
-    // TQ-active multi-slot gate.  The fused Stage-AB path (line ~5479)
-    // bypasses `apply_sdpa_with_kv_cache` entirely and calls
-    // `write_kv_with_optional_tq_encode` directly — so the canonical
-    // entry gate at `apply_sdpa_with_kv_cache:4371` does NOT fire for
-    // this path.  Defence-in-depth gates inside
-    // `write_kv_with_optional_tq_encode` + `dispatch_decode_sdpa_with_
-    // optional_tq` still surface slot-N TQ-active routing as a typed
-    // error, but only AFTER ops1-4 (4 projections + 2 per-head RMSNorm
-    // + 2 IMROPE dispatches) have been encoded into an uncommitted
-    // command encoder — wasteful and obscures the failure site.
-    //
-    // Pin the canonical gate HERE at the public entry, before any
-    // fused-stage eligibility predicate runs.  Routes TQ-active slot
-    // N>0 to a typed B4a-TQ error before any encoder work begins.
-    // Slot 0 with TQ-active remains byte-identical to pre-B4a-cont.
-    if slot_id.0 != 0 {
-        if let Some(slot_ref) = kv_cache_slot.as_deref() {
-            if slot_ref.tq.is_some() {
-                return Err(anyhow!(
-                    "build_gated_attn_layer: slot_id={} with slot.tq.is_some() \
-                     is not supported in Phase B4a-cont (the TQ encode + TQ \
-                     SDPA kernels are not yet slot-aware).  Requires the \
-                     Phase B4a-TQ slot-aware TQ kernel arc — defer per \
-                     ADR-040 §6.1.5 + §6.1.6 + dossier R5.  Slot 0 with \
-                     TQ-active remains supported.  Allocate the cache with \
-                     `tq_kv_active=false` for the multi-slot F32 path \
-                     (fully slot-aware in B4a-cont).",
-                    slot_id.0,
-                ));
-            }
-        }
-    }
-
     // Capture arena presence before moving fa_arena into the SDPA call below.
     // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7.
     //
@@ -7221,9 +7196,8 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     max_seq_len: u32,
     // ADR-040 Phase B4a-cont (2026-05-23): per-slot identity for the
     // single-CB decode path.  Same contract as `apply_sdpa_with_kv_
-    // cache` — per-slot cursor + per-slot K/V slice_view in the two
-    // dispatchers below.  TQ-active multi-slot gated as in the
-    // multi-CB sibling.
+    // cache` — per-slot cursor + per-slot K/V or TQ packed/norm views in
+    // the dispatchers below.
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     debug_assert_eq!(
@@ -7248,14 +7222,6 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
         slot_id.0,
         slot.current_len.len(),
     );
-    if slot.tq.is_some() && slot_id.0 != 0 {
-        return Err(anyhow!(
-            "apply_sdpa_with_kv_cache_decode_into: slot_id={} with slot.tq.is_some() \
-             is not supported in Phase B4a-cont (TQ kernels are not slot-aware).  \
-             See `apply_sdpa_with_kv_cache` for the canonical B4a-TQ deferral note.",
-            slot_id.0,
-        ));
-    }
     let cur_len = slot.current_len[slot_id.0 as usize] as usize;
 
     let kv_write_tokens = (seq).min(max_sl.saturating_sub(cur_len));
@@ -7426,27 +7392,6 @@ pub fn apply_gated_attn_layer_decode_into(
         0,
         "apply_gated_attn_layer_decode_into: head_dim must be %32==0"
     );
-
-    // ADR-040 Phase B4a-cont.1 M2 (cfa-finding-B4a-cont.1-M2): canonical
-    // TQ-active multi-slot gate at the decode-into entry.  Mirrors the
-    // gate at `build_gated_attn_layer` entry — prevents the ops1-4
-    // encoder work from running before the slot-N TQ-active error
-    // surfaces (defence-in-depth gates inside the two private TQ-aware
-    // dispatchers still fire, but only after ops1-4 are already encoded).
-    // Slot 0 with TQ-active remains byte-identical to pre-B4a-cont.
-    if slot_id.0 != 0 && slot.tq.is_some() {
-        return Err(anyhow!(
-            "apply_gated_attn_layer_decode_into: slot_id={} with \
-             slot.tq.is_some() is not supported in Phase B4a-cont (the \
-             TQ encode + TQ SDPA kernels are not yet slot-aware).  \
-             Requires the Phase B4a-TQ slot-aware TQ kernel arc — defer \
-             per ADR-040 §6.1.5 + §6.1.6 + dossier R5.  Slot 0 with \
-             TQ-active remains supported.  Allocate the cache with \
-             `tq_kv_active=false` for the multi-slot F32 path (fully \
-             slot-aware in B4a-cont).",
-            slot_id.0,
-        ));
-    }
 
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;

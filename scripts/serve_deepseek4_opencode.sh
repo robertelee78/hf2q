@@ -27,10 +27,15 @@
 #                           OpenCode manages conversation compaction, so the
 #                           server reports context overflow instead of silently
 #                           rewriting or truncating the transcript.
-#   --scheduler fifo-serial
-#                           Required by the current single-session DeepSeek
-#                           prefix-cache worker. Concurrent requests queue;
-#                           slot-aware serving is rejected explicitly.
+#   --scheduler inflight-batched --max-slots 4
+#                           Four independent agent sessions make progress.
+#                           Every slot advertises CONTEXT_LEN; context is never
+#                           divided by slot count. MAX_SLOTS=8 is the np8-like
+#                           operator setting after the hardware gate passes.
+#   --kv-cache-budget-bytes
+#                           Shared physical KV high-water across those full-
+#                           context slots. This bounds residency; it is not a
+#                           per-slot logical context limit.
 #   -v                      Enables request/cache/prefill/decode progress at
 #                           info level. Direct `hf2q serve` remains quiet by
 #                           default; this foreground launcher is observable.
@@ -46,6 +51,7 @@
 #   CONTEXT_LEN=131072 scripts/serve_deepseek4_opencode.sh  # lower-memory
 #   CONTEXT_LEN=1048576 scripts/serve_deepseek4_opencode.sh # full trained window
 #   CHECK_ONLY=1 scripts/serve_deepseek4_opencode.sh        # preflight only
+#   MAX_SLOTS=8 scripts/serve_deepseek4_opencode.sh         # np8-like
 set -euo pipefail
 
 # The default is the schema-v2, source-bound reproduction used by the strict
@@ -57,6 +63,8 @@ PORT="${PORT:-8080}"
 CONTEXT_LEN="${CONTEXT_LEN:-524288}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
+MAX_SLOTS="${MAX_SLOTS:-4}"
+KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-8589934592}" # 8 GiB shared
 
 # A ~100 GiB resident model leaves little margin on a 128 GiB host. Refuse a
 # load when prior inference has left the compressor/swap saturated or one
@@ -80,7 +88,8 @@ if ! [[ "$CONTEXT_LEN" =~ ^[0-9]+$ ]] || (( CONTEXT_LEN < 128 )); then
     exit 3
 fi
 for SETTING in CHECK_ONLY MAX_SWAP_USED_GIB MAX_COMPRESSOR_USED_GIB \
-    MAX_OTHER_PROCESS_RSS_GIB UNSAFE_MEMORY_OVERRIDE; do
+    MAX_OTHER_PROCESS_RSS_GIB UNSAFE_MEMORY_OVERRIDE MAX_SLOTS \
+    KV_CACHE_BUDGET_BYTES; do
     VALUE=${!SETTING}
     if ! [[ "$VALUE" =~ ^[0-9]+$ ]]; then
         echo "$SETTING must be a non-negative integer (got: $VALUE)" >&2
@@ -89,6 +98,10 @@ for SETTING in CHECK_ONLY MAX_SWAP_USED_GIB MAX_COMPRESSOR_USED_GIB \
 done
 if (( CHECK_ONLY > 1 || UNSAFE_MEMORY_OVERRIDE > 1 )); then
     echo "CHECK_ONLY and HF2Q_DEEPSEEK_UNSAFE_MEMORY_OVERRIDE must be 0 or 1" >&2
+    exit 3
+fi
+if (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); then
+    echo "MAX_SLOTS must be from 1 through 8 (got: $MAX_SLOTS)" >&2
     exit 3
 fi
 if [[ -n "${PREFILL_WINDOWS:-}" ]]; then
@@ -191,7 +204,7 @@ if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
 fi
 
 if (( CHECK_ONLY == 1 )); then
-    echo "hf2q DeepSeek-V4 preflight passed; no model was loaded"
+    echo "hf2q DeepSeek-V4 preflight passed: ${MAX_SLOTS} full-context slots, ${KV_CACHE_BUDGET_BYTES} shared KV bytes; no model was loaded"
     exit 0
 fi
 
@@ -203,4 +216,6 @@ exec env \
         --host "$HOST" \
         --port "$PORT" \
         --overflow-policy reject \
-        --scheduler fifo-serial
+        --scheduler inflight-batched \
+        --max-slots "$MAX_SLOTS" \
+        --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"

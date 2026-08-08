@@ -3820,7 +3820,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     let engine = api::engine::Engine::spawn_with_mode(
         loaded,
         config.queue_capacity,
-        None,
+        config.kv_cache_budget_bytes,
         config.engine_mode,
     )
     .map_err(|e| {
@@ -4055,6 +4055,27 @@ pub(crate) fn parse_scheduler_config(
 /// with headroom.
 pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4;
 
+/// Resolve the shared physical KV budget without touching process-global env.
+/// CLI wins; zero and blank mean "no explicit ceiling". Keeping this pure
+/// prevents configuration tests from racing over `std::env`.
+pub(crate) fn parse_kv_cache_budget(
+    cli_bytes: Option<u64>,
+    env_bytes: Option<&str>,
+) -> std::result::Result<Option<u64>, String> {
+    match cli_bytes {
+        Some(0) => Ok(None),
+        Some(bytes) => Ok(Some(bytes)),
+        None => match env_bytes.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("0") => Ok(None),
+            Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
+                format!(
+                    "HF2Q_KV_CACHE_BUDGET_BYTES must be a non-negative integer (got: {value:?})"
+                )
+            }),
+        },
+    }
+}
+
 pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
@@ -4098,12 +4119,17 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         max_slots_env.as_deref(),
     )
     .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+    let kv_cache_budget_env = std::env::var("HF2Q_KV_CACHE_BUDGET_BYTES").ok();
+    let kv_cache_budget_bytes =
+        parse_kv_cache_budget(args.kv_cache_budget_bytes, kv_cache_budget_env.as_deref())
+            .map_err(|message| anyhow::anyhow!(message))?;
     tracing::info!(
         engine_mode = ?engine_mode,
         scheduler_cli = ?args.scheduler,
         scheduler_env = ?scheduler_env,
         max_slots_cli = ?args.max_slots,
         max_slots_env = ?max_slots_env,
+        kv_cache_budget_bytes,
         "ADR-040 C4: resolved scheduler policy"
     );
 
@@ -4627,6 +4653,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             // scheduler policy. Default `SerialFifo` keeps the
             // ADR-005 byte-equivalence pledge when no flag/env is set.
             engine_mode,
+            kv_cache_budget_bytes,
         };
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -5982,9 +6009,9 @@ mod tests {
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, find_special_token_stop,
-        llama_cpp_special_token_id_for_model, maybe_print_serve_banner, parse_scheduler_config,
-        render_jinja_template, resolve_enable_thinking, run_decode_loop, should_enable_kv_persist,
-        DecodeStopReason, RaisePolicy, DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
+        llama_cpp_special_token_id_for_model, maybe_print_serve_banner, parse_kv_cache_budget,
+        parse_scheduler_config, render_jinja_template, resolve_enable_thinking, run_decode_loop,
+        should_enable_kv_persist, DecodeStopReason, RaisePolicy, DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
         FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::cli;
@@ -6043,6 +6070,7 @@ mod tests {
             kv_spill_active: false,
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
+            kv_fixed_bytes_per_slot_override: None,
         }
     }
 
@@ -6247,6 +6275,7 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -6285,6 +6314,7 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -6326,6 +6356,7 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -6369,6 +6400,7 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6396,6 +6428,7 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6422,6 +6455,7 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "unknown architecture must fail dispatch");
@@ -6451,6 +6485,7 @@ mod tests {
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -6487,6 +6522,7 @@ mod tests {
                 // ADR-040 Phase C iter-4 (C4) — test path stays on the
                 // SerialFifo default (the ADR-005 byte-equivalent route).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+                kv_cache_budget_bytes: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(
@@ -7933,5 +7969,30 @@ mod tests {
             mode,
             crate::serve::api::engine::EngineMode::SlotAware { max_slots: 2 }
         );
+    }
+
+    #[test]
+    fn c4_shared_kv_budget_cli_wins_and_is_never_divided() {
+        assert_eq!(
+            parse_kv_cache_budget(Some(48_000), Some("12")).expect("valid budget"),
+            Some(48_000)
+        );
+        assert_eq!(
+            parse_kv_cache_budget(None, Some(" 48000 ")).expect("trimmed env budget"),
+            Some(48_000)
+        );
+        // Slot count is intentionally absent from this parser: the value is
+        // an aggregate physical ceiling, not context/N or bytes/N.
+    }
+
+    #[test]
+    fn c4_shared_kv_budget_zero_blank_and_invalid_contract() {
+        assert_eq!(parse_kv_cache_budget(Some(0), Some("99")).unwrap(), None);
+        assert_eq!(parse_kv_cache_budget(None, Some("0")).unwrap(), None);
+        assert_eq!(parse_kv_cache_budget(None, Some("   ")).unwrap(), None);
+        let error = parse_kv_cache_budget(None, Some("8GiB"))
+            .expect_err("human suffix is not an integer byte count");
+        assert!(error.contains("HF2Q_KV_CACHE_BUDGET_BYTES"), "{error}");
+        assert!(error.contains("8GiB"), "{error}");
     }
 }

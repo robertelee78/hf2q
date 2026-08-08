@@ -17,6 +17,7 @@ MAX_CACHED_TTFT_MS=${MAX_CACHED_TTFT_MS:-5000}
 MAX_COLD_RESPONSE_MS=${MAX_COLD_RESPONSE_MS:-40000}
 MAX_CACHED_RESPONSE_MS=${MAX_CACHED_RESPONSE_MS:-10000}
 MAX_CACHED_SEMANTIC_MS=${MAX_CACHED_SEMANTIC_MS:-10000}
+MAX_TOOL_RESULT_RESPONSE_MS=${MAX_TOOL_RESULT_RESPONSE_MS:-$MAX_CACHED_RESPONSE_MS}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-60}
 MAX_TOKENS=${MAX_TOKENS:-128}
@@ -320,8 +321,8 @@ if [[ "$continuation_content" != "$SENTINEL" ]] || ! jq -e --arg sentinel "$SENT
   jq '.choices[0]' "$continuation_response" >&2
   exit 1
 fi
-if (( continuation_response_ms > MAX_CACHED_RESPONSE_MS )); then
-  echo "agentic gate failed: tool-result response took ${continuation_response_ms}ms; limit is ${MAX_CACHED_RESPONSE_MS}ms" >&2
+if (( continuation_response_ms > MAX_TOOL_RESULT_RESPONSE_MS )); then
+  echo "agentic gate failed: tool-result response took ${continuation_response_ms}ms; limit is ${MAX_TOOL_RESULT_RESPONSE_MS}ms" >&2
   exit 1
 fi
 
