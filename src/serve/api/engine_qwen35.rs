@@ -199,40 +199,18 @@ pub struct Qwen35LoadedModel {
     /// allocation; iter-13 makes it load-bearing for dispatch.
     pub tq_kv_active: bool,
 
-    /// **ADR-040 Phase C iter-2a (C2b) — persistent multi-seq KV cache
-    /// scaffold** (dossier
-    /// `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` R1 + §4
-    /// iter-2a step 6 + §2.4.3).
+    /// Long-lived architecture-typed KV cache.
     ///
-    /// Today Qwen35 allocates a fresh [`HybridKvCache`] per request inside
-    /// [`alloc_kv_cache_for_request`] (line ~1027). Iter-2a SerialFifo
-    /// (`max_slots = 1`) keeps that per-request alloc path: under
-    /// `n_seqs = 1` it is byte-equivalent to pre-C2 by construction, and
-    /// the prompt-cache restore at engine_qwen35.rs:1503 requires a
-    /// `max_seq_len` match between snapshot and cache (snapshots are
-    /// taken against the per-request `max_seq = (prompt_len + max_tokens
-    /// + 64).max(128).min(cfg.max_position_embeddings)`; a persistent
-    /// cache pre-allocated to a different `max_seq_len` would break the
-    /// `restore_from` byte-copy at kv_cache.rs:1898 + invalidate the
-    /// dossier R8 byte-equivalence pledge).
+    /// SerialFifo retains one demand-grown [`HybridKvCache`] across
+    /// requests so ordinary agentic turns reuse the same Metal buffers.
+    /// A larger request replaces it with a geometrically grown cache;
+    /// compatible snapshots restore through `restore_partial`, whose wire
+    /// format is independent of the destination cache capacity. SlotAware
+    /// uses the same typed field for its multi-sequence cache.
     ///
-    /// Iter-2a therefore leaves this field as `None` at all times — the
-    /// field is structural scaffolding for iter-2b's `SlotAware`
-    /// runtime, which will populate it at first-request time with
-    /// `n_seqs = max_slots` AFTER lifting the snapshot/restore wire
-    /// format to slot-aware semantics (dossier R7 + R4-bis: ADR-017
-    /// Qwen35 hybrid persistor wire format supports `n_seqs > 1` at the
-    /// type level but has never serialized > 1; iter-2b/iter-2c lands
-    /// the per-slot snapshot codec required for multi-slot prompt-cache
-    /// hits).
-    ///
-    /// The presence of this field as `Option` (rather than as a direct
-    /// constructor argument) was selected per dossier §2.4.2: per-arch
-    /// typed cache (`HybridKvCache`) on the per-arch `LoadedModel`
-    /// variant, NOT a `Box<dyn MultiSeqKvCache>` on `EngineInner`. This
-    /// preserves type info on the decode hot path (LLVM can devirtualize
-    /// `HybridKvCache::append_for_seq` calls) and matches the existing
-    /// per-arch dispatch shape at engine.rs:~3380.
+    /// Keeping the concrete cache on the architecture-specific loaded model
+    /// preserves type information on the decode hot path and avoids a
+    /// virtual cache interface in `EngineInner`.
     pub persistent_kv_cache: Option<HybridKvCache>,
 }
 
@@ -557,8 +535,9 @@ impl Qwen35LoadedModel {
         // ADR-027 sub-iter 23d-γ (2026-08-03) — the TQ × persist and
         // LCP-on-TQ combinations are both CLOSED and production-ready:
         //   * Persist in TQ-only mode: `cfg_from_cache` derives shape
-        //     from `slot.tq.k_packed` (F32 backing absent) and codec v4
-        //     round-trips the MTP TQ payload; `KvSubstrate` namespaces
+        //     from `slot.tq.k_packed` (F32 backing absent) and codec v5
+        //     round-trips compact full-attention/MTP TQ payloads;
+        //     `KvSubstrate` namespaces
         //     the on-disk fingerprint so cross-substrate hydration is a
         //     clean miss rather than a silent zero-restore.
         //   * LCP-on-TQ: `HybridKvCache::restore_partial` copies the
@@ -570,8 +549,9 @@ impl Qwen35LoadedModel {
         if loaded.tq_kv_active && opts.kv_persist_dir.is_some() {
             tracing::info!(
                 "ADR-027 sub-iter 23d-γ: HF2Q_TQ_KV=1 + HF2Q_KV_PERSIST both active — \
-                 persist snapshots round-trip the TQ substrate (codec v4); fingerprint \
-                 is substrate-namespaced so cross-mode hydration is a clean miss."
+                 persist snapshots round-trip the compact TQ substrate (codec v5); \
+                 fingerprint is capacity-independent and substrate-namespaced so \
+                 cross-mode hydration is a clean miss."
             );
         }
         if loaded.tq_kv_active {
@@ -615,9 +595,12 @@ impl Qwen35LoadedModel {
         sliding_window: usize,
         linear_capacity: usize,
     ) -> Result<(), crate::serve::kv_persist::lcp_registry::LcpStoreError> {
-        // 1) Disk write-through (if persistor is bound). Errors are
-        //    logged + swallowed so they don't break the in-memory path.
-        if let Some(persistor) = &self.disk_persistor {
+        let snapshot = std::sync::Arc::new(snapshot);
+        // Prepare the background job without serializing. The prompt clone is
+        // small relative to the checkpoint and the snapshot itself is shared
+        // by Arc with the in-memory registry, so enqueue adds no KV payload
+        // copy on the request path.
+        let disk_job = if let Some(persistor) = &self.disk_persistor {
             match crate::serve::kv_persist::families::qwen35_hybrid_persistor::cfg_from_cache(
                 kv_cache,
                 crate::serve::kv_persist::families::qwen35_hybrid_persistor::FullAttnCodec::F32Dense,
@@ -639,15 +622,7 @@ impl Qwen35LoadedModel {
                         sliding_window: sliding_window as u64,
                         linear_capacity: linear_capacity as u64,
                     };
-                    if let Err(e) = persistor.write(&cfg, &key_hex, &snapshot, &sidecar) {
-                        tracing::warn!(
-                            cache_dir = %persistor.cache_dir().display(),
-                            key_hex = %key_hex,
-                            error = %format!("{e:#}"),
-                            "ADR-027 iter-6b.3: disk persistor write failed; \
-                             in-memory store will still proceed"
-                        );
-                    }
+                    Some((std::sync::Arc::clone(persistor), cfg, key_hex, sidecar))
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -656,17 +631,46 @@ impl Qwen35LoadedModel {
                         "ADR-027 iter-6b.3: cfg_from_cache failed; disk \
                          write-through skipped (in-memory store still proceeds)"
                     );
+                    None
                 }
             }
-        }
-        // 2) In-memory store — exact pre-iter-6b.2 semantics.
+        } else {
+            None
+        };
+
+        // Make the checkpoint visible to the next agentic turn first. A
+        // rejected in-memory store is not submitted to disk as if it were a
+        // live recovery point.
         self.lcp_registry.store(
             key,
             prompt_tokens,
-            vec![std::sync::Arc::new(snapshot)],
+            vec![std::sync::Arc::clone(&snapshot)],
             sliding_window,
             linear_capacity,
-        )
+        )?;
+
+        if let Some((persistor, cfg, key_hex, sidecar)) = disk_job {
+            match persistor.enqueue_write(cfg, key_hex.clone(), snapshot, sidecar) {
+                Ok(replaced_pending) => {
+                    tracing::info!(
+                        target: "hf2q::serve::api::engine_qwen35::progress",
+                        key_hex = %key_hex,
+                        replaced_pending,
+                        pending_writes = persistor.pending_writes(),
+                        "Qwen35 checkpoint queued for async disk persistence"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cache_dir = %persistor.cache_dir().display(),
+                        key_hex = %key_hex,
+                        error = %format!("{e:#}"),
+                        "Qwen35 async checkpoint enqueue failed; in-memory checkpoint remains live"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// ADR-027 Phase A iter-6b.3 — cold-start hydrate. Walks the disk
@@ -1258,22 +1262,71 @@ fn prefill_positions_for(prompt_len: usize) -> Vec<i32> {
     flat
 }
 
+fn requested_kv_cache_capacity(
+    qwen: &Qwen35LoadedModel,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> usize {
+    (prompt_len + max_tokens + 64)
+        .max(128)
+        .min(qwen.model.cfg.max_position_embeddings as usize)
+}
+
+/// Select a demand-grown single-slot capacity. Powers of two avoid replacing
+/// the Metal buffers on every ordinary agentic turn while keeping short
+/// sessions far below the model's full training-context allocation.
+fn serial_kv_cache_capacity(required: usize, current: usize, maximum: usize) -> usize {
+    let rounded_required = required
+        .checked_next_power_of_two()
+        .unwrap_or(maximum)
+        .min(maximum);
+    rounded_required
+        .max(current.saturating_mul(2).min(maximum))
+        .max(required)
+        .min(maximum)
+}
+
+/// Allocate a SerialFifo cache with the bounded recovery-capture arena ready
+/// up front. This moves Metal allocation/zero-fill into the first cold cache
+/// admission, where it is amortized across the session, instead of charging
+/// the first short agentic continuation tens of milliseconds.
+fn alloc_serial_kv_cache(
+    qwen: &Qwen35LoadedModel,
+    device: &MlxDevice,
+    capacity: usize,
+) -> Result<HybridKvCache> {
+    let mut cache = HybridKvCache::new_with_options(
+        &qwen.model.cfg,
+        device,
+        capacity as u32,
+        1,
+        qwen.tq_kv_active,
+    )
+    .context("HybridKvCache::new_with_options (SerialFifo)")?;
+    cache
+        .ensure_la_capture(
+            &qwen.model.cfg,
+            device,
+            QWEN35_RECOVERY_CAPTURE_MAX_SUFFIX_TOKENS as u32,
+        )
+        .context("SerialFifo recovery capture preallocation")?;
+    cache.clear_la_capture();
+    Ok(cache)
+}
+
 /// Allocate a fresh `HybridKvCache` sized for `prompt_len + max_tokens + 64`,
 /// clamped to `cfg.max_position_embeddings` and floored at 128.
 ///
-/// Mirrors `cmd_generate_qwen35:1129-1131`.  Per-request allocation is
-/// the expedient MVP shape — a Wedge-4 follow-up may move the cache
-/// to a long-lived field on `Qwen35LoadedModel` to amortize the few-GB
-/// alloc across requests.
+/// This remains the one-shot helper for embeddings, multimodal siblings, and
+/// focused tests. Serial text generation uses [`take_serial_kv_cache`] so the
+/// same buffers survive across turns.
 fn alloc_kv_cache_for_request(
     qwen: &Qwen35LoadedModel,
     device: &MlxDevice,
     prompt_len: usize,
     max_tokens: usize,
 ) -> Result<HybridKvCache> {
-    let max_seq = (prompt_len + max_tokens + 64)
-        .max(128)
-        .min(qwen.model.cfg.max_position_embeddings as usize);
+    let max_seq = requested_kv_cache_capacity(qwen, prompt_len, max_tokens);
     // ADR-027 Phase B iter-12: branch on the engine-load-time
     // `tq_kv_active` flag (sourced from HF2Q_TQ_KV env). When true,
     // allocate TQ-active full-attn buffers alongside F32 K/V (shadow
@@ -1287,6 +1340,32 @@ fn alloc_kv_cache_for_request(
         qwen.tq_kv_active,
     )
     .context("HybridKvCache::new_with_options")
+}
+
+/// Take the retained SerialFifo cache when it is large enough; otherwise
+/// replace it with a geometrically grown single-slot cache. The caller resets
+/// a reused cache only on a true cold miss. LCP/prompt-cache restores fully
+/// replace semantic state and therefore do not need a zeroing pass first.
+fn take_serial_kv_cache(
+    qwen: &mut Qwen35LoadedModel,
+    device: &MlxDevice,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> Result<(HybridKvCache, bool)> {
+    let required = requested_kv_cache_capacity(qwen, prompt_len, max_tokens);
+    let maximum = qwen.model.cfg.max_position_embeddings as usize;
+    let current = qwen.persistent_kv_cache.take();
+    if let Some(cache) = current {
+        if cache.n_seqs == 1 && cache.max_seq_len as usize >= required {
+            return Ok((cache, true));
+        }
+        let capacity = serial_kv_cache_capacity(required, cache.max_seq_len as usize, maximum);
+        drop(cache);
+        return alloc_serial_kv_cache(qwen, device, capacity).map(|cache| (cache, false));
+    }
+
+    let capacity = serial_kv_cache_capacity(required, 0, maximum);
+    alloc_serial_kv_cache(qwen, device, capacity).map(|cache| (cache, false))
 }
 
 /// Sample the next token from a `[vocab_size]` logits slice using
@@ -1456,6 +1535,184 @@ fn build_lcp_key_for_qwen35_chunk(
     key
 }
 
+/// Find the longest coherent Qwen checkpoint for a continuation request.
+/// The base key holds the previous request's stable generation boundary,
+/// including prompts shorter than one checkpoint stride. Stride-keyed
+/// entries preserve older branch points. A checkpoint is usable only when
+/// the new request fully extends the cached prompt; DeltaNet state captured
+/// after a divergent suffix cannot be rolled back to the divergence point.
+fn lookup_qwen35_resume_checkpoint<T>(
+    registry: &mut crate::serve::kv_persist::lcp_registry::LcpRegistry<T>,
+    base_key: &crate::serve::kv_persist::lcp_registry::LcpKey,
+    new_tokens: &[u32],
+    stride: usize,
+) -> Option<(crate::serve::kv_persist::lcp_registry::LcpPrefix<T>, usize)>
+where
+    T: Send + Sync + 'static + crate::serve::kv_persist::lcp_registry::ByteSized,
+{
+    if new_tokens.is_empty() {
+        return None;
+    }
+
+    let base_match = registry
+        .lookup(base_key, new_tokens)
+        .filter(|prefix| prefix.k == prefix.cached_prompt_len && prefix.k < new_tokens.len());
+    let base_len = base_match.as_ref().map(|prefix| prefix.k).unwrap_or(0);
+
+    if stride > 0 {
+        let mut chunk_pos = (new_tokens.len() / stride).saturating_mul(stride);
+        while chunk_pos >= stride && chunk_pos > base_len {
+            let mut chunk_key = base_key.clone();
+            chunk_key.tenant_id = format!("qwen35:lcp_chunk:{chunk_pos}");
+            if let Some(prefix) = registry.lookup(&chunk_key, new_tokens) {
+                if prefix.k == prefix.cached_prompt_len && prefix.k < new_tokens.len() {
+                    return Some((prefix, chunk_pos));
+                }
+            }
+            if chunk_pos == stride {
+                break;
+            }
+            chunk_pos -= stride;
+        }
+    }
+
+    base_match.map(|prefix| (prefix, 0))
+}
+
+/// Conservative fallback when the loaded Qwen tokenizer does not confirm
+/// the vendor template's generation-only suffix at the end of the prompt.
+const QWEN35_RECOVERY_TAIL_FALLBACK_TOKENS: usize = 64;
+
+/// The existing mlx-native per-position DeltaNet capture kernel is tuned for
+/// decode and short batched verification. At or below this boundary it is
+/// cheaper to process the changed suffix once and snapshot the stable state
+/// from capture than to submit a second forward for the template tail.
+const QWEN35_RECOVERY_CAPTURE_MAX_SUFFIX_TOKENS: usize = 32;
+
+/// Qwen's vendor template appends one of these generation-only suffixes
+/// after the stable `<|im_start|>assistant\n` boundary. On the next turn the
+/// template renders the prior assistant content at that boundary instead,
+/// so retaining KV state for these suffix tokens is not coherent. Derive the
+/// token count with the loaded tokenizer and require an exact prompt suffix
+/// match; a foreign/custom template therefore falls back safely instead of
+/// inheriting an assumed token count.
+fn qwen35_recovery_tail_tokens(
+    qwen: &Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    params: &SamplingParams,
+) -> usize {
+    let unstable_suffix = if params.reasoning_forced_open {
+        "<think>\n"
+    } else {
+        "<think>\n\n</think>\n\n"
+    };
+    let encoded = qwen.tokenizer.encode(unstable_suffix, false);
+    let suffix_tokens = encoded.as_ref().map(|e| e.get_ids()).unwrap_or(&[]);
+    recovery_tail_for_suffix(
+        prompt_tokens,
+        suffix_tokens,
+        QWEN35_RECOVERY_TAIL_FALLBACK_TOKENS,
+    )
+}
+
+fn recovery_tail_for_suffix(
+    prompt_tokens: &[u32],
+    suffix_tokens: &[u32],
+    fallback: usize,
+) -> usize {
+    if !suffix_tokens.is_empty() && prompt_tokens.ends_with(suffix_tokens) {
+        suffix_tokens.len()
+    } else {
+        fallback
+    }
+}
+
+fn stride_checkpoint_superseded_by_recovery_anchor(
+    recovery_eligible: bool,
+    k_end: usize,
+    stride: usize,
+    recovery_anchor: usize,
+) -> bool {
+    recovery_eligible && k_end <= recovery_anchor && k_end.saturating_add(stride) > recovery_anchor
+}
+
+fn qwen35_recovery_capture_plan(
+    lcp_resume_start: usize,
+    recovery_anchor: usize,
+    prompt_len: usize,
+    recovery_eligible: bool,
+    chunked_eligible: bool,
+) -> Option<(usize, usize)> {
+    if !recovery_eligible
+        || chunked_eligible
+        || recovery_anchor <= lcp_resume_start
+        || prompt_len <= recovery_anchor
+    {
+        return None;
+    }
+    let suffix_len = prompt_len.checked_sub(lcp_resume_start)?;
+    if suffix_len == 0 || suffix_len > QWEN35_RECOVERY_CAPTURE_MAX_SUFFIX_TOKENS {
+        return None;
+    }
+    let capture_index = recovery_anchor.checked_sub(lcp_resume_start + 1)?;
+    Some((suffix_len, capture_index))
+}
+
+fn store_qwen35_latest_turn_checkpoint(
+    qwen: &mut Qwen35LoadedModel,
+    kv_cache: &HybridKvCache,
+    device: &MlxDevice,
+    params: &SamplingParams,
+    prompt_tokens: &[u32],
+    anchor: usize,
+    phase: &str,
+    capture_index: Option<usize>,
+) {
+    let snapshot_started = Instant::now();
+    let snapshot_result = match capture_index {
+        Some(index) => kv_cache.snapshot_prefix_from_capture(device, anchor, index),
+        None => kv_cache.snapshot_prefix(device, anchor),
+    };
+    match snapshot_result {
+        Ok(snapshot) => {
+            let snapshot_elapsed = snapshot_started.elapsed();
+            let snapshot_bytes = snapshot.total_bytes();
+            let base_key = build_lcp_key_for_qwen35(qwen, params);
+            let linear_capacity = kv_cache
+                .linear_attn
+                .first()
+                .map(|slot| slot.recurrent.byte_len())
+                .unwrap_or(0);
+            let disk_enabled = qwen.disk_persistor.is_some();
+            let store_started = Instant::now();
+            let store_result = qwen.store_lcp_with_disk_writeback(
+                kv_cache,
+                base_key,
+                prompt_tokens[..anchor].to_vec(),
+                snapshot,
+                0,
+                linear_capacity,
+            );
+            let store_elapsed = store_started.elapsed();
+            tracing::info!(
+                target: "hf2q::serve::api::engine_qwen35::progress",
+                phase,
+                anchor_tokens = anchor,
+                snapshot_bytes,
+                snapshot_ms = snapshot_elapsed.as_secs_f64() * 1_000.0,
+                store_ms = store_elapsed.as_secs_f64() * 1_000.0,
+                disk_enabled,
+                capture_index,
+                "Qwen35 latest-turn checkpoint prepared"
+            );
+            if let Err(error) = store_result {
+                lcp_store_error_notify(phase, anchor, &error);
+            }
+        }
+        Err(error) => lcp_snapshot_error_notify(phase, anchor, &error),
+    }
+}
+
 /// ADR-017 Phase E.a default-on — byte budget for the Qwen35 LCP registry.
 ///
 /// Delegates entirely to `default_lcp_byte_budget()` in `lcp_registry.rs`,
@@ -1545,6 +1802,11 @@ pub fn generate_qwen35_once(
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
 ) -> Result<GenerationResult> {
+    let request_start = Instant::now();
+    let _disk_request_guard = qwen
+        .disk_persistor
+        .as_ref()
+        .map(|persistor| persistor.begin_request());
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_qwen35_once: empty prompt_tokens"
@@ -1569,9 +1831,21 @@ pub fn generate_qwen35_once(
     };
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
+    let cache_alloc_start = Instant::now();
     let device =
         MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
-    let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
+    let (mut kv_cache, cache_reused) = take_serial_kv_cache(qwen, &device, prompt_len, max_tokens)?;
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "unary",
+        prompt_tokens = prompt_len,
+        max_tokens,
+        cache_capacity_tokens = kv_cache.max_seq_len,
+        cache_reused,
+        tq_kv = qwen.tq_kv_active,
+        elapsed_ms = cache_alloc_start.elapsed().as_secs_f64() * 1000.0,
+        "Qwen35 request cache ready"
+    );
 
     // ADR-027 iter-6b.3: cold-start hydrate of in-memory LcpRegistry
     // from disk-persisted snapshots.  Idempotent + cheap on hot path
@@ -1640,19 +1914,13 @@ pub fn generate_qwen35_once(
         // inside the closure.
         let stride_for_observe = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
         let base_key_for_observe = build_lcp_key_for_qwen35(qwen, params);
-        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity_chunk_aligned(
+        let detected = lookup_qwen35_resume_checkpoint(
             &mut qwen.lcp_registry,
+            &base_key_for_observe,
             prompt_tokens,
             stride_for_observe,
-            false, // is_multimodal: text-only path
-            |chunk_pos| {
-                let mut key = base_key_for_observe.clone();
-                if chunk_pos > 0 {
-                    key.tenant_id = format!("qwen35:lcp_chunk:{chunk_pos}");
-                }
-                key
-            },
-        );
+        )
+        .map(|(prefix, _chunk_pos)| prefix.k);
         if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
             sink.record_lcp_probe(detected);
         }
@@ -1677,123 +1945,49 @@ pub fn generate_qwen35_once(
         );
         if lcp_resume_enabled {
             let stride = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
-            // ADR-017 Phase E.a B.5 Codex Phase-2b finding (HIGH):
-            // guard `stride > 0` before any division.  If operators set
-            // `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=0` the probe would
-            // otherwise panic on integer division by zero.  Skip the
-            // probe entirely on stride == 0 — there are no stride-aligned
-            // chunks to find anyway.
-            if stride == 0 {
-                eprintln!(
-                    "[hf2q qwen35 lcp probe] stride=0; skipping descending \
-                     scan (HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE must be > 0)"
-                );
-                // Fall through to the rest of the function with
-                // `lcp_resume_start = 0` — runs fresh prefill normally.
-            }
-            // Iterate stride-aligned chunk positions descending.  The
-            // largest viable position is `(prompt_tokens.len() / stride)
-            // * stride` — any larger position would have cached_prompt_len
-            // > prompt_tokens.len(), failing the strict-prefix gate.
-            // Smallest is `stride` (positions < stride aren't checkpointed).
-            let max_chunk_pos = if stride == 0 {
-                0
-            } else {
-                (prompt_tokens.len() / stride).saturating_mul(stride)
-            };
+            let base_key = build_lcp_key_for_qwen35(qwen, params);
             eprintln!(
                 "[hf2q qwen35 lcp probe] enabled, registry_len={}, prompt_len={}, \
-                 stride={}, scanning chunk positions [{stride}..={max_chunk_pos}]",
+                 stride={}, scanning latest-turn + stride checkpoints",
                 qwen.lcp_registry.len(),
                 prompt_tokens.len(),
                 stride,
             );
-
-            let mut hit = false;
-            // Step from max_chunk_pos down to stride in -stride steps.
-            let mut chunk_pos = max_chunk_pos;
-            while chunk_pos >= stride && !hit {
-                let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, chunk_pos);
-                if let Some(prefix) = qwen.lcp_registry.lookup(&chunk_key, prompt_tokens) {
-                    // ADR-017 Phase E.a B.5 Codex Phase-2b finding
-                    // (HIGH, defense-in-depth): require `prefix.k <
-                    // prompt_tokens.len()` (LcpRegistry::lookup already
-                    // gates `k == new_tokens.len()` returning None, so
-                    // this is belt-and-suspenders).
-                    //
-                    // ADR-017 Phase E.a B.5 bench-driven change: use
-                    // non-consuming `lookup` instead of `take_prefix`.
-                    // B.5's `restore_partial` MEMCPYS bytes from the
-                    // snapshot into the request's kv_cache (does NOT
-                    // try_unwrap the Arc); the registry's entry stays
-                    // intact and is reusable for subsequent matching
-                    // requests.  The Gemma iter-3 reason for consuming
-                    // (Arc strong_count == 1 needed for try_unwrap) does
-                    // NOT apply to B.5's pathway.  Empirical impact:
-                    // bench `lcp_resume_speedup` shows 50% → 100% hit
-                    // rate (no inter-trial cache flush from
-                    // consumption), and R-P6 4-worker fan-out converges
-                    // to <= 1.0× single-worker (idealized B.5 speedup).
-                    if prefix.k == prefix.cached_prompt_len && prefix.k < prompt_tokens.len() {
-                        // True-continuation at this stride boundary.
-                        // The snapshot's DeltaNet recurrent state is at
-                        // exactly this position — byte-correct resume.
-                        //
-                        // B.5: use `restore_partial` instead of
-                        // `restore_from` — the snapshot's full-attn slot
-                        // K/V buffers were sized to the SOURCE request's
-                        // max_seq_len, which typically differs from the
-                        // current request's
-                        // (alloc_kv_cache_for_request sizes per-request).
-                        // restore_partial copies only positions [0..k]
-                        // per head, decoupling buffer sizing from
-                        // snapshot size.  DeltaNet recurrent + conv
-                        // state are copied verbatim (size-independent
-                        // of max_seq_len).
-                        let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
-                        let restore_start = Instant::now();
-                        kv_cache
-                            .restore_partial(snapshot, prefix.k)
-                            .context("qwen35 lcp_registry restore_partial")?;
-                        let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
-                        lcp_resume_start = prefix.k;
-                        eprintln!(
-                            "[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT — \
-                             restoring at k={} (cached_prompt_len={}, \
-                             chunk_pos={}, restore_ms={:.3})",
-                            prefix.k, prefix.cached_prompt_len, chunk_pos, restore_ms
-                        );
-                        hit = true;
-                    } else {
-                        // k < cached_prompt_len: the cached prompt at
-                        // this chunk_pos diverges from new_tokens before
-                        // hitting cached_prompt_len.  Means turn-2's
-                        // tokens diverge from turn-1's tokens at some
-                        // position ≤ chunk_pos.  Don't restore — the
-                        // residual DeltaNet state would be wrong.
-                        // Continue descending; smaller chunk_pos may
-                        // still match.
-                        eprintln!(
-                            "[hf2q qwen35 lcp probe] PARTIAL HIT at \
-                             chunk_pos={} — k={} < cached_prompt_len={}, \
-                             continuing descent",
-                            chunk_pos, prefix.k, prefix.cached_prompt_len
-                        );
-                    }
-                }
-                if chunk_pos == stride {
-                    break;
-                }
-                chunk_pos -= stride;
-            }
-            if !hit {
+            if let Some((prefix, chunk_pos)) = lookup_qwen35_resume_checkpoint(
+                &mut qwen.lcp_registry,
+                &base_key,
+                prompt_tokens,
+                stride,
+            ) {
+                let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
+                let restore_start = Instant::now();
+                kv_cache
+                    .restore_partial(snapshot, prefix.k)
+                    .context("qwen35 lcp_registry restore_partial")?;
+                let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
+                lcp_resume_start = prefix.k;
+                let checkpoint = if chunk_pos == 0 {
+                    "LATEST-TURN"
+                } else {
+                    "STRIDE-ALIGNED"
+                };
                 eprintln!(
-                    "[hf2q qwen35 lcp probe] no stride-aligned match \
+                    "[hf2q qwen35 lcp resume] {checkpoint} HIT — restoring at \
+                     k={} (cached_prompt_len={}, chunk_pos={}, restore_ms={:.3})",
+                    prefix.k, prefix.cached_prompt_len, chunk_pos, restore_ms
+                );
+            } else {
+                eprintln!(
+                    "[hf2q qwen35 lcp probe] no compatible checkpoint \
                      (registry_len={})",
                     qwen.lcp_registry.len()
                 );
             }
         }
+    }
+
+    if cache_reused && !prompt_cache_hit && lcp_resume_start == 0 {
+        kv_cache.reset();
     }
 
     let prefill_start = Instant::now();
@@ -1805,8 +1999,8 @@ pub fn generate_qwen35_once(
             .snapshot()
             .expect("try_match returned Some implies snapshot Some");
         kv_cache
-            .restore_from(snap)
-            .context("prompt_cache restore")?;
+            .restore_partial(snap, prompt_len)
+            .context("prompt_cache restore_partial")?;
         next_token = qwen.prompt_cache.first_decoded_token();
         tracing::debug!(
             "qwen35 prompt_cache: HIT — {} tokens; prefill skipped",
@@ -1879,21 +2073,115 @@ pub fn generate_qwen35_once(
         // boundary regardless of partial-tail length.
         let chunked_eligible = stride > 0
             && prompt_len > stride
+            && (lcp_resume_start == 0 || lcp_resume_start % stride == 0)
             && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
-        // ADR-017 Phase E.a B.5 Codex Phase-2b finding (MEDIUM):
-        // enforce `lcp_resume_start % stride == 0` at a single point
-        // before any prefill branch dispatch — covers chunked AND
-        // suffix-only branches.
-        if lcp_resume_start > 0 && stride > 0 {
-            anyhow::ensure!(
-                lcp_resume_start % stride == 0,
-                "qwen35 prefill: lcp_resume_start ({}) must be stride-\
-                 aligned ({}) — registry only stores at stride boundaries",
-                lcp_resume_start,
-                stride
+        let recovery_tail_tokens = qwen35_recovery_tail_tokens(qwen, prompt_tokens, params);
+        let recovery_anchor = prompt_len.saturating_sub(recovery_tail_tokens);
+        let recovery_eligible = lcp_resume_enabled
+            && recovery_anchor > lcp_resume_start
+            // The small-query-length resume kernel requires an established
+            // prefix. Very short prompts stay monolithic.
+            && recovery_anchor >= 16;
+        let recovery_capture_plan = qwen35_recovery_capture_plan(
+            lcp_resume_start,
+            recovery_anchor,
+            prompt_len,
+            recovery_eligible,
+            chunked_eligible,
+        );
+        let prefill_logits = if let Some((suffix_len, capture_index)) = recovery_capture_plan {
+            let capture_alloc_start = Instant::now();
+            kv_cache
+                .ensure_la_capture(&qwen.model.cfg, &device, suffix_len as u32)
+                .context("Qwen35 latest-turn recovery capture allocation")?;
+            let capture_alloc_ms = capture_alloc_start.elapsed().as_secs_f64() * 1000.0;
+            let position_build_start = Instant::now();
+            let suffix_tokens = &prompt_tokens[lcp_resume_start..];
+            let mut suffix_positions = vec![0i32; 4 * suffix_len];
+            for axis in 0..4 {
+                for token in 0..suffix_len {
+                    suffix_positions[axis * suffix_len + token] = (lcp_resume_start + token) as i32;
+                }
+            }
+            let position_build_ms = position_build_start.elapsed().as_secs_f64() * 1000.0;
+            let forward_start = Instant::now();
+            let logits = qwen
+                .model
+                .forward_gpu_last_logits(suffix_tokens, &suffix_positions, &mut kv_cache, SlotId(0))
+                .context("Qwen35 captured latest-turn suffix prefill")?;
+            let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
+            let checkpoint_start = Instant::now();
+            store_qwen35_latest_turn_checkpoint(
+                qwen,
+                &kv_cache,
+                &device,
+                params,
+                prompt_tokens,
+                recovery_anchor,
+                "captured latest-turn recovery-anchor",
+                Some(capture_index),
             );
-        }
-        let prefill_logits = if chunked_eligible {
+            let checkpoint_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
+            let capture_clear_start = Instant::now();
+            kv_cache.clear_la_capture();
+            let capture_clear_ms = capture_clear_start.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                target: "hf2q::serve::api::engine_qwen35::progress",
+                mode = "unary",
+                suffix_tokens = suffix_len,
+                capture_index,
+                capture_alloc_ms,
+                position_build_ms,
+                forward_ms,
+                checkpoint_ms,
+                capture_clear_ms,
+                "Qwen35 captured recovery prefill phase timing"
+            );
+            eprintln!(
+                "[hf2q qwen35 lcp store] captured latest-turn recovery anchor={} \
+                 suffix_tokens={} capture_index={}",
+                recovery_anchor, suffix_len, capture_index
+            );
+            logits
+        } else if recovery_eligible && !chunked_eligible {
+            let prefix_tokens = &prompt_tokens[lcp_resume_start..recovery_anchor];
+            let prefix_len = prefix_tokens.len();
+            let mut prefix_positions = vec![0i32; 4 * prefix_len];
+            for axis in 0..4 {
+                for token in 0..prefix_len {
+                    prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
+                }
+            }
+            qwen.model
+                .forward_gpu_last_logits(prefix_tokens, &prefix_positions, &mut kv_cache, SlotId(0))
+                .context("Qwen35 latest-turn recovery-anchor prefix prefill")?;
+            store_qwen35_latest_turn_checkpoint(
+                qwen,
+                &kv_cache,
+                &device,
+                params,
+                prompt_tokens,
+                recovery_anchor,
+                "latest-turn recovery-anchor",
+                None,
+            );
+
+            let tail_tokens = &prompt_tokens[recovery_anchor..];
+            let tail_len = tail_tokens.len();
+            let mut tail_positions = vec![0i32; 4 * tail_len];
+            for axis in 0..4 {
+                for token in 0..tail_len {
+                    tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                }
+            }
+            eprintln!(
+                "[hf2q qwen35 lcp store] latest-turn recovery anchor={} tail_tokens={}",
+                recovery_anchor, tail_len
+            );
+            qwen.model
+                .forward_gpu_last_logits(tail_tokens, &tail_positions, &mut kv_cache, SlotId(0))
+                .context("Qwen35 latest-turn recovery-anchor tail prefill")?
+        } else if chunked_eligible {
             // ADR-017 Phase B-hybrid.2a + B.3 — chunked prefill with mid-
             // prefill stride-aligned checkpoint storage.  Each chunk's
             // `forward_gpu_last_logits` call leaves the kv_cache state at
@@ -1916,16 +2204,26 @@ pub fn generate_qwen35_once(
                 stride
             );
             let first_chunk_idx = lcp_resume_start / stride;
-            let n_chunks = (prompt_len + stride - 1) / stride;
+            // On a cold chunked prefill, stop at the stable generation
+            // boundary, store it under the base key, then process only the
+            // generation-only template suffix. This replaces the final
+            // stride snapshot instead of adding a second large synchronous
+            // snapshot/write to the cold path.
+            let chunked_prefill_end = if recovery_eligible {
+                recovery_anchor
+            } else {
+                prompt_len
+            };
+            let n_chunks = (chunked_prefill_end + stride - 1) / stride;
             eprintln!(
                 "[hf2q qwen35 chunked prefill] {} chunks (stride={}, \
-                 prompt_len={}, first_chunk_idx={})",
-                n_chunks, stride, prompt_len, first_chunk_idx
+                 prompt_len={}, prefill_end={}, first_chunk_idx={})",
+                n_chunks, stride, prompt_len, chunked_prefill_end, first_chunk_idx
             );
             let mut last_logits: Option<Vec<f32>> = None;
             for chunk_idx in first_chunk_idx..n_chunks {
                 let k_start = chunk_idx * stride;
-                let k_end = ((chunk_idx + 1) * stride).min(prompt_len);
+                let k_end = ((chunk_idx + 1) * stride).min(chunked_prefill_end);
                 let chunk_seq_len = k_end - k_start;
                 let chunk_tokens = &prompt_tokens[k_start..k_end];
                 // Build positions for [k_start..k_end). Positions are
@@ -1964,6 +2262,12 @@ pub fn generate_qwen35_once(
                 // stride-descending probes can't address them, so storing
                 // would burn ~300 MB without any chance of being looked up.
                 let stride_aligned = k_end % stride == 0;
+                let superseded_by_recovery_anchor = stride_checkpoint_superseded_by_recovery_anchor(
+                    recovery_eligible,
+                    k_end,
+                    stride,
+                    recovery_anchor,
+                );
                 let mid_store_disabled =
                     std::env::var("HF2Q_KV_LCP_DISABLE_MID_STORE").as_deref() == Ok("1");
                 // 2026-08-03 store-gate fix: prefix KV state is a pure
@@ -1978,9 +2282,17 @@ pub fn generate_qwen35_once(
                 // Greedy gating stays ONLY on the decoded-token replay
                 // cache (HybridPromptCache); prefix checkpoints store
                 // unconditionally.
-                lcp_store_skip_notify(stride_aligned, lcp_resume_enabled, mid_store_disabled);
-                if lcp_resume_enabled && stride_aligned && !mid_store_disabled {
-                    match kv_cache.snapshot(&device) {
+                lcp_store_skip_notify(
+                    stride_aligned && !superseded_by_recovery_anchor,
+                    lcp_resume_enabled,
+                    mid_store_disabled,
+                );
+                if lcp_resume_enabled
+                    && stride_aligned
+                    && !superseded_by_recovery_anchor
+                    && !mid_store_disabled
+                {
+                    match kv_cache.snapshot_prefix(&device, k_end) {
                         Ok(snap) => {
                             let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, k_end);
                             let linear_capacity = kv_cache
@@ -2015,6 +2327,41 @@ pub fn generate_qwen35_once(
                         }
                     }
                 }
+            }
+            if recovery_eligible {
+                store_qwen35_latest_turn_checkpoint(
+                    qwen,
+                    &kv_cache,
+                    &device,
+                    params,
+                    prompt_tokens,
+                    recovery_anchor,
+                    "chunked latest-turn recovery-anchor",
+                    None,
+                );
+
+                let tail_tokens = &prompt_tokens[recovery_anchor..];
+                let tail_len = tail_tokens.len();
+                let mut tail_positions = vec![0i32; 4 * tail_len];
+                for axis in 0..4 {
+                    for token in 0..tail_len {
+                        tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                    }
+                }
+                eprintln!(
+                    "[hf2q qwen35 lcp store] latest-turn recovery anchor={} tail_tokens={}",
+                    recovery_anchor, tail_len
+                );
+                last_logits = Some(
+                    qwen.model
+                        .forward_gpu_last_logits(
+                            tail_tokens,
+                            &tail_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .context("Qwen35 chunked recovery-anchor tail prefill")?,
+                );
             }
             last_logits.expect("at least one chunk in chunked prefill")
         } else if lcp_resume_start > 0 {
@@ -2105,76 +2452,44 @@ pub fn generate_qwen35_once(
         // matching request.
         if is_greedy {
             // Snapshot 1: prompt_cache (full-equality replay, Phase E.b).
+            let prompt_snapshot_start = Instant::now();
             match kv_cache.snapshot(&device) {
                 Ok(snap) => {
+                    let snapshot_bytes = snap.total_bytes();
                     qwen.prompt_cache
-                        .update(prompt_tokens.to_vec(), snap, next_token, params)
+                        .update(prompt_tokens.to_vec(), snap, next_token, params);
+                    tracing::info!(
+                        target: "hf2q::serve::api::engine_qwen35::progress",
+                        phase = "full-prompt replay",
+                        snapshot_bytes,
+                        elapsed_ms = prompt_snapshot_start.elapsed().as_secs_f64() * 1000.0,
+                        "Qwen35 prompt-cache checkpoint prepared"
+                    );
                 }
                 Err(e) => {
                     eprintln!("[hf2q qwen35 lcp store] prompt_cache snapshot failed: {e}");
                 }
             }
         }
-
-        // Snapshot 2: lcp_registry (partial-prefill resume, Phase E.a).
-        // NOT greedy-gated — see the split rationale above.
-        {
-            // ADR-017 Phase E.a B.3: when chunked prefill ran (lcp_resume_enabled
-            // AND prompt_len > stride), the in-loop mid-prefill checkpointing
-            // already stored every stride-aligned boundary INCLUDING the last
-            // (when prompt_len is stride-aligned).  This end-of-prefill store
-            // handles the short-prompt case where chunked DIDN'T fire
-            // (prompt_len ≤ stride): the probe can still find this entry under
-            // chunk_pos = prompt_len when stride-aligned.
-            //
-            // Skip when prompt_len isn't stride-aligned: the descending probe
-            // only tests stride boundaries, so a non-stride-aligned chunk_pos
-            // would never be looked up.  Burning GB-scale memcpy on an
-            // unreachable entry is wasteful.
-            //
-            // Skip when chunked already ran: mid-prefill loop already stored
-            // the last chunk boundary, no need to double-store.
-            let chunked_already_stored = stride > 0
-                && prompt_len > stride
-                && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
-            let prompt_stride_aligned = stride > 0 && prompt_len > 0 && prompt_len % stride == 0;
-            let should_store_eof =
-                lcp_resume_enabled && !chunked_already_stored && prompt_stride_aligned;
-            if should_store_eof {
-                eprintln!(
-                    "[hf2q qwen35 lcp store] end-of-prefill snapshot for prompt_len={} \
-                     (chunk_pos={prompt_len}, registry_len_before={})",
-                    prompt_tokens.len(),
-                    qwen.lcp_registry.len()
-                );
-                match kv_cache.snapshot(&device) {
-                    Ok(snap) => {
-                        let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, prompt_len);
-                        let linear_capacity = kv_cache
-                            .linear_attn
-                            .first()
-                            .map(|s| s.recurrent.byte_len())
-                            .unwrap_or(0);
-                        // ADR-027 iter-6b.2: write-through helper.
-                        if let Err(e) = qwen.store_lcp_with_disk_writeback(
-                            &kv_cache,
-                            chunk_key,
-                            prompt_tokens.to_vec(),
-                            snap,
-                            0,
-                            linear_capacity,
-                        ) {
-                            lcp_store_error_notify("end-of-prefill", prompt_len, &e);
-                        }
-                    }
-                    Err(e) => {
-                        lcp_snapshot_error_notify("end-of-prefill", prompt_len, &e);
-                    }
-                }
-            }
-        }
     }
     let prefill_duration = prefill_start.elapsed();
+    let reported_cached_tokens =
+        qwen35_reported_cached_tokens(prompt_len, prompt_cache_hit, lcp_resume_start);
+    let prefill_work_tokens = prompt_len.saturating_sub(reported_cached_tokens);
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "unary",
+        prompt_tokens = prompt_len,
+        cached_tokens = reported_cached_tokens,
+        work_tokens = prefill_work_tokens,
+        elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
+        tokens_per_second = if prefill_duration.is_zero() {
+            0.0
+        } else {
+            prefill_work_tokens as f64 / prefill_duration.as_secs_f64()
+        },
+        "Qwen35 prefill complete"
+    );
 
     // ── Decode loop ────────────────────────────────────────────────
     let decode_start = Instant::now();
@@ -2270,6 +2585,19 @@ pub fn generate_qwen35_once(
         }
     }
     let decode_duration = decode_start.elapsed();
+    qwen.persistent_kv_cache = Some(kv_cache);
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "unary",
+        generated_tokens = generated_tokens.len(),
+        elapsed_ms = decode_duration.as_secs_f64() * 1000.0,
+        tokens_per_second = if decode_duration.is_zero() {
+            0.0
+        } else {
+            generated_tokens.len() as f64 / decode_duration.as_secs_f64()
+        },
+        "Qwen35 decode complete"
+    );
 
     // ── Reasoning split (Decision #21) ────────────────────────────
     // Use the existing registry helper so the split is byte-identical
@@ -2308,6 +2636,16 @@ pub fn generate_qwen35_once(
         _ => 0,
     };
 
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "unary",
+        prompt_tokens = prompt_len,
+        cached_tokens = reported_cached_tokens,
+        completion_tokens = generated_tokens.len(),
+        total_ms = request_start.elapsed().as_secs_f64() * 1000.0,
+        "Qwen35 request complete"
+    );
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -2321,11 +2659,7 @@ pub fn generate_qwen35_once(
         finish_reason,
         prefill_duration,
         decode_duration,
-        cached_tokens: qwen35_reported_cached_tokens(
-            prompt_len,
-            prompt_cache_hit,
-            lcp_resume_start,
-        ),
+        cached_tokens: reported_cached_tokens,
         logprobs: logprobs_vec,
     })
 }
@@ -4481,6 +4815,11 @@ pub fn generate_stream_qwen35_once_extended(
     registration: Option<&ModelRegistration>,
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
 ) {
+    let request_start = Instant::now();
+    let _disk_request_guard = qwen
+        .disk_persistor
+        .as_ref()
+        .map(|persistor| persistor.begin_request());
     macro_rules! send {
         ($ev:expr) => {
             if events.blocking_send($ev).is_err() {
@@ -4531,6 +4870,7 @@ pub fn generate_stream_qwen35_once_extended(
         }
     }
 
+    let cache_alloc_start = Instant::now();
     let device = match MlxDevice::new() {
         Ok(d) => d,
         Err(e) => {
@@ -4540,15 +4880,27 @@ pub fn generate_stream_qwen35_once_extended(
             return;
         }
     };
-    let mut kv_cache = match alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens) {
-        Ok(k) => k,
-        Err(e) => {
-            send!(GenerationEvent::Error(format!(
-                "qwen35 stream: KV cache alloc failed: {e:#}"
-            )));
-            return;
-        }
-    };
+    let (mut kv_cache, cache_reused) =
+        match take_serial_kv_cache(qwen, &device, prompt_len, max_tokens) {
+            Ok(k) => k,
+            Err(e) => {
+                send!(GenerationEvent::Error(format!(
+                    "qwen35 stream: KV cache alloc failed: {e:#}"
+                )));
+                return;
+            }
+        };
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "stream",
+        prompt_tokens = prompt_len,
+        max_tokens,
+        cache_capacity_tokens = kv_cache.max_seq_len,
+        cache_reused,
+        tq_kv = qwen.tq_kv_active,
+        elapsed_ms = cache_alloc_start.elapsed().as_secs_f64() * 1000.0,
+        "Qwen35 request cache ready"
+    );
 
     // ADR-027 iter-6b.3: cold-start hydrate (streaming path).
     // Idempotent + cheap on hot path; warn-logs + swallows persistence
@@ -4581,19 +4933,13 @@ pub fn generate_stream_qwen35_once_extended(
         // detected_total accurately reflects qwen35 resume opportunity.
         let stride_for_observe = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
         let base_key_for_observe = build_lcp_key_for_qwen35(qwen, params);
-        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity_chunk_aligned(
+        let detected = lookup_qwen35_resume_checkpoint(
             &mut qwen.lcp_registry,
+            &base_key_for_observe,
             prompt_tokens,
             stride_for_observe,
-            false,
-            |chunk_pos| {
-                let mut key = base_key_for_observe.clone();
-                if chunk_pos > 0 {
-                    key.tenant_id = format!("qwen35:lcp_chunk:{chunk_pos}");
-                }
-                key
-            },
-        );
+        )
+        .map(|(prefix, _chunk_pos)| prefix.k);
         if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
             sink.record_lcp_probe(detected);
         }
@@ -4613,75 +4959,52 @@ pub fn generate_stream_qwen35_once_extended(
         );
         if lcp_resume_enabled {
             let stride = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
-            // ADR-017 Phase E.a B.5 Codex Phase-2b finding (HIGH):
-            // guard `stride > 0` before any division.
-            let max_chunk_pos = if stride == 0 {
-                eprintln!(
-                    "[hf2q qwen35 stream lcp probe] stride=0; skipping \
-                     descending scan (HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE \
-                     must be > 0)"
-                );
-                0
-            } else {
-                (prompt_tokens.len() / stride).saturating_mul(stride)
-            };
+            let base_key = build_lcp_key_for_qwen35(qwen, params);
             eprintln!(
                 "[hf2q qwen35 stream lcp probe] enabled, registry_len={}, \
-                 prompt_len={}, stride={}, scanning [{stride}..={max_chunk_pos}]",
+                 prompt_len={}, stride={}, scanning latest-turn + stride checkpoints",
                 qwen.lcp_registry.len(),
                 prompt_tokens.len(),
                 stride,
             );
-            let mut hit = false;
-            let mut chunk_pos = max_chunk_pos;
-            while stride > 0 && chunk_pos >= stride && !hit {
-                let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, chunk_pos);
-                if let Some(prefix) = qwen.lcp_registry.lookup(&chunk_key, prompt_tokens) {
-                    // ADR-017 Phase E.a B.5 Codex Phase-2b (HIGH defense-
-                    // in-depth): require `prefix.k < prompt_tokens.len()`.
-                    // Non-consuming `lookup` (mirrors non-streaming
-                    // post-bench change) — `restore_partial` memcpys, so
-                    // registry entry stays reusable for subsequent
-                    // matching requests.
-                    if prefix.k == prefix.cached_prompt_len && prefix.k < prompt_tokens.len() {
-                        let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
-                        let restore_start = Instant::now();
-                        if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
-                            send!(GenerationEvent::Error(format!(
-                                "qwen35 stream: lcp_registry restore_partial failed: {e:#}"
-                            )));
-                            return;
-                        }
-                        let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
-                        lcp_resume_start = prefix.k;
-                        eprintln!(
-                            "[hf2q qwen35 stream lcp resume] STRIDE-ALIGNED HIT \
-                             — restoring at k={} (cached_prompt_len={}, chunk_pos={}, \
-                             restore_ms={:.3})",
-                            prefix.k, prefix.cached_prompt_len, chunk_pos, restore_ms
-                        );
-                        hit = true;
-                    } else {
-                        eprintln!(
-                            "[hf2q qwen35 stream lcp probe] PARTIAL HIT at \
-                             chunk_pos={} — k={} < cached_prompt_len={}",
-                            chunk_pos, prefix.k, prefix.cached_prompt_len
-                        );
-                    }
+            if let Some((prefix, chunk_pos)) = lookup_qwen35_resume_checkpoint(
+                &mut qwen.lcp_registry,
+                &base_key,
+                prompt_tokens,
+                stride,
+            ) {
+                let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
+                let restore_start = Instant::now();
+                if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
+                    send!(GenerationEvent::Error(format!(
+                        "qwen35 stream: lcp_registry restore_partial failed: {e:#}"
+                    )));
+                    return;
                 }
-                if chunk_pos == stride {
-                    break;
-                }
-                chunk_pos -= stride;
-            }
-            if !hit {
+                let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
+                lcp_resume_start = prefix.k;
+                let checkpoint = if chunk_pos == 0 {
+                    "LATEST-TURN"
+                } else {
+                    "STRIDE-ALIGNED"
+                };
                 eprintln!(
-                    "[hf2q qwen35 stream lcp probe] no stride-aligned match \
+                    "[hf2q qwen35 stream lcp resume] {checkpoint} HIT — restoring \
+                     at k={} (cached_prompt_len={}, chunk_pos={}, restore_ms={:.3})",
+                    prefix.k, prefix.cached_prompt_len, chunk_pos, restore_ms
+                );
+            } else {
+                eprintln!(
+                    "[hf2q qwen35 stream lcp probe] no compatible checkpoint \
                      (registry_len={})",
                     qwen.lcp_registry.len()
                 );
             }
         }
+    }
+
+    if cache_reused && !prompt_cache_hit && lcp_resume_start == 0 {
+        kv_cache.reset();
     }
 
     let prefill_start = Instant::now();
@@ -4691,9 +5014,9 @@ pub fn generate_stream_qwen35_once_extended(
             .prompt_cache
             .snapshot()
             .expect("try_match Some implies snapshot Some");
-        if let Err(e) = kv_cache.restore_from(snap) {
+        if let Err(e) = kv_cache.restore_partial(snap, prompt_len) {
             send!(GenerationEvent::Error(format!(
-                "qwen35 stream: prompt_cache restore failed: {e:#}"
+                "qwen35 stream: prompt_cache restore_partial failed: {e:#}"
             )));
             return;
         }
@@ -4733,22 +5056,21 @@ pub fn generate_stream_qwen35_once_extended(
         let chunked_eligible = !has_extension
             && stride > 0
             && prompt_len > stride
+            && (lcp_resume_start == 0 || lcp_resume_start % stride == 0)
             && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
-        // ADR-017 Phase E.a B.5 Codex Phase-2b finding (MEDIUM):
-        // enforce `lcp_resume_start % stride == 0` at a single point
-        // before any prefill branch dispatch — covers both chunked and
-        // suffix-only branches (the registry only stores at stride
-        // boundaries, so this assertion should always hold; defense-
-        // in-depth against future registry-shape changes).
-        if lcp_resume_start > 0 && stride > 0 && lcp_resume_start % stride != 0 {
-            send!(GenerationEvent::Error(format!(
-                "qwen35 stream: lcp_resume_start ({}) must be stride-aligned \
-                 ({}) — registry should only contain stride-aligned chunk-position \
-                 keys",
-                lcp_resume_start, stride
-            )));
-            return;
-        }
+        let recovery_tail_tokens = qwen35_recovery_tail_tokens(qwen, prompt_tokens, params);
+        let recovery_anchor = prompt_len.saturating_sub(recovery_tail_tokens);
+        let recovery_eligible = !has_extension
+            && lcp_resume_enabled
+            && recovery_anchor > lcp_resume_start
+            && recovery_anchor >= 16;
+        let recovery_capture_plan = qwen35_recovery_capture_plan(
+            lcp_resume_start,
+            recovery_anchor,
+            prompt_len,
+            recovery_eligible,
+            chunked_eligible,
+        );
         let prefill_logits_res = if has_extension {
             qwen.model
                 .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
@@ -4759,21 +5081,119 @@ pub fn generate_stream_qwen35_once_extended(
                     &mut kv_cache,
                     SlotId(0),
                 )
+        } else if let Some((suffix_len, capture_index)) = recovery_capture_plan {
+            if let Err(error) =
+                kv_cache.ensure_la_capture(&qwen.model.cfg, &device, suffix_len as u32)
+            {
+                send!(GenerationEvent::Error(format!(
+                    "qwen35 stream recovery capture allocation failed: {error:#}"
+                )));
+                return;
+            }
+            let suffix_tokens = &prompt_tokens[lcp_resume_start..];
+            let mut suffix_positions = vec![0i32; 4 * suffix_len];
+            for axis in 0..4 {
+                for token in 0..suffix_len {
+                    suffix_positions[axis * suffix_len + token] = (lcp_resume_start + token) as i32;
+                }
+            }
+            match qwen.model.forward_gpu_last_logits(
+                suffix_tokens,
+                &suffix_positions,
+                &mut kv_cache,
+                SlotId(0),
+            ) {
+                Ok(logits) => {
+                    store_qwen35_latest_turn_checkpoint(
+                        qwen,
+                        &kv_cache,
+                        &device,
+                        params,
+                        prompt_tokens,
+                        recovery_anchor,
+                        "stream captured latest-turn recovery-anchor",
+                        Some(capture_index),
+                    );
+                    kv_cache.clear_la_capture();
+                    eprintln!(
+                        "[hf2q qwen35 stream lcp store] captured latest-turn recovery \
+                         anchor={} suffix_tokens={} capture_index={}",
+                        recovery_anchor, suffix_len, capture_index
+                    );
+                    Ok(logits)
+                }
+                Err(error) => Err(error).context("Qwen35 stream captured latest-turn suffix"),
+            }
+        } else if recovery_eligible && !chunked_eligible {
+            let prefix_tokens = &prompt_tokens[lcp_resume_start..recovery_anchor];
+            let prefix_len = prefix_tokens.len();
+            let mut prefix_positions = vec![0i32; 4 * prefix_len];
+            for axis in 0..4 {
+                for token in 0..prefix_len {
+                    prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
+                }
+            }
+            if let Err(error) = qwen.model.forward_gpu_last_logits(
+                prefix_tokens,
+                &prefix_positions,
+                &mut kv_cache,
+                SlotId(0),
+            ) {
+                send!(GenerationEvent::Error(format!(
+                    "qwen35 stream recovery-anchor prefix failed: {error:#}"
+                )));
+                return;
+            }
+            store_qwen35_latest_turn_checkpoint(
+                qwen,
+                &kv_cache,
+                &device,
+                params,
+                prompt_tokens,
+                recovery_anchor,
+                "stream latest-turn recovery-anchor",
+                None,
+            );
+
+            let tail_tokens = &prompt_tokens[recovery_anchor..];
+            let tail_len = tail_tokens.len();
+            let mut tail_positions = vec![0i32; 4 * tail_len];
+            for axis in 0..4 {
+                for token in 0..tail_len {
+                    tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                }
+            }
+            eprintln!(
+                "[hf2q qwen35 stream lcp store] latest-turn recovery anchor={} \
+                 tail_tokens={}",
+                recovery_anchor, tail_len
+            );
+            qwen.model.forward_gpu_last_logits(
+                tail_tokens,
+                &tail_positions,
+                &mut kv_cache,
+                SlotId(0),
+            )
         } else if chunked_eligible {
             // Chunked prefill — mirrors non-streaming chunked block.
             // Stride alignment was already validated above (centralized
             // assertion covers both chunked + suffix-only branches).
             let first_chunk_idx = lcp_resume_start / stride;
-            let n_chunks = (prompt_len + stride - 1) / stride;
+            let chunked_prefill_end = if recovery_eligible {
+                recovery_anchor
+            } else {
+                prompt_len
+            };
+            let n_chunks = (chunked_prefill_end + stride - 1) / stride;
             eprintln!(
                 "[hf2q qwen35 stream chunked prefill] {} chunks (stride={}, \
-                 prompt_len={}, first_chunk_idx={})",
-                n_chunks, stride, prompt_len, first_chunk_idx
+                 prompt_len={}, prefill_end={}, first_chunk_idx={})",
+                n_chunks, stride, prompt_len, chunked_prefill_end, first_chunk_idx
             );
             let mut last_logits_res: Result<Vec<f32>> = Err(anyhow::anyhow!("no chunks executed"));
             for chunk_idx in first_chunk_idx..n_chunks {
                 let k_start = chunk_idx * stride;
-                let k_end = ((chunk_idx + 1) * stride).min(prompt_len);
+                let k_end = ((chunk_idx + 1) * stride).min(chunked_prefill_end);
                 let chunk_seq_len = k_end - k_start;
                 let chunk_tokens = &prompt_tokens[k_start..k_end];
                 let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
@@ -4809,11 +5229,25 @@ pub fn generate_stream_qwen35_once_extended(
                 // the stream path too (was non-stream-only — asymmetric
                 // kill-switch).
                 let stride_aligned = k_end % stride == 0;
+                let superseded_by_recovery_anchor = stride_checkpoint_superseded_by_recovery_anchor(
+                    recovery_eligible,
+                    k_end,
+                    stride,
+                    recovery_anchor,
+                );
                 let mid_store_disabled =
                     std::env::var("HF2Q_KV_LCP_DISABLE_MID_STORE").as_deref() == Ok("1");
-                lcp_store_skip_notify(stride_aligned, lcp_resume_enabled, mid_store_disabled);
-                if lcp_resume_enabled && stride_aligned && !mid_store_disabled {
-                    match kv_cache.snapshot(&device) {
+                lcp_store_skip_notify(
+                    stride_aligned && !superseded_by_recovery_anchor,
+                    lcp_resume_enabled,
+                    mid_store_disabled,
+                );
+                if lcp_resume_enabled
+                    && stride_aligned
+                    && !superseded_by_recovery_anchor
+                    && !mid_store_disabled
+                {
+                    match kv_cache.snapshot_prefix(&device, k_end) {
                         Ok(snap) => {
                             let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, k_end);
                             let linear_capacity = kv_cache
@@ -4848,6 +5282,38 @@ pub fn generate_stream_qwen35_once_extended(
                         }
                     }
                 }
+            }
+            if recovery_eligible {
+                store_qwen35_latest_turn_checkpoint(
+                    qwen,
+                    &kv_cache,
+                    &device,
+                    params,
+                    prompt_tokens,
+                    recovery_anchor,
+                    "stream chunked latest-turn recovery-anchor",
+                    None,
+                );
+
+                let tail_tokens = &prompt_tokens[recovery_anchor..];
+                let tail_len = tail_tokens.len();
+                let mut tail_positions = vec![0i32; 4 * tail_len];
+                for axis in 0..4 {
+                    for token in 0..tail_len {
+                        tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                    }
+                }
+                eprintln!(
+                    "[hf2q qwen35 stream lcp store] latest-turn recovery anchor={} \
+                     tail_tokens={}",
+                    recovery_anchor, tail_len
+                );
+                last_logits_res = qwen.model.forward_gpu_last_logits(
+                    tail_tokens,
+                    &tail_positions,
+                    &mut kv_cache,
+                    SlotId(0),
+                );
             }
             last_logits_res
         } else if lcp_resume_start > 0 {
@@ -4919,52 +5385,25 @@ pub fn generate_stream_qwen35_once_extended(
                 }
             }
         }
-
-        // ADR-017 Phase E.a B.3: end-of-prefill snapshot store
-        // under chunk-position key (when not already stored by
-        // mid-prefill loop).  See non-streaming sibling for the
-        // gating logic explanation.  NOT greedy-gated (2026-08-03
-        // store-gate fix): prefix KV state is sampling-independent.
-        // Still skipped on extension paths — a soft-token-tainted KV
-        // snapshot must never be restored by a subsequent text-only
-        // request.
-        if !has_extension && lcp_resume_enabled {
-            let chunked_already_stored = stride > 0
-                && prompt_len > stride
-                && (crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill || lcp_resume_start > 0);
-            let prompt_stride_aligned = stride > 0 && prompt_len > 0 && prompt_len % stride == 0;
-            if !chunked_already_stored && prompt_stride_aligned {
-                match kv_cache.snapshot(&device) {
-                    Ok(snap) => {
-                        let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, prompt_len);
-                        let linear_capacity = kv_cache
-                            .linear_attn
-                            .first()
-                            .map(|s| s.recurrent.byte_len())
-                            .unwrap_or(0);
-                        // Codex Phase-2b 2026-05-06: surface store errors
-                        // instead of `let _ = ...`. Mantra: no fallback.
-                        // ADR-027 iter-6b.2: write-through helper.
-                        if let Err(e) = qwen.store_lcp_with_disk_writeback(
-                            &kv_cache,
-                            chunk_key,
-                            prompt_tokens.to_vec(),
-                            snap,
-                            0,
-                            linear_capacity,
-                        ) {
-                            lcp_store_error_notify("stream end-of-prefill", prompt_len, &e);
-                        }
-                    }
-                    Err(e) => {
-                        // Was `if let Ok` — silent snapshot failure.
-                        lcp_snapshot_error_notify("stream end-of-prefill", prompt_len, &e);
-                    }
-                }
-            }
-        }
     }
     let prefill_duration = prefill_start.elapsed();
+    let reported_cached_tokens =
+        qwen35_reported_cached_tokens(prompt_len, prompt_cache_hit, lcp_resume_start);
+    let prefill_work_tokens = prompt_len.saturating_sub(reported_cached_tokens);
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "stream",
+        prompt_tokens = prompt_len,
+        cached_tokens = reported_cached_tokens,
+        work_tokens = prefill_work_tokens,
+        elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
+        tokens_per_second = if prefill_duration.is_zero() {
+            0.0
+        } else {
+            prefill_work_tokens as f64 / prefill_duration.as_secs_f64()
+        },
+        "Qwen35 prefill complete"
+    );
 
     // Wedge-4e: post-prefill text decode positions advance from the
     // global temporal counter (which advances by max(n_x, n_y) per
@@ -5393,8 +5832,7 @@ pub fn generate_stream_qwen35_once_extended(
     }
 
     let decode_duration = decode_start.elapsed();
-    let cached_tokens =
-        qwen35_reported_cached_tokens(prompt_len, prompt_cache_hit, lcp_resume_start);
+    let cached_tokens = reported_cached_tokens;
     let stats = StreamStats {
         prefill_time_secs: Some(prefill_duration.as_secs_f64()),
         decode_time_secs: Some(decode_duration.as_secs_f64()),
@@ -5419,6 +5857,29 @@ pub fn generate_stream_qwen35_once_extended(
             None
         },
     };
+
+    qwen.persistent_kv_cache = Some(kv_cache);
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "stream",
+        generated_tokens = completion_tokens,
+        elapsed_ms = decode_duration.as_secs_f64() * 1000.0,
+        tokens_per_second = if decode_duration.is_zero() {
+            0.0
+        } else {
+            completion_tokens as f64 / decode_duration.as_secs_f64()
+        },
+        "Qwen35 decode complete"
+    );
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode = "stream",
+        prompt_tokens = prompt_len,
+        cached_tokens,
+        completion_tokens,
+        total_ms = request_start.elapsed().as_secs_f64() * 1000.0,
+        "Qwen35 request complete"
+    );
 
     send!(GenerationEvent::Done {
         finish_reason,
@@ -6381,6 +6842,127 @@ mod tests {
     };
     use mlx_native::MlxDevice;
 
+    #[test]
+    fn serial_kv_cache_capacity_grows_geometrically() {
+        let maximum = 262_144;
+        assert_eq!(serial_kv_cache_capacity(5_366, 0, maximum), 8_192);
+        assert_eq!(serial_kv_cache_capacity(5_579, 8_192, maximum), 16_384);
+        assert_eq!(serial_kv_cache_capacity(9_000, 8_192, maximum), 16_384);
+        assert_eq!(serial_kv_cache_capacity(200_000, 131_072, maximum), maximum);
+    }
+
+    #[derive(Debug)]
+    struct ResumeTestPayload(u64);
+
+    impl crate::serve::kv_persist::lcp_registry::ByteSized for ResumeTestPayload {
+        fn byte_len(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn latest_turn_checkpoint_covers_short_prompts_and_longer_stride_wins() {
+        use crate::serve::kv_persist::format::ModelFingerprint;
+        use crate::serve::kv_persist::lcp_registry::{LcpKey, LcpRegistry};
+        use std::sync::Arc;
+
+        let base_key = LcpKey {
+            model_fingerprint: ModelFingerprint([9; 32]),
+            tenant_id: String::new(),
+            params_hash: 0,
+        };
+        let mut registry = LcpRegistry::new(8);
+        registry
+            .store(
+                base_key.clone(),
+                vec![1, 2, 3, 4, 5],
+                vec![Arc::new(ResumeTestPayload(1))],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let short =
+            lookup_qwen35_resume_checkpoint(&mut registry, &base_key, &[1, 2, 3, 4, 5, 6], 8)
+                .expect("latest-turn checkpoint must cover prompt shorter than stride");
+        assert_eq!((short.0.k, short.1), (5, 0));
+
+        let mut chunk_key = base_key.clone();
+        chunk_key.tenant_id = "qwen35:lcp_chunk:8".into();
+        registry
+            .store(
+                chunk_key,
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+                vec![Arc::new(ResumeTestPayload(1))],
+                0,
+                0,
+            )
+            .unwrap();
+        let longest = lookup_qwen35_resume_checkpoint(
+            &mut registry,
+            &base_key,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+            8,
+        )
+        .expect("stride checkpoint");
+        assert_eq!((longest.0.k, longest.1), (8, 8));
+
+        assert!(
+            lookup_qwen35_resume_checkpoint(&mut registry, &base_key, &[1, 2, 99, 4, 5, 6], 8,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_tail_uses_only_a_verified_prompt_suffix() {
+        let prompt = [10, 11, 12, 20, 21, 22, 23];
+        assert_eq!(recovery_tail_for_suffix(&prompt, &[20, 21, 22, 23], 64), 4);
+        assert_eq!(
+            recovery_tail_for_suffix(&prompt, &[21, 22, 99], 64),
+            64,
+            "a custom or drifted template must retain the conservative fallback"
+        );
+        assert_eq!(recovery_tail_for_suffix(&prompt, &[], 64), 64);
+    }
+
+    #[test]
+    fn recovery_anchor_replaces_exact_or_immediately_preceding_stride_checkpoint() {
+        assert!(stride_checkpoint_superseded_by_recovery_anchor(
+            true, 4096, 4096, 5042
+        ));
+        assert!(stride_checkpoint_superseded_by_recovery_anchor(
+            true, 4096, 4096, 4096
+        ));
+        assert!(!stride_checkpoint_superseded_by_recovery_anchor(
+            true, 4096, 4096, 8192
+        ));
+        assert!(!stride_checkpoint_superseded_by_recovery_anchor(
+            false, 4096, 4096, 5042
+        ));
+    }
+
+    #[test]
+    fn recovery_capture_plan_is_limited_to_short_non_chunked_suffixes() {
+        assert_eq!(
+            qwen35_recovery_capture_plan(5_239, 5_255, 5_259, true, false),
+            Some((20, 15))
+        );
+        assert_eq!(
+            qwen35_recovery_capture_plan(5_042, 5_239, 5_243, true, false),
+            None,
+            "201 changed tokens stay on the normal prefill kernel"
+        );
+        assert_eq!(
+            qwen35_recovery_capture_plan(5_239, 5_255, 5_259, true, true),
+            None,
+            "chunked prefill owns its checkpoint schedule"
+        );
+        assert_eq!(
+            qwen35_recovery_capture_plan(5_239, 5_255, 5_259, false, false),
+            None
+        );
+    }
+
     fn moe_cfg_40layer_for_cache_test() -> Qwen35Config {
         Qwen35Config {
             variant: Qwen35Variant::Moe,
@@ -6981,17 +7563,23 @@ mod tests {
              sampling-independent; greedy gating belongs only on \
              HybridPromptCache's decoded-token replay"
         );
-        // Positive pin: non-stream AND stream mid-prefill gates share the
-        // new shape, including the symmetric mid-store kill-switch.
-        let gate = concat!(
-            "if lcp_resume_enabled && stride_aligned",
-            " && !mid_store_disabled {"
+        // Positive pin: non-stream AND stream mid-prefill gates both skip
+        // the final stride checkpoint when the more useful near-tip
+        // recovery anchor replaces it. The symmetric kill-switch remains.
+        let recovery_guard = concat!("&& !superseded_by_", "recovery_anchor");
+        let kill_switch = concat!("&& !mid_store_", "disabled");
+        assert_eq!(
+            src.matches(recovery_guard).count(),
+            4,
+            "non-stream + stream mid-prefill notification and store gates \
+             must both be suppressed when a near-tip recovery anchor \
+             replaces the final stride checkpoint"
         );
         assert_eq!(
-            src.matches(gate).count(),
+            src.matches(kill_switch).count(),
             2,
-            "non-stream + stream mid-prefill store gates must both be \
-             `lcp_resume_enabled && stride_aligned && !mid_store_disabled`"
+            "non-stream + stream mid-prefill store gates must both retain \
+             the symmetric mid-store kill-switch"
         );
         // Greedy gate SURVIVES where it belongs: HybridPromptCache write —
         // the replayed first decoded token IS sampling-dependent.

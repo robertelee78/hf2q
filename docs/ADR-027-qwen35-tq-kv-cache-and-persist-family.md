@@ -554,3 +554,216 @@ This acceptance applies to the canonical fifo-serial launcher. Slot-aware and
 vision-augmented Qwen decode loops still use their older unconstrained sampler
 surface and must not be represented as grammar-equivalent until they receive
 their own real agentic gate.
+
+## Qwen agentic cache and cold-prefill correction (2026-08-07)
+
+### Measured problem
+
+A matched three-turn OpenAI chat transcript was run against hf2q and the
+pinned llama.cpp reference (`15586e2d7165570fb3aa7c26e0d442e289ef69de`) on
+the same M5 Max with the same `APEX-Q5_K_M.gguf`, prompt, temperature 0, seed
+42, repetition penalty 1.0, and one runtime resident at a time. Both runtimes
+returned the exact required outputs: the comma-separated integers 1 through
+64, then `OK`, then `DONE`. Coherence therefore passed before optimization.
+
+The pre-correction latency evidence was not agentic-parity:
+
+| Turn | llama.cpp | hf2q before this correction | Root cause |
+|---|---:|---:|---|
+| cold, 5,046 prompt tokens | 2,736.9 prompt tok/s | 2,389.9 prompt tok/s | hf2q paid cache snapshot/write work in the request; the historical Qwen server warmup no-op had already been fixed separately |
+| follow-up, 5,243 prompt tokens | 5,042 cached; 209 ms prompt work | 4,096 cached; 665 ms prompt work | stride-only checkpointing discarded 946 coherent tokens near the previous prompt tip |
+| follow-up, 5,259 prompt tokens | 5,239 cached; 85 ms prompt work | 5,179 cached; 208 ms prompt work | the first recovery-anchor spike guessed a 64-token unstable template tail; the real Qwen boundary is four tokens for this request |
+
+hf2q decode was already faster on the long answer (117.4 tok/s versus 103.2
+tok/s), so the correction targets prompt/cache work without changing logits or
+sampling.
+
+### RCA
+
+1. `HybridKvCache::snapshot()` deep-copied the full request allocation at every
+   LCP checkpoint, including unused sequence capacity.
+2. `HybridKvCacheSnapshot::total_bytes()` omitted every full-attention and MTP
+   TQ buffer. The byte-budgeted registry therefore treated production TQ
+   checkpoints as almost free, defeating its OOM protection.
+3. QH35 v4 required full-capacity shapes. The disk namespace also fingerprinted
+   per-request sequence capacity, so normal changes in prompt length or
+   `max_tokens` routed consecutive OpenCode turns into different directories.
+4. Stride checkpoints cannot preserve the latest stable DeltaNet state near a
+   turn boundary. An exact end-of-prompt snapshot is also wrong: Qwen's current
+   generation prompt and the same assistant message rendered as history diverge
+   before prompt EOF.
+5. The vendor template shows the structural boundary. With thinking disabled,
+   the prompt ends with a temporary `<think>\n\n</think>\n\n` seed. The next
+   turn replaces that seed with prior assistant content. The loaded tokenizer
+   maps this seed to four tokens in the canonical artifact, matching
+   llama.cpp's observed 5,042-token LCP from a 5,046-token prompt.
+
+### Decision
+
+- `snapshot_prefix(n)` compacts only rank-4 full-attention/MTP sequence
+  buffers; fixed-size DeltaNet recurrent and convolution state remains a full
+  copy. Snapshot byte accounting includes every TQ buffer.
+- QH35 v5 writes explicit rank-4 TQ shapes, accepts compact prefix payloads,
+  and retains v1-v4 readers. Its compatibility fingerprint excludes only the
+  request-capacity sequence axis while retaining all non-sequence dimensions,
+  layer counts, fixed DeltaNet shapes, codec, sequence count, and substrate.
+- The latest-turn checkpoint is stored immediately before the loaded
+  tokenizer's verified generation-only suffix. If the prompt does not end in
+  the expected vendor suffix, hf2q keeps the conservative 64-token margin.
+- Cold chunked prefill replaces its final stride snapshot with the more useful
+  latest-turn anchor instead of adding a second large synchronous snapshot.
+  Older stride checkpoints remain available as branch points.
+- Qwen server warmup now calls `ensure_gpu_cache_primed()` before the listener
+  reports ready in both serial and slot-aware worker modes.
+
+Rejected spikes remain rejected: skipping the intermediate LM head produced no
+measurable win; an exact EOF snapshot missed the next rendered prompt; stride
+8192 improved cold prefill but removed cache coverage for the 5K prompt; and a
+fixed 64-token recovery anchor improved later turns but remained materially
+slower than the template-derived boundary.
+
+### Proof status
+
+Focused regressions pass for compact snapshot/restore, exact TQ byte
+accounting, QH35 v5 TQ+MTP round-trip, v4 backward reading, capacity-independent
+fingerprinting, disk replay into a larger request cache, template-suffix
+verification/fallback, recovery-anchor selection, and startup warmup. The full
+Qwen slice reached 649 pass / 0 failed / 7 ignored after the structural
+source-shape pin was updated to name the corrected store gate.
+
+Four cold-process matched trials returned the exact required outputs and cache
+counts (`0`, `5,042`, `5,239`). Median wall times were 3.6746 seconds,
+184.62 milliseconds, and 141.20 milliseconds for the three turns. The pinned
+llama.cpp reference measured 3.8927 seconds, 198.16 milliseconds, and 103.78
+milliseconds. hf2q therefore leads on the cold turn and first follow-up, but
+the shortest cached continuation remains about 37 milliseconds slower and is
+not complete under the project performance contract.
+
+### Rejected GPU checkpoint-copy spike (2026-08-07)
+
+Raw-bit `u32` Metal copy kernels were tested in an isolated `mlx-native`
+worktree, then wired experimentally to compact Qwen snapshot and restore.
+Synthetic gates proved exact payload identity against the CPU reference,
+including packed TQ bytes, captured DeltaNet state, cursor state, and NaN
+payload bits. Four cold real-model trials also preserved the exact three
+required outputs and cache counts.
+
+The performance hypothesis was falsified. GPU restore reduced the measured
+restore call from about 1.8 milliseconds to 0.065--0.075 milliseconds, but
+allocating and copying the 120.5 MB snapshot still took 6.58--7.49
+milliseconds. Turn-three wall times were 126.99, 139.20, 143.24, and 141.66
+milliseconds: median 140.43 milliseconds, only 0.77 milliseconds better than
+the accepted CPU-copy baseline and far below the required 6 millisecond
+experimental acceptance margin. The hf2q integration was removed; the
+lower-level worktree and evidence at
+`/var/tmp/hf2q-qwen-gpucopy.TdmCWM` remain local research evidence. Further
+Qwen work must target the measured host/dispatch gap in the 20-token suffix,
+not checkpoint memcpy.
+
+### Encoder-session recovery-capture ordering correction (2026-08-07)
+
+Profiling the exact 20-token cached suffix attributed about 95.1 milliseconds
+to Qwen layer wall time but only 51.2 milliseconds to Metal command-buffer GPU
+work across roughly 170 buffers. `HF2Q_ENCODER_SESSION=1` exposed the intended
+command-buffer reduction, but the first four cold trials were incoherent: the
+cache counts remained exact while turn three returned `OK` rather than the
+required `DONE`.
+
+The K ladder localized the failure. K=1 and K=2 were exact; K=3 failed. A
+three-slot FFN output-ring spike made K=3 exact, but source audit showed that
+this only masked the real ordering defect. Latest-turn recovery capture sets
+DeltaNet capture buffers, which bypasses the session-aware arena helper and
+enters `build_delta_net_layer` on separate command encoders. When the previous
+quantized FFN was carried intra-K, its producer remained encoded in an open,
+unsubmitted session buffer while the legacy helper began consuming `hidden`.
+
+`forward_gpu_impl` now tracks that specific carried-producer state and issues
+a non-blocking session fence before entering recovery-capture DeltaNet. The
+diagnostic ring expansion was removed; the established two-slot ring remains.
+This restores producer submission before the sibling consumer without adding a
+host wait or changing model math.
+
+Four cold K=8 trials returned exact `1..64`, `OK`, and `DONE`, with cache counts
+`0`, `5,042`, and `5,239`. Turn-three wall times were 132.56, 134.58, 133.18,
+and 134.43 milliseconds (median 133.80 milliseconds), improving the accepted
+141.20 millisecond baseline by 7.40 milliseconds. The pinned llama.cpp result
+remains 103.78 milliseconds, so Qwen is coherent and faster than its previous
+accepted path but the overall peer-speed contract remains open. Evidence is at
+`/var/tmp/hf2q-qwen-session-k8-handoff.khbfOS`.
+
+The canonical OpenCode launcher enables encoder sessions at K=8. Broader
+session work must still audit every dependency boundary between an open
+session buffer and a plain sibling buffer. Apple documents that one command
+queue preserves command-buffer enqueue order; the failure here was that the
+session producer had not been submitted or enqueued at all before the sibling
+consumer committed. A reusable explicit handoff primitive may belong in
+`mlx-native`, but it must preserve the dependency direction at each call site;
+blindly enqueuing every fresh session buffer would invert sibling-producer to
+session-consumer paths.
+
+### Retained recovery-capture arena and matched peer closure (2026-08-07)
+
+Phase timing on the exact 20-token third-turn suffix found the remaining
+latency outside model math. A pre-correction request spent 46.873 milliseconds
+allocating and zero-filling per-position DeltaNet capture buffers, 56.580
+milliseconds in the forward, 8.169 milliseconds in checkpoint construction,
+and 1.183 milliseconds releasing capture storage. Repeating that allocation on
+every tool turn was the dominant avoidable cost.
+
+The cache now separates capture storage capacity from capture activity. The
+SerialFifo cache allocates a bounded 32-token recovery arena once; each request
+activates only its exact token depth, passes zero-copy prefix views to the
+capture kernels, and deactivates without dropping the buffers. Growth remains
+explicit and one-way, and suffixes above the bounded recovery limit retain the
+existing conservative path. The live recurrent and convolution ping-pong state
+is selected independently from capture activity.
+
+Two wiring spikes failed safely and were removed. Gating live-state selection
+on capture activity passed the wrong state into the model, and passing a
+retained 32-token allocation to a 20-token capture failed shape validation.
+The accepted correction gates only the capture outputs and supplies exact
+20-token views. Focused tests prove grow-only reuse, deactivation without
+storage loss, and an intermediate captured snapshot that neither aliases nor
+mutates live state.
+
+A proposed `mlx-native` raw-byte/overwrite allocator also failed the
+performance gate. Its component snapshot median was about 7.59 milliseconds
+versus 6.96 milliseconds for the existing direct-capture snapshot spike, so
+the hf2q integration and lower-level API were removed. This preserves
+`MlxDevice::alloc_buffer` zero-fill as the published safety contract and keeps
+hf2q reproducible against registry `mlx-native 0.10.3`.
+
+`scripts/bench_qwen36_agentic_cache.sh` is the executable acceptance gate.
+With `TRIALS=4 PEER=1`, it starts one full-model runtime at a time, runs four
+cold processes per implementation, requires exact `1..64`, `OK`, and `DONE`
+responses, and verifies cached-token counts `0 -> 5,042 -> 5,239`. The peer
+arm records the exact llama.cpp commit.
+
+Matched M5 Max evidence against llama.cpp
+`3653e6d6d547ec763317d9ecd0ace334a7e21359`, using the same
+`APEX-Q5_K_M.gguf`, requests, temperature 0, seed 42, repetition penalty 1,
+262,144-token peer context, and one resident runtime:
+
+| Turn | hf2q median wall | llama.cpp median wall | Result |
+|---|---:|---:|---|
+| Cold 5,046-token prompt | 3,766.36 ms | 3,678.37 ms | hf2q 2.4% slower; cold-prefill work remains open |
+| 5,042-token cached continuation | 186.97 ms | 192.74 ms | hf2q 3.0% faster |
+| 5,239-token cached continuation | 82.11 ms | 101.07 ms | hf2q 18.8% faster |
+
+All eight processes returned the exact required outputs. Post-correction phase
+logs report capture activation at about 0.001 milliseconds, forward at
+56.50--57.38 milliseconds, and checkpoint work at 9.27--9.97 milliseconds.
+This closes Qwen's cached agentic continuation peer-speed gate without
+weakening coherence. It does not close the cold-prefill gap or establish the
+same result for Gemma 4 or DeepSeek V4.
+
+Live agentic semantics were re-run after the retained-arena change. The
+forced-tool integration returned a structured `get_weather` call in unary and
+SSE forms, with valid JSON arguments, no content leakage, and
+`finish_reason=tool_calls`. The OpenWebUI-compatible streaming gate then
+proved automatic tool selection was deterministic, appended the assistant
+tool call plus a `role=tool` result, and produced a coherent natural-language
+answer using the returned Paris weather. The tool-disabled companion emitted
+ordinary text and no tool-call deltas. Its recorded-wire fixture is Gemma
+specific; the harness now regression-tests that a Qwen or DeepSeek override
+cannot be compared against Gemma model metadata.

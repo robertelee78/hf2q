@@ -47,6 +47,17 @@
 #                           never to the T=0 greedy argmax path. 1.05 is
 #                           the gentle coding-safe setting; raise toward
 #                           1.1 if loops persist on creative workloads.
+#   HF2Q_ENCODER_SESSION=1
+#                           Reuses ordered Metal command-buffer sessions
+#                           across Qwen prefill stages. Recovery-state capture
+#                           explicitly submits a carried FFN before entering
+#                           its legacy sibling encoder path, preserving exact
+#                           agentic output at K=8 while reducing short cached
+#                           continuation latency.
+#   HF2Q_FFN_TERMINAL_K_BATCH=8
+#                           Drains the session every eight layers. The matched
+#                           three-turn gate is 4/4 exact at K=8; larger values
+#                           are not promoted by this launcher.
 #   --kv-persist <dir>      Wires the hot-swap spiller substrate. Set to
 #                           the SAME dir as HF2Q_KV_PERSIST (they are two
 #                           separate mechanisms; see operating-kv-cache.md).
@@ -72,8 +83,9 @@
 #      agentic turn) restore configured checkpoints (stride 4096 here).
 #      The earlier stride-1024 fixture measured 9.0× TTFT on a
 #      2.7K-token prompt (2920 ms → 326 ms).
-#   3. Disk persistence — checkpoints survive server restarts
-#      (QH35 codec v4, substrate-namespaced fingerprint).
+#   3. Disk persistence — compact checkpoints survive server restarts
+#      across ordinary per-turn cache-capacity changes (QH35 codec v5,
+#      capacity-independent + substrate-namespaced fingerprint).
 #
 # Usage:
 #   scripts/serve_qwen36_opencode.sh            # foreground (default)
@@ -130,6 +142,8 @@ exec env \
     HF2Q_KV_PERSIST="$KV_DIR" \
     HF2Q_KV_PERSIST_BUDGET_BYTES="$KV_BUDGET_BYTES" \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
+    HF2Q_ENCODER_SESSION=1 \
+    HF2Q_FFN_TERMINAL_K_BATCH=8 \
     "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \

@@ -1374,3 +1374,52 @@ on the dwq48 wedding-cake fixture. Decode-greedy parity restored to
 "works as designed". Speed unchanged (~100 tok/s greedy at HEAD;
 0.81× peer per ADR-005's paired bench).
 
+---
+
+## 2026-08-07 — session/plain sibling ordering gap in Qwen recovery capture
+
+The Qwen latest-turn checkpoint path allocates per-position DeltaNet capture
+buffers for short resumed suffixes. That selects the legacy
+`build_delta_net_layer` helper rather than the session-aware arena helper. A
+previous intra-K quantized FFN could therefore remain encoded in an open
+`EncoderSession` command buffer while the legacy helper created and committed
+plain sibling command buffers that consumed its `hidden` output.
+
+The exact three-turn gate reproduced deterministic semantic drift at K=3 and
+K=8 while K=1 and K=2 stayed exact. The accepted narrow correction tracks an
+open carried FFN and calls the session fence before entering the non-session
+capture helper. The fence submits the producer non-blocking; it does not add a
+host wait. Four cold K=8 trials then returned byte-exact required outputs and
+improved the shortest cached turn from a 141.20 millisecond median to 133.80
+milliseconds.
+
+This closes the observed Qwen recovery-capture edge, not every possible mixed
+encoder dependency. Apple guarantees execution in enqueue order for buffers on
+one command queue; the violated precondition here was simpler: the open session
+producer had not been submitted or enqueued before the sibling consumer was
+committed. Other mixed sites must be audited for that directional handoff. A
+future `mlx-native` helper may make the handoff explicit, but automatically
+enqueuing every fresh session buffer is not valid because some sibling buffers
+produce inputs that the session consumes later.
+
+## 2026-08-07 — allocation ownership finding from Qwen agentic recovery
+
+Detailed phase timing corrected the working hypothesis for Qwen's shortest
+cached turn. The principal avoidable cost was not a missing generic Metal
+copy primitive: hf2q was allocating and zero-filling roughly 46.9 milliseconds
+of model-family capture storage on every request. Retaining the bounded capture
+arena in hf2q reduced activation to about 0.001 milliseconds and moved the
+matched four-run continuation median below llama.cpp.
+
+An isolated `mlx-native` spike added raw-byte views and an overwrite-complete
+allocator. Exact payload tests passed, but the component snapshot measurement
+did not improve over the accepted hf2q direct-capture path. The spike was
+removed rather than weakening the established fresh-buffer zero-fill contract
+or publishing an API without an end-to-end benefit.
+
+The resulting ownership rule is explicit: reusable family-neutral allocation
+or command-submission mechanisms belong in `mlx-native` only after a focused
+primitive test and a measured downstream win. Capture lifetime, exact suffix
+depth, checkpoint policy, and model-state semantics remain in hf2q. A local
+Cargo patch is valid only for the spike; accepted hf2q evidence must resolve a
+published registry revision.

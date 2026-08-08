@@ -3353,6 +3353,10 @@ pub fn build_delta_net_layer_with_arena(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
+    // Optional per-position recurrent and convolution capture buffers used by
+    // latest-turn recovery checkpoints and speculative verification.
+    state_capture: Option<&MlxBuffer>,
+    conv_state_capture: Option<&MlxBuffer>,
     // ADR-019 Phase 2 iter91: borrowed `&mut EncoderSession` for the
     // multi-stage chain.  `None` at env=0 (per-stage Plain CommandEncoder
     // shape, byte-identical to pre-iter91).  `Some(sess)` at env=1 — the
@@ -3432,6 +3436,14 @@ pub fn build_delta_net_layer_with_arena(
     let conv_state_out = &la_view.conv_state_out;
     let state_in = &la_view.recurrent_in;
     let state_out = &la_view.recurrent_out;
+    let state_capture_view = state_capture.map(|buffer| {
+        narrow_capture_states_to_slot(buffer, slot_id, d_k, d_v, n_v_heads, n_seqs_alloc)
+    });
+    let conv_state_capture_view = conv_state_capture.map(|buffer| {
+        narrow_conv_capture_to_slot(buffer, slot_id, qkv_channels, k_width - 1, n_seqs_alloc)
+    });
+    let state_capture = state_capture_view.as_ref();
+    let conv_state_capture = conv_state_capture_view.as_ref();
 
     let _seq = seq_len as usize;
     let nv = n_v_heads as usize;
@@ -3618,19 +3630,35 @@ pub fn build_delta_net_layer_with_arena(
             z_channels,
         )?;
         enc.encoder().memory_barrier();
-        dispatch_ssm_conv(
-            enc.encoder(),
-            registry,
-            device.metal_device(),
-            &arena.qkv_raw_buf,
-            &weights.ssm_conv1d,
-            conv_state_in,
-            conv_state_out,
-            &arena.qkv_conv_buf,
-            &arena.ssm_params_buf,
-            ssm_conv_params,
-        )
-        .context("dispatch_ssm_conv ops3 (arena)")?;
+        if let Some(capture) = conv_state_capture {
+            dispatch_ssm_conv_with_capture(
+                enc.encoder(),
+                registry,
+                device.metal_device(),
+                &arena.qkv_raw_buf,
+                &weights.ssm_conv1d,
+                conv_state_in,
+                &arena.qkv_conv_buf,
+                capture,
+                &arena.ssm_params_buf,
+                ssm_conv_params,
+            )
+            .context("dispatch_ssm_conv_with_capture ops3 (arena)")?;
+        } else {
+            dispatch_ssm_conv(
+                enc.encoder(),
+                registry,
+                device.metal_device(),
+                &arena.qkv_raw_buf,
+                &weights.ssm_conv1d,
+                conv_state_in,
+                conv_state_out,
+                &arena.qkv_conv_buf,
+                &arena.ssm_params_buf,
+                ssm_conv_params,
+            )
+            .context("dispatch_ssm_conv ops3 (arena)")?;
+        }
         // ADR-019 Phase 3a iter89e2-I: NEW intra-CB RAW barrier between
         // ssm_conv's write to qkv_conv_buf and qkv_split's read of it.
         // Replaces the legacy CB-boundary ordering when ops1-3 and
@@ -3693,6 +3721,10 @@ pub fn build_delta_net_layer_with_arena(
     }
 
     let output = if chunk_route {
+        anyhow::ensure!(
+            state_capture.is_none() && conv_state_capture.is_none(),
+            "DeltaNet arena capture is supported only by the autoregressive prefill route"
+        );
         // ---- CHUNK PREFILL (3-encoder split) — arena variant ----
         {
             let _w5b8 = super::wave5b8_profile::Section::start(
@@ -3972,23 +4004,48 @@ pub fn build_delta_net_layer_with_arena(
         // Stage-4 unconditional NSG-decode kernel where supported.
         let decode_kernel_eligible = d_k % 32 == 0 && d_k <= 128;
         if decode_kernel_eligible {
-            dispatch_gated_delta_net_decode(
-                &mut enc,
-                registry,
-                device.metal_device(),
-                &arena.q_scaled_buf,
-                &arena.k_normed_buf,
-                &arena.v_split_buf,
-                &arena.g_buf,
-                &arena.beta_buf,
-                state_in,
-                &arena.attn_out_buf,
-                state_out,
-                &arena.gdn_params_buf,
-                gdn_params,
-            )
-            .context("dispatch_gated_delta_net_decode prefill (arena)")?;
+            if let Some(capture) = state_capture {
+                use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture;
+                dispatch_gated_delta_net_decode_with_capture(
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &arena.q_scaled_buf,
+                    &arena.k_normed_buf,
+                    &arena.v_split_buf,
+                    &arena.g_buf,
+                    &arena.beta_buf,
+                    state_in,
+                    &arena.attn_out_buf,
+                    state_out,
+                    &arena.gdn_params_buf,
+                    capture,
+                    gdn_params,
+                )
+                .context("dispatch_gated_delta_net_decode_with_capture prefill (arena)")?;
+            } else {
+                dispatch_gated_delta_net_decode(
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &arena.q_scaled_buf,
+                    &arena.k_normed_buf,
+                    &arena.v_split_buf,
+                    &arena.g_buf,
+                    &arena.beta_buf,
+                    state_in,
+                    &arena.attn_out_buf,
+                    state_out,
+                    &arena.gdn_params_buf,
+                    gdn_params,
+                )
+                .context("dispatch_gated_delta_net_decode prefill (arena)")?;
+            }
         } else {
+            anyhow::ensure!(
+                state_capture.is_none(),
+                "DeltaNet arena capture requires an NSG-compatible key dimension"
+            );
             dispatch_gated_delta_net(
                 &mut enc,
                 registry,
@@ -6466,6 +6523,8 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
+            None, // recurrent capture disabled in parity fixture
+            None, // convolution capture disabled in parity fixture
             // iter91: synthetic test exercises the per-stage Plain
             // CommandEncoder shape (env=0 equivalent) — pass None.
             None,
@@ -6480,6 +6539,76 @@ mod tests {
                 .expect("flush commit_and_wait prod");
         }
         let prod_out = download_f32(&prod_out_buf).expect("download prod");
+        let prod_state_out = download_f32(&state_out_prod).expect("download prod state_out");
+        let prod_conv_out = download_f32(&conv_out_prod).expect("download prod conv_out");
+
+        // ---- Run 1b: production arena with recovery capture enabled ----
+        // The capture-aware arena must preserve the ordinary forward result
+        // and final ping-pong state while also recording the state after each
+        // prompt position. The final capture row is therefore an independent
+        // byte-exact oracle for the final state written by the non-capture
+        // kernels above.
+        let x_capture = upload_f32(&x_cpu, &device).expect("upload x capture");
+        let state_in_capture = upload_f32(&state_in, &device).expect("upload state_in capture");
+        let state_out_capture = upload_f32(&state_in, &device).expect("upload state_out capture");
+        let conv_in_capture = upload_f32(&conv_state, &device).expect("upload conv_in capture");
+        let conv_out_capture = upload_f32(&conv_state, &device).expect("upload conv_out capture");
+        let recurrent_capture = upload_f32(&vec![0.0f32; seq_len as usize * state_size], &device)
+            .expect("upload recurrent capture");
+        let convolution_capture = upload_f32(
+            &vec![0.0f32; seq_len as usize * km1 * qkv_channels as usize],
+            &device,
+        )
+        .expect("upload convolution capture");
+        let mut arena_capture = super::super::DnPrefillArena::new(
+            &device,
+            seq_len,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+        )
+        .expect("DnPrefillArena capture");
+        let capture_out_buf = build_delta_net_layer_with_arena(
+            &device,
+            &mut registry,
+            &x_capture,
+            &gpu_weights,
+            &conv_in_capture,
+            &conv_out_capture,
+            &state_in_capture,
+            &state_out_capture,
+            &mut arena_capture,
+            None,
+            None,
+            seq_len,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+            Some(&recurrent_capture),
+            Some(&convolution_capture),
+            None,
+            SlotId(0),
+        )
+        .expect("production capture-aware arena path");
+        {
+            let mut flush_enc = device.command_encoder().expect("flush capture");
+            flush_enc
+                .commit_and_wait()
+                .expect("flush commit_and_wait capture");
+        }
+        let capture_out = download_f32(&capture_out_buf).expect("download capture output");
+        let capture_state_out =
+            download_f32(&state_out_capture).expect("download capture state_out");
+        let recurrent_capture_cpu =
+            download_f32(&recurrent_capture).expect("download recurrent capture");
+        let convolution_capture_cpu =
+            download_f32(&convolution_capture).expect("download convolution capture");
 
         // ---- Run 2: LEGACY 2-CB reference path (pre-iter89e2-I structure) ----
         // Replicates the exact dispatch sequence of the production path EXCEPT
@@ -6819,6 +6948,55 @@ mod tests {
             "byte-exact parity: output lengths differ — prod={} ref={}",
             prod_out.len(),
             ref_out.len(),
+        );
+
+        let assert_f32_bits_eq = |label: &str, actual: &[f32], expected: &[f32]| {
+            assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+            let first_diff = actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .find(|(_, (a, e))| a.to_bits() != e.to_bits());
+            assert!(
+                first_diff.is_none(),
+                "{label}: first byte-exact difference at {:?}",
+                first_diff.map(|(i, (a, e))| (i, a.to_bits(), e.to_bits()))
+            );
+        };
+        assert_f32_bits_eq(
+            "capture output vs non-capture output",
+            &capture_out,
+            &prod_out,
+        );
+        assert_f32_bits_eq(
+            "capture state_out vs non-capture state_out",
+            &capture_state_out,
+            &prod_state_out,
+        );
+        let final_recurrent_capture = &recurrent_capture_cpu[(seq_len as usize - 1) * state_size..];
+        assert_f32_bits_eq(
+            "final recurrent capture vs non-capture state_out",
+            final_recurrent_capture,
+            &prod_state_out,
+        );
+        let conv_state_size = km1 * qkv_channels as usize;
+        let final_convolution_capture =
+            &convolution_capture_cpu[(seq_len as usize - 1) * conv_state_size..];
+        // The live ping-pong buffer is kernel-native [channels, K-1], while
+        // each capture row is [K-1, channels]. Compare after the explicit
+        // layout transform rather than treating the two contracts as flat-
+        // buffer aliases.
+        let mut prod_conv_out_capture_layout = vec![0.0f32; conv_state_size];
+        for channel in 0..qkv_channels as usize {
+            for kernel_pos in 0..km1 {
+                prod_conv_out_capture_layout[kernel_pos * qkv_channels as usize + channel] =
+                    prod_conv_out[channel * km1 + kernel_pos];
+            }
+        }
+        assert_f32_bits_eq(
+            "final convolution capture vs non-capture conv_out",
+            final_convolution_capture,
+            &prod_conv_out_capture_layout,
         );
 
         let mut n_diff = 0usize;

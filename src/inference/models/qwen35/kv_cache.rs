@@ -804,6 +804,11 @@ pub struct HybridKvCache {
     /// `pub` for symmetry with `n_seqs` / `max_seq_len` (read-only state
     /// derived from constructor inputs).
     pub tq_kv_active: bool,
+    /// Capture storage may remain allocated between agentic turns, but the
+    /// capture kernels must run only while this flag is set. Keeping activity
+    /// separate from allocation avoids re-creating hundreds of megabytes of
+    /// per-position DeltaNet buffers on every short cached continuation.
+    la_capture_active_tokens: Option<u32>,
 }
 
 /// Resolved slot index for a given model layer.
@@ -986,6 +991,12 @@ impl HybridKvCacheSnapshot {
     /// for memory accounting + tracing the per-prompt cache footprint.
     pub fn total_bytes(&self) -> usize {
         let mut n = 0usize;
+        let tq_bytes = |tq: &TqKvSnapshot| {
+            tq.k_packed.byte_len()
+                + tq.k_norms.byte_len()
+                + tq.v_packed.byte_len()
+                + tq.v_norms.byte_len()
+        };
         // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — sum only Some.
         for k in &self.full_attn_k {
             if let Some(buf) = k {
@@ -997,6 +1008,9 @@ impl HybridKvCacheSnapshot {
                 n += buf.byte_len();
             }
         }
+        for tq in self.full_attn_tq.iter().flatten() {
+            n += tq_bytes(tq);
+        }
         if let Some(s) = &self.mtp {
             // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — sum only Some.
             if let Some(buf) = &s.k {
@@ -1004,6 +1018,9 @@ impl HybridKvCacheSnapshot {
             }
             if let Some(buf) = &s.v {
                 n += buf.byte_len();
+            }
+            if let Some(tq) = &s.tq {
+                n += tq_bytes(tq);
             }
         }
         for c in &self.linear_conv {
@@ -1033,21 +1050,91 @@ fn deep_copy_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
     let shape = src.shape().to_vec();
     let mut dst = device
         .alloc_buffer(byte_len, dtype, shape)
-        .map_err(|e| anyhow!("deep_copy_buffer alloc: {e}"))?;
-    let src_bytes: &[u8] = src
+        .map_err(|e| anyhow!("deep_copy_buffer allocation: {e}"))?;
+    let src_bytes = src
         .as_slice::<u8>()
         .map_err(|e| anyhow!("deep_copy_buffer src as_slice: {e}"))?;
-    let dst_bytes: &mut [u8] = dst
+    let dst_bytes = dst
         .as_mut_slice::<u8>()
         .map_err(|e| anyhow!("deep_copy_buffer dst as_mut_slice: {e}"))?;
     anyhow::ensure!(
         src_bytes.len() == dst_bytes.len(),
-        "deep_copy_buffer: byte-length mismatch (src={} dst={})",
+        "deep_copy_buffer byte-length mismatch (src={} dst={})",
         src_bytes.len(),
         dst_bytes.len()
     );
     dst_bytes.copy_from_slice(src_bytes);
     Ok(dst)
+}
+
+/// Deep-copy only the first `n_tokens` positions of a rank-4 sequence
+/// buffer into a compact allocation whose sequence axis is exactly
+/// `n_tokens`.  LCP checkpoints need the valid prefix, not the unused tail
+/// of the request-sized cache allocation.
+fn deep_copy_buffer_prefix(
+    device: &MlxDevice,
+    src: &MlxBuffer,
+    n_tokens: usize,
+    name: &str,
+) -> Result<MlxBuffer> {
+    let src_shape = src.shape();
+    anyhow::ensure!(
+        src_shape.len() == 4,
+        "deep_copy_buffer_prefix ({name}): shape rank {} != 4",
+        src_shape.len()
+    );
+    anyhow::ensure!(
+        n_tokens > 0 && n_tokens <= src_shape[2],
+        "deep_copy_buffer_prefix ({name}): n_tokens={n_tokens} outside 1..={}",
+        src_shape[2]
+    );
+    let mut dst_shape = src_shape.to_vec();
+    dst_shape[2] = n_tokens;
+    let byte_len = dst_shape
+        .iter()
+        .try_fold(src.dtype().size_of(), |bytes, dim| bytes.checked_mul(*dim))
+        .ok_or_else(|| anyhow!("deep_copy_buffer_prefix ({name}): byte length overflow"))?;
+    let mut dst = device
+        .alloc_buffer(byte_len, src.dtype(), dst_shape)
+        .map_err(|e| anyhow!("deep_copy_buffer_prefix ({name}) allocation: {e}"))?;
+    let src_bytes = src
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_buffer_prefix ({name}) src as_slice: {e}"))?;
+    let dst_bytes = dst
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_buffer_prefix ({name}) dst as_mut_slice: {e}"))?;
+    let n_seqs = src_shape[0];
+    let n_kv_heads = src_shape[1];
+    let src_max_seq = src_shape[2];
+    let head_pos_bytes = src_shape[3] * src.dtype().size_of();
+    let copy_bytes = n_tokens * head_pos_bytes;
+    let src_head_stride_bytes = src_max_seq * head_pos_bytes;
+    let dst_head_stride_bytes = copy_bytes;
+    let src_seq_stride_bytes = n_kv_heads * src_head_stride_bytes;
+    let dst_seq_stride_bytes = n_kv_heads * dst_head_stride_bytes;
+    for seq in 0..n_seqs {
+        let src_seq_off = seq * src_seq_stride_bytes;
+        let dst_seq_off = seq * dst_seq_stride_bytes;
+        for head in 0..n_kv_heads {
+            let src_off = src_seq_off + head * src_head_stride_bytes;
+            let dst_off = dst_seq_off + head * dst_head_stride_bytes;
+            dst_bytes[dst_off..dst_off + copy_bytes]
+                .copy_from_slice(&src_bytes[src_off..src_off + copy_bytes]);
+        }
+    }
+    Ok(dst)
+}
+
+fn deep_copy_snapshot_sequence_buffer(
+    device: &MlxDevice,
+    src: &MlxBuffer,
+    prefix_tokens: Option<usize>,
+    name: &str,
+) -> Result<MlxBuffer> {
+    match prefix_tokens {
+        Some(n_tokens) => deep_copy_buffer_prefix(device, src, n_tokens, name),
+        None => deep_copy_buffer(device, src),
+    }
 }
 
 /// ADR-017 Phase E.a B.5 — partial-position copy of full-attn slot
@@ -1117,10 +1204,10 @@ fn partial_copy_slot(
     let src_seq_stride_bytes = src_n_kv * src_head_stride_bytes;
     let dst_seq_stride_bytes = dst_n_kv * dst_head_stride_bytes;
 
-    let src_bytes: &[u8] = src
+    let src_bytes = src
         .as_slice::<u8>()
         .map_err(|e| anyhow!("partial_copy_slot ({name}) src as_slice: {e}"))?;
-    let dst_bytes: &mut [u8] = dst
+    let dst_bytes = dst
         .as_mut_slice::<u8>()
         .map_err(|e| anyhow!("partial_copy_slot ({name}) dst as_mut_slice: {e}"))?;
 
@@ -1147,10 +1234,10 @@ fn copy_buffer_bytes(src: &MlxBuffer, dst: &mut MlxBuffer) -> Result<()> {
         src.byte_len(),
         dst.byte_len()
     );
-    let src_bytes: &[u8] = src
+    let src_bytes = src
         .as_slice::<u8>()
         .map_err(|e| anyhow!("copy_buffer_bytes src as_slice: {e}"))?;
-    let dst_bytes: &mut [u8] = dst
+    let dst_bytes = dst
         .as_mut_slice::<u8>()
         .map_err(|e| anyhow!("copy_buffer_bytes dst as_mut_slice: {e}"))?;
     dst_bytes.copy_from_slice(src_bytes);
@@ -1321,6 +1408,7 @@ impl HybridKvCache {
             conv_channels,
             per_layer_slot,
             tq_kv_active,
+            la_capture_active_tokens: None,
         };
         // ADR-015 iter61a (broken-window fix): explicitly zero every owned
         // GPU buffer to defend against StorageModeShared returning recycled,
@@ -1667,6 +1755,10 @@ impl HybridKvCache {
         if n_tokens_max == 0 {
             return Err(anyhow!("ensure_la_capture: n_tokens_max must be > 0"));
         }
+        // Fail closed if allocation below is interrupted. The retained
+        // buffers remain valid storage, but no forward may select capture
+        // kernels until every linear-attention slot is ready.
+        self.la_capture_active_tokens = None;
         let d_k = cfg.linear_key_head_dim as usize;
         let d_v = cfg.linear_value_head_dim as usize;
         let n_v_heads = cfg.linear_num_value_heads as usize;
@@ -1687,10 +1779,13 @@ impl HybridKvCache {
         let conv_shape = vec![n_seqs, n_tokens_max as usize, k_minus1, conv_channels];
 
         for slot in self.linear_attn.iter_mut() {
-            // Recurrent capture: skip re-alloc at same size; re-alloc
-            // when larger.
+            // Recurrent capture: an existing larger allocation is also valid.
+            // Kernel indexing derives its token capacity from the buffer shape,
+            // while callers only write the requested suffix length.
             if let Some(buf) = slot.capture_states.as_ref() {
-                if buf.element_count() == capture_elems {
+                if (n_seqs == 1 && buf.element_count() >= capture_elems)
+                    || buf.element_count() == capture_elems
+                {
                     // continue to conv check
                 } else {
                     let cap_buf = device
@@ -1704,9 +1799,11 @@ impl HybridKvCache {
                     .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
                 slot.capture_states = Some(cap_buf);
             }
-            // Conv capture (Step 4c): same idempotence semantics.
+            // Conv capture (Step 4c): same grow-only semantics.
             if let Some(buf) = slot.conv_capture_states.as_ref() {
-                if buf.element_count() == conv_capture_elems {
+                if (n_seqs == 1 && buf.element_count() >= conv_capture_elems)
+                    || buf.element_count() == conv_capture_elems
+                {
                     continue;
                 }
             }
@@ -1725,7 +1822,31 @@ impl HybridKvCache {
             );
             slot.conv_capture_states = Some(conv_cap_buf);
         }
+        self.la_capture_active_tokens = Some(n_tokens_max);
         Ok(())
+    }
+
+    /// End a bounded capture operation while retaining its grow-only storage.
+    /// Ordinary single-token decode sees capture as inactive and therefore
+    /// stays on the non-capture kernels. A later capture of equal or smaller
+    /// depth reuses the same buffers without Metal allocation or zero-fill.
+    pub fn clear_la_capture(&mut self) {
+        self.la_capture_active_tokens = None;
+    }
+
+    /// Whether the next forward must write per-position DeltaNet capture
+    /// state. Allocation alone is deliberately not an activity signal.
+    #[inline]
+    pub fn la_capture_active(&self) -> bool {
+        self.la_capture_active_tokens.is_some()
+    }
+
+    /// Requested capture depth for the active forward. Retained buffers may
+    /// have a larger physical capacity; callers bind a zero-copy prefix view
+    /// of exactly this many token positions to the capture kernels.
+    #[inline]
+    pub fn la_capture_active_tokens(&self) -> Option<u32> {
+        self.la_capture_active_tokens
     }
 
     /// ADR-034 task #90 Step 2 (2026-05-21) + ADR-040 Phase A2b (2026-05-29) —
@@ -2348,6 +2469,69 @@ impl HybridKvCache {
     /// (impossible in correct operation: every snapshot buffer is sized
     /// to its source's byte length).
     pub fn snapshot(&self, device: &MlxDevice) -> Result<HybridKvCacheSnapshot> {
+        self.snapshot_inner(device, None, None)
+    }
+
+    /// Take an LCP snapshot whose full-attention/MTP sequence buffers own
+    /// exactly `n_tokens` positions. DeltaNet state remains a full copy
+    /// because it is fixed-size recurrent state rather than a sequence-axis
+    /// cache. The compact snapshot is restored with [`Self::restore_partial`].
+    pub fn snapshot_prefix(
+        &self,
+        device: &MlxDevice,
+        n_tokens: usize,
+    ) -> Result<HybridKvCacheSnapshot> {
+        anyhow::ensure!(n_tokens > 0, "snapshot_prefix: n_tokens must be > 0");
+        self.snapshot_inner(device, Some(n_tokens), None)
+    }
+
+    /// Take a compact LCP snapshot after a captured multi-token forward while
+    /// preserving the live cache at the end of that forward. Full-attention
+    /// and MTP buffers are sliced at `n_tokens`; DeltaNet recurrent and conv
+    /// state are read from the per-position capture buffers at
+    /// `capture_index` rather than from the live end-of-forward state.
+    ///
+    /// This lets agentic serving process a short changed suffix in one GPU
+    /// forward and still retain the stable boundary immediately before a
+    /// generation-only chat-template tail. The ordinary alternative requires
+    /// two forwards (stable prefix, then template tail), whose fixed dispatch
+    /// cost dominates short follow-up turns.
+    ///
+    /// The current LCP serving path is serial (`n_seqs == 1`). Slot-aware
+    /// scheduling does not expose LCP resume, so this method rejects a
+    /// multi-sequence cache rather than inventing cross-slot capture semantics.
+    pub fn snapshot_prefix_from_capture(
+        &self,
+        device: &MlxDevice,
+        n_tokens: usize,
+        capture_index: usize,
+    ) -> Result<HybridKvCacheSnapshot> {
+        anyhow::ensure!(
+            self.n_seqs == 1,
+            "snapshot_prefix_from_capture: n_seqs={} != 1",
+            self.n_seqs
+        );
+        let mut snapshot = self.snapshot_inner(device, Some(n_tokens), Some(capture_index))?;
+
+        for lengths in &mut snapshot.full_attn_current_len {
+            for length in lengths {
+                *length = n_tokens as u32;
+            }
+        }
+        if let Some(mtp) = snapshot.mtp.as_mut() {
+            for length in &mut mtp.current_len {
+                *length = n_tokens as u32;
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn snapshot_inner(
+        &self,
+        device: &MlxDevice,
+        prefix_tokens: Option<usize>,
+        linear_capture_index: Option<usize>,
+    ) -> Result<HybridKvCacheSnapshot> {
         let mut full_attn_k = Vec::with_capacity(self.full_attn.len());
         let mut full_attn_v = Vec::with_capacity(self.full_attn.len());
         let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
@@ -2363,11 +2547,17 @@ impl HybridKvCache {
             // pushes None to mirror. iter-34 makes None the production
             // norm under tq_kv_active=true.
             full_attn_k.push(match slot.k.as_ref() {
-                Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot full_attn.k")?),
+                Some(buf) => Some(
+                    deep_copy_snapshot_sequence_buffer(device, buf, prefix_tokens, "full_attn.k")
+                        .context("snapshot full_attn.k")?,
+                ),
                 None => None,
             });
             full_attn_v.push(match slot.v.as_ref() {
-                Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot full_attn.v")?),
+                Some(buf) => Some(
+                    deep_copy_snapshot_sequence_buffer(device, buf, prefix_tokens, "full_attn.v")
+                        .context("snapshot full_attn.v")?,
+                ),
                 None => None,
             });
             // iter-35: capture slot.tq when present (deep-copy each of
@@ -2375,14 +2565,34 @@ impl HybridKvCache {
             // live cache and stable across subsequent decode writes).
             full_attn_tq.push(match slot.tq.as_ref() {
                 Some(tq) => Some(TqKvSnapshot {
-                    k_packed: deep_copy_buffer(device, &tq.k_packed)
-                        .context("snapshot full_attn.tq.k_packed")?,
-                    k_norms: deep_copy_buffer(device, &tq.k_norms)
-                        .context("snapshot full_attn.tq.k_norms")?,
-                    v_packed: deep_copy_buffer(device, &tq.v_packed)
-                        .context("snapshot full_attn.tq.v_packed")?,
-                    v_norms: deep_copy_buffer(device, &tq.v_norms)
-                        .context("snapshot full_attn.tq.v_norms")?,
+                    k_packed: deep_copy_snapshot_sequence_buffer(
+                        device,
+                        &tq.k_packed,
+                        prefix_tokens,
+                        "full_attn.tq.k_packed",
+                    )
+                    .context("snapshot full_attn.tq.k_packed")?,
+                    k_norms: deep_copy_snapshot_sequence_buffer(
+                        device,
+                        &tq.k_norms,
+                        prefix_tokens,
+                        "full_attn.tq.k_norms",
+                    )
+                    .context("snapshot full_attn.tq.k_norms")?,
+                    v_packed: deep_copy_snapshot_sequence_buffer(
+                        device,
+                        &tq.v_packed,
+                        prefix_tokens,
+                        "full_attn.tq.v_packed",
+                    )
+                    .context("snapshot full_attn.tq.v_packed")?,
+                    v_norms: deep_copy_snapshot_sequence_buffer(
+                        device,
+                        &tq.v_norms,
+                        prefix_tokens,
+                        "full_attn.tq.v_norms",
+                    )
+                    .context("snapshot full_attn.tq.v_norms")?,
                     norms_per_pos: tq.norms_per_pos,
                 }),
                 None => None,
@@ -2393,11 +2603,17 @@ impl HybridKvCache {
             Some(slot) => Some(MtpKvSnapshot {
                 // iter-23c-α: same Optional bridge as full_attn above.
                 k: match slot.k.as_ref() {
-                    Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot mtp.k")?),
+                    Some(buf) => Some(
+                        deep_copy_snapshot_sequence_buffer(device, buf, prefix_tokens, "mtp.k")
+                            .context("snapshot mtp.k")?,
+                    ),
                     None => None,
                 },
                 v: match slot.v.as_ref() {
-                    Some(buf) => Some(deep_copy_buffer(device, buf).context("snapshot mtp.v")?),
+                    Some(buf) => Some(
+                        deep_copy_snapshot_sequence_buffer(device, buf, prefix_tokens, "mtp.v")
+                            .context("snapshot mtp.v")?,
+                    ),
                     None => None,
                 },
                 current_len: slot.current_len.clone(),
@@ -2405,14 +2621,34 @@ impl HybridKvCache {
                 // full-attn slots when present).
                 tq: match slot.tq.as_ref() {
                     Some(tq) => Some(TqKvSnapshot {
-                        k_packed: deep_copy_buffer(device, &tq.k_packed)
-                            .context("snapshot mtp.tq.k_packed")?,
-                        k_norms: deep_copy_buffer(device, &tq.k_norms)
-                            .context("snapshot mtp.tq.k_norms")?,
-                        v_packed: deep_copy_buffer(device, &tq.v_packed)
-                            .context("snapshot mtp.tq.v_packed")?,
-                        v_norms: deep_copy_buffer(device, &tq.v_norms)
-                            .context("snapshot mtp.tq.v_norms")?,
+                        k_packed: deep_copy_snapshot_sequence_buffer(
+                            device,
+                            &tq.k_packed,
+                            prefix_tokens,
+                            "mtp.tq.k_packed",
+                        )
+                        .context("snapshot mtp.tq.k_packed")?,
+                        k_norms: deep_copy_snapshot_sequence_buffer(
+                            device,
+                            &tq.k_norms,
+                            prefix_tokens,
+                            "mtp.tq.k_norms",
+                        )
+                        .context("snapshot mtp.tq.k_norms")?,
+                        v_packed: deep_copy_snapshot_sequence_buffer(
+                            device,
+                            &tq.v_packed,
+                            prefix_tokens,
+                            "mtp.tq.v_packed",
+                        )
+                        .context("snapshot mtp.tq.v_packed")?,
+                        v_norms: deep_copy_snapshot_sequence_buffer(
+                            device,
+                            &tq.v_norms,
+                            prefix_tokens,
+                            "mtp.tq.v_norms",
+                        )
+                        .context("snapshot mtp.tq.v_norms")?,
                         norms_per_pos: tq.norms_per_pos,
                     }),
                     None => None,
@@ -2459,19 +2695,116 @@ impl HybridKvCache {
             }
             Ok(out)
         };
-        for slot in &self.linear_attn {
-            linear_conv.push(canonicalize(
-                &slot.conv_state,
-                &slot.conv_state_scratch,
-                &slot.pp_flipped,
-                "conv_state",
-            )?);
-            linear_recurrent.push(canonicalize(
-                &slot.recurrent,
-                &slot.recurrent_scratch,
-                &slot.pp_flipped,
-                "recurrent",
-            )?);
+        for (layer_idx, slot) in self.linear_attn.iter().enumerate() {
+            if let Some(capture_index) = linear_capture_index {
+                let recurrent_capture = slot.capture_states.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "snapshot_prefix_from_capture: linear_attn[{layer_idx}] recurrent capture missing"
+                    )
+                })?;
+                let recurrent_per_token = slot.recurrent.element_count();
+                anyhow::ensure!(
+                    recurrent_per_token > 0
+                        && recurrent_capture.element_count() % recurrent_per_token == 0,
+                    "snapshot_prefix_from_capture: linear_attn[{layer_idx}] recurrent capture shape mismatch"
+                );
+                let recurrent_capacity = recurrent_capture.element_count() / recurrent_per_token;
+                anyhow::ensure!(
+                    capture_index < recurrent_capacity,
+                    "snapshot_prefix_from_capture: capture_index={capture_index} >= recurrent capacity={recurrent_capacity} at layer {layer_idx}"
+                );
+                let recurrent_src = recurrent_capture.as_slice::<u8>().with_context(|| {
+                    format!("linear_attn[{layer_idx}] recurrent capture as_slice")
+                })?;
+                let recurrent_start = capture_index * recurrent_per_token;
+                let recurrent_end = recurrent_start + recurrent_per_token;
+                let recurrent_start_bytes = recurrent_start * std::mem::size_of::<f32>();
+                let recurrent_end_bytes = recurrent_end * std::mem::size_of::<f32>();
+                let mut recurrent_snapshot = device
+                    .alloc_buffer(
+                        slot.recurrent.byte_len(),
+                        slot.recurrent.dtype(),
+                        slot.recurrent.shape().to_vec(),
+                    )
+                    .with_context(|| {
+                        format!("linear_attn[{layer_idx}] recurrent snapshot allocation")
+                    })?;
+                recurrent_snapshot
+                    .as_mut_slice::<u8>()
+                    .with_context(|| {
+                        format!("linear_attn[{layer_idx}] recurrent snapshot as_mut_slice")
+                    })?
+                    .copy_from_slice(&recurrent_src[recurrent_start_bytes..recurrent_end_bytes]);
+
+                let conv_capture = slot.conv_capture_states.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "snapshot_prefix_from_capture: linear_attn[{layer_idx}] conv capture missing"
+                    )
+                })?;
+                let conv_shape = slot.conv_state.shape();
+                anyhow::ensure!(
+                    conv_shape.len() == 3 && conv_shape[2] == 1,
+                    "snapshot_prefix_from_capture: linear_attn[{layer_idx}] conv shape {:?} is not [channels, K-1, 1]",
+                    conv_shape
+                );
+                let channels = conv_shape[0];
+                let k_minus_one = conv_shape[1];
+                let conv_per_token = channels * k_minus_one;
+                anyhow::ensure!(
+                    conv_per_token > 0 && conv_capture.element_count() % conv_per_token == 0,
+                    "snapshot_prefix_from_capture: linear_attn[{layer_idx}] conv capture shape mismatch"
+                );
+                let conv_capacity = conv_capture.element_count() / conv_per_token;
+                anyhow::ensure!(
+                    capture_index < conv_capacity,
+                    "snapshot_prefix_from_capture: capture_index={capture_index} >= conv capacity={conv_capacity} at layer {layer_idx}"
+                );
+                let conv_src = conv_capture
+                    .as_slice::<u8>()
+                    .with_context(|| format!("linear_attn[{layer_idx}] conv capture as_slice"))?;
+                let conv_start = capture_index * conv_per_token;
+                let f32_bytes = std::mem::size_of::<f32>();
+                let conv_start_bytes = conv_start * f32_bytes;
+                let conv_src =
+                    &conv_src[conv_start_bytes..conv_start_bytes + conv_per_token * f32_bytes];
+                let mut conv_snapshot = device
+                    .alloc_buffer(
+                        slot.conv_state.byte_len(),
+                        slot.conv_state.dtype(),
+                        slot.conv_state.shape().to_vec(),
+                    )
+                    .with_context(|| {
+                        format!("linear_attn[{layer_idx}] conv snapshot allocation")
+                    })?;
+                let conv_dst = conv_snapshot.as_mut_slice::<u8>().with_context(|| {
+                    format!("linear_attn[{layer_idx}] conv snapshot as_mut_slice")
+                })?;
+                // Capture is [K-1, channels]; the active cache is
+                // [channels, K-1]. Preserve every f32 payload bit.
+                for k_idx in 0..k_minus_one {
+                    for channel in 0..channels {
+                        let src_byte = (k_idx * channels + channel) * f32_bytes;
+                        let dst_byte = (channel * k_minus_one + k_idx) * f32_bytes;
+                        conv_dst[dst_byte..dst_byte + f32_bytes]
+                            .copy_from_slice(&conv_src[src_byte..src_byte + f32_bytes]);
+                    }
+                }
+                linear_conv.push(conv_snapshot);
+                linear_recurrent.push(recurrent_snapshot);
+            } else {
+                linear_conv.push(canonicalize(
+                    &slot.conv_state,
+                    &slot.conv_state_scratch,
+                    &slot.pp_flipped,
+                    "conv_state",
+                )?);
+                linear_recurrent.push(canonicalize(
+                    &slot.recurrent,
+                    &slot.recurrent_scratch,
+                    &slot.pp_flipped,
+                    "recurrent",
+                )?);
+            }
         }
         Ok(HybridKvCacheSnapshot {
             full_attn_k,
@@ -6536,6 +6869,7 @@ mod tests {
         use super::super::gpu_full_attn::{
             apply_flash_attn_prefill_seq_major_resume,
             apply_flash_attn_prefill_seq_major_resume_via_tq_cache,
+            apply_tq_prefill_seq_major_resume_direct,
         };
         let device = match MlxDevice::new() {
             Ok(d) => d,
@@ -6751,6 +7085,29 @@ mod tests {
         )
         .expect("TQ-cache prefill resume");
 
+        // Path C (UNDER TEST): direct byte-packed TQ attention. The helper
+        // deliberately commits without a host wait; this explicit terminal
+        // drain proves both its output and pool-retained scratch lifetimes.
+        let out_c = apply_tq_prefill_seq_major_resume_direct(
+            &device,
+            &mut registry,
+            slot_ref,
+            &q_gpu,
+            chunk2_seq_len,
+            cur_len,
+            n_tokens,
+            cache_capacity,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )
+        .expect("direct TQ-cache prefill resume");
+        device
+            .command_encoder()
+            .expect("direct TQ terminal encoder")
+            .commit_and_wait()
+            .expect("direct TQ terminal wait");
+
         // NRMSE.
         let a = out_a.as_slice::<f32>().expect("out_a slice");
         let b = out_b.as_slice::<f32>().expect("out_b slice");
@@ -6770,6 +7127,28 @@ mod tests {
         );
         eprintln!(
             "[iter-33 prefill resume NRMSE F32 vs TQ-cache] {nrmse_value:.6} \
+             (cur_len={cur_len}, kv_seq={n_tokens}, qL={chunk2_seq_len})"
+        );
+
+        let c = out_c.as_slice::<f32>().expect("out_c slice");
+        assert_eq!(a.len(), c.len(), "out_a / out_c element count mismatch");
+        let mut direct_sum_sq_diff = 0.0f64;
+        for (av, cv) in a.iter().zip(c.iter()) {
+            let diff = (*av - *cv) as f64;
+            direct_sum_sq_diff += diff * diff;
+        }
+        let direct_nrmse = (direct_sum_sq_diff / sum_sq_ref.max(1e-30)).sqrt() as f32;
+        assert!(
+            direct_nrmse < 0.15,
+            "direct TQ-cache prefill resume NRMSE {direct_nrmse:.6} >= 0.15 \
+             (ADR-007 §F-0.3 threshold)"
+        );
+        assert!(
+            c.iter().all(|value| value.is_finite()),
+            "direct TQ-cache prefill produced a non-finite output"
+        );
+        eprintln!(
+            "[direct TQ prefill resume NRMSE F32 vs byte-packed] {direct_nrmse:.6} \
              (cur_len={cur_len}, kv_seq={n_tokens}, qL={chunk2_seq_len})"
         );
     }
@@ -7514,6 +7893,59 @@ mod tests {
             second_elems,
             2 * first_elems,
             "n_tokens_max=8 should double the buffer vs n_tokens_max=4"
+        );
+    }
+
+    #[test]
+    fn clear_la_capture_deactivates_but_retains_grow_only_storage() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        cache
+            .ensure_la_capture(&cfg, &device, 8)
+            .expect("allocate eight-token capture storage");
+        assert!(cache.la_capture_active());
+        let recurrent_elems = cache.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .expect("recurrent capture")
+            .element_count();
+        let conv_elems = cache.linear_attn[0]
+            .conv_capture_states
+            .as_ref()
+            .expect("conv capture")
+            .element_count();
+
+        cache.clear_la_capture();
+        assert!(!cache.la_capture_active());
+        assert!(cache
+            .linear_attn
+            .iter()
+            .all(|slot| { slot.capture_states.is_some() && slot.conv_capture_states.is_some() }));
+
+        cache
+            .ensure_la_capture(&cfg, &device, 4)
+            .expect("reuse larger capture storage for smaller request");
+        assert!(cache.la_capture_active());
+        assert_eq!(
+            cache.linear_attn[0]
+                .capture_states
+                .as_ref()
+                .expect("recurrent capture after reuse")
+                .element_count(),
+            recurrent_elems
+        );
+        assert_eq!(
+            cache.linear_attn[0]
+                .conv_capture_states
+                .as_ref()
+                .expect("conv capture after reuse")
+                .element_count(),
+            conv_elems
         );
     }
 
@@ -10029,6 +10461,210 @@ mod tests {
         let head_stride = max_seq * inner * elem;
         let all = buf.as_slice::<u8>().expect("slice");
         all[head * head_stride..head * head_stride + n_tokens * inner * elem].to_vec()
+    }
+
+    /// LCP checkpoints must own only the addressable prefix. This pins both
+    /// the reduced allocation shape and exact restoration into a larger live
+    /// cache under the production TQ-only substrate.
+    #[test]
+    fn snapshot_prefix_compacts_sequence_buffers_and_restores_exactly() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+
+        let mut src = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc src");
+        for slot in &mut src.full_attn {
+            plant_tq_pattern(slot.tq.as_mut().expect("tq"), 7);
+        }
+        plant_tq_pattern(
+            src.mtp_slot.as_mut().expect("mtp").tq.as_mut().expect("tq"),
+            11,
+        );
+        src.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = 17.25;
+
+        let full = src.snapshot(&device).expect("full snapshot");
+        let compact = src
+            .snapshot_prefix(&device, n_tokens)
+            .expect("prefix snapshot");
+        let compact_tq = compact.full_attn_tq[0].as_ref().expect("compact tq");
+        for buf in [
+            &compact_tq.k_packed,
+            &compact_tq.k_norms,
+            &compact_tq.v_packed,
+            &compact_tq.v_norms,
+        ] {
+            assert_eq!(buf.shape()[2], n_tokens, "snapshot sequence axis");
+        }
+        assert!(
+            compact.total_bytes() < full.total_bytes(),
+            "prefix snapshot must own fewer bytes (compact={} full={})",
+            compact.total_bytes(),
+            full.total_bytes()
+        );
+
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc dst");
+        dst.restore_partial(&compact, n_tokens)
+            .expect("restore compact prefix");
+        for (slot_index, slot) in dst.full_attn.iter().enumerate() {
+            let dst_tq = slot.tq.as_ref().expect("dst tq");
+            let src_tq = src.full_attn[slot_index].tq.as_ref().expect("src tq");
+            for (dst_buf, src_buf) in [
+                (&dst_tq.k_packed, &src_tq.k_packed),
+                (&dst_tq.k_norms, &src_tq.k_norms),
+                (&dst_tq.v_packed, &src_tq.v_packed),
+                (&dst_tq.v_norms, &src_tq.v_norms),
+            ] {
+                for head in 0..dst_buf.shape()[1] {
+                    assert_eq!(
+                        read_head_prefix(dst_buf, head, n_tokens),
+                        read_head_prefix(src_buf, head, n_tokens)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            dst.linear_attn[0].recurrent.as_slice::<f32>().unwrap()[0],
+            17.25,
+            "fixed-size DeltaNet state must survive compact snapshot restore"
+        );
+
+        assert!(src.snapshot_prefix(&device, 0).is_err());
+        assert!(src
+            .snapshot_prefix(&device, max_seq_len as usize + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn snapshot_prefix_from_capture_uses_intermediate_deltanet_state_without_mutating_live() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, true).expect("alloc cache");
+        cache
+            .ensure_la_capture(&cfg, &device, 3)
+            .expect("capture buffers");
+
+        for (layer_idx, slot) in cache.linear_attn.iter_mut().enumerate() {
+            slot.pp_flipped[0] = true;
+            slot.recurrent
+                .as_mut_slice::<f32>()
+                .expect("live recurrent")
+                .fill(900.0 + layer_idx as f32);
+            slot.conv_state
+                .as_mut_slice::<f32>()
+                .expect("live conv")
+                .fill(800.0 + layer_idx as f32);
+            slot.recurrent_scratch
+                .as_mut_slice::<f32>()
+                .expect("scratch recurrent")
+                .fill(f32::NAN);
+            slot.conv_state_scratch
+                .as_mut_slice::<f32>()
+                .expect("scratch conv")
+                .fill(f32::NAN);
+
+            let recurrent_per_token = slot.recurrent.element_count();
+            let recurrent_capture = slot
+                .capture_states
+                .as_mut()
+                .expect("recurrent capture")
+                .as_mut_slice::<f32>()
+                .expect("recurrent capture slice");
+            recurrent_capture[recurrent_per_token..2 * recurrent_per_token]
+                .fill(40.0 + layer_idx as f32);
+
+            let conv_shape = slot.conv_state.shape().to_vec();
+            let channels = conv_shape[0];
+            let k_minus_one = conv_shape[1];
+            let conv_per_token = channels * k_minus_one;
+            let conv_capture = slot
+                .conv_capture_states
+                .as_mut()
+                .expect("conv capture")
+                .as_mut_slice::<f32>()
+                .expect("conv capture slice");
+            let captured = &mut conv_capture[conv_per_token..2 * conv_per_token];
+            for k_idx in 0..k_minus_one {
+                for channel in 0..channels {
+                    captured[k_idx * channels + channel] =
+                        (layer_idx * 10_000 + k_idx * 1_000 + channel) as f32;
+                }
+            }
+        }
+
+        let snapshot = cache
+            .snapshot_prefix_from_capture(&device, 20, 1)
+            .expect("captured prefix snapshot");
+        for (layer_idx, slot) in cache.linear_attn.iter().enumerate() {
+            assert!(snapshot.linear_recurrent[layer_idx]
+                .as_slice::<f32>()
+                .expect("snapshot recurrent")
+                .iter()
+                .all(|&v| v == 40.0 + layer_idx as f32));
+            let conv_shape = slot.conv_state.shape();
+            let channels = conv_shape[0];
+            let k_minus_one = conv_shape[1];
+            let captured_conv = snapshot.linear_conv[layer_idx]
+                .as_slice::<f32>()
+                .expect("snapshot conv");
+            for channel in 0..channels {
+                for k_idx in 0..k_minus_one {
+                    assert_eq!(
+                        captured_conv[channel * k_minus_one + k_idx],
+                        (layer_idx * 10_000 + k_idx * 1_000 + channel) as f32
+                    );
+                }
+            }
+            assert!(slot
+                .recurrent
+                .as_slice::<f32>()
+                .expect("live recurrent unchanged")
+                .iter()
+                .all(|&v| v == 900.0 + layer_idx as f32));
+            assert!(slot
+                .conv_state
+                .as_slice::<f32>()
+                .expect("live conv unchanged")
+                .iter()
+                .all(|&v| v == 800.0 + layer_idx as f32));
+            assert!(slot.pp_flipped[0], "capture snapshot must not alter parity");
+            assert!(slot
+                .recurrent_scratch
+                .as_slice::<f32>()
+                .expect("scratch recurrent unchanged")
+                .iter()
+                .all(|v| v.is_nan()));
+            assert!(slot
+                .conv_state_scratch
+                .as_slice::<f32>()
+                .expect("scratch conv unchanged")
+                .iter()
+                .all(|v| v.is_nan()));
+        }
+        assert!(snapshot
+            .full_attn_current_len
+            .iter()
+            .flatten()
+            .all(|&len| len == 20));
+        assert!(snapshot
+            .mtp
+            .as_ref()
+            .expect("mtp snapshot")
+            .current_len
+            .iter()
+            .all(|&len| len == 20));
+
+        cache.clear_la_capture();
+        assert!(!cache.la_capture_active());
+        assert!(cache
+            .linear_attn
+            .iter()
+            .all(|slot| slot.capture_states.is_some() && slot.conv_capture_states.is_some()));
     }
 
     /// ADR-027 sub-iter 23d-γ — the load-bearing regression pin for the

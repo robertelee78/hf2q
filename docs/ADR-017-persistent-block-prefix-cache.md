@@ -4532,3 +4532,59 @@ resume position and computes prefill throughput from uncached suffix tokens.
 The real 16,407-token tool-result continuation reused 12,288 tokens and
 returned the exact sentinel; a repeated SSE request reused 16,384 tokens and
 emitted exactly one terminal `[DONE]`.
+
+### Qwen compact latest-turn checkpoints (2026-08-07)
+
+Matched OpenCode-style measurement exposed a Qwen-specific gap that stride
+checkpoints cannot close. Against pinned llama.cpp on an identical 5,046-token
+prompt, llama retained the true 5,042-token common prefix on turn 2 while hf2q
+fell back to its 4,096-token stride checkpoint. The result was 209 ms versus
+665 ms of follow-up prompt work despite exact output coherence and faster hf2q
+decode. A first 64-token recovery anchor improved the following turn but still
+recomputed 80 tokens where llama recomputed 20.
+
+The accepted family-specific rule is to snapshot the stable generation
+boundary, not prompt EOF and not a guessed tail. Qwen's loaded tokenizer must
+confirm that the prompt ends in the vendor template's generation-only thinking
+seed; the checkpoint is taken immediately before that seed. Mismatch keeps the
+conservative 64-token margin. Because DeltaNet state cannot be rewound after a
+divergent suffix, lookup continues to require a true continuation of the full
+stored prefix.
+
+Qwen LCP snapshots now compact rank-4 full-attention/MTP buffers to the stored
+prefix, count all TQ bytes in registry admission, and persist through QH35 v5.
+The v5 disk compatibility fingerprint excludes only request sequence capacity,
+allowing a compact turn-N checkpoint to hydrate into the differently-sized
+turn-N+1 cache after restart. Non-sequence dimensions, fixed DeltaNet state,
+codec, sequence count, and substrate remain strict namespace boundaries.
+QH35 v1-v4 envelopes remain readable, but the v2 compatibility-fingerprint
+domain intentionally starts a new cache directory namespace.
+
+Unit and small-Metal proof covers compact byte-exact restore, accurate memory
+accounting, v5/v4 codec behavior, and cross-capacity disk replay. Matched
+real-model and restart revalidation remains blocking evidence; see ADR-027's
+2026-08-07 correction section for the exact baseline and gate status.
+
+### Qwen retained-capture acceptance (2026-08-07)
+
+The remaining short-continuation gap was per-request allocation of DeltaNet
+recovery-capture storage, measured at 46.873 milliseconds on the exact
+20-token suffix. Qwen now allocates a bounded 32-token arena once, tracks the
+active token depth separately, passes exact zero-copy views to the capture
+kernels, and deactivates capture without freeing storage. This is
+family-specific state policy; no generic cache fallback is involved.
+
+The checked-in `scripts/bench_qwen36_agentic_cache.sh` gate now has an
+optional current-llama.cpp peer arm and guarantees that the two roughly 35 GB
+runtimes never co-reside. Four cold processes per runtime returned exact
+outputs and the same `0 -> 5,042 -> 5,239` cache progression. Against
+llama.cpp `3653e6d6d547ec763317d9ecd0ace334a7e21359`, median Qwen wall
+time was 186.97 versus 192.74 milliseconds on the first continuation and
+82.11 versus 101.07 milliseconds on the shortest continuation. The cold turn
+remains 2.4% slower (3,766.36 versus 3,678.37 milliseconds), so cached
+agentic continuation is closed while Qwen cold-prefill optimization remains
+open.
+
+This result is not transferable by assertion. Gemma and DeepSeek require the
+same phase decomposition, exact multi-turn coherence gate, cache-count proof,
+and matched peer measurement before their family status changes.

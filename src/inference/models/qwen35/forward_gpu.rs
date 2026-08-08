@@ -2976,21 +2976,9 @@ impl Qwen35Model {
         // typical DN shape (h, n_k_heads, n_v_heads, d_k, d_v) drawn from
         // the GGUF config — sums to a few hundred MB across the 23 slots,
         // well within M5 Max 128 GB unified memory.
-        // ADR-034 task #90 Step 4 (2026-05-21) — when any LA slot has
-        // capture_states allocated (signals K=N speculative decode is
-        // active), force the non-arena decode path so build_delta_net_layer
-        // can route through dispatch_gated_delta_net_decode_with_capture
-        // (Step 3). The arena variant (build_delta_net_layer_with_arena)
-        // dispatches the chunked-prefill kernel which doesn't write
-        // per-position capture; bypassing it for small-batch K=N spec
-        // verify (seq_len ∈ [2, 8]) is acceptable — the arena perf gain
-        // doesn't amortize at small seq anyway.
-        let la_capture_active = kv_cache
-            .linear_attn
-            .iter()
-            .any(|s| s.capture_states.is_some());
+        // Capture-aware arena wiring keeps short recovery/speculative
+        // prefills on the same session-aware GPU path as ordinary prefill.
         let mut dn_prefill_arena: Option<super::DnPrefillArena> = if seq_len > 1
-            && !la_capture_active
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
@@ -3012,7 +3000,7 @@ impl Qwen35Model {
             None
         };
 
-        // ---- ADR-019 Phase 2 iter92: FFN-output ring buffers (race closure) ----
+        // ---- ADR-019 Phase 2: FFN-output ring buffers (race closure) ----
         //
         // Two-slot rings rotate by `layer_idx % 2` to hold the per-layer
         // FFN final output (`down_out` / `sum_buf` for Dense; `out_buf`
@@ -3025,16 +3013,20 @@ impl Qwen35Model {
         // `MTLCommandBufferStatus::Error`.
         //
         // The ring's persistent ARC retain across the whole prefill
-        // structurally prevents the drop.  Both rings are sized
+        // structurally prevents the drop. Both rings are sized
         // [seq_capacity, hidden_size] F32 × 2 slots = 167 MB at apex
-        // pp4096 × h=5120; both rings active simultaneously costs ~334 MB
-        // — negligible vs the existing ~870 MB MoeFfnArena footprint on
-        // apex.  See `dense_ffn_arena.rs::DenseFfnOutputRingBuffer` doc
-        // for the rationale and AC-4 / AC-5 closure details.
+        // pp4096 × h=5120; both rings active simultaneously costs ~334 MB.
         //
         // Decode (`seq_len == 1`) keeps the existing per-call
         // `device.alloc_buffer` shape (decode never engages the
         // multi-layer race surface — each token is its own GPU sync).
+        let encoder_session_enabled = LayerEncoder::env_enabled() && seq_len > 1;
+        let ffn_terminal_k_batch = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(8);
+
         let mut dense_ffn_output_ring: Option<super::DenseFfnOutputRingBuffer> =
             if seq_len > 1 && cfg.intermediate_size.is_some() {
                 Some(
@@ -3258,34 +3250,6 @@ impl Qwen35Model {
         // and per-token `reset_decode_pool` — the K-batch only applies to
         // prefill (seq_len > 1).
         let n_layers = layer_weights_gpu.len();
-        // ADR-013 P21 stage-2c (2026-05-01): K=8 promoted to default after
-        // Stage 2 (GPU-side KV cache write) eliminated the FA fa.ops1_4
-        // host wait. K-batch ladder bench at pp80 + tg32 (5-cold-run median):
-        //   K=1 (pre-Stage-3a baseline): 199 t/s prefill, sync_count=161
-        //   K=4 (Stage 3b post-Stage-3a): 439 t/s, sync_count=21
-        //   K=8 (this commit, post-Stage-2): 582 t/s, sync_count=6
-        //   K=20: 599 t/s, sync_count=3 (3% over K=8, diminishing returns)
-        //   K=40: 598 t/s, sync_count=2 (no further gain — structural floor)
-        // K=8 is the sweet spot: 5x sync_count drop vs K=1 with 3% headroom
-        // remaining at K=20+. Operator can override via env for memory-
-        // constrained settings (smaller K = smaller pool peak).
-        let ffn_terminal_k_batch: usize = {
-            // ADR-015 iter95 — the iter94 Task #5 K=1 forced gate under the
-            // triple combo HF2Q_ENCODER_SESSION=1 + MLX_UNRETAINED_REFS=1 was
-            // REMOVED here: the underlying race (per-layer `hidden` Arc dropped
-            // mid-flight under unretained-refs) is now structurally closed by
-            // the iter95 `hidden_holds` K-batch hold-vec (~line 2671 below).
-            // AC-4 strict parity now PASSES at env=1+UNRETAINED across all
-            // available production fixtures (27b-dwq46, 35b-q4_0-flat,
-            // gemma-4-26b-dwq) at K=1/2/4/8 — verified at
-            // `/opt/hf2q/.cfa-archive/iter95/parity_unretained_run.txt`.
-            // The K=1 safety net is no longer required.
-            std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&k| k >= 1)
-                .unwrap_or(8)
-        };
 
         // ADR-019 Phase 1 — output-head + last-layer fusion eligibility.
         //
@@ -3440,6 +3404,7 @@ impl Qwen35Model {
             }
         }
 
+        let mut session_carry_pending = false;
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
@@ -3638,6 +3603,35 @@ impl Qwen35Model {
                     // rescission failure mode. Decode path (seq_len == 1)
                     // keeps the existing pooled variant (single-token
                     // thread-local pool is already optimal).
+                    let (state_capture_view, conv_capture_view): (
+                        Option<MlxBuffer>,
+                        Option<MlxBuffer>,
+                    ) = if linear_slot_idx != usize::MAX && kv_cache.la_capture_active() {
+                        let slot = &kv_cache.linear_attn[linear_slot_idx];
+                        let active_tokens = kv_cache
+                            .la_capture_active_tokens()
+                            .expect("active capture must carry its token depth")
+                            as usize;
+                        let state_elements = (shape.d_k as usize)
+                            * (shape.d_v as usize)
+                            * (shape.n_v_heads as usize)
+                            * active_tokens
+                            * (kv_cache.n_seqs as usize);
+                        let conv_elements =
+                            qkv_channels * km1 * active_tokens * (kv_cache.n_seqs as usize);
+                        (
+                            slot.capture_states
+                                .as_ref()
+                                .map(|buffer| buffer.slice_view(0, state_elements)),
+                            slot.conv_capture_states
+                                .as_ref()
+                                .map(|buffer| buffer.slice_view(0, conv_elements)),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let state_capture_ref = state_capture_view.as_ref();
+                    let conv_capture_ref = conv_capture_view.as_ref();
                     let out = if let Some(arena) = dn_prefill_arena.as_mut() {
                         build_delta_net_layer_with_arena(
                             &device,
@@ -3661,6 +3655,8 @@ impl Qwen35Model {
                             shape.d_v,
                             shape.conv_kernel,
                             shape.rms_norm_eps,
+                            state_capture_ref,
+                            conv_capture_ref,
                             // iter91: thread the borrowed session into the
                             // DN helper.  The DN helper has only one
                             // LayerEncoder site (stage_a) so it can
@@ -3677,6 +3673,19 @@ impl Qwen35Model {
                         )
                         .with_context(|| format!("delta_net_with_arena layer {layer_idx}"))?
                     } else {
+                        // Recovery-anchor capture routes DeltaNet through the
+                        // legacy non-session helper below. If the previous
+                        // quantized FFN was carried intra-K, its producer work
+                        // is still encoded in the open session command buffer.
+                        // Submit that producer before a separate encoder starts
+                        // consuming `hidden`; otherwise the consumer can be
+                        // committed ahead of its unsubmitted producer.
+                        if session_carry_pending {
+                            LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
+                                .context("recovery-capture session handoff encoder")?
+                                .fence_or_commit("layer.gdn.capture_handoff")
+                                .context("submit carried FFN before recovery-capture DeltaNet")?;
+                        }
                         // ADR-034 task #90 Step 3 (2026-05-21) — when the
                         // current LA slot has capture_states allocated
                         // (K=N spec-decode active), thread it through so
@@ -3685,18 +3694,6 @@ impl Qwen35Model {
                         // Step 4c (2026-05-21) — paired conv capture.
                         // Slot is byte-identical to pre-#90 when both
                         // captures are None.
-                        let (state_capture_ref, conv_capture_ref): (
-                            Option<&MlxBuffer>,
-                            Option<&MlxBuffer>,
-                        ) = if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (
-                                slot.capture_states.as_ref(),
-                                slot.conv_capture_states.as_ref(),
-                            )
-                        } else {
-                            (None, None)
-                        };
                         build_delta_net_layer(
                             &device,
                             &mut registry,
@@ -3736,7 +3733,6 @@ impl Qwen35Model {
                     out
                 }
             };
-
             if let Some(t) = t_attn_start {
                 let us = t.elapsed().as_micros() as u64;
                 total_attn_us += us;
@@ -4326,6 +4322,8 @@ impl Qwen35Model {
                     out
                 }
             };
+            session_carry_pending =
+                encoder_session_enabled && seq_len > 1 && !is_k_boundary && any_fused_eligible;
 
             if let Some(t) = t_ffn_start {
                 total_ffn_us += t.elapsed().as_micros() as u64;
@@ -5705,18 +5703,35 @@ impl Qwen35Model {
                         };
                         // ADR-034 task #90 Step 3+4c — same capture wire
                         // as the main decode path above.
-                        let (state_capture_ref, conv_capture_ref): (
-                            Option<&MlxBuffer>,
-                            Option<&MlxBuffer>,
-                        ) = if linear_slot_idx != usize::MAX {
+                        let (state_capture_view, conv_capture_view): (
+                            Option<MlxBuffer>,
+                            Option<MlxBuffer>,
+                        ) = if linear_slot_idx != usize::MAX && kv_cache.la_capture_active() {
                             let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            let active_tokens = kv_cache
+                                .la_capture_active_tokens()
+                                .expect("active capture must carry its token depth")
+                                as usize;
+                            let state_elements = (shape.d_k as usize)
+                                * (shape.d_v as usize)
+                                * (shape.n_v_heads as usize)
+                                * active_tokens
+                                * (kv_cache.n_seqs as usize);
+                            let conv_elements =
+                                qkv_channels * km1 * active_tokens * (kv_cache.n_seqs as usize);
                             (
-                                slot.capture_states.as_ref(),
-                                slot.conv_capture_states.as_ref(),
+                                slot.capture_states
+                                    .as_ref()
+                                    .map(|buffer| buffer.slice_view(0, state_elements)),
+                                slot.conv_capture_states
+                                    .as_ref()
+                                    .map(|buffer| buffer.slice_view(0, conv_elements)),
                             )
                         } else {
                             (None, None)
                         };
+                        let state_capture_ref = state_capture_view.as_ref();
+                        let conv_capture_ref = conv_capture_view.as_ref();
                         let out = build_delta_net_layer(
                             &device,
                             &mut registry,

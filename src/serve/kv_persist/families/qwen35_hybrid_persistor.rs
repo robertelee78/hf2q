@@ -86,7 +86,12 @@ pub const QH35_MAGIC: [u8; 4] = *b"QH35";
 ///   and the v3 serializer hard-panicked on the `expect` — same gap
 ///   class as the full-attn slots had pre-v2. v4 deserializer accepts
 ///   v1..v3 envelopes via fallback (MTP treated as kv_present).
-pub const QH35_CODEC_VERSION: u32 = 4;
+/// - v5: full-attention and MTP payloads may have a shorter sequence axis
+///   than the live request cache. TQ blobs carry their four-dimensional
+///   packed shape explicitly. Readers still accept v1..v4 full-capacity
+///   snapshots. This permits compact LCP checkpoints without changing the
+///   live-cache fingerprint or exact prompt-cache snapshot semantics.
+pub const QH35_CODEC_VERSION: u32 = 5;
 
 /// Per-slot `kv_present` byte values (v2 / v3).
 pub const QH35_KV_PRESENT: u8 = 1;
@@ -258,6 +263,22 @@ impl Qwen35HybridConfig {
         );
         Ok(())
     }
+}
+
+fn ensure_prefix_shape_compatible(actual: [u64; 4], live: [u64; 4], what: &str) -> Result<()> {
+    ensure!(
+        actual[0] == live[0] && actual[1] == live[1] && actual[3] == live[3],
+        "QH35 {what}: non-sequence shape {:?} incompatible with live cache {:?}",
+        actual,
+        live
+    );
+    ensure!(
+        actual[2] > 0 && actual[2] <= live[2],
+        "QH35 {what}: sequence capacity {} outside 1..={} (live cache)",
+        actual[2],
+        live[2]
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -631,12 +652,11 @@ pub fn serialize_hybrid_snapshot(
                     k.shape()[2] as u64,
                     k.shape()[3] as u64,
                 ];
-                ensure!(
-                    k_shape == cfg.full_attn_shape,
-                    "QH35 serialize: full_attn[{slot_idx}].k shape {:?} != cfg.full_attn_shape {:?}",
+                ensure_prefix_shape_compatible(
                     k_shape,
-                    cfg.full_attn_shape
-                );
+                    cfg.full_attn_shape,
+                    &format!("serialize full_attn[{slot_idx}].k"),
+                )?;
                 let v_shape: [u64; 4] = [
                     v.shape()[0] as u64,
                     v.shape()[1] as u64,
@@ -644,10 +664,10 @@ pub fn serialize_hybrid_snapshot(
                     v.shape()[3] as u64,
                 ];
                 ensure!(
-                    v_shape == cfg.full_attn_shape,
-                    "QH35 serialize: full_attn[{slot_idx}].v shape {:?} != cfg.full_attn_shape {:?}",
+                    v_shape == k_shape,
+                    "QH35 serialize: full_attn[{slot_idx}].v shape {:?} != k shape {:?}",
                     v_shape,
-                    cfg.full_attn_shape
+                    k_shape
                 );
 
                 let k_bytes: &[u8] = k.as_slice::<u8>().map_err(|e| {
@@ -700,7 +720,7 @@ pub fn serialize_hybrid_snapshot(
         match tq_opt {
             Some(tq) => {
                 write_u8(&mut out, QH35_TQ_PRESENT);
-                serialize_tq_blob(&mut out, tq, slot_idx, "full_attn")?;
+                serialize_tq_blob(&mut out, tq, slot_idx, "full_attn", cfg.full_attn_shape)?;
             }
             None => {
                 write_u8(&mut out, QH35_TQ_ABSENT);
@@ -788,12 +808,7 @@ pub fn serialize_hybrid_snapshot(
                     mtp_k.shape()[2] as u64,
                     mtp_k.shape()[3] as u64,
                 ];
-                ensure!(
-                    mk_shape == cfg.mtp_shape,
-                    "QH35 serialize: mtp.k shape {:?} != cfg.mtp_shape {:?}",
-                    mk_shape,
-                    cfg.mtp_shape
-                );
+                ensure_prefix_shape_compatible(mk_shape, cfg.mtp_shape, "serialize mtp.k")?;
                 let mv_shape: [u64; 4] = [
                     mtp_v.shape()[0] as u64,
                     mtp_v.shape()[1] as u64,
@@ -801,10 +816,10 @@ pub fn serialize_hybrid_snapshot(
                     mtp_v.shape()[3] as u64,
                 ];
                 ensure!(
-                    mv_shape == cfg.mtp_shape,
-                    "QH35 serialize: mtp.v shape {:?} != cfg.mtp_shape {:?}",
+                    mv_shape == mk_shape,
+                    "QH35 serialize: mtp.v shape {:?} != mtp.k shape {:?}",
                     mv_shape,
-                    cfg.mtp_shape
+                    mk_shape
                 );
                 let mk_bytes: &[u8] = mtp_k
                     .as_slice::<u8>()
@@ -841,7 +856,7 @@ pub fn serialize_hybrid_snapshot(
         match mtp_tq_opt {
             Some(tq) => {
                 write_u8(&mut out, QH35_TQ_PRESENT);
-                serialize_tq_blob(&mut out, tq, 0, "mtp")?;
+                serialize_tq_blob(&mut out, tq, 0, "mtp", cfg.mtp_shape)?;
             }
             None => {
                 write_u8(&mut out, QH35_TQ_ABSENT);
@@ -871,7 +886,40 @@ fn serialize_tq_blob(
     tq: &TqKvSnapshot,
     slot_idx: usize,
     family: &str,
+    live_shape: [u64; 4],
 ) -> Result<()> {
+    let packed_shape = |buf: &MlxBuffer, name: &str| -> Result<[u64; 4]> {
+        ensure!(
+            buf.shape().len() == 4,
+            "QH35 serialize: {family}[{slot_idx}].tq.{name} rank {} != 4",
+            buf.shape().len()
+        );
+        Ok([
+            buf.shape()[0] as u64,
+            buf.shape()[1] as u64,
+            buf.shape()[2] as u64,
+            buf.shape()[3] as u64,
+        ])
+    };
+    let shape = packed_shape(&tq.k_packed, "k_packed")?;
+    ensure_prefix_shape_compatible(
+        shape,
+        live_shape,
+        &format!("serialize {family}[{slot_idx}].tq.k_packed"),
+    )?;
+    ensure!(
+        packed_shape(&tq.v_packed, "v_packed")? == shape,
+        "QH35 serialize: {family}[{slot_idx}].tq.v_packed shape differs from k_packed"
+    );
+    let norms_shape = [shape[0], shape[1], shape[2], tq.norms_per_pos as u64];
+    ensure!(
+        packed_shape(&tq.k_norms, "k_norms")? == norms_shape,
+        "QH35 serialize: {family}[{slot_idx}].tq.k_norms shape mismatch"
+    );
+    ensure!(
+        packed_shape(&tq.v_norms, "v_norms")? == norms_shape,
+        "QH35 serialize: {family}[{slot_idx}].tq.v_norms shape mismatch"
+    );
     let kp = tq
         .k_packed
         .as_slice::<u8>()
@@ -889,6 +937,9 @@ fn serialize_tq_blob(
         .as_slice::<u8>()
         .map_err(|e| anyhow!("QH35 serialize: {family}[{slot_idx}].tq.v_norms as_slice: {e}"))?;
 
+    for dim in shape {
+        write_u64_le(out, dim);
+    }
     write_u32_le(out, tq.norms_per_pos);
     write_u64_le(out, kp.len() as u64);
     out.extend_from_slice(kp);
@@ -924,8 +975,23 @@ fn deserialize_tq_blob(
     device: &MlxDevice,
     slot_idx: usize,
     family: &str,
-    packed_shape4: [u64; 4],
+    live_shape4: [u64; 4],
+    codec_v5: bool,
 ) -> Result<TqKvSnapshot> {
+    let packed_shape4 = if codec_v5 {
+        let mut shape = [0u64; 4];
+        for dim in &mut shape {
+            *dim = read_u64_le(bytes, cursor)?;
+        }
+        ensure_prefix_shape_compatible(
+            shape,
+            live_shape4,
+            &format!("deserialize {family}[{slot_idx}].tq"),
+        )?;
+        shape
+    } else {
+        live_shape4
+    };
     let norms_per_pos = read_u32_le(bytes, cursor)?;
     ensure!(
         norms_per_pos > 0,
@@ -1072,13 +1138,14 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
     // sub-iter 23d-γ: v4 adds per-MTP kv_present:u8. v1..v3 envelopes
     // are read with implicit MTP kv_present=1.
     ensure!(
-        codec_version >= 1 && codec_version <= 4,
-        "QH35 deserialize: unsupported codec_version {} (expected 1, 2, 3, or 4)",
+        codec_version >= 1 && codec_version <= 5,
+        "QH35 deserialize: unsupported codec_version {} (expected 1 through 5)",
         codec_version
     );
     let codec_v2 = codec_version >= 2;
     let codec_v3 = codec_version >= 3;
     let codec_v4 = codec_version >= 4;
+    let codec_v5 = codec_version >= 5;
 
     let header_cfg = Qwen35HybridConfig {
         n_full_attn: read_u32_le(bytes, cursor)?,
@@ -1169,6 +1236,7 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                         slot_idx,
                         "full_attn",
                         cfg.full_attn_shape,
+                        codec_v5,
                     )?);
                 }
             }
@@ -1179,12 +1247,20 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
         for dim in &mut shape_arr {
             *dim = read_u64_le(bytes, cursor)?;
         }
-        ensure!(
-            shape_arr == cfg.full_attn_shape,
-            "QH35 deserialize: full_attn[{slot_idx}] shape on disk {:?} != cfg {:?}",
-            shape_arr,
-            cfg.full_attn_shape
-        );
+        if codec_v5 {
+            ensure_prefix_shape_compatible(
+                shape_arr,
+                cfg.full_attn_shape,
+                &format!("deserialize full_attn[{slot_idx}]"),
+            )?;
+        } else {
+            ensure!(
+                shape_arr == cfg.full_attn_shape,
+                "QH35 deserialize: full_attn[{slot_idx}] shape on disk {:?} != cfg {:?}",
+                shape_arr,
+                cfg.full_attn_shape
+            );
+        }
         let k_byte_len = read_u64_le(bytes, cursor)? as usize;
         let v_byte_len = read_u64_le(bytes, cursor)? as usize;
 
@@ -1250,6 +1326,7 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                     slot_idx,
                     "full_attn",
                     cfg.full_attn_shape,
+                    codec_v5,
                 )?);
             }
         }
@@ -1339,12 +1416,16 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             for dim in &mut mk_shape_arr {
                 *dim = read_u64_le(bytes, cursor)?;
             }
-            ensure!(
-                mk_shape_arr == cfg.mtp_shape,
-                "QH35 deserialize: mtp shape on disk {:?} != cfg.mtp_shape {:?}",
-                mk_shape_arr,
-                cfg.mtp_shape
-            );
+            if codec_v5 {
+                ensure_prefix_shape_compatible(mk_shape_arr, cfg.mtp_shape, "deserialize mtp")?;
+            } else {
+                ensure!(
+                    mk_shape_arr == cfg.mtp_shape,
+                    "QH35 deserialize: mtp shape on disk {:?} != cfg.mtp_shape {:?}",
+                    mk_shape_arr,
+                    cfg.mtp_shape
+                );
+            }
             let mk_byte_len = read_u64_le(bytes, cursor)? as usize;
             let mv_byte_len = read_u64_le(bytes, cursor)? as usize;
             let mut current_len = Vec::with_capacity(cfg.n_seqs as usize);
@@ -1413,6 +1494,7 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                     0,
                     "mtp",
                     cfg.mtp_shape,
+                    codec_v5,
                 )?)
             } else {
                 None
@@ -2244,10 +2326,16 @@ mod tests {
         // cfg-derived shape validation in deserialize_tq_blob.
         let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = Vec::new();
         for slot in 0..n_full_attn as usize {
-            let mut k_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
-            let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
-            let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
-            let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+            let packed_shape = vec![1, 2, 8, 4];
+            let norms_shape = vec![1, 2, 8, 1];
+            let mut k_packed = device
+                .alloc_buffer(64, DType::U8, packed_shape.clone())
+                .unwrap();
+            let mut k_norms = device
+                .alloc_buffer(64, DType::F32, norms_shape.clone())
+                .unwrap();
+            let mut v_packed = device.alloc_buffer(64, DType::U8, packed_shape).unwrap();
+            let mut v_norms = device.alloc_buffer(64, DType::F32, norms_shape).unwrap();
             for (i, b) in k_packed
                 .as_mut_slice::<u8>()
                 .unwrap()
@@ -2692,11 +2780,23 @@ mod tests {
         snap.full_attn_v = (0..n_full).map(|_| None).collect();
         snap.full_attn_tq = (0..n_full)
             .map(|slot| {
-                // cfg.full_attn_shape = [1,2,8,4] → packed 64 B; norms [1,2,8,1] F32 = 64 B.
-                let mut k_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
-                let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
-                let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
-                let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+                let packed_shape: Vec<usize> =
+                    cfg.full_attn_shape.iter().map(|d| *d as usize).collect();
+                let norms_shape = vec![packed_shape[0], packed_shape[1], packed_shape[2], 1];
+                let packed_bytes = packed_shape.iter().product();
+                let norms_bytes = norms_shape.iter().product::<usize>() * 4;
+                let mut k_packed = device
+                    .alloc_buffer(packed_bytes, DType::U8, packed_shape.clone())
+                    .unwrap();
+                let mut k_norms = device
+                    .alloc_buffer(norms_bytes, DType::F32, norms_shape.clone())
+                    .unwrap();
+                let mut v_packed = device
+                    .alloc_buffer(packed_bytes, DType::U8, packed_shape)
+                    .unwrap();
+                let mut v_norms = device
+                    .alloc_buffer(norms_bytes, DType::F32, norms_shape)
+                    .unwrap();
                 for (i, b) in k_packed
                     .as_mut_slice::<u8>()
                     .unwrap()
@@ -2739,11 +2839,27 @@ mod tests {
             })
             .collect();
         // MTP in TQ-only mode too.
-        // cfg.mtp_shape = [1,4,8,4] → packed 128 B; norms [1,4,8,1] F32 = 128 B.
-        let mut mk_packed = device.alloc_buffer(128, DType::U8, vec![128]).unwrap();
-        let mut mk_norms = device.alloc_buffer(128, DType::F32, vec![32]).unwrap();
-        let mut mv_packed = device.alloc_buffer(128, DType::U8, vec![128]).unwrap();
-        let mut mv_norms = device.alloc_buffer(128, DType::F32, vec![32]).unwrap();
+        let mtp_packed_shape: Vec<usize> = cfg.mtp_shape.iter().map(|d| *d as usize).collect();
+        let mtp_norms_shape = vec![
+            mtp_packed_shape[0],
+            mtp_packed_shape[1],
+            mtp_packed_shape[2],
+            1,
+        ];
+        let mtp_packed_bytes = mtp_packed_shape.iter().product();
+        let mtp_norms_bytes = mtp_norms_shape.iter().product::<usize>() * 4;
+        let mut mk_packed = device
+            .alloc_buffer(mtp_packed_bytes, DType::U8, mtp_packed_shape.clone())
+            .unwrap();
+        let mut mk_norms = device
+            .alloc_buffer(mtp_norms_bytes, DType::F32, mtp_norms_shape.clone())
+            .unwrap();
+        let mut mv_packed = device
+            .alloc_buffer(mtp_packed_bytes, DType::U8, mtp_packed_shape)
+            .unwrap();
+        let mut mv_norms = device
+            .alloc_buffer(mtp_norms_bytes, DType::F32, mtp_norms_shape)
+            .unwrap();
         for (i, b) in mk_packed
             .as_mut_slice::<u8>()
             .unwrap()
@@ -2792,21 +2908,21 @@ mod tests {
     }
 
     #[test]
-    fn qh35_v4_tq_only_with_mtp_round_trip_byte_exact() {
+    fn qh35_v5_tq_only_with_mtp_round_trip_byte_exact() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut cfg = synth_cfg_full(2, 0, true, 1);
         cfg.kv_substrate = KvSubstrate::TqOnly;
         let snap = synth_tq_only_snapshot_with_mtp(&device, &cfg);
 
-        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v4 TQ-only");
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v5 TQ-only");
         // Header: magic + version.
         assert_eq!(&bytes[..4], &QH35_MAGIC);
         let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        assert_eq!(version, 4, "serializer must emit codec v4");
+        assert_eq!(version, 5, "serializer must emit codec v5");
 
         let restored =
-            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize v4 TQ-only");
+            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize v5 TQ-only");
 
         // full-attn: k/v None restored; TQ blobs byte-exact.
         for slot in 0..cfg.n_full_attn as usize {
@@ -2840,12 +2956,12 @@ mod tests {
                 snap.full_attn_current_len[slot]
             );
         }
-        // MTP: k/v None restored (v4 kv_present=0); TQ blob byte-exact.
+        // MTP: k/v None restored (v4+ kv_present=0); TQ blob byte-exact.
         let msrc = snap.mtp.as_ref().unwrap();
         let mdst = restored.mtp.as_ref().expect("mtp restored");
         assert!(
             mdst.k.is_none() && mdst.v.is_none(),
-            "v4 must restore MTP k/v as None in TQ-only mode"
+            "v5 must restore MTP k/v as None in TQ-only mode"
         );
         let (stq, dtq) = (
             msrc.tq.as_ref().unwrap(),
@@ -2943,6 +3059,53 @@ mod tests {
     }
 
     #[test]
+    fn qh35_v4_full_capacity_tq_envelope_remains_readable() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut cfg = synth_cfg(1, 1);
+        cfg.kv_substrate = KvSubstrate::TqOnly;
+
+        // Hand-craft the final pre-v5 layout: one TQ-only full-attention
+        // slot. v4 TQ blobs had no shape field and therefore always used
+        // the live cache's full capacity.
+        let mut out = Vec::new();
+        out.extend_from_slice(&QH35_MAGIC);
+        write_u32_le(&mut out, 4);
+        write_u32_le(&mut out, 1); // n_full_attn
+        write_u32_le(&mut out, 0); // n_linear_attn
+        write_u8(&mut out, 0); // has_mtp
+        write_u8(&mut out, FullAttnCodec::F32Dense as u8);
+        write_u32_le(&mut out, 1); // n_seqs
+        write_u16_le(&mut out, 0);
+        write_u32_le(&mut out, 0); // slot index
+        write_u8(&mut out, QH35_KV_ABSENT);
+        write_u32_le(&mut out, 6); // current_len
+        write_u8(&mut out, QH35_TQ_PRESENT);
+        write_u32_le(&mut out, 1); // norms_per_pos
+
+        let packed_len = cfg.full_attn_shape.iter().product::<u64>() as usize;
+        let norms_len =
+            (cfg.full_attn_shape[0] * cfg.full_attn_shape[1] * cfg.full_attn_shape[2] * 4) as usize;
+        let payloads = [
+            (packed_len, 3u8),
+            (norms_len, 7u8),
+            (packed_len, 11u8),
+            (norms_len, 13u8),
+        ];
+        for (len, seed) in payloads {
+            write_u64_le(&mut out, len as u64);
+            out.extend((0..len).map(|i| seed.wrapping_add((i % 239) as u8)));
+        }
+
+        let restored = deserialize_hybrid_snapshot(&out, &cfg, &device)
+            .expect("v4 full-capacity TQ envelope must remain readable");
+        let tq = restored.full_attn_tq[0].as_ref().expect("restored tq");
+        assert_eq!(tq.k_packed.shape(), &[1, 2, 8, 4]);
+        assert_eq!(tq.k_norms.shape(), &[1, 2, 8, 1]);
+        assert_eq!(restored.full_attn_current_len[0], vec![6]);
+    }
+
+    #[test]
     fn fingerprint_namespaces_by_kv_substrate() {
         let mut a = synth_cfg(1, 1);
         a.kv_substrate = KvSubstrate::F32Only;
@@ -2964,7 +3127,7 @@ mod tests {
     /// deserializer emitted flat blobs. Pin: prefix bytes byte-exact +
     /// tail zero + current_len advanced.
     #[test]
-    fn qh35_v4_hydrated_tq_snapshot_restores_into_live_cache() {
+    fn qh35_v5_hydrated_tq_snapshot_restores_into_live_cache() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let live_cfg = tiny_qwen35_cfg(true);
@@ -3015,14 +3178,33 @@ mod tests {
                 }
             }
         }
-        let snap = src.snapshot(&device).expect("snapshot");
+        let full_snap = src.snapshot(&device).expect("full snapshot");
+        let snap = src
+            .snapshot_prefix(&device, n_tokens)
+            .expect("compact prefix snapshot");
         let cfg = cfg_from_cache(&src, FullAttnCodec::F32Dense).expect("cfg_from_cache");
         assert_eq!(cfg.kv_substrate, KvSubstrate::TqOnly);
 
         // 2) Disk round-trip (serialize → deserialize) — the hydrate arm.
+        let full_bytes = serialize_hybrid_snapshot(&full_snap, &cfg).expect("serialize full");
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        assert!(
+            bytes.len() < full_bytes.len(),
+            "compact disk envelope must be smaller (compact={} full={})",
+            bytes.len(),
+            full_bytes.len()
+        );
         let restored_snap =
             deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        assert_eq!(
+            restored_snap.full_attn_tq[0]
+                .as_ref()
+                .unwrap()
+                .k_packed
+                .shape()[2],
+            n_tokens,
+            "v5 hydrate must retain compact sequence capacity"
+        );
 
         // 3) LCP resume into a fresh TQ-mode cache — THE 500 PATH.
         let mut dst = HybridKvCache::new_with_options(&live_cfg, &device, max_seq_len, 1, true)

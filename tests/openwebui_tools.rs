@@ -104,6 +104,11 @@ fn fixture_path() -> PathBuf {
 /// would land their own literal here when added; for now Gemma 4 is the
 /// fixture model.
 const GEMMA4_TOOL_CALL_OPEN: &str = "<|tool_call>";
+const RECORDED_FIXTURE_MODEL_ID: &str = "Gemma4ForConditionalGeneration";
+
+fn fixture_matches_model(model_id: &str) -> bool {
+    model_id == RECORDED_FIXTURE_MODEL_ID
+}
 
 /// Per-stream accumulated structured tool-call data extracted from
 /// `delta.tool_calls[*]` chunks (iter B-2 W66). One entry per `index`. The
@@ -662,15 +667,27 @@ fn openwebui_tools_streaming_scenario_2() {
     if record {
         helpers::write_fixture(&fp, &turn1_chunks);
         eprintln!("openwebui_tools: recorded fixture at {fp:?}");
-    } else if fp.exists() {
+    } else if fp.exists() && fixture_matches_model(&model_id) {
         helpers::replay_fixture_assert(&fp, &turn1_chunks);
         eprintln!("openwebui_tools: replayed fixture at {fp:?} — content-shape match");
+    } else if fp.exists() {
+        eprintln!(
+            "openwebui_tools: fixture at {fp:?} belongs to \
+             Gemma4ForConditionalGeneration; skipping fixture replay for model_id={model_id:?}"
+        );
     } else {
         eprintln!(
             "openwebui_tools: no fixture at {fp:?} — set {ENV_RECORD}=1 once \
              to record a baseline; subsequent runs replay-and-assert"
         );
     }
+}
+
+#[test]
+fn recorded_fixture_is_not_replayed_across_model_families() {
+    assert!(fixture_matches_model(RECORDED_FIXTURE_MODEL_ID));
+    assert!(!fixture_matches_model("qwen36-abliterix-t63-APEX"));
+    assert!(!fixture_matches_model("DeepSeek-V4-Flash-0731"));
 }
 
 /// `tool_choice = "none"` companion. Open WebUI sends `tool_choice="none"`

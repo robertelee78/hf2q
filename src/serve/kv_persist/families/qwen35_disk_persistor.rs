@@ -18,8 +18,10 @@
 //! ```
 //!
 //! `<fingerprint>` is a 16-hex-char (8-byte) digest of the
-//! `Qwen35HybridConfig` shape fields so a re-quanted model with a
-//! different config can never read another's blocks.  `<lcp_key_hex>`
+//! `Qwen35HybridConfig` compatibility fields. Request-only sequence
+//! capacity is intentionally excluded: QH35 v5 compact checkpoints carry
+//! their own prefix length and can hydrate into any larger live cache.
+//! `<lcp_key_hex>`
 //! is the lcp_key's stable hex form (mirrors what `LcpRegistry` would
 //! produce for the same key in memory).
 //!
@@ -39,6 +41,9 @@ use mlx_native::MlxDevice;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
 
@@ -46,6 +51,219 @@ use super::qwen35_hybrid_persistor::{
     deserialize_hybrid_with_sidecar, serialize_hybrid_with_sidecar, FullAttnCodec,
     LcpSidecarMetadata, Qwen35HybridConfig,
 };
+
+/// Qwen checkpoints are large enough that a conventional bounded channel can
+/// retain several gigabytes during a cold chunked prefill. This single pending
+/// slot coalesces queued writes instead: one job may be in flight and the slot
+/// always holds the newest checkpoint submitted while that write runs.
+const QWEN35_ASYNC_PENDING_SLOTS: usize = 1;
+const QWEN35_ASYNC_IDLE_GRACE: Duration = Duration::from_secs(2);
+
+struct Qwen35DiskWriteJob {
+    cfg: Qwen35HybridConfig,
+    lcp_key_hex: String,
+    snapshot: Arc<HybridKvCacheSnapshot>,
+    sidecar: LcpSidecarMetadata,
+}
+
+struct Qwen35AsyncWriterState {
+    pending: Option<Qwen35DiskWriteJob>,
+    in_flight: bool,
+    shutdown: bool,
+    active_requests: usize,
+    idle_since: Option<Instant>,
+}
+
+impl Default for Qwen35AsyncWriterState {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            in_flight: false,
+            shutdown: false,
+            active_requests: 0,
+            idle_since: Some(Instant::now()),
+        }
+    }
+}
+
+struct Qwen35AsyncWriter {
+    shared: Arc<(Mutex<Qwen35AsyncWriterState>, Condvar)>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl Qwen35AsyncWriter {
+    fn spawn(cache_dir: PathBuf, budget_bytes: u64) -> Result<Self> {
+        let shared = Arc::new((
+            Mutex::new(Qwen35AsyncWriterState::default()),
+            Condvar::new(),
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let join_handle = thread::Builder::new()
+            .name("hf2q-qwen35-kv-writer".to_string())
+            .spawn(move || {
+                let sync_target = Qwen35DiskPersistor {
+                    cache_dir,
+                    budget_bytes,
+                    async_writer: None,
+                };
+                qwen35_async_writer_loop(&sync_target, &worker_shared);
+            })
+            .context("spawn hf2q-qwen35-kv-writer thread")?;
+        Ok(Self {
+            shared,
+            join_handle: Some(join_handle),
+        })
+    }
+
+    /// Queue without blocking inference. Replaces an older not-yet-started
+    /// checkpoint so graceful shutdown persists the newest available state.
+    fn enqueue(&self, job: Qwen35DiskWriteJob) -> bool {
+        let (lock, ready) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return false;
+        }
+        let replaced = state.pending.replace(job).is_some();
+        debug_assert_eq!(QWEN35_ASYNC_PENDING_SLOTS, 1);
+        ready.notify_one();
+        replaced
+    }
+
+    fn pending_jobs(&self) -> usize {
+        let (lock, _) = &*self.shared;
+        let state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        usize::from(state.in_flight) + usize::from(state.pending.is_some())
+    }
+
+    #[cfg(test)]
+    fn wait_for_idle(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let (lock, idle) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.in_flight || state.pending.is_some() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, wait_result) = idle
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if wait_result.timed_out() && (state.in_flight || state.pending.is_some()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for Qwen35AsyncWriter {
+    fn drop(&mut self) {
+        let pending_at_shutdown = self.pending_jobs();
+        let started = Instant::now();
+        let (lock, ready) = &*self.shared;
+        {
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.shutdown = true;
+            ready.notify_all();
+        }
+        let joined = self
+            .join_handle
+            .take()
+            .map(|handle| handle.join().is_ok())
+            .unwrap_or(true);
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            pending_at_shutdown,
+            drain_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            joined,
+            "Qwen35 async checkpoint writer drained"
+        );
+    }
+}
+
+fn qwen35_async_writer_loop(
+    target: &Qwen35DiskPersistor,
+    shared: &Arc<(Mutex<Qwen35AsyncWriterState>, Condvar)>,
+) {
+    loop {
+        let job = {
+            let (lock, ready) = &**shared;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if state.pending.is_none() {
+                    if state.shutdown {
+                        return;
+                    }
+                    state = ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                }
+                if state.shutdown {
+                    break;
+                }
+                if state.active_requests > 0 {
+                    state = ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                }
+                let idle_for = state
+                    .idle_since
+                    .map(|since| since.elapsed())
+                    .unwrap_or_default();
+                if idle_for >= QWEN35_ASYNC_IDLE_GRACE {
+                    break;
+                }
+                let remaining = QWEN35_ASYNC_IDLE_GRACE - idle_for;
+                let (next, _) = ready
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next;
+            }
+            match state.pending.take() {
+                Some(job) => {
+                    state.in_flight = true;
+                    job
+                }
+                None => break,
+            }
+        };
+
+        if let Err(error) = target.write(
+            &job.cfg,
+            &job.lcp_key_hex,
+            job.snapshot.as_ref(),
+            &job.sidecar,
+        ) {
+            tracing::warn!(
+                target: "hf2q::serve::api::engine_qwen35::progress",
+                cache_dir = %target.cache_dir().display(),
+                key_hex = %job.lcp_key_hex,
+                error = %format!("{error:#}"),
+                "Qwen35 async checkpoint write failed; continuing"
+            );
+        }
+
+        let (lock, idle) = &**shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = false;
+        idle.notify_all();
+    }
+}
+
+/// Keeps disk serialization outside an active Qwen request. The guard owns an
+/// Arc, so it does not borrow `Qwen35LoadedModel` across generation.
+pub struct Qwen35DiskRequestGuard {
+    persistor: Arc<Qwen35DiskPersistor>,
+}
+
+impl Drop for Qwen35DiskRequestGuard {
+    fn drop(&mut self) {
+        self.persistor.finish_request();
+    }
+}
 
 /// Disk-backed cold-resume persistor for qwen35 hybrid snapshots.
 ///
@@ -59,9 +277,10 @@ use super::qwen35_hybrid_persistor::{
 /// Multiple `Qwen35LoadedModel` instances using the same `cache_dir`
 /// can safely share one persistor; per-cfg isolation is enforced by
 /// the fingerprint subdir layout
-/// (`<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin`) — cfg drift on
-/// any shape field re-routes to a different subdir, so re-quanting
-/// or different `max_seq_len` requests cannot collide.
+/// (`<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin`) — incompatible model
+/// dimensions or substrate drift re-route to a different subdir, while
+/// ordinary per-request `max_seq_len` changes share one compatible v5
+/// namespace.
 pub struct Qwen35DiskPersistor {
     /// Root cache directory (operator-controlled). Persisted files land
     /// under `<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin`.
@@ -76,6 +295,9 @@ pub struct Qwen35DiskPersistor {
     /// session wrote ~105 GB of chunk snapshots unbudgeted (measured
     /// live 2026-08-03), which is an operational disk-exhaustion hazard.
     budget_bytes: u64,
+    /// Latest-wins, single-pending-slot writer. `None` only inside the
+    /// background thread's synchronous target to avoid recursive workers.
+    async_writer: Option<Qwen35AsyncWriter>,
 }
 
 impl Qwen35DiskPersistor {
@@ -92,9 +314,11 @@ impl Qwen35DiskPersistor {
         // per-cfg subdirs (we don't know which cfgs will be used yet).
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("Qwen35DiskPersistor: mkdir {}", cache_dir.display()))?;
+        let async_writer = Qwen35AsyncWriter::spawn(cache_dir.clone(), budget_bytes)?;
         Ok(Self {
             cache_dir,
             budget_bytes,
+            async_writer: Some(async_writer),
         })
     }
 
@@ -247,6 +471,85 @@ impl Qwen35DiskPersistor {
         Ok(())
     }
 
+    /// Submit a checkpoint without putting serialization, file I/O, or
+    /// `fsync` on the inference thread. At most one older pending checkpoint
+    /// is retained while the worker writes; a newer submission replaces it.
+    /// The in-flight write is never interrupted, and dropping the persistor
+    /// drains the newest pending job before joining the worker.
+    ///
+    /// Returns `true` when an older pending job was replaced. Returns an error
+    /// only when shutdown has begun; persistence failure inside the worker is
+    /// logged and does not affect the live in-memory cache.
+    pub fn enqueue_write(
+        &self,
+        cfg: Qwen35HybridConfig,
+        lcp_key_hex: String,
+        snapshot: Arc<HybridKvCacheSnapshot>,
+        sidecar: LcpSidecarMetadata,
+    ) -> Result<bool> {
+        let writer = self.async_writer.as_ref().ok_or_else(|| {
+            anyhow!("Qwen35DiskPersistor::enqueue_write: async writer is unavailable")
+        })?;
+        let shutting_down = {
+            let (lock, _) = &*writer.shared;
+            let state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.shutdown
+        };
+        ensure!(
+            !shutting_down,
+            "Qwen35DiskPersistor::enqueue_write: writer is shutting down"
+        );
+        Ok(writer.enqueue(Qwen35DiskWriteJob {
+            cfg,
+            lcp_key_hex,
+            snapshot,
+            sidecar,
+        }))
+    }
+
+    /// Number of accepted writes currently running or pending. Intended for
+    /// verbose operator feedback and shutdown diagnostics.
+    pub fn pending_writes(&self) -> usize {
+        self.async_writer
+            .as_ref()
+            .map(Qwen35AsyncWriter::pending_jobs)
+            .unwrap_or(0)
+    }
+
+    /// Mark the beginning of a Qwen request. The returned guard clears the
+    /// activity mark on every exit path, including cancellation and errors.
+    pub fn begin_request(self: &Arc<Self>) -> Qwen35DiskRequestGuard {
+        if let Some(writer) = self.async_writer.as_ref() {
+            let (lock, _) = &*writer.shared;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.active_requests = state.active_requests.saturating_add(1);
+            state.idle_since = None;
+        }
+        Qwen35DiskRequestGuard {
+            persistor: Arc::clone(self),
+        }
+    }
+
+    fn finish_request(&self) {
+        if let Some(writer) = self.async_writer.as_ref() {
+            let (lock, ready) = &*writer.shared;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.active_requests = state.active_requests.saturating_sub(1);
+            if state.active_requests == 0 {
+                state.idle_since = Some(Instant::now());
+                ready.notify_all();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_async_idle(&self, timeout: std::time::Duration) -> bool {
+        self.async_writer
+            .as_ref()
+            .map(|writer| writer.wait_for_idle(timeout))
+            .unwrap_or(true)
+    }
+
     /// Read the snapshot + sidecar metadata keyed by `(cfg, lcp_key_hex)`
     /// from disk; returns `Ok(None)` when the file doesn't exist (clean
     /// cache miss). Returns `Err` on file-present-but-corrupt (caller
@@ -365,22 +668,28 @@ impl Qwen35DiskPersistor {
     }
 }
 
-/// Compute the 8-byte (16-hex-char) fingerprint of a `Qwen35HybridConfig`.
-/// Used as the namespace subdir so re-quanting / shape changes never
-/// collide on disk.
+/// Compute the 8-byte (16-hex-char) compatibility fingerprint of a
+/// `Qwen35HybridConfig`.
 ///
-/// Sha256 over a stable byte serialization of the shape fields; first 8
-/// bytes lifted to lowercase hex.  Same input → same output across
-/// processes / runs / hosts.
+/// QH35 v5 snapshots may compact axis 2 (sequence capacity) to the stored
+/// prefix. The fingerprint therefore excludes axis 2 from full-attention
+/// and MTP shapes while retaining every non-sequence dimension, layer count,
+/// sequence count, codec, fixed DeltaNet state shape, and substrate. This is
+/// what lets a checkpoint written by one OpenCode turn hydrate after restart
+/// into the differently-sized cache allocated for the next turn.
 fn compute_config_fingerprint_hex(cfg: &Qwen35HybridConfig) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"QH35-cfg-fp-v1");
+    h.update(b"QH35-cfg-fp-v2-capacity-independent");
     h.update(&cfg.n_full_attn.to_le_bytes());
     h.update(&cfg.n_linear_attn.to_le_bytes());
     h.update(&[u8::from(cfg.has_mtp)]);
     h.update(&cfg.n_seqs.to_le_bytes());
-    for &dim in &cfg.full_attn_shape {
+    for &dim in &[
+        cfg.full_attn_shape[0],
+        cfg.full_attn_shape[1],
+        cfg.full_attn_shape[3],
+    ] {
         h.update(&dim.to_le_bytes());
     }
     h.update(&[full_attn_codec_byte(cfg.full_attn_codec)]);
@@ -390,7 +699,7 @@ fn compute_config_fingerprint_hex(cfg: &Qwen35HybridConfig) -> String {
     for &dim in &cfg.linear_recurrent_shape {
         h.update(&dim.to_le_bytes());
     }
-    for &dim in &cfg.mtp_shape {
+    for &dim in &[cfg.mtp_shape[0], cfg.mtp_shape[1], cfg.mtp_shape[3]] {
         h.update(&dim.to_le_bytes());
     }
     // ADR-027 sub-iter 23d-γ: mix the KV substrate into the fingerprint
@@ -686,6 +995,122 @@ mod tests {
     }
 
     #[test]
+    fn qh35_async_write_lands_and_round_trips() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg();
+        let tempdir = unique_tempdir("async-rt");
+        let _ = fs::remove_dir_all(&tempdir);
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let snapshot = Arc::new(synth_snapshot(&device, &cfg));
+        let sidecar = synth_sidecar();
+        persistor
+            .enqueue_write(
+                cfg.clone(),
+                "async_key".to_string(),
+                Arc::clone(&snapshot),
+                sidecar.clone(),
+            )
+            .expect("async enqueue");
+        assert!(
+            persistor.wait_for_async_idle(std::time::Duration::from_secs(5)),
+            "async writer did not drain within five seconds"
+        );
+        let (restored, restored_sidecar) = persistor
+            .read(&cfg, "async_key", &device)
+            .expect("async read")
+            .expect("async write must land");
+        assert!(snapshots_byte_equal(snapshot.as_ref(), &restored));
+        assert_eq!(restored_sidecar, sidecar);
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    #[test]
+    fn qh35_async_drop_drains_newest_pending_checkpoint() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg();
+        let tempdir = unique_tempdir("async-drop");
+        let _ = fs::remove_dir_all(&tempdir);
+        let snapshot = Arc::new(synth_snapshot(&device, &cfg));
+        let sidecar = synth_sidecar();
+        {
+            let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+            for key in ["async_old", "async_middle", "async_newest"] {
+                persistor
+                    .enqueue_write(
+                        cfg.clone(),
+                        key.to_string(),
+                        Arc::clone(&snapshot),
+                        sidecar.clone(),
+                    )
+                    .expect("async enqueue before drop");
+            }
+            // Drop closes submission, drains the newest pending checkpoint,
+            // and joins the worker before this scope exits.
+        }
+
+        let reader = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let restored = reader
+            .read(&cfg, "async_newest", &device)
+            .expect("newest read after drain")
+            .expect("newest pending checkpoint must survive graceful drop");
+        assert!(snapshots_byte_equal(snapshot.as_ref(), &restored.0));
+        assert_eq!(restored.1, sidecar);
+        drop(reader);
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    #[test]
+    fn qh35_async_writer_waits_until_request_is_idle() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg();
+        let tempdir = unique_tempdir("async-idle");
+        let _ = fs::remove_dir_all(&tempdir);
+        let persistor = Arc::new(Qwen35DiskPersistor::new(tempdir.clone()).unwrap());
+        let request = persistor.begin_request();
+        persistor
+            .enqueue_write(
+                cfg.clone(),
+                "idle_key".to_string(),
+                Arc::new(synth_snapshot(&device, &cfg)),
+                synth_sidecar(),
+            )
+            .expect("enqueue during active request");
+        std::thread::sleep(QWEN35_ASYNC_IDLE_GRACE + Duration::from_millis(50));
+        assert!(
+            !persistor.path_for_key(&cfg, "idle_key").exists(),
+            "disk serialization must not overlap an active request"
+        );
+        assert_eq!(persistor.pending_writes(), 1);
+
+        drop(request);
+        assert!(
+            persistor.wait_for_async_idle(Duration::from_secs(5)),
+            "writer did not drain after request became idle"
+        );
+        assert!(persistor.path_for_key(&cfg, "idle_key").exists());
+        drop(persistor);
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    #[test]
     fn qh35_disk_read_missing_returns_none() {
         let device = match MlxDevice::new() {
             Ok(d) => d,
@@ -768,6 +1193,58 @@ mod tests {
             result_b.is_none(),
             "cfg_b read must not see cfg_a's snapshot under shared key"
         );
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    #[test]
+    fn qh35_v5_fingerprint_ignores_only_request_sequence_capacity() {
+        let cfg_a = synth_cfg();
+        let mut cfg_b = synth_cfg();
+        cfg_b.full_attn_shape[2] = cfg_a.full_attn_shape[2] + 4096;
+        cfg_b.mtp_shape[2] = cfg_a.mtp_shape[2] + 4096;
+        assert_eq!(
+            Qwen35DiskPersistor::fingerprint_hex_for(&cfg_a),
+            Qwen35DiskPersistor::fingerprint_hex_for(&cfg_b),
+            "ordinary request-capacity growth must share the compact-v5 cache namespace"
+        );
+
+        cfg_b.full_attn_shape[3] += 1;
+        assert_ne!(
+            Qwen35DiskPersistor::fingerprint_hex_for(&cfg_a),
+            Qwen35DiskPersistor::fingerprint_hex_for(&cfg_b),
+            "head-dimension drift remains incompatible"
+        );
+    }
+
+    #[test]
+    fn qh35_v5_disk_replays_compact_snapshot_into_larger_request_capacity() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg_small = synth_cfg();
+        let mut cfg_large = synth_cfg();
+        cfg_large.full_attn_shape[2] = cfg_small.full_attn_shape[2] + 8;
+        cfg_large.mtp_shape[2] = cfg_small.mtp_shape[2] + 8;
+
+        let tempdir = unique_tempdir("cross-capacity-v5");
+        let _ = fs::remove_dir_all(&tempdir);
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let snapshot = synth_snapshot(&device, &cfg_small);
+        let sidecar = synth_sidecar();
+        persistor
+            .write(&cfg_small, "stable_turn", &snapshot, &sidecar)
+            .unwrap();
+
+        let (restored, restored_sidecar) = persistor
+            .read(&cfg_large, "stable_turn", &device)
+            .expect("larger-capacity read")
+            .expect("capacity-independent fingerprint must address the v5 file");
+        assert!(snapshots_byte_equal(&snapshot, &restored));
+        assert_eq!(restored_sidecar, sidecar);
         let _ = fs::remove_dir_all(&tempdir);
     }
 
@@ -1025,10 +1502,16 @@ mod tests {
             // TQ packed: 64 bytes ([1,2,8,4] U8); norms: 16 f32 = 64 bytes.
             // cfg.full_attn_shape = [1,2,8,4] → packed 64 B; norms [1,2,8,1] F32 = 64 B
             // (sub-iter 23d-γ shape-validated deserialize requires cfg-derived lengths).
-            let mut k_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
-            let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
-            let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
-            let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+            let packed_shape = vec![1, 2, 8, 4];
+            let norms_shape = vec![1, 2, 8, 1];
+            let mut k_packed = device
+                .alloc_buffer(64, DType::U8, packed_shape.clone())
+                .unwrap();
+            let mut k_norms = device
+                .alloc_buffer(64, DType::F32, norms_shape.clone())
+                .unwrap();
+            let mut v_packed = device.alloc_buffer(64, DType::U8, packed_shape).unwrap();
+            let mut v_norms = device.alloc_buffer(64, DType::F32, norms_shape).unwrap();
             for (i, b) in k_packed
                 .as_mut_slice::<u8>()
                 .unwrap()

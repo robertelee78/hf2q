@@ -616,7 +616,7 @@ impl LayerBoundaryArena {
 // = previous layer's output) and the write-side (current layer's FFN
 // output) within the SAME memory.  The FFN encoder reads `hidden` (= the
 // shared slot) into projections then writes results back to the SAME slot,
-// corrupting the residual stream.  The ring's two-slot rotation gives us
+// corrupting the residual stream.  A two-slot rotation gives us
 // (a) read-from = slot[(layer_idx-1) % 2]  and  (b) write-into =
 // slot[layer_idx % 2] — disjoint memory windows for the in-flight encoder.
 //
@@ -625,23 +625,13 @@ impl LayerBoundaryArena {
 // Cross-layer dependency depth is 1: layer N reads layer N-1's output as
 // its `hidden`.  Ring slot at index (N-1)%2 must be alive (ARC-retained by
 // the ring AND by the `hidden` clone) while layer N is encoding.  Layer
-// N+1 then writes to slot[(N+1)%2] which is the same physical slot that
-// held layer N-1's output — but layer N+1 is the GPU-write-side and the
-// in-flight CB pipeline (within the same `EncoderSession` chain when
-// `HF2Q_ENCODER_SESSION=1`) serializes writes via memory_barrier and the
-// session's MTLSharedEvent chain.  So the buffer's PHYSICAL memory is
-// re-used for layer N+1's output AFTER the GPU has finished reading it
-// for layer N.  The Rust-side ARC retain by the ring prevents
-// `removeAllocation:` from firing on the residency set during this
-// transfer — that was the iter90b/iter91 race closure failure.
-//
-// **K+1 slots considered and rejected.**  K=8 K-batch boundary, on first
-// glance suggests ring_size=K+1=9.  Reading the actual encoder ordering:
-// every K-boundary layer issues `commit_and_wait_labeled` which DRAINS
-// the GPU.  Any in-flight CB that wrote a previous slot is fully complete
-// before the next K-batch starts.  So the only intra-K race surface is
-// 2-deep (read N-1, write N), satisfied by 2 slots.  Empirical
-// confirmation lives in the AC-4 + AC-5 tests below.
+// N+1 writes to slot[(N+1)%2], the same physical slot that held layer
+// N-1's output, only after the earlier consumer has been submitted. The
+// session-aware attention helpers preserve this directly. Recovery capture
+// uses a legacy non-session DeltaNet helper, so `forward_gpu_impl` must fence
+// and submit a carried FFN before entering it. With that handoff invariant,
+// the queue orders the earlier read before the later write and two slots are
+// sufficient even when the terminal host drain uses K>2.
 //
 // **Lifetime contract** (mirrors `MoeFfnArena` / `DenseFfnArena` /
 // `LayerBoundaryArena` exactly):

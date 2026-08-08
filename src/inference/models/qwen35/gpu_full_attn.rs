@@ -4826,11 +4826,13 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
             device,
         )
         .context("dequant V seq → temp F32 unrotated")?;
-    // commit_and_wait so the temp buffers are populated before the
-    // resume kernel reads them. The resume kernel allocates its own
-    // encoder + commit_and_wait internally.
-    enc.commit_and_wait()
-        .context("apply_flash_attn_prefill_seq_major_resume_via_tq_cache: dequant commit")?;
+    // Submit without a host wait. The dense-resume command buffer below is
+    // on the same Metal queue, so queue ordering makes it consume the
+    // dequantized buffers only after this command buffer completes. `temp_k`
+    // and `temp_v` remain in this stack frame across the dense resume's
+    // terminal commit+wait, satisfying the unretained-reference lifetime
+    // contract as well.
+    enc.commit_labeled("layer.full_attn.tq_bridge_dequant");
 
     // Dispatch the same dense resume kernel against the tight temp
     // buffers. kv_capacity = kv_seq_len so the kernel's head-stride
@@ -4851,6 +4853,140 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
         head_dim,
     )
     .context("apply_flash_attn_prefill_seq_major_resume (TQ-decoded path)")
+}
+
+/// Maximum resumed query batch routed through the direct byte-packed TQ
+/// vector kernel. The kernel is designed for decode and short batched
+/// verification; larger suffixes retain the tiled dense-prefill bridge.
+const QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES: u32 = 32;
+
+/// Attend a short resumed query batch directly over byte-packed TQ K/V.
+///
+/// mlx-native's batched TQ-HB vector kernel accepts one absolute sequence
+/// position per query. Repeating slot 0 and supplying positions
+/// `cur_len..cur_len + seq_len` is therefore the single-sequence causal
+/// prefill case: query i sees K/V through its own absolute position. This
+/// avoids dequantizing the entire cached prefix to F32 on every agentic turn.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_tq_prefill_seq_major_resume_direct(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    slot: &super::kv_cache::FullAttnKvSlot,
+    q_seq_major: &MlxBuffer,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    cache_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    anyhow::ensure!(
+        seq_len > 0 && seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES,
+        "direct TQ prefill seq_len={} outside 1..={}",
+        seq_len,
+        QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES
+    );
+    anyhow::ensure!(
+        cur_len.saturating_add(seq_len) == kv_seq_len,
+        "direct TQ prefill cur_len({cur_len}) + seq_len({seq_len}) != kv_seq_len({kv_seq_len})"
+    );
+    let tq = slot
+        .tq
+        .as_ref()
+        .ok_or_else(|| anyhow!("direct TQ prefill requires a TQ-active full-attention slot"))?;
+    let output_elems = (seq_len as usize) * (n_heads as usize) * (head_dim as usize);
+    let output = device
+        .alloc_buffer(
+            output_elems * 4,
+            DType::F32,
+            vec![seq_len as usize, n_heads as usize, head_dim as usize],
+        )
+        .map_err(|error| anyhow!("direct TQ prefill output allocation: {error}"))?;
+    let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
+        seq_len.saturating_mul(n_heads),
+        head_dim,
+    );
+    // These buffers must outlive the non-blocking command buffer commit
+    // below. The per-forward decode pool keeps an ARC clone until the
+    // terminal FFN/output-head wait drains the queue and the next safe pool
+    // reset recycles it.
+    let tmp =
+        super::decode_pool::pooled_alloc_buffer(device, tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+            .map_err(|error| anyhow!("direct TQ prefill scratch allocation: {error}"))?;
+    let mut slot_ids = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len as usize) * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![seq_len as usize],
+    )
+    .map_err(|error| anyhow!("direct TQ prefill slot-id allocation: {error}"))?;
+    slot_ids
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("direct TQ prefill slot-id mapping: {error}"))?
+        .fill(0);
+    let mut sequence_positions = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len as usize) * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![seq_len as usize],
+    )
+    .map_err(|error| anyhow!("direct TQ prefill position allocation: {error}"))?;
+    for (index, position) in sequence_positions
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("direct TQ prefill position mapping: {error}"))?
+        .iter_mut()
+        .enumerate()
+    {
+        *position = cur_len + index as u32;
+    }
+    let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+    let codebook_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+        codebook_bits
+    } else {
+        8
+    };
+    let params = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+        num_heads: n_heads,
+        num_kv_heads: n_kv_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity: cache_capacity,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+        mask_type: 0,
+        sliding_window: 0,
+        softcap: 0.0,
+        ring_start: 0,
+        scale_factor_d512: 1.0,
+        codebook_bits,
+        fuse_fwht_pre: 1,
+        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
+    };
+    let mut encoder = device
+        .command_encoder()
+        .context("direct TQ prefill encoder")?;
+    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched(
+        &mut encoder,
+        registry,
+        device,
+        seq_len,
+        q_seq_major,
+        &tq.k_packed,
+        &tq.k_norms,
+        &tq.v_packed,
+        &tq.v_norms,
+        &output,
+        &tmp,
+        &slot_ids,
+        &sequence_positions,
+        &params,
+    )
+    .context("direct TQ prefill batched SDPA")?;
+    // Everything after this point stays GPU-only. Queue ordering makes the
+    // downstream gate/output projection consume `output` after attention;
+    // a host wait here would serialize every full-attention layer.
+    encoder.commit_labeled("layer.full_attn.tq_direct_prefill");
+    Ok(output)
 }
 
 // ================================================================
@@ -5485,7 +5621,9 @@ pub fn apply_sdpa_with_kv_cache(
                     head_dim,
                 )?
             } else {
-                // TQ-only mode: route through dequant+resume helper.
+                // TQ-only mode: short resumed suffixes attend directly over
+                // byte-packed K/V. Larger batches retain the tiled dense
+                // bridge, whose matrix kernel amortizes full-prefix dequant.
                 // slot.tq must be Some (alloc invariant: tq_kv_active=true ⇒
                 // both `slot.k.is_none()` AND `slot.tq.is_some()`).
                 //
@@ -5493,19 +5631,35 @@ pub fn apply_sdpa_with_kv_cache(
                 // at the top of `apply_sdpa_with_kv_cache` (typed error
                 // when slot.tq.is_some() && slot_id != 0) — reaching
                 // this branch implies slot_id == 0 by construction.
-                apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
-                    device,
-                    registry,
-                    slot,
-                    q_seq_major,
-                    seq_len,
-                    cur_len as u32,
-                    kv_seq_len,
-                    max_seq_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                )?
+                if seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES {
+                    apply_tq_prefill_seq_major_resume_direct(
+                        device,
+                        registry,
+                        slot,
+                        q_seq_major,
+                        seq_len,
+                        cur_len as u32,
+                        kv_seq_len,
+                        max_seq_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                    )?
+                } else {
+                    apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+                        device,
+                        registry,
+                        slot,
+                        q_seq_major,
+                        seq_len,
+                        cur_len as u32,
+                        kv_seq_len,
+                        max_seq_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                    )?
+                }
             };
             let new_len = kv_seq_len;
             slot.current_len[slot_id.0 as usize] = new_len;
@@ -5760,6 +5914,16 @@ pub fn build_gated_attn_layer(
             s.current_len[slot_idx]
         })
         .unwrap_or(0);
+    // A resumed production prefill is GPU-only at head_dim=256: ops1-4,
+    // offset KV write, TQ/F32 attention, and ops6-7 are all ordered on the
+    // Metal queue. The projection arena lives through the forward's terminal
+    // wait, so the old host barrier between ops1-4 and attention only drained
+    // the queue ten times per Qwen request without protecting a CPU read.
+    let gpu_only_prefill_resume = fa_proj_arena.is_some()
+        && kv_cache_slot.is_some()
+        && seq_len > 1
+        && head_dim == 256
+        && cur_len_for_arena > 0;
     let use_arena = fa_arena.is_some() && seq_len > 1 && head_dim == 256 && cur_len_for_arena == 0;
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
@@ -6447,7 +6611,7 @@ pub fn build_gated_attn_layer(
                 // arm of LayerEncoder calls inner.commit_labeled exactly as
                 // pre-iter90; on the Sessioned arm we still get the equivalent
                 // structural behavior (commit boundary, no fence).
-                if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
+                if (seq_len == 1 && head_dim % 32 == 0) || use_arena || gpu_only_prefill_resume {
                     enc.fence_or_commit("layer.full_attn.ops1-4")
                         .context("fence/commit ops1-4 (use_arena/decode)")?;
                 } else {

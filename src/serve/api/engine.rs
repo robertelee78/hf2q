@@ -7746,8 +7746,7 @@ fn run_slot_aware_qwen35(
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
                 Request::Warmup { reply } => {
-                    // Qwen35 warmup is a no-op (mirror of the SerialFifo arm).
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(warmup_qwen35_once(guard.model));
                 }
                 Request::Shutdown => {
                     tracing::info!("Qwen35 SlotAware worker received Shutdown; exiting");
@@ -8337,13 +8336,14 @@ fn worker_run(
             Request::Warmup { reply } => {
                 let result = match &mut loaded {
                     LoadedModel::Gemma(g) => warmup_once(g),
-                    // Iter-215 MVP: Qwen35 warmup is a no-op (the
-                    // chat-completion arm returns 501 immediately so
-                    // pre-warming kernels would be wasted work).  /readyz
-                    // depends on this returning Ok so the operator-facing
-                    // contract — "model is loaded; chat is 501" — surfaces
-                    // cleanly rather than a startup failure.
-                    LoadedModel::Qwen35(_) => Ok(()),
+                    // Qwen35 chat has been production-capable since the
+                    // iter-216 engine lift.  The old iter-215 MVP no-op left
+                    // `ensure_gpu_cache_primed` inside the first real request,
+                    // adding weight upload + pipeline setup to operator TTFT.
+                    // Run the same priming step as `cmd_generate_qwen35`
+                    // during startup so the first OpenCode turn measures only
+                    // its prompt prefill.
+                    LoadedModel::Qwen35(q) => warmup_qwen35_once(q),
                     // iter-228a Qwen3-VL text MVP: same shape — chat arm
                     // returns 501; warmup is a no-op so /readyz surfaces
                     // "model is loaded".
@@ -10951,9 +10951,8 @@ fn kv_restore_gemma(
 /// compile all kernels and fault in the hot weights.
 ///
 /// Iter-215 Wedge-2: takes `&mut GemmaLoadedModel` directly (after the
-/// `LoadedModel` enum lift).  The Qwen35 variant has its own no-op
-/// warmup path in the worker (the worker arm returns 501 immediately,
-/// so warmup is effectively a no-op for that variant in MVP).
+/// `LoadedModel` enum lift). Qwen35 uses [`warmup_qwen35_once`] because its
+/// cache substrate and priming contract are family-specific.
 fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     let started = Instant::now();
     // A 1-token prompt is enough to cycle through the prefill + decode path.
@@ -10998,6 +10997,27 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     loaded.weights.hybrid_kv_snapshot_for_lcp = None;
     tracing::info!(
         "hf2q-engine warmup complete in {:.0}ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+/// Prime Qwen3.5/3.6 GPU-resident weights and hot pipelines before the HTTP
+/// listener reports ready.
+///
+/// `Qwen35Model::forward_gpu_last_logits` calls the same method lazily, but
+/// leaving it there charges one-time upload and pipeline construction to the
+/// first real request. Unlike Gemma, Qwen does not need a synthetic prefill:
+/// `ensure_gpu_cache_primed` owns the family-specific residency and pipeline
+/// setup without mutating conversational KV state.
+fn warmup_qwen35_once(loaded: &mut super::engine_qwen35::Qwen35LoadedModel) -> Result<()> {
+    let started = Instant::now();
+    loaded
+        .model
+        .ensure_gpu_cache_primed()
+        .context("Qwen35Model::ensure_gpu_cache_primed (server warmup)")?;
+    tracing::info!(
+        "hf2q-engine Qwen35 warmup complete in {:.0}ms",
         started.elapsed().as_secs_f64() * 1000.0
     );
     Ok(())
@@ -40633,6 +40653,37 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             drafter_src.contains("pub struct MultiSeqDrafterKvCache "),
             "H240 FALSIFIED: A4 iter-1 MultiSeqDrafterKvCache sibling \
              surface removed."
+        );
+    }
+
+    #[test]
+    fn qwen35_startup_warmup_primes_gpu_for_serial_and_slot_aware() {
+        let src = include_str!("engine.rs");
+        let helper_start = src
+            .find("fn warmup_qwen35_once(")
+            .expect("Qwen35 warmup helper must exist");
+        let helper_end = helper_start
+            + src[helper_start..]
+                .find("\n}\n")
+                .expect("Qwen35 warmup helper must have a body");
+        let helper = &src[helper_start..helper_end];
+
+        assert!(
+            helper.contains(".ensure_gpu_cache_primed()"),
+            "Qwen35 startup warmup must eagerly prime GPU weights and pipelines"
+        );
+        assert!(
+            src.contains("LoadedModel::Qwen35(q) => warmup_qwen35_once(q)"),
+            "SerialFifo Qwen35 Warmup must call the family warmup helper"
+        );
+        assert!(
+            src.contains("reply.send(warmup_qwen35_once(guard.model))"),
+            "SlotAware Qwen35 Warmup must call the same family helper"
+        );
+        let obsolete_serial_noop = ["LoadedModel::Qwen35", "(_) => Ok(())"].concat();
+        assert!(
+            !src.contains(&obsolete_serial_noop),
+            "the obsolete SerialFifo Qwen35 warmup no-op must not return"
         );
     }
 }
