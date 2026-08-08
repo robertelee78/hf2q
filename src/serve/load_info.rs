@@ -758,6 +758,17 @@ fn fmt_vision(arch: ArchFamily, vision: &Option<VisionProjector>) -> String {
 
 fn fmt_kv_budget(info: &LoadInfo) -> String {
     match info.kv_cache_budget_bytes {
+        // Family overrides describe mixed fixed + token-linear layouts and
+        // the serve path applies this budget across all slots. A single
+        // "~N tokens" quotient would therefore be false operator telemetry.
+        // The exact per-slot context and family estimator are logged by the
+        // engine when SlotAware serving is configured.
+        Some(bytes)
+            if info.kv_bytes_per_token_override.is_some()
+                || info.kv_fixed_bytes_per_slot_override.is_some() =>
+        {
+            format!("{} shared", fmt_gib(bytes))
+        }
         Some(bytes) => match estimate_kv_tokens(info) {
             Some(tokens) => format!("{} (~{} tokens)", fmt_gib(bytes), tokens),
             None => fmt_gib(bytes),
@@ -2294,6 +2305,20 @@ mod tests {
             flat,
             "no override ⇒ flat formula path (homogeneous arch)"
         );
+    }
+
+    #[test]
+    fn mixed_family_shared_budget_banner_omits_false_token_quotient() {
+        let mut info = golden_qwen35moe_info();
+        info.kv_bytes_per_token_override = Some(10_400);
+        info.kv_fixed_bytes_per_slot_override = Some(256 * 1024 * 1024);
+        let mut output = Vec::new();
+
+        print_banner(&info, &mut output, false).expect("banner");
+        let output = String::from_utf8(output).expect("utf8");
+
+        assert!(output.contains("kv_budget = 4.00 GiB shared"));
+        assert!(!output.contains("~32768 tokens"));
     }
 
     /// **CRITICAL #1** — symmetric falsifier: a Gemma 4 fixture with the

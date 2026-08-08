@@ -8686,6 +8686,12 @@ fn admit_gemma4_slots_stable_batched(
             }
             Ok(a) => {
                 if let Some(handle) = a.handle {
+                    // Admission selected a different arena, but no prefill or
+                    // cache mutation occurred. Commit the measured zero
+                    // growth before release so the scheduler does not retain
+                    // the request's worst-case prompt reservation as phantom
+                    // physical residency.
+                    scheduler.record_slot_high_water(handle, 0);
                     scheduler.release(handle);
                 }
                 slot_fire_done(
@@ -8719,6 +8725,10 @@ fn admit_gemma4_slots_stable_batched(
 
     if admitted.len() < 2 {
         for (handle, prompt, params, reply, _, _) in admitted {
+            // The stable batch did not execute, so this arena is unchanged.
+            // Preserve only its prior measured high-water before retrying the
+            // request through the single-request path.
+            scheduler.record_slot_high_water(handle, 0);
             scheduler.release(handle);
             fallback_single(
                 guard,

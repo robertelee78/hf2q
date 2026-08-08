@@ -90,6 +90,13 @@ the transient old-plus-new recovery-anchor overlap. Sliding/window storage is
 charged in that fixed floor; only context-growing rows contribute to the
 per-token slope.
 
+A slot admitted but released before prefill explicitly records zero new
+physical growth. Its worst-case reservation is not evidence that pages were
+written and must not become permanent phantom high-water. Operator load
+telemetry likewise prints mixed-family budgets as shared bytes rather than a
+single approximate token quotient; fixed floors and several full-context
+slots make that quotient undefined.
+
 The canonical launcher configurations resolve to:
 
 | Family | Full logical context/slot | Linear bytes/token | Fixed floor/slot | Full context + 8,192-token reservation | np4 | np8 |

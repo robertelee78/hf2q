@@ -3368,6 +3368,24 @@ mod tests {
     }
 
     #[test]
+    fn measured_pre_prefill_release_does_not_charge_prompt_bytes() {
+        let fixed = 256;
+        let mut scheduler =
+            InflightBatchedScheduler::new_with_kv_budget_and_floor(4, 1, 16_384, fixed);
+        let admitted = scheduler
+            .admit(req_with_kv_parts(1_000, 128, 8_000, 7_000))
+            .expect("request fits")
+            .handle
+            .expect("physical slot");
+
+        scheduler.record_slot_high_water(admitted, 0);
+        scheduler.release(admitted);
+
+        assert_eq!(scheduler.resident_high_water_bytes(), fixed);
+        assert_eq!(scheduler.reserved_high_water_bytes(), fixed);
+    }
+
+    #[test]
     fn fixed_slot_floor_is_charged_once_and_prompt_fallback_is_exact() {
         let fixed = 256 * 1024 * 1024_u64;
         let mut s = InflightBatchedScheduler::new_with_kv_budget_and_floor(
