@@ -314,3 +314,40 @@ Hypothesis to test: HASS wins on long-context heterogeneous workloads (chat, RAG
 **Acceptance for ADR-037 closure (EAGLE-3 portion)**: Phase E7 empirical validation shows EAGLE-3 ≥1.3× base on pinned 2K natural prompt + ≥1.5× on long code-gen, AND Phase E8 codex /cfa final clean.
 
 **Acceptance for full mission closure**: Phase E9.5 empirical validation establishes per-workload winner between HASS and EAGLE-3, AND E9.6 codex /cfa final clean, AND HF2Q_SPEC_DRAFTER serve flag ships.
+
+## 12. 2026-08-08 release-gate correction: concurrent encoder ordering
+
+The 0.1.3 packed-crate verification exposed one intermittent failure of the
+E5b Step-2 golden byte-identity test at exact main `1a499621`: the unbatched
+path produced `-0.039354406` while the cache-aware path produced
+`-0.039684728` at logits index zero. Five fresh-process focused repetitions,
+all 235 Eagle3 tests, and a later full 3,924-test run passed, but a green rerun
+does not invalidate a coherence failure.
+
+Source review found three missing read-after-write orderings before RoPE in
+both drafter-forward variants. mlx-native intentionally uses
+`MTLDispatchTypeConcurrent`; without a hand-placed barrier, FC output may be
+read by `hidden_norm` before the projection completes, the two normalized
+branches may be read by concat before completion, and concat output may be
+read by Q/K/V projections before both column copies complete. The later
+forward stages already carried explicit barriers.
+
+The accepted correction is deliberately narrow:
+
+1. `dispatch_eagle3_hidden_norm` orders the upstream FC projection before
+   RMSNorm.
+2. `dispatch_eagle3_concat_2x_hidden` orders both normalized inputs before
+   its two disjoint column-copy dispatches.
+3. The same helper places one barrier after both disjoint copies, preserving
+   concurrent Q/K/V projection dispatch while making the complete concat
+   visible to all three consumers.
+
+This is an hf2q graph-ordering defect, not an mlx-native allocator or kernel
+defect, so no dependency release is required. Acceptance requires the exact
+bit-identity gate under default concurrent dispatch, the
+`HF2Q_FORCE_SERIAL_DISPATCH=1` negative-control arm, a fresh packed-crate full
+suite, and the normal exact-artifact release proof. The golden test accepts
+`HF2Q_EAGLE3_EQUIVALENCE_REPETITIONS` in `1..=1000` so release verification can
+run a same-process soak without hiding the result behind repeated cargo/test
+startup. Relaxing the equality contract or ignoring the intermittent receipt
+is explicitly rejected.

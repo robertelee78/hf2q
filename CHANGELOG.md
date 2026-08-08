@@ -9,14 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.3] — 2026-08-08
 
-### Fixed — registry archive verification
+### Fixed — registry verification and Eagle3 ordering
 
 - Include the small DeepSeek encoding fixtures, quantizer byte-comparison
   fixtures, and continuous-batching source audit used by crate-local unit
   tests. The 0.1.2 runtime archive built and installed correctly, but
   `cargo test` on the downloaded crate could not compile or complete because
-  those inputs were omitted. No runtime or inference behavior changed; 0.1.3
-  replaces the yanked 0.1.2 package.
+  those inputs were omitted.
+- Order the Eagle3 FC-to-normalization, normalization-to-concat, and
+  concat-to-projection dependencies explicitly when mlx-native uses its
+  concurrent Metal encoder. This removes an intermittent bit-identity drift
+  exposed by the packed-crate release gate without serializing the independent
+  Q/K/V projections.
+- 0.1.3 replaces the yanked 0.1.2 package.
 
 ## [0.1.2] — 2026-08-08
 
