@@ -18,7 +18,9 @@
 #                           temperature-zero greedy decoding is unchanged.
 #   HF2Q_DEEPSEEK_PREFILL_WINDOWS=adaptive
 #                           Uses the measured 2,048-token transaction while
-#                           the live cache is 131K, then 1,024 after capacity
+#                           the live cache is 131K, balances a cold prompt that
+#                           would otherwise leave a severely underfilled third
+#                           transaction, then uses 1,024 after cache capacity
 #                           grows. Set PREFILL_WINDOWS explicitly only when
 #                           benchmarking a measured alternative.
 #   --overflow-policy reject

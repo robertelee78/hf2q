@@ -1,17 +1,16 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
 - **Status:** Accepted for hf2q 0.1.1
-- **Updated:** 2026-08-06 — the completion candidate passed matched llama.cpp
-  parity, the full agentic tool gate, and the exact 120K context-cache gate.
-  The 119,808-token cold request reached 373.19 tok/s and made the exact tool
-  call; its tool-result turn reused 119,800 of 119,907 prompt tokens (99.91%)
-  and evaluated only 107 suffix tokens in 1.113 s TTFT. The process then shut
-  down cleanly without the former memory-pressure kill
+- **Updated:** 2026-08-07 — the bounded adaptive prefill candidate passed the
+  current matched llama.cpp gate at 1.0105x prompt and 1.0772x decode speed
+  with exact output on every trial. The full agentic tool/SSE gate and 119K
+  context-cache gate also passed; the long continuation reused 119,813 of
+  119,916 prompt tokens (99.91%) and evaluated its suffix in 1.132 s TTFT
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
 - **Reference implementation:** `/opt/llama.cpp` at
-  `15586e2d7165570fb3aa7c26e0d442e289ef69de` (build 10298)
+  `3653e6d6d547ec763317d9ecd0ace334a7e21359` (build 10326)
 - **Target host:** Apple M5 Max, 40-core GPU, 128 GiB unified memory
 
 ## Decision
@@ -825,6 +824,80 @@ passed this cold-prefix gate at 1.0019x llama.cpp prefill and 1.0672x decode.
 The complete source-bound receipt is retained under
 `hf2q-deepseek-parity.XXXXXX.1PXRWahgxc`; it records artifact, binary, hf2q
 patch, the clean mlx-native source state, and implementation hashes.
+
+The 2026-08-07 current-reference refresh used the same reproduced artifact,
+hf2q runtime `03e378e9862e6d9add0d08ea68c1d6c449357364`, clean `mlx-native`
+head `eb1b031876a0d5aa3b16803a54e78aa5de7d2e62`, and llama.cpp
+`3653e6d6d547ec763317d9ecd0ace334a7e21359`. All six transcripts were
+again exact with zero cache credit. llama.cpp measured
+666.655/674.345/669.544 prompt tok/s and 31.404/31.732/31.814 decode tok/s;
+hf2q measured 661.982/669.469/674.258 prompt tok/s and
+33.993/33.499/33.880 decode tok/s. The medians were therefore 669.544 versus
+669.469 prompt tok/s and 31.732 versus 33.880 decode tok/s. Decode remained
+1.0677x faster, but the strict prompt gate failed at 0.999888x even though the
+0.0112% difference is noise-sized. The raw evidence is
+`hf2q-deepseek-parity.XXXXXX.ue8E69ocNH`; this refresh reopens the prompt
+margin rather than weakening the `>= 1.00x` rule.
+
+The first reformulated hypothesis attributed the monotonic hf2q request times
+(7.5334/7.4492/7.3963 seconds) to production-shape work left uncovered by the
+64-token startup warmup. An initial direct 4,096-row implementation was
+stopped before loading either runtime when source review showed that it
+bypassed the normal chunker and would recreate the already rejected 4K Metal
+OOM transaction. The corrected spike used 4,096 varied valid token IDs through
+the ordinary prompt chunker, producing two bounded 2,048-row transactions and
+resetting cache/scratch before readiness. Its exact three-trial hf2q results
+were 661.703/671.261/624.270 prompt tok/s and
+33.687/33.659/30.504 decode tok/s, while the matched llama.cpp arm stayed flat
+at a 669.954 prompt-tok/s median. The warmup neither improved the first trial
+nor preserved sustained performance, so the entire code/test spike was
+removed. Moving another full sparse/indexer workload into startup is not an
+accepted performance technique.
+
+The next spike kept the same three Metal transactions for the 4,987-token
+parity prompt but changed their shapes from 2,048/2,048/891 to
+1,664/1,664/1,659 by selecting 13 sparse windows. Against the same current
+llama.cpp source, the exact zero-cache hf2q trials measured
+671.015/672.071/671.476 prompt tok/s; llama.cpp measured
+673.491/670.910/666.989. The 671.476 versus 670.910 medians passed at
+1.00084x, and hf2q decode remained 1.0653x faster. The raw evidence is
+`hf2q-deepseek-parity.XXXXXX.cBi5FosgDZ`.
+
+Thirteen windows are not a global replacement for the established 16-window
+transaction. The required 119,821-token cold agentic prompt remained coherent
+and produced the exact tool call, but fell to 336.226 prompt tok/s and
+356.371-second TTFT. Its 119,916-token continuation correctly reused 119,813
+tokens and reached the semantic response in 1.164 seconds, proving that cache
+semantics were intact rather than explaining the cold regression. Therefore
+the implementation balances only an uncached prompt
+strictly between two and three default transactions. Cached suffixes,
+boundary-sized prompts, long prompts, and grown-cache requests retain their
+previous measured policies.
+
+The final bounded-adaptive gate used the same reproduced artifact, current
+llama.cpp `3653e6d6d547ec763317d9ecd0ace334a7e21359`, clean mlx-native
+`eb1b031876a0d5aa3b16803a54e78aa5de7d2e62`, and the exact hf2q candidate
+binary SHA-256
+`222251a89a3535a92e6ba7c847fb1e395a5d617e78668c4c6f2449baf6ffae69`.
+llama.cpp measured 670.226/670.948/670.117 prompt tok/s and
+31.658/31.547/31.534 decode tok/s. hf2q measured
+672.913/678.760/677.283 prompt tok/s and
+33.647/33.982/33.985 decode tok/s. Every transcript was exact with zero cache
+credit. The 677.283 versus 670.226 prompt medians pass at 1.0105x; the 33.982
+versus 31.547 decode medians pass at 1.0772x. The source-bound evidence is
+`hf2q-deepseek-parity.XXXXXX.oeSqpKMbBX`.
+
+The exact candidate then passed the complete agentic gate: required and
+automatic tools, unary and SSE encoding, source-shaped arguments, and a real
+tool-result continuation. It reused 6,250 of 6,258 prompt tokens and reduced
+cached TTFT from 9.660 seconds cold to 228 ms. The no-cooldown 119,821-token
+correctness run on the same server produced the exact required tool at
+332.240 prompt tok/s; its 119,916-token continuation reused 119,813 tokens and
+reached TTFT in 1.132 seconds. The lower cold rate than the earlier isolated
+373.194 tok/s observation is recorded as sustained-run variance, not claimed
+as a speedup. It remains over the historical 159.953-217.5 tok/s llama.cpp
+long-prompt observations, while the current strict matched performance claim
+is limited to the cooled three-trial gate above.
 
 The parity harness now cools between measured trials as well as before and
 between runtime arms. External source reviews, including Kimi and Claude,

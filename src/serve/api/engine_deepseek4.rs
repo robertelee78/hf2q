@@ -45,6 +45,27 @@ const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
 /// not leave a multi-gigabyte working set idle beside a 100 GiB model.
 const MAX_RETAINED_DECODE_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
 
+fn balance_fresh_three_chunk_prefill(
+    cache_position: usize,
+    token_count: usize,
+    sliding_window: usize,
+    default_windows: usize,
+) -> usize {
+    if cache_position != 0 || sliding_window == 0 || default_windows == 0 {
+        return default_windows;
+    }
+    let default_chunk = sliding_window.saturating_mul(default_windows);
+    if token_count <= default_chunk.saturating_mul(2)
+        || token_count >= default_chunk.saturating_mul(3)
+    {
+        return default_windows;
+    }
+    token_count
+        .div_ceil(3)
+        .div_ceil(sliding_window)
+        .clamp(1, default_windows)
+}
+
 fn should_retain_decode_scratch(stats: TransientScratchStats) -> bool {
     stats.free_bytes <= MAX_RETAINED_DECODE_SCRATCH_BYTES
 }
@@ -330,6 +351,17 @@ impl Deepseek4LoadedModel {
             // transaction for ordinary agent sessions, but halve it after a
             // real request crosses the first capacity boundary.
             window_multiplier = window_multiplier.min(8);
+        } else if !explicit_prefill_windows {
+            // A fresh prompt just above two full transactions otherwise leaves
+            // a severely underfilled third matrix (4,987 -> 2,048/2,048/891).
+            // Keep the same three transactions but balance their row counts.
+            // Longer OpenCode contexts retain the measured 2,048-token path.
+            window_multiplier = balance_fresh_three_chunk_prefill(
+                self.cache.position(),
+                tokens.len(),
+                self.model.cfg.sliding_window as usize,
+                window_multiplier,
+            );
         }
         while offset < tokens.len() {
             let batch = matrix_prefill_chunk_len(
@@ -629,9 +661,18 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_capacity_for_request, prefer_matrix_prefill, select_prefix_reuse,
-        should_retain_decode_scratch, PrefixReuse, TransientScratchStats,
+        balance_fresh_three_chunk_prefill, cache_capacity_for_request, prefer_matrix_prefill,
+        select_prefix_reuse, should_retain_decode_scratch, PrefixReuse, TransientScratchStats,
     };
+
+    #[test]
+    fn fresh_three_chunk_prefill_balances_only_the_underfilled_band() {
+        assert_eq!(balance_fresh_three_chunk_prefill(0, 4_987, 128, 16), 13);
+        assert_eq!(balance_fresh_three_chunk_prefill(0, 4_096, 128, 16), 16);
+        assert_eq!(balance_fresh_three_chunk_prefill(0, 6_144, 128, 16), 16);
+        assert_eq!(balance_fresh_three_chunk_prefill(0, 119_821, 128, 16), 16);
+        assert_eq!(balance_fresh_three_chunk_prefill(1, 4_987, 128, 16), 16);
+    }
 
     #[test]
     fn decode_scratch_retention_is_bounded() {

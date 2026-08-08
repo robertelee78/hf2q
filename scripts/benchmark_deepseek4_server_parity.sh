@@ -42,6 +42,7 @@ METAL_TRACE_TRIAL=${METAL_TRACE_TRIAL:-0}
 METAL_TRACE_SECONDS=${METAL_TRACE_SECONDS:-20}
 HF2Q_DEEPSEEK_GRAPH_REORDER=${HF2Q_DEEPSEEK_GRAPH_REORDER:-1}
 HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB=${HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB:-4}
+HF2Q_DEEPSEEK_PREFILL_WINDOWS=${HF2Q_DEEPSEEK_PREFILL_WINDOWS:-adaptive}
 MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS=${MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS:-180}
 
 for command in awk cat curl date dirname git grep jq kill lsof mkdir mktemp \
@@ -63,6 +64,12 @@ for setting in PORT CONTEXT_LEN RUNS MAX_TOKENS CONTEXT_CHARS \
         exit 2
     fi
 done
+if [[ "$HF2Q_DEEPSEEK_PREFILL_WINDOWS" != "adaptive" ]] &&
+   { ! [[ "$HF2Q_DEEPSEEK_PREFILL_WINDOWS" =~ ^[1-9][0-9]*$ ]] ||
+     (( HF2Q_DEEPSEEK_PREFILL_WINDOWS > 16 )); }; then
+    echo "HF2Q_DEEPSEEK_PREFILL_WINDOWS must be adaptive or an integer from 1 through 16" >&2
+    exit 2
+fi
 if (( PORT < 1 || PORT > 65535 || CONTEXT_LEN < 1024 || RUNS < 3 || \
       MAX_TOKENS < 64 || CONTEXT_CHARS < 4096 )); then
     echo "invalid parity settings: port=$PORT ctx=$CONTEXT_LEN runs=$RUNS max_tokens=$MAX_TOKENS context_chars=$CONTEXT_CHARS" >&2
@@ -436,11 +443,16 @@ run_arm() {
       "USER=${USER:-}"
       "LOGNAME=${LOGNAME:-}"
     )
+    local hf2q_prefill_env=""
+    if [[ "$HF2Q_DEEPSEEK_PREFILL_WINDOWS" != "adaptive" ]]; then
+        hf2q_prefill_env="$HF2Q_DEEPSEEK_PREFILL_WINDOWS"
+    fi
     if [[ "$runtime" == "hf2q" ]]; then
         "${runtime_env[@]}" \
           MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN="$CONTEXT_LEN" \
           HF2Q_DEEPSEEK_GRAPH_REORDER="$HF2Q_DEEPSEEK_GRAPH_REORDER" \
           HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB="$HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB" \
+          PREFILL_WINDOWS="$hf2q_prefill_env" \
           MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS="$MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS" \
           REP_PENALTY=1.0 HOST="$HOST" PORT="$PORT" \
           "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh" \
@@ -605,7 +617,8 @@ jq -s --arg artifact_sha "$artifact_sha" \
       },
       hf2q_graph: {
         reorder: $hf2q_graph_reorder,
-        layers_per_command_buffer: $hf2q_graph_layers_per_cb
+        layers_per_command_buffer: $hf2q_graph_layers_per_cb,
+        prefill_windows: $hf2q_prefill_windows
       },
       mlx_native_residency_keep_alive_seconds: $mlx_native_residency_keep_alive_seconds,
       cooldown_seconds: {
@@ -627,6 +640,7 @@ jq -s --arg artifact_sha "$artifact_sha" \
   --argjson inter_trial_cooldown "$TRIAL_COOLDOWN_SECONDS" \
   --argjson hf2q_graph_reorder "$HF2Q_DEEPSEEK_GRAPH_REORDER" \
   --argjson hf2q_graph_layers_per_cb "$HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB" \
+  --arg hf2q_prefill_windows "$HF2Q_DEEPSEEK_PREFILL_WINDOWS" \
   --argjson mlx_native_residency_keep_alive_seconds "$MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS" \
   "$rows_file" >"$OUTPUT_DIR/summary.json"
 
