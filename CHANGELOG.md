@@ -34,24 +34,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool definitions, required and automatic calls, source-shaped arguments,
   tool-result continuations, unary responses, and SSE streams are covered by
   realistic four-agent gates for Gemma 4, Qwen 3.6, and DeepSeek V4.
-- DeepSeek's four-slot decoder runs bounded eight-token quanta and bounded
-  admission waves, preserving streamed progress without paying a model-state
-  swap on every generated token.
+- DeepSeek cold prefill resumes only after atomic cache-and-ledger commits.
+  At most two cold agents alternate matrix transactions through one scratch
+  arena; the completed cohort then decodes in fair eight-token quanta, and
+  retained-prefix continuations run before unrelated cold work can evict them.
 
 ### Performance and proof
 
-- On the target M5 Max with AC power, four concurrent DeepSeek agent requests
-  completed in 49 seconds versus 50.71 seconds for the matched llama.cpp
-  workload, while hf2q retained a 524,288-token logical context per slot and
-  llama.cpp divided its 32,768-token context into four 8,192-token slots.
+- On the target M5 Max with AC power, two exact four-agent DeepSeek gates
+  completed their cold cohorts in 53.86 and 52.32 seconds (53.09-second
+  median), versus about 54.1 seconds for matched llama.cpp with `--kv-unified`,
+  four parallel slots, and 131,072 logical tokens per slot. llama.cpp's
+  524,288-token unified allocation did not fit beside the 100 GiB model on
+  this 128 GiB host; hf2q retained 524,288 logical tokens per slot through
+  demand-grown physical admission.
 - A DeepSeek continuation after 131,072-to-262,144 cache growth reused
   119,692 of 119,778 prompt tokens (99.92%) and reached the first semantic
   stream event in 1.132 seconds.
 - Gemma's matched 24,200-token four-slot continuation sustained about
   1,831 aggregate prefill tokens/s, slightly ahead of the same GGUF and
-  settings under llama.cpp at about 1,733 tokens/s. Qwen's four-slot gate
-  retained the full 262,144-token logical context per agent with native
-  tool-result continuation.
+  settings under llama.cpp at about 1,733 tokens/s. Gemma and Qwen four-agent
+  gates retained at least 7,089 and 6,980 cached prompt tokens respectively,
+  with native tool-result continuation and the full 262,144-token logical
+  context per agent.
 - `mlx-native` 0.10.4 supplies the family-neutral lazy overwrite allocation,
   ring linearization, F16 mask construction, and direct TQ-HB-to-F16 staging
   primitives used by the bounded full-context paths.
