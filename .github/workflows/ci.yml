@@ -90,6 +90,19 @@ jobs:
           cargo test --locked --test convert_integration --all-features
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
+          cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features gemma4_bounded_prefill_tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features slotaware_fail_stop_tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features public_watchdog_fixture_bytes_are_stable_without_a_model -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
+          bash -n scripts/qwen36_watchdog_validate.sh \
+            scripts/test_qwen36_prefill_watchdog.sh \
+            scripts/test_qwen36_prefill_cancellation.sh \
+            scripts/test_qwen36_cumulative_release.sh \
+            scripts/test_deepseek4_agentic.sh \
+            scripts/test_deepseek4_cached_suffix.sh
+          bash scripts/test_qwen36_watchdog_harness_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
             --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
@@ -132,5 +145,8 @@ jobs:
               ./target/release/hf2q --help \
               > /dev/null 2>/tmp/stderr_unsafe.log
           grep -q "UNSAFE (ack-required, activated)" /tmp/stderr_unsafe.log
-          ! grep -q "REFUSED" /tmp/stderr_unsafe.log
+          if grep -q "REFUSED" /tmp/stderr_unsafe.log; then
+            echo "FAIL: explicitly acknowledged unsafe activation was refused" >&2
+            exit 1
+          fi
           echo "  OK"

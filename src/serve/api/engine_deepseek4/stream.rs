@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::serve::api::engine::SamplingParams;
+use crate::serve::api::engine::{
+    is_fatal_command_buffer_error, SamplingParams, SerialStreamEnd, SerialStreamResult,
+};
+use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
 use crate::serve::api::registry::{
     self, ModelRegistration, ReasoningSplitter, SplitSlot, ToolCallEvent, ToolCallSplitter,
@@ -388,14 +391,15 @@ impl StreamRouter {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn generate_stream(
+pub(in crate::serve::api) fn generate_stream(
     loaded: &mut Deepseek4LoadedModel,
     prompt_tokens: &[u32],
     params: &SamplingParams,
     events: &mpsc::Sender<GenerationEvent>,
     registration: Option<&ModelRegistration>,
     cancellation_counter: Option<&AtomicU64>,
-) {
+    supervisor: &EngineSupervisor,
+) -> SerialStreamResult {
     let scratch_guard = RequestScratchGuard::new();
     let mut progress = RequestProgress::start("stream", prompt_tokens.len(), params.max_tokens);
     let run = (|| -> Result<()> {
@@ -406,6 +410,7 @@ pub fn generate_stream(
             params.max_tokens,
             || events.is_closed(),
             &mut progress,
+            supervisor,
         )?;
         let prefill_duration = prefill_started.elapsed();
         progress.finish_prefill(prefill_duration);
@@ -438,7 +443,15 @@ pub fn generate_stream(
             if events.is_closed() {
                 anyhow::bail!("DeepSeek-V4 SSE client disconnected");
             }
-            let (token, _) = sample(loaded, &logits, params, &sampler, &generated, &mut runtime)?;
+            let (token, _) = sample(
+                loaded,
+                &logits,
+                params,
+                &sampler,
+                &generated,
+                &mut runtime,
+                supervisor,
+            )?;
             if loaded.eos_token_ids.contains(&token) {
                 finish_reason = "stop";
                 break;
@@ -484,7 +497,7 @@ pub fn generate_stream(
                 break;
             }
             if step + 1 < max_tokens {
-                logits = loaded.commit_generated_token(token)?;
+                logits = loaded.commit_generated_token(token, supervisor)?;
             }
             progress.advance_decode(generated.len());
         }
@@ -581,17 +594,25 @@ pub fn generate_stream(
     })();
 
     match run {
-        Ok(()) => scratch_guard.complete(),
-        Err(error) if error.to_string().contains("disconnected") || events.is_closed() => {
+        Ok(()) => {
+            scratch_guard.complete();
+            Ok(SerialStreamEnd::TerminalSent)
+        }
+        Err(error)
+            if events.is_closed()
+                && supervisor.is_healthy()
+                && !is_fatal_command_buffer_error(&error) =>
+        {
             if let Some(counter) = cancellation_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             progress.cancelled();
             tracing::info!("DeepSeek-V4 SSE stream dropped; generation cancelled");
+            Ok(SerialStreamEnd::ClientClosed)
         }
         Err(error) => {
             progress.failed(&error);
-            let _ = events.blocking_send(GenerationEvent::Error(format!("{error:#}")));
+            Err(error)
         }
     }
 }

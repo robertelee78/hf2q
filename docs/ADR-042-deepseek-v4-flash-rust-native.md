@@ -2,11 +2,10 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-08 — an operator OpenCode run first falsified destructive
-  131,072-to-262,144 cache growth. The corrected candidate then migrated
-  119,909 live tokens in 101.9 ms, retained 119,848 of 119,943 prompt tokens
-  (99.92%), returned the exact tool-result sentinel in 1.321 s TTFT, and added
-  no swap while crossing the same physical boundary
+- **Updated:** 2026-08-09 — a focused cached-suffix overlap and cancellation
+  gate proved that staggered warm work can join a decoding peer, yields between
+  native verifier transactions, and restores the valid pre-request turn anchor
+  after client cancellation
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1015,10 +1014,12 @@ tokens to every slot through demand-grown physical admission.
 
 The accepted scheduling policy uses an eight-token decode quantum and
 resumable cold prefill at atomic cache+ledger commit boundaries. At most two
-cold requests alternate complete matrix transactions through the one shared
-prefill scratch arena. Decode-ready members are parked until the bounded cold
-cohort completes prefill, preventing early responses from producing cached
-traffic that delays the remaining cold agents. Once the cohort drains,
+active cold prefills alternate complete matrix transactions through the one
+shared prefill scratch arena. The next-release fairness correction advances a
+decode-ready member by one token before each remaining transaction and parks
+only its terminal completion until the cohort drains. This prevents early
+responses from producing cached traffic that delays the remaining cold agents
+while bounding the short lane's semantic gaps. Once the cohort drains,
 longest-prefix continuations run before unrelated cold work can evict a
 retained agent cache. A paired long-row graph exceeded Metal memory, and a
 batched-output-head-only spike did not improve the cold tail; neither failed
@@ -1033,6 +1034,47 @@ selection. The final boundary request grew one retained slot from 131,072 to
 cached tokens (99.92%), evaluated only an 86-token suffix, and returned in
 1.132 seconds. That final correctness run occurred on battery power; its cold
 prefill rate is not used for a performance claim.
+
+### Cached-suffix overlap and cancellation revalidation (2026-08-09)
+
+The first focused overlap run exposed a scheduler-policy defect that the
+co-admitted four-agent gate could not see. `Idle` meant that no cold-cohort
+barrier was active, but admission reopened only when every physical slot was
+empty. A staggered cached continuation therefore waited behind an already
+decoding peer even though another slot was free. The corrected reconciliation
+opens `Idle` admission whenever a physical slot is free; full cohorts remain
+closed and the measured two-active-cold-prefill bound is unchanged.
+
+The cancellation half exposed a separate cache-lifetime defect. A bounded
+cached suffix observed client closure correctly, but its ordinary reset also
+discarded the valid pre-request recovery anchor. Cancellation now restores an
+unpoisoned anchor only when its snapshot position exactly agrees with the
+anchor token ledger. A poisoned, missing, empty, or inconsistent anchor still
+takes the conservative full-reset path. No partially extended request cursor,
+logits, or scheduler accounting is published.
+
+`scripts/test_deepseek4_cached_suffix.sh` binds both properties in one fresh
+four-slot process. The focused M5 Max run used release binary SHA-256
+`ee576b75e86623dd5887224450d37dcf6c9bad5d5f5f955338267ff6b9124076` and
+produced the following receipt:
+
+- the cached tool-result suffix reused 7,174 tokens and completed three native
+  prefill transactions;
+- its decoding SSE peer recorded two decode-progress events between the first
+  and last suffix transactions, grew from 1,097 to 137,841 bytes, and emitted
+  exactly one terminal `[DONE]`;
+- cancellation disconnected exactly after transaction three, admitted no
+  later transaction during settle or stability windows, incremented the
+  client-cancellation counter exactly once, and emitted no `[DONE]`;
+- the post-cancellation control request reused the same 7,174-token anchor;
+  readiness remained true and the request-log delta contained zero fatal
+  worker signatures.
+
+The atomic summary is under the host temporary receipt root
+`hf2q-deepseek-cached-suffix-rollback.XXXXXX.Iim31evVsJ`. This is focused
+hardware evidence for the two repaired invariants, not final release
+authority: a clean packed-artifact rerun and the unchanged full four-agent
+quality/performance gate remain required.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

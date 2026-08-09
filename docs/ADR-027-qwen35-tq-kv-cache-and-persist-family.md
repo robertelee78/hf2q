@@ -5,11 +5,16 @@
   1. **Silent coherence corruption in TQ-only LCP resume.** `HybridKvCache::restore_partial` copied only F32 K/V + DeltaNet state — under production `tq_kv_active=true` every TQ buffer stayed ZERO-INITIALIZED while `current_len` advanced past the resume boundary, so a resumed request attended over zeroed K/V for the entire cached prefix. (This is the gap the `effective_kv_lcp_resume` dense=0 auto-disable guarded; explicit `HF2Q_KV_LCP_RESUME=1` surfaced it.) Fix: `restore_partial` now partial-copies the first-n_tokens positions of all four TQ buffers (U8 packed + F32 norms) per slot, full-attn and MTP, via the dtype-generic `partial_copy_slot`. Pin: `restore_partial_tq_only_mode_restores_tq_prefix_bytes` (kv_cache tests).
   2. **`cfg_from_cache` panic in TQ-only mode.** Shape derivation hard-`expect`ed F32 `slot.k`; production TQ-only caches have `k=None` → engine-worker panic → HTTP 500 on the first request with `HF2Q_KV_PERSIST` set. Fix: shape derived from `slot.tq.k_packed` (identical `[n_seqs, n_kv, max_seq, head_dim]` dims) when F32 is absent; new `KvSubstrate` (F32Only/TqOnly/Both) classified from the live cache with a uniform-substrate invariant check.
   3. **Codec could not round-trip MTP in TQ-only mode + hydrated snapshots could not be LCP-resumed.** QH35 codec bumped to **v4**: per-MTP `kv_present: u8` byte (mirrors the full-attn v2 byte; v1..v3 envelopes read with implicit MTP-present); `deserialize_tq_blob` now allocates logical 4-rank shapes (was flat rank-1 blobs that hard-failed `partial_copy_slot` at restore) with cfg-derived byte-length validation. **Fingerprint is now substrate-namespaced** — a snapshot written under one KV substrate never hydrates into a cache allocated under another (the mismatched pairs would have restored nothing → silent zero-prefix; now a clean cache miss).
-  - **Live gates (qwen36-abliterix-t63-APEX Q5_K_M, M5 Max, serve + `HF2Q_QWEN36_AUTOREG=1` + default TQ-KV + `HF2Q_KV_LCP_RESUME=1` + `HF2Q_KV_PERSIST`):** needle-recall output byte-identical cold-vs-LCP-resumed (STRIDE-ALIGNED HIT at k=2048; TTFT 2920ms→326ms = **9.0×**); 182 MB chunk checkpoints written through to disk; **cold-process restart hydrate → resumed output byte-identical** (the full multi-turn agentic loop survives server restarts). Unit: 33 persistor + 189 kv_cache + 228 kv_persist + 18 engine_qwen35 green incl. v3 back-compat pin.
+  - **Historical live gates (qwen36-abliterix-t63-APEX Q5_K_M, M5 Max, default TQ-KV + `HF2Q_KV_LCP_RESUME=1` + `HF2Q_KV_PERSIST`):** the 2026-08-03 command also set the then-required `HF2Q_QWEN36_AUTOREG=1`; current Qwen3.6 autoregressive dispatch is default and no longer reads that activation variable. Needle-recall output was byte-identical cold-vs-LCP-resumed (STRIDE-ALIGNED HIT at k=2048; TTFT 2920ms→326ms = **9.0×**); 182 MB chunk checkpoints were written through to disk; **cold-process restart hydrate → resumed output byte-identical** (the full multi-turn agentic loop survives server restarts). Unit: 33 persistor + 189 kv_cache + 228 kv_persist + 18 engine_qwen35 green incl. v3 back-compat pin.
+  - **Scope correction (2026-08-08):** that cold-process hydration proof is
+    for SerialFifo. The bounded SlotAware worker has same-process retained-token
+    and prompt-anchor affinity, but it does not yet wire or claim disk restart
+    hydration. The canonical SlotAware launcher therefore omits the disk-LCP
+    variables and `--kv-persist` flag.
   - **Operational follow-ons landed in the same pass (long-context agentic realities, measured on a ~97K-token opencode first turn):**
     - **`Qwen35DiskPersistor` now enforces `HF2Q_KV_PERSIST_BUDGET_BYTES`** (`new_with_budget` + LRU-by-mtime eviction per cfg subdir; the just-written snapshot is never evicted). Pre-fix, one ~100K-token session wrote **105 GB** of chunk snapshots unbudgeted — a disk-exhaustion hazard. Test pin: `qh35_disk_budget_evicts_oldest_keeps_newest`.
-    - **Stride guidance for long contexts:** each stride-1024 checkpoint snapshots the *entire* state at that position (~600 MB at 97K — full-attn TQ grows with position, DeltaNet ~constant), i.e. ~1.2 GB of snapshot+disk I/O per 1024 prefilled tokens. `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=4096` quarters that cost at a worst-case resume-granularity loss of ~4095 tokens (~2 s at ~2K tok/s) — shipped as the opencode launcher default (`scripts/serve_qwen36_opencode.sh`). In-memory byte budget (`available×5%`, exact `ByteSized` accounting, no estimators) was verified sound — eviction uses true snapshot bytes, not the startup estimate.
-    - **Concurrency model confirmed by measurement (fifo-serial):** 3 concurrent chat requests queue FIFO and serialize (total wall ≈ sequential total); each admitted request decodes at full single-stream speed (~125 tok/s); no 429s under queue cap 32; outputs uncorrupted. `inflight-batched` remains a strict downgrade for this use case (qwen35moe multi-slot requires `HF2Q_TQ_KV=0` = 3.94× KV memory; slot-aware mode has no LCP resume — iter-LCP structural N/A).
+    - **Historical SerialFifo stride guidance for long contexts:** each stride-1024 checkpoint snapshots the *entire* state at that position (~600 MB at 97K — full-attn TQ grows with position, DeltaNet ~constant), i.e. ~1.2 GB of snapshot+disk I/O per 1024 prefilled tokens. `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=4096` quarters that cost at a worst-case resume-granularity loss of ~4095 tokens (~2 s at ~2K tok/s). It was the 2026-08-03 SerialFifo opencode launcher default; the current canonical SlotAware launcher omits disk-LCP configuration because that worker claims same-process affinity, not restart hydration. In-memory byte budget (`available×5%`, exact `ByteSized` accounting, no estimators) was verified sound — eviction uses true snapshot bytes, not the startup estimate.
+    - **Historical 2026-08-03 concurrency measurement (fifo-serial):** 3 concurrent chat requests queued FIFO and serialized (total wall ≈ sequential total); each admitted request decoded at full single-stream speed (~125 tok/s); no 429s under queue cap 32; outputs were uncorrupted. The later bounded SlotAware design in this ADR supersedes the old claim that multi-slot Qwen lacked LCP/recurrent-cache coherence; the historical measurement remains useful only as a FIFO baseline.
 - **Date:** 2026-05-08
 - **Deciders:** Operator + Claude
 - **Tags:** turboquant, kv-cache, qwen35, qwen36, kv-persist, tq-active, peer-parity
@@ -804,5 +809,104 @@ intermediate stride snapshots did not improve the cold curve versus the prior
 recorded run, so that performance hypothesis is rejected. The canonical
 serial-agentic launcher disables those redundant mid stores by default but
 retains the stable latest-turn checkpoint; `MID_STORES=1` opts into stride
-branch points. This policy change is not a claim that Qwen cold prefill now
+    branch points. That setting was the historical SerialFifo launcher default;
+    the canonical SlotAware launcher now omits disk persistence as stated in
+    the scope correction above. This policy change is not a claim that Qwen cold prefill now
 meets the peer-speed requirement.
+
+## Bounded slot-aware prefill and watchdog containment (2026-08-08)
+
+### Failure contract
+
+The canonical OpenCode workload admitted a 552-token stream and an
+87,972-token/347-tool stream together. The old slot-aware worker seeded every
+new request synchronously, so the long suffix entered one monolithic
+`forward_gpu_last_logits` call before the short request could decode. Its MoE
+path routed 703,776 rows; the `y_all` buffer alone was 5.369 GiB, with roughly
+4.027 GiB of additional expert intermediates for the production shape. Metal
+timed out at the first observed K=8 terminal boundary. The worker then treated
+that error as slot-local and submitted the short peer's output head to the
+poisoned queue, which returned `SubmissionsIgnored`.
+
+### Decision
+
+Slot-aware Qwen prefill is a state machine, not an admission-time function.
+Each transaction advances at most 2,048 absolute-position tokens on the same
+slot-local `HybridKvCache`, validates every full-attention and MTP cursor, and
+publishes its scheduler ledger only after the complete forward succeeds.
+`Mixed` quanta decode active peers before advancing one prefill transaction;
+multiple cold Qwen prefills rotate after every successful transaction. The
+first token, anchor, tool opener, and SSE semantic event are produced exactly
+once, only after the final suffix transaction.
+
+Cancellation is checked before and after every prefill transaction and before
+decode submission. An ordinary request error resets only that slot. A typed
+fatal Metal command-buffer/watchdog/ignored-submission error, including a
+device-loss report, closes admission,
+fails all active and queued replies exactly once, marks readiness false, and
+permits no later GPU call. In-process cache reset is not recovery from a Metal
+watchdog; operational recovery requires a fresh process/device generation.
+
+SlotAware `Embed` is capped at one 2,048-token forward and one embed is allowed
+per admission quantum before active chat decode resumes. Soft-token,
+deepstack, and 3D-position generation fails closed before Qwen SlotAware
+scheduler/SSE admission and before Qwen LM generation until its
+prefill and decode become scheduler-yielding. SerialFifo retains the historical
+multimodal primitive; SlotAware never discards those fields into plain text.
+
+### Proof and remaining release authority
+
+Current source gates pin the 87,972-token plan as 42 full 2,048-token slices
+plus a 1,956-token tail, keep a 552-token decoder live through every mixed
+quantum, alternate two long cold prefills across all 86 transactions, validate
+fatal fanout across an outstanding pre-close channel permit, and exercise
+readiness and closed-engine races. Real-model parity is byte-identical for
+2,061-token (2,048 + 13) and 4,004-token (2,048 + 1,956) prompts under the
+production autoregressive/TQ path.
+
+The exact 552 + 87,972 concurrent gate completed with one valid required tool
+call, one SSE terminator, and a continuation that reused 88,006 of 88,037
+tokens. A later cumulative stall exposed the separate ADR-019 Objective-C
+lifetime defect.
+
+An Objective-C command-buffer-pool spike plus hf2q's final-session terminal
+change then completed three fresh-process repetitions of the
+87,972-token/347-tool request in
+43 chunks, returned the exact `fixture_tool_346` call with
+`{"path":"src/serve/api/engine.rs"}`, then passed the unchanged four-agent
+required/automatic tool, unary/SSE, tool-result, source-argument, and cache
+gate in the same process. Minimum retained prefix was 6,985 tokens. A final
+tiny SSE completed in 215--241 milliseconds and `/readyz` remained 200.
+There were zero timeouts, ignored submissions, command-buffer errors, or
+30-second no-progress intervals, and live AGX command-buffer objects fell from
+37,999 to zero. Those causal trials also exposed a remaining +47,585 live
+CFString label leak, fixed afterward by pooling Metal label setters. They are
+spike evidence, not final-artifact release proof.
+
+The native prerequisite is now published and immutable: `mlx-native 0.10.6`,
+registry checksum
+`2652aadc2712ee588168382f62dfe3964e2c205fc4430fa4dc1e40e913fa308e`,
+from merged commit `94bf1055ddb487430b22307f064b40c24689beb1`.
+The intermediate 0.10.5 artifact eliminated the live AGX command-buffer cliff
+but retained copied Metal labels: identical waves grew CFStrings by 47,486
+and 47,484. The 0.10.6 regression therefore measures both zero live command
+buffers and bounded 0/N/2N CFString/autorelease-pool slopes, with an unpooled
+negative control and exact Metal System Trace label proof.
+hf2q release authority still requires clean packed-artifact verification and a
+fresh no-env run of the exact 552 + 87,972 overlap plus disconnect
+cancellation. The final heap must keep both AGX command buffers and CFStrings
+bounded. Unit tests or the earlier local dependency spike remain insufficient.
+
+The cumulative lifetime gate distinguishes the first agentic wave after the
+87,972-token request from its two measured steady-state waves. That first wave
+rebuilds four per-slot working sets and is bounded at 15 seconds for a
+tool-result turn; it is retained as a semantic/cache warmup receipt. Both
+subsequent measured waves retain the existing 10-second Qwen tool-result bound.
+This split was measured after a first post-long wave completed coherently at
+12 seconds while the immediately repeated four-slot wave completed at 7
+seconds. It does not relax the measured performance contract.
+
+The proven Qwen3.6 autoregressive graph is now the default serving and CLI
+route; `HF2Q_QWEN36_AUTOREG` is retired from the investigation surface and the
+canonical launcher no longer sets it. This graduation does not promote the
+separate unsafe chunk-scan kernel.

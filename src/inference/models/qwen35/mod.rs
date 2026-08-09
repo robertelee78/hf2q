@@ -600,12 +600,9 @@ impl Qwen35Config {
 /// only practical differentiator at GGUF level is the `general.name`
 /// string.
 ///
-/// This is the gating signal for the Wave 5a `HF2Q_QWEN36_AUTOREG=1`
-/// opt-in: when this returns `true` and the env var is unset,
-/// `cmd_generate` errors out with an operator-actionable message rather
-/// than silently routing through the autoregressive path. Wave 5b will
-/// land a chunk-scan kernel for long-prefill SOTA perf and remove the
-/// gate.
+/// This identifies the Qwen3.6 product label for load diagnostics. Qwen3.6
+/// now uses the production Qwen3.5-compatible autoregressive graph by default;
+/// the distinct unsafe chunk-scan experiment remains separately gated.
 ///
 /// Returns `false` if `general.name` is missing — the conservative
 /// default keeps known-good Qwen3.5 GGUFs on the existing path without

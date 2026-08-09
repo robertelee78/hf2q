@@ -42,7 +42,7 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          git merge-base --is-ancestor "$actual_sha" origin/main
+          test "$actual_sha" = "$(git rev-parse origin/main)"
           actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$actual_version" = "$EXPECTED_VERSION"
           test -n "$CARGO_REGISTRY_TOKEN"
@@ -77,9 +77,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          package_root="target/package/hf2q-${EXPECTED_VERSION}"
+          (
+            cd "$package_root"
+            cargo check --locked --all-targets --all-features
+            cargo test --locked --lib --all-features
+            cargo test --locked --test convert_integration --all-features
+            cargo test --locked --test lcp_registry_unit --all-features
+            cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
+            cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features gemma4_bounded_prefill_tests -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features slotaware_fail_stop_tests -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features public_watchdog_fixture_bytes_are_stable_without_a_model -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
+            bash scripts/test_qwen36_watchdog_harness_contract.sh
+            cargo test --locked --bin hf2q --all-features deepseek4 -- \
+              --skip attention_forward_tests \
+              --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
+              --skip cache_steps_publish_only_complete_groups_and_commit_transactionally \
+              --skip partial_token_poison_requires_reset_before_replay \
+              --skip start_zero_prefill_span_counts_complete_groups_and_publishes_once \
+              --skip ffn_forward_tests \
+              --skip raw_matmul_accepts_quality_sensitive_f32_weights \
+              --skip embedding_forward_rejects_empty_input \
+              --skip q2_k_embeddings_expand_to_four_identical_hc_streams \
+              --skip native_model_load_keeps_weights_and_cache_on_one_device \
+              --skip native_output_head_produces_finite_vocab_logits_and_rejects_shape_drift \
+              --skip loader_preserves_raw_blocks_and_expands_only_elementwise_state \
+              --skip loader_rejects_catalog_and_i32_storage_before_residency
+          )
           install_root="$RUNNER_TEMP/hf2q-install"
           cargo install \
-            --path "target/package/hf2q-${EXPECTED_VERSION}" \
+            --path "$package_root" \
             --locked \
             --root "$install_root"
           "$install_root/bin/hf2q" --help >/dev/null

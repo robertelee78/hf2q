@@ -2,37 +2,13 @@
 # serve_qwen36_opencode.sh — canonical hf2q serve launcher for the
 # Qwen 3.6 35B-A3B APEX GGUF, tuned for opencode agentic coding.
 #
-# Every flag/env below is load-bearing and verified 2026-08-03 on M5 Max
-# (see docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md sub-iter
-# 23d-γ for the prefix-cache coherence gates):
+# This is the canonical SlotAware launcher. Its live prefix-affinity and
+# four-slot contracts are distinct from the historical SerialFifo disk-LCP
+# restart path documented in ADR-027; this launcher does not claim or enable
+# disk restart hydration.
 #
-#   HF2Q_QWEN36_AUTOREG=1   REQUIRED — qwen3.6 GGUFs are gated behind the
-#                           Wave-5a autoregressive opt-in (serve refuses
-#                           to load the model without it).
-#   HF2Q_KV_LCP_RESUME=1    Enables LCP partial-prefill resume. Strictly
-#                           OPTIONAL post-23d-γ (2026-08-03): qwen35's TQ
-#                           restore path is proven, so the widened
-#                           effective_kv_lcp_resume gate admits this arch
-#                           by default. Kept explicit here for
-#                           discoverability + older binaries.
-#   HF2Q_KV_PERSIST=<dir>   Binds the Qwen35DiskPersistor (LCP snapshots
-#                           write through to disk; cold restarts hydrate).
-#   HF2Q_KV_PERSIST_BUDGET_BYTES
-#                           On-disk budget with LRU eviction (12.8 GiB =
-#                           ADR-017 §R-F5's 10%-of-RAM guidance on 128 GB).
-#                           Enforced by Qwen35DiskPersistor per cfg subdir
-#                           (23d-γ — pre-fix a single ~100K-token opencode
-#                           session wrote 105 GB unbudgeted).
-#   HF2Q_KV_LCP_DISABLE_MID_STORE=1
-#                           Serial agentic sessions retain one compact
-#                           latest-turn checkpoint at the verified Qwen
-#                           ChatML generation boundary. Intermediate stride
-#                           snapshots are redundant for that workload and are
-#                           disabled by default. Set MID_STORES=1 only for a
-#                           branch-heavy workload that needs older checkpoints.
-#   HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=4096
-#                           Granularity of optional intermediate checkpoints
-#                           when MID_STORES=1 (must be a multiple of 64).
+#   Qwen3.6 autoregressive dispatch is the production default. No
+#   investigation-only activation variable is required.
 #   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
 #                           Loop mitigation (2026-08-03). opencode's
 #                           openai-compatible provider cannot send
@@ -58,9 +34,6 @@
 #                           Drains the session every eight layers. The matched
 #                           three-turn gate is 4/4 exact at K=8; larger values
 #                           are not promoted by this launcher.
-#   --kv-persist <dir>      Wires the hot-swap spiller substrate. Set to
-#                           the SAME dir as HF2Q_KV_PERSIST (they are two
-#                           separate mechanisms; see operating-kv-cache.md).
 #   --overflow-policy reject
 #                           opencode manages its own compaction; the
 #                           server must 400 on overflow (OpenAI semantics)
@@ -83,8 +56,9 @@
 #      matching ChatML prefix.
 #   2. Each agent appends only its suffix to that slot's live TQ KV/recurrent
 #      state; another agent no longer resets the single global cache.
-#   3. Disk persistence remains available to SerialFifo runs. The multi-slot
-#      worker does not claim restart hydration until that path is proven.
+#   3. Disk persistence remains available to explicitly configured SerialFifo
+#      runs. The multi-slot worker does not claim restart hydration until that
+#      path is wired and proven.
 #
 # Usage:
 #   scripts/serve_qwen36_opencode.sh            # foreground (default)
@@ -94,10 +68,7 @@ set -euo pipefail
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-KV_DIR="${KV_DIR:-$HOME/.cache/hf2q/kv-persist}"
-KV_BUDGET_BYTES="${KV_BUDGET_BYTES:-13743895347}"  # 12.8 GiB
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
-MID_STORES="${MID_STORES:-0}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 
@@ -105,10 +76,6 @@ KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
-    exit 3
-fi
-if [[ "$MID_STORES" != "0" && "$MID_STORES" != "1" ]]; then
-    echo "MID_STORES must be 0 or 1 (got: $MID_STORES)" >&2
     exit 3
 fi
 if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); then
@@ -119,12 +86,6 @@ if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 
     echo "KV_CACHE_BUDGET_BYTES must be a positive integer (got: $KV_CACHE_BUDGET_BYTES)" >&2
     exit 3
 fi
-if [[ "$MID_STORES" == "1" ]]; then
-    DISABLE_MID_STORE=0
-else
-    DISABLE_MID_STORE=1
-fi
-
 # Refuse before loading the model when another service already owns the port.
 if command -v lsof >/dev/null 2>&1; then
     PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
@@ -152,15 +113,7 @@ for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
     fi
 done
 
-mkdir -p "$KV_DIR"
-
 exec env \
-    HF2Q_QWEN36_AUTOREG=1 \
-    HF2Q_KV_LCP_RESUME=1 \
-    HF2Q_KV_LCP_DISABLE_MID_STORE="$DISABLE_MID_STORE" \
-    HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE="${STRIDE:-4096}" \
-    HF2Q_KV_PERSIST="$KV_DIR" \
-    HF2Q_KV_PERSIST_BUDGET_BYTES="$KV_BUDGET_BYTES" \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
     HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
@@ -169,7 +122,6 @@ exec env \
         --model "$MODEL" \
         --host "$HOST" \
         --port "$PORT" \
-        --kv-persist "$KV_DIR" \
         --overflow-policy reject \
         --scheduler inflight-batched \
         --max-slots "$MAX_SLOTS" \

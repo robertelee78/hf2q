@@ -232,6 +232,22 @@ impl ApiError {
         e
     }
 
+    /// The selected inference worker stopped after a fatal device or worker
+    /// failure (HTTP 503). Unlike a normal generation error, retrying this
+    /// engine generation in place is unsafe; an operator/supervisor must
+    /// recreate the model process first.
+    pub fn engine_unhealthy(detail: impl Into<String>) -> Self {
+        let mut e = Self::bare(
+            StatusCode::SERVICE_UNAVAILABLE,
+            detail.into(),
+            "server_error",
+            Some("engine_unhealthy"),
+            None,
+        );
+        e.retry_after_seconds = Some(1);
+        e
+    }
+
     /// Generation error (HTTP 500) — Metal failure, decoder panic caught, etc.
     pub fn generation_error(detail: impl Into<String>) -> Self {
         Self::bare(

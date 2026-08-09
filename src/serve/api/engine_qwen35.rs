@@ -52,8 +52,12 @@ use crate::serve::multi_seq_kv::SlotId;
 
 use super::engine::{
     effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
-    LoadOptions, SamplingParams, ToolCallPolicy,
+    supervised_gpu_call, LoadOptions, SamplingParams, SerialStreamEnd, SerialStreamResult,
+    ToolCallPolicy,
 };
+use super::engine_supervisor::EngineSupervisor;
+
+const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Canonical Qwen3 chat-template stop tokens.
 ///
@@ -1796,11 +1800,12 @@ fn qwen35_strip_trailing_stop(text: &mut String, stops: &[String]) {
 /// Wedge-4 follow-up may inline tool-call structure here for parity
 /// with Gemma's non-streaming arm; for MVP the handler's call-graph is
 /// the canonical post-decode parser.
-pub fn generate_qwen35_once(
+pub(super) fn generate_qwen35_once(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
+    supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
     let request_start = Instant::now();
     let _disk_request_guard = qwen
@@ -2105,10 +2110,16 @@ pub fn generate_qwen35_once(
             }
             let position_build_ms = position_build_start.elapsed().as_secs_f64() * 1000.0;
             let forward_start = Instant::now();
-            let logits = qwen
-                .model
-                .forward_gpu_last_logits(suffix_tokens, &suffix_positions, &mut kv_cache, SlotId(0))
-                .context("Qwen35 captured latest-turn suffix prefill")?;
+            let logits = supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits(
+                        suffix_tokens,
+                        &suffix_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+                    .context("Qwen35 captured latest-turn suffix prefill")
+            })?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
             let checkpoint_start = Instant::now();
             store_qwen35_latest_turn_checkpoint(
@@ -2152,9 +2163,16 @@ pub fn generate_qwen35_once(
                     prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
                 }
             }
-            qwen.model
-                .forward_gpu_last_logits(prefix_tokens, &prefix_positions, &mut kv_cache, SlotId(0))
-                .context("Qwen35 latest-turn recovery-anchor prefix prefill")?;
+            supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits(
+                        prefix_tokens,
+                        &prefix_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+                    .context("Qwen35 latest-turn recovery-anchor prefix prefill")
+            })?;
             store_qwen35_latest_turn_checkpoint(
                 qwen,
                 &kv_cache,
@@ -2178,9 +2196,11 @@ pub fn generate_qwen35_once(
                 "[hf2q qwen35 lcp store] latest-turn recovery anchor={} tail_tokens={}",
                 recovery_anchor, tail_len
             );
-            qwen.model
-                .forward_gpu_last_logits(tail_tokens, &tail_positions, &mut kv_cache, SlotId(0))
-                .context("Qwen35 latest-turn recovery-anchor tail prefill")?
+            supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits(tail_tokens, &tail_positions, &mut kv_cache, SlotId(0))
+                    .context("Qwen35 latest-turn recovery-anchor tail prefill")
+            })?
         } else if chunked_eligible {
             // ADR-017 Phase B-hybrid.2a + B.3 — chunked prefill with mid-
             // prefill stride-aligned checkpoint storage.  Each chunk's
@@ -2235,20 +2255,25 @@ pub fn generate_qwen35_once(
                         chunk_positions[axis * chunk_seq_len + t] = (k_start + t) as i32;
                     }
                 }
-                let logits = qwen
-                    .model
-                    .forward_gpu_last_logits(
-                        chunk_tokens,
-                        &chunk_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "qwen35 chunked prefill: chunk {}/{} (k_start={}, k_end={}, seq_len={})",
-                            chunk_idx + 1, n_chunks, k_start, k_end, chunk_seq_len
+                let logits = supervised_gpu_call(
+                    supervisor,
+                    "qwen35_serial_prefill_chunk",
+                    || {
+                        qwen.model
+                        .forward_gpu_last_logits(
+                            chunk_tokens,
+                            &chunk_positions,
+                            &mut kv_cache,
+                            SlotId(0),
                         )
-                    })?;
+                        .with_context(|| {
+                            format!(
+                                "qwen35 chunked prefill: chunk {}/{} (k_start={}, k_end={}, seq_len={})",
+                                chunk_idx + 1, n_chunks, k_start, k_end, chunk_seq_len
+                            )
+                        })
+                    },
+                )?;
                 if chunk_idx == n_chunks - 1 {
                     last_logits = Some(logits.clone());
                 }
@@ -2352,16 +2377,20 @@ pub fn generate_qwen35_once(
                     "[hf2q qwen35 lcp store] latest-turn recovery anchor={} tail_tokens={}",
                     recovery_anchor, tail_len
                 );
-                last_logits = Some(
-                    qwen.model
-                        .forward_gpu_last_logits(
-                            tail_tokens,
-                            &tail_positions,
-                            &mut kv_cache,
-                            SlotId(0),
-                        )
-                        .context("Qwen35 chunked recovery-anchor tail prefill")?,
-                );
+                last_logits = Some(supervised_gpu_call(
+                    supervisor,
+                    "qwen35_serial_prefill",
+                    || {
+                        qwen.model
+                            .forward_gpu_last_logits(
+                                tail_tokens,
+                                &tail_positions,
+                                &mut kv_cache,
+                                SlotId(0),
+                            )
+                            .context("Qwen35 chunked recovery-anchor tail prefill")
+                    },
+                )?);
             }
             last_logits.expect("at least one chunk in chunked prefill")
         } else if lcp_resume_start > 0 {
@@ -2386,14 +2415,23 @@ pub fn generate_qwen35_once(
                  (lcp_resume_start={}, prompt_len={})",
                 suffix_len, lcp_resume_start, prompt_len
             );
-            qwen.model
-                .forward_gpu_last_logits(suffix_tokens, &suffix_positions, &mut kv_cache, SlotId(0))
-                .context("Qwen35Model::forward_gpu_last_logits (LCP resume suffix)")?
+            supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits(
+                        suffix_tokens,
+                        &suffix_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+                    .context("Qwen35Model::forward_gpu_last_logits (LCP resume suffix)")
+            })?
         } else {
             let positions = prefill_positions_for(prompt_len);
-            qwen.model
-                .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
-                .context("Qwen35Model::forward_gpu_last_logits (prefill)")?
+            supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
+                    .context("Qwen35Model::forward_gpu_last_logits (prefill)")
+            })?
         };
         anyhow::ensure!(
             prefill_logits.len() == qwen.vocab_size,
@@ -2529,25 +2567,33 @@ pub fn generate_qwen35_once(
             let decode_positions = vec![pos; 4];
 
             next_token = if is_greedy {
-                qwen.model
-                    // ADR-040 Phase B4d (2026-05-30) — forward_gpu_greedy
-                    // now accepts SlotId.  Single-seq engine path:
-                    // SlotId(0) is byte-identical to pre-B4d. C2c/C2d
-                    // SlotAware activation has its own slot-aware
-                    // sibling (forward_gpu_last_logits(.., slot_id))
-                    // — see engine_qwen35.rs:5204 for the routing.
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
-                    .with_context(|| format!("forward_gpu_greedy decode step {step}"))?
+                supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        // ADR-040 Phase B4d (2026-05-30) — forward_gpu_greedy
+                        // now accepts SlotId.  Single-seq engine path:
+                        // SlotId(0) is byte-identical to pre-B4d. C2c/C2d
+                        // SlotAware activation has its own slot-aware
+                        // sibling (forward_gpu_last_logits(.., slot_id))
+                        // — see engine_qwen35.rs:5204 for the routing.
+                        .forward_gpu_greedy(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| format!("forward_gpu_greedy decode step {step}"))
+                })?
             } else {
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
-                        &[next_token],
-                        &decode_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| format!("forward_gpu_last_logits decode step {step}"))?;
+                let logits_full = supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        .forward_gpu_last_logits(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| format!("forward_gpu_last_logits decode step {step}"))
+                })?;
                 let mut logits = logits_full;
                 let (token, logprob) = sample_logits_qwen35_constrained(
                     &mut logits,
@@ -3059,6 +3105,195 @@ pub(crate) struct Qwen35TickOutcome {
     pub finished: bool,
 }
 
+/// One bounded, scheduler-visible Qwen prompt transaction.
+///
+/// Slot-aware serving previously forwarded the entire uncached prompt inside
+/// admission. A large OpenCode tool prompt could therefore monopolize the
+/// worker and submit watchdog-scale Metal work before an existing stream got
+/// another decode turn. This state keeps the request-local cursor outside the
+/// forward call so the worker can yield only at a successfully committed
+/// cache+ledger boundary.
+pub(crate) enum Qwen35PrefillAdvance {
+    Pending {
+        state: Qwen35PrefillState,
+        advanced_tokens: usize,
+    },
+    Ready {
+        state: Qwen35DecodeState,
+        prefill_logits: Vec<f32>,
+        advanced_tokens: usize,
+    },
+}
+
+pub(crate) struct Qwen35PrefillState {
+    slot_id: SlotId,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    cached_tokens: usize,
+    next_token_index: usize,
+    cached_prefill_logits: Option<Vec<f32>>,
+    prefill_started: Instant,
+}
+
+impl Qwen35PrefillState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin(
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        registration: Option<&ModelRegistration>,
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+        cached_tokens: usize,
+        cached_prefill_logits: Option<Vec<f32>>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !prompt_tokens.is_empty(),
+            "Qwen35PrefillState::begin: empty prompt_tokens"
+        );
+        anyhow::ensure!(
+            slot_id.0 < kv_cache.n_seqs,
+            "Qwen35PrefillState::begin: SlotOutOfRange slot={} max_slots={}",
+            slot_id.0,
+            kv_cache.n_seqs,
+        );
+        let prompt_len = prompt_tokens.len();
+        anyhow::ensure!(
+            cached_tokens <= prompt_len,
+            "Qwen35PrefillState::begin: cached_tokens={} exceeds prompt_len={}",
+            cached_tokens,
+            prompt_len,
+        );
+        anyhow::ensure!(
+            (cached_tokens == prompt_len) == cached_prefill_logits.is_some(),
+            "Qwen35PrefillState::begin: a full-prompt cache hit requires prompt-boundary logits, and partial/cold prefill must not supply them"
+        );
+        let max_tokens = params.max_tokens.max(1);
+        let need_seq = prompt_len
+            .checked_add(max_tokens)
+            .and_then(|tokens| tokens.checked_add(64))
+            .context("Qwen35PrefillState::begin: prompt + completion capacity overflow")?;
+        anyhow::ensure!(
+            need_seq <= kv_cache.max_seq_len as usize,
+            "Qwen35PrefillState::begin: per-request need_seq={} exceeds persistent cache max_seq_len={} (slot={} prompt_len={} max_tokens={})",
+            need_seq,
+            kv_cache.max_seq_len,
+            slot_id.0,
+            prompt_len,
+            max_tokens,
+        );
+
+        // Reject malformed grammar/tool state before the first bounded Metal
+        // transaction, matching the legacy prefill path's fail-fast contract.
+        let _ = grammar_runtime_for_request(&params, registration)?;
+
+        if cached_tokens == 0 {
+            kv_cache
+                .reset_for_slot(slot_id)
+                .context("ADR-040 full-context slots: Qwen35 cold reset_for_slot at entry")?;
+        }
+        kv_cache
+            .validate_sequence_len_for_slot(slot_id, cached_tokens)
+            .context("Qwen35PrefillState::begin: validate cache/ledger boundary")?;
+
+        Ok(Self {
+            slot_id,
+            prompt_tokens,
+            params,
+            cached_tokens,
+            next_token_index: cached_tokens,
+            cached_prefill_logits,
+            prefill_started: Instant::now(),
+        })
+    }
+
+    pub(super) fn advance(
+        mut self,
+        qwen: &mut Qwen35LoadedModel,
+        registration: Option<&ModelRegistration>,
+        kv_cache: &mut HybridKvCache,
+        max_chunk_tokens: usize,
+        supervisor: &EngineSupervisor,
+    ) -> Result<Qwen35PrefillAdvance> {
+        let (prefill_logits, advanced_tokens) =
+            if let Some(logits) = self.cached_prefill_logits.take() {
+                anyhow::ensure!(
+                    logits.len() == qwen.vocab_size,
+                    "qwen35 cached prompt-boundary logits len {} != vocab_size {}",
+                    logits.len(),
+                    qwen.vocab_size
+                );
+                (logits, 0)
+            } else {
+                anyhow::ensure!(
+                    max_chunk_tokens > 0,
+                    "Qwen35PrefillState::advance requires a non-zero chunk"
+                );
+                kv_cache
+                    .validate_sequence_len_for_slot(self.slot_id, self.next_token_index)
+                    .context("validate Qwen35 slot cursors before bounded prefill")?;
+                let end = self
+                    .next_token_index
+                    .saturating_add(max_chunk_tokens)
+                    .min(self.prompt_tokens.len());
+                anyhow::ensure!(
+                    end > self.next_token_index,
+                    "Qwen35 bounded prefill has no suffix without cached logits"
+                );
+                let chunk_start = self.next_token_index;
+                let chunk = &self.prompt_tokens[self.next_token_index..end];
+                let positions = prefill_positions_from(self.next_token_index, chunk.len());
+                let chunk_started = Instant::now();
+                let lease =
+                    supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+                let forward =
+                    qwen.model
+                        .forward_gpu_last_logits(chunk, &positions, kv_cache, self.slot_id);
+                lease.finish()?;
+                let logits = forward
+                    .context("Qwen35Model::forward_gpu_last_logits (slot-aware bounded prefill)")?;
+                kv_cache
+                    .validate_sequence_len_for_slot(self.slot_id, end)
+                    .context("validate Qwen35 slot cursors after bounded prefill")?;
+                tracing::info!(
+                    slot = self.slot_id.0,
+                    chunk_start,
+                    chunk_end = end,
+                    chunk_tokens = chunk.len(),
+                    prompt_tokens = self.prompt_tokens.len(),
+                    elapsed_seconds = chunk_started.elapsed().as_secs_f64(),
+                    "Qwen35 bounded prefill chunk complete"
+                );
+                let advanced = end - self.next_token_index;
+                self.next_token_index = end;
+                (logits, advanced)
+            };
+
+        if self.next_token_index < self.prompt_tokens.len() {
+            return Ok(Qwen35PrefillAdvance::Pending {
+                state: self,
+                advanced_tokens,
+            });
+        }
+
+        let prefill_duration = self.prefill_started.elapsed();
+        let state = Qwen35DecodeState::from_prefill_logits(
+            qwen,
+            self.prompt_tokens,
+            self.params,
+            registration,
+            self.slot_id,
+            self.cached_tokens,
+            &prefill_logits,
+            prefill_duration,
+        )?;
+        Ok(Qwen35PrefillAdvance::Ready {
+            state,
+            prefill_logits,
+            advanced_tokens,
+        })
+    }
+}
+
 /// Hoisted per-slot decode state for a Qwen35 SlotAware request — the
 /// locals from `generate_qwen35_once_slot_aware`'s decode loop
 /// (engine_qwen35.rs:2292-2470), lifted for N-slot interleave. Field
@@ -3092,6 +3327,7 @@ pub(crate) struct Qwen35DecodeState {
     finish_reason: &'static str,
     /// Decode-step counter, mirrors the serial ref `step` (starts at 1).
     step: usize,
+    semantic_fragment_reported: bool,
     prefill_duration: Duration,
     decode_start: Instant,
 }
@@ -3151,15 +3387,11 @@ impl Qwen35DecodeState {
             ));
         }
 
-        let is_greedy = is_greedy_eligible(params);
-        let want_logprobs = params.logprobs;
-        let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
-            Some(Vec::with_capacity(max_tokens))
-        } else {
-            None
-        };
-        let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
-        let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
+        // Preserve the historical fail-fast contract: invalid grammar/tool
+        // state is rejected before any Metal submission. Seed sampling itself
+        // is centralized in `from_prefill_logits` so bounded and legacy slot
+        // paths cannot drift.
+        let _ = grammar_runtime_for_request(params, registration)?;
 
         if cached_tokens == 0 {
             kv_cache
@@ -3215,13 +3447,51 @@ impl Qwen35DecodeState {
             prefill_logits.len(),
             qwen.vocab_size
         );
+        let prefill_duration = prefill_start.elapsed();
+        let state = Self::from_prefill_logits(
+            qwen,
+            prompt_tokens.to_vec(),
+            params.clone(),
+            registration,
+            slot_id,
+            cached_tokens,
+            &prefill_logits,
+            prefill_duration,
+        )?;
+        Ok((state, prefill_logits))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prefill_logits(
+        qwen: &Qwen35LoadedModel,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        registration: Option<&ModelRegistration>,
+        slot_id: SlotId,
+        cached_tokens: usize,
+        prefill_logits: &[f32],
+        prefill_duration: Duration,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            prefill_logits.len() == qwen.vocab_size,
+            "qwen35 slot-aware prefill logits len {} != vocab_size {}",
+            prefill_logits.len(),
+            qwen.vocab_size
+        );
+        let prompt_len = prompt_tokens.len();
+        let max_tokens = params.max_tokens.max(1);
+        let is_greedy = is_greedy_eligible(&params);
+        let want_logprobs = params.logprobs;
+        let mut logprobs_vec = want_logprobs.then(|| Vec::with_capacity(max_tokens));
+        let mut grammar_runtime = grammar_runtime_for_request(&params, registration)?;
+        let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
         let next_token = if is_greedy && !want_logprobs {
-            greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+            greedy_argmax_last_token(prefill_logits, qwen.vocab_size as u32)
         } else {
-            let mut logits = prefill_logits.clone();
+            let mut logits = prefill_logits.to_vec();
             let (token, logprob) = sample_logits_qwen35_constrained(
                 &mut logits,
-                params,
+                &params,
                 &[],
                 grammar_runtime.as_ref(),
                 want_logprobs,
@@ -3231,11 +3501,9 @@ impl Qwen35DecodeState {
             }
             token
         };
-        advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
-        let prefill_duration = prefill_start.elapsed();
+        advance_qwen35_grammar(&mut grammar_runtime, &params, next_token);
 
-        let decode_start = Instant::now();
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut generated_tokens = Vec::with_capacity(max_tokens);
         generated_tokens.push(next_token);
         let mut decoded_text = qwen
             .tokenizer
@@ -3252,43 +3520,41 @@ impl Qwen35DecodeState {
                 }
             }
         }
-        let stops = params.stop_strings.clone();
-        let mut finish_reason: &'static str = "length";
-        // First-token EOS: qwen35 POPS + clears (divergent from gemma4,
-        // which does not pop). Serial ref 2387-2396.
-        if qwen.eos_token_ids.contains(&next_token) {
+        let stop_strings = params.stop_strings.clone();
+        let mut finish_reason = "length";
+        if qwen.eos_token_ids.contains(&next_token)
+            || qwen35_grammar_terminal_token(grammar_runtime.as_ref(), &params, next_token)
+        {
             generated_tokens.pop();
             decoded_text.clear();
             finish_reason = "stop";
-        } else if qwen35_hit_stop_string(&decoded_text, &stops) {
-            qwen35_strip_trailing_stop(&mut decoded_text, &stops);
+        } else if qwen35_hit_stop_string(&decoded_text, &stop_strings) {
+            qwen35_strip_trailing_stop(&mut decoded_text, &stop_strings);
             finish_reason = "stop";
         }
 
-        Ok((
-            Qwen35DecodeState {
-                slot_id,
-                prompt_tokens: prompt_tokens.to_vec(),
-                prompt_len,
-                max_tokens,
-                is_greedy,
-                want_logprobs,
-                logprobs_vec,
-                cached_tokens,
-                params: params.clone(),
-                grammar_runtime,
-                tool_splitter,
-                next_token,
-                generated_tokens,
-                decoded_text,
-                stop_strings: stops,
-                finish_reason,
-                step: 1,
-                prefill_duration,
-                decode_start,
-            },
-            prefill_logits,
-        ))
+        Ok(Self {
+            slot_id,
+            prompt_tokens,
+            prompt_len,
+            max_tokens,
+            is_greedy,
+            want_logprobs,
+            logprobs_vec,
+            cached_tokens,
+            params,
+            grammar_runtime,
+            tool_splitter,
+            next_token,
+            generated_tokens,
+            decoded_text,
+            stop_strings,
+            finish_reason,
+            step: 1,
+            semantic_fragment_reported: false,
+            prefill_duration,
+            decode_start: Instant::now(),
+        })
     }
 
     /// Whether the slot already terminated during prefill-seed.
@@ -3322,12 +3588,25 @@ impl Qwen35DecodeState {
         (&self.prompt_tokens, &self.params)
     }
 
+    /// Return true exactly once for the first non-reasoning semantic fragment.
+    /// The SlotAware overlap gate uses this request-scoped marker, while later
+    /// decode tokens stay out of the INFO hot path.
+    pub(crate) fn mark_first_semantic_fragment(&mut self) -> bool {
+        if self.semantic_fragment_reported {
+            false
+        } else {
+            self.semantic_fragment_reported = true;
+            true
+        }
+    }
+
     /// Advance this slot by exactly one decode token — mirror of the serial
     /// ref's `while` body engine_qwen35.rs:2410-2468 for ONE iteration.
-    pub(crate) fn decode_tick(
+    pub(super) fn decode_tick(
         &mut self,
         qwen: &mut Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
+        supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
         // Loop bound mirror: serial ref `while step < max_tokens &&
         // finish_reason == "length"`. The caller only ticks live slots, so
@@ -3345,25 +3624,32 @@ impl Qwen35DecodeState {
         let positions: Vec<i32> = vec![pos_i32; 4];
         let last_input = &self.generated_tokens[self.generated_tokens.len() - 1..];
         let tok = if self.is_greedy && !self.want_logprobs {
-            qwen.model
-                .forward_gpu_greedy(last_input, &positions, kv_cache, self.slot_id)
-                .with_context(|| {
-                    format!(
-                        "Qwen35Model::forward_gpu_greedy (slot-aware decode step {}; \
+            let lease =
+                supervisor.arm("Qwen35 decode greedy", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+            let forward =
+                qwen.model
+                    .forward_gpu_greedy(last_input, &positions, kv_cache, self.slot_id);
+            lease.finish()?;
+            forward.with_context(|| {
+                format!(
+                    "Qwen35Model::forward_gpu_greedy (slot-aware decode step {}; \
                          ADR-040 Phase F M1)",
-                        self.step
-                    )
-                })?
+                    self.step
+                )
+            })?
         } else {
-            let logits = qwen
-                .model
-                .forward_gpu_last_logits(last_input, &positions, kv_cache, self.slot_id)
-                .with_context(|| {
-                    format!(
-                        "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {})",
-                        self.step
-                    )
-                })?;
+            let lease =
+                supervisor.arm("Qwen35 decode logits", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+            let forward =
+                qwen.model
+                    .forward_gpu_last_logits(last_input, &positions, kv_cache, self.slot_id);
+            lease.finish()?;
+            let logits = forward.with_context(|| {
+                format!(
+                    "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {})",
+                    self.step
+                )
+            })?;
             anyhow::ensure!(
                 logits.len() == qwen.vocab_size,
                 "qwen35 slot-aware decode logits len {} != vocab_size {}",
@@ -4299,19 +4585,20 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
 ///
 /// When `soft_tokens` is empty, behaviour is byte-identical to
 /// `generate_qwen35_once`.
-pub fn generate_qwen35_once_with_soft_tokens(
+pub(super) fn generate_qwen35_once_with_soft_tokens(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
     soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
+    supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
     // Empty slice → identity over `generate_qwen35_once`.  This keeps
     // text-only fallback paths from paying any soft-token overhead
     // when (e.g.) a future caller threads an empty vec through the
     // engine `Request::GenerateWithSoftTokens` arm.
     if soft_tokens.is_empty() {
-        return generate_qwen35_once(qwen, prompt_tokens, params, registration);
+        return generate_qwen35_once(qwen, prompt_tokens, params, registration, supervisor);
     }
 
     anyhow::ensure!(
@@ -4343,16 +4630,17 @@ pub fn generate_qwen35_once_with_soft_tokens(
     // (see docstring above for the cache-key safety rationale).
     let prefill_start = Instant::now();
     let positions = prefill_positions_for(prompt_len);
-    let prefill_logits = qwen
-        .model
-        .forward_gpu_last_logits_with_soft_tokens(
-            prompt_tokens,
-            &positions,
-            soft_tokens,
-            &mut kv_cache,
-            SlotId(0),
-        )
-        .context("Qwen35Model::forward_gpu_last_logits_with_soft_tokens (prefill)")?;
+    let prefill_logits = supervised_gpu_call(supervisor, "qwen35_serial_soft_prefill", || {
+        qwen.model
+            .forward_gpu_last_logits_with_soft_tokens(
+                prompt_tokens,
+                &positions,
+                soft_tokens,
+                &mut kv_cache,
+                SlotId(0),
+            )
+            .context("Qwen35Model::forward_gpu_last_logits_with_soft_tokens (prefill)")
+    })?;
     anyhow::ensure!(
         prefill_logits.len() == qwen.vocab_size,
         "qwen35 prefill (soft tokens) logits len {} != vocab_size {}",
@@ -4411,19 +4699,20 @@ pub fn generate_qwen35_once_with_soft_tokens(
 
             next_token = if want_logprobs {
                 // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
-                        &[next_token],
-                        &decode_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| {
-                        format!(
+                let logits_full = supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        .forward_gpu_last_logits(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| {
+                            format!(
                             "forward_gpu_last_logits decode step {step} (soft tokens, logprobs)"
                         )
-                    })?;
+                        })
+                })?;
                 let mut logits = logits_full;
                 let (tok, lp) =
                     sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
@@ -4432,25 +4721,33 @@ pub fn generate_qwen35_once_with_soft_tokens(
                 }
                 tok
             } else if is_greedy {
-                qwen.model
-                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
-                    // engine_qwen35.rs:2071 for the SlotId contract.
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
-                    .with_context(|| {
-                        format!("forward_gpu_greedy decode step {step} (soft tokens)")
-                    })?
+                supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                        // engine_qwen35.rs:2071 for the SlotId contract.
+                        .forward_gpu_greedy(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| {
+                            format!("forward_gpu_greedy decode step {step} (soft tokens)")
+                        })
+                })?
             } else {
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
-                        &[next_token],
-                        &decode_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| {
-                        format!("forward_gpu_last_logits decode step {step} (soft tokens)")
-                    })?;
+                let logits_full = supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        .forward_gpu_last_logits(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| {
+                            format!("forward_gpu_last_logits decode step {step} (soft tokens)")
+                        })
+                })?;
                 let mut logits = logits_full;
                 sample_logits_qwen35(&mut logits, params, &generated_tokens)
             };
@@ -4545,7 +4842,7 @@ pub fn generate_qwen35_once_with_soft_tokens(
 ///
 /// When both `deepstack` and `positions_flat` are `None`, behaviour is
 /// identical to `generate_qwen35_once_with_soft_tokens`.
-pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
+pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
     soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
@@ -4553,10 +4850,11 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     positions_flat: Option<&[i32]>,
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
+    supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
     // Empty soft + no deepstack + no positions → identity over text-only.
     if soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none() {
-        return generate_qwen35_once(qwen, prompt_tokens, params, registration);
+        return generate_qwen35_once(qwen, prompt_tokens, params, registration, supervisor);
     }
 
     anyhow::ensure!(
@@ -4603,20 +4901,22 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         }
     };
 
-    let prefill_logits = qwen
-        .model
-        .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-            prompt_tokens,
-            positions,
-            soft_tokens,
-            deepstack,
-            &mut kv_cache,
-            SlotId(0),
-        )
-        .context(
-            "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
-             (prefill)",
-        )?;
+    let prefill_logits =
+        supervised_gpu_call(supervisor, "qwen35_serial_deepstack_prefill", || {
+            qwen.model
+                .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                    prompt_tokens,
+                    positions,
+                    soft_tokens,
+                    deepstack,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
+                .context(
+                    "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
+                 (prefill)",
+                )
+        })?;
     anyhow::ensure!(
         prefill_logits.len() == qwen.vocab_size,
         "qwen35 prefill (wedge-4d) logits len {} != vocab_size {}",
@@ -4702,9 +5002,9 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
 
             next_token = if want_logprobs {
                 // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
+                let logits_full =
+                    supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                        qwen.model.forward_gpu_last_logits(
                         &[next_token],
                         &decode_positions,
                         &mut kv_cache,
@@ -4712,6 +5012,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
                     )
                     .with_context(|| {
                         format!("forward_gpu_last_logits decode step {step} (wedge-4d, logprobs)")
+                    })
                     })?;
                 let mut logits = logits_full;
                 let (tok, lp) =
@@ -4721,23 +5022,33 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
                 }
                 tok
             } else if is_greedy {
-                qwen.model
-                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
-                    // engine_qwen35.rs:2071 for the SlotId contract.
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
-                    .with_context(|| format!("forward_gpu_greedy decode step {step} (wedge-4d)"))?
+                supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                        // engine_qwen35.rs:2071 for the SlotId contract.
+                        .forward_gpu_greedy(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| {
+                            format!("forward_gpu_greedy decode step {step} (wedge-4d)")
+                        })
+                })?
             } else {
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
-                        &[next_token],
-                        &decode_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| {
-                        format!("forward_gpu_last_logits decode step {step} (wedge-4d)")
-                    })?;
+                let logits_full = supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
+                    qwen.model
+                        .forward_gpu_last_logits(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                        .with_context(|| {
+                            format!("forward_gpu_last_logits decode step {step} (wedge-4d)")
+                        })
+                })?;
                 let mut logits = logits_full;
                 sample_logits_qwen35(&mut logits, params, &generated_tokens)
             };
@@ -4832,14 +5143,15 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
 /// entry threads `soft_tokens` + `deepstack` + `positions_flat`
 /// through the prefill so streaming Qwen3-VL chat (image-bearing +
 /// tools[] + reasoning_content) works end-to-end.
-pub fn generate_stream_qwen35_once(
+pub(super) fn generate_stream_qwen35_once(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
     params: &SamplingParams,
     events: &tokio::sync::mpsc::Sender<GenerationEvent>,
     registration: Option<&ModelRegistration>,
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
-) {
+    supervisor: &EngineSupervisor,
+) -> SerialStreamResult {
     generate_stream_qwen35_once_extended(
         qwen,
         prompt_tokens,
@@ -4850,6 +5162,7 @@ pub fn generate_stream_qwen35_once(
         events,
         registration,
         cancellation_counter,
+        supervisor,
     )
 }
 
@@ -4899,7 +5212,7 @@ pub fn generate_stream_qwen35_once(
 /// `SoftTokenData` is held by the `Request::GenerateStream` variant
 /// the caller dropped, so the buffers are reclaimed there too).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_stream_qwen35_once_extended(
+pub(super) fn generate_stream_qwen35_once_extended(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
     soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
@@ -4909,7 +5222,8 @@ pub fn generate_stream_qwen35_once_extended(
     events: &tokio::sync::mpsc::Sender<GenerationEvent>,
     registration: Option<&ModelRegistration>,
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
-) {
+    supervisor: &EngineSupervisor,
+) -> SerialStreamResult {
     let request_start = Instant::now();
     let _disk_request_guard = qwen
         .disk_persistor
@@ -4922,7 +5236,7 @@ pub fn generate_stream_qwen35_once_extended(
                 if let Some(c) = cancellation_counter {
                     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                return;
+                return Ok(SerialStreamEnd::ClientClosed);
             }
         };
     }
@@ -4931,7 +5245,7 @@ pub fn generate_stream_qwen35_once_extended(
         send!(GenerationEvent::Error(
             "generate_stream_qwen35_once: empty prompt_tokens".into()
         ));
-        return;
+        return Ok(SerialStreamEnd::TerminalSent);
     }
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
@@ -4942,7 +5256,7 @@ pub fn generate_stream_qwen35_once_extended(
             send!(GenerationEvent::Error(format!(
                 "qwen35 stream grammar initialization failed: {error:#}"
             )));
-            return;
+            return Ok(SerialStreamEnd::TerminalSent);
         }
     };
 
@@ -4961,7 +5275,7 @@ pub fn generate_stream_qwen35_once_extended(
                 p.len(),
                 4 * prompt_len
             )));
-            return;
+            return Ok(SerialStreamEnd::TerminalSent);
         }
     }
 
@@ -4969,20 +5283,14 @@ pub fn generate_stream_qwen35_once_extended(
     let device = match MlxDevice::new() {
         Ok(d) => d,
         Err(e) => {
-            send!(GenerationEvent::Error(format!(
-                "qwen35 stream: MlxDevice::new failed: {e}"
-            )));
-            return;
+            return Err(e).context("Qwen35 SerialFifo streaming device initialization");
         }
     };
     let (mut kv_cache, cache_reused) =
         match take_serial_kv_cache(qwen, &device, prompt_len, max_tokens) {
             Ok(k) => k,
             Err(e) => {
-                send!(GenerationEvent::Error(format!(
-                    "qwen35 stream: KV cache alloc failed: {e:#}"
-                )));
-                return;
+                return Err(e).context("Qwen35 SerialFifo streaming KV cache allocation");
             }
         };
     tracing::info!(
@@ -5071,10 +5379,7 @@ pub fn generate_stream_qwen35_once_extended(
                 let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
                 let restore_start = Instant::now();
                 if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
-                    send!(GenerationEvent::Error(format!(
-                        "qwen35 stream: lcp_registry restore_partial failed: {e:#}"
-                    )));
-                    return;
+                    return Err(e).context("Qwen35 SerialFifo streaming LCP checkpoint restore");
                 }
                 let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
                 lcp_resume_start = prefix.k;
@@ -5110,10 +5415,7 @@ pub fn generate_stream_qwen35_once_extended(
             .snapshot()
             .expect("try_match Some implies snapshot Some");
         if let Err(e) = kv_cache.restore_partial(snap, prompt_len) {
-            send!(GenerationEvent::Error(format!(
-                "qwen35 stream: prompt_cache restore_partial failed: {e:#}"
-            )));
-            return;
+            return Err(e).context("Qwen35 SerialFifo streaming prompt-cache restore");
         }
         next_token = qwen.prompt_cache.first_decoded_token();
         tracing::debug!(
@@ -5167,23 +5469,23 @@ pub fn generate_stream_qwen35_once_extended(
             chunked_eligible,
         );
         let prefill_logits_res = if has_extension {
-            qwen.model
-                .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                    prompt_tokens,
-                    positions_slice,
-                    soft_tokens,
-                    deepstack,
-                    &mut kv_cache,
-                    SlotId(0),
-                )
+            supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                        prompt_tokens,
+                        positions_slice,
+                        soft_tokens,
+                        deepstack,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+            })
         } else if let Some((suffix_len, capture_index)) = recovery_capture_plan {
             if let Err(error) =
                 kv_cache.ensure_la_capture(&qwen.model.cfg, &device, suffix_len as u32)
             {
-                send!(GenerationEvent::Error(format!(
-                    "qwen35 stream recovery capture allocation failed: {error:#}"
-                )));
-                return;
+                return Err(error)
+                    .context("Qwen35 SerialFifo streaming recovery-capture allocation");
             }
             let suffix_tokens = &prompt_tokens[lcp_resume_start..];
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
@@ -5192,12 +5494,14 @@ pub fn generate_stream_qwen35_once_extended(
                     suffix_positions[axis * suffix_len + token] = (lcp_resume_start + token) as i32;
                 }
             }
-            match qwen.model.forward_gpu_last_logits(
-                suffix_tokens,
-                &suffix_positions,
-                &mut kv_cache,
-                SlotId(0),
-            ) {
+            match supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
+                qwen.model.forward_gpu_last_logits(
+                    suffix_tokens,
+                    &suffix_positions,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
+            }) {
                 Ok(logits) => {
                     store_qwen35_latest_turn_checkpoint(
                         qwen,
@@ -5228,16 +5532,17 @@ pub fn generate_stream_qwen35_once_extended(
                     prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
                 }
             }
-            if let Err(error) = qwen.model.forward_gpu_last_logits(
-                prefix_tokens,
-                &prefix_positions,
-                &mut kv_cache,
-                SlotId(0),
-            ) {
-                send!(GenerationEvent::Error(format!(
-                    "qwen35 stream recovery-anchor prefix failed: {error:#}"
-                )));
-                return;
+            if let Err(error) =
+                supervised_gpu_call(supervisor, "qwen35_serial_stream_recovery_prefix", || {
+                    qwen.model.forward_gpu_last_logits(
+                        prefix_tokens,
+                        &prefix_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+                })
+            {
+                return Err(error).context("Qwen35 SerialFifo streaming recovery-anchor prefix");
             }
             store_qwen35_latest_turn_checkpoint(
                 qwen,
@@ -5263,12 +5568,14 @@ pub fn generate_stream_qwen35_once_extended(
                  tail_tokens={}",
                 recovery_anchor, tail_len
             );
-            qwen.model.forward_gpu_last_logits(
-                tail_tokens,
-                &tail_positions,
-                &mut kv_cache,
-                SlotId(0),
-            )
+            supervised_gpu_call(supervisor, "qwen35_serial_stream_recovery_tail", || {
+                qwen.model.forward_gpu_last_logits(
+                    tail_tokens,
+                    &tail_positions,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
+            })
         } else if chunked_eligible {
             // Chunked prefill — mirrors non-streaming chunked block.
             // Stride alignment was already validated above (centralized
@@ -5297,21 +5604,25 @@ pub fn generate_stream_qwen35_once_extended(
                         chunk_positions[axis * chunk_seq_len + t] = (k_start + t) as i32;
                     }
                 }
-                let res = qwen.model.forward_gpu_last_logits(
-                    chunk_tokens,
-                    &chunk_positions,
-                    &mut kv_cache,
-                    SlotId(0),
-                );
+                let res =
+                    supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill_chunk", || {
+                        qwen.model.forward_gpu_last_logits(
+                            chunk_tokens,
+                            &chunk_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                    });
                 let logits = match res {
                     Ok(l) => l,
                     Err(e) => {
-                        send!(GenerationEvent::Error(format!(
-                            "qwen35 stream chunked prefill chunk {}/{} failed: {e:#}",
-                            chunk_idx + 1,
-                            n_chunks
-                        )));
-                        return;
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Qwen35 SerialFifo streaming prefill chunk {}/{}",
+                                chunk_idx + 1,
+                                n_chunks
+                            )
+                        });
                     }
                 };
                 if chunk_idx == n_chunks - 1 {
@@ -5403,12 +5714,15 @@ pub fn generate_stream_qwen35_once_extended(
                      tail_tokens={}",
                     recovery_anchor, tail_len
                 );
-                last_logits_res = qwen.model.forward_gpu_last_logits(
-                    tail_tokens,
-                    &tail_positions,
-                    &mut kv_cache,
-                    SlotId(0),
-                );
+                last_logits_res =
+                    supervised_gpu_call(supervisor, "qwen35_serial_stream_recovery_tail", || {
+                        qwen.model.forward_gpu_last_logits(
+                            tail_tokens,
+                            &tail_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                    });
             }
             last_logits_res
         } else if lcp_resume_start > 0 {
@@ -5426,27 +5740,28 @@ pub fn generate_stream_qwen35_once_extended(
                  (lcp_resume_start={}, prompt_len={})",
                 suffix_len, lcp_resume_start, prompt_len
             );
-            qwen.model.forward_gpu_last_logits(
-                suffix_tokens,
-                &suffix_positions,
-                &mut kv_cache,
-                SlotId(0),
-            )
+            supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
+                qwen.model.forward_gpu_last_logits(
+                    suffix_tokens,
+                    &suffix_positions,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
+            })
         } else {
-            qwen.model.forward_gpu_last_logits(
-                prompt_tokens,
-                positions_slice,
-                &mut kv_cache,
-                SlotId(0),
-            )
+            supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
+                qwen.model.forward_gpu_last_logits(
+                    prompt_tokens,
+                    positions_slice,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
+            })
         };
         let prefill_logits = match prefill_logits_res {
             Ok(l) => l,
             Err(e) => {
-                send!(GenerationEvent::Error(format!(
-                    "qwen35 stream prefill failed: {e:#}"
-                )));
-                return;
+                return Err(e).context("Qwen35 SerialFifo streaming prefill");
             }
         };
         if is_greedy {
@@ -5708,7 +6023,7 @@ pub fn generate_stream_qwen35_once_extended(
             if let Some(c) = cancellation_counter {
                 c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            return;
+            return Ok(SerialStreamEnd::ClientClosed);
         }
     }
     completion_tokens += 1;
@@ -5742,17 +6057,26 @@ pub fn generate_stream_qwen35_once_extended(
             }
             let decode_positions = vec![pos; 4];
             let dec_result = if is_greedy {
-                qwen.model
-                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
-                    // engine_qwen35.rs:2071 for the SlotId contract.
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
+                supervised_gpu_call(supervisor, "qwen35_serial_stream_decode", || {
+                    qwen.model
+                        // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                        // engine_qwen35.rs:2071 for the SlotId contract.
+                        .forward_gpu_greedy(
+                            &[next_token],
+                            &decode_positions,
+                            &mut kv_cache,
+                            SlotId(0),
+                        )
+                })
             } else {
-                match qwen.model.forward_gpu_last_logits(
-                    &[next_token],
-                    &decode_positions,
-                    &mut kv_cache,
-                    SlotId(0),
-                ) {
+                match supervised_gpu_call(supervisor, "qwen35_serial_stream_decode", || {
+                    qwen.model.forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+                }) {
                     Ok(logits) => {
                         let mut tmp = logits;
                         let token = sample_logits_qwen35_constrained(
@@ -5771,10 +6095,8 @@ pub fn generate_stream_qwen35_once_extended(
             next_token = match dec_result {
                 Ok(t) => t,
                 Err(e) => {
-                    send!(GenerationEvent::Error(format!(
-                        "qwen35 stream decode step {step} failed: {e:#}"
-                    )));
-                    return;
+                    return Err(e)
+                        .with_context(|| format!("Qwen35 SerialFifo stream decode step {step}"));
                 }
             };
             advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
@@ -5807,7 +6129,7 @@ pub fn generate_stream_qwen35_once_extended(
                 if let Some(c) = cancellation_counter {
                     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                return;
+                return Ok(SerialStreamEnd::ClientClosed);
             }
             if reasoning_splitter
                 .as_ref()
@@ -5839,7 +6161,7 @@ pub fn generate_stream_qwen35_once_extended(
                         if let Some(c) = cancellation_counter {
                             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        return;
+                        return Ok(SerialStreamEnd::ClientClosed);
                     }
                 }
                 SplitSlot::Content => {
@@ -5856,7 +6178,7 @@ pub fn generate_stream_qwen35_once_extended(
                         if let Some(c) = cancellation_counter {
                             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        return;
+                        return Ok(SerialStreamEnd::ClientClosed);
                     }
                 }
             }
@@ -5877,7 +6199,7 @@ pub fn generate_stream_qwen35_once_extended(
                         if let Some(c) = cancellation_counter {
                             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        return;
+                        return Ok(SerialStreamEnd::ClientClosed);
                     }
                 }
                 ToolCallEvent::ToolCallText(t) => {
@@ -5885,7 +6207,7 @@ pub fn generate_stream_qwen35_once_extended(
                         send!(GenerationEvent::Error(
                             "tool_call_truncated_under_constrained".to_string()
                         ));
-                        return;
+                        return Ok(SerialStreamEnd::TerminalSent);
                     }
                     // End-of-stream mid-tool-call (no close marker
                     // observed): re-emit residual as Content with the
@@ -5905,7 +6227,7 @@ pub fn generate_stream_qwen35_once_extended(
                         if let Some(c) = cancellation_counter {
                             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        return;
+                        return Ok(SerialStreamEnd::ClientClosed);
                     }
                 }
                 ToolCallEvent::ToolCallOpen | ToolCallEvent::ToolCallClose => {
@@ -5919,7 +6241,7 @@ pub fn generate_stream_qwen35_once_extended(
         send!(GenerationEvent::Error(
             "tool_call_no_call_under_constrained".to_string()
         ));
-        return;
+        return Ok(SerialStreamEnd::TerminalSent);
     }
 
     if saw_tool_call {
@@ -5982,6 +6304,7 @@ pub fn generate_stream_qwen35_once_extended(
         completion_tokens,
         stats,
     });
+    Ok(SerialStreamEnd::TerminalSent)
 }
 
 /// Wedge-3 / Phase D: chat-as-embedder.  Replaces the `worker_run` 501
@@ -5993,7 +6316,11 @@ pub fn generate_stream_qwen35_once_extended(
 /// no decode loop, so cache is discarded after).  Prompt cache is NOT
 /// consulted here — the embedding path is a single forward; the
 /// snapshot/replay savings are dominated by the no-decode shape.
-pub fn embed_qwen35(qwen: &mut Qwen35LoadedModel, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
+pub(super) fn embed_qwen35(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    supervisor: &EngineSupervisor,
+) -> Result<Vec<f32>> {
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "embed_qwen35: empty prompt_tokens"
@@ -6004,14 +6331,16 @@ pub fn embed_qwen35(qwen: &mut Qwen35LoadedModel, prompt_tokens: &[u32]) -> Resu
     // size the cache to just the prompt.
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_tokens.len(), 0)?;
     let positions = prefill_positions_for(prompt_tokens.len());
-    qwen.model
-        // ADR-040 Phase B4b (2026-05-24): embed-last is single-stream
-        // chat-as-embedder; slot 0 preserves pre-B4b behaviour. The
-        // signature takes SlotId for uniformity with the rest of the
-        // decode-side surface — future slot-aware embedding workloads
-        // can pass SlotId(N) directly.
-        .forward_embed_last(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
-        .context("Qwen35Model::forward_embed_last")
+    supervised_gpu_call(supervisor, "qwen35_serial_embed", || {
+        qwen.model
+            // ADR-040 Phase B4b (2026-05-24): embed-last is single-stream
+            // chat-as-embedder; slot 0 preserves pre-B4b behaviour. The
+            // signature takes SlotId for uniformity with the rest of the
+            // decode-side surface — future slot-aware embedding workloads
+            // can pass SlotId(N) directly.
+            .forward_embed_last(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
+            .context("Qwen35Model::forward_embed_last")
+    })
 }
 
 /// **ADR-040 iter-C2d-cont-kernel iter-3 (2026-05-30)** — slot-aware
@@ -6185,24 +6514,23 @@ pub fn embed_qwen35_slot_aware(
     // ensures that even if a future iter adds a code path between
     // entry-reset and exit-reset that mutates per-slot state, the slot
     // is always clean at handoff. Mirrors iter-1 + iter-2 exit
-    // discipline; runs regardless of the embed result so a forward
-    // failure doesn't leave the slot dirty for the next request.
-    let reset_exit_res = kv_cache.reset_for_slot(slot_id);
+    // discipline. A failed forward returns immediately above: a typed Metal
+    // timeout/device loss must reach the worker classifier before any CPU
+    // mapping or mutation touches the poisoned cache generation.
+    finish_qwen35_slot_embed(embed_result, || {
+        kv_cache
+            .reset_for_slot(slot_id)
+            .context("ADR-040 iter-C2d-cont-kernel iter-3: reset_for_slot at exit")
+    })
+}
 
-    // Surface the embed result first (the load-bearing return); only
-    // override with the reset-exit error if the embed itself succeeded
-    // (otherwise the embed error is more diagnostic). The reset-exit
-    // call is a per-slot zero — failures here are typed
-    // `SlotOutOfRange` which the bounds check at entry already ruled
-    // out, so reaching this branch implies a structural bug worth
-    // surfacing.
-    match (embed_result, reset_exit_res) {
-        (Ok(vec), Ok(())) => Ok(vec),
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => {
-            Err(e).context("ADR-040 iter-C2d-cont-kernel iter-3: reset_for_slot at exit")
-        }
-    }
+fn finish_qwen35_slot_embed<T>(
+    forward: Result<T>,
+    reset_after_success: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    let output = forward?;
+    reset_after_success()?;
+    Ok(output)
 }
 
 /// ADR-040 Phase C iter-C2d-cont-kernel iter-4 (2026-05-30): slot-aware
@@ -6936,6 +7264,30 @@ mod tests {
         default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
     };
     use mlx_native::MlxDevice;
+    use std::cell::Cell;
+
+    #[test]
+    fn failed_embed_forward_never_resets_a_potentially_poisoned_slot() {
+        let reset_called = Cell::new(false);
+        let forward: Result<Vec<f32>> = Err(anyhow::Error::new(
+            mlx_native::MlxError::CommandBufferError(
+                "Caused GPU Timeout Error (00000002)".to_string(),
+            ),
+        ))
+        .context("Qwen35 slot-aware embed forward");
+        let error = finish_qwen35_slot_embed(forward, || {
+            reset_called.set(true);
+            Ok(())
+        })
+        .expect_err("typed Metal failure must escape before reset");
+        assert!(!reset_called.get());
+        assert!(error.chain().any(|source| {
+            matches!(
+                source.downcast_ref::<mlx_native::MlxError>(),
+                Some(mlx_native::MlxError::CommandBufferError(_))
+            )
+        }));
+    }
 
     #[test]
     fn serial_kv_cache_capacity_grows_geometrically() {
@@ -7160,6 +7512,52 @@ mod tests {
 
         assert_eq!(token, 1);
         assert_eq!(logprob, None);
+    }
+
+    #[test]
+    fn bounded_prefill_rejects_invalid_grammar_before_mutating_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = moe_cfg_40layer_for_cache_test();
+        let mut kv = HybridKvCache::new(&cfg, &device, 128, 1).expect("kv");
+        let mut params = greedy_params();
+        params.grammar = Some(
+            crate::serve::api::grammar::parse("not_root ::= \"x\"\n")
+                .expect("syntactically valid grammar without root"),
+        );
+
+        let error =
+            match Qwen35PrefillState::begin(vec![7], params, None, &mut kv, SlotId(0), 0, None) {
+                Ok(_) => panic!("missing-root grammar must fail before bounded prefill"),
+                Err(error) => error,
+            };
+        assert!(format!("{error:#}").contains("grammar has no root rule"));
+        assert_eq!(
+            kv.sequence_len_for_slot(SlotId(0)).expect("cursor"),
+            0,
+            "grammar validation must precede any cache mutation or Metal work"
+        );
+    }
+
+    #[test]
+    fn accepted_empty_grammar_token_terminates_the_prefill_seed() {
+        let grammar =
+            crate::serve::api::grammar::parse("root ::= \"\"\n").expect("empty terminal grammar");
+        let mut params = greedy_params();
+        params.grammar = Some(grammar);
+        params.token_bytes = Some(std::sync::Arc::new(vec![Vec::new()]));
+        let runtime = grammar_runtime_for_request(&params, None)
+            .expect("runtime build")
+            .expect("grammar runtime");
+        assert!(qwen35_grammar_terminal_token(Some(&runtime), &params, 0));
+
+        let src = include_str!("engine_qwen35.rs");
+        assert!(
+            src.contains(
+                "|| qwen35_grammar_terminal_token(grammar_runtime.as_ref(), &params, next_token)"
+            ),
+            "bounded prefill seed must stop on the same grammar terminal as legacy SSE"
+        );
     }
 
     #[test]
@@ -7706,39 +8104,32 @@ mod tests {
         );
     }
 
-    /// Wedge-4e: the Phase-2c soft_token guard at
-    /// `LoadedModel::Qwen35` streaming arm has been REMOVED. Pin via
-    /// source-grep — if a future iter re-introduces a guard that
-    /// short-circuits soft-token streaming, this test fails loud.
+    /// SerialFifo retains the historical Qwen3-VL extended stream primitive,
+    /// while SlotAware fails closed until those extra GPU inputs are carried
+    /// by the scheduler-yielding state machine. It must never silently drop
+    /// them and run the plain-text path.
     #[test]
-    fn wedge4e_phase_2c_soft_token_guard_is_removed() {
+    fn wedge4e_multimodal_streaming_is_explicit_per_scheduler_mode() {
         let src = include_str!("engine.rs");
         assert!(
-            !src.contains("Qwen35 streaming path does not yet support"),
-            "Wedge-4e: Phase-2c soft_token guard at engine.rs's \
-             LoadedModel::Qwen35 streaming arm MUST be removed — the \
-             extended streaming entry now threads soft_tokens + \
-             deepstack + positions through to the LM forward"
+            src.contains("validate_qwen35_slot_stream_payload("),
+            "SlotAware Qwen must validate every multimodal stream field before admission"
         );
         assert!(
-            !src.contains("For Qwen3-VL image-bearing chat, set \\\"stream\\\": false."),
-            "Wedge-4e: actionable diagnostic about set stream=false \
-             MUST be removed (the streaming path is now the \
-             production path)"
+            src.contains("reject_stream_before_sse(events, admission, error)"),
+            "unsupported SlotAware multimodal streams must fail before SSE"
         );
-        // Positive pin: the new dispatch reaches
-        // `generate_stream_qwen35_once_extended`.
         assert!(
             src.contains("generate_stream_qwen35_once_extended"),
-            "Wedge-4e: streaming arm must dispatch through the \
-             extended entry"
+            "SerialFifo must retain the extended multimodal stream primitive"
         );
     }
 
     /// Wedge-4e handler-side: the `chat_completions_stream` 501
     /// reject for Qwen3-VL deepstack streaming has been removed.
-    /// Image-bearing streaming chat now reaches the production
-    /// engine path.
+    /// Image-bearing streaming chat reaches the engine boundary; scheduler
+    /// mode then either dispatches the extended SerialFifo primitive or
+    /// returns the explicit pre-SSE SlotAware capability error above.
     #[test]
     fn wedge4e_handler_streaming_501_reject_is_removed() {
         let src = include_str!("handlers.rs");

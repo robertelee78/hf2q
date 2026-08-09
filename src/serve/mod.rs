@@ -854,22 +854,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 );
             }
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
-                // Wave 5a (ADR-005 Phase 4 ACs 5468/5470 partial): the
-                // Qwen3.5 forward path is autoregressive-only (per-token
-                // DeltaNet state update; correct at short prefill, slow at
-                // long prefill until the W-5b chunk-scan kernel lands).
-                // Qwen3.6 GGUFs reuse the same `general.architecture`
-                // strings as Qwen3.5, so we must distinguish here via
-                // `general.name` and require explicit opt-in to avoid
-                // silently shipping a slow long-prefill path.
-                if is_qwen36_gguf(&gguf_peek) && !INVESTIGATION_ENV.qwen36_autoreg {
-                    anyhow::bail!(
-                        "Qwen3.6 GGUF detected (general.name contains 'qwen3.6'), but \
-                         autoregressive forward-path support is opt-in. Set \
-                         HF2Q_QWEN36_AUTOREG=1 to dispatch through the existing \
-                         autoregressive Qwen3.5 path (correct at short prefill; long-prefill \
-                         SOTA via chunk-scan kernel deferred to Wave 5b). Model: {}",
-                        model_path.display(),
+                // Qwen3.6 reuses Qwen3.5's architecture strings and forward
+                // graph. The production autoregressive path is now the
+                // default for both CLI and serving; only the separate unsafe
+                // chunk-scan experiment remains environment-gated.
+                if is_qwen36_gguf(&gguf_peek) {
+                    tracing::info!(
+                        "Detected Qwen3.6 metadata → routing to the production Qwen3.5-compatible path"
                     );
                 }
                 tracing::info!("Detected architecture '{}' → routing to Qwen3.5 path", arch);
@@ -5006,10 +4997,31 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             }
         }
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .context("axum::serve")?;
+        // Bound the HTTP drain independently of the worker join. A stuck
+        // inference handler used to prevent us from ever reaching
+        // `Engine::shutdown`, leaving readiness and process supervision with
+        // no finite terminal state. Start this deadline only after the actual
+        // shutdown signal, not at server startup.
+        let shutdown_observed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let shutdown_for_server = shutdown_observed.clone();
+        let mut server = Box::pin(std::future::IntoFuture::into_future(
+            axum::serve(listener, router).with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                shutdown_for_server.notify_one();
+            }),
+        ));
+        let http_result: anyhow::Result<()> = tokio::select! {
+            result = &mut server => result.context("axum::serve"),
+            _ = shutdown_observed.notified() => {
+                match tokio::time::timeout(std::time::Duration::from_secs(150), &mut server).await {
+                    Ok(result) => result.context("axum::serve graceful shutdown"),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "http_shutdown_timeout: in-flight handlers did not drain within 150s; process restart required"
+                    )),
+                }
+            }
+        };
+        let mut shutdown_failure = http_result.err();
 
         // Axum has stopped accepting + drained in-flight HTTP responses.
         // Each in-flight handler that called `engine.generate*` has
@@ -5079,14 +5091,27 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             timed_out = drain_summary.timed_out,
             "ADR-017 graceful-shutdown KV-cache drain complete"
         );
+        if drain_summary.timed_out && shutdown_failure.is_none() {
+            shutdown_failure = Some(anyhow::anyhow!(
+                "kv_shutdown_timeout: persistent cache drain did not complete; process restart required"
+            ));
+        }
 
         for engine in shutdown_engines {
             match engine.shutdown().await {
                 Ok(()) => tracing::info!("hf2q-engine worker joined"),
-                Err(e) => tracing::warn!(error = %e, "hf2q-engine worker join failed"),
+                Err(error) => {
+                    tracing::error!(error = %error, "hf2q-engine worker join failed");
+                    if shutdown_failure.is_none() {
+                        shutdown_failure = Some(error);
+                    }
+                }
             }
         }
 
+        if let Some(error) = shutdown_failure {
+            return Err(error);
+        }
         tracing::info!("hf2q HTTP server shut down cleanly");
         Ok::<(), anyhow::Error>(())
     })?;

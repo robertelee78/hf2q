@@ -11,6 +11,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_URL=${BASE_URL:-http://127.0.0.1:8080}
 MODEL=${MODEL:-Deepseek v4 Flash 0731 Source}
 EXPECTED_PATH=${EXPECTED_PATH:-$ROOT_DIR/Cargo.toml}
+TOOL_RESULT_PATH=${TOOL_RESULT_PATH:-$EXPECTED_PATH}
 RUN_ID=${RUN_ID:-"$$-$(date +%s)"}
 MAX_COLD_TTFT_MS=${MAX_COLD_TTFT_MS:-30000}
 MAX_CACHED_TTFT_MS=${MAX_CACHED_TTFT_MS:-5000}
@@ -31,6 +32,10 @@ for command in curl date jq rg; do
     exit 2
   }
 done
+[[ -r "$TOOL_RESULT_PATH" ]] || {
+  echo "tool result fixture is not readable: $TOOL_RESULT_PATH" >&2
+  exit 2
+}
 for setting in MAX_TOKENS SOURCE_MAX_TOKENS CURL_CONNECT_TIMEOUT_SECONDS CURL_MAX_TIME_SECONDS; do
   value=${!setting}
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
@@ -284,7 +289,7 @@ if (( stream_semantic_ms > MAX_CACHED_SEMANTIC_MS )); then
 fi
 
 jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
-  --rawfile cargo Cargo.toml '
+  --rawfile tool_result "$TOOL_RESULT_PATH" '
     $base[0]
     | .messages += [
         {
@@ -295,7 +300,7 @@ jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
         {
           role: "tool",
           tool_call_id: $prior[0].choices[0].message.tool_calls[0].id,
-          content: ("Successful read_file result. Cargo.toml follows:\n" + $cargo)
+          content: ("Successful read_file result. File follows:\n" + $tool_result)
         }
       ]
     | .tool_choice = "auto"

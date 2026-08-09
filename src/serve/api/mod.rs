@@ -27,6 +27,7 @@ pub mod engine;
 pub mod engine_deepseek4;
 pub mod engine_qwen35;
 pub mod engine_qwen3vl;
+mod engine_supervisor;
 pub mod grammar;
 pub mod handlers;
 pub mod kv_spill_descriptor;
@@ -37,6 +38,9 @@ pub mod schema;
 pub mod sse;
 pub mod state;
 pub mod tq_packed_descriptor;
+
+#[cfg(test)]
+mod qwen36_watchdog_fixture_tests;
 
 pub use router::build_router;
 #[allow(unused_imports)]

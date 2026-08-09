@@ -1,19 +1,21 @@
 # hf2q Shipping Contract
 
-This document defines the canonical product surface for `hf2q` as
-shipped today, and the policy each environment variable is classified
-under. Per-variable effects live in `docs/operator-env-vars.md`; this
-document sits one level above and defines *what is supported*.
+This document defines the public hf2q 0.1.3 product surface and the
+**Unreleased next-release candidate** where explicitly marked. It also defines
+the policy each environment variable is classified under. Per-variable
+effects live in `docs/operator-env-vars.md`; this document sits one level above
+and defines *what is supported*.
 
 **Anything not listed in categories 1–3 below may be removed or
 relocated without notice** — it is not part of the supported surface.
 
 ---
 
-## Category 1 — Production contract (shipped default)
+## Category 1 — Production contract and next-release candidate
 
-What the default release binary does with **no environment variables
-set**, on the proven model class (Gemma-4 26B DWQ GGUF):
+What the default release binary does with **no environment variables set**.
+The exact model-family surface is explicit below; no family inherits another
+family's graph, cache, or scheduler contract by approximation.
 
 - Batched `forward_prefill_batched` (default-on since ADR-028
   iter-344; per-token `forward_prefill` was 14-45× slower than peer).
@@ -25,10 +27,40 @@ set**, on the proven model class (Gemma-4 26B DWQ GGUF):
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
   `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
   otherwise F16.
+- **Unreleased candidate:** Qwen3.5/Qwen3.6 generation and OpenAI-compatible
+  serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
+  Slot-aware Qwen prefill
+  is bounded and scheduler-yielding; no `HF2Q_QWEN36_AUTOREG` activation is
+  required. This default contract is the plain-text unary/SSE chat surface,
+  including native tools, reasoning, grammar, and retained-prefix
+  continuations. SlotAware soft-token/deepstack/3D-position requests fail
+  before Qwen LM scheduler/SSE admission until their own prefill and decode are scheduler-yielding;
+  the historical multimodal primitive remains available only under
+  SerialFifo. The separate chunk-scan prefill experiment remains Category 3.
+- **Unreleased candidate:** long plain-text Gemma SlotAware prefill advances in
+  at most 4,096-token transactions, split at the stable-prefix boundary. The
+  transaction publishes all configured per-layer cache cursors together.
+  Compatible installed prefill states may share those 4,096 aggregate rows;
+  the bound never multiplies by the number of slots. Long soft-token work
+  remains fail-closed until a resumable graph is proven.
+- **Unreleased candidate:** DeepSeek meaningful cached suffixes use the same
+  atomic resumable verifier transactions as cold prefill. Lopsided cold waves
+  allow one decode token between prefill transactions but park terminal
+  completion until the cohort barrier lifts. Outside a cold barrier, staggered
+  warm work may occupy any free physical slot. Cancellation restores only a
+  valid, position-consistent pre-request turn anchor; poisoned or inconsistent
+  state resets fully.
+- A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
+  independently observed transaction deadline that never returns, fails the
+  affected Qwen, Gemma, or DeepSeek worker closed. Every owned reply
+  terminates once; saturated SSE consumers cannot block fatal fanout; no cache
+  reset or later GPU submission is permitted. `/health` remains process
+  liveness while `/readyz` and new generation fail closed. OS process
+  supervision, not an in-process slot reset, owns device recovery.
 
 ### Required gates before merging
 
-Every change that could affect the forward pass or lm_head must pass
+Every Gemma change that could affect the forward pass or lm_head must pass
 `scripts/release-check.sh`:
 
 | Gate | Floor |
@@ -37,6 +69,28 @@ Every change that could affect the forward pass or lm_head must pass
 | `sourdough` common-byte-prefix with llama.cpp | ≥ 3094 bytes |
 | `sliding_wrap` common-byte-prefix with locked hf2q reference | ≥ 700 bytes |
 | Decode perf sanity on the sourdough prompt | ≥ 95 tok/s |
+
+Before that Unreleased Qwen candidate may ship, every Qwen SlotAware serving
+change must additionally pass all of these gates
+from a clean packed artifact that resolves the published, checksum-pinned
+`mlx-native` dependency:
+
+| Gate | Contract |
+|---|---|
+| Hosted model-free gates | Bounded 2,048-token plan, decode-first `Mixed`, cold round-robin, fatal fanout, readiness, request-boundary tests, stable fixture bytes, and the receipt-parser negative matrix pass in CI. |
+| Apple-Silicon artifact gates | Cross-layer/MTP cursor-ledger coherence and transaction-boundary cancellation pass against the packed candidate; these require the native cache/model path and are not inferred from hosted scheduler tests. |
+| Exact overlap | The deterministic 552-token SSE lane is enqueued immediately before the 87,972-token/347-tool lane; the short lane makes semantic progress while the long lane completes exactly 42×2,048 + 1,956 prompt tokens. |
+| Disconnect | Dropping the long SSE is observed at a transaction boundary, releases the same physical slot once, and a following request succeeds. |
+| Agentic four-slot gate | Required/automatic tools, unary/SSE, tool-result continuation, exact arguments, and retained-prefix reuse pass for four independent slots. |
+| Native lifetime/fatal recovery | Command-buffer and CFString populations remain bounded; no timeout, ignored submission, or post-fatal GPU submission occurs; `/health` remains liveness and `/readyz` fails closed after an injected fatal error. |
+
+The shared cross-family changes additionally require:
+
+| Family | Candidate artifact gate |
+|---|---|
+| Gemma 4 | Eager-versus-resumed exact output parity at 4,096 boundaries and non-aligned tails; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
+| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the unchanged four-agent cold/cached/tool gate twice. |
+| All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 
 ---
 
@@ -61,7 +115,7 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
 | `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
-| `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). Closes the long-prefill SOTA path on ADR-005 ACs 5468/5470 (currently only-partial via `HF2Q_QWEN36_AUTOREG`). Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are validated as separate iters before this becomes Category 1. |
+| `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). This is a performance experiment distinct from the production autoregressive path. Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are required before this experimental kernel can become Category 1. |
 
 ---
 
@@ -94,7 +148,6 @@ operator-facing; loaded through `src/debug/investigation_env.rs`
 | `HF2Q_PREFILL_DUMP`, `HF2Q_BATCHED_DUMP`, `HF2Q_BATCHED_LAYER_SCAN`, `HF2Q_DUMP_LAYERS`, `HF2Q_DUMP_BOUNDARY`, `HF2Q_DUMP_ALL_CACHE`, `HF2Q_DUMP_LAYER_DETAIL`, `HF2Q_DUMP_NORM_WEIGHT`, `HF2Q_DUMP_DIR` | Hidden-state / cache dumps; output-only, cannot affect decode. |
 | `HF2Q_DUMP_RENDERED_PROMPT`, `HF2Q_DUMP_PROMPT_TOKENS` | Prompt-path diagnostics. |
 | `HF2Q_MLX_TIMING`, `HF2Q_SPLIT_TIMING`, `HF2Q_MLX_KERNEL_PROFILE`, `HF2Q_MLX_PROFILE` | Timing / kernel-attribution diagnostics. |
-| `HF2Q_QWEN36_AUTOREG` | Wave 5a opt-in: when `=1`, dispatch Qwen3.6 GGUFs (`general.name` substring `qwen3.6`) through the existing autoregressive Qwen3.5 forward path (`inference::models::qwen35::*`). When unset, Qwen3.6 GGUFs soft-error with operator-actionable bail. Dispatch gate only — does not modify forward-pass math; no `HF2Q_UNSAFE_EXPERIMENTS` ack required. Removed once Wave 5b chunk-scan kernel lands (long-prefill SOTA path covers all Qwen3.x without env gate). |
 
 ---
 
@@ -114,10 +167,13 @@ document (for categories 2–3).
 
 ---
 
-## Qwen3.5 / Qwen3.6 conversion acceptance (ADR-012)
+## Historical ADR-012 conversion acceptance (superseded for inference)
 
-`qwen35` (dense 27B) and `qwen35moe` (MoE 35B) are shipped as **convert-only**
-model classes as of ADR-012. Inference coherence is delegated to ADR-013.
+ADR-012 originally accepted `qwen35` (dense 27B) and `qwen35moe` (MoE
+35B) as convert-only classes. That historical conversion contract remains
+authoritative for emitted artifacts. ADR-013, ADR-027, and ADR-040 now own the
+shipped inference, cache, and SlotAware serving contracts; Qwen is no longer
+convert-only.
 
 ### Acceptance gates for a converted GGUF
 
@@ -323,13 +379,16 @@ C++ implementation.
 
 These are deliberately not part of any category:
 
-- Inference coherence for models other than Gemma-4 26B DWQ. Qwen3.5
-  inference coherence is ADR-013.
 - Byte-identical batched-prefill parity with llama.cpp at the ~752-byte
   `sliding_wrap` level (see `docs/ADR-010-exact-batched-kernel-parity.md`;
   deferred).
-- An OpenAI-compatible server. The `hf2q serve` CLI subcommand exists
-  but is a stub; it is not part of the shipping contract.
+- Qwen SlotAware soft-token, deepstack, and 3D-position generation. Those
+  request shapes fail before Qwen LM scheduler/SSE admission; Qwen3-VL and
+  the historical SerialFifo multimodal primitive have separate contracts.
+- In-process recovery after a fatal Metal command-buffer/watchdog/ignored-
+  submission failure or an expired non-returning transaction. The worker and
+  HTTP surfaces fail closed, but an OS supervisor must recreate the
+  process/device generation.
 
 ---
 

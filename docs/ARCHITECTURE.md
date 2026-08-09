@@ -276,8 +276,10 @@ The full menu, gated by per-arch availability, lives in
 1. **Header read** (`serve/header.rs`) validates the GGUF magic +
    producer fingerprint (`serve/provenance.rs`) against the arch
    registry.
-2. **Arch dispatch** picks an engine wrapper under
-   `serve/api/engine*.rs` (Gemma 4, Qwen 3.5, Qwen 3-VL).
+2. **Arch dispatch** picks an explicit engine wrapper under
+   `serve/api/engine*.rs` (Gemma 4, Qwen 3.5/3.6, Qwen 3-VL,
+   DeepSeek-V4). Unsupported or cross-family shapes fail rather than falling
+   through an approximately compatible graph.
 3. **Weight load** dequantizes-on-demand into `mlx-native` MTL buffers
    (`inference/models/<arch>/...`). Fused-kernel pipelines compile at
    load time so the first request doesn't pay shader-compile latency.
@@ -293,10 +295,28 @@ Two paths share the same forward graph but differ in dispatch shape:
   parity reference. Used when `HF2Q_BATCHED_PREFILL=0` or for arches
   not yet on the batched path.
 - `serve/forward_prefill_batched.rs` — ADR-015's batched prefill;
-  HEAD-default for Gemma 4 + Qwen 3.5. Was the single largest serve
+  used by applicable Gemma and Qwen graph paths. Was the single largest serve
   speedup in the project (35× over per-token at `pp1024` on Gemma 4)
   when the HTTP path was wired in ADR-028 Phase 15. Flash-Attention
   (ADR-011) lives in this path.
+
+Slot-aware scheduling adds a transaction boundary above the family forward
+graph (`serve/api/engine.rs`, ADR-040). For Qwen 3.5/3.6 text serving, one
+prefill transaction contains at most 2,048 new prompt tokens on one slot-local
+hybrid KV cache. A successful transaction publishes the scheduler ledger only
+after all full-attention and MTP cursors agree. `Mixed` steps decode active
+streams before advancing the next cold prefill, and cold prefills rotate
+round-robin. This is distinct from the unsafe chunk-scan DeltaNet experiment:
+the outer transaction bounds the complete attention/MoE graph and gives the
+worker cancellation and fairness boundaries.
+
+Gemma 4 uses the same outer state-machine shape for long plain-text prompts,
+with a family-specific candidate cap of 4,096 tokens and mandatory splits at
+the stable-prefix boundary. Each successful transaction validates and commits
+the engaged HB, hybrid, dense, and MLX cursor rows before scheduler
+publication. DeepSeek uses its native verifier transaction width instead of a
+generic token cap. Both cold work and meaningful retained-prefix suffixes are
+resumable; cached suffixes remain outside the cold-cohort policy.
 
 ### 4.3 Decode
 
@@ -352,8 +372,8 @@ markers.
 
 | Route | Handler |
 |---|---|
-| `GET /health` | `handlers::health` — always 200 once warm |
-| `GET /readyz` | `handlers::readyz` — 200 once the engine is loaded |
+| `GET /health` | `handlers::health` — process liveness; remains 200 when generation readiness has failed |
+| `GET /readyz` | `handlers::readyz` — 200 only while generation is ready and every pooled engine worker is healthy |
 | `GET /metrics` | `handlers::metrics` — Prometheus exposition |
 | `GET /v1/models` | `handlers::list_models` |
 | `GET /v1/models/:model_id` | `handlers::get_model` |
@@ -370,6 +390,18 @@ Middleware (`serve/api/middleware.rs`) layers CORS, optional Bearer
 auth, and request-id propagation. SSE encoding lives in
 `serve/api/sse.rs`; the grammar sampler emits tool-call deltas that
 the SSE encoder threads into the OpenAI-shaped stream.
+
+Metal watchdog, ignored-submission, and device-loss errors are worker-fatal,
+not slot-local. An `EngineSupervisor` outside the model worker also observes
+individual Metal transaction leases, so a call that never returns still
+poisons readiness and unblocks unary/SSE waiters. Qwen, Gemma, and DeepSeek
+workers close admission, terminate active, detached, buffered, and
+pre-close-permitted requests once, stop submitting GPU work, and make
+`/readyz` return 503. The guarded SSE bridge treats a full downstream queue as
+request-local cancellation instead of blocking the sole worker. `/health`
+remains a liveness endpoint. OS supervision recreates the process/device
+generation; hf2q does not attempt an in-process reset of a poisoned Metal
+queue.
 
 The persistent block-prefix cache (`serve/kv_persist/`) is the most
 operationally interesting piece: it makes the first prefill of a
@@ -453,8 +485,8 @@ every new arch paid pre-`src/arch/`. The canonical reference is
 
 ## 8. Testing
 
-`tests/` (77 files) hosts integration tests; `src/**/*.rs` carries
-unit tests inline. The harness leans on three patterns:
+`tests/` hosts integration tests; `src/**/*.rs` carries unit tests inline. The
+harness leans on three patterns:
 
 1. **Spec-citation tests.** Every K-quant codec has a hand-authored
    spec-driven test that matches `llama.cpp`'s block layout byte-for-
@@ -501,6 +533,7 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-028** | Peer parity, coherence + speed (the perf canonical). |
 | **ADR-029** | Gemma4 MoE pipeline is the gap — perf investigation. |
 | **ADR-030** | dFlash block-diffusion spec-decode. |
+| **ADR-040** | Full-context agent slots, scheduler admission, fairness, and per-slot state. |
 
 Each ADR carries phase status, acceptance tests, and a "what comes
 next" section. ADRs are append-only; superseded ones are linked

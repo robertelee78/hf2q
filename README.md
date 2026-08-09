@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/robertelee78/hf2q/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/robertelee78/hf2q/actions/workflows/ci.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
-[![Rust 1.81+](https://img.shields.io/badge/rust-1.81%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey.svg)](#install)
-[![Backend: mlx-native](https://img.shields.io/badge/backend-mlx--native%200.9-purple.svg)](https://crates.io/crates/mlx-native)
+[![Backend: mlx-native](https://img.shields.io/badge/backend-mlx--native-purple.svg)](https://crates.io/crates/mlx-native)
 
 Pure-Rust CLI for converting HuggingFace models to hardware-optimized
 formats — and serving them through an OpenAI-compatible HTTP API on
@@ -12,45 +12,25 @@ Apple Silicon. **No C++ at build, test, or runtime** (ADR-008
 sovereignty rule); the inference path runs entirely on `mlx-native`
 Metal kernels we own end-to-end.
 
-> **Performance** — on M5 Max at HEAD (2026-05-17 re-bench, 3-run
-> median, default config including the HF2Q_NO_FA hybrid-attn fix from
-> commit `03328ee5`):
-> * **Gemma-4 26B-A4B Q6_K decode** — `tg200` 105.2 t/s vs llama.cpp
->   `-fa 1` 104.32 t/s (**1.01× peer-FA AHEAD**); `tg2000` 93.5 t/s vs
->   96.69 t/s (**0.97× peer-FA**).
-> * **Qwen 3.6 35B-A3B APEX-Q5_K_M decode (TQ-V default-on)** — `tg200`
->   130.6 t/s vs llama.cpp `-fa 1` 100.97 t/s (**1.29× peer-FA AHEAD**);
->   `tg1500` 129.1 t/s vs 89.25 t/s (**1.45× peer-FA AHEAD** — TQ-V's
->   bandwidth advantage widens with depth).  Byte-identical to llama.cpp
->   for the first 242 bytes of greedy output (sourdough_qwen35.sh gate).
-> * **Gemma-4 prefill** — `pp1800` 2734 t/s vs llama.cpp 2837 t/s
->   (**0.96× peer-FA**); `pp3700` 2703 t/s vs 2181 t/s (**1.24×
->   peer-FA AHEAD**) — hf2q's prefill rate drops only ~1% from
->   pp1800→pp3700 while llama's drops ~23%, so the cross-over is in
->   the lower part of this range.
-> * **TurboQuant 8-bit KV cache** — Qwen 3.6 35B-A3B at 32K context:
->   340 MiB vs 1.34 GiB F32 baseline = **3.94× memory savings**
->   (ADR-027 iter-34, regression-pinned by
->   `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).  Default-on for Qwen
->   3.5/3.6 as of 2026-05-17 — opt out with `HF2Q_TQ_KV=0`.
-> * **DeepSeek-V4-Flash-0731 Q2_K_S decode** — 45.1 t/s median on the
->   official 89.65 GiB hf2q-converted artifact vs 41.58 t/s for the
->   pinned llama.cpp reference. Required-tool grammar decode reaches
->   25.4 t/s and returns structured OpenAI tool calls.
->
-> Methodology references in
-> [`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md);
-> the historical 1.05× decode + 1.07-1.09× prefill claims (ADR-029
-> iter-175) were measured at a pre-HF2Q_NO_FA HEAD and do not hold
-> at current main per the re-bench above.
+> **Serving reliability is part of correctness.** The canonical SlotAware
+> launchers for native Qwen, Gemma, and DeepSeek give each agent an independent
+> full logical context while sharing model weights. Qwen SlotAware prefill advances in bounded GPU
+> transactions so active streams can decode and cancellation can be observed
+> between chunks. A fatal Metal command-buffer/watchdog/ignored-submission
+> error, or an independently observed transaction deadline that never
+> returns, fails the affected Qwen, Gemma, or DeepSeek worker closed;
+> the process must be recreated rather than submitting more work to a poisoned
+> queue. See [Full-context agentic serving](#full-context-agentic-serving),
+> [the shipping contract](docs/shipping-contract.md), and the family ADRs for
+> the exact supported surface and current evidence.
 
 | | |
 |---|---|
 | **License** | Apache-2.0 OR MIT (dual) |
-| **Rust** | 1.81+ |
-| **Inference backend** | [`mlx-native`](https://crates.io/crates/mlx-native) 0.9 (Apple Metal) — ADR-008 |
+| **Rust** | 1.88+ |
+| **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
-| **Status** | Pre-release on M-series Macs. Some paths are fast and well-tested (batched prefill, TQ KV cache, Qwen 3.5 / 3.6 convert + serve); others are incomplete or actively under investigation (spec-decode wire-up, multi-arch coverage). See the ADR ledger for per-feature status. |
+| **Status** | hf2q 0.1.3 is the current public Cargo release for Apple Silicon. The serving corrections described here are the **0.1.4 release candidate**; it resolves published, checksum-pinned `mlx-native 0.10.6`, but still requires clean packed-artifact and family hardware proof before publication. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
@@ -106,8 +86,8 @@ cargo build --release
 ./target/release/hf2q --help
 ```
 
-The default `mlx-native = "0.9"` declaration at `Cargo.toml:105` resolves
-from `crates.io`.  For local mlx-native development place a path
+The exact `mlx-native` declaration in `Cargo.toml` resolves from `crates.io`.
+For local mlx-native development place a path
 override in a gitignored `.cargo/config.toml` (template at
 `Cargo.toml:217+`) — out-of-the-box `cargo build` does NOT path-pin
 to a sibling checkout.
@@ -116,7 +96,7 @@ to a sibling checkout.
 
 - macOS with Metal Performance Shaders (M1 or newer).
 - A working Rust toolchain at the version pinned in `Cargo.toml`
-  (`rust-version = "1.81.0"`).
+  (`rust-version = "1.88.0"`).
 - Per-arch disk floor for convert (`src/arch/entries/`): **100 GB** for
   Qwen 3.5 dense, **150 GB** for Qwen 3.5 MoE. Smoke preflight refuses
   to start below `disk_floor_gb + 10`.
@@ -236,6 +216,41 @@ GGUF. `KV_CACHE_BUDGET_BYTES` independently caps aggregate physical KV
 high-water. Requests that cannot safely fit wait or fail explicitly instead of
 silently receiving a shorter context.
 
+Use `/readyz`, not merely `/health` or `/v1/models`, as the generation
+readiness probe. `/health` is process liveness. In the Unreleased SlotAware
+correction, a fatal Metal command-buffer/watchdog/ignored-submission error
+(including device-loss reports), or an independently observed transaction
+deadline, terminates every active and queued request for the affected Qwen,
+Gemma, or DeepSeek worker once, rejects new work with HTTP 503, and keeps
+`/readyz` unavailable. A slow SSE consumer is cancelled locally instead of
+blocking other slots.
+A supervisor must recreate the process/device generation; an in-process slot
+reset is not safe recovery from a poisoned Metal queue.
+
+Qwen3.5/Qwen3.6 SlotAware text chat uses at most 2,048 prompt tokens per GPU
+prefill transaction. Active decoders run before the next cold transaction,
+multiple cold prompts rotate fairly, and cache/ledger state advances only
+after every full-attention and MTP cursor agrees. SlotAware embeddings are
+limited to one <=2,048-token forward per admission quantum. Soft-token,
+deepstack, and 3D-position generation is rejected before Qwen SlotAware
+scheduler/SSE admission and before Qwen LM generation until its
+prefill and decode are scheduler-yielding; the separate SerialFifo primitive
+retains the historical multimodal path. Qwen3-VL remains a distinct model
+family rather than an approximate fallback through Qwen3.6 text serving.
+
+Long Gemma 4 text prefills use candidate 4,096-token transactions and split at
+the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and
+all configured HB, hybrid, dense, and MLX per-slot cursors are committed only
+after the complete transaction succeeds. Cross-slot cold and retained-prefix
+batches share the same 4,096-row aggregate Metal-transaction ceiling; lanes
+over that bound remain FIFO and return to scheduler-backed resumable states.
+When several compatible long-text states are installed, one transaction
+shares the 4,096 rows across those lanes instead of multiplying the bound by
+the number of slots. The 4,096-token ceiling is a
+family-specific candidate that must pass exact eager-versus-resumed real-model
+parity before release; it is not inherited from Qwen. Long Gemma soft-token
+prefill remains fail-closed until it has a resumable graph.
+
 On the target M5 Max host, the launcher defaults to the schema-v2,
 source-bound `deepseek4-agentic-q2` reproduction that passed the strict
 coherence, throughput, tool-use, and long-prefix cache gates. It enables
@@ -251,6 +266,98 @@ slot-aware and uses bounded admission/decode waves so several agents make
 progress without duplicating model weights. Embeddings and multimodal messages
 remain unsupported for DeepSeek and fail explicitly rather than selecting
 another family or runtime.
+
+DeepSeek cold and meaningful retained-prefix suffix work advances at native
+atomic verifier boundaries. At most two cold prefills own the single scratch
+arena concurrently. In a lopsided cohort, a decode-ready lane advances one
+token before each remaining cold-prefill transaction; if it becomes terminal,
+completion stays parked until the barrier lifts so its physical cache cannot
+be reused before a tool-result continuation. Cached-suffix work is not counted
+as cold-cohort work. With no cold barrier active, staggered warm work may join
+an existing decoder whenever another physical slot is free. Cancelling a
+cached suffix rolls back to a valid, position-consistent pre-request turn
+anchor; poisoned or inconsistent state still resets fully.
+
+`scripts/test_deepseek4_cached_suffix.sh` is the focused Apple-Silicon gate for
+that contract. It overlaps a three-transaction cached tool-result suffix with
+a live SSE decoder, then disconnects a separate cached suffix at transaction
+three and requires bounded stop, one cancellation count, no terminal Done,
+post-cancellation prefix reuse, readiness, and a clean fatal-log delta. Its
+focused receipt complements rather than replaces the unchanged four-agent
+agentic gate.
+
+The Qwen watchdog acceptance scripts are reproducible operator gates, not
+startup defaults. Existing receipts are causal local dependency-spike evidence;
+they are not final hf2q artifact authority. Release requires rerunning the same
+gates from a clean hf2q package resolving published `mlx-native 0.10.6`:
+
+- `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
+  552-token SSE lane immediately before the public 87,972-token/347-tool lane,
+  requires decode-first progress and the exact 43-chunk plan, and validates the
+  complete tool/SSE response.
+- `scripts/test_qwen36_prefill_cancellation.sh` runs with `MAX_SLOTS=1`, drops
+  the long stream at a transaction boundary, and proves exact slot reuse.
+- `scripts/test_qwen36_watchdog_harness_contract.sh` is the model-free negative
+  test for the receipt parser.
+
+The governing decisions and the old-failure-versus-final-artifact distinction
+are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,
+`docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
+`docs/ADR-040-continuous-batching-reopen.md`.
+
+#### Test the 0.1.4 serving candidate
+
+Build and verify the exact checkout before loading a model:
+
+```bash
+cargo check --locked --all-targets --all-features
+cargo build --release --locked
+
+# These are the focused serving contracts. CI also runs the library,
+# conversion, LCP, fixture, readiness, and parser-negative suites listed in
+# .github/workflows/ci.yml.
+cargo test --locked --bin hf2q --all-features \
+  qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features \
+  gemma4_bounded_prefill_tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features \
+  engine_supervisor::tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features deepseek4 -- \
+  --skip real_artifact_tests
+bash scripts/test_qwen36_watchdog_harness_contract.sh
+```
+
+Then start exactly one family from the same checkout. Setting `HF2Q_BIN`
+prevents a launcher from accidentally selecting an older repository build:
+
+```bash
+# Choose one launcher and leave it in the foreground.
+HF2Q_BIN="$PWD/target/release/hf2q" ./scripts/serve_qwen36_opencode.sh
+HF2Q_BIN="$PWD/target/release/hf2q" MMPROJ=/nonexistent \
+  ./scripts/serve_gemma4_opencode.sh
+HF2Q_BIN="$PWD/target/release/hf2q" ./scripts/serve_deepseek4_opencode.sh
+```
+
+In another terminal, verify readiness and run the matching four-agent gate:
+
+```bash
+curl --fail http://127.0.0.1:8081/readyz
+BASE_URL=http://127.0.0.1:8081 FAMILY=qwen36 AGENTS=4 \
+  ./scripts/test_full_context_agent_slots.sh
+
+curl --fail http://127.0.0.1:8082/readyz
+BASE_URL=http://127.0.0.1:8082 FAMILY=gemma4 AGENTS=4 \
+  ./scripts/test_full_context_agent_slots.sh
+
+curl --fail http://127.0.0.1:8080/readyz
+BASE_URL=http://127.0.0.1:8080 FAMILY=deepseek4 AGENTS=4 \
+  ./scripts/test_full_context_agent_slots.sh
+```
+
+Run one model at a time. A battery-powered run is useful for functional
+testing but is not performance authority; the release latency gates require
+AC power, clear thermal status, and the exact artifact/power receipts described
+in `docs/shipping-contract.md`.
 
 For MoE models, pass an APEX tier instead of a standard ftype:
 
@@ -337,9 +444,14 @@ HF │ input/       │ -> │ models/<arch>/   │ -> │ backends/    │
                                               └──────────────────┘
 ```
 
-## Performance
+## Historical performance snapshot
 
-Re-bench at HEAD 2026-05-17 on M5 Max against `llama.cpp` peer
+The following numbers are the matched 2026-05-17 M5 Max snapshot, not a claim
+about every later commit or model artifact. Re-run the linked protocol for a
+current purchasing or deployment decision; correctness and release gates do
+not treat these historical medians as continuously verified.
+
+Re-bench at the recorded HEAD on M5 Max against `llama.cpp` peer
 (build `389ff61d7`, `-fa 1`) with identical GGUFs.  3-run median;
 hf2q uses default config including the HF2Q_NO_FA hybrid-attn
 fix from commit `03328ee5`.  See
@@ -399,9 +511,9 @@ src/
 ├── quality/       cosine / KL / perplexity scorers
 ├── quantize/      Q-format codecs (legacy / K-quant / DWQ / mixed)
 └── serve/         OpenAI HTTP API, block-prefix KV cache, multi-model
-docs/              ADRs 004–031 + per-feature runbooks
-tests/             77 integration test files
-scripts/           109 bench / repro / runbook scripts
+docs/              architectural decisions + operator/runbook evidence
+tests/             integration, parity, packaging, and regression gates
+scripts/           launchers, benchmarks, incident repros, and runbooks
 ```
 
 ## Development
@@ -425,7 +537,14 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.
 - `docs/operating-kv-cache.md` — TurboQuant KV cache operator guide.
 - `docs/operator-env-vars.md` — every `HF2Q_*` env var, what it gates.
-- `docs/ADR-004…ADR-031` — every architectural decision, with rationale and verification status.
+- `docs/shipping-contract.md` — default, supported, experimental, and
+  investigation-only product surfaces.
+- `docs/ADR-019-mlx-native-encoder-architecture.md` — Metal encoder ownership
+  and pool-less worker lifetime contract.
+- `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md` — Qwen hybrid cache,
+  bounded prefill, cancellation, and watchdog containment.
+- `docs/ADR-040-continuous-batching-reopen.md` — full-context slot scheduling.
+- `docs/ADR-*.md` — architectural decisions, rationale, failed spikes, and verification status.
 
 ## License
 

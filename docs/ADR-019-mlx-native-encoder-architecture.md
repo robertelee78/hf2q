@@ -2,6 +2,13 @@
 
 **Status:** Proposed v1.1 (post-Codex Phase-2b review, 2026-05-03). D3 is the PRIMARY architectural target subject to Phase 0a evidence-based gates (xctrace residual attribution + D4 microprototype falsification). D2 (CPU dispatch_apply) REJECTED. D4 (MLX-style watermark) DEFERRED until Phase 0a.2 microprototype evidence; if D4 microprototype beats D3-projection on FA-path slice, ADR-019 is rewritten with D4 as primary.
 
+**Current status addendum (2026-08-08):** the original D3/D4 performance
+decision remains historical/proposed. The pool-less-worker Objective-C
+lifetime correction in [the 2026-08-08 addendum](#2026-08-08--pool-less-worker-command-buffer-lifetime-correction)
+is accepted architecture, pending publication of the corrected `mlx-native`
+patch and clean-artifact release gates. Earlier local dependency-spike trials
+are causal evidence, not registry release authority.
+
 
 
 - **Status:** Proposed (2026-05-03)
@@ -1423,3 +1430,92 @@ primitive test and a measured downstream win. Capture lifetime, exact suffix
 depth, checkpoint policy, and model-state semantics remain in hf2q. A local
 Cargo patch is valid only for the spike; accepted hf2q evidence must resolve a
 published registry revision.
+
+## 2026-08-08 — pool-less worker command-buffer lifetime correction
+
+### Observed failure and falsified explanations
+
+After Qwen long-prefill work was bounded to 2,048-token transactions, one
+87,972-token request completed successfully, but the same process later
+stalled during a four-agent cold wave. The scheduler executes only one Qwen
+forward transaction at a time, so this was not four simultaneous graphs. The
+worker sample blocked before Rust regained control, inside
+`-[AGX commandQueue commandBuffer]` waiting on the queue semaphore; it was not
+blocked in `waitUntilCompleted`, SSE output, or cache admission.
+
+The receipt contains exactly 63 successful bounded multi-token forwards and
+no completion for the next transaction. Apple's Metal headers document that a
+default command queue permits up to 64 non-completed command buffers. The
+preserved heap held 37,999 `AGXG17XFamilyCommandBuffer` objects and 37,998
+matching implementation objects, with 38,063 896-byte and 38,059 640-byte
+allocations. Those object counts rule out ordinary GPU execution backlog or
+retained KV as the primary cause.
+
+### Root cause
+
+hf2q's slot-aware inference worker is a long-lived raw Rust thread without an
+Objective-C autorelease pool. Metal's `commandBuffer`, compute-encoder, and
+label factories return autoreleased objects. `mlx-native` retained the returned
+objects for Rust ownership, but dropping that explicit retain did not drain the
+original autorelease claim on the pool-less worker.
+
+Qwen's session path made the queue leak deterministic. Every final-layer
+`commit_and_wait_labeled` unconditionally called `reset_for_next_stage`, which
+opened a fresh empty command buffer. Session/output-head fusion is disabled in
+this configuration, so the output head used a separate encoder and the fresh
+session buffer was never committed. One non-completed buffer therefore leaked
+per forward in addition to the broader autoreleased-object accumulation.
+
+### Accepted architecture
+
+The family-neutral lifetime fix belongs in `mlx-native`: scope autorelease
+pools around both command-buffer factory/retain sites, the compute-encoder
+factory/retain site, and label setters whose metal-rs bridge creates temporary
+NSStrings. Rust or explicit retains survive the local pool; temporary +0
+Objective-C claims do not. Metal label properties copy synchronously, so the
+NSString temporary can be drained after the setters. A failed intermediate
+test had read a fresh command buffer's nullable label through metal-rs's
+non-null `&str` surface; the accepted test compares Metal object identity
+instead. hf2q adds a separate graph-side invariant: a final session terminal
+drains and does not rotate, while reusable non-final terminals continue to
+rotate normally.
+
+The smallest native regression runs on an isolated raw Rust thread and exceeds
+the observed failure population: 50,000 command-buffer/compute-encoder drops,
+50,000 labeled commits, and 50,000 `EncoderSession` commit/reset/drop cycles,
+followed by a committed sentinel. A parent-process timeout kills and fails the
+child if Objective-C allocation wedges, because an in-worker elapsed-time
+check cannot observe a call that never returns from Metal.
+
+### Causal spike and landing gate
+
+A temporary dependency spike removed the object cliff: after the exact
+87,972-token SSE request, heap enumeration found zero live AGX command-buffer
+objects (versus 37,999 before), and the subsequent full four-agent
+tool/SSE/cache gate completed. Three fresh-process repetitions with the final
+local integration binary repeated that cumulative order. Long walls were
+100.061, 99.572, and 104.823 seconds; every request completed all 43 chunks,
+the following four-agent gate passed, and a post-gate tiny SSE completed in
+0.215--0.241 seconds. Heap enumeration after both the long request and the
+full gate found zero AGX command-buffer objects in every trial. The 896/640
+byte allocation populations remained bounded at 58/55--59, versus
+38,063/38,059 in the failed receipt; physical footprint was 42.7 GiB in all
+three trials. Those trials also exposed deterministic label-string growth from
+6,658 to 54,243 live CFStrings while label setters were outside the pool; the
+accepted native diff includes the label scope, and a clean-artifact heap gate
+must prove that final seam before landing.
+
+The final native correction is published as `mlx-native 0.10.6` from merged
+commit `94bf1055ddb487430b22307f064b40c24689beb1`; the crates.io archive
+checksum is
+`2652aadc2712ee588168382f62dfe3964e2c205fc4430fa4dc1e40e913fa308e`.
+Version 0.10.5 closed the live command-buffer cliff but did not close the
+copied-label lifetime: repeated identical waves still grew live CFStrings by
+47,486 and 47,484. Version 0.10.6 pools Rust-owned command-buffer destruction,
+clears the compute-encoder copied label before release, removes the redundant
+high-rate counter-descriptor label, and adds a fail-closed 0/N/2N heap slope
+test with an unpooled negative control. Exact Metal System Trace evidence pins
+normal synchronous, asynchronous, and fenced command-buffer/encoder labels.
+hf2q still must repeat the applicable packed-artifact and family heap gates
+from a clean source tree resolving that exact registry pin. Raising the queue
+cap, reducing slot count, or restarting periodically is rejected as a fix.
