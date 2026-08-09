@@ -6,12 +6,16 @@ use mlx_native::MlxBuffer;
 use crate::serve::api::engine::{
     arm_lazy_tool_grammar, effective_repetition_penalty, GenerationResult, SamplingParams,
 };
+use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
 use crate::serve::api::registry::{self, ModelRegistration, SplitSlot};
 use crate::serve::sampler_pure;
 
 use super::progress::RequestProgress;
-use super::{release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard};
+use super::{
+    release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard,
+    GPU_TRANSACTION_TIMEOUT,
+};
 
 pub(super) fn sampler_config(params: &SamplingParams) -> sampler_pure::SamplingParams {
     sampler_pure::SamplingParams {
@@ -78,6 +82,7 @@ pub(super) fn sample(
     sampler: &sampler_pure::SamplingParams,
     previous: &[u32],
     runtime: &mut Option<GrammarRuntime>,
+    supervisor: &EngineSupervisor,
 ) -> Result<(u32, Option<f32>)> {
     let needs_cpu = params.temperature > 0.0
         || params.top_k > 0
@@ -87,7 +92,11 @@ pub(super) fn sample(
         || runtime.is_some()
         || params.logprobs;
     if !needs_cpu {
-        return loaded.model.greedy_token(logits).map(|token| (token, None));
+        return supervisor
+            .run("deepseek4_greedy_sample", GPU_TRANSACTION_TIMEOUT, || {
+                loaded.model.greedy_token(logits)
+            })
+            .map(|token| (token, None));
     }
     let mut values = logits
         .as_slice::<f32>()
@@ -175,17 +184,23 @@ pub(super) fn split_reasoning(
     (content, (!reasoning.is_empty()).then_some(reasoning))
 }
 
-pub fn generate_once(
+pub(in crate::serve::api) fn generate_once(
     loaded: &mut Deepseek4LoadedModel,
     prompt_tokens: &[u32],
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
+    supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
     let scratch_guard = RequestScratchGuard::new();
     let mut progress = RequestProgress::start("unary", prompt_tokens.len(), params.max_tokens);
     let prefill_started = Instant::now();
-    let (mut logits, cached_tokens) =
-        loaded.prefill_suffix(prompt_tokens, params.max_tokens, || false, &mut progress)?;
+    let (mut logits, cached_tokens) = loaded.prefill_suffix(
+        prompt_tokens,
+        params.max_tokens,
+        || false,
+        &mut progress,
+        supervisor,
+    )?;
     let prefill_duration = prefill_started.elapsed();
     progress.finish_prefill(prefill_duration);
     release_completed_prefill_scratch();
@@ -206,7 +221,15 @@ pub fn generate_once(
     let mut finish_reason = "length";
 
     for step in 0..max_tokens {
-        let (token, logprob) = sample(loaded, &logits, params, &sampler, &generated, &mut runtime)?;
+        let (token, logprob) = sample(
+            loaded,
+            &logits,
+            params,
+            &sampler,
+            &generated,
+            &mut runtime,
+            supervisor,
+        )?;
         if loaded.eos_token_ids.contains(&token) {
             finish_reason = "stop";
             break;
@@ -234,7 +257,7 @@ pub fn generate_once(
             break;
         }
         if step + 1 < max_tokens {
-            logits = loaded.commit_generated_token(token)?;
+            logits = loaded.commit_generated_token(token, supervisor)?;
         }
         progress.advance_decode(generated.len());
     }

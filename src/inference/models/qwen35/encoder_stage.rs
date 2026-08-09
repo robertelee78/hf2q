@@ -58,11 +58,12 @@
 //! (one allocation, one drop).  The `reset_for_next_stage` call inside the
 //! Sessioned arm of `fence_or_commit` rotates to a fresh CB that is THE
 //! NEXT STAGE'S DISPATCH TARGET, not a discarded one.  The encoded wait
-//! orders that next CB behind the prior fence's signal-event.  Each
-//! `reset_for_next_stage` is matched 1:1 by a subsequent fence or commit on
-//! the same session.  The terminal output-head `commit_and_wait` drains the
-//! GPU and clears `fence_pending`; the session drops at end of
-//! `forward_gpu_impl` in the Drained state — `Drop` Case 1 — clean release.
+//! orders that next CB behind the prior fence's signal-event.  Every
+//! non-final `reset_for_next_stage` is matched 1:1 by a subsequent fence or
+//! commit on the same session.  The final transformer layer uses
+//! `commit_and_wait_labeled_terminal`, which drains without opening an empty
+//! next-stage CB; the separate output-head encoder then runs after the layer
+//! session is already Drained.
 //!
 //! # iter91 H2 CB-count reduction LANDED
 //!
@@ -393,6 +394,20 @@ impl<'sess> LayerEncoder<'sess> {
     /// after wait — propagated from the underlying `CommandEncoder` /
     /// `EncoderSession` impl.
     pub(super) fn commit_and_wait_labeled(self, label: &str) -> Result<()> {
+        self.commit_and_wait_labeled_impl(label, true)
+    }
+
+    /// Drain the final transformer stage without opening an unused next CB.
+    ///
+    /// The output head owns a separate encoder when `EncoderSession` is
+    /// active, so the last layer has no consumer for `reset_for_next_stage`.
+    /// Allocating one there leaves an empty, uncommitted command buffer until
+    /// the session drops and needlessly consumes a queue slot.
+    pub(super) fn commit_and_wait_labeled_terminal(self, label: &str) -> Result<()> {
+        self.commit_and_wait_labeled_impl(label, false)
+    }
+
+    fn commit_and_wait_labeled_impl(self, label: &str, reset_for_next_stage: bool) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => enc
                 .commit_and_wait_labeled(label)
@@ -415,11 +430,75 @@ impl<'sess> LayerEncoder<'sess> {
                 // K-boundary callers needed pre-iter91 from the Plain arm
                 // (`device.command_encoder()` opens a fresh CB for the
                 // next layer).
-                sess.reset_for_next_stage().with_context(|| {
-                    format!("EncoderSession::reset_for_next_stage after commit_and_wait({label})")
-                })?;
+                if reset_for_next_stage {
+                    sess.reset_for_next_stage().with_context(|| {
+                        format!(
+                            "EncoderSession::reset_for_next_stage after commit_and_wait({label})"
+                        )
+                    })?;
+                }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_session_terminal_does_not_allocate_an_unused_command_buffer() {
+        if !LayerEncoder::env_enabled() {
+            eprintln!("SKIP: rerun with HF2Q_ENCODER_SESSION=1");
+            return;
+        }
+
+        let _gpu_test_lock = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("create Metal device");
+        mlx_native::reset_counters();
+        let mut session = device
+            .encoder_session()
+            .expect("create encoder session")
+            .expect("HF2Q_ENCODER_SESSION=1 must create a session");
+        assert_eq!(mlx_native::cmd_buf_count(), 1);
+
+        LayerEncoder::Sessioned(&mut session)
+            .commit_and_wait_labeled_terminal("test.final_layer")
+            .expect("drain final transformer layer");
+
+        assert!(session.is_drained());
+        assert_eq!(
+            mlx_native::cmd_buf_count(),
+            1,
+            "final-layer drain must not allocate a next-stage command buffer"
+        );
+    }
+
+    #[test]
+    fn reusable_session_terminal_still_rotates_for_the_next_layer() {
+        if !LayerEncoder::env_enabled() {
+            eprintln!("SKIP: rerun with HF2Q_ENCODER_SESSION=1");
+            return;
+        }
+
+        let _gpu_test_lock = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("create Metal device");
+        mlx_native::reset_counters();
+        let mut session = device
+            .encoder_session()
+            .expect("create encoder session")
+            .expect("HF2Q_ENCODER_SESSION=1 must create a session");
+
+        LayerEncoder::Sessioned(&mut session)
+            .commit_and_wait_labeled("test.reusable_layer")
+            .expect("drain reusable transformer layer");
+
+        assert!(!session.is_drained());
+        assert_eq!(
+            mlx_native::cmd_buf_count(),
+            2,
+            "reusable drain must allocate exactly one next-stage command buffer"
+        );
     }
 }

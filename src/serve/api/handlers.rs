@@ -493,24 +493,8 @@ async fn chat_completions_with_prepared(
             // surfaced with iter-10a's multimodal failure ("forward
             // step 0 (multimodal)" hid the real underlying error).
             let msg = format!("{e:#}");
-            // Distinguish queue_full (→ 429) from other engine errors (→ 500).
-            if msg.contains("queue_full") {
-                state
-                    .metrics
-                    .chat_completions_queue_full
-                    .fetch_add(1, Ordering::Relaxed);
-                return queue_full_with_rate_limit_headers(&state);
-            }
-            // ADR-040 §3.5 iter-A5b — typed-prefix routing for the
-            // shared physical KV budget rejection. The worker_run admit arms
-            // wrap `AdmitError::SlotBudgetExceeded` in an anyhow error
-            // whose message starts with `slot_budget_exceeded:`; the
-            // handler maps it to HTTP 429 + Retry-After parallel to
-            // queue_full but with a distinct `slot_budget_exceeded`
-            // code for observability.
-            if msg.contains("slot_budget_exceeded") {
-                let (needed, budget) = parse_slot_budget_exceeded(&msg);
-                return ApiError::slot_budget_exceeded(needed, budget).into_response();
+            if let Some(response) = common_engine_error_response(Some(&state), &msg) {
+                return response;
             }
             // ADR-005 Phase 4 reopen iter-215 Wedge-2: Qwen3.5/3.6 SERVE-side
             // chat completion path returns the sentinel; map to HTTP 501 with
@@ -1099,6 +1083,13 @@ where
         )
         .into_response());
     }
+    if req.messages.is_empty() {
+        return Err(ApiError::invalid_request(
+            "messages must contain at least one entry",
+            Some("messages".into()),
+        )
+        .into_response());
+    }
 
     // --- Pool-routed engine resolution (iter-209) ---
     // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
@@ -1108,14 +1099,12 @@ where
     // when the auto-pipeline cannot resolve the requested name.
     let loaded_engine = resolver(state, req.model.clone()).await?;
     let engine: &Engine = &loaded_engine.engine;
-    if req.messages.is_empty() {
-        return Err(ApiError::invalid_request(
-            "messages must contain at least one entry",
-            Some("messages".into()),
-        )
-        .into_response());
+    if !engine.is_worker_healthy() {
+        return Err(
+            ApiError::engine_unhealthy(engine::ENGINE_UNHEALTHY_MESSAGE.to_string())
+                .into_response(),
+        );
     }
-
     // --- Multimodal content pipeline (Phase 2c — Decision #1, iter-99) ---
     // Scan messages for `image_url` content parts; if any are present,
     // require a mmproj, parse each URL, load the bytes, and preprocess
@@ -1928,10 +1917,27 @@ async fn chat_completions_stream(
     // request gives us the typed-error seam to short-circuit to
     // ApiError::slot_budget_exceeded with a wire-level shape
     // identical to queue_full (429 + Retry-After: 1).
-    if let Err(e) = engine.try_admit_budget(
-        prepared.prompt_tokens.len() as u32,
-        prepared.params.max_tokens as u32,
-    ) {
+    let prompt_token_count_u32 = match u32::try_from(prepared.prompt_tokens.len()) {
+        Ok(value) => value,
+        Err(_) => {
+            return ApiError::invalid_request(
+                "rendered prompt token count exceeds the engine request limit",
+                Some("messages".into()),
+            )
+            .into_response();
+        }
+    };
+    let max_token_count_u32 = match u32::try_from(prepared.params.max_tokens) {
+        Ok(value) => value,
+        Err(_) => {
+            return ApiError::invalid_request(
+                "max_tokens exceeds the engine request limit",
+                Some("max_tokens".into()),
+            )
+            .into_response();
+        }
+    };
+    if let Err(e) = engine.try_admit_budget(prompt_token_count_u32, max_token_count_u32) {
         match e {
             engine::EngineAdmitError::SlotBudgetExceeded {
                 needed_bytes,
@@ -1958,23 +1964,9 @@ async fn chat_completions_stream(
         )
         .await
     {
-        let msg = format!("{e}");
-        if msg.contains("queue_full") {
-            state
-                .metrics
-                .chat_completions_queue_full
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return queue_full_with_rate_limit_headers(&state);
-        }
-        // ADR-040 §3.5 iter-A5b — defense-in-depth slot_budget_exceeded
-        // routing for the streaming arm (parallel to the non-streaming
-        // chat handler at line ~436). Today this branch is reached only
-        // if `engine.try_admit_budget` was bypassed (e.g. enforcement
-        // disabled at the engine level but enabled at the scheduler
-        // level — a configuration error). Mantra-aligned typed match.
-        if msg.contains("slot_budget_exceeded") {
-            let (needed, budget) = parse_slot_budget_exceeded(&msg);
-            return ApiError::slot_budget_exceeded(needed, budget).into_response();
+        let msg = format!("{e:#}");
+        if let Some(response) = common_engine_error_response(Some(&state), &msg) {
+            return response;
         }
         tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
         return ApiError::generation_error(msg).into_response();
@@ -2001,6 +1993,7 @@ async fn chat_completions_stream(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono_seconds();
+    let events_rx = engine.supervise_stream_events(events_rx);
     let sse = generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts);
     let mut response = sse.into_response();
     apply_transparency_headers(
@@ -6434,6 +6427,94 @@ fn parse_slot_budget_exceeded(msg: &str) -> (u64, u64) {
     )
 }
 
+/// Map the engine's stable typed prefixes to their OpenAI wire classes.
+///
+/// Both unary generation and pre-SSE admission pass through this helper so
+/// an engine-boundary validation failure cannot silently drift from 400 to
+/// 500 depending on `stream`. Runtime faults intentionally return `None` and
+/// remain `generation_error` at the caller.
+fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<Response> {
+    use std::sync::atomic::Ordering;
+
+    if msg.contains("queue_full") {
+        if let Some(state) = state {
+            state
+                .metrics
+                .chat_completions_queue_full
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(queue_full_with_rate_limit_headers(state));
+        }
+        return Some(ApiError::queue_full().into_response());
+    }
+    if msg.contains("slot_budget_exceeded") {
+        let (needed, budget) = parse_slot_budget_exceeded(msg);
+        return Some(ApiError::slot_budget_exceeded(needed, budget).into_response());
+    }
+    if msg.contains(engine::ENGINE_UNHEALTHY_SENTINEL) {
+        return Some(ApiError::engine_unhealthy(msg.to_string()).into_response());
+    }
+    if msg.contains("invalid_request:") {
+        return Some(ApiError::invalid_request(msg.to_string(), None).into_response());
+    }
+    if msg.contains("capability_unsupported:") {
+        return Some(ApiError::capability_unsupported(msg).into_response());
+    }
+    None
+}
+
+#[cfg(test)]
+mod qwen_engine_wire_error_tests {
+    use super::*;
+    use crate::serve::api::ServerConfig;
+    use axum::body::to_bytes;
+
+    async fn assert_wire_class(message: &str, status: StatusCode, code: Option<&str>) {
+        let state = AppState::new(ServerConfig::default());
+        let response = common_engine_error_response(Some(&state), message)
+            .expect("stable engine prefix must have an HTTP mapping");
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("OpenAI error JSON");
+        match code {
+            Some(code) => assert_eq!(json["error"]["code"], code),
+            None => assert!(json["error"]["code"].is_null()),
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_and_pre_sse_engine_errors_keep_their_wire_classes() {
+        assert_wire_class(
+            "slot-aware prefill: invalid_request: max_tokens exceeds u32",
+            StatusCode::BAD_REQUEST,
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_and_unhealthy_engine_errors_are_not_generation_500s() {
+        assert_wire_class(
+            "capability_unsupported: Qwen35 SlotAware soft-token generation",
+            StatusCode::NOT_IMPLEMENTED,
+            Some("capability_unsupported"),
+        )
+        .await;
+        assert_wire_class(
+            &format!(
+                "{}: poisoned Metal generation",
+                engine::ENGINE_UNHEALTHY_SENTINEL
+            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("engine_unhealthy"),
+        )
+        .await;
+        let state = AppState::new(ServerConfig::default());
+        assert!(common_engine_error_response(Some(&state), "ordinary graph error").is_none());
+    }
+}
+
 fn queue_full_with_rate_limit_headers(state: &AppState) -> Response {
     use axum::http::{header::HeaderName, HeaderValue};
     let err = ApiError::queue_full();
@@ -6899,29 +6980,9 @@ async fn chat_model_embeddings(engine: super::engine::Engine, req: EmbeddingRequ
         let embedding: Vec<f32> = match engine.embed(prompt_tokens).await {
             Ok(v) => v,
             Err(e) => {
-                let msg = format!("{e}");
-                if msg.contains("queue_full") {
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        [(axum::http::header::RETRY_AFTER, "1")],
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": "engine queue full; retry shortly",
-                                "type": "rate_limit_exceeded",
-                                "param": null,
-                                "code": "queue_full"
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
-                // ADR-040 §3.5 iter-A5b — defense-in-depth
-                // slot_budget_exceeded routing for the embeddings
-                // arm; reaches this branch only if pre-dispatch was
-                // bypassed (configuration error).
-                if msg.contains("slot_budget_exceeded") {
-                    let (needed, budget) = parse_slot_budget_exceeded(&msg);
-                    return ApiError::slot_budget_exceeded(needed, budget).into_response();
+                let msg = format!("{e:#}");
+                if let Some(response) = common_engine_error_response(None, &msg) {
+                    return response;
                 }
                 // Iter-215 Wedge-2: Qwen3.5/3.6 embed sentinel → 501.
                 if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
@@ -9091,6 +9152,44 @@ mod readiness_guard_tests {
     use super::super::state::{AppState, ServerConfig};
     use super::*;
     use axum::http::header::RETRY_AFTER;
+    use std::time::SystemTime;
+
+    fn minimal_chat_request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            top_p: None,
+            seed: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stream_options: None,
+            top_k: None,
+            repetition_penalty: None,
+            min_p: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            parallel_tool_calls: None,
+            hf2q_overflow_policy: None,
+            hf2q_enable_thinking: None,
+            chat_template_kwargs: None,
+        }
+    }
 
     /// Verify that `ApiError::not_ready()` (the error emitted by the early-503
     /// guard) produces HTTP 503 + `Retry-After: 1`.  The guard in
@@ -9105,6 +9204,17 @@ mod readiness_guard_tests {
             .get(RETRY_AFTER)
             .expect("Retry-After must be set on not_ready");
         assert_eq!(ra, "1");
+    }
+
+    #[test]
+    fn engine_unhealthy_error_is_503_with_retry_after_1() {
+        let resp = ApiError::engine_unhealthy(engine::ENGINE_UNHEALTHY_MESSAGE).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After must be set on engine_unhealthy");
+        assert_eq!(retry_after, "1");
     }
 
     /// The readiness flag starts true (server is ready after `AppState::new`)
@@ -9218,6 +9328,90 @@ mod readiness_guard_tests {
             .get(RETRY_AFTER)
             .expect("Retry-After header must be present on not-ready 503");
         assert_eq!(ra, "1", "not-ready Retry-After must be 1 second");
+    }
+
+    #[tokio::test]
+    async fn dead_engine_in_pool_keeps_health_live_and_readiness_unavailable() {
+        for (arch, model) in [
+            (engine::LoadedArch::Qwen35, "dead-qwen"),
+            (engine::LoadedArch::Gemma, "dead-gemma"),
+            (engine::LoadedArch::Deepseek4, "dead-deepseek"),
+        ] {
+            let state = AppState::new(ServerConfig::default());
+            let engine = engine::make_synthetic_engine_for_test(arch);
+            engine.shutdown().await.expect("stop synthetic worker");
+            assert!(!engine.is_worker_healthy());
+            state
+                .pool
+                .write()
+                .expect("lock pool")
+                .admit_for_test(model, QuantType::Q4_K_M, 1_024, engine)
+                .expect("admit dead synthetic engine");
+
+            let health_response = health(State(state.clone())).await.into_response();
+            assert_eq!(health_response.status(), StatusCode::OK, "arch={arch:?}");
+            let ready_response = readyz(State(state.clone())).await.into_response();
+            assert_eq!(
+                ready_response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "arch={arch:?}"
+            );
+            assert_eq!(
+                ready_response.headers().get(RETRY_AFTER),
+                Some(&axum::http::HeaderValue::from_static("1")),
+                "arch={arch:?}"
+            );
+
+            let resolver = |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
+                unreachable!("global readiness must reject before resolving a dead pooled engine")
+            };
+            let response =
+                match prepare_chat_generation_core(&state, &minimal_chat_request(model), resolver)
+                    .await
+                {
+                    Err(response) => response,
+                    Ok(_) => panic!("dead pooled engine must reject generation for {arch:?}"),
+                };
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "arch={arch:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_dying_during_resolution_maps_to_engine_unhealthy_503() {
+        let state = AppState::new(ServerConfig::default());
+        assert!(state.is_ready_for_gen(), "empty pool starts globally ready");
+        let engine = engine::make_synthetic_engine_for_test(engine::LoadedArch::Qwen35);
+        engine.shutdown().await.expect("stop synthetic worker");
+        let loaded = Arc::new(LoadedEngine {
+            engine,
+            repo: "raced-dead-qwen".to_string(),
+            quant: QuantType::Q4_K_M,
+            bytes_resident: 1_024,
+            loaded_at: SystemTime::now(),
+        });
+        let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
+            let loaded = Arc::clone(&loaded);
+            Box::pin(async move { Ok(loaded) })
+        };
+        let response = match prepare_chat_generation_core(
+            &state,
+            &minimal_chat_request("raced-dead-qwen"),
+            resolver,
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("resolver-returned dead engine must reject generation"),
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("1"))
+        );
     }
 }
 

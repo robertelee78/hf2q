@@ -1345,6 +1345,22 @@ impl InflightBatchedScheduler {
         };
     }
 
+    /// Move a still-prefilling request behind its prefilling peers.
+    ///
+    /// This is an explicit driver callback rather than the scheduler's
+    /// global default: Qwen long-context serving uses it after each bounded
+    /// transaction so two cold agents alternate, while families with proven
+    /// cohort/FIFO policies remain unchanged.
+    pub fn yield_prefill_turn(&mut self, handle: SlotHandle) {
+        let Some(index) = self.in_flight.iter().position(|slot| {
+            slot.handle == handle && matches!(slot.phase, SlotPhase::Prefilling { .. })
+        }) else {
+            return;
+        };
+        let slot = self.in_flight.remove(index);
+        self.in_flight.push(slot);
+    }
+
     /// Driver callback: report that `handle` just emitted one decode
     /// token. Auto-releases when `tokens_produced >= max_tokens`. Stale
     /// handles, wrong-phase slots, and unknown handles are silent no-ops.

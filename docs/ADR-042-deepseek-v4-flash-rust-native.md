@@ -1015,10 +1015,12 @@ tokens to every slot through demand-grown physical admission.
 
 The accepted scheduling policy uses an eight-token decode quantum and
 resumable cold prefill at atomic cache+ledger commit boundaries. At most two
-cold requests alternate complete matrix transactions through the one shared
-prefill scratch arena. Decode-ready members are parked until the bounded cold
-cohort completes prefill, preventing early responses from producing cached
-traffic that delays the remaining cold agents. Once the cohort drains,
+active cold prefills alternate complete matrix transactions through the one
+shared prefill scratch arena. The next-release fairness correction advances a
+decode-ready member by one token before each remaining transaction and parks
+only its terminal completion until the cohort drains. This prevents early
+responses from producing cached traffic that delays the remaining cold agents
+while bounding the short lane's semantic gaps. Once the cohort drains,
 longest-prefix continuations run before unrelated cold work can evict a
 retained agent cache. A paired long-row graph exceeded Metal memory, and a
 batched-output-head-only spike did not improve the cold tail; neither failed

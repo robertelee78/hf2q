@@ -134,13 +134,16 @@ their template-marker/tool-response validators during load. DeepSeek reports
 family templates fail closed; the fallback templates exist only for GGUFs
 whose metadata genuinely omits a template and remain family-specific.
 
-#### Three-family acceptance evidence (M5 Max, 2026-08-08)
+#### Three-family baseline evidence (M5 Max, 2026-08-08)
 
 The checked-in `scripts/test_full_context_agent_slots.sh` runs four independent
 OpenCode-shaped conversations concurrently. Each conversation proves a cold
 required tool call, cached repeat, automatic tool selection, SSE tool-call
 reconstruction, tool-result continuation, and a source-shaped argument. The
 canonical launchers configure four slots by default without dividing context.
+This table predates the Qwen watchdog correction in §7.QWEN. Gemma and
+DeepSeek retain their family evidence; current Qwen release authority comes
+from the clean-artifact gates in §7.QWEN rather than the older Qwen row.
 
 | Family | Logical context per slot | Four-agent evidence |
 |---|---:|---|
@@ -149,11 +152,13 @@ canonical launchers configure four slots by default without dividing context.
 | DeepSeek-V4 | 524,288 | Two powered gates passed: 6,677/6,685 minimum prefix reuse; maximum cached TTFT 268.68 ms; cached unary/SSE turns completed in 6-13 s and every tool-result turn completed within 20-32 s. Exact server-side cold-cohort makespans were 53.86 s and 52.32 s (53.09 s median), versus about 54.1 s for matched llama.cpp with four unified 131,072-token slots. llama.cpp's 524,288-token unified allocation did not fit beside the 100 GiB artifact on this 128 GiB host; hf2q retained 524,288 logical tokens per slot under demand-grown physical admission. |
 
 DeepSeek uses a bounded decode quantum of eight tokens and resumable cold
-prefill at the verifier's atomic cache-commit boundary. At most two cold slots
-alternate complete matrix transactions through one scratch arena. Decode-ready
-members remain parked until the bounded cold cohort has finished prefill, then
-the cohort decodes fairly. That barrier prevents an early agent from creating
-cached continuation work that steals the remaining cold agents' deadline.
+prefill at the verifier's atomic cache-commit boundary. At most two active cold
+prefills alternate complete matrix transactions through one scratch arena. A
+decode-ready member advances by one token before each remaining cold-prefill
+transaction; if it becomes terminal, completion remains parked until the
+cohort finishes prefill. That preserves bounded semantic progress without
+allowing early cached continuation work to steal the remaining cold agents'
+deadline or evict the completed member's cache.
 After the cold cohort drains, cache-bearing requests take precedence over
 unrelated cold requests so a retained agent slot cannot be evicted between a
 tool call and its result. Within every wave, each slot retains independent
@@ -162,9 +167,9 @@ scheduling policy, not a claim of fused DeepSeek verification.
 
 The cross-family contract is the full logical context per slot, physical
 high-water admission, retained-session affinity, and fair bounded decode—not
-the DeepSeek cohort width itself. Gemma 4 and Qwen 3.6 keep their measured fast
-prefill paths and the generic 512-token scheduler quantum because their exact
-four-agent gates already meet the latency and coherence contract. A cold-cohort
+the DeepSeek cohort width itself. Gemma 4 retains its measured prefill policy.
+Qwen 3.6 now uses the family-specific 2,048-token atomic prefill transaction
+defined in §7.QWEN; the earlier generic 512-token statement is superseded. A cold-cohort
 barrier may be enabled for either family only after a source-bound gate proves
 the same cold-prefill cascade; copying DeepSeek's constant without that
 evidence would delay first semantic output.
@@ -1244,6 +1249,104 @@ All four Phase iter-1 scaffolding tracks landed in parallel under goal-mode dire
 **Result.** The §7.LCP "next wall" is closed: 8 concurrent ~32k-context connections (the real agent workload) prefill via O(seq) FA globals with no O(seq²) `pf_kq` (would have been 68.7 GB), no GPU faults, byte-stable outputs, with zero behavior change for all traffic ≤ 8192. Remaining speed work (0.89× llama decode at 8k×8, K-quant batched kernel) is the separate M-SPEED-LC milestone.
 
 ---
+## 7.QWEN — bounded prefill transactions and fatal-device ownership (2026-08-08)
+
+The Qwen SlotAware driver previously bypassed the scheduler's prefill phase:
+admission ran the entire uncached suffix synchronously and installed Decode
+only after first-token sampling. An 87,972-token tool prompt therefore starved
+an admitted 552-token stream and exceeded Metal's command-buffer watchdog.
+Reducing one kernel tile or FFN terminal K does not solve this architectural
+ownership error because the worker still cannot schedule or cancel between
+outer graph transactions.
+
+Qwen now installs `Prefill` work at admission. One scheduling quantum advances
+at most 2,048 prompt tokens; `Mixed` runs all eligible decode handles before
+one prefill transaction, and a successful pending transaction rotates its
+prefill handle behind other cold Qwen work. Scheduler accounting advances only
+after the cache validates every full-attention and MTP cursor. Failed work is
+never published as a partial cache ledger or anchor.
+
+The recovery boundary is model-worker-wide for a typed fatal Metal
+command-buffer/watchdog/ignored-submission error, including device-loss
+reports. That path closes the receiver before draining
+outstanding pre-close permits, fails every active and buffered reply once,
+marks readiness false, and performs no later Metal submission or cache reset.
+Request-local validation, client cancellation, and bounded SSE backpressure
+remain slot-local. A thread blocked inside Objective-C command-buffer
+allocation cannot classify its own hang, so a mode-neutral `EngineSupervisor`
+outside the worker observes an armed transaction lease. Deadline expiry is
+one-way: `/readyz` and new generation fail closed, unary/SSE waiters terminate,
+and a late Metal return cannot publish scheduler/cache state or resume work.
+ADR-019's native lifetime correction removes the deterministic ownership
+cliff; OS supervision remains the only safe authority for reclaiming and
+restarting a poisoned process/device generation.
+
+Transaction size and scheduling remain family-specific. The shared fatal
+worker boundary now covers Qwen, Gemma, and DeepSeek, but it does not unify
+their forward graphs. Gemma's candidate 4,096-token text transaction and
+DeepSeek's native verifier transaction require separate parity and latency
+gates; neither inherits Qwen's 2,048-token constant.
+
+The production Qwen SlotAware contract here is plain-text chat. Embed work is
+limited to one <=2,048-token forward per admission quantum. Soft-token,
+deepstack, and 3D-position generation is rejected before Qwen SlotAware
+scheduler/SSE admission and before Qwen LM generation because its
+legacy implementation performs a whole-request inline decode; SerialFifo
+retains that historical multimodal path. Accepting and then dropping those
+fields is forbidden.
+
+## 7.GEMMA-PREFILL — candidate resumable text transactions (2026-08-08)
+
+The Qwen audit exposed the same admission-time starvation class in Gemma:
+SlotAware text admission ran the complete prompt before the scheduler could
+decode a peer or observe cancellation. The next-release candidate installs a
+Gemma `Prefill` state for plain-text prompts above 4,096 tokens. Each step
+advances at most 4,096 tokens and never crosses the stable-prefix boundary.
+`Mixed` decodes first, successful pending work yields its prefill turn, and
+the first sampled token/anchor/SSE seed is produced only by final `Ready`.
+
+The limit is per Metal transaction, not per logical lane. Cross-slot admission
+validates every lane before scheduler admission and coalesces only a contiguous
+FIFO class whose aggregate rendered rows are at most 4,096. Cold and stable
+resume classes do not reorder across each other; the overflow request and its
+tail return to the front of the worker-local queue. Both multi-sequence helper
+functions independently enforce the same aggregate bound so a direct caller
+cannot multiply it by `max_slots` (16,384 rows at the canonical four slots or
+32,768 at the supported maximum eight).
+
+Gemma's persistent HB, hybrid, dense, and MLX sequence cursors previously were
+not a production transaction ledger. The candidate prevalidates every engaged
+cursor, performs the GPU forward, then commits all cursor rows together before
+advancing scheduler accounting. Cursor disagreement or reset failure is a
+worker invariant failure; a typed Metal command-buffer failure enters the
+shared fail-stop path without any reset or later submission. Long soft-token
+prefill remains unsupported because the resume surface explicitly rejects
+soft tokens. The 4,096-token cap is provisional until eager-versus-resumed
+real-model parity and the long-overlap/cancellation gates pass.
+
+## 7.DEEPSEEK-FAIRNESS — resumable cached suffixes and lopsided cohorts (2026-08-08)
+
+DeepSeek's cold path already yielded at native verifier transactions, but a
+meaningful retained-prefix suffix still replayed synchronously inside one
+worker call. The candidate applies effective prefix selection once, credits
+the reused prefix once, and advances only the suffix through the same atomic
+resumable plan. Cached work carries `cold_wave=false` and never changes the
+measured two-active-cold-prefill cohort width.
+
+The prior cold barrier parked all decode-ready work, so a short request could
+remain semantically silent behind a much longer peer. `Mixed` now runs one
+decode tick before each remaining cold-prefill transaction. If that tick
+finishes the lane, its final scheduler tick, terminal response, and physical
+slot release are deferred until active cold prefill reaches zero; emitted SSE
+deltas are not repeated. Production resolves each accounting result through
+an explicit `Reinstall | Park | Finalize` ownership transition. The model-free
+composition gate proves that a fresh terminal tick and repeated parked
+selection emit no terminal event, retain the same handle generation, and let
+barrier lift consume the reply exactly once. Central phase reconciliation
+makes cancellation or ordinary failure of the last prefill return to
+`Idle`/admission rather than
+leaving an empty worker stuck in `Draining`.
+
 ## 8. References
 
 ### vLLM

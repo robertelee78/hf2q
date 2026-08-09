@@ -1,6 +1,7 @@
 use mlx_native::{DType, MlxDevice};
 
 use super::cache::{CacheError, CacheKind, Deepseek4Cache, Deepseek4CachePlan};
+use super::verifier_forward::publish_state_after_gate;
 use super::Deepseek4Config;
 
 fn config(ratios: Vec<u32>) -> Deepseek4Config {
@@ -301,6 +302,61 @@ fn partial_token_poison_requires_reset_before_replay() {
     cache.reset().unwrap();
     assert!(!cache.is_poisoned());
     assert_eq!(cache.plan_next_step().unwrap().position, 0);
+}
+
+#[test]
+fn supervisor_commit_gate_controls_cache_cursor_publication() {
+    #[derive(Default)]
+    struct SyntheticCacheState {
+        position: usize,
+        poisoned: bool,
+    }
+    let mut cache = SyntheticCacheState::default();
+
+    let error = publish_state_after_gate(
+        &mut cache,
+        || anyhow::bail!("synthetic late supervisor verdict"),
+        |cache| {
+            cache.position += 4;
+            Ok(())
+        },
+        |cache| cache.poisoned = true,
+        "before cache publication",
+        "publish cache",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("before cache publication"));
+    assert_eq!(cache.position, 0);
+    assert!(cache.poisoned);
+
+    cache.poisoned = false;
+    publish_state_after_gate(
+        &mut cache,
+        || Ok(()),
+        |cache| {
+            cache.position += 4;
+            Ok(())
+        },
+        |cache| cache.poisoned = true,
+        "before cache publication",
+        "publish cache",
+    )
+    .unwrap();
+    assert_eq!(cache.position, 4);
+    assert!(!cache.poisoned);
+
+    let error = publish_state_after_gate(
+        &mut cache,
+        || Ok(()),
+        |_cache| anyhow::bail!("synthetic cursor mismatch"),
+        |cache| cache.poisoned = true,
+        "before cache publication",
+        "publish cache",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("publish cache"));
+    assert_eq!(cache.position, 4);
+    assert!(cache.poisoned);
 }
 
 #[test]

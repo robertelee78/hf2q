@@ -41,6 +41,16 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
+use super::engine_supervisor::EngineSupervisor;
+
+const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+// The preserved Gemma cold-prefill baseline is roughly 388 seconds for
+// 25,187 rows. A bounded 4,096-row transaction therefore needs materially
+// more headroom than Qwen's measured 30-second watchdog while still turning a
+// non-returning Metal call into a finite readiness failure.
+const GEMMA4_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+const ENGINE_SYNC_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
+
 use crate::inference::models::gemma4::{
     MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator,
 };
@@ -1376,6 +1386,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
     Engine {
         inner: Arc::new(EngineInner {
             tx,
+            supervisor: EngineSupervisor::new(),
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("synth-kv-bridge-test"),
             arch: LoadedArch::Gemma,
@@ -1432,6 +1443,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
     Engine {
         inner: Arc::new(EngineInner {
             tx,
+            supervisor: EngineSupervisor::new(),
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("iter-215-test-model"),
             arch,
@@ -1505,6 +1517,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
     Engine {
         inner: Arc::new(EngineInner {
             tx,
+            supervisor: EngineSupervisor::new(),
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("a5d-over-budget-test-model"),
             arch,
@@ -1568,6 +1581,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
     Engine {
         inner: Arc::new(EngineInner {
             tx,
+            supervisor: EngineSupervisor::new(),
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("aggregate-stream-pressure-test-model"),
             arch,
@@ -1656,6 +1670,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
     Engine {
         inner: Arc::new(EngineInner {
             tx,
+            supervisor: EngineSupervisor::new(),
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("a5d-worker-error-test-model"),
             arch,
@@ -1692,6 +1707,9 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
 
 struct EngineInner {
     tx: mpsc::Sender<Request>,
+    /// Independent one-way health state for a worker that may remain alive
+    /// while blocked forever inside Objective-C/Metal.
+    supervisor: EngineSupervisor,
     /// Worker-thread join handle. Held in a `Mutex<Option<...>>` so
     /// `Engine::shutdown` can `take()` it once and `.join()` the thread, and
     /// callers can be cheap-clone an `Engine` without contending on the
@@ -4017,6 +4035,8 @@ impl Engine {
         let worker_per_slot_budget = initial_per_slot_kv_budget_bytes;
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
+        let supervisor = EngineSupervisor::new();
+        let worker_supervisor = supervisor.clone();
         let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine".into())
             .spawn(move || {
@@ -4030,6 +4050,7 @@ impl Engine {
                     worker_per_slot_budget,
                     worker_kv_bytes_per_token,
                     worker_kv_fixed_bytes_per_slot,
+                    worker_supervisor,
                 )
             })
             .expect("spawn hf2q-engine thread");
@@ -4037,6 +4058,7 @@ impl Engine {
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
+                supervisor,
                 worker_handle: Mutex::new(Some(worker_handle)),
                 info,
                 arch,
@@ -4583,6 +4605,8 @@ impl Engine {
         let worker_per_slot_budget = initial_per_slot_kv_budget_bytes;
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
+        let supervisor = EngineSupervisor::new();
+        let worker_supervisor = supervisor.clone();
         let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine-slotaware".into())
             .spawn(move || {
@@ -4596,6 +4620,7 @@ impl Engine {
                     worker_per_slot_budget,
                     worker_kv_bytes_per_token,
                     worker_kv_fixed_bytes_per_slot,
+                    worker_supervisor,
                 )
             })
             .expect("spawn hf2q-engine-slotaware thread");
@@ -4603,6 +4628,7 @@ impl Engine {
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
+                supervisor,
                 worker_handle: Mutex::new(Some(worker_handle)),
                 info,
                 arch,
@@ -4641,6 +4667,87 @@ impl Engine {
     /// `EngineMode::default()`" was a Liskov-substitution violation).
     pub fn mode(&self) -> EngineMode {
         self.inner.mode
+    }
+
+    /// Whether this engine still owns a live request receiver.
+    ///
+    /// A Qwen Metal command-buffer failure closes the receiver before the
+    /// worker exits. The sender-side signal is lock-free and lets readiness
+    /// fail closed without asking the poisoned worker to process a health
+    /// request on the same command queue.
+    pub fn is_worker_healthy(&self) -> bool {
+        self.inner.supervisor.is_healthy() && !self.inner.tx.is_closed()
+    }
+
+    fn ensure_worker_healthy(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.is_worker_healthy(),
+            "{}",
+            self.inner.supervisor.unhealthy_message()
+        );
+        Ok(())
+    }
+
+    async fn await_worker_reply<T>(
+        &self,
+        reply: oneshot::Receiver<T>,
+        operation: &'static str,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            _ = self.inner.supervisor.wait_unhealthy() => {
+                anyhow::bail!(self.inner.supervisor.unhealthy_message())
+            }
+            result = reply => result.with_context(|| format!("{operation} reply dropped")),
+        }
+    }
+
+    fn send_sync_control(&self, request: Request, operation: &'static str) -> Result<()> {
+        self.ensure_worker_healthy()?;
+        match self.inner.tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                anyhow::bail!("engine_control_busy: {operation} queue is full")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!(ENGINE_UNHEALTHY_MESSAGE)
+            }
+        }
+    }
+
+    fn await_sync_control_reply<T>(
+        &self,
+        reply: oneshot::Receiver<T>,
+        operation: &'static str,
+    ) -> Result<T> {
+        self.await_sync_control_reply_with_timeout(reply, operation, ENGINE_SYNC_CONTROL_TIMEOUT)
+    }
+
+    fn await_sync_control_reply_with_timeout<T>(
+        &self,
+        mut reply: oneshot::Receiver<T>,
+        operation: &'static str,
+        timeout: Duration,
+    ) -> Result<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.ensure_worker_healthy()?;
+            match reply.try_recv() {
+                Ok(value) => return Ok(value),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    anyhow::bail!("{operation} reply dropped")
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                self.inner.supervisor.poison_now("sync-control-timeout");
+                anyhow::bail!(
+                    "engine_unhealthy: {operation} did not complete within {:.0}s; process restart required",
+                    timeout.as_secs_f64()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// **ADR-040 Phase C iter-2a (C2b)** — slot cap snapshot.
@@ -4870,13 +4977,6 @@ impl Engine {
     ///
     /// ## Synchronous semantics
     ///
-    /// The hook calls this from
-    /// `Gemma4DenseSpill::snapshot_block(&self, ...)` which is `&self`
-    /// (no async). We use a tokio runtime handle if available — the
-    /// hook runs from `HotSwapManager::evict` / `load_or_get` which
-    /// are async paths (per multi_model.rs:887-892). Falls back to a
-    /// `blocking_send` + `blocking_recv` pair when called from a
-    /// non-tokio context (e.g. unit tests on the main thread).
     /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — synchronously
     /// snapshot the loaded model's `PromptCache` into a JSON byte
     /// payload. Returns `Ok(None)` when the cache is empty or
@@ -4885,25 +4985,14 @@ impl Engine {
     ///
     /// Drives a `Request::PromptCacheSnapshot` round-trip through the
     /// worker thread (sole owner of `loaded.prompt_cache`). Same
-    /// channel + blocking-send/recv pattern as `request_kv_snapshot`.
+    /// bounded control channel as `request_kv_snapshot`. Queue saturation,
+    /// worker poison, and a missing reply all fail closed instead of blocking
+    /// the caller indefinitely.
     pub fn request_prompt_cache_snapshot(&self) -> Result<Option<Vec<u8>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::PromptCacheSnapshot { reply: reply_tx };
-        match self.inner.tx.try_send(req) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                self.inner
-                    .tx
-                    .blocking_send(req)
-                    .context("engine worker is gone (prompt_cache_snapshot full→blocking)")?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone (prompt_cache_snapshot)");
-            }
-        }
-        reply_rx
-            .blocking_recv()
-            .context("prompt_cache_snapshot reply dropped")?
+        self.send_sync_control(req, "prompt_cache_snapshot")?;
+        self.await_sync_control_reply(reply_rx, "prompt_cache_snapshot")?
     }
 
     /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — synchronously
@@ -4916,21 +5005,8 @@ impl Engine {
             payload,
             reply: reply_tx,
         };
-        match self.inner.tx.try_send(req) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                self.inner
-                    .tx
-                    .blocking_send(req)
-                    .context("engine worker is gone (prompt_cache_restore full→blocking)")?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone (prompt_cache_restore)");
-            }
-        }
-        reply_rx
-            .blocking_recv()
-            .context("prompt_cache_restore reply dropped")?
+        self.send_sync_control(req, "prompt_cache_restore")?;
+        self.await_sync_control_reply(reply_rx, "prompt_cache_restore")?
     }
 
     pub fn request_kv_snapshot(
@@ -4944,33 +5020,12 @@ impl Engine {
             range,
             reply: reply_tx,
         };
-        // Send synchronously via the tokio Sender's `blocking_send`
-        // helper. Works from any thread; if called from inside a
-        // tokio runtime task, prefer `Handle::block_on(tx.send(...))`
-        // path to avoid the "blocking inside async" warning. The
-        // `try_send` path is non-blocking and surfaces queue-full
-        // immediately; we fall back to `blocking_send` if try_send
-        // returns full because KV snapshot is a control-plane request
-        // that should NOT silently fail.
-        match self.inner.tx.try_send(req) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                // Queue full — do a blocking send so the request is
-                // eventually delivered. Acceptable because KV snapshot
-                // is rare (eviction-time only) and the FIFO already
-                // forces serialization.
-                self.inner
-                    .tx
-                    .blocking_send(req)
-                    .context("engine worker is gone (kv_snapshot full→blocking)")?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone (kv_snapshot)");
-            }
-        }
-        reply_rx
-            .blocking_recv()
-            .context("kv_snapshot reply dropped")?
+        // Control-plane callers must remain finite even if the model worker is
+        // live-blocked in Metal. Queue saturation is therefore an explicit
+        // busy error; an accepted request has a bounded, health-aware reply
+        // wait.
+        self.send_sync_control(req, "kv_snapshot")?;
+        self.await_sync_control_reply(reply_rx, "kv_snapshot")?
     }
 
     /// Phase B-dense.2 follow-up: synchronously write a layer's
@@ -5006,21 +5061,8 @@ impl Engine {
             write_pos,
             reply: reply_tx,
         };
-        match self.inner.tx.try_send(req) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                self.inner
-                    .tx
-                    .blocking_send(req)
-                    .context("engine worker is gone (kv_restore full→blocking)")?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone (kv_restore)");
-            }
-        }
-        reply_rx
-            .blocking_recv()
-            .context("kv_restore reply dropped")?
+        self.send_sync_control(req, "kv_restore")?;
+        self.await_sync_control_reply(reply_rx, "kv_restore")?
     }
 
     /// **Phase B-tq.4** — synchronously snapshot a layer's TQ-packed
@@ -5051,21 +5093,8 @@ impl Engine {
             scale,
             reply: reply_tx,
         };
-        match self.inner.tx.try_send(req) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                self.inner
-                    .tx
-                    .blocking_send(req)
-                    .context("engine worker is gone (tq_packed_kv_snapshot full→blocking)")?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone (tq_packed_kv_snapshot)");
-            }
-        }
-        reply_rx
-            .blocking_recv()
-            .context("tq_packed_kv_snapshot reply dropped")?
+        self.send_sync_control(req, "tq_packed_kv_snapshot")?;
+        self.await_sync_control_reply(reply_rx, "tq_packed_kv_snapshot")?
     }
 
     /// **Phase B-tq.4** — synchronously restore a layer's TQ-packed
@@ -5088,21 +5117,8 @@ impl Engine {
             v_payload: v_payload.to_vec(),
             reply: reply_tx,
         };
-        match self.inner.tx.try_send(req) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                self.inner
-                    .tx
-                    .blocking_send(req)
-                    .context("engine worker is gone (tq_packed_kv_restore full→blocking)")?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone (tq_packed_kv_restore)");
-            }
-        }
-        reply_rx
-            .blocking_recv()
-            .context("tq_packed_kv_restore reply dropped")?
+        self.send_sync_control(req, "tq_packed_kv_restore")?;
+        self.await_sync_control_reply(reply_rx, "tq_packed_kv_restore")?
     }
 
     /// Run a single-prompt warmup pass. Blocks until the worker finishes it.
@@ -5111,13 +5127,18 @@ impl Engine {
     /// kernels and fault in hot weights so the first real request doesn't
     /// pay the one-time setup latency.
     pub async fn warmup(&self) -> Result<()> {
+        self.ensure_worker_healthy()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.inner
-            .tx
-            .send(Request::Warmup { reply: reply_tx })
-            .await
-            .context("engine worker is gone")?;
-        reply_rx.await.context("warmup reply dropped")?
+        tokio::select! {
+            biased;
+            _ = self.inner.supervisor.wait_unhealthy() => {
+                anyhow::bail!(self.inner.supervisor.unhealthy_message())
+            }
+            sent = self.inner.tx.send(Request::Warmup { reply: reply_tx }) => {
+                sent.map_err(|_| anyhow::anyhow!(ENGINE_UNHEALTHY_MESSAGE))?;
+            }
+        }
+        self.await_worker_reply(reply_rx, "warmup").await?
     }
 
     /// Enqueue a non-streaming generation. Returns `queue_full` if the FIFO
@@ -5127,6 +5148,7 @@ impl Engine {
         prompt_tokens: Vec<u32>,
         params: SamplingParams,
     ) -> Result<GenerationResult> {
+        self.ensure_worker_healthy()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::Generate {
             prompt_tokens,
@@ -5140,10 +5162,10 @@ impl Engine {
                 anyhow::bail!("queue_full");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone");
+                anyhow::bail!(ENGINE_UNHEALTHY_MESSAGE);
             }
         }
-        reply_rx.await.context("generation reply dropped")?
+        self.await_worker_reply(reply_rx, "generation").await?
     }
 
     /// Enqueue a streaming generation. The caller owns `events_rx` (returned
@@ -5162,6 +5184,7 @@ impl Engine {
         cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
         soft_tokens: Vec<SoftTokenData>,
     ) -> Result<()> {
+        self.ensure_worker_healthy()?;
         self.generate_stream_with_deepstack(
             prompt_tokens,
             params,
@@ -5172,6 +5195,16 @@ impl Engine {
             None,
         )
         .await
+    }
+
+    /// Bind an admitted SSE stream to the mode-neutral worker health lease.
+    /// Once a Metal transaction expires, the adapter emits one Error and
+    /// drops the source receiver; late worker completion cannot produce Done.
+    pub(crate) fn supervise_stream_events(
+        &self,
+        events: mpsc::Receiver<super::sse::GenerationEvent>,
+    ) -> mpsc::Receiver<super::sse::GenerationEvent> {
+        self.inner.supervisor.guard_generation_events(events)
     }
 
     /// **Wedge-4e (iter-224 row 5)**: streaming-with-soft-tokens entry
@@ -5203,6 +5236,9 @@ impl Engine {
         deepstack: Option<DeepstackData>,
         positions_flat: Option<Vec<i32>>,
     ) -> Result<()> {
+        self.ensure_worker_healthy()?;
+        let prompt_token_count = prompt_tokens.len();
+        let max_token_count = params.max_tokens;
         let (admission, admission_rx) = if matches!(self.inner.mode, EngineMode::SlotAware { .. }) {
             let (tx, rx) = oneshot::channel();
             (Some(tx), Some(rx))
@@ -5222,11 +5258,18 @@ impl Engine {
         match self.inner.tx.try_send(req) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
-            Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!("engine worker is gone"),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!(ENGINE_UNHEALTHY_MESSAGE)
+            }
         }
+        tracing::info!(
+            prompt_tokens = prompt_token_count,
+            max_tokens = max_token_count,
+            "streaming request submitted to inference channel"
+        );
         if let Some(rx) = admission_rx {
-            rx.await
-                .context("slot-aware stream admission reply dropped")??;
+            self.await_worker_reply(rx, "slot-aware stream admission")
+                .await??;
         }
         Ok(())
     }
@@ -5238,6 +5281,7 @@ impl Engine {
     /// as `generate`: a full queue maps to `queue_full` (handler maps to
     /// HTTP 429 + Retry-After).
     pub async fn embed(&self, prompt_tokens: Vec<u32>) -> Result<Vec<f32>> {
+        self.ensure_worker_healthy()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::Embed {
             prompt_tokens,
@@ -5249,10 +5293,10 @@ impl Engine {
                 anyhow::bail!("queue_full");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone");
+                anyhow::bail!(ENGINE_UNHEALTHY_MESSAGE);
             }
         }
-        reply_rx.await.context("embedding reply dropped")?
+        self.await_worker_reply(reply_rx, "embedding").await?
     }
 
     /// Vision-aware non-streaming generation (Phase 2c Task #17 / iter-98).
@@ -5270,6 +5314,7 @@ impl Engine {
         soft_tokens: Vec<SoftTokenData>,
         params: SamplingParams,
     ) -> Result<GenerationResult> {
+        self.ensure_worker_healthy()?;
         self.generate_with_soft_tokens_and_deepstack(prompt_tokens, soft_tokens, params, None, None)
             .await
     }
@@ -5289,6 +5334,7 @@ impl Engine {
         deepstack: Option<DeepstackData>,
         positions_flat: Option<Vec<i32>>,
     ) -> Result<GenerationResult> {
+        self.ensure_worker_healthy()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::GenerateWithSoftTokens {
             prompt_tokens,
@@ -5304,48 +5350,86 @@ impl Engine {
                 anyhow::bail!("queue_full");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("engine worker is gone");
+                anyhow::bail!(ENGINE_UNHEALTHY_MESSAGE);
             }
         }
-        reply_rx.await.context("vision generation reply dropped")?
+        self.await_worker_reply(reply_rx, "vision generation")
+            .await?
     }
 
     /// Request a clean shutdown of the worker. Drains in-flight + queued work
     /// (FIFO ordering means the `Shutdown` sentinel runs after every request
     /// already enqueued) and then joins the worker thread.
     ///
-    /// Returns `Ok(())` once the worker thread has fully exited; returns
-    /// `Err(...)` only if the join itself panicked.
+    /// Returns `Ok(())` once the worker thread has fully exited. A worker
+    /// wedged inside Metal is never joined blindly: shutdown returns a typed
+    /// timeout and leaves process supervision responsible for restart.
     ///
     /// Idempotent: calling twice (or on a clone whose sibling already
     /// joined) is a no-op — the second call observes `worker_handle = None`
-    /// and returns immediately. The blocking `.join()` runs inside
-    /// `tokio::task::spawn_blocking` so the calling tokio runtime is not
-    /// blocked while the worker drains a long generation.
+    /// and returns immediately. Shutdown polls `JoinHandle::is_finished`
+    /// asynchronously and calls `.join()` only after the worker has exited;
+    /// it never strands a `spawn_blocking` task on a wedged worker.
     pub async fn shutdown(&self) -> Result<()> {
-        // Send Shutdown sentinel. Errors here mean the worker tx was already
-        // dropped/closed — the thread has already exited; treat as success
-        // for the join step below.
-        let _ = self.inner.tx.send(Request::Shutdown).await;
-
-        // Take the JoinHandle exactly once. Subsequent shutdown() calls
-        // observe None and return Ok(()).
-        let handle = match self.inner.worker_handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None, // poisoned mutex => worker already gone
+        let grace = if self.inner.supervisor.is_healthy() {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(1)
         };
+        let deadline = Instant::now() + grace;
 
-        if let Some(handle) = handle {
-            // Join can block until the in-flight Generate finishes; do it
-            // off-runtime so we don't stall axum's drain phase. The handle's
-            // ownership has already been moved out of `inner`, so this
-            // closure can take it.
-            tokio::task::spawn_blocking(move || handle.join())
+        // Preserve the Shutdown sentinel until the same overall shutdown
+        // deadline. Dropping it after an arbitrary short queue wait can leave
+        // a healthy worker idle on an open receiver and make the subsequent
+        // join time out even though capacity became available within grace.
+        match self.inner.tx.try_send(Request::Shutdown) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.inner.tx.send(request),
+                )
                 .await
-                .context("spawn_blocking for worker join")?
-                .map_err(|panic| {
-                    anyhow::anyhow!("engine worker thread panicked on shutdown: {:?}", panic)
-                })?;
+                {
+                    Ok(Ok(())) | Ok(Err(_)) => {}
+                    Err(_) => anyhow::bail!(
+                        "engine_shutdown_timeout: shutdown sentinel could not be enqueued within {:.3}s; process restart required",
+                        grace.as_secs_f64()
+                    ),
+                }
+            }
+        }
+        loop {
+            let finished = self
+                .inner
+                .worker_handle
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(JoinHandle::is_finished))
+                .unwrap_or(true);
+            if finished {
+                break;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "engine_shutdown_timeout: worker did not stop within {:.3}s; process restart required",
+                    grace.as_secs_f64()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // is_finished() made join non-blocking; take the handle exactly once.
+        let handle = self
+            .inner
+            .worker_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(handle) = handle {
+            handle.join().map_err(|panic| {
+                anyhow::anyhow!("engine worker thread panicked on shutdown: {:?}", panic)
+            })?;
         }
 
         Ok(())
@@ -5369,6 +5453,9 @@ impl Engine {
 /// Sentinel substring the chat / embedding / vision handlers match on
 /// to map worker errors to HTTP 501 (Not Implemented).  Iter-215 MVP
 /// only — Wedge-3 removes this once forward_gpu lands.
+pub const ENGINE_UNHEALTHY_SENTINEL: &str = "engine_unhealthy";
+pub const ENGINE_UNHEALTHY_MESSAGE: &str =
+    "engine_unhealthy: inference worker stopped; retry after model/process recovery";
 pub const QWEN35_NOT_IMPLEMENTED_SENTINEL: &str = "qwen35_not_implemented";
 
 /// Operator-facing message body emitted on the 501 path.  Names both
@@ -5584,6 +5671,16 @@ impl SlotReply {
             Self::Stream { events, .. } => events.is_closed(),
         }
     }
+
+    fn record_client_cancellation(&self) {
+        if let Self::Stream {
+            cancel: Some(counter),
+            ..
+        } = self
+        {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// Per-request family-aware streaming state for the generic Gemma/Qwen slot
@@ -5792,6 +5889,397 @@ struct TickOutcome {
 // `generate_gemma4_once_slot_aware` engine.rs:8835 exactly).
 // ---------------------------------------------------------------------------
 
+/// Reliability-first outer transaction for Gemma 4 text prefill.  One
+/// scheduler turn may contain several of the model's existing 256-query
+/// internal tiles, but it never owns an unbounded rendered prompt.  The
+/// 4,096-token starting point is a family-specific rollout candidate derived
+/// from Gemma's measured 6K-class suffix route; the release hardware matrix
+/// may lower it, but may not raise it without watchdog/fairness evidence.
+const GEMMA4_SLOT_PREFILL_CHUNK_TOKENS: u32 = 4_096;
+
+fn gemma4_admission_budget(all_slots_idle: bool, free_slots: usize) -> usize {
+    if all_slots_idle {
+        free_slots
+    } else {
+        free_slots.min(1)
+    }
+}
+
+fn gemma4_cross_batch_eligible(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    has_stable_boundary: bool,
+    require_stable_boundary: bool,
+    has_soft_tokens: bool,
+) -> bool {
+    prompt_tokens > 0
+        && max_tokens > 0
+        && u32::try_from(max_tokens).is_ok()
+        && prompt_tokens <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+        && !has_soft_tokens
+        && has_stable_boundary == require_stable_boundary
+}
+
+fn gemma4_batch_rows_within_transaction_limit<I>(rows: I) -> bool
+where
+    I: IntoIterator<Item = usize>,
+{
+    rows.into_iter()
+        .try_fold(0usize, |total, rows| total.checked_add(rows))
+        .is_some_and(|total| total <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gemma4CrossBatchClass {
+    Cold,
+    Stable,
+}
+
+fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchClass, usize)> {
+    match request {
+        Request::Generate {
+            prompt_tokens,
+            params,
+            ..
+        } if gemma4_cross_batch_eligible(
+            prompt_tokens.len(),
+            params.max_tokens,
+            params.stable_prompt_prefix_tokens.is_some(),
+            params.stable_prompt_prefix_tokens.is_some(),
+            false,
+        ) =>
+        {
+            Some((
+                if params.stable_prompt_prefix_tokens.is_some() {
+                    Gemma4CrossBatchClass::Stable
+                } else {
+                    Gemma4CrossBatchClass::Cold
+                },
+                prompt_tokens.len(),
+            ))
+        }
+        Request::GenerateStream {
+            prompt_tokens,
+            params,
+            soft_tokens,
+            ..
+        } if gemma4_cross_batch_eligible(
+            prompt_tokens.len(),
+            params.max_tokens,
+            params.stable_prompt_prefix_tokens.is_some(),
+            params.stable_prompt_prefix_tokens.is_some(),
+            !soft_tokens.is_empty(),
+        ) =>
+        {
+            Some((
+                if params.stable_prompt_prefix_tokens.is_some() {
+                    Gemma4CrossBatchClass::Stable
+                } else {
+                    Gemma4CrossBatchClass::Cold
+                },
+                prompt_tokens.len(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn gemma4_request_runs_inline_gpu(request: &Request) -> bool {
+    match request {
+        Request::Warmup { .. } | Request::Embed { .. } | Request::GenerateWithSoftTokens { .. } => {
+            true
+        }
+        Request::Generate { prompt_tokens, .. } | Request::GenerateStream { prompt_tokens, .. } => {
+            prompt_tokens.len() <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+        }
+        _ => false,
+    }
+}
+
+fn gemma4_bounded_batch_prefix_len<I>(candidates: I) -> usize
+where
+    I: IntoIterator<Item = Option<(Gemma4CrossBatchClass, usize)>>,
+{
+    let mut total = 0usize;
+    let mut accepted = 0usize;
+    let mut class = None;
+    for candidate in candidates {
+        let Some((candidate_class, rows)) = candidate else {
+            break;
+        };
+        if class.is_some_and(|class| class != candidate_class) {
+            break;
+        }
+        let Some(next_total) = total.checked_add(rows) else {
+            break;
+        };
+        if next_total > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize {
+            break;
+        }
+        class = Some(candidate_class);
+        total = next_total;
+        accepted += 1;
+    }
+    accepted
+}
+
+fn gemma4_next_prefill_end(
+    cursor: usize,
+    prompt_len: usize,
+    stable_boundary: Option<usize>,
+    max_chunk_tokens: usize,
+) -> Result<usize> {
+    anyhow::ensure!(
+        cursor < prompt_len,
+        "Gemma4 prefill cursor is already complete"
+    );
+    anyhow::ensure!(
+        max_chunk_tokens > 0,
+        "Gemma4 prefill chunk must be positive"
+    );
+    if let Some(boundary) = stable_boundary {
+        anyhow::ensure!(
+            boundary > 0 && boundary < prompt_len,
+            "Gemma4 stable boundary {boundary} must satisfy 0 < boundary < {prompt_len}"
+        );
+    }
+    let capped = cursor.saturating_add(max_chunk_tokens).min(prompt_len);
+    Ok(match stable_boundary {
+        Some(boundary) if cursor < boundary && capped >= boundary => boundary,
+        _ => capped,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Gemma4PrefillPlan {
+    start: usize,
+    end: usize,
+    capture_anchor: bool,
+    ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gemma4PrefillCommit {
+    Pending { advanced_tokens: usize },
+    Ready { advanced_tokens: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Gemma4PrefillProgress {
+    cursor: usize,
+    prompt_len: usize,
+    stable_boundary: Option<usize>,
+}
+
+impl Gemma4PrefillProgress {
+    fn new(cursor: usize, prompt_len: usize, stable_boundary: Option<usize>) -> Result<Self> {
+        anyhow::ensure!(
+            cursor < prompt_len,
+            "Gemma4 resumable prefill requires cursor ({cursor}) < prompt_len ({prompt_len})"
+        );
+        if let Some(boundary) = stable_boundary {
+            anyhow::ensure!(
+                boundary > 0 && boundary < prompt_len,
+                "Gemma stable prompt boundary {boundary} must satisfy 0 < boundary < prompt_len {prompt_len}"
+            );
+            anyhow::ensure!(
+                cursor <= boundary,
+                "Gemma cached prefix {cursor} extends beyond stable prompt boundary {boundary}"
+            );
+        }
+        Ok(Self {
+            cursor,
+            prompt_len,
+            stable_boundary,
+        })
+    }
+
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn plan(&self, max_chunk_tokens: usize) -> Result<Gemma4PrefillPlan> {
+        let end = gemma4_next_prefill_end(
+            self.cursor,
+            self.prompt_len,
+            self.stable_boundary,
+            max_chunk_tokens,
+        )?;
+        Ok(Gemma4PrefillPlan {
+            start: self.cursor,
+            end,
+            capture_anchor: self.stable_boundary == Some(end),
+            ready: end == self.prompt_len,
+        })
+    }
+
+    fn commit(&mut self, plan: Gemma4PrefillPlan) -> Result<Gemma4PrefillCommit> {
+        anyhow::ensure!(
+            self.cursor == plan.start,
+            "Gemma4 stale prefill plan starts at {} but cursor is {}",
+            plan.start,
+            self.cursor
+        );
+        let expected = self.plan(plan.end.saturating_sub(plan.start))?;
+        anyhow::ensure!(
+            expected == plan,
+            "Gemma4 prefill plan changed before commit"
+        );
+        let advanced_tokens = plan.end - plan.start;
+        self.cursor = plan.end;
+        Ok(if plan.ready {
+            Gemma4PrefillCommit::Ready { advanced_tokens }
+        } else {
+            Gemma4PrefillCommit::Pending { advanced_tokens }
+        })
+    }
+}
+
+struct Gemma4PrefillState {
+    slot_id: SlotId,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    cached_tokens: usize,
+    progress: Gemma4PrefillProgress,
+    pending_anchor: Option<Gemma4PromptAnchor>,
+    compute_duration: Duration,
+}
+
+enum Gemma4PrefillAdvance {
+    Pending {
+        state: Gemma4PrefillState,
+        advanced_tokens: usize,
+    },
+    Ready {
+        state: Gemma4DecodeState,
+        prompt_anchor: Option<Gemma4PromptAnchor>,
+        advanced_tokens: usize,
+    },
+}
+
+impl Gemma4PrefillState {
+    fn new(
+        slot_id: SlotId,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        cached_tokens: usize,
+        pending_anchor: Option<Gemma4PromptAnchor>,
+        stable_boundary: Option<usize>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            cached_tokens < prompt_tokens.len(),
+            "Gemma4 resumable prefill requires cached_tokens ({cached_tokens}) < prompt_len ({})",
+            prompt_tokens.len()
+        );
+        let progress =
+            Gemma4PrefillProgress::new(cached_tokens, prompt_tokens.len(), stable_boundary)?;
+        Ok(Self {
+            slot_id,
+            prompt_tokens,
+            params,
+            cached_tokens,
+            progress,
+            pending_anchor,
+            compute_duration: Duration::ZERO,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance(
+        mut self,
+        guard: &mut Gemma4KvGuard<'_>,
+        registration: Option<&super::registry::ModelRegistration>,
+        max_chunk_tokens: usize,
+        supervisor: &EngineSupervisor,
+    ) -> Result<Gemma4PrefillAdvance> {
+        let plan = self.progress.plan(max_chunk_tokens)?;
+        validate_gemma4_slot_cursor(guard, self.slot_id, plan.start)?;
+        let started = Instant::now();
+        let max_decode_tokens = self.params.max_tokens.max(1);
+        let first_token = supervised_gemma4_gpu_call(supervisor, "gemma4_bounded_prefill", || {
+            if plan.start == 0 {
+                guard
+                    .model
+                    .weights
+                    .forward_prefill_with_soft_tokens_slot_aware(
+                        &self.prompt_tokens[..plan.end],
+                        &[],
+                        max_decode_tokens,
+                        &mut guard.model.ctx,
+                        self.slot_id,
+                        &mut guard.kv,
+                        guard.hybrid.as_mut(),
+                        guard.dense.as_mut(),
+                        guard.mlx.as_mut(),
+                    )
+            } else {
+                guard
+                    .model
+                    .weights
+                    .forward_prefill_with_soft_tokens_slot_aware_resume(
+                        &self.prompt_tokens[..plan.end],
+                        &[],
+                        max_decode_tokens,
+                        &mut guard.model.ctx,
+                        self.slot_id,
+                        &mut guard.kv,
+                        guard.hybrid.as_mut(),
+                        guard.dense.as_mut(),
+                        guard.mlx.as_mut(),
+                        plan.start,
+                    )
+            }
+        })?;
+        self.compute_duration += started.elapsed();
+        clear_gemma4_self_mounts(guard.model);
+        commit_gemma4_slot_cursor(guard, self.slot_id, plan.start, plan.end)?;
+
+        if plan.capture_anchor {
+            let hybrid = guard.hybrid.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Gemma stable prompt boundary requires hybrid KV")
+            })?;
+            let kv = crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                hybrid,
+                self.slot_id,
+                plan.end,
+            )?;
+            self.pending_anchor = Some(Gemma4PromptAnchor {
+                prompt_tokens: self.prompt_tokens[..plan.end].to_vec(),
+                kv,
+            });
+        }
+
+        let committed = self.progress.commit(plan)?;
+        let advanced_tokens = match committed {
+            Gemma4PrefillCommit::Pending { advanced_tokens }
+            | Gemma4PrefillCommit::Ready { advanced_tokens } => advanced_tokens,
+        };
+        if matches!(committed, Gemma4PrefillCommit::Pending { .. }) {
+            return Ok(Gemma4PrefillAdvance::Pending {
+                state: self,
+                advanced_tokens,
+            });
+        }
+
+        let decode = Gemma4DecodeState::from_first_token(
+            guard.model,
+            &self.prompt_tokens,
+            &self.params,
+            registration,
+            self.slot_id,
+            first_token,
+            None,
+            self.compute_duration,
+            self.cached_tokens,
+        )?;
+        Ok(Gemma4PrefillAdvance::Ready {
+            state: decode,
+            prompt_anchor: self.pending_anchor,
+            advanced_tokens,
+        })
+    }
+}
+
 /// Hoisted per-slot decode state for a Gemma 4 SlotAware request — the
 /// locals that live in the frame of `generate_gemma4_once_slot_aware`'s
 /// decode loop, lifted so N slots can interleave across ticks. Field
@@ -5877,6 +6365,7 @@ impl Gemma4DecodeState {
         mut multi_seq_kv_mlx: Option<
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
         >,
+        supervisor: &EngineSupervisor,
         cached_tokens: usize,
     ) -> Result<(
         Self,
@@ -5945,32 +6434,44 @@ impl Gemma4DecodeState {
             // cue. This avoids heuristic ring rewind on the next tool turn.
             if cached_tokens < boundary {
                 if cached_tokens == 0 {
-                    let _ = loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
-                        &prompt_tokens[..boundary],
-                        &[],
-                        max_decode_tokens,
-                        &mut loaded.ctx,
-                        slot_id,
-                        multi_seq_kv,
-                        multi_seq_kv_hybrid.as_deref_mut(),
-                        multi_seq_kv_dense.as_deref_mut(),
-                        multi_seq_kv_mlx.as_deref_mut(),
+                    let _ = supervised_gemma4_gpu_call(
+                        supervisor,
+                        "gemma4_prefill_stable_boundary",
+                        || {
+                            loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
+                                &prompt_tokens[..boundary],
+                                &[],
+                                max_decode_tokens,
+                                &mut loaded.ctx,
+                                slot_id,
+                                multi_seq_kv,
+                                multi_seq_kv_hybrid.as_deref_mut(),
+                                multi_seq_kv_dense.as_deref_mut(),
+                                multi_seq_kv_mlx.as_deref_mut(),
+                            )
+                        },
                     )?;
                 } else {
-                    let _ = loaded
-                        .weights
-                        .forward_prefill_with_soft_tokens_slot_aware_resume(
-                            &prompt_tokens[..boundary],
-                            &[],
-                            max_decode_tokens,
-                            &mut loaded.ctx,
-                            slot_id,
-                            multi_seq_kv,
-                            multi_seq_kv_hybrid.as_deref_mut(),
-                            multi_seq_kv_dense.as_deref_mut(),
-                            multi_seq_kv_mlx.as_deref_mut(),
-                            cached_tokens,
-                        )?;
+                    let _ = supervised_gemma4_gpu_call(
+                        supervisor,
+                        "gemma4_prefill_stable_boundary",
+                        || {
+                            loaded
+                                .weights
+                                .forward_prefill_with_soft_tokens_slot_aware_resume(
+                                    &prompt_tokens[..boundary],
+                                    &[],
+                                    max_decode_tokens,
+                                    &mut loaded.ctx,
+                                    slot_id,
+                                    multi_seq_kv,
+                                    multi_seq_kv_hybrid.as_deref_mut(),
+                                    multi_seq_kv_dense.as_deref_mut(),
+                                    multi_seq_kv_mlx.as_deref_mut(),
+                                    cached_tokens,
+                                )
+                        },
+                    )?;
                 }
                 clear_gemma4_self_mounts(loaded);
             }
@@ -5982,44 +6483,28 @@ impl Gemma4DecodeState {
                     slot_id,
                     boundary,
                 )?;
-            let first_decode_token = loaded
-                .weights
-                .forward_prefill_with_soft_tokens_slot_aware_resume(
-                    prompt_tokens,
-                    &[],
-                    max_decode_tokens,
-                    &mut loaded.ctx,
-                    slot_id,
-                    multi_seq_kv,
-                    multi_seq_kv_hybrid.as_deref_mut(),
-                    multi_seq_kv_dense.as_deref_mut(),
-                    multi_seq_kv_mlx.as_deref_mut(),
-                    boundary,
-                )?;
+            let first_decode_token =
+                supervised_gemma4_gpu_call(supervisor, "gemma4_prefill_stable_cue", || {
+                    loaded
+                        .weights
+                        .forward_prefill_with_soft_tokens_slot_aware_resume(
+                            prompt_tokens,
+                            &[],
+                            max_decode_tokens,
+                            &mut loaded.ctx,
+                            slot_id,
+                            multi_seq_kv,
+                            multi_seq_kv_hybrid.as_deref_mut(),
+                            multi_seq_kv_dense.as_deref_mut(),
+                            multi_seq_kv_mlx.as_deref_mut(),
+                            boundary,
+                        )
+                })?;
             (first_decode_token, Some(anchor))
         } else if cached_tokens == 0 {
             (
-                loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
-                    prompt_tokens,
-                    soft_tokens,
-                    max_decode_tokens,
-                    &mut loaded.ctx,
-                    slot_id,
-                    multi_seq_kv,
-                    multi_seq_kv_hybrid.as_deref_mut(),
-                    multi_seq_kv_dense.as_deref_mut(),
-                    multi_seq_kv_mlx.as_deref_mut(),
-                )?,
-                None,
-            )
-        } else {
-            if !soft_tokens.is_empty() {
-                anyhow::bail!("Gemma 4 live-prefix resume does not accept soft-token prompts");
-            }
-            (
-                loaded
-                    .weights
-                    .forward_prefill_with_soft_tokens_slot_aware_resume(
+                supervised_gemma4_gpu_call(supervisor, "gemma4_prefill", || {
+                    loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
                         prompt_tokens,
                         soft_tokens,
                         max_decode_tokens,
@@ -6029,8 +6514,31 @@ impl Gemma4DecodeState {
                         multi_seq_kv_hybrid.as_deref_mut(),
                         multi_seq_kv_dense.as_deref_mut(),
                         multi_seq_kv_mlx.as_deref_mut(),
-                        cached_tokens,
-                    )?,
+                    )
+                })?,
+                None,
+            )
+        } else {
+            if !soft_tokens.is_empty() {
+                anyhow::bail!("Gemma 4 live-prefix resume does not accept soft-token prompts");
+            }
+            (
+                supervised_gemma4_gpu_call(supervisor, "gemma4_prefill_resume", || {
+                    loaded
+                        .weights
+                        .forward_prefill_with_soft_tokens_slot_aware_resume(
+                            prompt_tokens,
+                            soft_tokens,
+                            max_decode_tokens,
+                            &mut loaded.ctx,
+                            slot_id,
+                            multi_seq_kv,
+                            multi_seq_kv_hybrid.as_deref_mut(),
+                            multi_seq_kv_dense.as_deref_mut(),
+                            multi_seq_kv_mlx.as_deref_mut(),
+                            cached_tokens,
+                        )
+                })?,
                 None,
             )
         };
@@ -6551,6 +7059,7 @@ fn worker_run_slot_aware(
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
     kv_fixed_bytes_per_slot: u64,
+    supervisor: EngineSupervisor,
 ) {
     let scheduler = InflightBatchedScheduler::new_with_kv_budget_and_floor(
         queue_capacity,
@@ -6567,6 +7076,7 @@ fn worker_run_slot_aware(
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
             kv_bytes_per_token,
+            supervisor,
         ),
         LoadedModel::Qwen35(q) => run_slot_aware_qwen35(
             q,
@@ -6576,6 +7086,7 @@ fn worker_run_slot_aware(
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
             kv_bytes_per_token,
+            supervisor,
         ),
         // Qwen3-VL text-LM has no slot-aware decode path in M1 scope
         // (ADR-040 §0.5 targets are gemma4 + qwen35moe). Preserve the
@@ -6594,6 +7105,7 @@ fn worker_run_slot_aware(
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
             kv_bytes_per_token,
+            supervisor,
         ),
     }
 }
@@ -6604,6 +7116,11 @@ enum Deepseek4SlotWork {
         state: super::engine_deepseek4::Deepseek4SlotState,
         cold_wave: bool,
     },
+    ParkedCompletion {
+        state: super::engine_deepseek4::Deepseek4SlotState,
+        cold_wave: bool,
+        deferred_decode_ticks: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6613,19 +7130,172 @@ enum Deepseek4ColdCohortPhase {
     Draining,
 }
 
-fn deepseek4_cold_cohort_should_drain(
-    cohort_full: bool,
-    active_prefills: usize,
-    cold_waiting: bool,
-) -> bool {
-    cohort_full || (active_prefills == 0 && !cold_waiting)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Deepseek4ColdCohortDecision {
+    phase: Deepseek4ColdCohortPhase,
+    admission_open: bool,
+    rerun_admission: bool,
 }
 
-fn deepseek4_cold_cohort_blocks_decode(
+fn deepseek4_reconcile_cold_cohort(
+    phase: Deepseek4ColdCohortPhase,
+    cohort_full: bool,
+    slots_empty: bool,
+    has_free_slot: bool,
+    active_cold: usize,
+    active_prefills: usize,
+    cold_waiting: bool,
+    pending_nonempty: bool,
+) -> Deepseek4ColdCohortDecision {
+    let (phase, admission_open) = match phase {
+        Deepseek4ColdCohortPhase::Idle => (Deepseek4ColdCohortPhase::Idle, slots_empty),
+        Deepseek4ColdCohortPhase::Filling if cohort_full => {
+            (Deepseek4ColdCohortPhase::Draining, false)
+        }
+        Deepseek4ColdCohortPhase::Filling
+            if cold_waiting
+                && has_free_slot
+                && active_prefills < DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS =>
+        {
+            (Deepseek4ColdCohortPhase::Filling, true)
+        }
+        Deepseek4ColdCohortPhase::Filling if active_cold == 0 => {
+            (Deepseek4ColdCohortPhase::Idle, slots_empty)
+        }
+        Deepseek4ColdCohortPhase::Filling if active_prefills == 0 => {
+            (Deepseek4ColdCohortPhase::Draining, false)
+        }
+        Deepseek4ColdCohortPhase::Filling => (Deepseek4ColdCohortPhase::Filling, false),
+        Deepseek4ColdCohortPhase::Draining if active_cold == 0 => {
+            (Deepseek4ColdCohortPhase::Idle, slots_empty)
+        }
+        Deepseek4ColdCohortPhase::Draining => (Deepseek4ColdCohortPhase::Draining, false),
+    };
+    Deepseek4ColdCohortDecision {
+        phase,
+        admission_open,
+        rerun_admission: admission_open && has_free_slot && pending_nonempty,
+    }
+}
+
+fn deepseek4_mixed_decode_quantum(
     phase: Deepseek4ColdCohortPhase,
     active_prefills: usize,
-) -> bool {
-    phase != Deepseek4ColdCohortPhase::Idle && active_prefills > 0
+    configured_quantum: usize,
+) -> usize {
+    if phase != Deepseek4ColdCohortPhase::Idle && active_prefills > 0 {
+        1
+    } else {
+        configured_quantum
+    }
+}
+
+fn deepseek4_should_park_completion(cold_wave: bool, active_cold_prefills: usize) -> bool {
+    cold_wave && active_cold_prefills > 0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4DecodeAccounting {
+    Fresh {
+        completed_ticks: usize,
+        finished: bool,
+    },
+    Parked {
+        deferred_ticks: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4DecodeDisposition {
+    Continue,
+    Park { deferred_ticks: usize },
+    Finalize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4DecodeOwnership {
+    Reinstall,
+    Park { deferred_ticks: usize },
+    Finalize,
+}
+
+fn resolve_deepseek4_decode_ownership(
+    disposition: Deepseek4DecodeDisposition,
+    finished: bool,
+) -> Result<Deepseek4DecodeOwnership> {
+    match (disposition, finished) {
+        (Deepseek4DecodeDisposition::Continue, false) => {
+            Ok(Deepseek4DecodeOwnership::Reinstall)
+        }
+        (Deepseek4DecodeDisposition::Park { deferred_ticks }, true) => {
+            anyhow::ensure!(
+                deferred_ticks > 0,
+                "DeepSeek parked completion must retain at least one final decode tick"
+            );
+            Ok(Deepseek4DecodeOwnership::Park { deferred_ticks })
+        }
+        (Deepseek4DecodeDisposition::Finalize, true) => {
+            Ok(Deepseek4DecodeOwnership::Finalize)
+        }
+        (disposition, finished) => anyhow::bail!(
+            "DeepSeek decode disposition/state mismatch: disposition={disposition:?}, finished={finished}"
+        ),
+    }
+}
+
+/// Apply the scheduler half of one DeepSeek decode transaction. A cold lane
+/// that becomes terminal while another cold prefill is active retains exactly
+/// one final scheduler tick; this keeps its handle and physical slot owned
+/// until the cohort barrier lifts. The retained-KV high-water must be recorded
+/// immediately before a terminal tick auto-releases the scheduler handle.
+fn account_deepseek4_decode_turn(
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    accounting: Deepseek4DecodeAccounting,
+    cold_wave: bool,
+    active_cold_prefills: usize,
+    retained_tokens: usize,
+    kv_bytes_per_token: u64,
+) -> Deepseek4DecodeDisposition {
+    let (advance_ticks, terminal, deferred_ticks, park_after) = match accounting {
+        Deepseek4DecodeAccounting::Fresh {
+            completed_ticks,
+            finished,
+        } if finished && deepseek4_should_park_completion(cold_wave, active_cold_prefills) => {
+            let deferred_ticks = usize::from(completed_ticks > 0);
+            (
+                completed_ticks.saturating_sub(deferred_ticks),
+                false,
+                deferred_ticks,
+                true,
+            )
+        }
+        Deepseek4DecodeAccounting::Fresh {
+            completed_ticks,
+            finished,
+        } => (completed_ticks, finished, 0, false),
+        Deepseek4DecodeAccounting::Parked { deferred_ticks }
+            if deepseek4_should_park_completion(cold_wave, active_cold_prefills) =>
+        {
+            return Deepseek4DecodeDisposition::Park { deferred_ticks };
+        }
+        Deepseek4DecodeAccounting::Parked { deferred_ticks } => (deferred_ticks, true, 0, false),
+    };
+
+    for tick_index in 0..advance_ticks {
+        if terminal && tick_index + 1 == advance_ticks {
+            record_retained_slot_kv(scheduler, handle, retained_tokens, kv_bytes_per_token);
+        }
+        scheduler.advance_after_decode(handle);
+    }
+
+    if park_after {
+        Deepseek4DecodeDisposition::Park { deferred_ticks }
+    } else if terminal {
+        Deepseek4DecodeDisposition::Finalize
+    } else {
+        Deepseek4DecodeDisposition::Continue
+    }
 }
 
 type Deepseek4Slot = (Deepseek4SlotWork, SlotReply, SlotHandle);
@@ -6806,6 +7476,25 @@ fn pop_cold_deepseek4_request(
     pending.remove(index).map(|request| (request, Some(0), 0))
 }
 
+fn pop_cached_deepseek4_request(
+    pending: &mut VecDeque<Request>,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    unavailable_slots: &[bool],
+) -> Option<(Request, Option<usize>, usize)> {
+    let (index, score) = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            deepseek4_request_reuse_score(request, sessions, unavailable_slots)
+                .filter(|score| *score > 0)
+                .map(|score| (index, score))
+        })
+        .max_by_key(|(_, score)| *score)?;
+    pending
+        .remove(index)
+        .map(|request| (request, Some(score), score))
+}
+
 fn deepseek4_cold_cohort_active(slots: &[Option<Deepseek4Slot>]) -> usize {
     slots
         .iter()
@@ -6813,11 +7502,19 @@ fn deepseek4_cold_cohort_active(slots: &[Option<Deepseek4Slot>]) -> usize {
             slot.as_ref().is_some_and(|(work, _, _)| {
                 matches!(
                     work,
-                    Deepseek4SlotWork::Prefill(_)
-                        | Deepseek4SlotWork::Decode {
-                            cold_wave: true,
-                            ..
-                        }
+                    Deepseek4SlotWork::Prefill(state) if state.is_cold_wave()
+                ) || matches!(
+                    work,
+                    Deepseek4SlotWork::Decode {
+                        cold_wave: true,
+                        ..
+                    }
+                ) || matches!(
+                    work,
+                    Deepseek4SlotWork::ParkedCompletion {
+                        cold_wave: true,
+                        ..
+                    }
                 )
             })
         })
@@ -6828,8 +7525,9 @@ fn deepseek4_cold_prefill_active(slots: &[Option<Deepseek4Slot>]) -> usize {
     slots
         .iter()
         .filter(|slot| {
-            slot.as_ref()
-                .is_some_and(|(work, _, _)| matches!(work, Deepseek4SlotWork::Prefill(_)))
+            slot.as_ref().is_some_and(|(work, _, _)| {
+                matches!(work, Deepseek4SlotWork::Prefill(state) if state.is_cold_wave())
+            })
         })
         .count()
 }
@@ -6885,11 +7583,13 @@ fn choose_full_context_slot(
 
 /// DeepSeek-V4 full-context slot worker. Each physical slot retains independent
 /// compressed KV and recurrent state. Cold matrix prefill yields only after an
-/// atomic cache+ledger commit. A bounded cold cohort fills at most two active
-/// prefills at a time, parks decode-ready members, and starts fair decode only
-/// after the cohort is fully prefetched. This prevents early responders from
-/// flooding the remaining cold agents with continuation work. No more than one
-/// prefill transaction owns the shared scratch arena at any instant.
+/// atomic cache+ledger commit. A bounded cold cohort runs at most two active
+/// prefills at a time. When a shorter member becomes decode-ready, `Mixed`
+/// advances it by one token before each remaining cold-prefill transaction;
+/// a terminal completion remains parked until the cold cohort drains, so its
+/// physical cache cannot be reused before a tool-result continuation arrives.
+/// No more than one prefill transaction owns the shared scratch arena at any
+/// instant.
 #[allow(clippy::too_many_arguments)]
 fn run_slot_aware_deepseek4(
     mut model: super::engine_deepseek4::Deepseek4LoadedModel,
@@ -6899,6 +7599,7 @@ fn run_slot_aware_deepseek4(
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
     shared_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: EngineSupervisor,
 ) {
     let decode_quantum = deepseek4_slot_decode_quantum();
     // DeepSeek's verifier owns an architecture-specific atomic matrix chunk
@@ -6922,10 +7623,11 @@ fn run_slot_aware_deepseek4(
     let mut admission_open = true;
     let mut last_prefill_slot = None;
     let mut cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
+    let mut shutdown_requested = false;
     tracing::info!(
         slots = sessions.len(),
         decode_quantum,
-        admission_policy = "two-prefill-cold-cohort-then-fair-decode-waves",
+        admission_policy = "two-active-cold-prefills-with-bounded-mixed-decode",
         "DeepSeek-V4 full-context session worker started"
     );
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
@@ -6937,31 +7639,50 @@ fn run_slot_aware_deepseek4(
     'worker: loop {
         while pending.len() < sessions.len() {
             match rx.try_recv() {
+                Ok(Request::Shutdown) => {
+                    tracing::info!(
+                        "DeepSeek-V4 SlotAware worker received Shutdown; draining prior work"
+                    );
+                    rx.close();
+                    shutdown_requested = true;
+                    break;
+                }
                 Ok(request) => pending.push_back(request),
                 Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    shutdown_requested = true;
+                    break;
+                }
             }
-        }
-        if let Some(index) = pending
-            .iter()
-            .position(|request| matches!(request, Request::Shutdown))
-        {
-            let _ = pending.remove(index);
-            break 'worker;
         }
 
         let mut wave_seeds = Vec::with_capacity(sessions.len());
         let cold_prefill_active = deepseek4_cold_prefill_active(&slots);
         let mut cold_wave_seeds = 0_usize;
+        let mut cached_wave = false;
         while admission_open
             && slots.iter().any(Option::is_none)
             && wave_seeds.len() < sessions.len()
         {
             while pending.len() < sessions.len() {
+                if shutdown_requested {
+                    break;
+                }
                 match rx.try_recv() {
+                    Ok(Request::Shutdown) => {
+                        tracing::info!(
+                            "DeepSeek-V4 SlotAware worker received Shutdown; draining prior work"
+                        );
+                        rx.close();
+                        shutdown_requested = true;
+                        break;
+                    }
                     Ok(request) => pending.push_back(request),
                     Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        shutdown_requested = true;
+                        break;
+                    }
                 }
             }
             let selected = match cold_cohort_phase {
@@ -6981,13 +7702,32 @@ fn run_slot_aware_deepseek4(
                     pop_control_deepseek4_request(&mut pending, &sessions, &reserved_slots)
                 }
                 Deepseek4ColdCohortPhase::Idle => {
-                    pop_preferred_deepseek4_request(&mut pending, &sessions, &reserved_slots, true)
+                    if cached_wave {
+                        pop_control_deepseek4_request(&mut pending, &sessions, &reserved_slots)
+                            .or_else(|| {
+                                pop_cached_deepseek4_request(
+                                    &mut pending,
+                                    &sessions,
+                                    &reserved_slots,
+                                )
+                            })
+                    } else {
+                        pop_preferred_deepseek4_request(
+                            &mut pending,
+                            &sessions,
+                            &reserved_slots,
+                            true,
+                        )
                         .map(|(request, reuse)| (request, reuse, 0))
+                    }
                 }
             };
             let Some((request, reuse_score, _cached_suffix)) = selected else {
                 break;
             };
+            if reuse_score.is_some_and(|score| score > 0) {
+                cached_wave = true;
+            }
             match request {
                 Request::Generate {
                     prompt_tokens,
@@ -7001,7 +7741,6 @@ fn run_slot_aware_deepseek4(
                         &reserved_slots,
                         &last_used,
                         &mut scheduler,
-                        registration.as_ref(),
                         shared_kv_budget_bytes,
                         kv_bytes_per_token,
                         prompt_tokens,
@@ -7038,7 +7777,6 @@ fn run_slot_aware_deepseek4(
                             &reserved_slots,
                             &last_used,
                             &mut scheduler,
-                            registration.as_ref(),
                             shared_kv_budget_bytes,
                             kv_bytes_per_token,
                             prompt_tokens,
@@ -7067,9 +7805,36 @@ fn run_slot_aware_deepseek4(
                         );
                     }
                 }
-                Request::Warmup { reply } => {
-                    let _ = reply.send(Ok(()));
-                }
+                Request::Warmup { reply } => match model.warmup(&supervisor) {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let fatal = if is_worker_fatal(&supervisor, &error) {
+                            SlotAwareGpuFatal::warmup(reply, error)
+                        } else {
+                            SlotAwareGpuFatal {
+                                error,
+                                kind: SlotAwareFatalKind::Invariant,
+                                owned: vec![SlotAwareOwnedReply {
+                                    handle: None,
+                                    reply: SlotAwareFatalReply::Warmup(reply),
+                                }],
+                            }
+                        };
+                        fail_stop_deepseek4_worker(
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            &mut slots,
+                            &mut pending,
+                            fatal,
+                            wave_seeds,
+                        );
+                        break 'worker;
+                    }
+                },
                 Request::Embed { reply, .. } => {
                     let _ = reply.send(Err(anyhow::anyhow!(
                         "DeepSeek-V4 embeddings are not supported"
@@ -7080,52 +7845,93 @@ fn run_slot_aware_deepseek4(
                         "DeepSeek-V4 does not accept multimodal soft tokens"
                     )));
                 }
-                Request::Shutdown => break 'worker,
-                _ => {}
+                Request::Shutdown => {
+                    rx.close();
+                    shutdown_requested = true;
+                    break;
+                }
+                request @ (Request::KvSnapshot { .. }
+                | Request::KvRestore { .. }
+                | Request::TqPackedKvSnapshot { .. }
+                | Request::TqPackedKvRestore { .. }
+                | Request::PromptCacheSnapshot { .. }
+                | Request::PromptCacheRestore { .. }) => {
+                    reject_slotaware_control_request("DeepSeek-V4", request);
+                }
             }
             publish(&scheduler, &scheduler_stats_snapshot);
         }
         if !wave_seeds.is_empty() {
-            seed_deepseek4_wave(
+            if let Some(fatal) = seed_deepseek4_wave(
                 &mut model,
                 &mut sessions,
                 &mut slots,
                 &mut scheduler,
                 registration.as_ref(),
                 kv_bytes_per_token,
+                &supervisor,
                 wave_seeds,
-            );
+            ) {
+                fail_stop_deepseek4_worker(
+                    &supervisor,
+                    &mut rx,
+                    &mut scheduler,
+                    &scheduler_stats_snapshot,
+                    &mut slots,
+                    &mut pending,
+                    fatal,
+                    Vec::new(),
+                );
+                break 'worker;
+            }
             reserved_slots.fill(false);
             publish(&scheduler, &scheduler_stats_snapshot);
         }
-        if cold_cohort_phase == Deepseek4ColdCohortPhase::Filling {
-            let cohort_full = slots.iter().all(Option::is_some);
-            let cold_waiting = pending.iter().any(|request| {
-                matches!(
-                    deepseek4_request_reuse_score(request, &sessions, &reserved_slots),
-                    Some(0)
-                )
-            });
-            if deepseek4_cold_cohort_should_drain(
-                cohort_full,
-                deepseek4_cold_prefill_active(&slots),
-                cold_waiting,
-            ) {
-                cold_cohort_phase = Deepseek4ColdCohortPhase::Draining;
-                admission_open = false;
+        let slots_empty = slots.iter().all(Option::is_none);
+        let has_free_slot = slots.iter().any(Option::is_none);
+        let cold_waiting = pending.iter().any(|request| {
+            matches!(
+                deepseek4_request_reuse_score(request, &sessions, &reserved_slots),
+                Some(0)
+            )
+        });
+        let cohort = deepseek4_reconcile_cold_cohort(
+            cold_cohort_phase,
+            slots.iter().all(Option::is_some),
+            slots_empty,
+            has_free_slot,
+            deepseek4_cold_cohort_active(&slots),
+            deepseek4_cold_prefill_active(&slots),
+            cold_waiting,
+            !pending.is_empty(),
+        );
+        cold_cohort_phase = cohort.phase;
+        admission_open = cohort.admission_open;
+
+        if shutdown_requested && pending.is_empty() && slots.iter().all(Option::is_none) {
+            let message = format!(
+                "{ENGINE_UNHEALTHY_SENTINEL}: DeepSeek-V4 SlotAware worker is shutting down"
+            );
+            while let Some(request) = rx.blocking_recv() {
+                fail_slotaware_buffered_request(request, &message);
             }
+            break 'worker;
         }
-        if slots.iter().any(Option::is_some) {
-            admission_open = false;
+        if cohort.rerun_admission {
+            continue 'worker;
         }
 
         match scheduler.step() {
             Ok(SchedulerStep::Idle) => match rx.blocking_recv() {
+                Some(Request::Shutdown) => {
+                    rx.close();
+                    shutdown_requested = true;
+                }
                 Some(request) => pending.push_back(request),
-                None => break 'worker,
+                None => shutdown_requested = true,
             },
             Ok(SchedulerStep::Decode { handles }) => {
-                decode_batch_deepseek4(
+                if let Some(fatal) = decode_batch_deepseek4(
                     &mut model,
                     &mut sessions,
                     &mut slots,
@@ -7136,16 +7942,20 @@ fn run_slot_aware_deepseek4(
                     &handles,
                     kv_bytes_per_token,
                     decode_quantum,
-                );
-                if cold_cohort_phase == Deepseek4ColdCohortPhase::Draining
-                    && deepseek4_cold_cohort_active(&slots) == 0
-                {
-                    cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
-                    admission_open = true;
-                } else if cold_cohort_phase == Deepseek4ColdCohortPhase::Idle
-                    && slots.iter().all(Option::is_none)
-                {
-                    admission_open = true;
+                    0,
+                    &supervisor,
+                ) {
+                    fail_stop_deepseek4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                    );
+                    break 'worker;
                 }
                 publish(&scheduler, &scheduler_stats_snapshot);
             }
@@ -7153,7 +7963,7 @@ fn run_slot_aware_deepseek4(
                 let handle =
                     next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
                 last_prefill_slot = Some(handle.slot_id);
-                advance_deepseek4_prefill(
+                if let Some(fatal) = advance_deepseek4_prefill(
                     &mut model,
                     &mut sessions,
                     &mut slots,
@@ -7161,11 +7971,19 @@ fn run_slot_aware_deepseek4(
                     registration.as_ref(),
                     handle,
                     kv_bytes_per_token,
-                );
-                if cold_cohort_phase == Deepseek4ColdCohortPhase::Filling
-                    && slots.iter().any(Option::is_none)
-                {
-                    admission_open = true;
+                    &supervisor,
+                ) {
+                    fail_stop_deepseek4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                    );
+                    break 'worker;
                 }
                 publish(&scheduler, &scheduler_stats_snapshot);
             }
@@ -7174,28 +7992,42 @@ fn run_slot_aware_deepseek4(
                 decode_handles,
                 ..
             }) => {
-                let cohort_barrier = deepseek4_cold_cohort_blocks_decode(
+                let active_cold_prefills = deepseek4_cold_prefill_active(&slots);
+                let mixed_decode_quantum = deepseek4_mixed_decode_quantum(
                     cold_cohort_phase,
-                    deepseek4_cold_prefill_active(&slots),
+                    active_cold_prefills,
+                    decode_quantum,
                 );
-                if !cohort_barrier {
-                    decode_batch_deepseek4(
-                        &mut model,
-                        &mut sessions,
-                        &mut slots,
-                        &mut last_used,
-                        &mut clock,
+                if let Some(fatal) = decode_batch_deepseek4(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &mut last_used,
+                    &mut clock,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    &decode_handles,
+                    kv_bytes_per_token,
+                    mixed_decode_quantum,
+                    active_cold_prefills,
+                    &supervisor,
+                ) {
+                    fail_stop_deepseek4_worker(
+                        &supervisor,
+                        &mut rx,
                         &mut scheduler,
-                        registration.as_ref(),
-                        &decode_handles,
-                        kv_bytes_per_token,
-                        decode_quantum,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
                     );
+                    break 'worker;
                 }
                 let prefill =
                     next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(prefill);
                 last_prefill_slot = Some(prefill.slot_id);
-                advance_deepseek4_prefill(
+                if let Some(fatal) = advance_deepseek4_prefill(
                     &mut model,
                     &mut sessions,
                     &mut slots,
@@ -7203,20 +8035,35 @@ fn run_slot_aware_deepseek4(
                     registration.as_ref(),
                     prefill,
                     kv_bytes_per_token,
-                );
-                if cold_cohort_phase == Deepseek4ColdCohortPhase::Filling
-                    && slots.iter().any(Option::is_none)
-                {
-                    admission_open = true;
-                } else if cold_cohort_phase == Deepseek4ColdCohortPhase::Idle
-                    && slots.iter().all(Option::is_none)
-                {
-                    admission_open = true;
+                    &supervisor,
+                ) {
+                    fail_stop_deepseek4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                    );
+                    break 'worker;
                 }
                 publish(&scheduler, &scheduler_stats_snapshot);
             }
             Err(error) => {
-                tracing::error!(?error, "DeepSeek-V4 SlotAware scheduler step failed");
+                fail_stop_deepseek4_worker(
+                    &supervisor,
+                    &mut rx,
+                    &mut scheduler,
+                    &scheduler_stats_snapshot,
+                    &mut slots,
+                    &mut pending,
+                    SlotAwareGpuFatal::invariant(anyhow::anyhow!(
+                        "DeepSeek-V4 SlotAware scheduler step failed: {error:?}"
+                    )),
+                    Vec::new(),
+                );
                 break 'worker;
             }
         }
@@ -7236,13 +8083,52 @@ fn prepare_deepseek4_slot(
     reserved_slots: &[bool],
     last_used: &[u64],
     scheduler: &mut InflightBatchedScheduler,
-    registration: Option<&super::registry::ModelRegistration>,
     shared_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
     mut reply: SlotReply,
 ) -> Option<Deepseek4PendingSeed> {
+    let prompt_len = match u32::try_from(prompt_tokens.len()) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            fire_deepseek4_error(
+                reply,
+                anyhow::anyhow!(
+                    "invalid_request: DeepSeek-V4 SlotAware requires a nonempty prompt fitting u32"
+                ),
+            );
+            return None;
+        }
+    };
+    let max_tokens = match u32::try_from(params.max_tokens) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            fire_deepseek4_error(
+                reply,
+                anyhow::anyhow!(
+                    "invalid_request: DeepSeek-V4 SlotAware requires max_tokens in 1..=u32::MAX"
+                ),
+            );
+            return None;
+        }
+    };
+    let context_limit = model
+        .context_length
+        .unwrap_or(model.model.cfg.max_position_embeddings as usize);
+    let needed_positions = match prompt_tokens.len().checked_add(params.max_tokens) {
+        Some(value) if value <= context_limit => value,
+        _ => {
+            fire_deepseek4_error(
+                reply,
+                anyhow::anyhow!(
+                    "invalid_request: DeepSeek-V4 prompt + completion exceeds per-slot context {context_limit}"
+                ),
+            );
+            return None;
+        }
+    };
+    let _ = needed_positions;
     let preferred =
         preferred_deepseek_session(sessions, slots, reserved_slots, last_used, &prompt_tokens);
     let needed = if shared_kv_budget_bytes == 0 || kv_bytes_per_token == 0 {
@@ -7253,8 +8139,8 @@ fn prepare_deepseek4_slot(
             .saturating_mul(kv_bytes_per_token)
     };
     let admitted = match scheduler.admit(AdmitRequest {
-        prompt_tokens: prompt_tokens.len() as u32,
-        max_tokens: params.max_tokens as u32,
+        prompt_tokens: prompt_len,
+        max_tokens,
         kv_bytes_needed: needed,
         prompt_kv_bytes: if needed == 0 {
             0
@@ -7274,47 +8160,13 @@ fn prepare_deepseek4_slot(
     };
 
     let Some(handle) = admitted.handle else {
-        // The bounded-wave worker only calls `admit` while one of its
-        // physical sessions is idle, so the scheduler's only valid
-        // handle-less success is CompletedAtAdmit (`max_tokens == 0`). Do
-        // not silently run an ordinary queued request outside scheduler KV
-        // admission if those invariants ever drift.
-        if admitted.max_tokens != 0 {
-            let _ = scheduler.cancel_queued(admitted.request_id);
-            fire_deepseek4_error(
-                reply,
-                anyhow::anyhow!(
-                    "DeepSeek-V4 full-context slot admit returned no physical slot for a nonzero decode budget"
-                ),
-            );
-            return None;
-        }
-        reply.accept_stream_admission();
-        let slot_index = preferred.0 as usize;
-        sessions[slot_index].swap_with_loaded(model);
-        match reply {
-            SlotReply::Unary(reply) => {
-                let result = super::engine_deepseek4::generate_once(
-                    model,
-                    &prompt_tokens,
-                    &params,
-                    registration,
-                );
-                sessions[slot_index].swap_with_loaded(model);
-                let _ = reply.send(result);
-            }
-            SlotReply::Stream { events, cancel, .. } => {
-                super::engine_deepseek4::generate_stream(
-                    model,
-                    &prompt_tokens,
-                    &params,
-                    &events,
-                    registration,
-                    cancel.as_deref(),
-                );
-                sessions[slot_index].swap_with_loaded(model);
-            }
-        }
+        let _ = scheduler.cancel_queued(admitted.request_id);
+        fire_deepseek4_error(
+            reply,
+            anyhow::anyhow!(
+                "DeepSeek-V4 full-context slot admit returned no physical slot for a nonzero decode budget"
+            ),
+        );
         return None;
     };
 
@@ -7335,18 +8187,36 @@ fn seed_deepseek4_wave(
     scheduler: &mut InflightBatchedScheduler,
     registration: Option<&super::registry::ModelRegistration>,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     seeds: Vec<Deepseek4PendingSeed>,
-) {
-    for seed in seeds {
-        seed_deepseek4_single(
+) -> Option<SlotAwareGpuFatal> {
+    let mut seeds = seeds.into_iter();
+    while let Some(seed) = seeds.next() {
+        if let Some(mut fatal) = seed_deepseek4_single(
             model,
             sessions,
             slots,
             scheduler,
             registration,
             kv_bytes_per_token,
+            supervisor,
             seed,
-        );
+        ) {
+            fatal.extend_slots(seeds.map(|seed| (Some(seed.handle), seed.reply)));
+            return Some(fatal);
+        }
+    }
+    None
+}
+
+fn reset_deepseek4_session_for_reply(
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    handle: SlotHandle,
+    reply: SlotReply,
+) -> std::result::Result<SlotReply, SlotAwareGpuFatal> {
+    match sessions[handle.slot_id.0 as usize].reset() {
+        Ok(()) => Ok(reply),
+        Err(error) => Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
     }
 }
 
@@ -7358,18 +8228,22 @@ fn seed_deepseek4_single(
     scheduler: &mut InflightBatchedScheduler,
     registration: Option<&super::registry::ModelRegistration>,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     seed: Deepseek4PendingSeed,
-) {
+) -> Option<SlotAwareGpuFatal> {
     let Deepseek4PendingSeed {
         prompt_tokens,
         params,
-        reply,
+        mut reply,
         handle,
         admitted_prompt_tokens,
     } = seed;
     let slot_index = handle.slot_id.0 as usize;
-    let resumable_cold = sessions[slot_index].reusable_prefix_len(&prompt_tokens) == 0
-        && prompt_tokens.len() >= model.model.cfg.sliding_window as usize;
+    let reusable_prefix = sessions[slot_index].reusable_prefix_len(&prompt_tokens);
+    let cold_request = reusable_prefix == 0;
+    let resumable_cold =
+        cold_request && prompt_tokens.len() >= model.model.cfg.sliding_window as usize;
+    let resumable_cached = reusable_prefix > 0 && reusable_prefix < prompt_tokens.len();
     sessions[slot_index].swap_with_loaded(model);
     let is_stream = matches!(&reply, SlotReply::Stream { .. });
     let result = if resumable_cold {
@@ -7379,7 +8253,18 @@ fn seed_deepseek4_single(
             params,
             is_stream,
         )
-        .map(Deepseek4SlotWork::Prefill)
+        .map(|state| (Deepseek4SlotWork::Prefill(state), 0_u32))
+    } else if resumable_cached {
+        super::engine_deepseek4::Deepseek4PrefillState::begin_cached(
+            model,
+            prompt_tokens,
+            params,
+            is_stream,
+        )
+        .map(|state| {
+            let initial_cached_tokens = state.initial_cached_tokens() as u32;
+            (Deepseek4SlotWork::Prefill(state), initial_cached_tokens)
+        })
     } else {
         super::engine_deepseek4::Deepseek4SlotState::prefill_seed(
             model,
@@ -7388,32 +8273,50 @@ fn seed_deepseek4_single(
             registration,
             is_stream,
             || reply.client_closed(),
+            supervisor,
         )
-        .map(|state| Deepseek4SlotWork::Decode {
-            state,
-            cold_wave: false,
+        .map(|state| {
+            (
+                Deepseek4SlotWork::Decode {
+                    state,
+                    cold_wave: cold_request,
+                },
+                admitted_prompt_tokens,
+            )
         })
     };
     sessions[slot_index].swap_with_loaded(model);
     match result {
-        Ok(work) => {
-            if matches!(work, Deepseek4SlotWork::Decode { .. }) {
-                scheduler.advance_after_prefill(handle, admitted_prompt_tokens);
+        Ok((work, initial_prefill_tokens)) => {
+            if initial_prefill_tokens > 0 {
+                scheduler.advance_after_prefill(handle, initial_prefill_tokens);
             }
             slots[slot_index] = Some((work, reply, handle));
         }
         Err(error) => {
+            if is_worker_fatal(supervisor, &error) {
+                return Some(SlotAwareGpuFatal::slot(handle, reply, error));
+            }
+            let client_closed = reply.client_closed();
             record_retained_slot_kv(
                 scheduler,
                 handle,
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            let _ = sessions[slot_index].reset();
+            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             scheduler.release(handle);
-            fire_deepseek4_error(reply, error);
+            if client_closed {
+                reply.record_client_cancellation();
+            } else {
+                fire_deepseek4_error(reply, error);
+            }
         }
     }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7425,22 +8328,38 @@ fn advance_deepseek4_prefill(
     registration: Option<&super::registry::ModelRegistration>,
     handle: SlotHandle,
     kv_bytes_per_token: u64,
-) {
+    supervisor: &EngineSupervisor,
+) -> Option<SlotAwareGpuFatal> {
     let slot_index = handle.slot_id.0 as usize;
-    let Some((work, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take) else {
-        return;
+    let Some((work, mut reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
+    else {
+        return Some(SlotAwareGpuFatal::invariant_handle(
+            handle,
+            anyhow::anyhow!(
+                "DeepSeek-V4 scheduler selected absent prefill slot {}",
+                handle.slot_id.0
+            ),
+        ));
     };
     if installed != handle {
         slots[slot_index] = Some((work, reply, installed));
-        return;
+        return Some(SlotAwareGpuFatal::invariant_handle(
+            handle,
+            anyhow::anyhow!(
+                "DeepSeek-V4 prefill handle mismatch: scheduled {handle:?}, installed {installed:?}"
+            ),
+        ));
     }
     let Deepseek4SlotWork::Prefill(state) = work else {
         slots[slot_index] = Some((work, reply, installed));
-        return;
+        return Some(SlotAwareGpuFatal::invariant_handle(
+            handle,
+            anyhow::anyhow!("DeepSeek-V4 scheduler selected Decode work as Prefill for {handle:?}"),
+        ));
     };
 
     sessions[slot_index].swap_with_loaded(model);
-    let result = state.advance(model, registration, || reply.client_closed());
+    let result = state.advance(model, registration, || reply.client_closed(), supervisor);
     sessions[slot_index].swap_with_loaded(model);
     match result {
         Ok(super::engine_deepseek4::Deepseek4PrefillAdvance::Pending {
@@ -7453,29 +8372,39 @@ fn advance_deepseek4_prefill(
         Ok(super::engine_deepseek4::Deepseek4PrefillAdvance::Ready {
             state,
             advanced_tokens,
+            cold_wave,
         }) => {
             scheduler.advance_after_prefill(handle, advanced_tokens as u32);
             slots[slot_index] = Some((
-                Deepseek4SlotWork::Decode {
-                    state,
-                    cold_wave: true,
-                },
+                Deepseek4SlotWork::Decode { state, cold_wave },
                 reply,
                 handle,
             ));
         }
         Err(error) => {
+            if is_worker_fatal(supervisor, &error) {
+                return Some(SlotAwareGpuFatal::slot(handle, reply, error));
+            }
+            let client_closed = reply.client_closed();
             record_retained_slot_kv(
                 scheduler,
                 handle,
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            let _ = sessions[slot_index].reset();
+            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             scheduler.release(handle);
-            fire_deepseek4_error(reply, error);
+            if client_closed {
+                reply.record_client_cancellation();
+            } else {
+                fire_deepseek4_error(reply, error);
+            }
         }
     }
+    None
 }
 
 fn decode_batch_deepseek4(
@@ -7489,24 +8418,63 @@ fn decode_batch_deepseek4(
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
     decode_quantum: usize,
-) {
+    active_cold_prefills: usize,
+    supervisor: &EngineSupervisor,
+) -> Option<SlotAwareGpuFatal> {
     for &handle in handles {
         let slot_index = handle.slot_id.0 as usize;
-        let Some((work, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
+        let Some((work, mut reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
         else {
-            continue;
+            return Some(SlotAwareGpuFatal::invariant_handle(
+                handle,
+                anyhow::anyhow!(
+                    "DeepSeek-V4 scheduler selected absent decode slot {}",
+                    handle.slot_id.0
+                ),
+            ));
         };
         if installed != handle {
             slots[slot_index] = Some((work, reply, installed));
-            continue;
+            return Some(SlotAwareGpuFatal::invariant_handle(
+                handle,
+                anyhow::anyhow!(
+                    "DeepSeek-V4 decode handle mismatch: scheduled {handle:?}, installed {installed:?}"
+                ),
+            ));
         }
-        let Deepseek4SlotWork::Decode {
-            mut state,
-            cold_wave,
-        } = work
-        else {
-            slots[slot_index] = Some((work, reply, installed));
-            continue;
+        let (mut state, cold_wave, deferred_decode_ticks, was_parked) = match work {
+            Deepseek4SlotWork::Decode { state, cold_wave } => (state, cold_wave, 0_usize, false),
+            Deepseek4SlotWork::ParkedCompletion {
+                state,
+                cold_wave,
+                deferred_decode_ticks,
+            } => {
+                if reply.client_closed() {
+                    state.cancelled();
+                    reply.record_client_cancellation();
+                    record_retained_slot_kv(
+                        scheduler,
+                        handle,
+                        sessions[slot_index].committed_tokens().len(),
+                        kv_bytes_per_token,
+                    );
+                    if let Err(fatal) = reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                        return Some(fatal);
+                    }
+                    scheduler.release(handle);
+                    continue;
+                }
+                (state, cold_wave, deferred_decode_ticks, true)
+            }
+            Deepseek4SlotWork::Prefill(state) => {
+                slots[slot_index] = Some((Deepseek4SlotWork::Prefill(state), reply, installed));
+                return Some(SlotAwareGpuFatal::invariant_handle(
+                    handle,
+                    anyhow::anyhow!(
+                        "DeepSeek-V4 scheduler selected Prefill work as Decode for {handle:?}"
+                    ),
+                ));
+            }
         };
         if let SlotReply::Stream { events, cancel, .. } = &reply {
             if events.is_closed() {
@@ -7520,59 +8488,62 @@ fn decode_batch_deepseek4(
                     sessions[slot_index].committed_tokens().len(),
                     kv_bytes_per_token,
                 );
-                let _ = sessions[slot_index].reset();
+                if let Err(fatal) = reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                    return Some(fatal);
+                }
                 scheduler.release(handle);
                 continue;
             }
         }
 
-        sessions[slot_index].swap_with_loaded(model);
         let events = match &reply {
             SlotReply::Unary(_) => None,
             SlotReply::Stream { events, .. } => Some(events),
         };
-        let mut completed_ticks = 0_usize;
+        let mut completed_ticks = deferred_decode_ticks;
         let mut tick_error = None;
         let mut client_closed = false;
-        for _ in 0..decode_quantum {
-            if let SlotReply::Stream { events, cancel, .. } = &reply {
-                if events.is_closed() {
-                    state.cancelled();
-                    if let Some(counter) = cancel {
-                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    client_closed = true;
-                    break;
-                }
-            }
-            match state.tick(model, registration, events) {
-                Ok(()) => {
-                    completed_ticks = completed_ticks.saturating_add(1);
-                    if state.is_finished() {
+        if !was_parked {
+            sessions[slot_index].swap_with_loaded(model);
+            for _ in 0..decode_quantum {
+                if let SlotReply::Stream { events, cancel, .. } = &reply {
+                    if events.is_closed() {
+                        state.cancelled();
+                        if let Some(counter) = cancel {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        client_closed = true;
                         break;
                     }
                 }
-                Err(error) => {
-                    let _ = model.reset_live_cache();
-                    tick_error = Some(error);
-                    break;
+                let tick_result = state.tick(model, registration, events, supervisor);
+                match tick_result {
+                    Ok(()) => {
+                        completed_ticks = completed_ticks.saturating_add(1);
+                        if state.is_finished() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tick_error = Some(error);
+                        break;
+                    }
                 }
             }
+            sessions[slot_index].swap_with_loaded(model);
         }
-        sessions[slot_index].swap_with_loaded(model);
 
-        let finished = state.is_finished();
-        for tick_index in 0..completed_ticks {
-            if finished && tick_index + 1 == completed_ticks {
-                record_retained_slot_kv(
-                    scheduler,
-                    handle,
-                    sessions[slot_index].committed_tokens().len(),
-                    kv_bytes_per_token,
-                );
-            }
-            scheduler.advance_after_decode(handle);
+        if tick_error
+            .as_ref()
+            .is_some_and(|error| is_worker_fatal(supervisor, error))
+        {
+            return Some(SlotAwareGpuFatal::slot(
+                handle,
+                reply,
+                tick_error.expect("fatal branch requires an error"),
+            ));
         }
+
         if client_closed {
             record_retained_slot_kv(
                 scheduler,
@@ -7580,10 +8551,33 @@ fn decode_batch_deepseek4(
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            let _ = sessions[slot_index].reset();
+            if let Err(fatal) = reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                return Some(fatal);
+            }
             scheduler.release(handle);
             continue;
         }
+
+        let finished = state.is_finished();
+        let accounting = if was_parked {
+            Deepseek4DecodeAccounting::Parked {
+                deferred_ticks: deferred_decode_ticks,
+            }
+        } else {
+            Deepseek4DecodeAccounting::Fresh {
+                completed_ticks,
+                finished,
+            }
+        };
+        let disposition = account_deepseek4_decode_turn(
+            scheduler,
+            handle,
+            accounting,
+            cold_wave,
+            active_cold_prefills,
+            sessions[slot_index].committed_tokens().len(),
+            kv_bytes_per_token,
+        );
         if let Some(error) = tick_error {
             state.failed(&error);
             record_retained_slot_kv(
@@ -7592,31 +8586,58 @@ fn decode_batch_deepseek4(
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            let _ = sessions[slot_index].reset();
+            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             scheduler.release(handle);
             fire_deepseek4_error(reply, error);
             continue;
         }
-        if finished {
-            let completion = state.finish(registration, events);
-            if completion.is_err() {
-                let _ = sessions[slot_index].reset();
+        let ownership = match resolve_deepseek4_decode_ownership(disposition, finished) {
+            Ok(ownership) => ownership,
+            Err(error) => return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+        };
+        match ownership {
+            Deepseek4DecodeOwnership::Park { deferred_ticks } => {
+                slots[slot_index] = Some((
+                    Deepseek4SlotWork::ParkedCompletion {
+                        state,
+                        cold_wave,
+                        deferred_decode_ticks: deferred_ticks,
+                    },
+                    reply,
+                    handle,
+                ));
             }
-            scheduler.release(handle);
-            last_used[slot_index] = *clock;
-            *clock = clock.saturating_add(1);
-            match completion {
-                Ok(completion) => fire_deepseek4_completion(reply, completion),
-                Err(error) => fire_deepseek4_error(reply, error),
+            Deepseek4DecodeOwnership::Finalize => match state.finish(registration, events) {
+                Ok(completion) => {
+                    scheduler.release(handle);
+                    last_used[slot_index] = *clock;
+                    *clock = clock.saturating_add(1);
+                    fire_deepseek4_completion(reply, completion);
+                }
+                Err(error) => {
+                    reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                        Ok(reply) => reply,
+                        Err(fatal) => return Some(fatal),
+                    };
+                    scheduler.release(handle);
+                    last_used[slot_index] = *clock;
+                    *clock = clock.saturating_add(1);
+                    fire_deepseek4_error(reply, error);
+                }
+            },
+            Deepseek4DecodeOwnership::Reinstall => {
+                slots[slot_index] = Some((
+                    Deepseek4SlotWork::Decode { state, cold_wave },
+                    reply,
+                    handle,
+                ));
             }
-        } else {
-            slots[slot_index] = Some((
-                Deepseek4SlotWork::Decode { state, cold_wave },
-                reply,
-                handle,
-            ));
         }
     }
+    None
 }
 
 fn fire_deepseek4_completion(
@@ -7751,6 +8772,27 @@ fn slot_fire_done(reply: SlotReply, gr: Result<GenerationResult>, client_dropped
     }
 }
 
+/// Fail one reply after the worker supervisor has been poisoned. Stream
+/// terminals are deliberately nonblocking: the guarded HTTP bridge observes
+/// the supervisor poison and emits the authoritative Error even when the raw
+/// worker channel is already saturated by a slow client.
+fn slot_fire_fatal(reply: SlotReply, message: &str) {
+    match reply {
+        SlotReply::Unary(tx) => {
+            let _ = tx.send(Err(anyhow::anyhow!(message.to_string())));
+        }
+        SlotReply::Stream {
+            events, admission, ..
+        } => {
+            if let Some(tx) = admission {
+                let _ = tx.send(Err(anyhow::anyhow!(message.to_string())));
+            } else {
+                let _ = events.try_send(super::sse::GenerationEvent::Error(message.to_string()));
+            }
+        }
+    }
+}
+
 /// Reject a slot-aware stream before the handler commits to SSE. Serial FIFO
 /// callers have no admission channel and retain the historical in-stream
 /// error event.
@@ -7762,7 +8804,7 @@ fn reject_stream_before_sse(
     if let Some(tx) = admission {
         let _ = tx.send(Err(error));
     } else {
-        let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!("{error:#}")));
+        let _ = events.try_send(super::sse::GenerationEvent::Error(format!("{error:#}")));
     }
 }
 
@@ -7925,10 +8967,435 @@ impl Drop for Gemma4KvGuard<'_> {
     }
 }
 
-/// Type alias for one installed Gemma 4 slot: its decode state, where its
-/// output goes, and its scheduler handle (for `advance_after_decode` /
-/// `release`).
-type Gemma4Slot = (Gemma4DecodeState, SlotReply, SlotHandle);
+enum Gemma4SlotWork {
+    Prefill(Gemma4PrefillState),
+    Decode(Gemma4DecodeState),
+}
+
+/// Type alias for one installed Gemma 4 slot: bounded prefill or decode work,
+/// where its output goes, and its scheduler handle.
+type Gemma4Slot = (Gemma4SlotWork, SlotReply, SlotHandle);
+
+enum SlotAwareFatalReply {
+    None,
+    Slot(SlotReply),
+    Warmup(oneshot::Sender<Result<()>>),
+    Embed(oneshot::Sender<Result<Vec<f32>>>),
+}
+
+struct SlotAwareOwnedReply {
+    handle: Option<SlotHandle>,
+    reply: SlotAwareFatalReply,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotAwareFatalKind {
+    Gpu,
+    Invariant,
+}
+
+struct SlotAwareGpuFatal {
+    error: anyhow::Error,
+    kind: SlotAwareFatalKind,
+    owned: Vec<SlotAwareOwnedReply>,
+}
+
+impl SlotAwareGpuFatal {
+    fn slot(handle: SlotHandle, reply: SlotReply, error: anyhow::Error) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Gpu,
+            owned: vec![SlotAwareOwnedReply {
+                handle: Some(handle),
+                reply: SlotAwareFatalReply::Slot(reply),
+            }],
+        }
+    }
+
+    fn embed(
+        handle: Option<SlotHandle>,
+        reply: oneshot::Sender<Result<Vec<f32>>>,
+        error: anyhow::Error,
+    ) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Gpu,
+            owned: vec![SlotAwareOwnedReply {
+                handle,
+                reply: SlotAwareFatalReply::Embed(reply),
+            }],
+        }
+    }
+
+    fn warmup(reply: oneshot::Sender<Result<()>>, error: anyhow::Error) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Gpu,
+            owned: vec![SlotAwareOwnedReply {
+                handle: None,
+                reply: SlotAwareFatalReply::Warmup(reply),
+            }],
+        }
+    }
+
+    fn invariant_embed(
+        handle: SlotHandle,
+        reply: oneshot::Sender<Result<Vec<f32>>>,
+        error: anyhow::Error,
+    ) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: vec![SlotAwareOwnedReply {
+                handle: Some(handle),
+                reply: SlotAwareFatalReply::Embed(reply),
+            }],
+        }
+    }
+
+    fn invariant(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: Vec::new(),
+        }
+    }
+
+    fn invariant_handle(handle: SlotHandle, error: anyhow::Error) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: vec![SlotAwareOwnedReply {
+                handle: Some(handle),
+                reply: SlotAwareFatalReply::None,
+            }],
+        }
+    }
+
+    fn invariant_slot(handle: SlotHandle, reply: SlotReply, error: anyhow::Error) -> Self {
+        Self {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: vec![SlotAwareOwnedReply {
+                handle: Some(handle),
+                reply: SlotAwareFatalReply::Slot(reply),
+            }],
+        }
+    }
+
+    fn extend_slots<I>(&mut self, replies: I)
+    where
+        I: IntoIterator<Item = (Option<SlotHandle>, SlotReply)>,
+    {
+        self.owned.extend(
+            replies
+                .into_iter()
+                .map(|(handle, reply)| SlotAwareOwnedReply {
+                    handle,
+                    reply: SlotAwareFatalReply::Slot(reply),
+                }),
+        );
+    }
+}
+
+fn take_expected_slotaware_slot<Work>(
+    family: &'static str,
+    scheduled: SlotHandle,
+    slot: Option<(Work, SlotReply, SlotHandle)>,
+) -> std::result::Result<(Work, SlotReply), SlotAwareGpuFatal> {
+    let Some((work, reply, installed)) = slot else {
+        return Err(SlotAwareGpuFatal::invariant_handle(
+            scheduled,
+            anyhow::anyhow!(
+                "{family} scheduler selected missing decode slot {} generation {}",
+                scheduled.slot_id.0,
+                scheduled.generation
+            ),
+        ));
+    };
+    if installed != scheduled {
+        return Err(SlotAwareGpuFatal::invariant_slot(
+            scheduled,
+            reply,
+            anyhow::anyhow!(
+                "{family} decode handle mismatch: scheduled {scheduled:?}, installed {installed:?}"
+            ),
+        ));
+    }
+    Ok((work, reply))
+}
+
+fn fail_slotaware_fatal_reply(reply: SlotAwareFatalReply, message: &str) {
+    let error = || anyhow::anyhow!(message.to_string());
+    match reply {
+        SlotAwareFatalReply::None => {}
+        SlotAwareFatalReply::Slot(reply) => slot_fire_fatal(reply, message),
+        SlotAwareFatalReply::Warmup(reply) => {
+            let _ = reply.send(Err(error()));
+        }
+        SlotAwareFatalReply::Embed(reply) => {
+            let _ = reply.send(Err(error()));
+        }
+    }
+}
+
+/// Terminal ownership contract for legacy SerialFifo stream drivers.
+///
+/// An `Err` from [`SerialStreamResult`] means the driver has not emitted a
+/// terminal event and retains the original error chain so the outer worker
+/// can classify a fatal Metal command-buffer failure before any scheduler,
+/// cache, reset, or later GPU work. Successful outcomes have already either
+/// emitted one terminal event or observed that the client is gone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SerialStreamEnd {
+    TerminalSent,
+    ClientClosed,
+}
+
+pub(super) type SerialStreamResult = Result<SerialStreamEnd>;
+
+fn serial_stream_client_closed(
+    cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
+) -> SerialStreamResult {
+    if let Some(counter) = cancellation_counter {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(SerialStreamEnd::ClientClosed)
+}
+
+pub(super) fn supervised_gpu_call<T>(
+    supervisor: &EngineSupervisor,
+    kind: &'static str,
+    call: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    supervisor.run(kind, SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, call)
+}
+
+fn supervised_gemma4_gpu_call<T>(
+    supervisor: &EngineSupervisor,
+    kind: &'static str,
+    call: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    supervisor.run(kind, GEMMA4_GPU_TRANSACTION_TIMEOUT, call)
+}
+
+fn is_worker_fatal(supervisor: &EngineSupervisor, error: &anyhow::Error) -> bool {
+    !supervisor.is_healthy() || is_fatal_command_buffer_error(error)
+}
+
+/// SerialFifo cannot interleave a monolithic family prefill with watchdog
+/// heartbeats. Keep that compatibility mode inside the same independently
+/// bounded transaction envelope used by the SlotAware implementations. Long
+/// agent prompts must use the canonical inflight-batched launchers, where
+/// prefill is resumable and decode-first scheduling remains observable.
+fn validate_serial_prefill_transaction(loaded: &LoadedModel, prompt_tokens: usize) -> Result<()> {
+    validate_serial_prefill_family(loaded_model_family(loaded), prompt_tokens)
+}
+
+fn validate_serial_prefill_family(family: &str, prompt_tokens: usize) -> Result<()> {
+    let limit = match family {
+        "Gemma4" => GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize,
+        "Qwen35" | "Qwen3VL" => QWEN35_SLOT_PREFILL_CHUNK_TOKENS as usize,
+        "DeepSeek4" => return Ok(()),
+        other => anyhow::bail!("unsupported SerialFifo model family {other}"),
+    };
+    anyhow::ensure!(
+        prompt_tokens <= limit,
+        "capability_unsupported: {family} SerialFifo prompt has {prompt_tokens} tokens, exceeding the {limit}-token bounded Metal transaction limit; use --scheduler inflight-batched"
+    );
+    Ok(())
+}
+
+enum SerialStreamDisposition {
+    Complete,
+    RequestError(anyhow::Error),
+    WorkerFatal(anyhow::Error),
+}
+
+fn classify_serial_stream_result(
+    supervisor: &EngineSupervisor,
+    result: SerialStreamResult,
+) -> SerialStreamDisposition {
+    match result {
+        Ok(SerialStreamEnd::TerminalSent | SerialStreamEnd::ClientClosed) => {
+            SerialStreamDisposition::Complete
+        }
+        Err(error) if is_worker_fatal(supervisor, &error) => {
+            SerialStreamDisposition::WorkerFatal(error)
+        }
+        Err(error) => SerialStreamDisposition::RequestError(error),
+    }
+}
+
+fn fail_stop_slotaware_worker(
+    family: &'static str,
+    supervisor: &EngineSupervisor,
+    rx: &mut mpsc::Receiver<Request>,
+    scheduler: &mut InflightBatchedScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    mut fatal: SlotAwareGpuFatal,
+    installed: Vec<(SlotHandle, SlotReply)>,
+    buffered: Vec<Request>,
+) {
+    let detail = format!("{:#}", fatal.error);
+    let cause = match fatal.kind {
+        SlotAwareFatalKind::Gpu => "fatal Metal command-buffer failure",
+        SlotAwareFatalKind::Invariant => "fatal SlotAware worker invariant failure",
+    };
+    let message = format!(
+        "{ENGINE_UNHEALTHY_SENTINEL}: {cause}; {family} worker stopped; \
+         retry after model/process recovery: {detail}"
+    );
+    tracing::error!(
+        family,
+        error = %detail,
+        "SlotAware model worker fail-stop"
+    );
+
+    // Poison and close before replies. This function deliberately has no model/cache
+    // argument, so reset, snapshot, spill, or later GPU submission is
+    // structurally impossible after a poisoned command queue is observed.
+    supervisor.poison_now("slotaware-worker-fatal");
+    rx.close();
+    fatal.extend_slots(
+        installed
+            .into_iter()
+            .map(|(handle, reply)| (Some(handle), reply)),
+    );
+    for owned in fatal.owned {
+        if let Some(handle) = owned.handle {
+            scheduler.release(handle);
+        }
+        fail_slotaware_fatal_reply(owned.reply, &message);
+    }
+    for request in buffered {
+        fail_slotaware_buffered_request(request, &message);
+    }
+    while let Some(request) = rx.blocking_recv() {
+        fail_slotaware_buffered_request(request, &message);
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+}
+
+fn fail_stop_serial_fifo_worker(
+    family: &'static str,
+    supervisor: &EngineSupervisor,
+    rx: &mut mpsc::Receiver<Request>,
+    scheduler: &mut WorkerScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    handle: Option<SlotHandle>,
+    reply: SlotAwareFatalReply,
+    error: anyhow::Error,
+) {
+    let detail = format!("{error:#}");
+    let message = format!(
+        "{ENGINE_UNHEALTHY_SENTINEL}: fatal Metal command-buffer failure; \
+         {family} SerialFifo worker stopped; retry after model/process recovery: {detail}"
+    );
+    tracing::error!(
+        family,
+        error = %detail,
+        "SerialFifo model worker fail-stop"
+    );
+
+    // Poison and close admission before notifying the origin. The helper deliberately
+    // cannot access the model or any cache, so a poisoned queue cannot be
+    // reset, snapshotted, spilled, or submitted to again after this point.
+    supervisor.poison_now("serial-fifo-worker-fatal");
+    rx.close();
+    if let Some(handle) = handle {
+        scheduler.release(handle);
+    }
+    fail_slotaware_fatal_reply(reply, &message);
+    while let Some(request) = rx.blocking_recv() {
+        fail_slotaware_buffered_request(request, &message);
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+}
+
+fn loaded_model_family(loaded: &LoadedModel) -> &'static str {
+    match loaded {
+        LoadedModel::Gemma(_) => "Gemma4",
+        LoadedModel::Qwen35(_) => "Qwen35",
+        LoadedModel::Qwen3VlText(_) => "Qwen3VL",
+        LoadedModel::Deepseek4(_) => "DeepSeek4",
+    }
+}
+
+fn take_gemma4_installed_replies(slots: &mut [Option<Gemma4Slot>]) -> Vec<(SlotHandle, SlotReply)> {
+    slots
+        .iter_mut()
+        .filter_map(|slot| slot.take().map(|(_state, reply, handle)| (handle, reply)))
+        .collect()
+}
+
+fn fail_stop_gemma4_worker(
+    supervisor: &EngineSupervisor,
+    rx: &mut mpsc::Receiver<Request>,
+    scheduler: &mut InflightBatchedScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    slots: &mut [Option<Gemma4Slot>],
+    pending: &mut VecDeque<Request>,
+    mut fatal: SlotAwareGpuFatal,
+    detached_replies: Vec<SlotReply>,
+    mut buffered: Vec<Request>,
+) {
+    fatal.extend_slots(detached_replies.into_iter().map(|reply| (None, reply)));
+    buffered.extend(pending.drain(..));
+    let installed = take_gemma4_installed_replies(slots);
+    fail_stop_slotaware_worker(
+        "Gemma4",
+        supervisor,
+        rx,
+        scheduler,
+        scheduler_stats_snapshot,
+        fatal,
+        installed,
+        buffered,
+    );
+}
+
+fn take_deepseek4_installed_replies(
+    slots: &mut [Option<Deepseek4Slot>],
+) -> Vec<(SlotHandle, SlotReply)> {
+    slots
+        .iter_mut()
+        .filter_map(|slot| slot.take().map(|(_work, reply, handle)| (handle, reply)))
+        .collect()
+}
+
+fn fail_stop_deepseek4_worker(
+    supervisor: &EngineSupervisor,
+    rx: &mut mpsc::Receiver<Request>,
+    scheduler: &mut InflightBatchedScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    slots: &mut [Option<Deepseek4Slot>],
+    pending: &mut VecDeque<Request>,
+    mut fatal: SlotAwareGpuFatal,
+    detached_seeds: Vec<Deepseek4PendingSeed>,
+) {
+    fatal.extend_slots(
+        detached_seeds
+            .into_iter()
+            .map(|seed| (Some(seed.handle), seed.reply)),
+    );
+    let installed = take_deepseek4_installed_replies(slots);
+    let buffered = pending.drain(..).collect();
+    fail_stop_slotaware_worker(
+        "DeepSeek-V4",
+        supervisor,
+        rx,
+        scheduler,
+        scheduler_stats_snapshot,
+        fatal,
+        installed,
+        buffered,
+    );
+}
 
 struct Gemma4PromptAnchor {
     prompt_tokens: Vec<u32>,
@@ -7953,6 +9420,7 @@ fn run_slot_aware_gemma4(
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: EngineSupervisor,
 ) {
     let mut guard = match Gemma4KvGuard::take(&mut model) {
         Ok(g) => g,
@@ -7964,6 +9432,7 @@ fn run_slot_aware_gemma4(
         }
     };
     let n_slots = guard.kv.first().map(|b| b.n_seqs).unwrap_or(0) as usize;
+    scheduler.set_prefill_chunk_tokens(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS);
     let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
     let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
     let mut prompt_anchors: Vec<Option<Gemma4PromptAnchor>> = (0..n_slots).map(|_| None).collect();
@@ -7976,7 +9445,8 @@ fn run_slot_aware_gemma4(
 
     // A request pulled off `rx` that still needs admitting (set when the
     // loop parked on Idle and blocked for one request).
-    let mut pending: Option<Request> = None;
+    let mut pending = VecDeque::new();
+    let mut shutdown_requested = false;
 
     // ADR-040 iter-G(a) — cross-slot BATCHED admit gate. When on, the admit
     // phase collects greedy text requests for free slots and prefills them in
@@ -8011,15 +9481,22 @@ fn run_slot_aware_gemma4(
             // everything else (sampling / soft-tokens / warmup / embed) via the
             // single path, exactly as the default loop does.
             loop {
+                if shutdown_requested {
+                    break;
+                }
                 let n_free = slots.iter().filter(|s| s.is_none()).count();
                 if n_free == 0 {
                     break;
                 }
-                let mut reqs: Vec<Request> = Vec::with_capacity(n_free);
                 let all_slots_idle = slots.iter().all(Option::is_none);
+                // Once any stream is active, consume at most one new request
+                // before the scheduler runs. This prevents a burst of inline
+                // Warmup/Embed forwards from monopolising the worker.
+                let admission_budget = gemma4_admission_budget(all_slots_idle, n_free);
+                let mut reqs: Vec<Request> = Vec::with_capacity(admission_budget);
                 let mut coalesce_deadline: Option<Instant> = None;
-                while reqs.len() < n_free {
-                    let req = match pending.take() {
+                while reqs.len() < admission_budget {
+                    let req = match pending.pop_front() {
                         Some(r) => r,
                         None => match rx.try_recv() {
                             Ok(r) => r,
@@ -8035,7 +9512,10 @@ fn run_slot_aware_gemma4(
                                 }
                                 break;
                             }
-                            Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                shutdown_requested = true;
+                                break;
+                            }
                         },
                     };
                     reqs.push(req);
@@ -8046,16 +9526,60 @@ fn run_slot_aware_gemma4(
                 if reqs.is_empty() {
                     break;
                 }
+                let batch_prefix_len =
+                    gemma4_bounded_batch_prefix_len(reqs.iter().map(gemma4_cross_batch_candidate));
+                // A batchable prefix is one contiguous cold-or-stable class
+                // and shares one 4,096-row transaction budget. A non-batch
+                // request gets one admission quantum by itself. Everything
+                // later returns to the front in original FIFO order.
+                let process_len = batch_prefix_len.max(1).min(reqs.len());
+                let deferred = reqs.split_off(process_len);
+                let mut deferred = VecDeque::from(deferred);
+                deferred.append(&mut pending);
+                pending = deferred;
                 let mut batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
                 let mut stable_batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
-                for req in reqs {
+                let mut reqs = reqs.into_iter();
+                let mut yielded_inline_gpu = false;
+                while let Some(req) = reqs.next() {
+                    let yield_after_inline_gpu =
+                        batch_prefix_len == 0 && gemma4_request_runs_inline_gpu(&req);
+                    macro_rules! stop_on_cross_fatal {
+                        ($outcome:expr) => {
+                            if let Some(fatal) = $outcome {
+                                let detached = batch
+                                    .drain(..)
+                                    .map(|(_, _, reply)| reply)
+                                    .chain(stable_batch.drain(..).map(|(_, _, reply)| reply))
+                                    .collect();
+                                let buffered = reqs.collect();
+                                fail_stop_gemma4_worker(
+                                    &supervisor,
+                                    &mut rx,
+                                    &mut scheduler,
+                                    &scheduler_stats_snapshot,
+                                    &mut slots,
+                                    &mut pending,
+                                    fatal,
+                                    detached,
+                                    buffered,
+                                );
+                                break 'worker;
+                            }
+                        };
+                    }
                     match req {
                         Request::Generate {
                             prompt_tokens,
                             params,
                             reply,
-                        } if params.max_tokens > 0
-                            && params.stable_prompt_prefix_tokens.is_none() =>
+                        } if gemma4_cross_batch_eligible(
+                            prompt_tokens.len(),
+                            params.max_tokens,
+                            params.stable_prompt_prefix_tokens.is_some(),
+                            false,
+                            false,
+                        ) =>
                         {
                             batch.push((prompt_tokens, params, SlotReply::Unary(reply)));
                         }
@@ -8065,9 +9589,15 @@ fn run_slot_aware_gemma4(
                             events,
                             cancellation_counter,
                             admission,
+                            soft_tokens,
                             ..
-                        } if params.max_tokens > 0
-                            && params.stable_prompt_prefix_tokens.is_none() =>
+                        } if gemma4_cross_batch_eligible(
+                            prompt_tokens.len(),
+                            params.max_tokens,
+                            params.stable_prompt_prefix_tokens.is_some(),
+                            false,
+                            !soft_tokens.is_empty(),
+                        ) =>
                         {
                             let reply = SlotReply::family_stream(
                                 events,
@@ -8082,8 +9612,13 @@ fn run_slot_aware_gemma4(
                             prompt_tokens,
                             params,
                             reply,
-                        } if params.max_tokens > 0
-                            && params.stable_prompt_prefix_tokens.is_some() =>
+                        } if gemma4_cross_batch_eligible(
+                            prompt_tokens.len(),
+                            params.max_tokens,
+                            params.stable_prompt_prefix_tokens.is_some(),
+                            true,
+                            false,
+                        ) =>
                         {
                             stable_batch.push((prompt_tokens, params, SlotReply::Unary(reply)));
                         }
@@ -8093,9 +9628,15 @@ fn run_slot_aware_gemma4(
                             events,
                             cancellation_counter,
                             admission,
+                            soft_tokens,
                             ..
-                        } if params.max_tokens > 0
-                            && params.stable_prompt_prefix_tokens.is_some() =>
+                        } if gemma4_cross_batch_eligible(
+                            prompt_tokens.len(),
+                            params.max_tokens,
+                            params.stable_prompt_prefix_tokens.is_some(),
+                            true,
+                            !soft_tokens.is_empty(),
+                        ) =>
                         {
                             let reply = SlotReply::family_stream(
                                 events,
@@ -8111,7 +9652,7 @@ fn run_slot_aware_gemma4(
                             params,
                             reply,
                         } => {
-                            admit_gemma4_slot(
+                            stop_on_cross_fatal!(admit_gemma4_slot(
                                 &mut guard,
                                 &mut scheduler,
                                 &mut slots,
@@ -8121,11 +9662,12 @@ fn run_slot_aware_gemma4(
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
+                                &supervisor,
                                 prompt_tokens,
                                 Vec::new(),
                                 params,
                                 SlotReply::Unary(reply),
-                            );
+                            ));
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
                         Request::GenerateStream {
@@ -8134,6 +9676,7 @@ fn run_slot_aware_gemma4(
                             events,
                             cancellation_counter,
                             admission,
+                            soft_tokens,
                             ..
                         } => {
                             let reply = SlotReply::family_stream(
@@ -8143,7 +9686,7 @@ fn run_slot_aware_gemma4(
                                 registration.as_ref(),
                                 &params,
                             );
-                            admit_gemma4_slot(
+                            stop_on_cross_fatal!(admit_gemma4_slot(
                                 &mut guard,
                                 &mut scheduler,
                                 &mut slots,
@@ -8153,11 +9696,12 @@ fn run_slot_aware_gemma4(
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
+                                &supervisor,
                                 prompt_tokens,
-                                Vec::new(),
+                                soft_tokens,
                                 params,
                                 reply,
-                            );
+                            ));
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
                         Request::GenerateWithSoftTokens {
@@ -8167,7 +9711,7 @@ fn run_slot_aware_gemma4(
                             reply,
                             ..
                         } => {
-                            admit_gemma4_slot(
+                            stop_on_cross_fatal!(admit_gemma4_slot(
                                 &mut guard,
                                 &mut scheduler,
                                 &mut slots,
@@ -8177,40 +9721,80 @@ fn run_slot_aware_gemma4(
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
+                                &supervisor,
                                 prompt_tokens,
                                 soft_tokens,
                                 params,
                                 SlotReply::Unary(reply),
-                            );
+                            ));
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
                         Request::Warmup { reply } => {
-                            let _ = reply.send(warmup_once(&mut guard.model));
+                            let result = warmup_once(&mut guard.model, &supervisor);
+                            match result {
+                                Err(error) if is_worker_fatal(&supervisor, &error) => {
+                                    stop_on_cross_fatal!(Some(SlotAwareGpuFatal::warmup(
+                                        reply, error,
+                                    )));
+                                }
+                                result => {
+                                    let _ = reply.send(result);
+                                }
+                            }
                         }
                         Request::Shutdown => {
-                            tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting");
-                            break 'worker;
+                            tracing::info!(
+                                "Gemma4 SlotAware worker received Shutdown; draining active slots"
+                            );
+                            rx.close();
+                            shutdown_requested = true;
+                            let message = format!(
+                                "{ENGINE_UNHEALTHY_SENTINEL}: Gemma4 SlotAware worker is shutting down"
+                            );
+                            for request in reqs.by_ref() {
+                                fail_slotaware_buffered_request(request, &message);
+                            }
+                            break;
                         }
                         Request::Embed {
                             prompt_tokens,
                             reply,
                         } => {
-                            embed_gemma4_inline(
+                            stop_on_cross_fatal!(embed_gemma4_inline(
                                 &mut guard,
                                 &mut scheduler,
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
+                                &supervisor,
                                 prompt_tokens,
                                 reply,
-                            );
+                            ));
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
-                        _ => {}
+                        request @ (Request::KvSnapshot { .. }
+                        | Request::KvRestore { .. }
+                        | Request::TqPackedKvSnapshot { .. }
+                        | Request::TqPackedKvRestore { .. }
+                        | Request::PromptCacheSnapshot { .. }
+                        | Request::PromptCacheRestore { .. }) => {
+                            reject_slotaware_control_request("Gemma4", request);
+                        }
+                    }
+                    if yield_after_inline_gpu {
+                        yielded_inline_gpu = true;
+                        let mut deferred: VecDeque<Request> = reqs.by_ref().collect();
+                        deferred.append(&mut pending);
+                        pending = deferred;
+                        break;
                     }
                 }
+                if shutdown_requested && batch.is_empty() && stable_batch.is_empty() {
+                    break;
+                }
                 if batch.len() >= 2 {
-                    admit_gemma4_slots_batched(
+                    let stable_replies_on_failure = stable_batch.iter().map(|(_, _, _)| ()).count();
+                    let outcome = admit_gemma4_slots_batched(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
@@ -8220,12 +9804,31 @@ fn run_slot_aware_gemma4(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        &supervisor,
                         batch,
                     );
+                    if let Some(mut fatal) = outcome {
+                        let _ = stable_replies_on_failure;
+                        fatal.extend_slots(
+                            stable_batch.drain(..).map(|(_, _, reply)| (None, reply)),
+                        );
+                        fail_stop_gemma4_worker(
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            &mut slots,
+                            &mut pending,
+                            fatal,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                        break 'worker;
+                    }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 } else {
                     for (prompt_tokens, params, reply) in batch {
-                        admit_gemma4_slot(
+                        if let Some(mut fatal) = admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
@@ -8235,16 +9838,33 @@ fn run_slot_aware_gemma4(
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
+                            &supervisor,
                             prompt_tokens,
                             Vec::new(),
                             params,
                             reply,
-                        );
+                        ) {
+                            fatal.extend_slots(
+                                stable_batch.drain(..).map(|(_, _, reply)| (None, reply)),
+                            );
+                            fail_stop_gemma4_worker(
+                                &supervisor,
+                                &mut rx,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                &mut slots,
+                                &mut pending,
+                                fatal,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            break 'worker;
+                        }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
                 }
                 if stable_batch.len() >= 2 {
-                    admit_gemma4_slots_stable_batched(
+                    if let Some(fatal) = admit_gemma4_slots_stable_batched(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
@@ -8254,12 +9874,26 @@ fn run_slot_aware_gemma4(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        &supervisor,
                         stable_batch,
-                    );
+                    ) {
+                        fail_stop_gemma4_worker(
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            &mut slots,
+                            &mut pending,
+                            fatal,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                        break 'worker;
+                    }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 } else {
                     for (prompt_tokens, params, reply) in stable_batch {
-                        admit_gemma4_slot(
+                        if let Some(fatal) = admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
@@ -8269,35 +9903,68 @@ fn run_slot_aware_gemma4(
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
+                            &supervisor,
                             prompt_tokens,
                             Vec::new(),
                             params,
                             reply,
-                        );
+                        ) {
+                            fail_stop_gemma4_worker(
+                                &supervisor,
+                                &mut rx,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                &mut slots,
+                                &mut pending,
+                                fatal,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            break 'worker;
+                        }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
+                }
+                if shutdown_requested {
+                    break;
+                }
+                if yielded_inline_gpu {
+                    break;
+                }
+                if !all_slots_idle {
+                    // The active cohort gets a scheduler/decode turn after
+                    // exactly one admission quantum.
+                    break;
                 }
             }
         } else {
             loop {
+                if shutdown_requested {
+                    break;
+                }
                 let free = slots.iter().position(|s| s.is_none());
                 let Some(free_idx) = free else { break };
                 let _ = free_idx;
-                let req = match pending.take() {
+                let active_cohort_before_request = slots.iter().any(Option::is_some);
+                let req = match pending.pop_front() {
                     Some(r) => r,
                     None => match rx.try_recv() {
                         Ok(r) => r,
                         Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            shutdown_requested = true;
+                            break;
+                        }
                     },
                 };
+                let yield_after_inline_gpu = gemma4_request_runs_inline_gpu(&req);
                 match req {
                     Request::Generate {
                         prompt_tokens,
                         params,
                         reply,
                     } => {
-                        admit_gemma4_slot(
+                        if let Some(fatal) = admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
@@ -8307,11 +9974,25 @@ fn run_slot_aware_gemma4(
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
+                            &supervisor,
                             prompt_tokens,
                             Vec::new(),
                             params,
                             SlotReply::Unary(reply),
-                        );
+                        ) {
+                            fail_stop_gemma4_worker(
+                                &supervisor,
+                                &mut rx,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                &mut slots,
+                                &mut pending,
+                                fatal,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            break 'worker;
+                        }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
                     Request::GenerateStream {
@@ -8320,6 +10001,7 @@ fn run_slot_aware_gemma4(
                         events,
                         cancellation_counter,
                         admission,
+                        soft_tokens,
                         ..
                     } => {
                         let reply = SlotReply::family_stream(
@@ -8329,7 +10011,7 @@ fn run_slot_aware_gemma4(
                             registration.as_ref(),
                             &params,
                         );
-                        admit_gemma4_slot(
+                        if let Some(fatal) = admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
@@ -8339,11 +10021,25 @@ fn run_slot_aware_gemma4(
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
+                            &supervisor,
                             prompt_tokens,
-                            Vec::new(),
+                            soft_tokens,
                             params,
                             reply,
-                        );
+                        ) {
+                            fail_stop_gemma4_worker(
+                                &supervisor,
+                                &mut rx,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                &mut slots,
+                                &mut pending,
+                                fatal,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            break 'worker;
+                        }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
                     // GenerateWithSoftTokens (multimodal vision generation) IS
@@ -8362,7 +10058,7 @@ fn run_slot_aware_gemma4(
                         reply,
                         ..
                     } => {
-                        admit_gemma4_slot(
+                        if let Some(fatal) = admit_gemma4_slot(
                             &mut guard,
                             &mut scheduler,
                             &mut slots,
@@ -8372,19 +10068,56 @@ fn run_slot_aware_gemma4(
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
+                            &supervisor,
                             prompt_tokens,
                             soft_tokens,
                             params,
                             SlotReply::Unary(reply),
-                        );
+                        ) {
+                            fail_stop_gemma4_worker(
+                                &supervisor,
+                                &mut rx,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                &mut slots,
+                                &mut pending,
+                                fatal,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            break 'worker;
+                        }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
                     Request::Warmup { reply } => {
-                        let _ = reply.send(warmup_once(&mut guard.model));
+                        let result = warmup_once(&mut guard.model, &supervisor);
+                        if let Err(error) = result {
+                            if is_worker_fatal(&supervisor, &error) {
+                                fail_stop_gemma4_worker(
+                                    &supervisor,
+                                    &mut rx,
+                                    &mut scheduler,
+                                    &scheduler_stats_snapshot,
+                                    &mut slots,
+                                    &mut pending,
+                                    SlotAwareGpuFatal::warmup(reply, error),
+                                    Vec::new(),
+                                    Vec::new(),
+                                );
+                                break 'worker;
+                            }
+                            let _ = reply.send(Err(error));
+                        } else {
+                            let _ = reply.send(result);
+                        }
                     }
                     Request::Shutdown => {
-                        tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting");
-                        break 'worker;
+                        tracing::info!(
+                            "Gemma4 SlotAware worker received Shutdown; draining active slots"
+                        );
+                        rx.close();
+                        shutdown_requested = true;
+                        break;
                     }
                     // Embed (pooled last-token embedding) IS served at SlotId>0
                     // by the legacy inflight arm today (embed_gemma4_slot_aware,
@@ -8396,20 +10129,56 @@ fn run_slot_aware_gemma4(
                         prompt_tokens,
                         reply,
                     } => {
-                        embed_gemma4_inline(
+                        if let Some(fatal) = embed_gemma4_inline(
                             &mut guard,
                             &mut scheduler,
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
+                            &supervisor,
                             prompt_tokens,
                             reply,
-                        );
+                        ) {
+                            fail_stop_gemma4_worker(
+                                &supervisor,
+                                &mut rx,
+                                &mut scheduler,
+                                &scheduler_stats_snapshot,
+                                &mut slots,
+                                &mut pending,
+                                fatal,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            break 'worker;
+                        }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
-                    _ => {}
+                    request @ (Request::KvSnapshot { .. }
+                    | Request::KvRestore { .. }
+                    | Request::TqPackedKvSnapshot { .. }
+                    | Request::TqPackedKvRestore { .. }
+                    | Request::PromptCacheSnapshot { .. }
+                    | Request::PromptCacheRestore { .. }) => {
+                        reject_slotaware_control_request("Gemma4", request);
+                    }
+                }
+                if yield_after_inline_gpu || active_cohort_before_request {
+                    break;
                 }
             }
+        }
+
+        if shutdown_requested && slots.iter().all(Option::is_none) {
+            let message =
+                format!("{ENGINE_UNHEALTHY_SENTINEL}: Gemma4 SlotAware worker is shutting down");
+            for request in pending.drain(..) {
+                fail_slotaware_buffered_request(request, &message);
+            }
+            while let Some(request) = rx.blocking_recv() {
+                fail_slotaware_buffered_request(request, &message);
+            }
+            break 'worker;
         }
 
         // ── STEP ─────────────────────────────────────────────────────
@@ -8417,7 +10186,19 @@ fn run_slot_aware_gemma4(
         let step = match scheduler.step() {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("Gemma4 SlotAware scheduler.step() failed: {e:?}");
+                fail_stop_gemma4_worker(
+                    &supervisor,
+                    &mut rx,
+                    &mut scheduler,
+                    &scheduler_stats_snapshot,
+                    &mut slots,
+                    &mut pending,
+                    SlotAwareGpuFatal::invariant(anyhow::anyhow!(
+                        "Gemma4 SlotAware scheduler.step() failed: {e:?}"
+                    )),
+                    Vec::new(),
+                    Vec::new(),
+                );
                 break 'worker;
             }
         };
@@ -8427,23 +10208,48 @@ fn run_slot_aware_gemma4(
         );
         match step {
             SchedulerStep::Idle => {
+                if shutdown_requested {
+                    continue;
+                }
                 // No work. Park until a request arrives, then re-loop to
                 // admit it. Disconnect ends the worker.
                 match rx.blocking_recv() {
-                    Some(r) => pending = Some(r),
-                    None => break 'worker,
+                    Some(r) => pending.push_back(r),
+                    None => shutdown_requested = true,
                 }
             }
-            SchedulerStep::Prefill { .. } => {
-                // Prefill is run eagerly at admit time (prefill_seed), so the
-                // scheduler's Prefilling phase is advanced immediately there.
-                // Reaching here means a slot is still Prefilling in the
-                // scheduler's view but has no pending forward work — advance
-                // is handled in admit. Nothing to do this tick.
+            SchedulerStep::Prefill { handle, n_tokens } => {
+                if let Some(fatal) = advance_gemma4_prefill(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    &mut retained_tokens,
+                    &mut prompt_anchors,
+                    registration.as_ref(),
+                    &scheduler_stats_snapshot,
+                    handle,
+                    n_tokens,
+                    kv_bytes_per_token,
+                    &supervisor,
+                ) {
+                    fail_stop_gemma4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    break 'worker;
+                }
+                publish(&scheduler, &scheduler_stats_snapshot);
             }
             SchedulerStep::Decode { handles } => {
                 let _hp_db = std::time::Instant::now();
-                decode_batch_gemma4(
+                if let Some(fatal) = decode_batch_gemma4(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -8451,7 +10257,21 @@ fn run_slot_aware_gemma4(
                     registration.as_ref(),
                     &handles,
                     kv_bytes_per_token,
-                );
+                    &supervisor,
+                ) {
+                    fail_stop_gemma4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    break 'worker;
+                }
                 crate::inference::models::gemma4::batched_body::host_phases::add(
                     crate::inference::models::gemma4::batched_body::host_phases::Phase::DecodeBatchTotal,
                     _hp_db.elapsed().as_nanos() as u64,
@@ -8463,12 +10283,14 @@ fn run_slot_aware_gemma4(
                     _hp_pub.elapsed().as_nanos() as u64,
                 );
             }
-            SchedulerStep::Mixed { decode_handles, .. } => {
-                // Prefill already ran at admit; the just-admitted slot is
-                // Prefilling and excluded from `decode_handles`
-                // (collect_decoding_handles skips Prefilling). Decode the
-                // rest this tick.
-                decode_batch_gemma4(
+            SchedulerStep::Mixed {
+                prefill,
+                n_prefill_tokens,
+                decode_handles,
+            } => {
+                // Preserve semantic stream responsiveness: existing decoders
+                // run before one bounded cold/suffix transaction.
+                if let Some(fatal) = decode_batch_gemma4(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -8476,7 +10298,47 @@ fn run_slot_aware_gemma4(
                     registration.as_ref(),
                     &decode_handles,
                     kv_bytes_per_token,
-                );
+                    &supervisor,
+                ) {
+                    fail_stop_gemma4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    break 'worker;
+                }
+                if let Some(fatal) = advance_gemma4_prefill(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    &mut retained_tokens,
+                    &mut prompt_anchors,
+                    registration.as_ref(),
+                    &scheduler_stats_snapshot,
+                    prefill,
+                    n_prefill_tokens,
+                    kv_bytes_per_token,
+                    &supervisor,
+                ) {
+                    fail_stop_gemma4_worker(
+                        &supervisor,
+                        &mut rx,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        &mut slots,
+                        &mut pending,
+                        fatal,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    break 'worker;
+                }
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
                 crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -8574,6 +10436,7 @@ fn admit_gemma4_slot(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     // Owned soft-token injections (empty for plain Generate/GenerateStream;
     // the request's vision embeddings for GenerateWithSoftTokens). Borrowed
@@ -8581,7 +10444,64 @@ fn admit_gemma4_slot(
     soft_token_data: Vec<SoftTokenData>,
     params: SamplingParams,
     mut reply: SlotReply,
-) {
+) -> Option<SlotAwareGpuFatal> {
+    if reply.client_closed() {
+        reply.record_client_cancellation();
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "client disconnected before Gemma4 admission"
+            )),
+            true,
+        );
+        return None;
+    }
+    let max_seq_len = guard
+        .model
+        .context_length
+        .unwrap_or(guard.model.config.max_position_embeddings as usize);
+    let shape = match validate_gemma4_generation_request(
+        prompt_tokens.len(),
+        params.max_tokens,
+        max_seq_len,
+    ) {
+        Ok(shape) => shape,
+        Err(error) => {
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
+    if let Some(grammar) = params.grammar.as_ref() {
+        let grammar_check = (|| -> Result<()> {
+            let root = grammar
+                .rule_id("root")
+                .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+            anyhow::ensure!(
+                super::grammar::GrammarRuntime::new(grammar.clone(), root).is_some(),
+                "grammar runtime init failed"
+            );
+            Ok(())
+        })();
+        if let Err(error) = grammar_check {
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    }
+    if !soft_token_data.is_empty()
+        && prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+    {
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "capability_unsupported: Gemma4 SlotAware soft-token prefill is limited to one {}-token transaction until multimodal resume is implemented",
+                GEMMA4_SLOT_PREFILL_CHUNK_TOKENS
+            )),
+            false,
+        );
+        return None;
+    }
+    let bounded_text_prefill = soft_token_data.is_empty()
+        && prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
     // Build borrowed injection slices from the owned data — same shape as
     // the legacy SoftTokens arm (engine.rs:8212-8218). Empty ⇒ identity
     // over the text-only prefill (Generate path).
@@ -8600,13 +10520,13 @@ fn admit_gemma4_slot(
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
-        u64::from(prompt_tokens.len() as u32)
-            .saturating_add(u64::from(params.max_tokens as u32))
+        u64::from(shape.prompt_tokens)
+            .saturating_add(u64::from(shape.max_tokens))
             .saturating_mul(kv_bytes_per_token)
     };
     let admit_req = AdmitRequest {
-        prompt_tokens: prompt_tokens.len() as u32,
-        max_tokens: params.max_tokens as u32,
+        prompt_tokens: shape.prompt_tokens,
+        max_tokens: shape.max_tokens,
         kv_bytes_needed: needed_bytes,
         prompt_kv_bytes: if needed_bytes == 0 {
             0
@@ -8627,15 +10547,14 @@ fn admit_gemma4_slot(
                  logical context was not divided by slot count."
             ));
             slot_fire_done(reply, gr, false);
-            return;
+            return None;
         }
         Err(e) => {
             let gr = Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e}"));
             slot_fire_done(reply, gr, false);
-            return;
+            return None;
         }
     };
-    reply.accept_stream_admission();
     let Some(handle) = admitted.handle else {
         // `handle: None` == the scheduler's CompletedAtAdmit outcome
         // (`max_tokens == 0`): no physical slot allocated, no scheduler
@@ -8645,20 +10564,28 @@ fn admit_gemma4_slot(
         // `max_tokens.max(1)` → one decode token) and fire. With soft
         // tokens present, the soft-token sibling is used. Preserves
         // byte-equivalence for the degenerate `max_tokens == 0` request.
-        let gr = if soft_tokens.is_empty() {
-            generate_once(guard.model, &prompt_tokens, &params, registration)
-        } else {
-            generate_once_with_soft_tokens(
-                guard.model,
-                &prompt_tokens,
-                &soft_tokens,
-                &params,
-                registration,
-            )
-        };
-        slot_fire_done(reply, gr, false);
-        return;
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "invalid_request: max_tokens must be greater than zero"
+            )),
+            false,
+        );
+        return None;
     };
+
+    if reply.client_closed() {
+        reply.record_client_cancellation();
+        scheduler.record_slot_high_water(handle, 0);
+        scheduler.release(handle);
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!("client disconnected before Gemma4 prefill")),
+            true,
+        );
+        return None;
+    }
+    reply.accept_stream_admission();
 
     let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
     let cached_tokens = selected_preference
@@ -8693,6 +10620,16 @@ fn admit_gemma4_slot(
     if cached_tokens == 0 {
         retained_tokens[handle.slot_id.0 as usize].clear();
         prompt_anchors[handle.slot_id.0 as usize] = None;
+        reply = match reset_gemma4_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
     } else if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
         let restore_result = (|| -> Result<()> {
             let anchor = prompt_anchors[handle.slot_id.0 as usize]
@@ -8717,13 +10654,27 @@ fn admit_gemma4_slot(
             Ok(())
         })();
         if let Err(e) = restore_result {
-            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             retained_tokens[handle.slot_id.0 as usize].clear();
             prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
             slot_fire_done(reply, Err(e), false);
-            return;
+            return None;
         }
+        if let Err(error) = install_gemma4_slot_cursor(guard, handle.slot_id, cached_tokens) {
+            return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+        }
+    } else if let Err(error) = validate_gemma4_slot_cursor(guard, handle.slot_id, cached_tokens) {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
 
     // Restore the per-prefill self-mount fresh state (None) before this
@@ -8731,6 +10682,71 @@ fn admit_gemma4_slot(
     // this slot's consume-gate (forward_prefill.rs:699/2344; precedent at
     // forward_embed_last :2459). Load-bearing for N>1 concurrency.
     clear_gemma4_self_mounts(guard.model);
+
+    if reply.client_closed() {
+        reply.record_client_cancellation();
+        reply = match reset_gemma4_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
+        retained_tokens[handle.slot_id.0 as usize].clear();
+        prompt_anchors[handle.slot_id.0 as usize] = None;
+        scheduler.release(handle);
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!("client disconnected before Gemma4 prefill")),
+            true,
+        );
+        return None;
+    }
+
+    if bounded_text_prefill {
+        let pending_anchor =
+            if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
+                prompt_anchors[handle.slot_id.0 as usize].take()
+            } else {
+                None
+            };
+        let stable_boundary = params
+            .stable_prompt_prefix_tokens
+            .filter(|_| guard.hybrid.is_some());
+        let prefill = match Gemma4PrefillState::new(
+            handle.slot_id,
+            prompt_tokens,
+            params,
+            cached_tokens,
+            pending_anchor,
+            stable_boundary,
+        ) {
+            Ok(prefill) => prefill,
+            Err(error) => {
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[handle.slot_id.0 as usize].clear();
+                prompt_anchors[handle.slot_id.0 as usize] = None;
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(error), false);
+                return None;
+            }
+        };
+        scheduler.advance_after_prefill(handle, cached_tokens as u32);
+        slots[handle.slot_id.0 as usize] = Some((Gemma4SlotWork::Prefill(prefill), reply, handle));
+        return None;
+    }
 
     let seed = Gemma4DecodeState::prefill_seed(
         guard.model,
@@ -8743,13 +10759,26 @@ fn admit_gemma4_slot(
         guard.hybrid.as_mut(),
         guard.dense.as_mut(),
         guard.mlx.as_mut(),
+        supervisor,
         cached_tokens,
     );
     let (state, stable_anchor) = match seed {
         Ok(seed) => seed,
         Err(e) => {
+            if is_worker_fatal(supervisor, &e) {
+                return Some(SlotAwareGpuFatal::slot(handle, reply, e));
+            }
             // Prefill failed: reset the slot's KV, release, fire error.
-            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             retained_tokens[handle.slot_id.0 as usize].clear();
             prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
@@ -8757,9 +10786,37 @@ fn admit_gemma4_slot(
                 *g = scheduler.stats();
             }
             slot_fire_done(reply, Err(e), false);
-            return;
+            return None;
         }
     };
+    if let Err(error) =
+        commit_gemma4_slot_cursor(guard, handle.slot_id, cached_tokens, prompt_tokens.len())
+    {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+    }
+
+    if reply.client_closed() {
+        reply.record_client_cancellation();
+        reply = match reset_gemma4_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
+        retained_tokens[handle.slot_id.0 as usize].clear();
+        prompt_anchors[handle.slot_id.0 as usize] = None;
+        scheduler.release(handle);
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!("client disconnected during Gemma4 prefill")),
+            true,
+        );
+        return None;
+    }
 
     if let Some(kv) = stable_anchor {
         let boundary = kv.prompt_len();
@@ -8799,18 +10856,27 @@ fn admit_gemma4_slot(
 
     // Prefill consumed the whole prompt in one shot → advance the
     // scheduler's Prefilling phase to Decoding immediately.
-    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+    scheduler.advance_after_prefill(handle, shape.prompt_tokens);
 
     // Prefill has already selected completion token zero. Route it before the
     // first decode tick so a native Gemma tool opener is not omitted from SSE.
     let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
     if seed_dropped {
-        reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+        reply = match reset_gemma4_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
         retained_tokens[handle.slot_id.0 as usize].clear();
         scheduler.release(handle);
         let gr = Ok(state.finish(registration));
         slot_fire_done(reply, gr, true);
-        return;
+        return None;
     }
 
     if state.finished_at_seed() {
@@ -8825,11 +10891,218 @@ fn admit_gemma4_slot(
         scheduler.release(handle);
         let gr = Ok(state.finish(registration));
         slot_fire_done(reply, gr, false);
-        return;
+        return None;
     }
 
     let slot_idx = handle.slot_id.0 as usize;
-    slots[slot_idx] = Some((state, reply, handle));
+    slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_gemma4_prefill(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    handle: SlotHandle,
+    requested_tokens: u32,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<SlotAwareGpuFatal> {
+    let slot_idx = handle.slot_id.0 as usize;
+    let Some((work, mut reply, installed)) = slots.get_mut(slot_idx).and_then(Option::take) else {
+        return Some(SlotAwareGpuFatal::invariant_handle(
+            handle,
+            anyhow::anyhow!(
+                "Gemma4 scheduler selected missing prefill slot {} generation {}",
+                handle.slot_id.0,
+                handle.generation
+            ),
+        ));
+    };
+    if installed != handle {
+        return Some(SlotAwareGpuFatal::invariant_slot(
+            handle,
+            reply,
+            anyhow::anyhow!(
+                "Gemma4 prefill handle mismatch (scheduled={handle:?}, installed={installed:?})"
+            ),
+        ));
+    }
+    let state = match work {
+        Gemma4SlotWork::Prefill(state) => state,
+        Gemma4SlotWork::Decode(_) => {
+            return Some(SlotAwareGpuFatal::invariant_slot(
+                handle,
+                reply,
+                anyhow::anyhow!(
+                    "Gemma4 scheduler requested prefill for decode work at slot {} generation {}",
+                    handle.slot_id.0,
+                    handle.generation
+                ),
+            ));
+        }
+    };
+
+    if reply.client_closed() {
+        reply.record_client_cancellation();
+        reply = match reset_gemma4_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
+        retained_tokens[slot_idx].clear();
+        prompt_anchors[slot_idx] = None;
+        scheduler.release(handle);
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
+            true,
+        );
+        return None;
+    }
+
+    let max_chunk_tokens = requested_tokens
+        .min(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS)
+        .max(1) as usize;
+    match state.advance(guard, registration, max_chunk_tokens, supervisor) {
+        Ok(Gemma4PrefillAdvance::Pending {
+            state,
+            advanced_tokens,
+        }) => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            tracing::info!(
+                slot = handle.slot_id.0,
+                advanced_tokens,
+                committed_tokens = state.progress.cursor(),
+                prompt_tokens = state.prompt_tokens.len(),
+                "Gemma4 bounded prefill transaction complete"
+            );
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
+                    true,
+                );
+            } else {
+                scheduler.yield_prefill_turn(handle);
+                slots[slot_idx] = Some((Gemma4SlotWork::Prefill(state), reply, handle));
+            }
+        }
+        Ok(Gemma4PrefillAdvance::Ready {
+            state,
+            prompt_anchor,
+            advanced_tokens,
+        }) => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            tracing::info!(
+                slot = handle.slot_id.0,
+                advanced_tokens,
+                prompt_tokens = state.prompt_len,
+                "Gemma4 bounded prefill transaction complete"
+            );
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
+                    true,
+                );
+                return None;
+            }
+            prompt_anchors[slot_idx] = prompt_anchor;
+            let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
+            if seed_dropped {
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                let result = Ok(state.finish(registration));
+                slot_fire_done(reply, result, true);
+            } else if state.finished_at_seed() {
+                retained_tokens[slot_idx] = state.retained_prefix();
+                record_retained_slot_kv(
+                    scheduler,
+                    handle,
+                    retained_tokens[slot_idx].len(),
+                    kv_bytes_per_token,
+                );
+                scheduler.advance_after_decode(handle);
+                scheduler.release(handle);
+                slot_fire_done(reply, Ok(state.finish(registration)), false);
+            } else {
+                slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
+            }
+        }
+        Err(error) => {
+            if is_worker_fatal(supervisor, &error) {
+                return Some(SlotAwareGpuFatal::slot(handle, reply, error));
+            }
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[slot_idx].clear();
+            prompt_anchors[slot_idx] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(error), false);
+        }
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    None
 }
 
 /// ADR-040 iter-G(a) — cross-slot BATCHED admit. Prefills N text requests
@@ -8856,22 +11129,81 @@ fn admit_gemma4_slots_batched(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
-) {
+) -> Option<SlotAwareGpuFatal> {
+    // The family watchdog bound applies to the complete Metal transaction,
+    // not independently to every lane. Direct/internal callers that hand us
+    // a larger aggregate are routed through the bounded single-slot state
+    // machine instead of constructing a 16K-32K multi-sequence forward.
+    if !gemma4_batch_rows_within_transaction_limit(
+        requests.iter().map(|(prompt, _, _)| prompt.len()),
+    ) {
+        let mut requests = requests.into_iter();
+        while let Some((prompt_tokens, params, reply)) = requests.next() {
+            if let Some(mut fatal) = admit_gemma4_slot(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                registration,
+                scheduler_stats_snapshot,
+                per_slot_kv_budget_bytes,
+                kv_bytes_per_token,
+                supervisor,
+                prompt_tokens,
+                Vec::new(),
+                params,
+                reply,
+            ) {
+                fatal.extend_slots(requests.map(|(_, _, reply)| (None, reply)));
+                return Some(fatal);
+            }
+        }
+        return None;
+    }
+
+    let max_seq_len = guard
+        .model
+        .context_length
+        .unwrap_or(guard.model.config.max_position_embeddings as usize);
     // 1. Reserve a physical slot for each request.
     let mut admitted: Vec<(SlotHandle, Vec<u32>, SamplingParams, SlotReply)> =
         Vec::with_capacity(requests.len());
     for (prompt_tokens, params, reply) in requests {
+        if reply.client_closed() {
+            reply.record_client_cancellation();
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "client disconnected before Gemma4 batched admission"
+                )),
+                true,
+            );
+            continue;
+        }
+        let shape = match validate_gemma4_generation_request(
+            prompt_tokens.len(),
+            params.max_tokens,
+            max_seq_len,
+        ) {
+            Ok(shape) => shape,
+            Err(error) => {
+                slot_fire_done(reply, Err(error), false);
+                continue;
+            }
+        };
         let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
             0
         } else {
-            u64::from(prompt_tokens.len() as u32)
-                .saturating_add(u64::from(params.max_tokens as u32))
+            u64::from(shape.prompt_tokens)
+                .saturating_add(u64::from(shape.max_tokens))
                 .saturating_mul(kv_bytes_per_token)
         };
         let admit_req = AdmitRequest {
-            prompt_tokens: prompt_tokens.len() as u32,
-            max_tokens: params.max_tokens as u32,
+            prompt_tokens: shape.prompt_tokens,
+            max_tokens: shape.max_tokens,
             kv_bytes_needed: needed_bytes,
             prompt_kv_bytes: if needed_bytes == 0 {
                 0
@@ -8886,10 +11218,13 @@ fn admit_gemma4_slots_batched(
                 // handle:None == queued/completed-at-admit. We only batch when
                 // slots are free + max_tokens>0, so this is not expected; serve
                 // via the legacy non-slot path rather than drop the request.
-                None => {
-                    let gr = generate_once(guard.model, &prompt_tokens, &params, registration);
-                    slot_fire_done(reply, gr, false);
-                }
+                None => slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!(
+                        "invalid_request: max_tokens must be greater than zero"
+                    )),
+                    false,
+                ),
             },
             Err(e) => slot_fire_done(
                 reply,
@@ -8904,13 +11239,37 @@ fn admit_gemma4_slots_batched(
         *g = scheduler.stats();
     }
 
+    // A stream can close while earlier requests in this batch are being
+    // admitted. Remove it before any slot reset or Metal submission. Since
+    // its reservation never touched cache state, publish zero physical growth
+    // before release so the scheduler does not retain phantom prompt bytes.
+    let mut live_admitted = Vec::with_capacity(admitted.len());
+    for (handle, prompt_tokens, params, reply) in admitted {
+        if reply.client_closed() {
+            reply.record_client_cancellation();
+            scheduler.record_slot_high_water(handle, 0);
+            scheduler.release(handle);
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "client disconnected before Gemma4 batched prefill"
+                )),
+                true,
+            );
+        } else {
+            live_admitted.push((handle, prompt_tokens, params, reply));
+        }
+    }
+    let mut admitted = live_admitted;
+
     // Fewer than 2 survived → the batched forward isn't worthwhile; route the
     // survivor(s) through the validated single path (release the reservation
     // first; admit_gemma4_slot re-admits).
     if admitted.len() < 2 {
         for (handle, prompt_tokens, params, reply) in admitted {
+            scheduler.record_slot_high_water(handle, 0);
             scheduler.release(handle);
-            admit_gemma4_slot(
+            if let Some(fatal) = admit_gemma4_slot(
                 guard,
                 scheduler,
                 slots,
@@ -8920,13 +11279,16 @@ fn admit_gemma4_slots_batched(
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
                 kv_bytes_per_token,
+                supervisor,
                 prompt_tokens,
                 Vec::new(),
                 params,
                 reply,
-            );
+            ) {
+                return Some(fatal);
+            }
         }
-        return;
+        return None;
     }
 
     for (_, _, _, reply) in &mut admitted {
@@ -8935,8 +11297,25 @@ fn admit_gemma4_slots_batched(
 
     // 2. Per-slot entry reset (kv + hybrid) + clear self-mounts (mirror
     //    prefill_seed's entry reset + the iter-F-prefill-determinism pre-clear).
+    let reset_failure = admitted.iter().find_map(|(handle, _, _, _)| {
+        reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
+            .err()
+            .map(|error| (*handle, error))
+    });
+    if let Some((_failed_handle, error)) = reset_failure {
+        let mut fatal = SlotAwareGpuFatal {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: Vec::with_capacity(admitted.len()),
+        };
+        fatal.extend_slots(
+            admitted
+                .into_iter()
+                .map(|(handle, _, _, reply)| (Some(handle), reply)),
+        );
+        return Some(fatal);
+    }
     for (handle, _, _, _) in &admitted {
-        reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token);
         retained_tokens[handle.slot_id.0 as usize].clear();
         prompt_anchors[handle.slot_id.0 as usize] = None;
     }
@@ -8959,22 +11338,57 @@ fn admit_gemma4_slots_batched(
         .hybrid
         .as_deref()
         .expect("iter-G(a): hybrid scaffold present (capability-gated by caller)");
-    let forward = guard.model.weights.forward_prefill_batched_multi_seq(
-        &seqs,
-        scaffold,
-        max_decode,
-        &mut guard.model.ctx,
-    );
+    let forward = supervised_gemma4_gpu_call(supervisor, "gemma4_batched_prefill", || {
+        guard.model.weights.forward_prefill_batched_multi_seq(
+            &seqs,
+            scaffold,
+            max_decode,
+            &mut guard.model.ctx,
+        )
+    });
     let prefill_duration = prefill_started.elapsed();
-    clear_gemma4_self_mounts(guard.model);
 
     let output = match forward {
-        Ok(t) => t,
+        Ok(t) => {
+            clear_gemma4_self_mounts(guard.model);
+            t
+        }
         Err(e) => {
+            if is_worker_fatal(supervisor, &e) {
+                let mut fatal = SlotAwareGpuFatal {
+                    error: e,
+                    kind: SlotAwareFatalKind::Gpu,
+                    owned: Vec::with_capacity(admitted.len()),
+                };
+                fatal.extend_slots(
+                    admitted
+                        .into_iter()
+                        .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                );
+                return Some(fatal);
+            }
+            clear_gemma4_self_mounts(guard.model);
             // All-or-nothing: reset + release + error every reserved slot.
             let msg = format!("ADR-040 iter-G(a) multi-seq prefill failed: {e}");
+            let reset_failure = admitted.iter().find_map(|(handle, _, _, _)| {
+                reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
+                    .err()
+                    .map(|error| (*handle, error))
+            });
+            if let Some((_failed_handle, error)) = reset_failure {
+                let mut fatal = SlotAwareGpuFatal {
+                    error,
+                    kind: SlotAwareFatalKind::Invariant,
+                    owned: Vec::with_capacity(admitted.len()),
+                };
+                fatal.extend_slots(
+                    admitted
+                        .into_iter()
+                        .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                );
+                return Some(fatal);
+            }
             for (handle, _, _, reply) in admitted {
-                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
                 prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(anyhow::anyhow!("{msg}")), false);
@@ -8982,7 +11396,7 @@ fn admit_gemma4_slots_batched(
             if let Ok(mut g) = scheduler_stats_snapshot.lock() {
                 *g = scheduler.stats();
             }
-            return;
+            return None;
         }
     };
     if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
@@ -8993,14 +11407,35 @@ fn admit_gemma4_slots_batched(
         );
     }
 
-    // 4. Install each slot — identical tail to admit_gemma4_slot.
-    for ((handle, prompt_tokens, params, mut reply), (first_token, first_logits)) in
-        admitted.into_iter().zip(
-            output
-                .first_tokens
+    // Publish the full prompt cursor for every lane as one software
+    // transaction only after the shared GPU forward completed.
+    let cursor_commits: Vec<(SlotId, usize, usize)> = admitted
+        .iter()
+        .map(|(handle, prompt, _, _)| (handle.slot_id, 0, prompt.len()))
+        .collect();
+    if let Err(error) = commit_gemma4_slot_cursors(guard, &cursor_commits) {
+        let mut fatal = SlotAwareGpuFatal {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: Vec::with_capacity(admitted.len()),
+        };
+        fatal.extend_slots(
+            admitted
                 .into_iter()
-                .zip(output.logits.into_iter()),
-        )
+                .map(|(handle, _, _, reply)| (Some(handle), reply)),
+        );
+        return Some(fatal);
+    }
+
+    // 4. Install each slot — identical tail to admit_gemma4_slot.
+    let mut installs = admitted.into_iter().zip(
+        output
+            .first_tokens
+            .into_iter()
+            .zip(output.logits.into_iter()),
+    );
+    while let Some(((handle, prompt_tokens, params, mut reply), (first_token, first_logits))) =
+        installs.next()
     {
         // The multi-sequence fast path sees only the final rendered prompt,
         // not an exact pre-generation boundary. Never manufacture a
@@ -9020,7 +11455,23 @@ fn admit_gemma4_slots_batched(
         ) {
             Ok(s) => s,
             Err(e) => {
-                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(installs.map(
+                            |((remaining_handle, _, _, remaining_reply), _)| {
+                                (Some(remaining_handle), remaining_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
                 retained_tokens[handle.slot_id.0 as usize].clear();
                 prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
@@ -9028,10 +11479,29 @@ fn admit_gemma4_slots_batched(
                 continue;
             }
         };
-        scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+        scheduler.advance_after_prefill(
+            handle,
+            u32::try_from(prompt_tokens.len()).expect("Gemma batch request was validated"),
+        );
         let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
         if seed_dropped {
-            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(mut fatal) => {
+                    fatal.extend_slots(installs.map(
+                        |((remaining_handle, _, _, remaining_reply), _)| {
+                            (Some(remaining_handle), remaining_reply)
+                        },
+                    ));
+                    return Some(fatal);
+                }
+            };
             retained_tokens[handle.slot_id.0 as usize].clear();
             scheduler.release(handle);
             let gr = Ok(state.finish(registration));
@@ -9053,11 +11523,12 @@ fn admit_gemma4_slots_batched(
             continue;
         }
         let slot_idx = handle.slot_id.0 as usize;
-        slots[slot_idx] = Some((state, reply, handle));
+        slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
     }
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
     }
+    None
 }
 
 /// Batch exact Gemma agentic continuations without weakening the native
@@ -9079,49 +11550,104 @@ fn admit_gemma4_slots_stable_batched(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
-) {
-    let fallback_single =
-        |guard: &mut Gemma4KvGuard<'_>,
-         scheduler: &mut InflightBatchedScheduler,
-         slots: &mut [Option<Gemma4Slot>],
-         retained_tokens: &mut [Vec<u32>],
-         prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
-         requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>| {
-            for (prompt_tokens, params, reply) in requests {
-                admit_gemma4_slot(
-                    guard,
-                    scheduler,
-                    slots,
-                    retained_tokens,
-                    prompt_anchors,
-                    registration,
-                    scheduler_stats_snapshot,
-                    per_slot_kv_budget_bytes,
-                    kv_bytes_per_token,
-                    prompt_tokens,
-                    Vec::new(),
-                    params,
-                    reply,
-                );
+) -> Option<SlotAwareGpuFatal> {
+    let fallback_single = |guard: &mut Gemma4KvGuard<'_>,
+                           scheduler: &mut InflightBatchedScheduler,
+                           slots: &mut [Option<Gemma4Slot>],
+                           retained_tokens: &mut [Vec<u32>],
+                           prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+                           requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>|
+     -> Option<SlotAwareGpuFatal> {
+        let mut requests = requests.into_iter();
+        while let Some((prompt_tokens, params, reply)) = requests.next() {
+            if let Some(mut fatal) = admit_gemma4_slot(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                registration,
+                scheduler_stats_snapshot,
+                per_slot_kv_budget_bytes,
+                kv_bytes_per_token,
+                supervisor,
+                prompt_tokens,
+                Vec::new(),
+                params,
+                reply,
+            ) {
+                fatal.extend_slots(requests.map(|(_, _, reply)| (None, reply)));
+                return Some(fatal);
             }
-        };
+        }
+        None
+    };
+
+    // Both stable phases are multi-sequence Metal transactions. Conservatively
+    // cap the sum of full rendered rows; their actual boundary/cue suffix sums
+    // can only be smaller. This keeps each phase within the same 4,096-row
+    // watchdog boundary as ordinary Gemma prefill.
+    if !gemma4_batch_rows_within_transaction_limit(
+        requests.iter().map(|(prompt, _, _)| prompt.len()),
+    ) {
+        return fallback_single(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            requests,
+        );
+    }
+
+    let max_seq_len = guard
+        .model
+        .context_length
+        .unwrap_or(guard.model.config.max_position_embeddings as usize);
 
     // Plan against both installed and newly reserved slots. Without the
     // second bitmap, two similar conversations could select the same longest
     // anchor before the scheduler reservation becomes visible in `slots`.
     let mut selected = vec![false; slots.len()];
     let mut planned = Vec::with_capacity(requests.len());
-    for (prompt_tokens, params, reply) in requests {
+    let mut requests = requests.into_iter();
+    while let Some((prompt_tokens, params, reply)) = requests.next() {
+        if reply.client_closed() {
+            reply.record_client_cancellation();
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "client disconnected before Gemma4 stable admission"
+                )),
+                true,
+            );
+            continue;
+        }
+        let shape = match validate_gemma4_generation_request(
+            prompt_tokens.len(),
+            params.max_tokens,
+            max_seq_len,
+        ) {
+            Ok(shape) => shape,
+            Err(error) => {
+                slot_fire_done(reply, Err(error), false);
+                continue;
+            }
+        };
         let Some(boundary) = params.stable_prompt_prefix_tokens else {
-            fallback_single(
+            if let Some(mut fatal) = fallback_single(
                 guard,
                 scheduler,
                 slots,
                 retained_tokens,
                 prompt_anchors,
                 vec![(prompt_tokens, params, reply)],
-            );
+            ) {
+                fatal.extend_slots(requests.map(|(_, _, remaining_reply)| (None, remaining_reply)));
+                return Some(fatal);
+            }
             continue;
         };
         let preference = preferred_gemma4_slot_excluding(
@@ -9137,26 +11663,29 @@ fn admit_gemma4_slots_stable_batched(
                 && boundary > 0
                 && boundary < prompt_tokens.len()
         }) else {
-            fallback_single(
+            if let Some(mut fatal) = fallback_single(
                 guard,
                 scheduler,
                 slots,
                 retained_tokens,
                 prompt_anchors,
                 vec![(prompt_tokens, params, reply)],
-            );
+            ) {
+                fatal.extend_slots(requests.map(|(_, _, remaining_reply)| (None, remaining_reply)));
+                return Some(fatal);
+            }
             continue;
         };
         selected[preference.slot.0 as usize] = true;
-        planned.push((prompt_tokens, params, reply, preference, boundary));
+        planned.push((prompt_tokens, params, reply, preference, boundary, shape));
     }
 
     if planned.len() < 2 {
         let requests = planned
             .into_iter()
-            .map(|(prompt, params, reply, _, _)| (prompt, params, reply))
+            .map(|(prompt, params, reply, _, _, _)| (prompt, params, reply))
             .collect();
-        fallback_single(
+        let fatal = fallback_single(
             guard,
             scheduler,
             slots,
@@ -9164,21 +11693,21 @@ fn admit_gemma4_slots_stable_batched(
             prompt_anchors,
             requests,
         );
-        return;
+        return fatal;
     }
 
     let mut admitted = Vec::with_capacity(planned.len());
-    for (prompt_tokens, params, reply, preference, boundary) in planned {
+    for (prompt_tokens, params, reply, preference, boundary, shape) in planned {
         let needed_bytes = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
             0
         } else {
-            (prompt_tokens.len() as u64)
-                .saturating_add(params.max_tokens as u64)
+            u64::from(shape.prompt_tokens)
+                .saturating_add(u64::from(shape.max_tokens))
                 .saturating_mul(kv_bytes_per_token)
         };
         let admit = scheduler.admit(AdmitRequest {
-            prompt_tokens: prompt_tokens.len() as u32,
-            max_tokens: params.max_tokens as u32,
+            prompt_tokens: shape.prompt_tokens,
+            max_tokens: shape.max_tokens,
             kv_bytes_needed: needed_bytes,
             prompt_kv_bytes: if needed_bytes == 0 {
                 0
@@ -9237,6 +11766,27 @@ fn admit_gemma4_slots_stable_batched(
         }
     }
 
+    // Admission and preference planning may take long enough for an SSE
+    // receiver to disappear. Filter again before anchor restore/cache writes.
+    let mut live_admitted = Vec::with_capacity(admitted.len());
+    for (handle, prompt, params, reply, preference, boundary) in admitted {
+        if reply.client_closed() {
+            reply.record_client_cancellation();
+            scheduler.record_slot_high_water(handle, 0);
+            scheduler.release(handle);
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "client disconnected before Gemma4 stable prefill"
+                )),
+                true,
+            );
+        } else {
+            live_admitted.push((handle, prompt, params, reply, preference, boundary));
+        }
+    }
+    let mut admitted = live_admitted;
+
     if admitted.len() < 2 {
         for (handle, prompt, params, reply, _, _) in admitted {
             // The stable batch did not execute, so this arena is unchanged.
@@ -9244,16 +11794,18 @@ fn admit_gemma4_slots_stable_batched(
             // request through the single-request path.
             scheduler.record_slot_high_water(handle, 0);
             scheduler.release(handle);
-            fallback_single(
+            if let Some(fatal) = fallback_single(
                 guard,
                 scheduler,
                 slots,
                 retained_tokens,
                 prompt_anchors,
                 vec![(prompt, params, reply)],
-            );
+            ) {
+                return Some(fatal);
+            }
         }
-        return;
+        return None;
     }
 
     for (_, _, _, reply, _, _) in &mut admitted {
@@ -9287,7 +11839,7 @@ fn admit_gemma4_slots_stable_batched(
         Ok(())
     })();
     if let Err(e) = restore_result {
-        fail_gemma4_stable_batch(
+        return fail_gemma4_stable_batch(
             guard,
             scheduler,
             retained_tokens,
@@ -9296,7 +11848,24 @@ fn admit_gemma4_slots_stable_batched(
             kv_bytes_per_token,
             e,
         );
-        return;
+    }
+    for (handle, _, _, _, preference, _) in &admitted {
+        let cursor_result = if preference.restore_prompt_anchor {
+            install_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)
+        } else {
+            validate_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)
+        };
+        if let Err(error) = cursor_result {
+            return fail_gemma4_stable_batch(
+                guard,
+                scheduler,
+                retained_tokens,
+                prompt_anchors,
+                admitted,
+                kv_bytes_per_token,
+                error,
+            );
+        }
     }
 
     clear_gemma4_self_mounts(guard.model);
@@ -9327,12 +11896,15 @@ fn admit_gemma4_slots_stable_batched(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume lost hybrid KV"))?;
         if !boundary_seqs.is_empty() {
-            let _ = guard.model.weights.forward_prefill_batched_multi_seq_live(
-                &boundary_seqs,
-                scaffold,
-                max_decode,
-                &mut guard.model.ctx,
-            )?;
+            let _ =
+                supervised_gemma4_gpu_call(supervisor, "gemma4_stable_prefill_boundary", || {
+                    guard.model.weights.forward_prefill_batched_multi_seq_live(
+                        &boundary_seqs,
+                        scaffold,
+                        max_decode,
+                        &mut guard.model.ctx,
+                    )
+                })?;
             clear_gemma4_self_mounts(guard.model);
         }
 
@@ -9355,19 +11927,37 @@ fn admit_gemma4_slots_stable_batched(
                 (prompt[*boundary..].to_vec(), handle.slot_id, *boundary)
             })
             .collect();
-        guard.model.weights.forward_prefill_batched_multi_seq_live(
-            &cue_seqs,
-            scaffold,
-            max_decode,
-            &mut guard.model.ctx,
-        )
+        supervised_gemma4_gpu_call(supervisor, "gemma4_stable_prefill_cue", || {
+            guard.model.weights.forward_prefill_batched_multi_seq_live(
+                &cue_seqs,
+                scaffold,
+                max_decode,
+                &mut guard.model.ctx,
+            )
+        })
     })();
-    clear_gemma4_self_mounts(guard.model);
 
     let output = match forward_result {
-        Ok(output) => output,
+        Ok(output) => {
+            clear_gemma4_self_mounts(guard.model);
+            output
+        }
         Err(e) => {
-            fail_gemma4_stable_batch(
+            if is_worker_fatal(supervisor, &e) {
+                let mut fatal = SlotAwareGpuFatal {
+                    error: e,
+                    kind: SlotAwareFatalKind::Gpu,
+                    owned: Vec::with_capacity(admitted.len()),
+                };
+                fatal.extend_slots(
+                    admitted
+                        .into_iter()
+                        .map(|(handle, _, _, reply, _, _)| (Some(handle), reply)),
+                );
+                return Some(fatal);
+            }
+            clear_gemma4_self_mounts(guard.model);
+            return fail_gemma4_stable_batch(
                 guard,
                 scheduler,
                 retained_tokens,
@@ -9376,7 +11966,6 @@ fn admit_gemma4_slots_stable_batched(
                 kv_bytes_per_token,
                 e,
             );
-            return;
         }
     };
     let prefill_duration = prefill_started.elapsed();
@@ -9388,13 +11977,36 @@ fn admit_gemma4_slots_stable_batched(
         "Gemma4 stable agent suffixes prefilled in one multi-slot body"
     );
 
-    for ((handle, prompt, params, mut reply, preference, _), (first_token, first_logits)) in
-        admitted.into_iter().zip(
-            output
-                .first_tokens
+    let cursor_commits: Vec<(SlotId, usize, usize)> = admitted
+        .iter()
+        .map(|(handle, prompt, _, _, preference, _)| {
+            (handle.slot_id, preference.cached_tokens, prompt.len())
+        })
+        .collect();
+    if let Err(error) = commit_gemma4_slot_cursors(guard, &cursor_commits) {
+        let mut fatal = SlotAwareGpuFatal {
+            error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: Vec::with_capacity(admitted.len()),
+        };
+        fatal.extend_slots(
+            admitted
                 .into_iter()
-                .zip(output.logits.into_iter()),
-        )
+                .map(|(handle, _, _, reply, _, _)| (Some(handle), reply)),
+        );
+        return Some(fatal);
+    }
+
+    let mut installs = admitted.into_iter().zip(
+        output
+            .first_tokens
+            .into_iter()
+            .zip(output.logits.into_iter()),
+    );
+    while let Some((
+        (handle, prompt, params, mut reply, preference, _),
+        (first_token, first_logits),
+    )) = installs.next()
     {
         let state = match Gemma4DecodeState::from_first_token(
             guard.model,
@@ -9409,7 +12021,23 @@ fn admit_gemma4_slots_stable_batched(
         ) {
             Ok(state) => state,
             Err(e) => {
-                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(installs.map(
+                            |((remaining_handle, _, _, remaining_reply, _, _), _)| {
+                                (Some(remaining_handle), remaining_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
                 retained_tokens[handle.slot_id.0 as usize].clear();
                 prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
@@ -9417,9 +12045,28 @@ fn admit_gemma4_slots_stable_batched(
                 continue;
             }
         };
-        scheduler.advance_after_prefill(handle, prompt.len() as u32);
+        scheduler.advance_after_prefill(
+            handle,
+            u32::try_from(prompt.len()).expect("Gemma stable batch request was validated"),
+        );
         if slot_emit_token(&mut reply, &state.seed_tick()) {
-            reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(mut fatal) => {
+                    fatal.extend_slots(installs.map(
+                        |((remaining_handle, _, _, remaining_reply, _, _), _)| {
+                            (Some(remaining_handle), remaining_reply)
+                        },
+                    ));
+                    return Some(fatal);
+                }
+            };
             retained_tokens[handle.slot_id.0 as usize].clear();
             prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
@@ -9436,12 +12083,13 @@ fn admit_gemma4_slots_stable_batched(
             scheduler.release(handle);
             slot_fire_done(reply, Ok(state.finish(registration)), false);
         } else {
-            slots[handle.slot_id.0 as usize] = Some((state, reply, handle));
+            slots[handle.slot_id.0 as usize] = Some((Gemma4SlotWork::Decode(state), reply, handle));
         }
     }
     if let Ok(mut stats) = scheduler_stats_snapshot.lock() {
         *stats = scheduler.stats();
     }
+    None
 }
 
 fn fail_gemma4_stable_batch(
@@ -9459,15 +12107,33 @@ fn fail_gemma4_stable_batch(
     )>,
     kv_bytes_per_token: u64,
     error: anyhow::Error,
-) {
+) -> Option<SlotAwareGpuFatal> {
     let message = format!("Gemma stable multi-slot prefill failed: {error:#}");
+    let reset_failure = admitted.iter().find_map(|(handle, _, _, _, _, _)| {
+        reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
+            .err()
+            .map(|reset_error| (*handle, reset_error))
+    });
+    if let Some((_failed_handle, reset_error)) = reset_failure {
+        let mut fatal = SlotAwareGpuFatal {
+            error: reset_error,
+            kind: SlotAwareFatalKind::Invariant,
+            owned: Vec::with_capacity(admitted.len()),
+        };
+        fatal.extend_slots(
+            admitted
+                .into_iter()
+                .map(|(handle, _, _, reply, _, _)| (Some(handle), reply)),
+        );
+        return Some(fatal);
+    }
     for (handle, _, _, reply, _, _) in admitted {
-        reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
         retained_tokens[handle.slot_id.0 as usize].clear();
         prompt_anchors[handle.slot_id.0 as usize] = None;
         scheduler.release(handle);
         slot_fire_done(reply, Err(anyhow::anyhow!(message.clone())), false);
     }
+    None
 }
 
 /// One-shot Gemma 4 pooled-embedding request under SlotAware (`Request::Embed`).
@@ -9482,17 +12148,29 @@ fn embed_gemma4_inline(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     reply: oneshot::Sender<Result<Vec<f32>>>,
-) {
+) -> Option<SlotAwareGpuFatal> {
+    let max_seq_len = guard
+        .model
+        .context_length
+        .unwrap_or(guard.model.config.max_position_embeddings as usize);
+    let prompt_tokens_u32 = match validate_gemma4_embed_request(prompt_tokens.len(), max_seq_len) {
+        Ok(prompt_tokens) => prompt_tokens,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return None;
+        }
+    };
     // Embed has no decode budget; size the KV admit as prompt-only.
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
-        u64::from(prompt_tokens.len() as u32).saturating_mul(kv_bytes_per_token)
+        u64::from(prompt_tokens_u32).saturating_mul(kv_bytes_per_token)
     };
     let admit_req = AdmitRequest {
-        prompt_tokens: prompt_tokens.len() as u32,
+        prompt_tokens: prompt_tokens_u32,
         max_tokens: 1, // ≥1 so the scheduler allocates a physical slot
         // (max_tokens==0 → CompletedAtAdmit/no handle).
         kv_bytes_needed: needed_bytes,
@@ -9505,36 +12183,65 @@ fn embed_gemma4_inline(
             let _ = reply.send(Err(anyhow::anyhow!(
                 "ADR-040 Phase F M1 Embed admit failed: {e:?}"
             )));
-            return;
+            return None;
         }
     };
     let Some(handle) = admitted.handle else {
-        // No physical slot (shouldn't happen at max_tokens=1 with a free
-        // slot). Fall back to the legacy single-seq embed at SlotId(0).
-        let r = guard
-            .model
-            .weights
-            .forward_embed_last(&prompt_tokens, &mut guard.model.ctx);
-        let _ = reply.send(r);
-        return;
+        let _ = reply.send(Err(anyhow::anyhow!(
+            "Gemma4 SlotAware Embed admitted without a physical slot"
+        )));
+        return None;
     };
     clear_gemma4_self_mounts(guard.model);
-    let result = embed_gemma4_slot_aware(
-        guard.model,
-        &prompt_tokens,
-        &mut guard.kv,
-        guard.hybrid.as_mut(),
-        guard.dense.as_mut(),
-        guard.mlx.as_mut(),
-        handle.slot_id,
-    );
-    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+    let result = supervised_gemma4_gpu_call(supervisor, "gemma4_embed", || {
+        embed_gemma4_slot_aware(
+            guard.model,
+            &prompt_tokens,
+            &mut guard.kv,
+            guard.hybrid.as_mut(),
+            guard.dense.as_mut(),
+            guard.mlx.as_mut(),
+            handle.slot_id,
+        )
+    });
+    let embedding = match result {
+        Ok(embedding) => embedding,
+        Err(error) => {
+            if is_worker_fatal(supervisor, &error) {
+                return Some(SlotAwareGpuFatal::embed(Some(handle), reply, error));
+            }
+            scheduler.advance_after_prefill(handle, prompt_tokens_u32);
+            if let Err(reset_error) =
+                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token)
+            {
+                return Some(SlotAwareGpuFatal::invariant_embed(
+                    handle,
+                    reply,
+                    reset_error,
+                ));
+            }
+            scheduler.release(handle);
+            if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+                *g = scheduler.stats();
+            }
+            let _ = reply.send(Err(error));
+            return None;
+        }
+    };
+    scheduler.advance_after_prefill(handle, prompt_tokens_u32);
+    if let Err(reset_error) = reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token) {
+        return Some(SlotAwareGpuFatal::invariant_embed(
+            handle,
+            reply,
+            reset_error,
+        ));
+    }
     scheduler.release(handle);
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
     }
-    let _ = reply.send(result);
+    let _ = reply.send(Ok(embedding));
+    None
 }
 
 /// ADR-040 §0.21 decode-category split — per-phase GPU-busy ns accumulators
@@ -9570,7 +12277,8 @@ fn decode_batch_gemma4(
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
-) {
+    supervisor: &EngineSupervisor,
+) -> Option<SlotAwareGpuFatal> {
     // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
     // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
     // seed that finalize_token_from_logits never lets affect the result (the max
@@ -9647,12 +12355,63 @@ fn decode_batch_gemma4(
         let mut positions: Vec<usize> = Vec::new();
         for &handle in handles {
             let slot_idx = handle.slot_id.0 as usize;
-            let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
-                continue;
+            let (work, mut reply) = match take_expected_slotaware_slot(
+                "Gemma4",
+                handle,
+                slots.get_mut(slot_idx).and_then(Option::take),
+            ) {
+                Ok(slot) => slot,
+                Err(mut fatal) => {
+                    fatal.extend_slots(captured.drain(..).map(
+                        |(captured_handle, _, _, captured_reply)| {
+                            (Some(captured_handle), captured_reply)
+                        },
+                    ));
+                    return Some(fatal);
+                }
             };
-            let (state, reply, installed) = slot;
-            if installed != handle {
-                slots[slot_idx] = Some((state, reply, installed));
+            let state = match work {
+                Gemma4SlotWork::Decode(state) => state,
+                Gemma4SlotWork::Prefill(_) => {
+                    let mut fatal = SlotAwareGpuFatal::invariant_slot(
+                        handle,
+                        reply,
+                        anyhow::anyhow!(
+                            "Gemma4 scheduler requested decode for prefill work at slot {} generation {}",
+                            handle.slot_id.0,
+                            handle.generation
+                        ),
+                    );
+                    fatal.extend_slots(captured.drain(..).map(
+                        |(captured_handle, _, _, captured_reply)| {
+                            (Some(captured_handle), captured_reply)
+                        },
+                    ));
+                    return Some(fatal);
+                }
+            };
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(captured.drain(..).map(
+                            |(captured_handle, _, _, captured_reply)| {
+                                (Some(captured_handle), captured_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
+                retained_tokens[slot_idx].clear();
+                scheduler.release(handle);
+                slot_fire_done(reply, Ok(state.finish(registration)), true);
                 continue;
             }
             positions.push(state.prompt_len + state.generated_tokens.len() - 1);
@@ -9661,7 +12420,7 @@ fn decode_batch_gemma4(
             captured.push((handle, slot_idx, state, reply));
         }
         if captured.is_empty() {
-            return;
+            return None;
         }
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::GatherMisc,
@@ -9680,43 +12439,49 @@ fn decode_batch_gemma4(
         // condition as a typed `iter-C2c-cont-invariant-violated` error (see
         // `forward_prefill.rs:4587-4602`); this mirrors that, no silent
         // fallback.
-        let body_res = if crate::debug::INVESTIGATION_ENV.hybrid_kv {
-            match guard.hybrid.as_mut() {
-                Some(hybrid) => {
-                    let mut regime = crate::inference::models::gemma4::batched_body::BatchedKvRegime::Hybrid(
-                        hybrid.as_mut_slice(),
-                    );
-                    let lm = &mut *guard.model;
-                    lm.weights
-                        .forward_decode_body_batched(
-                            &tokens, &sids, &positions, &mut regime, &mut fused_head_out, &mut lm.ctx,
+        let body_res = supervised_gemma4_gpu_call(supervisor, "gemma4_decode_body", || {
+            if crate::debug::INVESTIGATION_ENV.hybrid_kv {
+                match guard.hybrid.as_mut() {
+                    Some(hybrid) => {
+                        let mut regime = crate::inference::models::gemma4::batched_body::BatchedKvRegime::Hybrid(
+                            hybrid.as_mut_slice(),
+                        );
+                        let lm = &mut *guard.model;
+                        lm.weights.forward_decode_body_batched(
+                            &tokens,
+                            &sids,
+                            &positions,
+                            &mut regime,
+                            &mut fused_head_out,
+                            &mut lm.ctx,
                         )
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "gemma4-batched-decode-hybrid-scaffold-absent (iter-C2c-cont-invariant-violated \
+                         per ADR-040 §6.1.38 — HF2Q_HYBRID_KV=1 production-default; \
+                         INVESTIGATION_ENV.hybrid_kv == true AT CALL TIME but guard.hybrid is None \
+                         at the batched-body call site — iter-C2c-cont spawn-arm invariant violated \
+                         (provision_multi_seq_kv_for_slot_aware must allocate MultiSeqHybridKvBuffers \
+                         when HF2Q_HYBRID_KV=1; ADR-040 §6.1.33). ADR-040 M-SPEED-LC Stage 2 regime \
+                         selection — no silent FullTq fallback."
+                    )),
                 }
-                None => Err(anyhow::anyhow!(
-                    "gemma4-batched-decode-hybrid-scaffold-absent (iter-C2c-cont-invariant-violated \
-                     per ADR-040 §6.1.38 — HF2Q_HYBRID_KV=1 production-default; \
-                     INVESTIGATION_ENV.hybrid_kv == true AT CALL TIME but guard.hybrid is None \
-                     at the batched-body call site — iter-C2c-cont spawn-arm invariant violated \
-                     (provision_multi_seq_kv_for_slot_aware must allocate MultiSeqHybridKvBuffers \
-                     when HF2Q_HYBRID_KV=1; ADR-040 §6.1.33). ADR-040 M-SPEED-LC Stage 2 regime \
-                     selection — no silent FullTq fallback."
-                )),
+            } else {
+                let mut regime =
+                    crate::inference::models::gemma4::batched_body::BatchedKvRegime::FullTq(
+                        guard.kv.as_mut_slice(),
+                    );
+                let lm = &mut *guard.model;
+                lm.weights.forward_decode_body_batched(
+                    &tokens,
+                    &sids,
+                    &positions,
+                    &mut regime,
+                    &mut fused_head_out,
+                    &mut lm.ctx,
+                )
             }
-        } else {
-            let mut regime =
-                crate::inference::models::gemma4::batched_body::BatchedKvRegime::FullTq(
-                    guard.kv.as_mut_slice(),
-                );
-            let lm = &mut *guard.model;
-            lm.weights.forward_decode_body_batched(
-                &tokens,
-                &sids,
-                &positions,
-                &mut regime,
-                &mut fused_head_out,
-                &mut lm.ctx,
-            )
-        };
+        });
         DECODE_BODY_GPU_NS.fetch_add(
             _catsplit_g0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -9730,11 +12495,58 @@ fn decode_batch_gemma4(
                 for (_, _, state, _) in &mut captured {
                     state.valid_tokens = state.valid_tokens.saturating_add(1);
                 }
+                let committed: Vec<(SlotId, usize)> = captured
+                    .iter()
+                    .map(|(_, _, state, _)| (state.slot_id, state.valid_tokens))
+                    .collect();
+                if let Err(error) = commit_gemma4_decode_cursors(guard, &committed) {
+                    let mut fatal = SlotAwareGpuFatal {
+                        error,
+                        kind: SlotAwareFatalKind::Invariant,
+                        owned: Vec::with_capacity(captured.len()),
+                    };
+                    fatal.extend_slots(
+                        captured
+                            .drain(..)
+                            .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                    );
+                    return Some(fatal);
+                }
             }
             Err(e) => {
+                if is_worker_fatal(supervisor, &e) {
+                    let mut fatal = SlotAwareGpuFatal {
+                        error: e,
+                        kind: SlotAwareFatalKind::Gpu,
+                        owned: Vec::with_capacity(captured.len()),
+                    };
+                    fatal.extend_slots(
+                        captured
+                            .drain(..)
+                            .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                    );
+                    return Some(fatal);
+                }
                 let msg = format!("{e}");
+                let reset_failure = captured.iter().find_map(|(handle, _, _, _)| {
+                    reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
+                        .err()
+                        .map(|error| (*handle, error))
+                });
+                if let Some((_failed_handle, error)) = reset_failure {
+                    let mut fatal = SlotAwareGpuFatal {
+                        error,
+                        kind: SlotAwareFatalKind::Invariant,
+                        owned: Vec::with_capacity(captured.len()),
+                    };
+                    fatal.extend_slots(
+                        captured
+                            .drain(..)
+                            .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                    );
+                    return Some(fatal);
+                }
                 for (handle, _slot_idx, _state, reply) in captured.drain(..) {
-                    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
                     retained_tokens[handle.slot_id.0 as usize].clear();
                     scheduler.release(handle);
                     slot_fire_done(
@@ -9743,35 +12555,123 @@ fn decode_batch_gemma4(
                         false,
                     );
                 }
-                return;
+                return None;
             }
         }
     } else {
         for &handle in handles {
             let slot_idx = handle.slot_id.0 as usize;
-            let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
-                continue;
+            let (work, mut reply) = match take_expected_slotaware_slot(
+                "Gemma4",
+                handle,
+                slots.get_mut(slot_idx).and_then(Option::take),
+            ) {
+                Ok(slot) => slot,
+                Err(mut fatal) => {
+                    fatal.extend_slots(captured.drain(..).map(
+                        |(captured_handle, _, _, captured_reply)| {
+                            (Some(captured_handle), captured_reply)
+                        },
+                    ));
+                    return Some(fatal);
+                }
             };
-            let (mut state, reply, installed) = slot;
-            if installed != handle {
-                // Stale handle for this physical slot: put it back untouched.
-                slots[slot_idx] = Some((state, reply, installed));
+            let mut state = match work {
+                Gemma4SlotWork::Decode(state) => state,
+                Gemma4SlotWork::Prefill(_) => {
+                    let mut fatal = SlotAwareGpuFatal::invariant_slot(
+                        handle,
+                        reply,
+                        anyhow::anyhow!(
+                            "Gemma4 scheduler requested decode for prefill work at slot {} generation {}",
+                            handle.slot_id.0,
+                            handle.generation
+                        ),
+                    );
+                    fatal.extend_slots(captured.drain(..).map(
+                        |(captured_handle, _, _, captured_reply)| {
+                            (Some(captured_handle), captured_reply)
+                        },
+                    ));
+                    return Some(fatal);
+                }
+            };
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(captured.drain(..).map(
+                            |(captured_handle, _, _, captured_reply)| {
+                                (Some(captured_handle), captured_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
+                retained_tokens[slot_idx].clear();
+                scheduler.release(handle);
+                slot_fire_done(reply, Ok(state.finish(registration)), true);
                 continue;
             }
-            match state.decode_tick_capture(
-                guard.model,
-                &mut guard.kv,
-                guard.hybrid.as_mut(),
-                guard.dense.as_mut(),
-                guard.mlx.as_mut(),
-            ) {
+            match supervised_gemma4_gpu_call(supervisor, "gemma4_decode_body", || {
+                state.decode_tick_capture(
+                    guard.model,
+                    &mut guard.kv,
+                    guard.hybrid.as_mut(),
+                    guard.dense.as_mut(),
+                    guard.mlx.as_mut(),
+                )
+            }) {
                 Ok(hidden) => {
+                    if let Err(error) =
+                        commit_gemma4_decode_cursors(guard, &[(state.slot_id, state.valid_tokens)])
+                    {
+                        let mut fatal = SlotAwareGpuFatal::invariant_slot(handle, reply, error);
+                        fatal.extend_slots(captured.drain(..).map(
+                            |(captured_handle, _, _, captured_reply)| {
+                                (Some(captured_handle), captured_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
                     hidden_rows.extend_from_slice(&hidden);
                     captured.push((handle, slot_idx, state, reply));
                 }
                 Err(e) => {
+                    if is_worker_fatal(supervisor, &e) {
+                        let mut fatal = SlotAwareGpuFatal::slot(handle, reply, e);
+                        fatal.extend_slots(captured.drain(..).map(
+                            |(captured_handle, _, _, captured_reply)| {
+                                (Some(captured_handle), captured_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
                     // Body forward error: evict this slot with a typed error.
-                    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                    let reply = match reset_gemma4_slot_for_reply(
+                        guard,
+                        scheduler,
+                        handle,
+                        kv_bytes_per_token,
+                        reply,
+                    ) {
+                        Ok(reply) => reply,
+                        Err(mut fatal) => {
+                            fatal.extend_slots(captured.drain(..).map(
+                                |(captured_handle, _, _, captured_reply)| {
+                                    (Some(captured_handle), captured_reply)
+                                },
+                            ));
+                            return Some(fatal);
+                        }
+                    };
                     retained_tokens[handle.slot_id.0 as usize].clear();
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(e), false);
@@ -9779,7 +12679,7 @@ fn decode_batch_gemma4(
             }
         }
         if captured.is_empty() {
-            return;
+            return None;
         }
     }
     let n = captured.len();
@@ -9792,23 +12692,54 @@ fn decode_batch_gemma4(
     let head = if let Some(h) = fused_head_out.take() {
         h
     } else {
-        match guard
-            .model
-            .weights
-            .lm_head_batched(&hidden_rows, n, &mut guard.model.ctx)
-        {
+        match supervised_gemma4_gpu_call(supervisor, "gemma4_decode_head", || {
+            guard
+                .model
+                .weights
+                .lm_head_batched(&hidden_rows, n, &mut guard.model.ctx)
+        }) {
             Ok(h) => h,
             Err(e) => {
+                if is_worker_fatal(supervisor, &e) {
+                    let mut fatal = SlotAwareGpuFatal {
+                        error: e,
+                        kind: SlotAwareFatalKind::Gpu,
+                        owned: Vec::with_capacity(captured.len()),
+                    };
+                    fatal.extend_slots(
+                        captured
+                            .into_iter()
+                            .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                    );
+                    return Some(fatal);
+                }
                 // Head failure is fatal for this tick's slots (no tokens
                 // producible); evict each. anyhow::Error isn't Clone, carry msg.
                 let msg = format!("{e}");
+                let reset_failure = captured.iter().find_map(|(handle, _, _, _)| {
+                    reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
+                        .err()
+                        .map(|error| (*handle, error))
+                });
+                if let Some((_failed_handle, error)) = reset_failure {
+                    let mut fatal = SlotAwareGpuFatal {
+                        error,
+                        kind: SlotAwareFatalKind::Invariant,
+                        owned: Vec::with_capacity(captured.len()),
+                    };
+                    fatal.extend_slots(
+                        captured
+                            .into_iter()
+                            .map(|(handle, _, _, reply)| (Some(handle), reply)),
+                    );
+                    return Some(fatal);
+                }
                 for (handle, _slot_idx, _state, reply) in captured {
-                    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
                     retained_tokens[handle.slot_id.0 as usize].clear();
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
                 }
-                return;
+                return None;
             }
         }
     };
@@ -9820,7 +12751,8 @@ fn decode_batch_gemma4(
 
     // Pass 2 — finalize each slot from its logits row.
     let _hp_sample = std::time::Instant::now();
-    for (i, (handle, slot_idx, mut state, mut reply)) in captured.into_iter().enumerate() {
+    let mut captured = captured.into_iter().enumerate();
+    while let Some((i, (handle, slot_idx, mut state, mut reply))) = captured.next() {
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
         let normed_row = &head.normed[i * hs..(i + 1) * hs];
         // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
@@ -9854,7 +12786,23 @@ fn decode_batch_gemma4(
         let greedy_token = match greedy_result {
             Ok(t) => t,
             Err(e) => {
-                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(captured.map(
+                            |(_, (remaining_handle, _, _, remaining_reply))| {
+                                (Some(remaining_handle), remaining_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
                 retained_tokens[handle.slot_id.0 as usize].clear();
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
@@ -9869,7 +12817,23 @@ fn decode_batch_gemma4(
         let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
             Ok(t) => t,
             Err(e) => {
-                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(captured.map(
+                            |(_, (remaining_handle, _, _, remaining_reply))| {
+                                (Some(remaining_handle), remaining_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
                 retained_tokens[handle.slot_id.0 as usize].clear();
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
@@ -9895,7 +12859,23 @@ fn decode_batch_gemma4(
 
         if tick.finished || client_dropped {
             if client_dropped {
-                reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token);
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(captured.map(
+                            |(_, (remaining_handle, _, _, remaining_reply))| {
+                                (Some(remaining_handle), remaining_reply)
+                            },
+                        ));
+                        return Some(fatal);
+                    }
+                };
                 retained_tokens[slot_idx].clear();
             }
             scheduler.release(handle);
@@ -9903,18 +12883,19 @@ fn decode_batch_gemma4(
             slot_fire_done(reply, gr, client_dropped);
         } else {
             // Still generating: re-seat the slot for the next tick.
-            slots[slot_idx] = Some((state, reply, handle));
+            slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
         }
     }
     crate::inference::models::gemma4::batched_body::host_phases::add(
         crate::inference::models::gemma4::batched_body::host_phases::Phase::SampleLoop,
         _hp_sample.elapsed().as_nanos() as u64,
     );
+    None
 }
 
 /// Per-slot KV exit reset for Gemma 4 (mirror of the serial ref's exit
-/// reset). Swallows errors (logged) — a failed reset is observability-only
-/// because the next admission's entry reset re-cleans the slot.
+/// reset). Bounds for every configured cache regime are validated before any
+/// cursor is changed, so the software reset is an all-or-nothing transaction.
 /// Clear the gemma4 forward's per-prefill self-mounted KV scratch
 /// (`self.dense_kvs` / `self.hybrid_kv` / `self.leg_hb_encoded`) back to the
 /// `None` fresh state the slot-aware prefill consume-gate expects on entry
@@ -9940,12 +12921,166 @@ fn clear_gemma4_self_mounts(g: &mut GemmaLoadedModel) {
     g.weights.leg_hb_encoded = None;
 }
 
+fn validate_gemma4_slot_cursor(
+    guard: &Gemma4KvGuard<'_>,
+    slot_id: SlotId,
+    expected: usize,
+) -> Result<()> {
+    let expected = u32::try_from(expected).context("Gemma4 slot cursor exceeds u32")?;
+    let slot_idx = slot_id.0 as usize;
+    let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
+        let actual = seq_lens.get(slot_idx).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Gemma4 {regime} layer {layer} has no slot {} (slots={})",
+                slot_id.0,
+                seq_lens.len()
+            )
+        })?;
+        anyhow::ensure!(
+            actual == expected,
+            "Gemma4 slot {} cursor mismatch in {regime} layer {layer}: expected {expected}, got {actual}",
+            slot_id.0
+        );
+        Ok(())
+    };
+    for (layer, buffer) in guard.kv.iter().enumerate() {
+        validate("hb", layer, &buffer.seq_lens)?;
+    }
+    if let Some(buffers) = guard.hybrid.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("hybrid", layer, &buffer.seq_lens)?;
+        }
+    }
+    if let Some(buffers) = guard.dense.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("dense", layer, &buffer.seq_lens)?;
+        }
+    }
+    if let Some(buffers) = guard.mlx.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("mlx", layer, &buffer.seq_lens)?;
+        }
+    }
+    Ok(())
+}
+
+fn install_gemma4_slot_cursor(
+    guard: &mut Gemma4KvGuard<'_>,
+    slot_id: SlotId,
+    cursor: usize,
+) -> Result<()> {
+    let cursor = u32::try_from(cursor).context("Gemma4 slot cursor exceeds u32")?;
+    let slot_idx = slot_id.0 as usize;
+    let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
+        anyhow::ensure!(
+            slot_idx < seq_lens.len(),
+            "Gemma4 {regime} layer {layer} has no slot {} (slots={})",
+            slot_id.0,
+            seq_lens.len()
+        );
+        Ok(())
+    };
+    for (layer, buffer) in guard.kv.iter().enumerate() {
+        validate("hb", layer, &buffer.seq_lens)?;
+    }
+    if let Some(buffers) = guard.hybrid.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("hybrid", layer, &buffer.seq_lens)?;
+        }
+    }
+    if let Some(buffers) = guard.dense.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("dense", layer, &buffer.seq_lens)?;
+        }
+    }
+    if let Some(buffers) = guard.mlx.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("mlx", layer, &buffer.seq_lens)?;
+        }
+    }
+    for buffer in &mut guard.kv {
+        buffer.seq_lens[slot_idx] = cursor;
+    }
+    if let Some(buffers) = guard.hybrid.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = cursor;
+        }
+    }
+    if let Some(buffers) = guard.dense.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = cursor;
+        }
+    }
+    if let Some(buffers) = guard.mlx.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = cursor;
+        }
+    }
+    Ok(())
+}
+
+fn commit_gemma4_slot_cursor(
+    guard: &mut Gemma4KvGuard<'_>,
+    slot_id: SlotId,
+    expected: usize,
+    committed: usize,
+) -> Result<()> {
+    commit_gemma4_slot_cursors(guard, &[(slot_id, expected, committed)])
+}
+
+fn commit_gemma4_slot_cursors(
+    guard: &mut Gemma4KvGuard<'_>,
+    commits: &[(SlotId, usize, usize)],
+) -> Result<()> {
+    for &(slot_id, expected, committed) in commits {
+        anyhow::ensure!(
+            committed >= expected,
+            "Gemma4 slot cursor cannot move backwards ({expected} -> {committed})"
+        );
+        validate_gemma4_slot_cursor(guard, slot_id, expected)?;
+        let _ = u32::try_from(committed).context("Gemma4 committed cursor exceeds u32")?;
+    }
+    for &(slot_id, _, committed) in commits {
+        install_gemma4_slot_cursor(guard, slot_id, committed)?;
+    }
+    Ok(())
+}
+
+fn commit_gemma4_decode_cursors(
+    guard: &mut Gemma4KvGuard<'_>,
+    committed: &[(SlotId, usize)],
+) -> Result<()> {
+    let commits = committed
+        .iter()
+        .map(|&(slot_id, cursor)| {
+            let expected = cursor
+                .checked_sub(1)
+                .context("Gemma4 decode cursor cannot commit position zero")?;
+            Ok((slot_id, expected, cursor))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    commit_gemma4_slot_cursors(guard, &commits)
+}
+
+fn reset_gemma4_slot_for_reply(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    reply: SlotReply,
+) -> std::result::Result<SlotReply, SlotAwareGpuFatal> {
+    match reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token) {
+        Ok(()) => Ok(reply),
+        Err(error) => Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    }
+}
+
 fn reset_gemma4_slot(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     handle: SlotHandle,
     kv_bytes_per_token: u64,
-) {
+) -> Result<()> {
     let slot_id = handle.slot_id;
     let slot_idx = slot_id.0 as usize;
     let mut live_tokens = guard
@@ -9982,24 +13117,54 @@ fn reset_gemma4_slot(
         );
     }
     record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
-    for (layer_idx, buf) in guard.kv.iter_mut().enumerate() {
-        if let Err(e) = buf.reset_for_slot(slot_id) {
-            tracing::warn!(
-                "Gemma4 SlotAware exit reset L{layer_idx} slot={} failed: {e}",
-                slot_id.0
-            );
+    let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
+        anyhow::ensure!(
+            slot_idx < seq_lens.len(),
+            "Gemma4 SlotAware reset slot {} absent from {regime} layer {layer} (slots={})",
+            slot_id.0,
+            seq_lens.len()
+        );
+        Ok(())
+    };
+    for (layer, buffer) in guard.kv.iter().enumerate() {
+        validate("hb", layer, &buffer.seq_lens)?;
+    }
+    if let Some(buffers) = guard.hybrid.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("hybrid", layer, &buffer.seq_lens)?;
         }
     }
-    if let Some(hybrid) = guard.hybrid.as_mut() {
-        for (layer_idx, buf) in hybrid.iter_mut().enumerate() {
-            if let Err(e) = buf.reset_for_slot(slot_id) {
-                tracing::warn!(
-                    "Gemma4 SlotAware exit reset (hybrid) L{layer_idx} slot={} failed: {e}",
-                    slot_id.0
-                );
-            }
+    if let Some(buffers) = guard.dense.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("dense", layer, &buffer.seq_lens)?;
         }
     }
+    if let Some(buffers) = guard.mlx.as_ref() {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            validate("mlx", layer, &buffer.seq_lens)?;
+        }
+    }
+
+    for buffer in &mut guard.kv {
+        buffer.seq_lens[slot_idx] = 0;
+    }
+    if let Some(buffers) = guard.hybrid.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = 0;
+        }
+    }
+    if let Some(buffers) = guard.dense.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = 0;
+        }
+    }
+    if let Some(buffers) = guard.mlx.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = 0;
+        }
+    }
+    clear_gemma4_self_mounts(guard.model);
+    Ok(())
 }
 
 fn record_retained_slot_kv(
@@ -10023,7 +13188,7 @@ fn reset_qwen35_slot(
     scheduler: &mut InflightBatchedScheduler,
     handle: SlotHandle,
     kv_bytes_per_token: u64,
-) {
+) -> Result<()> {
     let live_tokens = guard
         .kv
         .as_ref()
@@ -10031,57 +13196,199 @@ fn reset_qwen35_slot(
         .unwrap_or(0) as usize;
     record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
     if let Some(kv) = guard.kv.as_mut() {
-        if let Err(error) = kv.reset_for_slot(handle.slot_id) {
-            tracing::warn!(
-                slot = handle.slot_id.0,
-                %error,
-                "Qwen35 SlotAware exit reset failed"
-            );
-        }
+        kv.reset_for_slot(handle.slot_id).with_context(|| {
+            format!(
+                "Qwen35 SlotAware exit reset failed for slot {} generation {}; refusing physical-slot reuse",
+                handle.slot_id.0, handle.generation
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Reset a request's physical slot or convert a partial/failed reset into a
+/// worker-fatal invariant.  The reply is returned only when the slot is safe
+/// to release and reuse; on failure it is retained by the fatal fanout path.
+fn reset_qwen35_slot_for_reply(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    reply: SlotReply,
+) -> std::result::Result<SlotReply, Qwen35FatalFailure> {
+    qwen35_reset_result_for_reply(
+        handle,
+        reply,
+        reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token),
+    )
+}
+
+fn qwen35_reset_result_for_reply(
+    handle: SlotHandle,
+    reply: SlotReply,
+    reset: Result<()>,
+) -> std::result::Result<SlotReply, Qwen35FatalFailure> {
+    match reset {
+        Ok(()) => Ok(reply),
+        Err(error) => Err(Qwen35FatalFailure {
+            handle: Some(handle),
+            reply: Qwen35FatalReply::Slot(reply),
+            error,
+            kind: Qwen35WorkerFatalKind::Invariant,
+        }),
     }
 }
 
 /// Answer every pending request with a typed startup error so callers do
 /// not hang when a SlotAware loop cannot start (e.g. KV scaffold absent).
 fn drain_with_startup_error(mut rx: mpsc::Receiver<Request>, why: &str) {
+    // Startup incapability is terminal for this worker generation. Close
+    // first so Engine health flips immediately, then drain every queued or
+    // pre-close-permitted request to an explicit terminal result.
+    rx.close();
+    let message = format!("{ENGINE_UNHEALTHY_SENTINEL}: SlotAware worker could not start: {why}");
     while let Some(req) = rx.blocking_recv() {
-        match req {
-            Request::Generate { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
-                     could not start: {why}"
-                )));
-            }
-            Request::GenerateStream {
-                events, admission, ..
-            } => {
-                reject_stream_before_sse(
-                    events,
-                    admission,
-                    anyhow::anyhow!(
-                        "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
-                         could not start: {why}"
-                    ),
-                );
-            }
-            Request::Warmup { reply } => {
-                let _ = reply.send(Ok(()));
-            }
-            Request::Embed { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
-                     could not start: {why}"
-                )));
-            }
-            Request::GenerateWithSoftTokens { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
-                     could not start: {why}"
-                )));
-            }
-            Request::Shutdown => break,
-            _ => {}
+        fail_slotaware_buffered_request(req, &message);
+    }
+}
+
+fn fail_slotaware_buffered_request(request: Request, message: &str) {
+    let error = || anyhow::anyhow!(message.to_string());
+    match request {
+        Request::Warmup { reply } => {
+            let _ = reply.send(Err(error()));
         }
+        Request::Generate { reply, .. } | Request::GenerateWithSoftTokens { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Request::GenerateStream {
+            events, admission, ..
+        } => reject_stream_before_sse(events, admission, error()),
+        Request::Embed { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Request::KvSnapshot { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Request::KvRestore { reply, .. }
+        | Request::TqPackedKvRestore { reply, .. }
+        | Request::PromptCacheRestore { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Request::TqPackedKvSnapshot { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Request::PromptCacheSnapshot { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        Request::Shutdown => {}
+    }
+}
+
+/// Terminate a control-plane request that cannot safely operate on a
+/// multi-sequence SlotAware cache. These requests must never fall through a
+/// wildcard arm: their synchronous Engine callers wait for the oneshot reply.
+fn reject_slotaware_control_request(family: &'static str, request: Request) {
+    let unsupported = |operation: &str| {
+        anyhow::anyhow!(
+            "{operation}: not supported on {family} SlotAware multi-sequence cache state"
+        )
+    };
+    match request {
+        Request::KvSnapshot { reply, .. } => {
+            let _ = reply.send(Err(unsupported("kv_snapshot")));
+        }
+        Request::KvRestore { reply, .. } => {
+            let _ = reply.send(Err(unsupported("kv_restore")));
+        }
+        Request::TqPackedKvSnapshot { reply, .. } => {
+            let _ = reply.send(Err(unsupported("tq_packed_kv_snapshot")));
+        }
+        Request::TqPackedKvRestore { reply, .. } => {
+            let _ = reply.send(Err(unsupported("tq_packed_kv_restore")));
+        }
+        Request::PromptCacheSnapshot { reply } => {
+            let _ = reply.send(Err(unsupported("prompt_cache_snapshot")));
+        }
+        Request::PromptCacheRestore { reply, .. } => {
+            let _ = reply.send(Err(unsupported("prompt_cache_restore")));
+        }
+        _ => unreachable!("only SlotAware control requests may reach this responder"),
+    }
+}
+
+enum Qwen35FatalReply {
+    None,
+    Slot(SlotReply),
+    Warmup(oneshot::Sender<Result<()>>),
+    Embed(oneshot::Sender<Result<Vec<f32>>>),
+}
+
+fn fail_qwen35_fatal_reply(reply: Qwen35FatalReply, message: &str) {
+    match reply {
+        Qwen35FatalReply::None => {}
+        Qwen35FatalReply::Slot(reply) => slot_fire_fatal(reply, message),
+        Qwen35FatalReply::Warmup(reply) => {
+            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
+        }
+        Qwen35FatalReply::Embed(reply) => {
+            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
+        }
+    }
+}
+
+fn fail_qwen35_worker_after_gpu_fatal(
+    supervisor: &EngineSupervisor,
+    rx: &mut mpsc::Receiver<Request>,
+    pending: &mut Option<Request>,
+    slots: &mut [Option<Qwen35Slot>],
+    scheduler: &mut InflightBatchedScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    fatal: Qwen35FatalFailure,
+) {
+    let detail = format!("{:#}", fatal.error);
+    let reason = match fatal.kind {
+        Qwen35WorkerFatalKind::Gpu => "fatal Metal command-buffer failure",
+        Qwen35WorkerFatalKind::Invariant => "fatal Qwen scheduler/work-state invariant failure",
+    };
+    let message = format!(
+        "engine_unhealthy: {reason}; Qwen worker stopped; retry after model/process recovery: {detail}"
+    );
+    tracing::error!(
+        slot = fatal.handle.map(|handle| handle.slot_id.0),
+        error = %detail,
+        reason,
+        "Qwen35 worker fail-stop"
+    );
+
+    // Poison and stop admission before notifying clients. A watchdog can invalidate the
+    // shared command queue; no cache reset, snapshot, spill, or later forward
+    // is safe in this worker generation.
+    supervisor.poison_now("qwen35-worker-fatal");
+    rx.close();
+    if let Some(handle) = fatal.handle {
+        scheduler.release(handle);
+    }
+    fail_qwen35_fatal_reply(fatal.reply, &message);
+
+    for slot in slots.iter_mut() {
+        if let Some((_work, reply, handle)) = slot.take() {
+            scheduler.release(handle);
+            slot_fire_fatal(reply, &message);
+        }
+    }
+    if let Some(request) = pending.take() {
+        fail_slotaware_buffered_request(request, &message);
+    }
+    // `close()` prevents new permits, but a sender that acquired a permit
+    // before the close may still enqueue. Wait until every outstanding
+    // permit is released so no raced request loses its explicit terminal
+    // error when the worker exits.
+    while let Some(request) = rx.blocking_recv() {
+        fail_slotaware_buffered_request(request, &message);
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
     }
 }
 
@@ -10126,11 +13433,173 @@ impl Drop for Qwen35KvGuard<'_> {
     }
 }
 
-type Qwen35Slot = (
-    super::engine_qwen35::Qwen35DecodeState,
-    SlotReply,
-    SlotHandle,
-);
+enum Qwen35SlotWork {
+    Prefill(super::engine_qwen35::Qwen35PrefillState),
+    Decode(super::engine_qwen35::Qwen35DecodeState),
+}
+
+type Qwen35Slot = (Qwen35SlotWork, SlotReply, SlotHandle);
+
+struct Qwen35FatalFailure {
+    handle: Option<SlotHandle>,
+    reply: Qwen35FatalReply,
+    error: anyhow::Error,
+    kind: Qwen35WorkerFatalKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35WorkerFatalKind {
+    Gpu,
+    Invariant,
+}
+
+pub(super) fn is_fatal_command_buffer_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<mlx_native::MlxError>(),
+            Some(mlx_native::MlxError::CommandBufferError(_))
+        )
+    })
+}
+
+/// Reliability-first outer transaction cap for Qwen slot-aware prompt work.
+///
+/// The production failure supplied an 87,972-row transaction. At the Qwen
+/// MoE top-k=8 shape that creates 703,776 routed expert rows and multi-GiB
+/// intermediates before the first observable command-buffer failure. 2K is
+/// the conservative initial cap; promotion to 4K is a measured performance
+/// decision, never an automatic response to a near-watchdog completion.
+const QWEN35_SLOT_PREFILL_CHUNK_TOKENS: u32 = 2_048;
+/// Inline Qwen surfaces do not yet have resumable request state. Keep them at
+/// the same proven transaction ceiling as bounded text prefill; longer work
+/// must fail before Metal instead of reintroducing a watchdog-sized escape
+/// hatch through embeddings or multimodal soft-token generation.
+const QWEN35_SLOT_INLINE_PROMPT_LIMIT: usize = QWEN35_SLOT_PREFILL_CHUNK_TOKENS as usize;
+
+fn validate_qwen35_inline_prompt(surface: &str, prompt_tokens: usize) -> Result<()> {
+    anyhow::ensure!(
+        prompt_tokens <= QWEN35_SLOT_INLINE_PROMPT_LIMIT,
+        "capability_unsupported: Qwen35 SlotAware {surface} prompt has {prompt_tokens} tokens; inline GPU routes are bounded to {QWEN35_SLOT_INLINE_PROMPT_LIMIT} until resumable prefill lands"
+    );
+    Ok(())
+}
+
+fn validate_qwen35_slot_stream_payload(
+    has_soft_tokens: bool,
+    has_deepstack: bool,
+    has_positions: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !has_soft_tokens && !has_deepstack && !has_positions,
+        "capability_unsupported: Qwen35 SlotAware streaming with soft tokens, deepstack, or 3D-mRoPE positions is disabled until the multimodal prefill/decode state machine is scheduler-yielding"
+    );
+    Ok(())
+}
+
+fn qwen35_slot_soft_tokens_unsupported() -> anyhow::Error {
+    anyhow::anyhow!(
+        "capability_unsupported: Qwen35 SlotAware soft-token/deepstack generation is disabled until its prefill and decode are scheduler-yielding; use SerialFifo for this multimodal surface"
+    )
+}
+
+/// Inline GPU requests consume one admission quantum, then hand control back
+/// to the scheduler. This predicate is used by the production loop and by a
+/// no-model fairness regression built from real `Request` values.
+fn qwen35_yields_after_inline_admission(request: &Request) -> bool {
+    matches!(request, Request::Warmup { .. } | Request::Embed { .. })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Qwen35ValidatedRequestShape {
+    prompt_tokens: u32,
+    max_tokens: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Gemma4ValidatedRequestShape {
+    prompt_tokens: u32,
+    max_tokens: u32,
+}
+
+fn validate_gemma4_embed_request(prompt_tokens: usize, max_seq_len: usize) -> Result<u32> {
+    anyhow::ensure!(
+        prompt_tokens > 0,
+        "invalid_request: Gemma4 SlotAware embedding requires at least one prompt token"
+    );
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
+        .context("invalid_request: Gemma4 embedding token count exceeds u32")?;
+    anyhow::ensure!(
+        prompt_tokens <= max_seq_len,
+        "invalid_request: Gemma4 embedding needs {prompt_tokens} sequence positions, exceeding the per-slot limit {max_seq_len}"
+    );
+    anyhow::ensure!(
+        prompt_tokens <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize,
+        "capability_unsupported: Gemma4 SlotAware embedding is limited to one {}-token transaction until embedding prefill is scheduler-resumable",
+        GEMMA4_SLOT_PREFILL_CHUNK_TOKENS
+    );
+    Ok(prompt_tokens_u32)
+}
+
+fn validate_gemma4_generation_request(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    max_seq_len: usize,
+) -> Result<Gemma4ValidatedRequestShape> {
+    anyhow::ensure!(
+        prompt_tokens > 0,
+        "invalid_request: Gemma4 SlotAware generation requires at least one prompt token"
+    );
+    anyhow::ensure!(
+        max_tokens > 0,
+        "invalid_request: Gemma4 SlotAware generation requires max_tokens > 0"
+    );
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
+        .context("invalid_request: Gemma4 prompt token count exceeds u32")?;
+    let max_tokens_u32 =
+        u32::try_from(max_tokens).context("invalid_request: Gemma4 max_tokens exceeds u32")?;
+    let needed = prompt_tokens
+        .checked_add(max_tokens)
+        .context("invalid_request: Gemma4 prompt + completion capacity overflow")?;
+    anyhow::ensure!(
+        needed <= max_seq_len,
+        "invalid_request: Gemma4 request needs {needed} sequence positions, exceeding the per-slot limit {max_seq_len}"
+    );
+    Ok(Gemma4ValidatedRequestShape {
+        prompt_tokens: prompt_tokens_u32,
+        max_tokens: max_tokens_u32,
+    })
+}
+
+fn validate_qwen35_generation_request(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    max_seq_len: usize,
+) -> Result<Qwen35ValidatedRequestShape> {
+    anyhow::ensure!(
+        prompt_tokens > 0,
+        "invalid_request: Qwen35 SlotAware generation requires at least one prompt token"
+    );
+    anyhow::ensure!(
+        max_tokens > 0,
+        "invalid_request: Qwen35 SlotAware generation requires max_tokens > 0"
+    );
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
+        .context("invalid_request: Qwen35 prompt token count exceeds u32")?;
+    let max_tokens_u32 =
+        u32::try_from(max_tokens).context("invalid_request: Qwen35 max_tokens exceeds u32")?;
+    let need_seq = prompt_tokens
+        .checked_add(max_tokens)
+        .and_then(|tokens| tokens.checked_add(64))
+        .context("invalid_request: Qwen35 prompt + completion capacity overflow")?;
+    anyhow::ensure!(
+        need_seq <= max_seq_len,
+        "invalid_request: Qwen35 request needs {need_seq} sequence positions including safety slack, exceeding the per-slot limit {max_seq_len}"
+    );
+    Ok(Qwen35ValidatedRequestShape {
+        prompt_tokens: prompt_tokens_u32,
+        max_tokens: max_tokens_u32,
+    })
+}
 
 struct Qwen35PromptAnchor {
     prompt_tokens: Vec<u32>,
@@ -10262,6 +13731,7 @@ fn run_slot_aware_qwen35(
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: EngineSupervisor,
 ) {
     let mut guard = match Qwen35KvGuard::take(&mut model) {
         Ok(g) => g,
@@ -10272,6 +13742,7 @@ fn run_slot_aware_qwen35(
         }
     };
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
+    scheduler.set_prefill_chunk_tokens(QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
     let mut slots: Vec<Option<Qwen35Slot>> = (0..n_slots).map(|_| None).collect();
     let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
@@ -10283,10 +13754,14 @@ fn run_slot_aware_qwen35(
         }
     };
     let mut pending: Option<Request> = None;
+    let mut shutdown_requested = false;
 
     'worker: loop {
         // ── ADMIT ────────────────────────────────────────────────────
-        loop {
+        'admit: loop {
+            if shutdown_requested {
+                break;
+            }
             let Some(_free) = slots.iter().position(|s| s.is_none()) else {
                 break;
             };
@@ -10295,16 +13770,20 @@ fn run_slot_aware_qwen35(
                 None => match rx.try_recv() {
                     Ok(r) => r,
                     Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        shutdown_requested = true;
+                        break;
+                    }
                 },
             };
+            let yield_after_inline_admission = qwen35_yields_after_inline_admission(&req);
             match req {
                 Request::Generate {
                     prompt_tokens,
                     params,
                     reply,
                 } => {
-                    admit_qwen35_slot(
+                    if let Some(fatal) = admit_qwen35_slot(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
@@ -10315,10 +13794,22 @@ fn run_slot_aware_qwen35(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        &supervisor,
                         prompt_tokens,
                         params,
                         SlotReply::Unary(reply),
-                    );
+                    ) {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
                 Request::GenerateStream {
@@ -10327,8 +13818,18 @@ fn run_slot_aware_qwen35(
                     events,
                     cancellation_counter,
                     admission,
-                    ..
+                    soft_tokens,
+                    deepstack,
+                    positions_flat,
                 } => {
+                    if let Err(error) = validate_qwen35_slot_stream_payload(
+                        !soft_tokens.is_empty(),
+                        deepstack.is_some(),
+                        positions_flat.is_some(),
+                    ) {
+                        reject_stream_before_sse(events, admission, error);
+                        continue;
+                    }
                     let reply = SlotReply::family_stream(
                         events,
                         cancellation_counter,
@@ -10336,7 +13837,7 @@ fn run_slot_aware_qwen35(
                         registration.as_ref(),
                         &params,
                     );
-                    admit_qwen35_slot(
+                    if let Some(fatal) = admit_qwen35_slot(
                         &mut guard,
                         &mut scheduler,
                         &mut slots,
@@ -10347,18 +13848,58 @@ fn run_slot_aware_qwen35(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        &supervisor,
                         prompt_tokens,
                         params,
                         reply,
-                    );
+                    ) {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
                 Request::Warmup { reply } => {
-                    let _ = reply.send(warmup_qwen35_once(guard.model));
+                    let result = warmup_qwen35_once(guard.model, &supervisor);
+                    if !supervisor.is_healthy()
+                        || result
+                            .as_ref()
+                            .err()
+                            .is_some_and(is_fatal_command_buffer_error)
+                    {
+                        let error = result.expect_err("fatal branch requires an error");
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            Qwen35FatalFailure {
+                                handle: None,
+                                reply: Qwen35FatalReply::Warmup(reply),
+                                error,
+                                kind: Qwen35WorkerFatalKind::Gpu,
+                            },
+                        );
+                        break 'worker;
+                    }
+                    let _ = reply.send(result);
                 }
                 Request::Shutdown => {
-                    tracing::info!("Qwen35 SlotAware worker received Shutdown; exiting");
-                    break 'worker;
+                    tracing::info!(
+                        "Qwen35 SlotAware worker received Shutdown; draining active slots"
+                    );
+                    rx.close();
+                    shutdown_requested = true;
+                    break;
                 }
                 // Embed IS served at SlotId>0 by the legacy inflight arm
                 // today (embed_qwen35_slot_aware, engine_qwen35.rs:5288) →
@@ -10367,73 +13908,140 @@ fn run_slot_aware_qwen35(
                     prompt_tokens,
                     reply,
                 } => {
-                    embed_qwen35_inline(
+                    if let Some(fatal) = embed_qwen35_inline(
                         &mut guard,
                         &mut scheduler,
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        &supervisor,
                         prompt_tokens,
                         reply,
-                    );
+                    ) {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
-                // GenerateWithSoftTokens IS served at SlotId>0 today
-                // (generate_qwen35_once_with_soft_tokens[_and_deepstack]_slot_aware,
-                // engine_qwen35.rs:5460/5783) → 501 would regress. The
-                // qwen35 soft-token forward path carries deepstack +
-                // 3D-mRoPE positions (Wedge-4) with a distinct forward
-                // primitive, so — unlike the gemma4 shared-prefill path —
-                // it runs inline in admit via the existing slot-aware
-                // soft-token generator (which does its own full decode),
-                // reusing the same primitive the legacy arm called. This
-                // preserves the capability exactly; STEP-2/F2 can fold it
-                // into the batched loop once the soft-token decode primitive
-                // is threaded through the per-slot scaffold.
-                Request::GenerateWithSoftTokens {
-                    prompt_tokens,
-                    soft_tokens,
-                    params,
-                    deepstack,
-                    positions_flat,
-                    reply,
-                } => {
-                    generate_qwen35_soft_tokens_inline(
-                        &mut guard,
-                        &mut scheduler,
-                        registration.as_ref(),
-                        &scheduler_stats_snapshot,
-                        per_slot_kv_budget_bytes,
-                        kv_bytes_per_token,
-                        prompt_tokens,
-                        soft_tokens,
-                        deepstack,
-                        positions_flat,
-                        params,
-                        reply,
-                    );
-                    publish(&scheduler, &scheduler_stats_snapshot);
+                // The soft-token/deepstack path owns a different forward
+                // primitive and still performs its whole decode inline. It
+                // must not silently monopolize this multi-agent worker or
+                // discard multimodal state. SerialFifo retains the historical
+                // capability; SlotAware fails before GPU work until that path
+                // has its own scheduler-yielding state machine.
+                Request::GenerateWithSoftTokens { reply, .. } => {
+                    let _ = reply.send(Err(qwen35_slot_soft_tokens_unsupported()));
                 }
-                _ => {}
+                Request::KvSnapshot { reply, .. } => {
+                    let _ = reply.send(Ok(None));
+                }
+                Request::KvRestore { reply, .. } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "kv_restore: not supported on Qwen35 SlotAware hybrid KV state"
+                    )));
+                }
+                Request::TqPackedKvSnapshot { reply, .. } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "tq_packed_kv_snapshot: Gemma spill snapshots are not the Qwen35 TQ live-cache persistor"
+                    )));
+                }
+                Request::TqPackedKvRestore { reply, .. } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "tq_packed_kv_restore: Gemma spill restore is not supported on Qwen35 SlotAware"
+                    )));
+                }
+                Request::PromptCacheSnapshot { reply } => {
+                    let _ = reply.send(Ok(None));
+                }
+                Request::PromptCacheRestore { reply, .. } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "prompt_cache_restore: use the Qwen35 hybrid LCP persistor; generic PromptCache restore is not supported"
+                    )));
+                }
             }
+            if yield_after_inline_admission {
+                break 'admit;
+            }
+        }
+
+        if shutdown_requested && slots.iter().all(Option::is_none) {
+            let message =
+                format!("{ENGINE_UNHEALTHY_SENTINEL}: Qwen35 SlotAware worker is shutting down");
+            while let Some(request) = rx.blocking_recv() {
+                fail_slotaware_buffered_request(request, &message);
+            }
+            break 'worker;
         }
 
         // ── STEP ─────────────────────────────────────────────────────
         let step = match scheduler.step() {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("Qwen35 SlotAware scheduler.step() failed: {e:?}");
+                fail_qwen35_worker_after_gpu_fatal(
+                    &supervisor,
+                    &mut rx,
+                    &mut pending,
+                    &mut slots,
+                    &mut scheduler,
+                    &scheduler_stats_snapshot,
+                    Qwen35FatalFailure {
+                        handle: None,
+                        reply: Qwen35FatalReply::None,
+                        error: anyhow::anyhow!("Qwen35 SlotAware scheduler.step() failed: {e:?}"),
+                        kind: Qwen35WorkerFatalKind::Invariant,
+                    },
+                );
                 break 'worker;
             }
         };
         match step {
-            SchedulerStep::Idle => match rx.blocking_recv() {
-                Some(r) => pending = Some(r),
-                None => break 'worker,
-            },
-            SchedulerStep::Prefill { .. } => {}
+            SchedulerStep::Idle => {
+                if shutdown_requested {
+                    continue;
+                }
+                match rx.blocking_recv() {
+                    Some(r) => pending = Some(r),
+                    None => shutdown_requested = true,
+                }
+            }
+            SchedulerStep::Prefill { handle, n_tokens } => {
+                if let Some(fatal) = advance_qwen35_prefill(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    &mut retained_tokens,
+                    &mut prompt_caches,
+                    &mut prompt_anchors,
+                    registration.as_ref(),
+                    &scheduler_stats_snapshot,
+                    handle,
+                    n_tokens,
+                    kv_bytes_per_token,
+                    &supervisor,
+                ) {
+                    fail_qwen35_worker_after_gpu_fatal(
+                        &supervisor,
+                        &mut rx,
+                        &mut pending,
+                        &mut slots,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        fatal,
+                    );
+                    break 'worker;
+                }
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
             SchedulerStep::Decode { handles } => {
-                decode_batch_qwen35(
+                if let Some(fatal) = decode_batch_qwen35(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -10443,7 +14051,19 @@ fn run_slot_aware_qwen35(
                     registration.as_ref(),
                     &handles,
                     kv_bytes_per_token,
-                );
+                    &supervisor,
+                ) {
+                    fail_qwen35_worker_after_gpu_fatal(
+                        &supervisor,
+                        &mut rx,
+                        &mut pending,
+                        &mut slots,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        fatal,
+                    );
+                    break 'worker;
+                }
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
                 crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -10451,8 +14071,16 @@ fn run_slot_aware_qwen35(
                     _hp_pub.elapsed().as_nanos() as u64,
                 );
             }
-            SchedulerStep::Mixed { decode_handles, .. } => {
-                decode_batch_qwen35(
+            SchedulerStep::Mixed {
+                prefill,
+                n_prefill_tokens,
+                decode_handles,
+            } => {
+                // Existing streams run before one bounded cold transaction.
+                // This ordering is the observable fairness contract: a newly
+                // admitted large tool prompt cannot make a decode-ready peer
+                // wait for its entire prefill.
+                if let Some(fatal) = decode_batch_qwen35(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -10462,7 +14090,44 @@ fn run_slot_aware_qwen35(
                     registration.as_ref(),
                     &decode_handles,
                     kv_bytes_per_token,
-                );
+                    &supervisor,
+                ) {
+                    fail_qwen35_worker_after_gpu_fatal(
+                        &supervisor,
+                        &mut rx,
+                        &mut pending,
+                        &mut slots,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        fatal,
+                    );
+                    break 'worker;
+                }
+                if let Some(fatal) = advance_qwen35_prefill(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    &mut retained_tokens,
+                    &mut prompt_caches,
+                    &mut prompt_anchors,
+                    registration.as_ref(),
+                    &scheduler_stats_snapshot,
+                    prefill,
+                    n_prefill_tokens,
+                    kv_bytes_per_token,
+                    &supervisor,
+                ) {
+                    fail_qwen35_worker_after_gpu_fatal(
+                        &supervisor,
+                        &mut rx,
+                        &mut pending,
+                        &mut slots,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        fatal,
+                    );
+                    break 'worker;
+                }
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
                 crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -10489,17 +14154,34 @@ fn admit_qwen35_slot(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
     mut reply: SlotReply,
-) {
+) -> Option<Qwen35FatalFailure> {
+    let max_seq_len = guard
+        .kv
+        .as_ref()
+        .expect("kv Some during Qwen35 admission")
+        .max_seq_len as usize;
+    let request_shape = match validate_qwen35_generation_request(
+        prompt_tokens.len(),
+        params.max_tokens,
+        max_seq_len,
+    ) {
+        Ok(shape) => shape,
+        Err(error) => {
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
     if let Some(result) = prompt_caches
         .iter()
         .find_map(|cache| cache.lookup(&prompt_tokens, &params))
     {
         reply.accept_stream_admission();
         replay_slot_prompt_cache(reply, result);
-        return;
+        return None;
     }
     let anchor_preferred = prompt_anchors
         .iter()
@@ -10520,18 +14202,18 @@ fn admit_qwen35_slot(
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
-        u64::from(prompt_tokens.len() as u32)
-            .saturating_add(u64::from(params.max_tokens as u32))
+        u64::from(request_shape.prompt_tokens)
+            .saturating_add(u64::from(request_shape.max_tokens))
             .saturating_mul(kv_bytes_per_token)
     };
     let admit_req = AdmitRequest {
-        prompt_tokens: prompt_tokens.len() as u32,
-        max_tokens: params.max_tokens as u32,
+        prompt_tokens: request_shape.prompt_tokens,
+        max_tokens: request_shape.max_tokens,
         kv_bytes_needed: needed_bytes,
         prompt_kv_bytes: if needed_bytes == 0 {
             0
         } else {
-            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
+            u64::from(request_shape.prompt_tokens).saturating_mul(kv_bytes_per_token)
         },
         preferred_slot: preferred.map(|(slot, _)| slot),
     };
@@ -10550,7 +14232,7 @@ fn admit_qwen35_slot(
                 )),
                 false,
             );
-            return;
+            return None;
         }
         Err(e) => {
             slot_fire_done(
@@ -10558,23 +14240,23 @@ fn admit_qwen35_slot(
                 Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e}")),
                 false,
             );
-            return;
+            return None;
         }
     };
-    reply.accept_stream_admission();
     let Some(handle) = admitted.handle else {
-        // CompletedAtAdmit (`max_tokens == 0`): mirror the SerialFifo arm's
-        // fallback — run the legacy non-slot-aware `generate_qwen35_once`
-        // and fire, no scheduler bookkeeping (byte-equivalence).
-        let gr = super::engine_qwen35::generate_qwen35_once(
-            guard.model,
-            &prompt_tokens,
-            &params,
-            registration,
+        // max_tokens > 0 was checked before cache lookup and admission, so a
+        // handle-less scheduler outcome is an invariant failure. Keep the
+        // stream pre-SSE until a physical slot really exists.
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "Qwen35 SlotAware scheduler admitted a nonzero generation without a handle"
+            )),
+            false,
         );
-        slot_fire_done(reply, gr, false);
-        return;
+        return None;
     };
+    reply.accept_stream_admission();
 
     let anchor_hit = anchor_preferred
         .map(|(slot, _)| slot == handle.slot_id)
@@ -10603,7 +14285,16 @@ fn admit_qwen35_slot(
             .expect("kv Some during loop")
             .restore_slot_anchor(handle.slot_id, &anchor.kv)
         {
-            reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             retained_tokens[slot_idx].clear();
             prompt_anchors[slot_idx] = None;
             scheduler.release(handle);
@@ -10612,7 +14303,7 @@ fn admit_qwen35_slot(
                 Err(e.context("Qwen35 slot-local prompt-boundary restore")),
                 false,
             );
-            return;
+            return None;
         }
         tracing::info!(
             slot = handle.slot_id.0,
@@ -10625,33 +14316,303 @@ fn admit_qwen35_slot(
         None
     };
 
-    let seed = super::engine_qwen35::Qwen35DecodeState::prefill_seed(
-        guard.model,
-        &prompt_tokens,
-        &params,
+    let prefill = match super::engine_qwen35::Qwen35PrefillState::begin(
+        prompt_tokens,
+        params,
         registration,
         guard.kv.as_mut().expect("kv Some during loop"),
         handle.slot_id,
         cached_tokens,
-        cached_prefill_logits.as_deref(),
-    );
-    let (state, prefill_logits) = match seed {
-        Ok(s) => s,
-        Err(e) => {
-            reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+        cached_prefill_logits,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
             retained_tokens[handle.slot_id.0 as usize].clear();
             prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
-            if let Ok(mut g) = scheduler_stats_snapshot.lock() {
-                *g = scheduler.stats();
+            if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+                *snapshot = scheduler.stats();
             }
-            slot_fire_done(reply, Err(e), false);
-            return;
+            slot_fire_done(reply, Err(error), false);
+            return None;
         }
     };
 
-    if !anchor_hit {
-        let slot_idx = handle.slot_id.0 as usize;
+    // Reused prefix tokens are already transactionally present in this
+    // physical slot. Publish only that verified cursor now; every uncached
+    // slice is published by `advance_qwen35_prefill` after its forward call
+    // returns successfully.
+    scheduler.advance_after_prefill(handle, cached_tokens as u32);
+    let slot_idx = handle.slot_id.0 as usize;
+    slots[slot_idx] = Some((Qwen35SlotWork::Prefill(prefill), reply, handle));
+
+    // A full prompt-anchor hit has no GPU work and the scheduler has already
+    // transitioned it to Decoding. Finalize it synchronously so the slot work
+    // and scheduler phase cannot disagree.
+    if anchor_hit {
+        return advance_qwen35_prefill(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_caches,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            1,
+            kv_bytes_per_token,
+            supervisor,
+        );
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_qwen35_prefill(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    handle: SlotHandle,
+    requested_tokens: u32,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
+    let slot_idx = handle.slot_id.0 as usize;
+    let Some((work, mut reply, installed)) = slots.get_mut(slot_idx).and_then(Option::take) else {
+        return Some(Qwen35FatalFailure {
+            handle: Some(handle),
+            reply: Qwen35FatalReply::None,
+            error: anyhow::anyhow!(
+                "Qwen35 scheduler selected missing prefill slot {} generation {}",
+                handle.slot_id.0,
+                handle.generation
+            ),
+            kind: Qwen35WorkerFatalKind::Invariant,
+        });
+    };
+    if installed != handle {
+        return Some(Qwen35FatalFailure {
+            // The scheduler owns `handle`; `installed` is stale driver
+            // state. Release the scheduled reservation during fail-stop.
+            handle: Some(handle),
+            reply: Qwen35FatalReply::Slot(reply),
+            error: anyhow::anyhow!(
+                "Qwen35 prefill handle mismatch (scheduled={handle:?}, installed={installed:?})"
+            ),
+            kind: Qwen35WorkerFatalKind::Invariant,
+        });
+    }
+    let state = match work {
+        Qwen35SlotWork::Prefill(state) => state,
+        Qwen35SlotWork::Decode(_) => {
+            return Some(Qwen35FatalFailure {
+                handle: Some(handle),
+                reply: Qwen35FatalReply::Slot(reply),
+                error: anyhow::anyhow!(
+                    "Qwen35 scheduler requested prefill for decode work at slot {} generation {}",
+                    handle.slot_id.0,
+                    handle.generation
+                ),
+                kind: Qwen35WorkerFatalKind::Invariant,
+            });
+        }
+    };
+
+    if reply.client_closed() {
+        reply.record_client_cancellation();
+        reply = match reset_qwen35_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
+        retained_tokens[slot_idx].clear();
+        prompt_anchors[slot_idx] = None;
+        scheduler.release(handle);
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!("Qwen35 bounded prefill cancelled")),
+            true,
+        );
+        return None;
+    }
+
+    let max_chunk_tokens = requested_tokens
+        .min(QWEN35_SLOT_PREFILL_CHUNK_TOKENS)
+        .max(1) as usize;
+    let advance = state.advance(
+        guard.model,
+        registration,
+        guard.kv.as_mut().expect("kv Some during loop"),
+        max_chunk_tokens,
+        supervisor,
+    );
+    match advance {
+        Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
+            state,
+            advanced_tokens,
+        }) => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!("Qwen35 bounded prefill cancelled")),
+                    true,
+                );
+            } else {
+                scheduler.yield_prefill_turn(handle);
+                slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
+            }
+        }
+        Ok(super::engine_qwen35::Qwen35PrefillAdvance::Ready {
+            state,
+            prefill_logits,
+            advanced_tokens,
+        }) => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!("Qwen35 bounded prefill cancelled")),
+                    true,
+                );
+                return None;
+            }
+            if let Some(fatal) = finish_qwen35_prefill(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_caches,
+                prompt_anchors,
+                registration,
+                handle,
+                state,
+                prefill_logits,
+                reply,
+                kv_bytes_per_token,
+            ) {
+                return Some(fatal);
+            }
+        }
+        Err(error) => {
+            if !supervisor.is_healthy() {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error,
+                    kind: Qwen35WorkerFatalKind::Gpu,
+                });
+            }
+            if is_fatal_command_buffer_error(&error) {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error,
+                    kind: Qwen35WorkerFatalKind::Gpu,
+                });
+            }
+            // A failed slice is not resumable: full-attention cursors and
+            // recurrent ping-pong state mutate during the forward call. Do
+            // not advance the scheduler token ledger for this slice.
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[slot_idx].clear();
+            prompt_anchors[slot_idx] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(error), false);
+        }
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_qwen35_prefill(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    handle: SlotHandle,
+    mut state: super::engine_qwen35::Qwen35DecodeState,
+    prefill_logits: Vec<f32>,
+    mut reply: SlotReply,
+    kv_bytes_per_token: u64,
+) -> Option<Qwen35FatalFailure> {
+    let slot_idx = handle.slot_id.0 as usize;
+    let (prompt_tokens, params) = {
+        let (prompt, params) = state.prompt_cache_identity();
+        (prompt.to_vec(), params.clone())
+    };
+
+    // An exact retry already owns its prompt-boundary anchor. Every cold or
+    // suffix-prefilled request captures one only after the final transaction
+    // commits; partial chunks are never selectable affinity state.
+    let already_anchored = prompt_anchors[slot_idx]
+        .as_ref()
+        .is_some_and(|anchor| anchor.prompt_tokens == prompt_tokens);
+    if !already_anchored {
         let anchor = guard
             .kv
             .as_ref()
@@ -10671,28 +14632,37 @@ fn admit_qwen35_slot(
                     prefill_logits,
                 });
             }
-            Err(e) => {
-                reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+            Err(error) => {
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
                 retained_tokens[slot_idx].clear();
                 prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 slot_fire_done(
                     reply,
-                    Err(e.context("Qwen35 slot-local prompt-boundary capture")),
+                    Err(error.context("Qwen35 slot-local prompt-boundary capture")),
                     false,
                 );
-                return;
+                return None;
             }
         }
     }
 
-    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-
-    // `prefill_seed` has already sampled completion token zero. Unary replies
-    // retain it inside `state`; live SSE must route it now, before decode tick
-    // one. Qwen commonly encodes `<tool_call>` as that seed token, so omitting
-    // it makes every later body fragment look like ordinary content even
-    // though the assembled unary result parses correctly.
+    if !state.seed_fragment().is_empty() && state.mark_first_semantic_fragment() {
+        tracing::info!(
+            slot = handle.slot_id.0,
+            prompt_tokens = prompt_tokens.len(),
+            "Qwen35 semantic fragment ready"
+        );
+    }
     let seed_dropped = slot_emit_token(
         &mut reply,
         &TickOutcome {
@@ -10702,14 +14672,22 @@ fn admit_qwen35_slot(
         },
     );
     if seed_dropped {
-        let slot_idx = handle.slot_id.0 as usize;
-        reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+        reply = match reset_qwen35_slot_for_reply(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            reply,
+        ) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
+        };
         retained_tokens[slot_idx].clear();
         prompt_anchors[slot_idx] = None;
         scheduler.release(handle);
         let result = Ok(state.finish(guard.model, registration));
         slot_fire_done(reply, result, true);
-        return;
+        return None;
     }
 
     if state.finished_at_seed() {
@@ -10719,25 +14697,25 @@ fn admit_qwen35_slot(
             .expect("kv Some during loop")
             .sequence_len_for_slot(handle.slot_id)
             .unwrap_or(0) as usize;
-        retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix(valid_tokens);
+        retained_tokens[slot_idx] = state.retained_prefix(valid_tokens);
         record_retained_slot_kv(
             scheduler,
             handle,
-            retained_tokens[handle.slot_id.0 as usize].len(),
+            retained_tokens[slot_idx].len(),
             kv_bytes_per_token,
         );
         scheduler.advance_after_decode(handle);
         scheduler.release(handle);
-        let gr = Ok(state.finish(guard.model, registration));
-        if let Ok(result) = gr.as_ref() {
-            prompt_caches[handle.slot_id.0 as usize].store(&prompt_tokens, &params, result);
+        let result = Ok(state.finish(guard.model, registration));
+        if let Ok(generation) = result.as_ref() {
+            prompt_caches[slot_idx].store(&prompt_tokens, &params, generation);
         }
-        slot_fire_done(reply, gr, false);
-        return;
+        slot_fire_done(reply, result, false);
+        return None;
     }
 
-    let slot_idx = handle.slot_id.0 as usize;
-    slots[slot_idx] = Some((state, reply, handle));
+    slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
+    None
 }
 
 /// One-shot Qwen35 pooled-embedding (`Request::Embed`) under SlotAware —
@@ -10750,9 +14728,14 @@ fn embed_qwen35_inline(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     reply: oneshot::Sender<Result<Vec<f32>>>,
-) {
+) -> Option<Qwen35FatalFailure> {
+    if let Err(error) = validate_qwen35_inline_prompt("embedding", prompt_tokens.len()) {
+        let _ = reply.send(Err(error));
+        return None;
+    }
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
@@ -10771,7 +14754,7 @@ fn embed_qwen35_inline(
             let _ = reply.send(Err(anyhow::anyhow!(
                 "ADR-040 Phase F M1 Qwen35 Embed admit failed: {e:?}"
             )));
-            return;
+            return None;
         }
     };
     let Some(handle) = admitted.handle else {
@@ -10779,157 +14762,47 @@ fn embed_qwen35_inline(
             "ADR-040 Phase F M1 — Qwen35 Embed got no physical slot (capacity \
              mismatch)."
         )));
-        return;
+        return None;
     };
-    let result = super::engine_qwen35::embed_qwen35_slot_aware(
-        guard.model,
-        &prompt_tokens,
-        guard.kv.as_mut().expect("kv Some during loop"),
-        handle.slot_id,
-    );
+    let result = supervised_gpu_call(supervisor, "qwen35_slot_embed", || {
+        super::engine_qwen35::embed_qwen35_slot_aware(
+            guard.model,
+            &prompt_tokens,
+            guard.kv.as_mut().expect("kv Some during loop"),
+            handle.slot_id,
+        )
+    });
+    if !supervisor.is_healthy()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(is_fatal_command_buffer_error)
+    {
+        return Some(Qwen35FatalFailure {
+            handle: Some(handle),
+            reply: Qwen35FatalReply::Embed(reply),
+            error: result.expect_err("fatal branch requires an error"),
+            kind: Qwen35WorkerFatalKind::Gpu,
+        });
+    }
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
     if result.is_ok() {
         record_retained_slot_kv(scheduler, handle, prompt_tokens.len(), kv_bytes_per_token);
     }
-    reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
-    scheduler.release(handle);
-    if let Ok(mut g) = scheduler_stats_snapshot.lock() {
-        *g = scheduler.stats();
-    }
-    let _ = reply.send(result);
-}
-
-/// Qwen35 `Request::GenerateWithSoftTokens` under SlotAware — run inline in
-/// admit via the existing slot-aware soft-token generator (which carries
-/// deepstack + 3D-mRoPE positions and does its own full decode). Reuses the
-/// SAME primitive the legacy inflight arm called (engine.rs:8548/8560), so
-/// it preserves the served-today capability exactly; folding it into the
-/// batched decode loop is STEP-2/F2 work (the soft-token decode primitive
-/// must be threaded through the per-slot scaffold first).
-#[allow(clippy::too_many_arguments)]
-fn generate_qwen35_soft_tokens_inline(
-    guard: &mut Qwen35KvGuard<'_>,
-    scheduler: &mut InflightBatchedScheduler,
-    registration: Option<&super::registry::ModelRegistration>,
-    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
-    per_slot_kv_budget_bytes: u64,
-    kv_bytes_per_token: u64,
-    prompt_tokens: Vec<u32>,
-    soft_tokens: Vec<SoftTokenData>,
-    deepstack: Option<DeepstackData>,
-    positions_flat: Option<Vec<i32>>,
-    params: SamplingParams,
-    reply: oneshot::Sender<Result<GenerationResult>>,
-) {
-    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
-        0
-    } else {
-        u64::from(prompt_tokens.len() as u32)
-            .saturating_add(u64::from(params.max_tokens as u32))
-            .saturating_mul(kv_bytes_per_token)
-    };
-    let admit_req = AdmitRequest {
-        prompt_tokens: prompt_tokens.len() as u32,
-        max_tokens: params.max_tokens as u32,
-        kv_bytes_needed: needed_bytes,
-        prompt_kv_bytes: if needed_bytes == 0 {
-            0
-        } else {
-            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
-        },
-        preferred_slot: None,
-    };
-    let admitted = match scheduler.admit(admit_req) {
-        Ok(slot) => slot,
-        Err(e) => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "ADR-040 Phase F M1 Qwen35 SoftTokens admit failed: {e:?}"
-            )));
-            return;
-        }
-    };
-    // Build borrowed injections + deepstack from owned data (mirror of the
-    // legacy arm engine.rs:8530-8542).
-    let injections: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> = soft_tokens
-        .iter()
-        .map(|d| crate::serve::forward_prefill::SoftTokenInjection {
-            range: d.range.clone(),
-            embeddings: &d.embeddings,
-        })
-        .collect();
-    let ds_borrow: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> = deepstack
-        .as_ref()
-        .map(|d| crate::serve::forward_prefill::DeepstackInjection {
-            image_token_positions: d.image_token_positions.clone(),
-            chunks: d.chunks.iter().collect(),
+    if let Err(error) = reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token) {
+        return Some(Qwen35FatalFailure {
+            handle: Some(handle),
+            reply: Qwen35FatalReply::Embed(reply),
+            error,
+            kind: Qwen35WorkerFatalKind::Invariant,
         });
-    let Some(handle) = admitted.handle else {
-        // max_tokens==0 CompletedAtAdmit: no slot. Fall back to the legacy
-        // non-slot-aware soft-token generator at SlotId(0).
-        let result = if ds_borrow.is_some() || positions_flat.is_some() {
-            super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack(
-                guard.model,
-                &prompt_tokens,
-                &injections,
-                ds_borrow.as_ref(),
-                positions_flat.as_deref(),
-                &params,
-                registration,
-            )
-        } else {
-            super::engine_qwen35::generate_qwen35_once_with_soft_tokens(
-                guard.model,
-                &prompt_tokens,
-                &injections,
-                &params,
-                registration,
-            )
-        };
-        let _ = reply.send(result);
-        return;
-    };
-    let kv = guard.kv.as_mut().expect("kv Some during loop");
-    let result = if ds_borrow.is_some() || positions_flat.is_some() {
-        super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
-            guard.model,
-            &prompt_tokens,
-            &injections,
-            ds_borrow.as_ref(),
-            positions_flat.as_deref(),
-            &params,
-            registration,
-            kv,
-            handle.slot_id,
-        )
-    } else {
-        super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(
-            guard.model,
-            &prompt_tokens,
-            &injections,
-            &params,
-            registration,
-            kv,
-            handle.slot_id,
-        )
-    };
-    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-    if let Ok(ref gr) = result {
-        record_retained_slot_kv(
-            scheduler,
-            handle,
-            gr.prompt_tokens.saturating_add(gr.completion_tokens),
-            kv_bytes_per_token,
-        );
-        for _ in 0..gr.completion_tokens {
-            scheduler.advance_after_decode(handle);
-        }
     }
-    reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
     scheduler.release(handle);
     if let Ok(mut g) = scheduler_stats_snapshot.lock() {
         *g = scheduler.stats();
     }
     let _ = reply.send(result);
+    None
 }
 
 fn decode_batch_qwen35(
@@ -10942,35 +14815,129 @@ fn decode_batch_qwen35(
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
-) {
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
         let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
-            continue;
+            return Some(Qwen35FatalFailure {
+                handle: Some(handle),
+                reply: Qwen35FatalReply::None,
+                error: anyhow::anyhow!(
+                    "Qwen35 scheduler selected missing decode slot {} generation {}",
+                    handle.slot_id.0,
+                    handle.generation
+                ),
+                kind: Qwen35WorkerFatalKind::Invariant,
+            });
         };
-        let (mut state, mut reply, installed) = slot;
+        let (work, mut reply, installed) = slot;
         if installed != handle {
-            slots[slot_idx] = Some((state, reply, installed));
+            return Some(Qwen35FatalFailure {
+                // The scheduler owns `handle`; `installed` is stale driver
+                // state. Release the scheduled reservation during fail-stop.
+                handle: Some(handle),
+                reply: Qwen35FatalReply::Slot(reply),
+                error: anyhow::anyhow!(
+                    "Qwen35 decode handle mismatch (scheduled={handle:?}, installed={installed:?})"
+                ),
+                kind: Qwen35WorkerFatalKind::Invariant,
+            });
+        }
+        let mut state = match work {
+            Qwen35SlotWork::Decode(state) => state,
+            Qwen35SlotWork::Prefill(_) => {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error: anyhow::anyhow!(
+                        "Qwen35 scheduler requested decode for prefill work at slot {} generation {}",
+                        handle.slot_id.0,
+                        handle.generation
+                    ),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                });
+            }
+        };
+
+        if reply.client_closed() {
+            reply.record_client_cancellation();
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[slot_idx].clear();
+            prompt_anchors[slot_idx] = None;
+            scheduler.release(handle);
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "Qwen35 decode cancelled before GPU submission"
+                )),
+                true,
+            );
             continue;
         }
 
-        let qtick =
-            match state.decode_tick(guard.model, guard.kv.as_mut().expect("kv Some during loop")) {
-                Ok(t) => t,
-                Err(e) => {
-                    reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
-                    retained_tokens[slot_idx].clear();
-                    prompt_anchors[slot_idx] = None;
-                    scheduler.release(handle);
-                    slot_fire_done(reply, Err(e), false);
-                    continue;
+        let qtick = match state.decode_tick(
+            guard.model,
+            guard.kv.as_mut().expect("kv Some during loop"),
+            supervisor,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                if !supervisor.is_healthy() {
+                    return Some(Qwen35FatalFailure {
+                        handle: Some(handle),
+                        reply: Qwen35FatalReply::Slot(reply),
+                        error: e,
+                        kind: Qwen35WorkerFatalKind::Gpu,
+                    });
                 }
-            };
+                if is_fatal_command_buffer_error(&e) {
+                    return Some(Qwen35FatalFailure {
+                        handle: Some(handle),
+                        reply: Qwen35FatalReply::Slot(reply),
+                        error: e,
+                        kind: Qwen35WorkerFatalKind::Gpu,
+                    });
+                }
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
         let tick = TickOutcome {
             fragment: qtick.fragment,
             is_reasoning: qtick.is_reasoning,
             finished: qtick.finished,
         };
+
+        if !tick.fragment.is_empty() && !tick.is_reasoning && state.mark_first_semantic_fragment() {
+            tracing::info!(
+                slot = handle.slot_id.0,
+                prompt_tokens = state.prompt_cache_identity().0.len(),
+                "Qwen35 semantic fragment ready"
+            );
+        }
 
         let client_dropped = slot_emit_token(&mut reply, &tick);
         if tick.finished && !client_dropped {
@@ -10992,7 +14959,16 @@ fn decode_batch_qwen35(
 
         if tick.finished || client_dropped {
             if client_dropped {
-                reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token);
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
                 retained_tokens[slot_idx].clear();
                 prompt_anchors[slot_idx] = None;
             }
@@ -11009,9 +14985,10 @@ fn decode_batch_qwen35(
             }
             slot_fire_done(reply, gr, client_dropped);
         } else {
-            slots[slot_idx] = Some((state, reply, handle));
+            slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
         }
     }
+    None
 }
 
 fn worker_run(
@@ -11024,6 +15001,7 @@ fn worker_run(
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
     kv_fixed_bytes_per_slot: u64,
+    supervisor: EngineSupervisor,
 ) {
     tracing::info!(
         model = %loaded.model_id(),
@@ -11059,6 +15037,7 @@ fn worker_run(
             per_slot_kv_budget_bytes,
             kv_bytes_per_token,
             kv_fixed_bytes_per_slot,
+            supervisor,
         );
         return;
     }
@@ -11141,8 +15120,9 @@ fn worker_run(
     while let Some(req) = rx.blocking_recv() {
         match req {
             Request::Warmup { reply } => {
+                let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
-                    LoadedModel::Gemma(g) => warmup_once(g),
+                    LoadedModel::Gemma(g) => warmup_once(g, &supervisor),
                     // Qwen35 chat has been production-capable since the
                     // iter-216 engine lift.  The old iter-215 MVP no-op left
                     // `ensure_gpu_cache_primed` inside the first real request,
@@ -11150,12 +15130,29 @@ fn worker_run(
                     // Run the same priming step as `cmd_generate_qwen35`
                     // during startup so the first OpenCode turn measures only
                     // its prompt prefill.
-                    LoadedModel::Qwen35(q) => warmup_qwen35_once(q),
+                    LoadedModel::Qwen35(q) => warmup_qwen35_once(q, &supervisor),
                     // iter-228a Qwen3-VL text MVP: same shape — chat arm
                     // returns 501; warmup is a no-op so /readyz surfaces
                     // "model is loaded".
                     LoadedModel::Qwen3VlText(_) => Ok(()),
-                    LoadedModel::Deepseek4(_) => Ok(()),
+                    LoadedModel::Deepseek4(d) => d.warmup(&supervisor),
+                };
+                let deepseek_warmup = matches!(loaded, LoadedModel::Deepseek4(_));
+                let result = match result {
+                    Err(error) if deepseek_warmup || is_worker_fatal(&supervisor, &error) => {
+                        fail_stop_serial_fifo_worker(
+                            family,
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            None,
+                            SlotAwareFatalReply::Warmup(reply),
+                            error,
+                        );
+                        return;
+                    }
+                    other => other,
                 };
                 let _ = reply.send(result);
             }
@@ -11164,6 +15161,12 @@ fn worker_run(
                 params,
                 reply,
             } => {
+                if let Err(error) =
+                    validate_serial_prefill_transaction(&loaded, prompt_tokens.len())
+                {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
                 // ADR-040 Phase C iter-2a (C2b) — Shape A admit→drive→
                 // release wrap (dossier §4 iter-2a step 4). Under
                 // SerialFifo `admit` is infallible on a fresh adapter
@@ -11568,10 +15571,15 @@ fn worker_run(
                 // skip the scheduler bookkeeping entirely — no slot was
                 // allocated, so `advance_after_*` + `release` would all
                 // be no-ops.
+                let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
-                    LoadedModel::Gemma(g) => {
-                        generate_once(g, &prompt_tokens, &params, registration.as_ref())
-                    }
+                    LoadedModel::Gemma(g) => generate_once(
+                        g,
+                        &prompt_tokens,
+                        &params,
+                        registration.as_ref(),
+                        &supervisor,
+                    ),
                     // Wedge-3 / iter-216 Phase D: real chat completion via
                     // Qwen35Model::forward_gpu_last_logits + forward_gpu_greedy.
                     LoadedModel::Qwen35(q) => super::engine_qwen35::generate_qwen35_once(
@@ -11579,6 +15587,7 @@ fn worker_run(
                         &prompt_tokens,
                         &params,
                         registration.as_ref(),
+                        &supervisor,
                     ),
                     // iter-9b: live dense transformer forward via the
                     // naive O(N²) re-prefill loop in
@@ -11597,7 +15606,24 @@ fn worker_run(
                         &prompt_tokens,
                         &params,
                         registration.as_ref(),
+                        &supervisor,
                     ),
+                };
+                let result = match result {
+                    Err(error) if is_worker_fatal(&supervisor, &error) => {
+                        fail_stop_serial_fifo_worker(
+                            family,
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            admitted.handle,
+                            SlotAwareFatalReply::Slot(SlotReply::Unary(reply)),
+                            error,
+                        );
+                        return;
+                    }
+                    other => other,
                 };
 
                 if let Some(handle) = admitted.handle {
@@ -11631,6 +15657,12 @@ fn worker_run(
                 deepstack,
                 positions_flat,
             } => {
+                if let Err(error) =
+                    validate_serial_prefill_transaction(&loaded, prompt_tokens.len())
+                {
+                    reject_stream_before_sse(events, admission, error);
+                    continue;
+                }
                 // ADR-040 C2b admit→drive→release wrap (dossier §4
                 // iter-2a step 4). The streaming arm differs from
                 // Request::Generate in two ways relevant to scheduler
@@ -12127,7 +16159,8 @@ fn worker_run(
                         image_token_positions: d.image_token_positions.clone(),
                         chunks: d.chunks.iter().collect(),
                     });
-                match &mut loaded {
+                let family = loaded_model_family(&loaded);
+                let stream_result: SerialStreamResult = match &mut loaded {
                     LoadedModel::Gemma(g) => {
                         // Gemma streaming does not consume `deepstack` or
                         // 3D `positions_flat` (those are Qwen3-VL-only);
@@ -12141,7 +16174,8 @@ fn worker_run(
                             &events,
                             registration.as_ref(),
                             cancellation_counter.as_deref(),
-                        );
+                            &supervisor,
+                        )
                     }
                     // Wedge-3 / iter-216 Phase D: real streaming chat
                     // completion via Qwen35Model + per-token splitter
@@ -12167,7 +16201,8 @@ fn worker_run(
                             &events,
                             registration.as_ref(),
                             cancellation_counter.as_deref(),
-                        );
+                            &supervisor,
+                        )
                     }
                     // iter-228a Qwen3-VL text MVP: emit a single Error
                     // event onto the stream channel carrying the
@@ -12179,10 +16214,9 @@ fn worker_run(
                         let _ = (&ds_borrow_stream, &positions_flat);
                         let pending: Result<()> =
                             crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err();
-                        if let Err(e) = pending {
-                            let _ = events.blocking_send(super::sse::GenerationEvent::Error(
-                                format!("{e:#}"),
-                            ));
+                        match pending {
+                            Ok(()) => Ok(SerialStreamEnd::TerminalSent),
+                            Err(error) => Err(error),
                         }
                     }
                     LoadedModel::Deepseek4(d) => {
@@ -12190,11 +16224,9 @@ fn worker_run(
                             || ds_borrow_stream.is_some()
                             || positions_flat.is_some()
                         {
-                            let _ = events.blocking_send(super::sse::GenerationEvent::Error(
-                                "DeepSeek-V4 does not support multimodal soft-token or \
-                                     DeepStack injections"
-                                    .to_string(),
-                            ));
+                            Err(anyhow::anyhow!(
+                                "DeepSeek-V4 does not support multimodal soft-token or DeepStack injections"
+                            ))
                         } else {
                             super::engine_deepseek4::generate_stream(
                                 d,
@@ -12203,8 +16235,42 @@ fn worker_run(
                                 &events,
                                 registration.as_ref(),
                                 cancellation_counter.as_deref(),
-                            );
+                                &supervisor,
+                            )
                         }
+                    }
+                };
+
+                match classify_serial_stream_result(&supervisor, stream_result) {
+                    SerialStreamDisposition::Complete => {}
+                    SerialStreamDisposition::WorkerFatal(error) => {
+                        fail_stop_serial_fifo_worker(
+                            family,
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            admitted_handle,
+                            SlotAwareFatalReply::Slot(SlotReply::Stream {
+                                events,
+                                cancel: cancellation_counter,
+                                admission: None,
+                                router: None,
+                            }),
+                            error,
+                        );
+                        return;
+                    }
+                    SerialStreamDisposition::RequestError(error) => {
+                        fail_slotaware_fatal_reply(
+                            SlotAwareFatalReply::Slot(SlotReply::Stream {
+                                events,
+                                cancel: cancellation_counter,
+                                admission: None,
+                                router: None,
+                            }),
+                            &format!("{error:#}"),
+                        );
                     }
                 }
 
@@ -12230,6 +16296,12 @@ fn worker_run(
                 prompt_tokens,
                 reply,
             } => {
+                if let Err(error) =
+                    validate_serial_prefill_transaction(&loaded, prompt_tokens.len())
+                {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
                 // ADR-040 C2b admit→release wrap (dossier §4 iter-2a
                 // step 4). Embed is a single prefill-only forward (no
                 // decode loop, no completion tokens). `max_tokens = 0`
@@ -12563,13 +16635,18 @@ fn worker_run(
                 // self.activations + self.dense_kvs is fine here — it
                 // can't race with a concurrent generate call because the
                 // worker is serial.
+                let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
-                    LoadedModel::Gemma(g) => {
-                        g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)
-                    }
+                    LoadedModel::Gemma(g) => supervised_gemma4_gpu_call(
+                        &supervisor,
+                        "gemma4_serial_embed",
+                        || g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx),
+                    ),
                     // Wedge-3 / iter-216 Phase D: real chat-as-embedder via
                     // Qwen35Model::forward_embed_last (Phase A).
-                    LoadedModel::Qwen35(q) => super::engine_qwen35::embed_qwen35(q, &prompt_tokens),
+                    LoadedModel::Qwen35(q) => {
+                        super::engine_qwen35::embed_qwen35(q, &prompt_tokens, &supervisor)
+                    }
                     // iter-228a Qwen3-VL text MVP: embed surface joins
                     // chat in returning the forward-pending sentinel.
                     // iter-228b lands a real `forward_embed_last`
@@ -12580,6 +16657,22 @@ fn worker_run(
                     LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
                         "embeddings are not supported by the DeepSeek-V4 generative runtime"
                     )),
+                };
+                let result = match result {
+                    Err(error) if is_worker_fatal(&supervisor, &error) => {
+                        fail_stop_serial_fifo_worker(
+                            family,
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            admitted.handle,
+                            SlotAwareFatalReply::Embed(reply),
+                            error,
+                        );
+                        return;
+                    }
+                    other => other,
                 };
 
                 if let Some(handle) = admitted.handle {
@@ -12603,6 +16696,12 @@ fn worker_run(
                 positions_flat,
                 reply,
             } => {
+                if let Err(error) =
+                    validate_serial_prefill_transaction(&loaded, prompt_tokens.len())
+                {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
                 // ADR-040 C2b admit→drive→release wrap (dossier §4
                 // iter-2a step 4). Vision-aware generate shares the
                 // synthetic prefill+decode bookkeeping shape with
@@ -13055,6 +17154,7 @@ fn worker_run(
                             image_token_positions: d.image_token_positions.clone(),
                             chunks: d.chunks.iter().collect(),
                         });
+                let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
                     LoadedModel::Gemma(g) => {
                         // Gemma path doesn't consume deepstack / 3D
@@ -13066,6 +17166,7 @@ fn worker_run(
                             &injections,
                             &params,
                             registration.as_ref(),
+                            &supervisor,
                         )
                     }
                     // ADR-005 Phase 4 Wedge-4a (2026-05-01): closes the
@@ -13088,6 +17189,7 @@ fn worker_run(
                                 positions_flat.as_deref(),
                                 &params,
                                 registration.as_ref(),
+                                &supervisor,
                             )
                         } else {
                             super::engine_qwen35::generate_qwen35_once_with_soft_tokens(
@@ -13096,6 +17198,7 @@ fn worker_run(
                                 &injections,
                                 &params,
                                 registration.as_ref(),
+                                &supervisor,
                             )
                         }
                     }
@@ -13154,9 +17257,26 @@ fn worker_run(
                                 &prompt_tokens,
                                 &params,
                                 registration.as_ref(),
+                                &supervisor,
                             )
                         }
                     }
+                };
+                let result = match result {
+                    Err(error) if is_worker_fatal(&supervisor, &error) => {
+                        fail_stop_serial_fifo_worker(
+                            family,
+                            &supervisor,
+                            &mut rx,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            admitted_handle,
+                            SlotAwareFatalReply::Slot(SlotReply::Unary(reply)),
+                            error,
+                        );
+                        return;
+                    }
+                    other => other,
                 };
 
                 // ADR-040 C2b post-pattern — same bookkeeping shape as
@@ -13796,22 +17916,25 @@ fn kv_restore_gemma(
 /// Iter-215 Wedge-2: takes `&mut GemmaLoadedModel` directly (after the
 /// `LoadedModel` enum lift). Qwen35 uses [`warmup_qwen35_once`] because its
 /// cache substrate and priming contract are family-specific.
-fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
+fn warmup_once(loaded: &mut GemmaLoadedModel, supervisor: &EngineSupervisor) -> Result<()> {
     let started = Instant::now();
     // A 1-token prompt is enough to cycle through the prefill + decode path.
     // Use the GGUF bos-token id if available; else fall back to 1.
     let bos: u32 = 1;
     let prompt = vec![bos];
     let max_tokens = 1;
-    let last_token = loaded
-        .weights
-        .forward_prefill(&prompt, max_tokens, &mut loaded.ctx)?;
-    // One decode step to exercise the decode kernel set.
-    let mut profiler = None;
-    let _ =
+    let last_token = supervised_gemma4_gpu_call(supervisor, "gemma4_warmup_prefill", || {
         loaded
             .weights
-            .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)?;
+            .forward_prefill(&prompt, max_tokens, &mut loaded.ctx)
+    })?;
+    // One decode step to exercise the decode kernel set.
+    let mut profiler = None;
+    let _ = supervised_gemma4_gpu_call(supervisor, "gemma4_warmup_decode", || {
+        loaded
+            .weights
+            .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)
+    })?;
     // Discard the warmup's per-prefill cache state.  warmup runs with
     // `prompt_len=1, max_tokens=1` → `linear_capacity = 2` allocated for
     // every per-layer KV buffer.  The `is_none()` re-alloc guards at
@@ -13853,12 +17976,17 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
 /// first real request. Unlike Gemma, Qwen does not need a synthetic prefill:
 /// `ensure_gpu_cache_primed` owns the family-specific residency and pipeline
 /// setup without mutating conversational KV state.
-fn warmup_qwen35_once(loaded: &mut super::engine_qwen35::Qwen35LoadedModel) -> Result<()> {
+fn warmup_qwen35_once(
+    loaded: &mut super::engine_qwen35::Qwen35LoadedModel,
+    supervisor: &EngineSupervisor,
+) -> Result<()> {
     let started = Instant::now();
-    loaded
-        .model
-        .ensure_gpu_cache_primed()
-        .context("Qwen35Model::ensure_gpu_cache_primed (server warmup)")?;
+    supervised_gpu_call(supervisor, "qwen35_warmup", || {
+        loaded
+            .model
+            .ensure_gpu_cache_primed()
+            .context("Qwen35Model::ensure_gpu_cache_primed (server warmup)")
+    })?;
     tracing::info!(
         "hf2q-engine Qwen35 warmup complete in {:.0}ms",
         started.elapsed().as_secs_f64() * 1000.0
@@ -14211,8 +18339,9 @@ fn generate_once(
     prompt_tokens: &[u32],
     params: &SamplingParams,
     registration: Option<&super::registry::ModelRegistration>,
+    supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
-    generate_once_with_soft_tokens(loaded, prompt_tokens, &[], params, registration)
+    generate_once_with_soft_tokens(loaded, prompt_tokens, &[], params, registration, supervisor)
 }
 
 /// Vision-aware variant — same as `generate_once` except the prefill
@@ -14227,6 +18356,7 @@ fn generate_once_with_soft_tokens(
     soft_tokens: &[SoftTokenInjection<'_>],
     params: &SamplingParams,
     registration: Option<&super::registry::ModelRegistration>,
+    supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -14764,33 +18894,35 @@ fn generate_once_with_soft_tokens(
             )
     });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
-    let prefill_argmax = if let Some(k) = live_batched_resume {
-        tracing::info!(
-            target: "hf2q::serve::api::engine_gemma4::progress",
-            cached_tokens = k,
-            suffix_tokens = prompt_tokens.len().saturating_sub(k),
-            "Gemma4 bounded batched live append engaged"
-        );
-        loaded.weights.forward_prefill_batched_live_resume(
-            &prompt_tokens[k..],
-            max_tokens,
-            k,
-            &mut loaded.ctx,
-        )?
-    } else if use_batched_serve {
-        loaded
-            .weights
-            .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)?
-    } else {
-        loaded.weights.forward_prefill_with_soft_tokens_resume(
-            prompt_tokens,
-            soft_tokens,
-            max_tokens,
-            &mut loaded.ctx,
-            resume_lcp,
-            false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
-        )?
-    };
+    let prefill_argmax = supervised_gemma4_gpu_call(supervisor, "gemma4_serial_prefill", || {
+        if let Some(k) = live_batched_resume {
+            tracing::info!(
+                target: "hf2q::serve::api::engine_gemma4::progress",
+                cached_tokens = k,
+                suffix_tokens = prompt_tokens.len().saturating_sub(k),
+                "Gemma4 bounded batched live append engaged"
+            );
+            loaded.weights.forward_prefill_batched_live_resume(
+                &prompt_tokens[k..],
+                max_tokens,
+                k,
+                &mut loaded.ctx,
+            )
+        } else if use_batched_serve {
+            loaded
+                .weights
+                .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)
+        } else {
+            loaded.weights.forward_prefill_with_soft_tokens_resume(
+                prompt_tokens,
+                soft_tokens,
+                max_tokens,
+                &mut loaded.ctx,
+                resume_lcp,
+                false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
+            )
+        }
+    })?;
     let prefill_duration = prefill_start.elapsed();
 
     // First decode token: greedy fast-path uses prefill's on-GPU argmax;
@@ -14910,9 +19042,11 @@ fn generate_once_with_soft_tokens(
             // returned u32 is the on-GPU greedy argmax (only used on the
             // greedy fast-path).
             let greedy_token =
-                loaded
-                    .weights
-                    .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)?;
+                supervised_gemma4_gpu_call(supervisor, "gemma4_serial_decode", || {
+                    loaded
+                        .weights
+                        .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)
+                })?;
             // ADR-017 Phase E.a iter-3 — count physical KV write.
             // `forward_decode` always writes exactly one position; this
             // increments BEFORE any later EOS / stop_string / grammar-
@@ -17735,10 +21869,16 @@ fn finalize_streaming_tool_state(
                              grammar should have prevented this",
                             policy_label
                         );
-                        let _ = events.blocking_send(GenerationEvent::Error(
-                            "tool_call_truncated_under_constrained".into(),
-                        ));
-                        return FinalizeStreamingAction::ErrorEmitted;
+                        return if events
+                            .blocking_send(GenerationEvent::Error(
+                                "tool_call_truncated_under_constrained".into(),
+                            ))
+                            .is_ok()
+                        {
+                            FinalizeStreamingAction::ErrorEmitted
+                        } else {
+                            FinalizeStreamingAction::ClientDropped
+                        };
                     }
                     // Auto (no grammar): legacy behaviour — emit residual
                     // body as Content with the literal open marker
@@ -17779,10 +21919,16 @@ fn finalize_streaming_tool_state(
              should have prevented this — either max_tokens cut a call \
              mid-emission or the grammar emitter has a bug"
         );
-        let _ = events.blocking_send(GenerationEvent::Error(
-            "tool_call_no_call_under_constrained".into(),
-        ));
-        return FinalizeStreamingAction::ErrorEmitted;
+        return if events
+            .blocking_send(GenerationEvent::Error(
+                "tool_call_no_call_under_constrained".into(),
+            ))
+            .is_ok()
+        {
+            FinalizeStreamingAction::ErrorEmitted
+        } else {
+            FinalizeStreamingAction::ClientDropped
+        };
     }
 
     FinalizeStreamingAction::Continue
@@ -19094,7 +23240,8 @@ fn generate_stream_once(
     events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
     registration: Option<&super::registry::ModelRegistration>,
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
-) {
+    supervisor: &EngineSupervisor,
+) -> SerialStreamResult {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
     // W-A2.2: streaming origin captures the per-emit sequence into a
@@ -19117,10 +23264,7 @@ fn generate_stream_once(
         ($ev:expr) => {
             if events.blocking_send($ev).is_err() {
                 tracing::info!("SSE stream dropped by client; aborting decode");
-                if let Some(c) = cancellation_counter {
-                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                return;
+                return serial_stream_client_closed(cancellation_counter);
             }
         };
     }
@@ -19129,7 +23273,7 @@ fn generate_stream_once(
         send!(GenerationEvent::Error(
             "generate_stream_once: empty prompt_tokens".into()
         ));
-        return;
+        return Ok(SerialStreamEnd::TerminalSent);
     }
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
@@ -19188,11 +23332,9 @@ fn generate_stream_once(
         .is_err()
         {
             tracing::info!("SSE stream dropped by client during cache replay; aborting");
-            if let Some(c) = cancellation_counter {
-                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            return serial_stream_client_closed(cancellation_counter);
         }
-        return;
+        return Ok(SerialStreamEnd::TerminalSent);
     }
 
     let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL").ok();
@@ -19738,7 +23880,7 @@ fn generate_stream_once(
                 Some(id) => id,
                 None => {
                     send!(GenerationEvent::Error("grammar has no root rule".into()));
-                    return;
+                    return Ok(SerialStreamEnd::TerminalSent);
                 }
             };
             match super::grammar::GrammarRuntime::new(g.clone(), start_rule_id) {
@@ -19752,7 +23894,7 @@ fn generate_stream_once(
                 }
                 None => {
                     send!(GenerationEvent::Error("grammar runtime init failed".into()));
-                    return;
+                    return Ok(SerialStreamEnd::TerminalSent);
                 }
             }
         }
@@ -19802,39 +23944,44 @@ fn generate_stream_once(
             )
     });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
-    let next_token_result = if let Some(k) = live_batched_resume {
-        tracing::info!(
-            target: "hf2q::serve::api::engine_gemma4::progress",
-            cached_tokens = k,
-            suffix_tokens = prompt_tokens.len().saturating_sub(k),
-            "Gemma4 streaming bounded batched live append engaged"
-        );
-        loaded.weights.forward_prefill_batched_live_resume(
-            &prompt_tokens[k..],
-            max_tokens,
-            k,
-            &mut loaded.ctx,
-        )
-    } else if use_batched_serve {
-        loaded
-            .weights
-            .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)
-    } else {
-        loaded.weights.forward_prefill_with_soft_tokens_resume(
-            prompt_tokens,
-            soft_tokens,
-            max_tokens,
-            &mut loaded.ctx,
-            resume_lcp,
-            false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
-        )
-    };
+    let next_token_result =
+        supervised_gemma4_gpu_call(supervisor, "gemma4_serial_stream_prefill", || {
+            if let Some(k) = live_batched_resume {
+                tracing::info!(
+                    target: "hf2q::serve::api::engine_gemma4::progress",
+                    cached_tokens = k,
+                    suffix_tokens = prompt_tokens.len().saturating_sub(k),
+                    "Gemma4 streaming bounded batched live append engaged"
+                );
+                loaded.weights.forward_prefill_batched_live_resume(
+                    &prompt_tokens[k..],
+                    max_tokens,
+                    k,
+                    &mut loaded.ctx,
+                )
+            } else if use_batched_serve {
+                loaded.weights.forward_prefill_batched(
+                    prompt_tokens,
+                    max_tokens,
+                    0,
+                    &mut loaded.ctx,
+                )
+            } else {
+                loaded.weights.forward_prefill_with_soft_tokens_resume(
+                    prompt_tokens,
+                    soft_tokens,
+                    max_tokens,
+                    &mut loaded.ctx,
+                    resume_lcp,
+                    false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
+                )
+            }
+        });
     let prefill_duration = prefill_start.elapsed();
     let prefill_argmax = match next_token_result {
         Ok(t) => t,
         Err(e) => {
-            send!(GenerationEvent::Error(format!("prefill failed: {e}")));
-            return;
+            return Err(e).context("Gemma4 SerialFifo streaming prefill");
         }
     };
     // First decode token: greedy fast-path uses prefill's on-GPU argmax;
@@ -19845,10 +23992,7 @@ fn generate_stream_once(
         let logits_view = match loaded.weights.logits_view() {
             Ok(v) => v.to_vec(),
             Err(e) => {
-                send!(GenerationEvent::Error(format!(
-                    "first-token logits read: {e}"
-                )));
-                return;
+                return Err(e).context("Gemma4 SerialFifo first-token logits read");
             }
         };
         let mut logits = logits_view;
@@ -19925,7 +24069,7 @@ fn generate_stream_once(
         .is_err()
         {
             tracing::info!("SSE stream dropped by client; aborting decode");
-            return;
+            return serial_stream_client_closed(cancellation_counter);
         }
     }
     completion_tokens += 1;
@@ -19944,15 +24088,16 @@ fn generate_stream_once(
             let pos = prompt_len + completion_tokens - 1;
             let mut p = profiler.start_token();
             let dec_result =
-                loaded
-                    .weights
-                    .forward_decode(next_token, pos, &mut loaded.ctx, &mut p);
+                supervised_gemma4_gpu_call(supervisor, "gemma4_serial_stream_decode", || {
+                    loaded
+                        .weights
+                        .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)
+                });
             profiler.finish_token(p);
             let greedy_token = match dec_result {
                 Ok(t) => t,
                 Err(e) => {
-                    send!(GenerationEvent::Error(format!("decode failed: {e}")));
-                    return;
+                    return Err(e).context("Gemma4 SerialFifo streaming decode");
                 }
             };
             // ADR-017 Phase E.a iter-3 — count physical KV write
@@ -19964,8 +24109,7 @@ fn generate_stream_once(
                 let mut logits: Vec<f32> = match loaded.weights.logits_view() {
                     Ok(v) => v.to_vec(),
                     Err(e) => {
-                        send!(GenerationEvent::Error(format!("logits read: {e}")));
-                        return;
+                        return Err(e).context("Gemma4 SerialFifo decode logits read");
                     }
                 };
                 if !params.logit_bias.is_empty() {
@@ -20040,7 +24184,7 @@ fn generate_stream_once(
             .is_err()
             {
                 tracing::info!("SSE stream dropped by client; aborting decode");
-                return;
+                return serial_stream_client_closed(cancellation_counter);
             }
             if splitter.as_ref().map(|s| s.in_reasoning()).unwrap_or(false) {
                 reasoning_token_count += 1;
@@ -20068,7 +24212,7 @@ fn generate_stream_once(
                             .is_err()
                     {
                         tracing::info!("SSE stream dropped by client; aborting decode");
-                        return;
+                        return serial_stream_client_closed(cancellation_counter);
                     }
                 }
                 super::registry::SplitSlot::Content => {
@@ -20086,7 +24230,7 @@ fn generate_stream_once(
                     .is_err()
                     {
                         tracing::info!("SSE stream dropped by client; aborting decode");
-                        return;
+                        return serial_stream_client_closed(cancellation_counter);
                     }
                 }
             }
@@ -20109,14 +24253,14 @@ fn generate_stream_once(
         FinalizeStreamingAction::Continue => {}
         FinalizeStreamingAction::ClientDropped => {
             tracing::info!("SSE stream dropped by client; aborting decode");
-            return;
+            return serial_stream_client_closed(cancellation_counter);
         }
         FinalizeStreamingAction::ErrorEmitted => {
             // Mid-call truncation or no-call under Constrained already
             // emitted GenerationEvent::Error — do NOT also emit Done. The
             // SSE encoder closes the stream with a finish_reason="error"
             // final chunk on receipt of Error (sse.rs:298-322).
-            return;
+            return Ok(SerialStreamEnd::TerminalSent);
         }
     }
 
@@ -20320,6 +24464,7 @@ fn generate_stream_once(
             }
         }
     }
+    Ok(SerialStreamEnd::TerminalSent)
 }
 
 fn hit_stop_string(text: &str, stops: &[String]) -> bool {
@@ -20859,28 +25004,379 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_cold_cohort_parks_decode_until_bounded_prefill_finishes() {
-        assert!(!deepseek4_cold_cohort_should_drain(false, 2, true));
-        assert!(!deepseek4_cold_cohort_should_drain(false, 1, false));
-        assert!(deepseek4_cold_cohort_should_drain(false, 0, false));
-        assert!(deepseek4_cold_cohort_should_drain(true, 2, true));
+    fn deepseek4_cold_cohort_bounds_decode_while_bounded_prefill_remains() {
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Filling,
+                true,
+                false,
+                false,
+                4,
+                2,
+                true,
+                true,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Draining,
+                admission_open: false,
+                rerun_admission: false,
+            }
+        );
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Filling,
+                false,
+                false,
+                true,
+                2,
+                0,
+                true,
+                true,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Filling,
+                admission_open: true,
+                rerun_admission: true,
+            },
+            "short cold decoders must not prevent the remaining cohort slots from filling"
+        );
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Filling,
+                false,
+                true,
+                true,
+                0,
+                0,
+                true,
+                true,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Filling,
+                admission_open: true,
+                rerun_admission: true,
+            },
+            "a failed or cancelled last prefill must admit waiting cold work instead of deadlocking"
+        );
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Filling,
+                false,
+                false,
+                true,
+                1,
+                0,
+                false,
+                false,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Draining,
+                admission_open: false,
+                rerun_admission: false,
+            }
+        );
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Draining,
+                false,
+                true,
+                true,
+                0,
+                0,
+                true,
+                true,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Idle,
+                admission_open: true,
+                rerun_admission: true,
+            },
+            "Draining with no installed cold work must reopen admission"
+        );
 
-        assert!(deepseek4_cold_cohort_blocks_decode(
-            Deepseek4ColdCohortPhase::Filling,
+        assert_eq!(
+            deepseek4_mixed_decode_quantum(Deepseek4ColdCohortPhase::Filling, 1, 8,),
             1
+        );
+        assert_eq!(
+            deepseek4_mixed_decode_quantum(Deepseek4ColdCohortPhase::Draining, 2, 8,),
+            1
+        );
+        assert_eq!(
+            deepseek4_mixed_decode_quantum(Deepseek4ColdCohortPhase::Draining, 0, 8,),
+            8
+        );
+        assert_eq!(
+            deepseek4_mixed_decode_quantum(Deepseek4ColdCohortPhase::Idle, 2, 8,),
+            8
+        );
+        assert!(deepseek4_should_park_completion(true, 1));
+        assert!(!deepseek4_should_park_completion(true, 0));
+        assert!(!deepseek4_should_park_completion(false, 1));
+    }
+
+    #[test]
+    fn deepseek4_lopsided_mixed_step_advances_decode_between_prefill_commits() {
+        let request = |prompt_tokens, max_tokens| AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 2, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let short = scheduler
+            .admit(request(552, 64))
+            .expect("admit short DeepSeek request")
+            .handle
+            .expect("short handle");
+        scheduler.advance_after_prefill(short, 552);
+        let long = scheduler
+            .admit(request(120_000, 64))
+            .expect("admit long DeepSeek request")
+            .handle
+            .expect("long handle");
+
+        for committed in [4_096, 2_048] {
+            match scheduler.step().expect("lopsided Mixed step") {
+                SchedulerStep::Mixed {
+                    prefill,
+                    decode_handles,
+                    ..
+                } => {
+                    assert_eq!(prefill, long);
+                    assert_eq!(decode_handles, vec![short]);
+                    assert_eq!(
+                        deepseek4_mixed_decode_quantum(Deepseek4ColdCohortPhase::Filling, 1, 8,),
+                        1
+                    );
+                }
+                other => panic!("expected lopsided Mixed, got {other:?}"),
+            }
+            scheduler.advance_after_decode(short);
+            scheduler.advance_after_prefill(long, committed);
+        }
+
+        scheduler.release(long);
+        match scheduler
+            .step()
+            .expect("short decode survives long cancellation")
+        {
+            SchedulerStep::Decode { handles } => assert_eq!(handles, vec![short]),
+            other => panic!("expected surviving short Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepseek4_parked_completion_defers_the_final_scheduler_tick() {
+        let request = |prompt_tokens, max_tokens| AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 2, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let short = scheduler
+            .admit(request(552, 1))
+            .expect("admit one-token short request")
+            .handle
+            .expect("short handle");
+        scheduler.advance_after_prefill(short, 552);
+        let long = scheduler
+            .admit(request(120_000, 64))
+            .expect("admit long request")
+            .handle
+            .expect("long handle");
+
+        match scheduler.step().expect("Mixed before parking completion") {
+            SchedulerStep::Mixed { decode_handles, .. } => {
+                assert_eq!(decode_handles, vec![short]);
+            }
+            other => panic!("expected Mixed before parking, got {other:?}"),
+        }
+        assert_eq!(
+            account_deepseek4_decode_turn(
+                &mut scheduler,
+                short,
+                Deepseek4DecodeAccounting::Fresh {
+                    completed_ticks: 1,
+                    finished: true,
+                },
+                true,
+                1,
+                552,
+                0,
+            ),
+            Deepseek4DecodeDisposition::Park { deferred_ticks: 1 }
+        );
+        assert_eq!(scheduler.stats().completed_total, 0);
+        scheduler.advance_after_prefill(long, 4_096);
+
+        match scheduler.step().expect("parked handle stays owned") {
+            SchedulerStep::Mixed { decode_handles, .. } => {
+                assert_eq!(decode_handles, vec![short]);
+            }
+            other => panic!("expected parked handle in Mixed, got {other:?}"),
+        }
+        assert_eq!(
+            account_deepseek4_decode_turn(
+                &mut scheduler,
+                short,
+                Deepseek4DecodeAccounting::Parked { deferred_ticks: 1 },
+                true,
+                1,
+                552,
+                0,
+            ),
+            Deepseek4DecodeDisposition::Park { deferred_ticks: 1 }
+        );
+        assert_eq!(scheduler.stats().completed_total, 0);
+        scheduler.release(long);
+        assert_eq!(scheduler.stats().completed_total, 1);
+        match scheduler
+            .step()
+            .expect("barrier lift exposes parked handle")
+        {
+            SchedulerStep::Decode { handles } => assert_eq!(handles, vec![short]),
+            other => panic!("expected parked Decode after barrier lift, got {other:?}"),
+        }
+        assert_eq!(
+            account_deepseek4_decode_turn(
+                &mut scheduler,
+                short,
+                Deepseek4DecodeAccounting::Parked { deferred_ticks: 1 },
+                true,
+                0,
+                552,
+                0,
+            ),
+            Deepseek4DecodeDisposition::Finalize
+        );
+        assert_eq!(scheduler.stats().completed_total, 2);
+        assert!(matches!(
+            scheduler.step().expect("final tick releases parked handle"),
+            SchedulerStep::Idle
         ));
-        assert!(deepseek4_cold_cohort_blocks_decode(
-            Deepseek4ColdCohortPhase::Draining,
-            2
+    }
+
+    #[test]
+    fn deepseek4_parked_completion_emits_exactly_one_terminal_done() {
+        let (events, mut receiver) = mpsc::channel(2);
+        let mut reply = Some(SlotReply::deepseek_stream(events, None, None));
+        let request = |prompt_tokens, max_tokens| AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 2, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let short = scheduler
+            .admit(request(552, 1))
+            .expect("admit short")
+            .handle
+            .expect("short handle");
+        scheduler.advance_after_prefill(short, 552);
+        let long = scheduler
+            .admit(request(120_000, 64))
+            .expect("admit long")
+            .handle
+            .expect("long handle");
+
+        let first = account_deepseek4_decode_turn(
+            &mut scheduler,
+            short,
+            Deepseek4DecodeAccounting::Fresh {
+                completed_ticks: 1,
+                finished: true,
+            },
+            true,
+            1,
+            552,
+            0,
+        );
+        assert_eq!(
+            resolve_deepseek4_decode_ownership(first, true).unwrap(),
+            Deepseek4DecodeOwnership::Park { deferred_ticks: 1 }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert!(!deepseek4_cold_cohort_blocks_decode(
-            Deepseek4ColdCohortPhase::Draining,
-            0
+        assert!(reply.is_some(), "parked reply ownership must be retained");
+
+        let still_parked = account_deepseek4_decode_turn(
+            &mut scheduler,
+            short,
+            Deepseek4DecodeAccounting::Parked { deferred_ticks: 1 },
+            true,
+            1,
+            552,
+            0,
+        );
+        assert_eq!(
+            resolve_deepseek4_decode_ownership(still_parked, true).unwrap(),
+            Deepseek4DecodeOwnership::Park { deferred_ticks: 1 }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert!(!deepseek4_cold_cohort_blocks_decode(
-            Deepseek4ColdCohortPhase::Idle,
-            2
-        ));
+
+        scheduler.release(long);
+        let lifted = account_deepseek4_decode_turn(
+            &mut scheduler,
+            short,
+            Deepseek4DecodeAccounting::Parked { deferred_ticks: 1 },
+            true,
+            0,
+            552,
+            0,
+        );
+        assert_eq!(
+            resolve_deepseek4_decode_ownership(lifted, true).unwrap(),
+            Deepseek4DecodeOwnership::Finalize
+        );
+        let completion = super::super::engine_deepseek4::Deepseek4SlotCompletion {
+            result: GenerationResult {
+                text: "OK".to_owned(),
+                reasoning_text: None,
+                prompt_tokens: 552,
+                completion_tokens: 1,
+                reasoning_tokens: None,
+                finish_reason: "stop",
+                prefill_duration: Duration::from_millis(20),
+                decode_duration: Duration::from_millis(5),
+                cached_tokens: 128,
+                logprobs: None,
+            },
+            semantic_ttft: Duration::from_millis(25),
+        };
+
+        fire_deepseek4_completion(
+            reply.take().expect("finalization consumes reply once"),
+            completion,
+        );
+        assert!(reply.take().is_none(), "reply cannot finalize twice");
+        match receiver.blocking_recv() {
+            Some(super::super::sse::GenerationEvent::Done {
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+                stats,
+            }) => {
+                assert_eq!(finish_reason, "stop");
+                assert_eq!(prompt_tokens, 552);
+                assert_eq!(completion_tokens, 1);
+                assert_eq!(stats.cached_prompt_tokens, Some(128));
+            }
+            other => panic!("expected one DeepSeek terminal Done, got {other:?}"),
+        }
+        assert!(receiver.blocking_recv().is_none());
     }
 
     #[test]
@@ -22140,7 +26636,26 @@ assistant:
     where
         F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel::<Request>(8);
+        make_test_engine_with_worker_arch_budget_and_capacity(
+            arch,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token_cached,
+            8,
+            worker,
+        )
+    }
+
+    fn make_test_engine_with_worker_arch_budget_and_capacity<F>(
+        arch: LoadedArch,
+        per_slot_kv_budget_bytes: u64,
+        kv_bytes_per_token_cached: u64,
+        queue_capacity: usize,
+        worker: F,
+    ) -> Engine
+    where
+        F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel::<Request>(queue_capacity);
         let handle = std::thread::Builder::new()
             .name("hf2q-engine-test".into())
             .spawn(move || worker(rx))
@@ -22149,6 +26664,7 @@ assistant:
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
+                supervisor: EngineSupervisor::new(),
                 worker_handle: Mutex::new(Some(handle)),
                 info: synthetic_load_info("test-model"),
                 arch,
@@ -22173,7 +26689,9 @@ assistant:
                 scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                     policy: SchedulerPolicy::FifoSerial,
                     in_flight_slots: 0,
-                    queue_capacity: 8,
+                    queue_capacity: queue_capacity
+                        .try_into()
+                        .expect("test queue capacity fits u32"),
                     admitted_total: 0,
                     rejected_429_total: 0,
                     completed_total: 0,
@@ -22213,6 +26731,78 @@ assistant:
             // production worker they have replies, but here we just drop
             // them — the senders never await a reply.
         }
+    }
+
+    #[tokio::test]
+    async fn buffered_worker_reply_loses_a_simultaneous_race_to_poison() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        let lease = engine
+            .inner
+            .supervisor
+            .arm("buffered-unary-race", Duration::from_secs(60))
+            .expect("arm supervisor");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        reply_tx.send(7_u32).expect("buffer unary reply");
+        engine.inner.supervisor.backdate_without_monitor_for_test();
+        assert!(lease.finish().is_err(), "deadline must poison the engine");
+
+        let error = engine
+            .await_worker_reply(reply_rx, "buffered unary")
+            .await
+            .expect_err("biased health branch must beat buffered success");
+        assert!(format!("{error:#}").contains("buffered-unary-race"));
+    }
+
+    #[tokio::test]
+    async fn extended_generation_entries_reject_poisoned_open_workers_before_enqueue() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        engine.inner.supervisor.poison_now("synthetic-open-worker");
+        assert!(!engine.inner.tx.is_closed());
+
+        let (events, _received) = mpsc::channel(1);
+        let stream_error = engine
+            .generate_stream_with_deepstack(
+                vec![1],
+                SamplingParams::default(),
+                events,
+                None,
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("extended stream must reject poisoned worker");
+        assert!(format!("{stream_error:#}").contains("synthetic-open-worker"));
+
+        let unary_error = engine
+            .generate_with_soft_tokens_and_deepstack(
+                vec![1],
+                Vec::new(),
+                SamplingParams::default(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("extended unary must reject poisoned worker");
+        assert!(format!("{unary_error:#}").contains("synthetic-open-worker"));
+        engine.shutdown().await.expect("synthetic worker shutdown");
+    }
+
+    #[test]
+    fn synchronous_control_timeout_poison_is_bounded_and_one_way() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        let (_reply_tx, reply_rx) = oneshot::channel::<()>();
+        let started = Instant::now();
+        let error = engine
+            .await_sync_control_reply_with_timeout(
+                reply_rx,
+                "synthetic control",
+                Duration::from_millis(1),
+            )
+            .expect_err("unanswered control must time out");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(format!("{error:#}").contains("process restart required"));
+        assert!(!engine.is_worker_healthy());
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -22658,6 +27248,36 @@ assistant:
         // Handle must have been taken (and joined) by shutdown.
         let guard = engine.inner.worker_handle.lock().unwrap();
         assert!(guard.is_none(), "worker handle taken post-shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_preserves_sentinel_until_full_queue_drains() {
+        let engine = make_test_engine_with_worker_arch_budget_and_capacity(
+            LoadedArch::Gemma,
+            0,
+            0,
+            1,
+            |mut rx| {
+                std::thread::sleep(Duration::from_millis(1_100));
+                while let Some(request) = rx.blocking_recv() {
+                    if matches!(request, Request::Shutdown) {
+                        break;
+                    }
+                }
+            },
+        );
+        let (reply, _reply_rx) = oneshot::channel();
+        engine
+            .inner
+            .tx
+            .try_send(Request::Warmup { reply })
+            .expect("fill the one-entry worker queue");
+
+        tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+            .await
+            .expect("shutdown must not lose the sentinel after one second")
+            .expect("healthy worker joins after its queue drains");
+        assert!(engine.inner.worker_handle.lock().unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23806,6 +28426,7 @@ assistant:
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
+                supervisor: EngineSupervisor::new(),
                 worker_handle: Mutex::new(Some(handle)),
                 info: synthetic_load_info("synth-kv"),
                 arch: LoadedArch::Gemma,
@@ -27479,7 +32100,9 @@ assistant:
         let LoadedModel::Gemma(lg3) = &mut legacy_gen else {
             panic!("expected Gemma")
         };
-        let r_legacy = generate_once(lg3, &prompt, &params, None).expect("generate_once");
+        let supervisor = EngineSupervisor::new();
+        let r_legacy =
+            generate_once(lg3, &prompt, &params, None, &supervisor).expect("generate_once");
         let r_slot_ref = gemma4_serial_slot_aware_ref(&load_opts, &prompt, &params);
         eprintln!(
             "[fwd-divergence WRAPPER] generate_once vs serial_slot_aware: text_match={} \
@@ -29471,6 +34094,41 @@ mod finalize_streaming_tool_state_tests {
             out.push(ev);
         }
         out
+    }
+
+    #[test]
+    fn gemma_serial_stream_client_close_is_counted_once() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        assert!(matches!(
+            serial_stream_client_closed(Some(&counter)),
+            Ok(SerialStreamEnd::ClientClosed)
+        ));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one observed disconnect must increment the cancellation metric once"
+        );
+    }
+
+    #[test]
+    fn constrained_finalize_distinguishes_a_dropped_error_receiver() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg)
+            .expect("gemma4 has tool markers, splitter must build");
+        let (tx, rx) = mpsc::channel::<GenerationEvent>(1);
+        drop(rx);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::Constrained,
+            false,
+            Some(&reg),
+            64,
+            0,
+            &EventSink::new(&tx),
+        );
+
+        assert_eq!(action, FinalizeStreamingAction::ClientDropped);
     }
 
     /// Streaming Constrained mid-call truncation: the splitter has seen the
@@ -31584,6 +36242,254 @@ mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
     }
 }
 
+#[cfg(test)]
+mod gemma4_bounded_prefill_tests {
+    use super::*;
+
+    fn admit(
+        scheduler: &mut InflightBatchedScheduler,
+        prompt_tokens: u32,
+        max_tokens: u32,
+    ) -> SlotHandle {
+        scheduler
+            .admit(AdmitRequest {
+                prompt_tokens,
+                max_tokens,
+                kv_bytes_needed: 0,
+                prompt_kv_bytes: 0,
+                preferred_slot: None,
+            })
+            .expect("admit")
+            .handle
+            .expect("physical slot")
+    }
+
+    #[test]
+    fn gemma_prefill_plan_is_bounded_and_never_crosses_stable_boundary() {
+        assert_eq!(
+            gemma4_next_prefill_end(0, 4_095, None, 4_096).unwrap(),
+            4_095
+        );
+        assert_eq!(
+            gemma4_next_prefill_end(0, 4_096, None, 4_096).unwrap(),
+            4_096
+        );
+        assert_eq!(
+            gemma4_next_prefill_end(0, 4_097, None, 4_096).unwrap(),
+            4_096
+        );
+        assert_eq!(
+            gemma4_next_prefill_end(4_096, 4_097, None, 4_096).unwrap(),
+            4_097
+        );
+
+        let mut cursor = 0;
+        let mut ends = Vec::new();
+        while cursor < 9_000 {
+            cursor = gemma4_next_prefill_end(cursor, 9_000, Some(3_000), 4_096).unwrap();
+            ends.push(cursor);
+        }
+        assert_eq!(ends, vec![3_000, 7_096, 9_000]);
+    }
+
+    #[test]
+    fn gemma_prefill_progress_commits_only_after_the_transaction_is_proven() {
+        let mut progress = Gemma4PrefillProgress::new(0, 9_000, Some(3_000)).unwrap();
+
+        let boundary = progress.plan(4_096).unwrap();
+        assert_eq!(
+            boundary,
+            Gemma4PrefillPlan {
+                start: 0,
+                end: 3_000,
+                capture_anchor: true,
+                ready: false,
+            }
+        );
+        assert_eq!(
+            progress.cursor(),
+            0,
+            "planning or a failed forward/snapshot must not publish progress"
+        );
+        assert_eq!(
+            progress.commit(boundary).unwrap(),
+            Gemma4PrefillCommit::Pending {
+                advanced_tokens: 3_000
+            }
+        );
+
+        let middle = progress.plan(4_096).unwrap();
+        assert_eq!((middle.start, middle.end), (3_000, 7_096));
+        assert!(!middle.capture_anchor && !middle.ready);
+        assert!(
+            progress.commit(boundary).is_err(),
+            "a stale or double commit must fail without cursor movement"
+        );
+        assert_eq!(progress.cursor(), 3_000);
+        progress.commit(middle).unwrap();
+
+        let tail = progress.plan(4_096).unwrap();
+        assert_eq!((tail.start, tail.end), (7_096, 9_000));
+        assert!(tail.ready && !tail.capture_anchor);
+        assert_eq!(
+            progress.commit(tail).unwrap(),
+            Gemma4PrefillCommit::Ready {
+                advanced_tokens: 1_904
+            }
+        );
+
+        let cached = Gemma4PrefillProgress::new(2_500, 9_000, Some(3_000)).unwrap();
+        let cached_boundary = cached.plan(4_096).unwrap();
+        assert_eq!((cached_boundary.start, cached_boundary.end), (2_500, 3_000));
+        assert!(cached_boundary.capture_anchor);
+        assert_eq!(cached.cursor(), 2_500);
+    }
+
+    #[test]
+    fn gemma_nonhybrid_prefill_preserves_request_boundary_without_capturing_anchor() {
+        let params = SamplingParams {
+            stable_prompt_prefix_tokens: Some(3_000),
+            ..SamplingParams::default()
+        };
+        // Non-hybrid operation has no rewind-anchor substrate, so admission
+        // passes an effective boundary of None while preserving the request
+        // parameter used by the rest of generation semantics.
+        let mut progress = Gemma4PrefillProgress::new(0, 9_000, None).unwrap();
+        let mut ends = Vec::new();
+        while progress.cursor() < 9_000 {
+            let plan = progress
+                .plan(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
+                .unwrap();
+            assert!(!plan.capture_anchor);
+            ends.push(plan.end);
+            progress.commit(plan).unwrap();
+        }
+        assert_eq!(ends, vec![4_096, 8_192, 9_000]);
+        assert_eq!(params.stable_prompt_prefix_tokens, Some(3_000));
+    }
+
+    #[test]
+    fn gemma_long_prefill_keeps_a_decode_peer_in_every_mixed_quantum() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, 0);
+        scheduler.set_prefill_chunk_tokens(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS);
+        let short = admit(&mut scheduler, 552, 64);
+        scheduler.advance_after_prefill(short, 552);
+        let long = admit(&mut scheduler, 9_000, 64);
+
+        let mut chunks = Vec::new();
+        loop {
+            match scheduler.step().unwrap() {
+                SchedulerStep::Mixed {
+                    prefill,
+                    n_prefill_tokens,
+                    decode_handles,
+                } => {
+                    assert_eq!(prefill, long);
+                    assert!(decode_handles.contains(&short));
+                    chunks.push(n_prefill_tokens);
+                    scheduler.advance_after_decode(short);
+                    scheduler.advance_after_prefill(long, n_prefill_tokens);
+                    if chunks.iter().map(|&n| n as usize).sum::<usize>() == 9_000 {
+                        break;
+                    }
+                    scheduler.yield_prefill_turn(long);
+                }
+                other => panic!("expected Mixed while long prefill remains, got {other:?}"),
+            }
+        }
+        assert_eq!(chunks, vec![4_096, 4_096, 808]);
+        match scheduler.step().unwrap() {
+            SchedulerStep::Decode { handles } => {
+                assert!(handles.contains(&short));
+                assert!(handles.contains(&long));
+            }
+            other => panic!("both lanes should decode after prefill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma_inline_embed_and_multimodal_streams_fail_closed_at_the_gpu_boundary() {
+        assert!(validate_gemma4_embed_request(0, 262_144).is_err());
+        assert_eq!(
+            validate_gemma4_embed_request(4_096, 262_144).unwrap(),
+            4_096
+        );
+        let too_long = validate_gemma4_embed_request(4_097, 262_144)
+            .expect_err("multi-transaction embed must fail closed");
+        assert!(format!("{too_long:#}").contains("capability_unsupported"));
+        assert!(validate_gemma4_embed_request(101, 100).is_err());
+        assert!(validate_gemma4_embed_request(usize::MAX, usize::MAX).is_err());
+
+        assert!(gemma4_cross_batch_eligible(4_096, 1, false, false, false));
+        assert!(
+            !gemma4_cross_batch_eligible(4_096, 1, false, false, true),
+            "multimodal streaming must never enter the plain-text batch arm"
+        );
+        assert_eq!(gemma4_admission_budget(true, 4), 4);
+        assert_eq!(
+            gemma4_admission_budget(false, 3),
+            1,
+            "active decode peers must see the scheduler after one admission"
+        );
+    }
+
+    #[test]
+    fn gemma_cross_slot_batches_validate_shapes_and_cap_aggregate_metal_rows() {
+        use Gemma4CrossBatchClass::{Cold, Stable};
+
+        assert!(gemma4_batch_rows_within_transaction_limit([4_096]));
+        assert!(gemma4_batch_rows_within_transaction_limit([2_048, 2_048]));
+        assert!(!gemma4_batch_rows_within_transaction_limit([2_048, 2_049]));
+        assert!(!gemma4_batch_rows_within_transaction_limit([
+            4_096, 4_096, 4_096, 4_096
+        ]));
+        assert!(!gemma4_batch_rows_within_transaction_limit(
+            std::iter::repeat_n(4_096, 8)
+        ));
+
+        let exact = [Some((Cold, 2_048)), Some((Cold, 2_048)), Some((Cold, 1))];
+        assert_eq!(gemma4_bounded_batch_prefix_len(exact), 2);
+        let overflow = [
+            ("cold-a", Some((Cold, 2_048))),
+            ("cold-b", Some((Cold, 2_049))),
+            ("cold-c", Some((Cold, 1))),
+        ];
+        let prefix = gemma4_bounded_batch_prefix_len(overflow.iter().map(|(_, lane)| *lane));
+        assert_eq!(prefix, 1);
+        assert_eq!(
+            overflow[prefix..]
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["cold-b", "cold-c"],
+            "overflow and its tail must remain in FIFO order"
+        );
+        assert_eq!(
+            gemma4_bounded_batch_prefix_len([Some((Stable, 2_048)), Some((Cold, 2_048)),]),
+            1,
+            "stable work must not be reordered behind a later cold batch"
+        );
+        assert_eq!(
+            gemma4_bounded_batch_prefix_len([Some((Cold, 2_048)), Some((Stable, 2_048))]),
+            1,
+            "one admission quantum contains one contiguous batch class"
+        );
+
+        assert!(validate_gemma4_generation_request(0, 1, 262_144).is_err());
+        assert!(validate_gemma4_generation_request(1, 0, 262_144).is_err());
+        assert!(validate_gemma4_generation_request(1, u32::MAX as usize + 1, usize::MAX).is_err());
+        assert!(validate_gemma4_generation_request(262_140, 5, 262_144).is_err());
+        assert!(validate_gemma4_generation_request(usize::MAX, 1, usize::MAX).is_err());
+        assert_eq!(
+            validate_gemma4_generation_request(4_096, 64, 262_144).unwrap(),
+            Gemma4ValidatedRequestShape {
+                prompt_tokens: 4_096,
+                max_tokens: 64,
+            }
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ADR-040 Phase C iter-2c (C2c) tests — Gemma 4 SlotAware engine activation
 // (2026-05-24, this commit)
@@ -32478,6 +37384,988 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
 // typed-error variants. The full SlotAware-decode end-to-end witness
 // requires Path A landing in iter-C2d-cont-kernel + a real GGUF.
 // ---------------------------------------------------------------------------
+#[cfg(test)]
+mod qwen35_bounded_prefill_watchdog_tests {
+    use super::*;
+
+    fn request(prompt_tokens: u32, max_tokens: u32) -> AdmitRequest {
+        AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        }
+    }
+
+    #[test]
+    fn active_decode_runs_in_the_same_quantum_as_long_qwen_prefill() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, 0);
+        scheduler.set_prefill_chunk_tokens(QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        let short = scheduler
+            .admit(request(552, 64))
+            .expect("admit short")
+            .handle
+            .expect("short handle");
+        scheduler.advance_after_prefill(short, 552);
+        let long = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit long")
+            .handle
+            .expect("long handle");
+
+        match scheduler.step().expect("mixed scheduling step") {
+            SchedulerStep::Mixed {
+                prefill,
+                n_prefill_tokens,
+                decode_handles,
+            } => {
+                assert_eq!(prefill, long);
+                assert_eq!(n_prefill_tokens, 2_048);
+                assert_eq!(decode_handles, vec![short]);
+            }
+            other => panic!("expected Mixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_qwen_embeds_yield_one_at_a_time_to_an_active_decoder() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, 0);
+        let decode = scheduler
+            .admit(request(32, 4))
+            .expect("admit active decoder")
+            .handle
+            .expect("decode handle");
+        scheduler.advance_after_prefill(decode, 32);
+        let (reply_a, _received_a) = oneshot::channel();
+        let (reply_b, _received_b) = oneshot::channel();
+        let mut queued = VecDeque::from([
+            Request::Embed {
+                prompt_tokens: vec![1; QWEN35_SLOT_INLINE_PROMPT_LIMIT],
+                reply: reply_a,
+            },
+            Request::Embed {
+                prompt_tokens: vec![2; QWEN35_SLOT_INLINE_PROMPT_LIMIT],
+                reply: reply_b,
+            },
+        ]);
+
+        for expected_first_token in [1, 2] {
+            let inline = queued.pop_front().expect("queued Embed request");
+            let Request::Embed { prompt_tokens, .. } = &inline else {
+                panic!("fixture must remain a real Request::Embed")
+            };
+            assert_eq!(prompt_tokens[0], expected_first_token);
+            assert!(qwen35_yields_after_inline_admission(&inline));
+            match scheduler.step().expect("decode between inline admits") {
+                SchedulerStep::Decode { handles } => assert_eq!(handles, vec![decode]),
+                other => panic!("Embed burst starved active decode: {other:?}"),
+            }
+            scheduler.advance_after_decode(decode);
+        }
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn nested_mlx_command_buffer_error_is_qwen_worker_fatal() {
+        let fatal = anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+            "Caused GPU Timeout Error".into(),
+        ))
+        .context("layer.moe_ffn")
+        .context("slot-aware bounded prefill");
+        assert!(is_fatal_command_buffer_error(&fatal));
+        assert!(!is_fatal_command_buffer_error(&anyhow::anyhow!(
+            "ordinary request validation error"
+        )));
+    }
+
+    #[test]
+    fn qwen_cold_prefill_yields_to_the_next_cold_slot() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, 0);
+        scheduler.set_prefill_chunk_tokens(QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        let first = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit first cold request")
+            .handle
+            .expect("first cold handle");
+        let second = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit second cold request")
+            .handle
+            .expect("second cold handle");
+        let third = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit third cold request")
+            .handle
+            .expect("third cold handle");
+
+        match scheduler.step().expect("first prefill step") {
+            SchedulerStep::Prefill { handle, n_tokens } => {
+                assert_eq!(handle, first);
+                assert_eq!(n_tokens, QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+            }
+            other => panic!("expected first Prefill, got {other:?}"),
+        }
+        scheduler.advance_after_prefill(first, QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        scheduler.yield_prefill_turn(first);
+
+        match scheduler.step().expect("rotated prefill step") {
+            SchedulerStep::Prefill { handle, n_tokens } => {
+                assert_eq!(handle, second);
+                assert_eq!(n_tokens, QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+            }
+            other => panic!("expected rotated Prefill, got {other:?}"),
+        }
+        scheduler.advance_after_prefill(second, QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        scheduler.yield_prefill_turn(second);
+        match scheduler.step().expect("third prefill step") {
+            SchedulerStep::Prefill { handle, n_tokens } => {
+                assert_eq!(handle, third);
+                assert_eq!(n_tokens, QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+            }
+            other => panic!("expected third Prefill, got {other:?}"),
+        }
+        scheduler.advance_after_prefill(third, QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        scheduler.yield_prefill_turn(third);
+        match scheduler.step().expect("round-robin returns to first") {
+            SchedulerStep::Prefill { handle, .. } => assert_eq!(handle, first),
+            other => panic!("expected first Prefill again, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_long_qwen_prefills_alternate_every_bounded_transaction() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, 0);
+        scheduler.set_prefill_chunk_tokens(QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        let first = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit first long request")
+            .handle
+            .expect("first handle");
+        let second = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit second long request")
+            .handle
+            .expect("second handle");
+        let mut first_chunks = Vec::new();
+        let mut second_chunks = Vec::new();
+
+        for turn in 0..86 {
+            let (handle, tokens) = match scheduler.step().expect("fair prefill step") {
+                SchedulerStep::Prefill { handle, n_tokens } => (handle, n_tokens),
+                SchedulerStep::Mixed {
+                    prefill,
+                    n_prefill_tokens,
+                    decode_handles,
+                } => {
+                    assert_eq!(
+                        turn, 85,
+                        "Mixed is expected only for the final second lane tail"
+                    );
+                    assert_eq!(decode_handles, vec![first]);
+                    (prefill, n_prefill_tokens)
+                }
+                other => panic!("unexpected long-prefill fairness step: {other:?}"),
+            };
+            let expected = if turn % 2 == 0 { first } else { second };
+            assert_eq!(handle, expected, "cold lanes must alternate every chunk");
+            if handle == first {
+                first_chunks.push(tokens);
+            } else {
+                second_chunks.push(tokens);
+            }
+            scheduler.advance_after_prefill(handle, tokens);
+            scheduler.yield_prefill_turn(handle);
+        }
+
+        for chunks in [&first_chunks, &second_chunks] {
+            assert_eq!(chunks.len(), 43);
+            assert!(chunks[..42]
+                .iter()
+                .all(|&tokens| tokens == QWEN35_SLOT_PREFILL_CHUNK_TOKENS));
+            assert_eq!(chunks[42], 1_956);
+        }
+        match scheduler.step().expect("both long lanes decode-ready") {
+            SchedulerStep::Decode { handles } => assert_eq!(handles, vec![first, second]),
+            other => panic!("expected Decode after both long prefills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen_87972_prompt_is_bounded_to_42_full_chunks_and_one_tail() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, 0);
+        scheduler.set_prefill_chunk_tokens(QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+        let short = scheduler
+            .admit(request(552, 64))
+            .expect("admit live short request")
+            .handle
+            .expect("short handle");
+        scheduler.advance_after_prefill(short, 552);
+        let long = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit long request")
+            .handle
+            .expect("long handle");
+        let mut chunks = Vec::new();
+        while chunks.len() < 43 {
+            match scheduler.step().expect("bounded prefill step") {
+                SchedulerStep::Mixed {
+                    prefill,
+                    n_prefill_tokens,
+                    decode_handles,
+                } => {
+                    assert_eq!(prefill, long);
+                    assert_eq!(decode_handles, vec![short]);
+                    chunks.push(n_prefill_tokens);
+                    scheduler.advance_after_decode(short);
+                    scheduler.advance_after_prefill(long, n_prefill_tokens);
+                    scheduler.yield_prefill_turn(long);
+                }
+                other => panic!("expected Mixed throughout long prefill, got {other:?}"),
+            }
+        }
+        assert_eq!(chunks.len(), 43);
+        assert!(chunks[..42]
+            .iter()
+            .all(|&tokens| tokens == QWEN35_SLOT_PREFILL_CHUNK_TOKENS));
+        assert_eq!(chunks[42], 1_956);
+        assert_eq!(chunks.iter().copied().sum::<u32>(), 87_972);
+        match scheduler.step().expect("both requests decode-ready") {
+            SchedulerStep::Decode { handles } => assert_eq!(handles, vec![short, long]),
+            other => panic!("expected both handles in Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen_unresumable_inline_routes_fail_before_watchdog_sized_prompts() {
+        validate_qwen35_inline_prompt("embedding", QWEN35_SLOT_INLINE_PROMPT_LIMIT)
+            .expect("limit is accepted");
+        let error = validate_qwen35_inline_prompt("embedding", QWEN35_SLOT_INLINE_PROMPT_LIMIT + 1)
+            .expect_err("over-limit inline prompt must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("capability_unsupported"));
+        assert!(message.contains("inline GPU routes are bounded"));
+    }
+
+    #[test]
+    fn qwen_slot_stream_rejects_every_unscheduled_multimodal_payload_shape() {
+        validate_qwen35_slot_stream_payload(false, false, false)
+            .expect("plain text streaming remains supported");
+        for shape in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let error = validate_qwen35_slot_stream_payload(shape.0, shape.1, shape.2)
+                .expect_err("multimodal streaming must fail before SSE admission");
+            assert!(format!("{error:#}").contains("capability_unsupported"));
+        }
+    }
+
+    #[test]
+    fn qwen_slot_soft_tokens_fail_closed_until_they_are_scheduler_yielding() {
+        let error = qwen35_slot_soft_tokens_unsupported();
+        let message = format!("{error:#}");
+        assert!(message.contains("capability_unsupported"));
+        assert!(message.contains("scheduler-yielding"));
+        assert!(message.contains("SerialFifo"));
+    }
+
+    #[test]
+    fn qwen_zero_completion_stream_is_rejected_before_sse_admission() {
+        let error = validate_qwen35_generation_request(8, 0, 262_144)
+            .expect_err("zero-token generation must fail at the engine boundary");
+        let (events, mut received_events) = mpsc::channel(2);
+        let (admission, received_admission) = oneshot::channel();
+        slot_fire_done(
+            SlotReply::Stream {
+                events,
+                cancel: None,
+                admission: Some(admission),
+                router: None,
+            },
+            Err(error),
+            false,
+        );
+        let admission_error = received_admission
+            .blocking_recv()
+            .expect("admission reply")
+            .expect_err("zero-token stream must fail before SSE");
+        assert!(format!("{admission_error:#}").contains("invalid_request"));
+        assert!(matches!(
+            received_events.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected) | Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn serial_stream_outcome_preserves_typed_fatal_before_outer_terminal() {
+        let supervisor = EngineSupervisor::new();
+        for end in [SerialStreamEnd::TerminalSent, SerialStreamEnd::ClientClosed] {
+            assert!(matches!(
+                classify_serial_stream_result(&supervisor, Ok(end)),
+                SerialStreamDisposition::Complete
+            ));
+        }
+
+        let ordinary = classify_serial_stream_result(
+            &supervisor,
+            Err(anyhow::anyhow!("ordinary stream policy error")),
+        );
+        assert!(matches!(ordinary, SerialStreamDisposition::RequestError(_)));
+
+        let fatal = anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+            "Caused GPU Timeout Error".into(),
+        ))
+        .context("family stream decode")
+        .context("SerialFifo outer driver");
+        match classify_serial_stream_result(&supervisor, Err(fatal)) {
+            SerialStreamDisposition::WorkerFatal(error) => {
+                assert!(is_fatal_command_buffer_error(&error));
+                assert!(format!("{error:#}").contains("family stream decode"));
+            }
+            _ => panic!("nested Metal failure must reach SerialFifo fail-stop"),
+        }
+
+        let poisoned = EngineSupervisor::new();
+        let lease = poisoned
+            .arm("plain-supervisor-error", Duration::from_secs(60))
+            .unwrap();
+        poisoned.backdate_without_monitor_for_test();
+        assert!(lease.finish().is_err());
+        assert!(matches!(
+            classify_serial_stream_result(
+                &poisoned,
+                Err(anyhow::anyhow!("late successful transaction")),
+            ),
+            SerialStreamDisposition::WorkerFatal(_)
+        ));
+    }
+
+    #[test]
+    fn serial_prefill_limits_reject_unbounded_family_transactions() {
+        for (family, limit) in [
+            ("Qwen35", QWEN35_SLOT_PREFILL_CHUNK_TOKENS as usize),
+            ("Qwen3VL", QWEN35_SLOT_PREFILL_CHUNK_TOKENS as usize),
+            ("Gemma4", GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize),
+        ] {
+            validate_serial_prefill_family(family, limit).expect("bounded request");
+            let error = validate_serial_prefill_family(family, limit + 1)
+                .expect_err("unbounded SerialFifo transaction must fail closed");
+            assert!(format!("{error:#}").contains("inflight-batched"));
+        }
+        validate_serial_prefill_family("DeepSeek4", usize::MAX)
+            .expect("DeepSeek has inner resumable transaction leases");
+    }
+
+    #[test]
+    fn qwen_request_shape_rejects_narrowing_overflow_and_context_overrun() {
+        for (prompt, completion, expected) in [
+            (usize::MAX, 1, "exceeds u32"),
+            (8, u32::MAX as usize + 1, "exceeds u32"),
+            (262_080, 1, "exceeding the per-slot limit"),
+        ] {
+            let error = validate_qwen35_generation_request(prompt, completion, 262_144)
+                .expect_err("invalid scheduler shape must fail before admission");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected validation error: {error:#}"
+            );
+        }
+        let shape = validate_qwen35_generation_request(87_972, 64, 262_144)
+            .expect("watchdog fixture fits the full logical context");
+        assert_eq!(shape.prompt_tokens, 87_972);
+        assert_eq!(shape.max_tokens, 64);
+    }
+
+    #[test]
+    fn failed_slot_reset_is_worker_fatal_and_never_returns_reusable_reply() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(1, 1, 0);
+        let handle = scheduler
+            .admit(request(8, 1))
+            .expect("admit reset-failure fixture")
+            .handle
+            .expect("fixture handle");
+        let (reply, received) = oneshot::channel();
+        let fatal = match qwen35_reset_result_for_reply(
+            handle,
+            SlotReply::Unary(reply),
+            Err(anyhow::anyhow!("injected partial recurrent reset failure")),
+        ) {
+            Ok(_) => panic!("failed reset must not return a reusable slot reply"),
+            Err(fatal) => fatal,
+        };
+        assert_eq!(fatal.kind, Qwen35WorkerFatalKind::Invariant);
+        assert_eq!(fatal.handle, Some(handle));
+        assert!(format!("{:#}", fatal.error).contains("partial recurrent reset"));
+        fail_qwen35_fatal_reply(fatal.reply, ENGINE_UNHEALTHY_MESSAGE);
+        let error = received
+            .blocking_recv()
+            .expect("fatal reset reply")
+            .expect_err("reset failure must fail the request");
+        assert!(format!("{error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+    }
+
+    #[test]
+    fn active_stream_receives_one_fatal_error_and_no_done_event() {
+        let (events, mut received) = mpsc::channel(4);
+        fail_qwen35_fatal_reply(
+            Qwen35FatalReply::Slot(SlotReply::Stream {
+                events,
+                cancel: None,
+                admission: None,
+                router: None,
+            }),
+            ENGINE_UNHEALTHY_MESSAGE,
+        );
+        match received.blocking_recv().expect("one terminal event") {
+            super::super::sse::GenerationEvent::Error(message) => {
+                assert!(message.contains(ENGINE_UNHEALTHY_SENTINEL));
+            }
+            other => panic!("expected fatal Error, got {other:?}"),
+        }
+        assert!(
+            received.blocking_recv().is_none(),
+            "engine must not emit Done after fatal Error"
+        );
+    }
+
+    #[test]
+    fn buffered_stream_fails_admission_without_opening_event_stream() {
+        let (events, mut received) = mpsc::channel(4);
+        let (admission, admission_rx) = oneshot::channel();
+        fail_slotaware_buffered_request(
+            Request::GenerateStream {
+                prompt_tokens: vec![1],
+                params: SamplingParams::default(),
+                events,
+                cancellation_counter: None,
+                admission: Some(admission),
+                soft_tokens: Vec::new(),
+                deepstack: None,
+                positions_flat: None,
+            },
+            ENGINE_UNHEALTHY_MESSAGE,
+        );
+        let error = admission_rx
+            .blocking_recv()
+            .expect("admission receives a terminal result")
+            .expect_err("buffered stream must be rejected");
+        assert!(format!("{error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        assert!(
+            received.blocking_recv().is_none(),
+            "pre-admission failure must not emit SSE events"
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_close_drains_request_sent_through_preclose_permit() {
+        let (tx, rx) = mpsc::channel::<Request>(2);
+        let permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("reserve capacity before receiver close");
+        let (origin_tx, origin_rx) = oneshot::channel();
+        let (late_tx, late_rx) = oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            let supervisor = EngineSupervisor::new();
+            let mut rx = rx;
+            let mut pending = None;
+            let mut slots: Vec<Option<Qwen35Slot>> = Vec::new();
+            let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(1, 1, 0);
+            let stats = Arc::new(Mutex::new(scheduler.stats()));
+            fail_qwen35_worker_after_gpu_fatal(
+                &supervisor,
+                &mut rx,
+                &mut pending,
+                &mut slots,
+                &mut scheduler,
+                &stats,
+                Qwen35FatalFailure {
+                    handle: None,
+                    reply: Qwen35FatalReply::Warmup(origin_tx),
+                    error: anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+                        "Caused GPU Timeout Error".into(),
+                    )),
+                    kind: Qwen35WorkerFatalKind::Gpu,
+                },
+            );
+        });
+
+        let origin = tokio::time::timeout(std::time::Duration::from_secs(2), origin_rx)
+            .await
+            .expect("fatal origin reply timed out")
+            .expect("origin receives fatal terminal result")
+            .expect_err("origin must fail");
+        assert!(format!("{origin:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        assert!(tx.is_closed(), "receiver must close before fatal reply");
+        let (fresh_tx, _fresh_rx) = oneshot::channel();
+        assert!(matches!(
+            tx.try_send(Request::Warmup { reply: fresh_tx }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+
+        permit.send(Request::Warmup { reply: late_tx });
+        drop(tx);
+        let late = tokio::time::timeout(std::time::Duration::from_secs(2), late_rx)
+            .await
+            .expect("pre-close permit reply timed out")
+            .expect("pre-close permit request is explicitly drained")
+            .expect_err("late request must fail");
+        assert!(format!("{late:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        worker.join().expect("fatal drain worker joins");
+    }
+
+    #[tokio::test]
+    async fn closed_engine_apis_return_the_unhealthy_sentinel() {
+        fn assert_unhealthy(error: anyhow::Error) {
+            assert!(
+                format!("{error:#}").contains(ENGINE_UNHEALTHY_SENTINEL),
+                "closed worker error lost engine_unhealthy sentinel: {error:#}"
+            );
+        }
+
+        let engine = make_synthetic_engine_for_test(LoadedArch::Qwen35);
+        engine.shutdown().await.expect("stop synthetic worker");
+        assert!(!engine.is_worker_healthy());
+
+        assert_unhealthy(engine.warmup().await.expect_err("warmup must fail"));
+        assert_unhealthy(
+            engine
+                .generate(vec![1], SamplingParams::default())
+                .await
+                .expect_err("generate must fail"),
+        );
+        assert_unhealthy(engine.embed(vec![1]).await.expect_err("embed must fail"));
+        assert_unhealthy(
+            engine
+                .generate_with_soft_tokens(vec![1], Vec::new(), SamplingParams::default())
+                .await
+                .expect_err("soft-token generation must fail"),
+        );
+        let (events, _received) = mpsc::channel(1);
+        assert_unhealthy(
+            engine
+                .generate_stream(vec![1], SamplingParams::default(), events, None, Vec::new())
+                .await
+                .expect_err("stream enqueue must fail"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod slotaware_fail_stop_tests {
+    use super::*;
+
+    fn assert_control_error<T: std::fmt::Debug>(rx: oneshot::Receiver<Result<T>>, operation: &str) {
+        let error = rx
+            .blocking_recv()
+            .expect("control reply sender dropped")
+            .expect_err("SlotAware control request must fail explicitly");
+        let message = format!("{error:#}");
+        assert!(message.contains(operation), "missing operation: {message}");
+        assert!(
+            message.contains("synthetic-family SlotAware"),
+            "missing family/scheduler scope: {message}"
+        );
+    }
+
+    fn request(prompt_tokens: u32, max_tokens: u32) -> AdmitRequest {
+        AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        }
+    }
+
+    #[test]
+    fn scheduled_slot_lookup_never_skips_missing_or_mismatched_ownership() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(1, 2, 0);
+        let scheduled = scheduler
+            .admit(request(8, 1))
+            .expect("admit scheduled handle")
+            .handle
+            .expect("scheduled handle");
+        let missing = match take_expected_slotaware_slot::<()>("Gemma4", scheduled, None) {
+            Ok(_) => panic!("missing scheduled slot must be fatal"),
+            Err(fatal) => fatal,
+        };
+        assert_eq!(missing.kind, SlotAwareFatalKind::Invariant);
+        assert_eq!(missing.owned.len(), 1);
+        assert_eq!(missing.owned[0].handle, Some(scheduled));
+        assert!(matches!(&missing.owned[0].reply, SlotAwareFatalReply::None));
+
+        scheduler.release(scheduled);
+        let installed = scheduler
+            .admit(request(8, 1))
+            .expect("re-admit installed generation")
+            .handle
+            .expect("installed handle");
+        assert_ne!(scheduled, installed);
+        let (reply, _reply_rx) = oneshot::channel();
+        let mismatched = match take_expected_slotaware_slot(
+            "Gemma4",
+            scheduled,
+            Some(((), SlotReply::Unary(reply), installed)),
+        ) {
+            Ok(_) => panic!("mismatched installed generation must be fatal"),
+            Err(fatal) => fatal,
+        };
+        assert_eq!(mismatched.kind, SlotAwareFatalKind::Invariant);
+        assert_eq!(mismatched.owned.len(), 1);
+        assert_eq!(mismatched.owned[0].handle, Some(scheduled));
+        assert!(matches!(
+            &mismatched.owned[0].reply,
+            SlotAwareFatalReply::Slot(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_fatal_stream_cannot_block_later_reply_fanout() {
+        let supervisor = EngineSupervisor::new();
+        let (raw_events, raw_events_rx) = mpsc::channel(1);
+        raw_events
+            .try_send(super::super::sse::GenerationEvent::Delta {
+                kind: super::super::sse::DeltaKind::Content,
+                text: "prefilled".into(),
+            })
+            .expect("saturate raw stream before fail-stop");
+        let mut guarded_events = supervisor.guard_generation_events(raw_events_rx);
+        let (later_reply, later_rx) = oneshot::channel();
+        let (request_tx, request_rx) = mpsc::channel::<Request>(1);
+        drop(request_tx);
+        let worker_supervisor = supervisor.clone();
+        let worker = std::thread::spawn(move || {
+            let mut rx = request_rx;
+            let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(1, 1, 0);
+            let handle = scheduler
+                .admit(request(8, 1))
+                .expect("admit saturated stream")
+                .handle
+                .expect("stream handle");
+            let stats = Arc::new(Mutex::new(scheduler.stats()));
+            fail_stop_slotaware_worker(
+                "synthetic-family",
+                &worker_supervisor,
+                &mut rx,
+                &mut scheduler,
+                &stats,
+                SlotAwareGpuFatal {
+                    error: anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+                        "Caused GPU Timeout Error".into(),
+                    )),
+                    kind: SlotAwareFatalKind::Gpu,
+                    owned: vec![SlotAwareOwnedReply {
+                        handle: Some(handle),
+                        reply: SlotAwareFatalReply::Slot(SlotReply::Stream {
+                            events: raw_events,
+                            cancel: None,
+                            admission: None,
+                            router: None,
+                        }),
+                    }],
+                },
+                Vec::new(),
+                vec![Request::Warmup { reply: later_reply }],
+            );
+        });
+
+        let later_error = tokio::time::timeout(Duration::from_secs(2), later_rx)
+            .await
+            .expect("later reply fanout must not block behind full SSE")
+            .expect("later reply sender dropped")
+            .expect_err("later request must fail after worker poison");
+        assert!(format!("{later_error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        worker.join().expect("fatal fanout worker joins");
+
+        let mut errors = 0;
+        let mut done = 0;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), guarded_events.recv())
+            .await
+            .expect("guarded stream must close after poison")
+        {
+            match event {
+                super::super::sse::GenerationEvent::Error(message) => {
+                    errors += 1;
+                    assert!(message.contains(ENGINE_UNHEALTHY_SENTINEL));
+                }
+                super::super::sse::GenerationEvent::Done { .. } => done += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(errors, 1, "guard emits one authoritative fatal Error");
+        assert_eq!(done, 0, "fatal stream must never emit Done");
+    }
+
+    #[tokio::test]
+    async fn shared_fail_stop_drains_every_reply_owner_and_preclose_permit() {
+        let (tx, rx) = mpsc::channel::<Request>(2);
+        let permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("reserve capacity before receiver close");
+        let (origin_tx, origin_rx) = oneshot::channel();
+        let (installed_events, mut installed_events_rx) = mpsc::channel(2);
+        let (buffered_tx, buffered_rx) = oneshot::channel();
+        let (late_tx, late_rx) = oneshot::channel();
+
+        let worker = std::thread::spawn(move || {
+            let supervisor = EngineSupervisor::new();
+            let mut rx = rx;
+            let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(2, 2, 0);
+            let origin_handle = scheduler
+                .admit(request(8, 1))
+                .expect("admit fatal origin")
+                .handle
+                .expect("origin handle");
+            let installed_handle = scheduler
+                .admit(request(8, 1))
+                .expect("admit installed peer")
+                .handle
+                .expect("installed handle");
+            let stats = Arc::new(Mutex::new(scheduler.stats()));
+            fail_stop_slotaware_worker(
+                "synthetic-family",
+                &supervisor,
+                &mut rx,
+                &mut scheduler,
+                &stats,
+                SlotAwareGpuFatal {
+                    error: anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+                        "Caused GPU Timeout Error".into(),
+                    )),
+                    kind: SlotAwareFatalKind::Gpu,
+                    owned: vec![SlotAwareOwnedReply {
+                        handle: Some(origin_handle),
+                        reply: SlotAwareFatalReply::Slot(SlotReply::Unary(origin_tx)),
+                    }],
+                },
+                vec![(
+                    installed_handle,
+                    SlotReply::Stream {
+                        events: installed_events,
+                        cancel: None,
+                        admission: None,
+                        router: None,
+                    },
+                )],
+                vec![Request::Warmup { reply: buffered_tx }],
+            );
+            assert_eq!(
+                scheduler.stats().in_flight_slots,
+                0,
+                "shared fail-stop must release every scheduler handle"
+            );
+        });
+
+        let origin_error = tokio::time::timeout(std::time::Duration::from_secs(2), origin_rx)
+            .await
+            .expect("origin fatal reply timed out")
+            .expect("origin reply sender dropped")
+            .expect_err("origin request must fail");
+        assert!(format!("{origin_error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            installed_events_rx.recv(),
+        )
+        .await
+        .expect("installed SSE fatal event timed out")
+        .expect("installed SSE sender dropped before terminal event")
+        {
+            super::super::sse::GenerationEvent::Error(message) => {
+                assert!(message.contains(ENGINE_UNHEALTHY_SENTINEL));
+            }
+            other => panic!("installed SSE expected Error, got {other:?}"),
+        }
+        let buffered_error = tokio::time::timeout(std::time::Duration::from_secs(2), buffered_rx)
+            .await
+            .expect("buffered fatal reply timed out")
+            .expect("buffered reply sender dropped")
+            .expect_err("buffered request must fail");
+        assert!(format!("{buffered_error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+
+        assert!(tx.is_closed(), "receiver must close before the first reply");
+        let (fresh_tx, _fresh_rx) = oneshot::channel();
+        assert!(matches!(
+            tx.try_send(Request::Warmup { reply: fresh_tx }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        permit.send(Request::Warmup { reply: late_tx });
+        drop(tx);
+        let late_error = tokio::time::timeout(std::time::Duration::from_secs(2), late_rx)
+            .await
+            .expect("pre-close permit reply timed out")
+            .expect("pre-close permit sender dropped")
+            .expect_err("pre-close permit request must fail");
+        assert!(format!("{late_error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        worker.join().expect("shared fail-stop worker joins");
+        assert!(
+            installed_events_rx.recv().await.is_none(),
+            "shared fail-stop must not emit Done after the SSE Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_fifo_fail_stop_closes_before_reply_and_drains_preclose_permit() {
+        let (tx, rx) = mpsc::channel::<Request>(2);
+        let permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("reserve capacity before receiver close");
+        let (origin_events, mut origin_events_rx) = mpsc::channel(2);
+        let (buffered_tx, buffered_rx) = oneshot::channel();
+        let (late_tx, late_rx) = oneshot::channel();
+        tx.try_send(Request::Warmup { reply: buffered_tx })
+            .expect("queue buffered request before fatal");
+
+        let worker = std::thread::spawn(move || {
+            let supervisor = EngineSupervisor::new();
+            let mut rx = rx;
+            let mut scheduler = WorkerScheduler::Fifo(FifoSchedulerAdapter::new(2));
+            let handle = scheduler
+                .admit(request(8, 1))
+                .expect("admit serial fatal origin")
+                .handle
+                .expect("serial origin handle");
+            let stats = Arc::new(Mutex::new(scheduler.stats()));
+            fail_stop_serial_fifo_worker(
+                "synthetic-family",
+                &supervisor,
+                &mut rx,
+                &mut scheduler,
+                &stats,
+                Some(handle),
+                SlotAwareFatalReply::Slot(SlotReply::Stream {
+                    events: origin_events,
+                    cancel: None,
+                    admission: None,
+                    router: None,
+                }),
+                anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+                    "Caused GPU Timeout Error".into(),
+                )),
+            );
+            assert_eq!(scheduler.stats().in_flight_slots, 0);
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_secs(2), origin_events_rx.recv())
+            .await
+            .expect("serial fatal SSE timed out")
+            .expect("serial fatal SSE sender dropped")
+        {
+            super::super::sse::GenerationEvent::Error(message) => {
+                assert!(message.contains(ENGINE_UNHEALTHY_SENTINEL));
+                assert!(message.contains("SerialFifo"));
+            }
+            other => panic!("serial fatal SSE expected Error, got {other:?}"),
+        }
+        assert!(tx.is_closed(), "SerialFifo receiver must close first");
+        let buffered_error = tokio::time::timeout(std::time::Duration::from_secs(2), buffered_rx)
+            .await
+            .expect("buffered serial reply timed out")
+            .expect("buffered serial reply sender dropped")
+            .expect_err("buffered serial request must fail");
+        assert!(format!("{buffered_error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        let (fresh_tx, _fresh_rx) = oneshot::channel();
+        assert!(matches!(
+            tx.try_send(Request::Warmup { reply: fresh_tx }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+
+        permit.send(Request::Warmup { reply: late_tx });
+        drop(tx);
+        let late_error = tokio::time::timeout(std::time::Duration::from_secs(2), late_rx)
+            .await
+            .expect("pre-close serial permit timed out")
+            .expect("pre-close serial reply sender dropped")
+            .expect_err("pre-close serial request must fail");
+        assert!(format!("{late_error:#}").contains(ENGINE_UNHEALTHY_SENTINEL));
+        worker.join().expect("serial fail-stop worker joins");
+        assert!(
+            origin_events_rx.recv().await.is_none(),
+            "SerialFifo must not emit Done after fatal Error"
+        );
+    }
+
+    #[test]
+    fn slotaware_control_requests_all_receive_one_typed_reply() {
+        let (tx, rx) = oneshot::channel();
+        reject_slotaware_control_request(
+            "synthetic-family",
+            Request::KvSnapshot {
+                layer_rank: 0,
+                range: 0..1,
+                reply: tx,
+            },
+        );
+        assert_control_error(rx, "kv_snapshot");
+
+        let (tx, rx) = oneshot::channel();
+        reject_slotaware_control_request(
+            "synthetic-family",
+            Request::KvRestore {
+                layer_rank: 0,
+                range: 0..1,
+                k_payload: Vec::new(),
+                v_payload: Vec::new(),
+                write_pos: 0,
+                reply: tx,
+            },
+        );
+        assert_control_error(rx, "kv_restore");
+
+        let bits = crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord::new(4)
+            .expect("valid test bit width");
+        let (tx, rx) = oneshot::channel();
+        reject_slotaware_control_request(
+            "synthetic-family",
+            Request::TqPackedKvSnapshot {
+                layer_rank: 0,
+                range: 0..1,
+                bits_per_coord: bits,
+                flags: 0,
+                scale: 1.0,
+                reply: tx,
+            },
+        );
+        assert_control_error(rx, "tq_packed_kv_snapshot");
+
+        let (tx, rx) = oneshot::channel();
+        reject_slotaware_control_request(
+            "synthetic-family",
+            Request::TqPackedKvRestore {
+                layer_rank: 0,
+                range: 0..1,
+                bits_per_coord: bits,
+                k_payload: Vec::new(),
+                v_payload: Vec::new(),
+                reply: tx,
+            },
+        );
+        assert_control_error(rx, "tq_packed_kv_restore");
+
+        let (tx, rx) = oneshot::channel();
+        reject_slotaware_control_request(
+            "synthetic-family",
+            Request::PromptCacheSnapshot { reply: tx },
+        );
+        assert_control_error(rx, "prompt_cache_snapshot");
+
+        let (tx, rx) = oneshot::channel();
+        reject_slotaware_control_request(
+            "synthetic-family",
+            Request::PromptCacheRestore {
+                payload: Vec::new(),
+                reply: tx,
+            },
+        );
+        assert_control_error(rx, "prompt_cache_restore");
+    }
+}
+
 #[cfg(test)]
 mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
     use super::*;
@@ -44033,30 +49921,41 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
     #[test]
     fn qwen35_startup_warmup_primes_gpu_for_serial_and_slot_aware() {
         let src = include_str!("engine.rs");
-        let helper_start = src
-            .find("fn warmup_qwen35_once(")
-            .expect("Qwen35 warmup helper must exist");
-        let helper_end = helper_start
-            + src[helper_start..]
-                .find("\n}\n")
-                .expect("Qwen35 warmup helper must have a body");
-        let helper = &src[helper_start..helper_end];
+        let function = |signature: &str| {
+            let start = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("production function `{signature}` must exist"));
+            let tail = &src[start..];
+            let end = tail[signature.len()..]
+                .find("\nfn ")
+                .map_or(tail.len(), |offset| signature.len() + offset);
+            &tail[..end]
+        };
+        let helper = function("fn warmup_qwen35_once(");
+        let serial_worker = function("fn worker_run(");
+        let slot_worker = function("fn run_slot_aware_qwen35(");
 
         assert!(
             helper.contains(".ensure_gpu_cache_primed()"),
             "Qwen35 startup warmup must eagerly prime GPU weights and pipelines"
         );
         assert!(
-            src.contains("LoadedModel::Qwen35(q) => warmup_qwen35_once(q)"),
+            helper.contains("supervised_gpu_call(supervisor"),
+            "Qwen35 warmup must arm the worker transaction supervisor"
+        );
+        assert!(
+            serial_worker.contains("LoadedModel::Qwen35(q) => warmup_qwen35_once(q, &supervisor)"),
             "SerialFifo Qwen35 Warmup must call the family warmup helper"
         );
         assert!(
-            src.contains("reply.send(warmup_qwen35_once(guard.model))"),
-            "SlotAware Qwen35 Warmup must call the same family helper"
+            slot_worker.contains(
+                "let result = warmup_qwen35_once(guard.model, &supervisor)"
+            ),
+            "SlotAware Qwen35 Warmup must call the same family helper before typed fatal classification"
         );
         let obsolete_serial_noop = ["LoadedModel::Qwen35", "(_) => Ok(())"].concat();
         assert!(
-            !src.contains(&obsolete_serial_noop),
+            !serial_worker.contains(&obsolete_serial_noop),
             "the obsolete SerialFifo Qwen35 warmup no-op must not return"
         );
     }

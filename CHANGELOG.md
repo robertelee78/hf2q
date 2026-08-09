@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-08-09
+
+### Fixed — bounded multi-agent prefill and Metal command-buffer lifetime
+
+- Advance Qwen 3.5/3.6 slot-aware prefill in bounded, scheduler-yielding
+  transactions. Active decoders run before each cold-prefill slice, cold
+  prefills rotate fairly, and cache/ledger state is published only after every
+  full-attention and MTP cursor agrees at a successful transaction boundary.
+- Bound inline Qwen embeddings to one admission quantum, and reject
+  soft-token/deepstack SlotAware requests explicitly until those multimodal
+  paths have scheduler-yielding prefill and decode. No multimodal field is
+  silently discarded into the plain-text graph.
+- Treat Metal command-buffer timeouts and ignored submissions as
+  SlotAware-worker-fatal for Qwen, Gemma, and DeepSeek. Active, detached, and
+  queued requests terminate once, readiness fails closed, and the poisoned
+  device generation receives no further GPU submissions or cache resets.
+- Supervise individual Metal transactions from outside the model worker.
+  A transaction that never returns poisons readiness, unblocks unary/SSE
+  waiters, and requires process restart; slow SSE consumers are cancelled
+  locally rather than backpressuring every slot. Fatal reply fanout is
+  nonblocking even when a stream channel is already full.
+- Preserve Qwen worker failures at the OpenAI boundary: invalid request shapes
+  are rejected before Qwen LM scheduler/SSE admission and before Qwen LM
+  generation, unsupported SlotAware capabilities
+  return 501, queue/physical-budget pressure returns 429, and an unhealthy
+  engine returns 503 instead of collapsing these cases into a generic 500.
+- End Qwen's final encoder-session stage without opening an unused replacement
+  command buffer. The companion `mlx-native` correction scopes Objective-C
+  autoreleases at command-buffer, compute-encoder, and label-string seams.
+  hf2q now resolves the published, checksum-pinned `mlx-native 0.10.6`; no
+  local Cargo patch participates in the candidate.
+- Graduate the validated Qwen3.6 autoregressive route to the default product
+  surface. The canonical launcher no longer sets the investigation-only
+  `HF2Q_QWEN36_AUTOREG` gate; unsafe chunk-scan remains a separate experiment.
+- Add deterministic scheduling, cancellation, fatal-fanout, readiness,
+  cross-layer cache-cursor, and 87,972-token/347-tool watchdog regressions.
+- Advance long Gemma text prefills in bounded 4,096-token transactions, split
+  exactly at the stable-prefix boundary, validate and publish every configured
+  physical cache cursor only after a successful transaction, and run decode
+  before prefill in `Mixed`. Cross-slot batches validate every lane before
+  admission and share one 4,096-row aggregate transaction cap instead of
+  multiplying that cap by the slot count. Long soft-token requests remain
+  fail-closed until their own resumable path is proven.
+- Route meaningful DeepSeek retained-prefix suffixes through the existing
+  atomic resumable-prefill machinery. During a lopsided cold cohort, one
+  decode token runs before each remaining prefill transaction; a terminal
+  response stays parked until the cold-prefill barrier lifts, preserving the
+  retained cache for its continuation. Cancellation and ordinary failure now
+  reconcile the cohort back to an admissible phase instead of stranding an
+  idle worker.
+
 ## [0.1.3] — 2026-08-08
 
 ### Fixed — registry verification and Eagle3 ordering
@@ -323,6 +374,9 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/robertelee78/hf2q/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/robertelee78/hf2q/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/robertelee78/hf2q/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/robertelee78/hf2q/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/robertelee78/hf2q/releases/tag/v0.1.0

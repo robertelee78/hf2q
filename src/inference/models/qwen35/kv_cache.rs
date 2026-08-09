@@ -1472,6 +1472,61 @@ impl HybridKvCache {
         crate::serve::multi_seq_kv::MultiSeqKvCache::seq_len(self, slot)
     }
 
+    /// Verify that every full-attention layer (and the optional MTP layer)
+    /// has committed the same request-local cursor before the serving driver
+    /// publishes a resumable prefill boundary.
+    ///
+    /// `sequence_len_for_slot` intentionally remains a cheap canonical read
+    /// for metrics. Scheduler transaction boundaries need a release-mode
+    /// check: a command-buffer or restore defect must not let layer 0 advance
+    /// the public token ledger while another layer remains behind.
+    pub(crate) fn validate_sequence_len_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        expected: usize,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "validate_sequence_len_for_slot: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        let expected = u32::try_from(expected)
+            .context("validate_sequence_len_for_slot: expected cursor exceeds u32")?;
+        anyhow::ensure!(
+            !self.full_attn.is_empty(),
+            "validate_sequence_len_for_slot: Qwen cache has no full-attention layers"
+        );
+        for (layer_idx, full) in self.full_attn.iter().enumerate() {
+            let actual = full.current_len.get(slot_idx).copied().ok_or_else(|| {
+                anyhow!(
+                    "validate_sequence_len_for_slot: full_attn[{layer_idx}] cursor missing for slot {}",
+                    slot.0
+                )
+            })?;
+            anyhow::ensure!(
+                actual == expected,
+                "validate_sequence_len_for_slot: full_attn[{layer_idx}] cursor={actual} != expected={expected} for slot {}",
+                slot.0
+            );
+        }
+        if let Some(mtp) = self.mtp_slot.as_ref() {
+            let actual = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                anyhow!(
+                    "validate_sequence_len_for_slot: MTP cursor missing for slot {}",
+                    slot.0
+                )
+            })?;
+            anyhow::ensure!(
+                actual == expected,
+                "validate_sequence_len_for_slot: MTP cursor={actual} != expected={expected} for slot {}",
+                slot.0
+            );
+        }
+        Ok(())
+    }
+
     /// Capture the prompt boundary for one physical agent slot without
     /// duplicating its append-only full-attention K/V rows.
     pub(crate) fn snapshot_slot_anchor(
@@ -1509,12 +1564,18 @@ impl HybridKvCache {
             .mtp_slot
             .as_ref()
             .map(|mtp| {
-                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                let cursor = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
                     anyhow!(
                         "snapshot_slot_anchor: MTP cursor missing for slot {}",
                         slot.0
                     )
-                })
+                })?;
+                anyhow::ensure!(
+                    cursor as usize == prompt_len,
+                    "snapshot_slot_anchor: MTP cursor={cursor} != prompt_len={prompt_len} for slot {}",
+                    slot.0
+                );
+                Ok(cursor)
             })
             .transpose()?;
 
@@ -9535,6 +9596,41 @@ mod tests {
             cache.seq_len(SlotId(1)).expect("seq_len 1 in range"),
             canonical
         );
+    }
+
+    #[test]
+    fn qwen35_release_boundary_validation_rejects_later_layer_and_mtp_desync() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        cfg.mtp_num_hidden_layers = 1;
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let slot = SlotId(1);
+        cache.append_for_seq(slot, 5).expect("seed cursors");
+        cache
+            .validate_sequence_len_for_slot(slot, 5)
+            .expect("homogeneous boundary");
+
+        assert!(cache.full_attn.len() >= 2, "fixture needs a later layer");
+        cache.full_attn[1].current_len[1] = 4;
+        let layer_error = cache
+            .validate_sequence_len_for_slot(slot, 5)
+            .expect_err("later full-attention cursor desync must fail closed");
+        assert!(format!("{layer_error:#}").contains("full_attn[1] cursor=4"));
+        cache.full_attn[1].current_len[1] = 5;
+
+        let mtp = cache.mtp_slot.as_mut().expect("fixture has MTP slot");
+        mtp.current_len[1] = 3;
+        let mtp_error = cache
+            .validate_sequence_len_for_slot(slot, 5)
+            .expect_err("MTP cursor desync must fail closed");
+        assert!(format!("{mtp_error:#}").contains("MTP cursor=3"));
+
+        let anchor_error = match cache.snapshot_slot_anchor(slot, 5) {
+            Ok(_) => panic!("prompt anchor must reject an MTP cursor desync independently"),
+            Err(error) => error,
+        };
+        assert!(format!("{anchor_error:#}").contains("MTP cursor=3"));
     }
 
     /// Pin: drop resets ONLY the target slot's cursor (across all

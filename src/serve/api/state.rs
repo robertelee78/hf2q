@@ -951,7 +951,17 @@ impl AppState {
     }
 
     pub fn is_ready_for_gen(&self) -> bool {
-        self.ready_for_gen.load(Ordering::Acquire)
+        if !self.ready_for_gen.load(Ordering::Acquire) {
+            return false;
+        }
+        self.pool
+            .try_read()
+            .map(|pool| {
+                pool.snapshot_engines()
+                    .into_iter()
+                    .all(|loaded| loaded.engine.is_worker_healthy())
+            })
+            .unwrap_or(false)
     }
 
     /// Allocate the next request counter value.
@@ -994,6 +1004,16 @@ mod tests {
         assert!(!state.is_ready_for_gen());
         state.mark_ready_for_gen();
         assert!(state.is_ready_for_gen());
+    }
+
+    #[test]
+    fn readiness_fails_fast_while_model_pool_is_write_locked() {
+        let state = AppState::new(ServerConfig::default());
+        let _pool_write = state.pool.write().expect("lock synthetic model pool");
+        assert!(
+            !state.is_ready_for_gen(),
+            "pool mutation must report not-ready instead of blocking readiness"
+        );
     }
 
     #[test]

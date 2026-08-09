@@ -10,11 +10,11 @@ mod sampling;
 mod slots;
 mod stream;
 
-pub use sampling::generate_once;
+pub(super) use sampling::generate_once;
 pub(super) use slots::{
     Deepseek4PrefillAdvance, Deepseek4PrefillState, Deepseek4SlotCompletion, Deepseek4SlotState,
 };
-pub use stream::generate_stream;
+pub(super) use stream::generate_stream;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ use crate::serve::load_info::{
 
 use self::progress::RequestProgress;
 use super::engine::LoadOptions;
+use super::engine_supervisor::EngineSupervisor;
 
 /// First practical OpenCode target: enough headroom for the ~100K-token
 /// sessions already used by the repository's Qwen serving harness. Operators
@@ -46,6 +47,7 @@ const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
 const MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS: usize = 32;
 const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
+const GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Preserve a modest hot decode arena across successful agent turns, but do
 /// not leave a multi-gigabyte working set idle beside a 100 GiB model.
 const MAX_RETAINED_DECODE_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
@@ -99,6 +101,24 @@ struct Deepseek4ResumablePrefill {
     cursor: usize,
     recovery_position: usize,
     window_multiplier: usize,
+    cached_tokens: usize,
+    origin: Deepseek4PrefillOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4PrefillOrigin {
+    Cold,
+    Cached,
+}
+
+impl Deepseek4ResumablePrefill {
+    fn initial_cached_tokens(&self) -> usize {
+        self.cached_tokens
+    }
+
+    fn is_cold_wave(&self) -> bool {
+        self.origin == Deepseek4PrefillOrigin::Cold
+    }
 }
 
 enum Deepseek4ResumablePrefillAdvance {
@@ -236,7 +256,17 @@ impl Deepseek4Session {
                     && prompt_tokens.starts_with(&self.turn_anchor_tokens)
             })
             .map_or(0, |_| self.turn_anchor_tokens.len());
-        live.max(recovery)
+        let selected = if live >= recovery && live > 0 {
+            PrefixReuse::Live(live)
+        } else if recovery > 0 {
+            PrefixReuse::RecoveryAnchor(recovery)
+        } else {
+            PrefixReuse::Reset
+        };
+        match prefer_matrix_prefill(prompt_tokens.len(), selected) {
+            PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor(count) => count,
+            PrefixReuse::Reset => 0,
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -267,6 +297,30 @@ impl Deepseek4Session {
 }
 
 impl Deepseek4LoadedModel {
+    fn supervised_verifier_prefill(
+        &mut self,
+        token_ids: &[u32],
+        supervisor: &EngineSupervisor,
+        kind: &'static str,
+    ) -> Result<MlxBuffer> {
+        let lease = supervisor.arm(kind, GPU_TRANSACTION_TIMEOUT)?;
+        self.model
+            .forward_verifier_prefill_with_commit_gate(token_ids, &mut self.cache, || {
+                lease.finish()
+            })
+    }
+
+    fn supervised_verifier_one(
+        &mut self,
+        token_id: u32,
+        supervisor: &EngineSupervisor,
+        kind: &'static str,
+    ) -> Result<MlxBuffer> {
+        let lease = supervisor.arm(kind, GPU_TRANSACTION_TIMEOUT)?;
+        self.model
+            .forward_verifier_one_with_commit_gate(token_id, &mut self.cache, || lease.finish())
+    }
+
     pub fn load(opts: &LoadOptions) -> Result<Self> {
         let started = Instant::now();
         let gguf = GgufFile::open(&opts.model_path)
@@ -296,7 +350,7 @@ impl Deepseek4LoadedModel {
         let eos = gguf
             .metadata_u32("tokenizer.ggml.eos_token_id")
             .unwrap_or(1);
-        let mut model =
+        let model =
             Deepseek4Model::load_from_gguf(&gguf).context("load native DeepSeek-V4 model")?;
         tracing::info!(
             logical_weight_bytes = model.weights.resident_bytes(),
@@ -322,7 +376,7 @@ impl Deepseek4LoadedModel {
             model.cfg.sliding_window
         );
         let initial_cache_length = context_length.min(INITIAL_CACHE_LENGTH);
-        let mut cache = model
+        let cache = model
             .allocate_cache(initial_cache_length)
             .with_context(|| {
                 format!("allocate initial {initial_cache_length}-token DeepSeek-V4 cache")
@@ -332,28 +386,6 @@ impl Deepseek4LoadedModel {
             allocated_cache_context = initial_cache_length,
             "DeepSeek-V4 cache admitted with demand-grown capacity"
         );
-
-        // Metal pipeline creation and the first page-in of the 43 verifier
-        // layers otherwise happen after the server has announced readiness,
-        // adding several silent seconds to the first OpenCode turn. Exercise
-        // an aligned matrix prefill and the output head before becoming ready,
-        // then discard every byte of logical conversation state.
-        if std::env::var("HF2Q_DEEPSEEK_SKIP_WARMUP").as_deref() != Ok("1") {
-            let warm_tokens = vec![eos; 64];
-            let warm_state = model
-                .forward_verifier_prefill(&warm_tokens, &mut cache)
-                .context("warm DeepSeek-V4 matrix prefill")?;
-            let warm_last = model
-                .last_token_state(&warm_state)
-                .context("view DeepSeek-V4 warmup state")?;
-            model
-                .forward_logits(&warm_last)
-                .context("warm DeepSeek-V4 output head")?;
-            cache
-                .reset()
-                .context("reset DeepSeek-V4 cache after warmup")?;
-            log_scratch("release", "startup-warmup", release_prefill_scratch());
-        }
 
         Ok(Self {
             model,
@@ -374,6 +406,35 @@ impl Deepseek4LoadedModel {
             turn_anchor_tokens: Vec::new(),
             slot_sessions: None,
         })
+    }
+
+    /// Exercise the verifier and output head only after the worker supervisor
+    /// exists. Loading used to submit these Metal transactions before any
+    /// readiness poison/timeout authority was available, so a startup wedge
+    /// could leave the server permanently warming with no bounded failure.
+    pub(super) fn warmup(&mut self, supervisor: &EngineSupervisor) -> Result<()> {
+        if std::env::var("HF2Q_DEEPSEEK_SKIP_WARMUP").as_deref() == Ok("1") {
+            return Ok(());
+        }
+        let eos = self.eos_token_ids.first().copied().unwrap_or(1);
+        let warm_tokens = vec![eos; 64];
+        let warm_state = self
+            .supervised_verifier_prefill(&warm_tokens, supervisor, "deepseek4_warmup_prefill")
+            .context("warm DeepSeek-V4 matrix prefill")?;
+        let warm_last = self
+            .model
+            .last_token_state(&warm_state)
+            .context("view DeepSeek-V4 warmup state")?;
+        supervisor.run("deepseek4_warmup_head", GPU_TRANSACTION_TIMEOUT, || {
+            self.model
+                .forward_logits(&warm_last)
+                .context("warm DeepSeek-V4 output head")
+        })?;
+        self.cache
+            .reset()
+            .context("reset DeepSeek-V4 cache after warmup")?;
+        log_scratch("release", "startup-warmup", release_prefill_scratch());
+        Ok(())
     }
 
     pub(super) fn provision_slot_sessions(&mut self, max_slots: u32) -> Result<()> {
@@ -532,15 +593,107 @@ impl Deepseek4LoadedModel {
             cursor: 0,
             recovery_position: prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS),
             window_multiplier,
+            cached_tokens: 0,
+            origin: Deepseek4PrefillOrigin::Cold,
         })
     }
 
-    fn advance_resumable_cold_prefill(
+    fn begin_resumable_cached_prefill(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        progress: &mut RequestProgress,
+    ) -> Result<Deepseek4ResumablePrefill> {
+        anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
+        anyhow::ensure!(
+            prompt_tokens.len() <= self.context_limit(),
+            "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
+            prompt_tokens.len(),
+            self.context_limit()
+        );
+        let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
+        let cache_poisoned = self.cache.is_poisoned();
+        let live_position = self.cache.position();
+        let selectable_live_position = if cache_poisoned {
+            usize::MAX
+        } else {
+            live_position
+        };
+        let anchor_position = self
+            .turn_anchor
+            .as_ref()
+            .map_or(0, Deepseek4CacheSnapshot::position);
+        let selected_reuse = select_prefix_reuse(
+            prompt_tokens,
+            &self.committed_tokens,
+            selectable_live_position,
+            &self.turn_anchor_tokens,
+            anchor_position,
+        );
+        let reuse = prefer_matrix_prefill(prompt_tokens.len(), selected_reuse);
+        let (cached_tokens, cache_action) = match reuse {
+            PrefixReuse::Live(count) => (count, if cache_grew { "grow-live" } else { "live" }),
+            PrefixReuse::RecoveryAnchor(count) => {
+                let snapshot = self
+                    .turn_anchor
+                    .as_ref()
+                    .context("DeepSeek-V4 turn anchor disappeared before cached resume")?;
+                self.cache
+                    .restore(snapshot)
+                    .context("restore DeepSeek-V4 prompt-boundary cache for cached resume")?;
+                self.committed_tokens.clone_from(&self.turn_anchor_tokens);
+                (
+                    count,
+                    if cache_grew {
+                        "grow-recovery-anchor"
+                    } else {
+                        "recovery-anchor"
+                    },
+                )
+            }
+            PrefixReuse::Reset => anyhow::bail!(
+                "DeepSeek-V4 cached resumable prefill lost its effective reusable prefix"
+            ),
+        };
+        anyhow::ensure!(
+            cached_tokens > 0 && cached_tokens < prompt_tokens.len(),
+            "DeepSeek-V4 cached resumable prefill requires a nonempty suffix (cached={}, prompt={})",
+            cached_tokens,
+            prompt_tokens.len()
+        );
+        anyhow::ensure!(
+            self.cache.position() == cached_tokens
+                && self.committed_tokens.len() == cached_tokens
+                && prompt_tokens.starts_with(&self.committed_tokens),
+            "DeepSeek-V4 cached resume cursor {} disagrees with cache {} / token ledger {}",
+            cached_tokens,
+            self.cache.position(),
+            self.committed_tokens.len()
+        );
+        self.live_logits = None;
+        progress.plan_prefill(
+            cached_tokens,
+            prompt_tokens.len().saturating_sub(cached_tokens),
+            cache_action,
+        );
+        let window_multiplier =
+            self.prefill_window_multiplier(prompt_tokens.len().saturating_sub(cached_tokens))?;
+        Ok(Deepseek4ResumablePrefill {
+            cursor: cached_tokens,
+            recovery_position: prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS),
+            window_multiplier,
+            cached_tokens,
+            origin: Deepseek4PrefillOrigin::Cached,
+        })
+    }
+
+    fn advance_resumable_prefill(
         &mut self,
         prompt_tokens: &[u32],
         plan: &mut Deepseek4ResumablePrefill,
         cancelled: &impl Fn() -> bool,
         progress: &mut RequestProgress,
+        supervisor: &EngineSupervisor,
     ) -> Result<Deepseek4ResumablePrefillAdvance> {
         anyhow::ensure!(
             self.cache.position() == plan.cursor && self.committed_tokens.len() == plan.cursor,
@@ -591,8 +744,7 @@ impl Deepseek4LoadedModel {
                     "DeepSeek-V4 generation cancelled during recovery-tail prefill"
                 );
                 state = Some(
-                    self.model
-                        .forward_verifier_one(token, &mut self.cache)
+                    self.supervised_verifier_one(token, supervisor, "deepseek4_recovery_prefill")
                         .context("execute DeepSeek-V4 resumable recovery-tail token")?,
                 );
                 self.committed_tokens.push(token);
@@ -610,7 +762,8 @@ impl Deepseek4LoadedModel {
                     advanced_tokens: remaining,
                 });
             }
-            let (logits, cached_tokens) = self.finish_prefill(state, 0)?;
+            let (logits, cached_tokens) =
+                self.finish_prefill(state, plan.cached_tokens, supervisor)?;
             return Ok(Deepseek4ResumablePrefillAdvance::Ready {
                 logits,
                 cached_tokens,
@@ -619,8 +772,11 @@ impl Deepseek4LoadedModel {
         }
         let end = plan.cursor.saturating_add(batch);
         let state = self
-            .model
-            .forward_verifier_prefill(&prompt_tokens[plan.cursor..end], &mut self.cache)
+            .supervised_verifier_prefill(
+                &prompt_tokens[plan.cursor..end],
+                supervisor,
+                "deepseek4_matrix_prefill",
+            )
             .context("execute DeepSeek-V4 resumable matrix prefill chunk")?;
         self.committed_tokens
             .extend_from_slice(&prompt_tokens[plan.cursor..end]);
@@ -640,7 +796,7 @@ impl Deepseek4LoadedModel {
                 advanced_tokens: batch,
             });
         }
-        let (logits, cached_tokens) = self.finish_prefill(state, 0)?;
+        let (logits, cached_tokens) = self.finish_prefill(state, plan.cached_tokens, supervisor)?;
         Ok(Deepseek4ResumablePrefillAdvance::Ready {
             logits,
             cached_tokens,
@@ -653,6 +809,7 @@ impl Deepseek4LoadedModel {
         tokens: &[u32],
         cancelled: &impl Fn() -> bool,
         progress: &mut RequestProgress,
+        supervisor: &EngineSupervisor,
     ) -> Result<Option<MlxBuffer>> {
         if tokens.is_empty() {
             return Ok(None);
@@ -675,9 +832,12 @@ impl Deepseek4LoadedModel {
                 "DeepSeek-V4 generation cancelled during prefill"
             );
             state = Some(
-                self.model
-                    .forward_verifier_prefill(&tokens[offset..offset + batch], &mut self.cache)
-                    .context("execute DeepSeek-V4 matrix prefill chunk")?,
+                self.supervised_verifier_prefill(
+                    &tokens[offset..offset + batch],
+                    supervisor,
+                    "deepseek4_matrix_prefill",
+                )
+                .context("execute DeepSeek-V4 matrix prefill chunk")?,
             );
             self.committed_tokens
                 .extend_from_slice(&tokens[offset..offset + batch]);
@@ -690,8 +850,7 @@ impl Deepseek4LoadedModel {
                 "DeepSeek-V4 generation cancelled during prefill"
             );
             state = Some(
-                self.model
-                    .forward_verifier_one(token, &mut self.cache)
+                self.supervised_verifier_one(token, supervisor, "deepseek4_tail_prefill")
                     .context("execute DeepSeek-V4 cached-prefix append token")?,
             );
             self.committed_tokens.push(token);
@@ -706,6 +865,7 @@ impl Deepseek4LoadedModel {
         max_tokens: usize,
         cancelled: impl Fn() -> bool,
         progress: &mut RequestProgress,
+        supervisor: &EngineSupervisor,
     ) -> Result<(MlxBuffer, usize)> {
         anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
         anyhow::ensure!(
@@ -799,7 +959,12 @@ impl Deepseek4LoadedModel {
         // Short position-zero prompts must execute as one verifier batch.
         // Build their small recovery checkpoint in a separate prepass.
         if short_recovery_prepass {
-            self.append_prompt_tokens(&prompt_tokens[..recovery_position], &cancelled, progress)?;
+            self.append_prompt_tokens(
+                &prompt_tokens[..recovery_position],
+                &cancelled,
+                progress,
+                supervisor,
+            )?;
             self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
             self.cache
                 .reset()
@@ -808,9 +973,9 @@ impl Deepseek4LoadedModel {
             self.live_logits = None;
 
             let final_state = self
-                .append_prompt_tokens(prompt_tokens, &cancelled, progress)?
+                .append_prompt_tokens(prompt_tokens, &cancelled, progress, supervisor)?
                 .context("DeepSeek-V4 prompt produced no verifier state")?;
-            return self.finish_prefill(final_state, 0);
+            return self.finish_prefill(final_state, 0, supervisor);
         }
 
         let mut cursor = cached_tokens;
@@ -820,16 +985,18 @@ impl Deepseek4LoadedModel {
                 &prompt_tokens[cursor..recovery_position],
                 &cancelled,
                 progress,
+                supervisor,
             )?;
             cursor = recovery_position;
             self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
         }
         final_state = self
-            .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled, progress)?
+            .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled, progress, supervisor)?
             .or(final_state);
         self.finish_prefill(
             final_state.context("DeepSeek-V4 suffix produced no verifier state")?,
             cached_tokens,
+            supervisor,
         )
     }
 
@@ -837,34 +1004,38 @@ impl Deepseek4LoadedModel {
         &mut self,
         state: MlxBuffer,
         cached_tokens: usize,
+        supervisor: &EngineSupervisor,
     ) -> Result<(MlxBuffer, usize)> {
         let last = self
             .model
             .last_token_state(&state)
             .context("view DeepSeek-V4 last prompt state")?;
-        let logits = self
-            .model
-            .forward_logits(&last)
-            .context("execute DeepSeek-V4 prompt output head")?;
+        let logits = supervisor.run("deepseek4_prefill_head", GPU_TRANSACTION_TIMEOUT, || {
+            self.model
+                .forward_logits(&last)
+                .context("execute DeepSeek-V4 prompt output head")
+        })?;
         self.live_logits = Some(logits.clone());
         Ok((logits, cached_tokens))
     }
 
-    fn commit_generated_token(&mut self, token: u32) -> Result<MlxBuffer> {
+    fn commit_generated_token(
+        &mut self,
+        token: u32,
+        supervisor: &EngineSupervisor,
+    ) -> Result<MlxBuffer> {
+        let cache_position = self.cache.position();
         let state = self
-            .model
-            .forward_verifier_one(token, &mut self.cache)
+            .supervised_verifier_one(token, supervisor, "deepseek4_decode_verifier")
             .with_context(|| {
-                format!(
-                    "execute DeepSeek-V4 decode token at cache position {}",
-                    self.cache.position()
-                )
+                format!("execute DeepSeek-V4 decode token at cache position {cache_position}")
             })?;
         self.committed_tokens.push(token);
-        let logits = self
-            .model
-            .forward_logits(&state)
-            .context("execute DeepSeek-V4 decode output head")?;
+        let logits = supervisor.run("deepseek4_decode_head", GPU_TRANSACTION_TIMEOUT, || {
+            self.model
+                .forward_logits(&state)
+                .context("execute DeepSeek-V4 decode output head")
+        })?;
         self.live_logits = Some(logits.clone());
         Ok(logits)
     }

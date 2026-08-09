@@ -4,7 +4,7 @@
 **Authored against commit:** `7c6c16005250ffb3ce993a9227d01456adf403b2`
 **ADR:** `docs/ADR-017-persistent-block-prefix-cache.md` (R-O1)
 
-> **⚠ 2026-08-03 addendum (supersedes qwen35-family claims below).**
+> **⚠ 2026-08-08 addendum (supersedes qwen35-family claims below).**
 > This runbook predates the qwen35/3.6 persist family. What it calls
 > `[NOT YET IMPLEMENTED]` items §11.9–10 ("Hybrid (Qwen 3.5) family",
 > "TQ-active codec family") **landed** (ADR-027 iters 1..54:
@@ -13,12 +13,16 @@
 > (2026-08-03)**: TQ-only LCP resume restores all four TQ buffers per
 > slot (was silent zero-prefix corruption), `cfg_from_cache` derives
 > shape from TQ buffers (was an engine panic → HTTP 500), QH35 codec is
-> at **v4** (per-MTP `kv_present` byte; shaped TQ deserialization), and
+> at **v5** (compact sequence-axis snapshots; readers retain v1--v4
+> compatibility), and
 > the on-disk fingerprint is **substrate-namespaced** (F32Only/TqOnly/
-> Both never cross-hydrate). Qwen-serve operator config that works
-> TODAY:
-> `HF2Q_QWEN36_AUTOREG=1 HF2Q_KV_LCP_RESUME=1 HF2Q_KV_PERSIST=<dir>
-> HF2Q_KV_PERSIST_BUDGET_BYTES=<n> hf2q serve --model <qwen3.6.gguf>
+> Both never cross-hydrate). Qwen autoregressive serve is now the default;
+> no `HF2Q_QWEN36_AUTOREG` activation is required. Disk restart hydration is
+> proven only for SerialFifo; the canonical SlotAware launcher provides
+> same-process retained-prefix affinity and does not enable this disk path.
+> Current SerialFifo operator shape:
+> `HF2Q_KV_LCP_RESUME=1 HF2Q_KV_PERSIST=<dir>
+> HF2Q_KV_PERSIST_BUDGET_BYTES=<n> hf2q serve --scheduler fifo_serial --model <qwen3.6.gguf>
 > --kv-persist <dir> --overflow-policy reject`
 > (note: the qwen35 disk persistor is bound from the `HF2Q_KV_PERSIST`
 > ENV var, while `--kv-persist` wires the hot-swap spiller substrate —

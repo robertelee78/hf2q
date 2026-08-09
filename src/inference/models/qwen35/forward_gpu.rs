@@ -77,6 +77,19 @@ use mlx_native::ops::argmax::dispatch_argmax_f32;
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
 
+/// Large Qwen prefills are intentionally drained at every layer boundary.
+/// K>1 is a decode/short-row throughput optimization; on a substantial
+/// prompt it widens the asynchronous error-observation window after a Metal
+/// watchdog fault. The outer serving scheduler separately caps prompt rows,
+/// while this graph-level guard protects every direct forward entry point.
+fn effective_ffn_terminal_k_batch(seq_len: u32, configured: usize) -> usize {
+    if seq_len > 32 {
+        1
+    } else {
+        configured.max(1)
+    }
+}
+
 // ================================================================
 // Debug dump helpers (HF2Q_DUMP_LAYER_N / HF2Q_DUMP_LAYER_ACTIVATIONS env gates)
 // ================================================================
@@ -774,10 +787,15 @@ impl OutputHeadEncoder {
         self.fused
     }
     fn commit_and_wait_labeled(&mut self, label: &str) -> Result<()> {
-        self.enc
-            .commit_and_wait_labeled(label)
-            .map_err(|e| anyhow!("commit {}: {}", label, e))
+        context_output_head_commit(self.enc.commit_and_wait_labeled(label), label)
     }
+}
+
+fn context_output_head_commit(
+    result: std::result::Result<(), mlx_native::MlxError>,
+    label: &str,
+) -> Result<()> {
+    result.with_context(|| format!("commit {label}"))
 }
 
 /// Encode the output-head pipeline (output_norm RMSNorm + Q4 lm_head
@@ -3020,11 +3038,13 @@ impl Qwen35Model {
         // `device.alloc_buffer` shape (decode never engages the
         // multi-layer race surface — each token is its own GPU sync).
         let encoder_session_enabled = LayerEncoder::env_enabled() && seq_len > 1;
-        let ffn_terminal_k_batch = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+        let configured_ffn_terminal_k_batch = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(8);
+        let ffn_terminal_k_batch =
+            effective_ffn_terminal_k_batch(seq_len, configured_ffn_terminal_k_batch);
 
         let mut dense_ffn_output_ring: Option<super::DenseFfnOutputRingBuffer> =
             if seq_len > 1 && cfg.intermediate_size.is_some() {
@@ -3093,13 +3113,13 @@ impl Qwen35Model {
         //   3. `build_delta_net_layer_with_arena`'s `layer_session`
         //      parameter (the DN stage_a helper).
         //
-        // The session is dropped at end of `forward_gpu_impl` AFTER the
-        // output-head terminal `commit_and_wait_labeled` drains the GPU
-        // and clears `fence_pending` (`encoder_session.rs::Drop` Case 1
-        // — clean release).  Dropping a Fenced session BEFORE the
-        // matching wait-event lands is the iter90b "14-minute Metal
-        // back-pressure hang" antipattern that this iter91 borrowed-
-        // session shape structurally avoids.
+        // The final transformer layer drains this session through
+        // `commit_and_wait_labeled_terminal`, without allocating a discarded
+        // next-stage CB. The output head owns a separate encoder under env=1,
+        // so it cannot drain or reuse the layer session. Dropping a Fenced
+        // session BEFORE the matching wait-event lands is the iter90b
+        // "14-minute Metal back-pressure hang" antipattern that this
+        // borrowed-session shape structurally avoids.
         //
         // env=0 (default): None.  Each per-layer LayerEncoder constructor
         // opens its own owned `CommandEncoder` (Plain variant) — byte-
@@ -4143,10 +4163,14 @@ impl Qwen35Model {
                                 last_layer_held_enc = Some(plain_enc);
                             } else {
                                 // K-boundary TERMINAL — drain the GPU.
-                                enc.commit_and_wait_labeled("layer.dense_ffn")
-                                    .with_context(|| {
-                                        format!("commit fused-DenseQ layer {layer_idx}")
-                                    })?;
+                                let commit = if (layer_idx + 1) == n_layers {
+                                    enc.commit_and_wait_labeled_terminal("layer.dense_ffn")
+                                } else {
+                                    enc.commit_and_wait_labeled("layer.dense_ffn")
+                                };
+                                commit.with_context(|| {
+                                    format!("commit fused-DenseQ layer {layer_idx}")
+                                })?;
                             }
                         } else {
                             // ADR-013 P20: K-batched FFN intra-K terminal —
@@ -4295,7 +4319,12 @@ impl Qwen35Model {
                                 });
                             last_layer_held_enc = Some(plain_enc);
                         } else {
-                            enc.commit_and_wait_labeled("layer.moe_ffn")
+                            let commit = if (layer_idx + 1) == n_layers {
+                                enc.commit_and_wait_labeled_terminal("layer.moe_ffn")
+                            } else {
+                                enc.commit_and_wait_labeled("layer.moe_ffn")
+                            };
+                            commit
                                 .with_context(|| format!("commit fused-MoeQ layer {layer_idx}"))?;
                         }
                     } else {
@@ -6435,6 +6464,33 @@ mod tests {
         default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
     };
     use mlx_native::MlxDevice;
+
+    #[test]
+    fn output_head_commit_context_preserves_typed_mlx_failure() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let error = context_output_head_commit(
+            Err(mlx_native::MlxError::CommandBufferError(
+                "Caused GPU Timeout Error".into(),
+            )),
+            "output_head.test",
+        )
+        .expect_err("injected output-head commit must fail");
+        assert!(format!("{error:#}").contains("commit output_head.test"));
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<mlx_native::MlxError>(),
+            Some(mlx_native::MlxError::CommandBufferError(_))
+        )));
+    }
+
+    #[test]
+    fn long_prefill_forces_single_layer_terminal_drains() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        assert_eq!(effective_ffn_terminal_k_batch(33, 8), 1);
+        assert_eq!(effective_ffn_terminal_k_batch(2_048, 8), 1);
+        assert_eq!(effective_ffn_terminal_k_batch(87_972, 8), 1);
+        assert_eq!(effective_ffn_terminal_k_batch(32, 8), 8);
+        assert_eq!(effective_ffn_terminal_k_batch(1, 8), 8);
+    }
 
     // ============================================================
     // ADR-015 iter30: per-quant-class chain_n default lookup table

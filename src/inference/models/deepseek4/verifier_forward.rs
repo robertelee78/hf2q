@@ -25,6 +25,60 @@ pub(crate) const MIN_MATRIX_APPEND_TOKENS: usize = 33;
 
 static STAGE_PROFILE_CAPTURED: AtomicBool = AtomicBool::new(false);
 
+pub(super) fn publish_state_after_gate<State>(
+    state: &mut State,
+    commit_gate: impl FnOnce() -> Result<()>,
+    publish: impl FnOnce(&mut State) -> Result<()>,
+    poison: impl FnOnce(&mut State),
+    rejection_context: &'static str,
+    publication_context: &'static str,
+) -> Result<()> {
+    if let Err(error) = commit_gate() {
+        poison(state);
+        return Err(error).context(rejection_context);
+    }
+    if let Err(error) = publish(state) {
+        poison(state);
+        return Err(error).context(publication_context);
+    }
+    Ok(())
+}
+
+fn publish_prefill_cache_after_gate(
+    cache: &mut Deepseek4Cache,
+    start_position: usize,
+    token_count: usize,
+    commit_gate: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    publish_state_after_gate(
+        cache,
+        commit_gate,
+        |cache| {
+            cache
+                .commit_prefill(start_position, token_count)
+                .map_err(Into::into)
+        },
+        Deepseek4Cache::poison,
+        "DeepSeek-V4 prompt prefill rejected before cache publication",
+        "publish complete DeepSeek-V4 prompt prefill",
+    )
+}
+
+fn publish_verifier_cache_after_gate(
+    cache: &mut Deepseek4Cache,
+    position: usize,
+    commit_gate: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    publish_state_after_gate(
+        cache,
+        commit_gate,
+        |cache| cache.commit_step(position).map_err(Into::into),
+        Deepseek4Cache::poison,
+        "DeepSeek-V4 verifier token rejected before cache publication",
+        "publish complete DeepSeek-V4 verifier token",
+    )
+}
+
 pub(crate) fn matrix_prefill_chunk_len(
     cache_position: usize,
     remaining: usize,
@@ -127,6 +181,19 @@ impl Deepseek4Model {
         token_ids: &[u32],
         cache: &mut Deepseek4Cache,
     ) -> Result<MlxBuffer> {
+        self.forward_verifier_prefill_with_commit_gate(token_ids, cache, || Ok(()))
+    }
+
+    /// Execute a bounded prompt transaction, but publish its logical cache
+    /// cursor only after the caller accepts the completed GPU transaction.
+    /// Serving uses this gate for the worker deadline lease; CLI and existing
+    /// inference callers retain the historical immediate-commit wrapper.
+    pub fn forward_verifier_prefill_with_commit_gate(
+        &mut self,
+        token_ids: &[u32],
+        cache: &mut Deepseek4Cache,
+        commit_gate: impl FnOnce() -> Result<()>,
+    ) -> Result<MlxBuffer> {
         let span = cache
             .plan_prefill(token_ids.len())
             .context("plan DeepSeek-V4 batched prefill transaction")?;
@@ -154,10 +221,12 @@ impl Deepseek4Model {
         }
         match result {
             Ok(state) => {
-                if let Err(error) = cache.commit_prefill(span.start_position, span.token_count) {
-                    cache.poison();
-                    return Err(error).context("publish complete DeepSeek-V4 prompt prefill");
-                }
+                publish_prefill_cache_after_gate(
+                    cache,
+                    span.start_position,
+                    span.token_count,
+                    commit_gate,
+                )?;
                 Ok(state)
             }
             Err(error) => {
@@ -484,14 +553,24 @@ impl Deepseek4Model {
         token_id: u32,
         cache: &mut Deepseek4Cache,
     ) -> Result<MlxBuffer> {
+        self.forward_verifier_one_with_commit_gate(token_id, cache, || Ok(()))
+    }
+
+    /// One-token verifier sibling of
+    /// [`Self::forward_verifier_prefill_with_commit_gate`]. The graph may
+    /// complete, but a late supervisor verdict poisons the cache without
+    /// advancing its logical cursor.
+    pub fn forward_verifier_one_with_commit_gate(
+        &mut self,
+        token_id: u32,
+        cache: &mut Deepseek4Cache,
+        commit_gate: impl FnOnce() -> Result<()>,
+    ) -> Result<MlxBuffer> {
         let position = cache.position();
         let result = self.forward_verifier_one_uncommitted(token_id, cache);
         match result {
             Ok(state) => {
-                if let Err(error) = cache.commit_step(position) {
-                    cache.poison();
-                    return Err(error).context("publish complete DeepSeek-V4 verifier token");
-                }
+                publish_verifier_cache_after_gate(cache, position, commit_gate)?;
                 Ok(state)
             }
             Err(error) => {
