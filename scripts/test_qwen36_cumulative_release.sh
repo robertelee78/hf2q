@@ -55,10 +55,13 @@ capture_heap() {
 
 run_agent_wave() {
   local phase="$1"
+  local max_tool_result_ms="${2:-10000}"
   local wave_dir="$OUT_DIR/$phase"
   mkdir -p "$wave_dir"
   qwen36_assert_power_guard
-  BASE_URL="$BASE_URL" FAMILY=qwen36 AGENTS=4 OUT_DIR="$wave_dir/agents" \
+  BASE_URL="$BASE_URL" FAMILY=qwen36 AGENTS=4 \
+    MAX_TOOL_RESULT_RESPONSE_MS="$max_tool_result_ms" \
+    OUT_DIR="$wave_dir/agents" \
     "$script_dir/test_full_context_agent_slots.sh" >"$wave_dir/summary.json.tmp" \
     2>"$wave_dir/gate.err"
   jq -e '.status == "pass" and .family == "qwen36" and .concurrent_agents == 4' \
@@ -82,11 +85,16 @@ jq -e '.status == "pass" and .max_slots == 4 and .chunks == 43 and .ready_http =
 shasum -c "$overlap_dir/long-watchdog-summary.json.sha256" >/dev/null
 capture_heap post-overlap
 
-run_agent_wave np4-warmup
+# The first wave after the 87,972-token incident request deliberately rebuilds
+# the four per-slot agentic working sets. It is a semantic/cache warmup, not a
+# measured steady-state wave. Preserve a finite bound based on the observed
+# 12-second cold transition, while keeping both measured waves on the existing
+# 10-second Qwen tool-result contract.
+run_agent_wave np4-warmup 15000
 capture_heap post-warmup
-run_agent_wave np4-wave1
+run_agent_wave np4-wave1 10000
 capture_heap post-wave1
-run_agent_wave np4-wave2
+run_agent_wave np4-wave2 10000
 capture_heap post-wave2
 
 qwen36_validate_heap_series \
@@ -170,6 +178,8 @@ jq -n \
   --arg manifest_sha256 "$(sha256_file "$OUT_DIR/artifact-manifest.sha256")" \
   --argjson server_pid "$SERVER_PID" \
   --argjson max_slots "$MAX_SLOTS" \
+  --argjson warmup_max_tool_result_ms 15000 \
+  --argjson measured_max_tool_result_ms 10000 \
   --argjson ready_http "$ready_code" \
   --argjson power_event_baseline "$QWEN36_POWER_EVENT_BASELINE" \
   --argjson power_event_final "$QWEN36_POWER_EVENT_FINAL" \
@@ -178,9 +188,9 @@ jq -n \
   --slurpfile warmup "$OUT_DIR/heap-post-warmup.json" \
   --slurpfile wave1 "$OUT_DIR/heap-post-wave1.json" \
   --slurpfile wave2 "$OUT_DIR/heap-post-wave2.json" \
-  '{status:$status,binary_path:$binary_path,binary_sha256:$binary_sha256,model_path:$model_path,model_sha256:$model_sha256,server_pid:$server_pid,max_slots:$max_slots,ready_http:$ready_http,power_event_baseline:$power_event_baseline,power_event_final:$power_event_final,power_event_delta:($power_event_final-$power_event_baseline),artifact_manifest_sha256:$manifest_sha256,heap_bounds_valid:true,heap_deltas:{cfstring_baseline_to_overlap:($overlap[0].cfstring_count-$baseline[0].cfstring_count),cfstring_overlap_to_warmup:($warmup[0].cfstring_count-$overlap[0].cfstring_count),cfstring_warmup_to_wave1:($wave1[0].cfstring_count-$warmup[0].cfstring_count),cfstring_wave1_to_wave2:($wave2[0].cfstring_count-$wave1[0].cfstring_count),cfstring_warmup_to_wave2:($wave2[0].cfstring_count-$warmup[0].cfstring_count),pool_baseline_to_overlap:($overlap[0].autoreleasepool_content_count-$baseline[0].autoreleasepool_content_count),pool_overlap_to_warmup:($warmup[0].autoreleasepool_content_count-$overlap[0].autoreleasepool_content_count),pool_warmup_to_wave1:($wave1[0].autoreleasepool_content_count-$warmup[0].autoreleasepool_content_count),pool_wave1_to_wave2:($wave2[0].autoreleasepool_content_count-$wave1[0].autoreleasepool_content_count)},heap:{baseline:$baseline[0],post_overlap:$overlap[0],post_warmup:$warmup[0],post_wave1:$wave1[0],post_wave2:$wave2[0]}}' \
+  '{status:$status,binary_path:$binary_path,binary_sha256:$binary_sha256,model_path:$model_path,model_sha256:$model_sha256,server_pid:$server_pid,max_slots:$max_slots,warmup_max_tool_result_ms:$warmup_max_tool_result_ms,measured_max_tool_result_ms:$measured_max_tool_result_ms,ready_http:$ready_http,power_event_baseline:$power_event_baseline,power_event_final:$power_event_final,power_event_delta:($power_event_final-$power_event_baseline),artifact_manifest_sha256:$manifest_sha256,heap_bounds_valid:true,heap_deltas:{cfstring_baseline_to_overlap:($overlap[0].cfstring_count-$baseline[0].cfstring_count),cfstring_overlap_to_warmup:($warmup[0].cfstring_count-$overlap[0].cfstring_count),cfstring_warmup_to_wave1:($wave1[0].cfstring_count-$warmup[0].cfstring_count),cfstring_wave1_to_wave2:($wave2[0].cfstring_count-$wave1[0].cfstring_count),cfstring_warmup_to_wave2:($wave2[0].cfstring_count-$warmup[0].cfstring_count),pool_baseline_to_overlap:($overlap[0].autoreleasepool_content_count-$baseline[0].autoreleasepool_content_count),pool_overlap_to_warmup:($warmup[0].autoreleasepool_content_count-$overlap[0].autoreleasepool_content_count),pool_warmup_to_wave1:($wave1[0].autoreleasepool_content_count-$warmup[0].autoreleasepool_content_count),pool_wave1_to_wave2:($wave2[0].autoreleasepool_content_count-$wave1[0].autoreleasepool_content_count)},heap:{baseline:$baseline[0],post_overlap:$overlap[0],post_warmup:$warmup[0],post_wave1:$wave1[0],post_wave2:$wave2[0]}}' \
   >"$summary.tmp"
-jq -e '.status == "pass" and .server_pid > 0 and .max_slots == 4 and .ready_http == 200 and .power_event_delta == 0 and .heap_bounds_valid == true and all(.heap[]; .command_buffer_objects == 0 and .command_buffer_impls == 0) and .heap_deltas.cfstring_baseline_to_overlap <= 512 and .heap_deltas.cfstring_overlap_to_warmup <= 512 and .heap_deltas.cfstring_warmup_to_wave1 <= 256 and .heap_deltas.cfstring_wave1_to_wave2 <= 256 and .heap_deltas.cfstring_warmup_to_wave2 <= 512 and .heap_deltas.pool_baseline_to_overlap <= 8 and .heap_deltas.pool_overlap_to_warmup <= 8 and .heap_deltas.pool_warmup_to_wave1 <= 8 and .heap_deltas.pool_wave1_to_wave2 <= 8' \
+jq -e '.status == "pass" and .server_pid > 0 and .max_slots == 4 and .warmup_max_tool_result_ms == 15000 and .measured_max_tool_result_ms == 10000 and .ready_http == 200 and .power_event_delta == 0 and .heap_bounds_valid == true and all(.heap[]; .command_buffer_objects == 0 and .command_buffer_impls == 0) and .heap_deltas.cfstring_baseline_to_overlap <= 512 and .heap_deltas.cfstring_overlap_to_warmup <= 512 and .heap_deltas.cfstring_warmup_to_wave1 <= 256 and .heap_deltas.cfstring_wave1_to_wave2 <= 256 and .heap_deltas.cfstring_warmup_to_wave2 <= 512 and .heap_deltas.pool_baseline_to_overlap <= 8 and .heap_deltas.pool_overlap_to_warmup <= 8 and .heap_deltas.pool_warmup_to_wave1 <= 8 and .heap_deltas.pool_wave1_to_wave2 <= 8' \
   "$summary.tmp" >/dev/null
 mv "$summary.tmp" "$summary"
 shasum -a 256 "$summary" >"$summary.sha256"

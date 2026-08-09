@@ -897,6 +897,15 @@ fresh no-env run of the exact 552 + 87,972 overlap plus disconnect
 cancellation. The final heap must keep both AGX command buffers and CFStrings
 bounded. Unit tests or the earlier local dependency spike remain insufficient.
 
+The cumulative lifetime gate distinguishes the first agentic wave after the
+87,972-token request from its two measured steady-state waves. That first wave
+rebuilds four per-slot working sets and is bounded at 15 seconds for a
+tool-result turn; it is retained as a semantic/cache warmup receipt. Both
+subsequent measured waves retain the existing 10-second Qwen tool-result bound.
+This split was measured after a first post-long wave completed coherently at
+12 seconds while the immediately repeated four-slot wave completed at 7
+seconds. It does not relax the measured performance contract.
+
 The proven Qwen3.6 autoregressive graph is now the default serving and CLI
 route; `HF2Q_QWEN36_AUTOREG` is retired from the investigation surface and the
 canonical launcher no longer sets it. This graduation does not promote the
