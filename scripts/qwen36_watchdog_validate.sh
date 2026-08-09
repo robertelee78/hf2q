@@ -26,7 +26,7 @@ qwen36_reject_fatal_log() {
     echo "Qwen gate cannot read the required server log: $log_path" >&2
     return 1
   }
-  if rg -i "$QWEN36_FATAL_LOG_PATTERN" "$log_path" >/dev/null; then
+  if grep -Eiq "$QWEN36_FATAL_LOG_PATTERN" "$log_path"; then
     echo "Qwen gate observed a fatal worker/GPU log signature" >&2
     return 1
   fi
@@ -103,7 +103,7 @@ qwen36_reject_successful_terminal_sse() {
     return 1
   }
 
-  if rg -x 'data: \[DONE\]' "$sse_path" >/dev/null; then
+  if grep -Fxq 'data: [DONE]' "$sse_path"; then
     echo "cancelled SSE unexpectedly reached [DONE]" >&2
     return 1
   fi
@@ -280,7 +280,7 @@ qwen36_start_power_guard() {
     echo "Qwen hardware gate power-guard target PID is not live: $target_pid" >&2
     return 1
   }
-  pmset -g batt | rg "Now drawing from 'AC Power'" >/dev/null || {
+  pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
     echo "Qwen hardware gate requires AC power" >&2
     return 1
   }
@@ -295,7 +295,7 @@ qwen36_start_power_guard() {
       return 1
     fi
     if pmset -g assertions \
-      | rg "pid ${QWEN36_POWER_GUARD_PID}\\(caffeinate\\)" >/dev/null; then
+      | grep -Eq "pid ${QWEN36_POWER_GUARD_PID}\\(caffeinate\\)"; then
       return 0
     fi
     sleep 0.02
@@ -314,7 +314,7 @@ qwen36_assert_power_guard() {
       echo "Qwen hardware gate lost its caffeinate assertion" >&2
       return 1
     }
-  pmset -g batt | rg "Now drawing from 'AC Power'" >/dev/null || {
+  pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
     echo "Qwen hardware gate lost AC power" >&2
     return 1
   }
