@@ -204,6 +204,24 @@ pub(super) struct Deepseek4Session {
     turn_anchor_tokens: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4CancellationRecovery {
+    TurnAnchor,
+    Reset,
+}
+
+fn deepseek4_cancellation_recovery(
+    cache_poisoned: bool,
+    anchor_position: Option<usize>,
+    anchor_tokens: usize,
+) -> Deepseek4CancellationRecovery {
+    if !cache_poisoned && anchor_position == Some(anchor_tokens) && anchor_tokens > 0 {
+        Deepseek4CancellationRecovery::TurnAnchor
+    } else {
+        Deepseek4CancellationRecovery::Reset
+    }
+}
+
 impl Deepseek4Session {
     /// Start with the same bounded cache shape as the proven SerialFifo path,
     /// while keeping append-only KV lazy so four idle slots do not register
@@ -281,6 +299,39 @@ impl Deepseek4Session {
         self.live_logits = None;
         self.turn_anchor = None;
         self.turn_anchor_tokens.clear();
+        Ok(())
+    }
+
+    /// Cancelled work must not publish its partially extended live cursor, but
+    /// a valid pre-request turn anchor remains safe to reuse. Restore that
+    /// compact checkpoint when possible; cold/no-anchor cancellation retains
+    /// the conservative full-reset fallback.
+    pub(super) fn recover_after_cancellation(&mut self) -> Result<()> {
+        let recovery = deepseek4_cancellation_recovery(
+            self.cache.is_poisoned(),
+            self.turn_anchor
+                .as_ref()
+                .map(Deepseek4CacheSnapshot::position),
+            self.turn_anchor_tokens.len(),
+        );
+        if recovery == Deepseek4CancellationRecovery::Reset {
+            return self.reset();
+        }
+        let anchor = self
+            .turn_anchor
+            .as_ref()
+            .context("DeepSeek-V4 cancellation turn anchor disappeared")?;
+        self.cache
+            .restore(anchor)
+            .context("restore DeepSeek-V4 turn anchor after cancellation")?;
+        self.committed_tokens.clone_from(&self.turn_anchor_tokens);
+        self.live_logits = None;
+        anyhow::ensure!(
+            self.cache.position() == self.committed_tokens.len(),
+            "DeepSeek-V4 cancellation rollback cache position {} disagrees with token ledger {}",
+            self.cache.position(),
+            self.committed_tokens.len()
+        );
         Ok(())
     }
 
@@ -1165,7 +1216,8 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 mod tests {
     use super::{
         balance_fresh_three_chunk_prefill, cache_capacity_for_request, common_prefix_len,
-        prefer_matrix_prefill, select_prefix_reuse, should_retain_decode_scratch, PrefixReuse,
+        deepseek4_cancellation_recovery, prefer_matrix_prefill, select_prefix_reuse,
+        should_retain_decode_scratch, Deepseek4CancellationRecovery, PrefixReuse,
         TransientScratchStats,
     };
 
@@ -1227,6 +1279,25 @@ mod tests {
             select_prefix_reuse(&[1, 2, 7, 8], &[1, 2, 9, 7], 4, &[1, 2], 2),
             PrefixReuse::RecoveryAnchor(2)
         );
+    }
+
+    #[test]
+    fn cancellation_preserves_only_a_valid_unpoisoned_turn_anchor() {
+        assert_eq!(
+            deepseek4_cancellation_recovery(false, Some(7_174), 7_174),
+            Deepseek4CancellationRecovery::TurnAnchor
+        );
+        for (poisoned, position, tokens) in [
+            (true, Some(7_174), 7_174),
+            (false, Some(7_173), 7_174),
+            (false, None, 7_174),
+            (false, Some(0), 0),
+        ] {
+            assert_eq!(
+                deepseek4_cancellation_recovery(poisoned, position, tokens),
+                Deepseek4CancellationRecovery::Reset
+            );
+        }
     }
 
     #[test]

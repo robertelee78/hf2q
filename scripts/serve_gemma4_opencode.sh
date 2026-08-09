@@ -51,16 +51,18 @@
 #   The loader uses the GGUF-embedded Gemma APEX template and validates its
 #   native turn, tool-call, and tool-response markers before inference.
 #
-#   Cold prompts still auto-route between the existing batched and
-#   linear-memory paths. The batched route engages only when its O(n²)
-#   overhead fits 1/6 of currently available RAM. Overhead is config-dependent:
+#   Short cold prompts still auto-route through the existing eager batched
+#   path when its O(n²) overhead fits 1/6 of currently available RAM.
+#   Overhead is config-dependent:
 #     default (tensor-mm globals): ~72 B/seq² — masks + pf_kq scratch
 #       ⇒ batched envelope ≈ ≤12K tokens on a 128 GB box
 #     HF2Q_GLOBAL_FA=1 (FA globals): ~8 B/seq² — masks only
 #       ⇒ batched envelope ≈ ≤35-40K tokens
-#   Larger cold prompts fall back to the linear-memory route. A measured
-#   25,187-token baseline took about 388 seconds on this host, so no stale
-#   ~1,700 tok/s promise is made here.
+#   Long plain-text SlotAware prompts instead install resumable states. Each
+#   Metal transaction contains at most 4,096 aggregate rows; compatible
+#   installed lanes may divide those rows (four equal lanes advance 1,024
+#   rows each) without multiplying the watchdog boundary by MAX_SLOTS.
+#   Long soft-token work remains fail-closed until it has a resumable graph.
 #
 #   Normal follow-ups use zero-copy live-prefix reuse and process only the
 #   uncached suffix in bounded 256-query chunks. A real 6,784-token OpenCode

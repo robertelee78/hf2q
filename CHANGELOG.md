@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.4] — 2026-08-09
-
 ### Fixed — bounded multi-agent prefill and Metal command-buffer lifetime
 
 - Advance Qwen 3.5/3.6 slot-aware prefill in bounded, scheduler-yielding
@@ -48,7 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   physical cache cursor only after a successful transaction, and run decode
   before prefill in `Mixed`. Cross-slot batches validate every lane before
   admission and share one 4,096-row aggregate transaction cap instead of
-  multiplying that cap by the slot count. Long soft-token requests remain
+  multiplying that cap by the slot count. Already-installed long-text prefill
+  states may share that same aggregate transaction while preserving per-lane
+  cache, scheduler, and reply ownership. Long soft-token requests remain
   fail-closed until their own resumable path is proven.
 - Route meaningful DeepSeek retained-prefix suffixes through the existing
   atomic resumable-prefill machinery. During a lopsided cold cohort, one
@@ -56,7 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response stays parked until the cold-prefill barrier lifts, preserving the
   retained cache for its continuation. Cancellation and ordinary failure now
   reconcile the cohort back to an admissible phase instead of stranding an
-  idle worker.
+  idle worker. Staggered warm continuations can join an existing decoder while
+  another physical slot is free, and cancellation restores a valid,
+  position-consistent pre-request turn anchor instead of deleting reusable KV.
+- Add a focused DeepSeek cached-suffix gate that requires three resumable
+  transactions with peer decode progress between them, exact middle-transaction
+  cancellation accounting, no terminal Done after disconnect, retained-prefix
+  reuse after rollback, readiness, and a clean fatal-log delta.
 
 ## [0.1.3] — 2026-08-08
 
@@ -374,8 +380,7 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.4...HEAD
-[0.1.4]: https://github.com/robertelee78/hf2q/compare/v0.1.3...v0.1.4
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.3...HEAD
 [0.1.3]: https://github.com/robertelee78/hf2q/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/robertelee78/hf2q/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/robertelee78/hf2q/compare/v0.1.0...v0.1.1

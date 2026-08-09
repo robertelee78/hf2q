@@ -40,11 +40,16 @@ family's graph, cache, or scheduler contract by approximation.
 - **Unreleased candidate:** long plain-text Gemma SlotAware prefill advances in
   at most 4,096-token transactions, split at the stable-prefix boundary. The
   transaction publishes all configured per-layer cache cursors together.
-  Long soft-token work remains fail-closed until a resumable graph is proven.
+  Compatible installed prefill states may share those 4,096 aggregate rows;
+  the bound never multiplies by the number of slots. Long soft-token work
+  remains fail-closed until a resumable graph is proven.
 - **Unreleased candidate:** DeepSeek meaningful cached suffixes use the same
   atomic resumable verifier transactions as cold prefill. Lopsided cold waves
   allow one decode token between prefill transactions but park terminal
-  completion until the cohort barrier lifts.
+  completion until the cohort barrier lifts. Outside a cold barrier, staggered
+  warm work may occupy any free physical slot. Cancellation restores only a
+  valid, position-consistent pre-request turn anchor; poisoned or inconsistent
+  state resets fully.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
   independently observed transaction deadline that never returns, fails the
   affected Qwen, Gemma, or DeepSeek worker closed. Every owned reply
@@ -83,7 +88,7 @@ The shared cross-family changes additionally require:
 
 | Family | Candidate artifact gate |
 |---|---|
-| Gemma 4 | Eager-versus-resumed exact output parity at 4,096 boundaries and non-aligned tails; aggregate cross-slot transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
+| Gemma 4 | Eager-versus-resumed exact output parity at 4,096 boundaries and non-aligned tails; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
 | DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the unchanged four-agent cold/cached/tool gate twice. |
 | All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 

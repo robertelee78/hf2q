@@ -243,8 +243,10 @@ the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and
 all configured HB, hybrid, dense, and MLX per-slot cursors are committed only
 after the complete transaction succeeds. Cross-slot cold and retained-prefix
 batches share the same 4,096-row aggregate Metal-transaction ceiling; lanes
-over that bound remain FIFO and return to the scheduler-backed single-slot
-path. The 4,096-token ceiling is a
+over that bound remain FIFO and return to scheduler-backed resumable states.
+When several compatible long-text states are installed, one transaction
+shares the 4,096 rows across those lanes instead of multiplying the bound by
+the number of slots. The 4,096-token ceiling is a
 family-specific candidate that must pass exact eager-versus-resumed real-model
 parity before release; it is not inherited from Qwen. Long Gemma soft-token
 prefill remains fail-closed until it has a resumable graph.
@@ -271,7 +273,18 @@ arena concurrently. In a lopsided cohort, a decode-ready lane advances one
 token before each remaining cold-prefill transaction; if it becomes terminal,
 completion stays parked until the barrier lifts so its physical cache cannot
 be reused before a tool-result continuation. Cached-suffix work is not counted
-as cold-cohort work.
+as cold-cohort work. With no cold barrier active, staggered warm work may join
+an existing decoder whenever another physical slot is free. Cancelling a
+cached suffix rolls back to a valid, position-consistent pre-request turn
+anchor; poisoned or inconsistent state still resets fully.
+
+`scripts/test_deepseek4_cached_suffix.sh` is the focused Apple-Silicon gate for
+that contract. It overlaps a three-transaction cached tool-result suffix with
+a live SSE decoder, then disconnects a separate cached suffix at transaction
+three and requires bounded stop, one cancellation count, no terminal Done,
+post-cancellation prefix reuse, readiness, and a clean fatal-log delta. Its
+focused receipt complements rather than replaces the unchanged four-agent
+agentic gate.
 
 The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
@@ -291,6 +304,60 @@ The governing decisions and the old-failure-versus-final-artifact distinction
 are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/ADR-040-continuous-batching-reopen.md`.
+
+#### Test the 0.1.4 serving candidate
+
+Build and verify the exact checkout before loading a model:
+
+```bash
+cargo check --locked --all-targets --all-features
+cargo build --release --locked
+
+# These are the focused serving contracts. CI also runs the library,
+# conversion, LCP, fixture, readiness, and parser-negative suites listed in
+# .github/workflows/ci.yml.
+cargo test --locked --bin hf2q --all-features \
+  qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features \
+  gemma4_bounded_prefill_tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features \
+  engine_supervisor::tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features deepseek4 -- \
+  --skip real_artifact_tests
+bash scripts/test_qwen36_watchdog_harness_contract.sh
+```
+
+Then start exactly one family from the same checkout. Setting `HF2Q_BIN`
+prevents a launcher from accidentally selecting an older repository build:
+
+```bash
+# Choose one launcher and leave it in the foreground.
+HF2Q_BIN="$PWD/target/release/hf2q" ./scripts/serve_qwen36_opencode.sh
+HF2Q_BIN="$PWD/target/release/hf2q" MMPROJ=/nonexistent \
+  ./scripts/serve_gemma4_opencode.sh
+HF2Q_BIN="$PWD/target/release/hf2q" ./scripts/serve_deepseek4_opencode.sh
+```
+
+In another terminal, verify readiness and run the matching four-agent gate:
+
+```bash
+curl --fail http://127.0.0.1:8081/readyz
+BASE_URL=http://127.0.0.1:8081 FAMILY=qwen36 AGENTS=4 \
+  ./scripts/test_full_context_agent_slots.sh
+
+curl --fail http://127.0.0.1:8082/readyz
+BASE_URL=http://127.0.0.1:8082 FAMILY=gemma4 AGENTS=4 \
+  ./scripts/test_full_context_agent_slots.sh
+
+curl --fail http://127.0.0.1:8080/readyz
+BASE_URL=http://127.0.0.1:8080 FAMILY=deepseek4 AGENTS=4 \
+  ./scripts/test_full_context_agent_slots.sh
+```
+
+Run one model at a time. A battery-powered run is useful for functional
+testing but is not performance authority; the release latency gates require
+AC power, clear thermal status, and the exact artifact/power receipts described
+in `docs/shipping-contract.md`.
 
 For MoE models, pass an APEX tier instead of a standard ftype:
 

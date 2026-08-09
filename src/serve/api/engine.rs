@@ -5996,6 +5996,39 @@ fn gemma4_request_runs_inline_gpu(request: &Request) -> bool {
     }
 }
 
+fn gemma4_deferred_text_request(request: &Request) -> bool {
+    match request {
+        Request::Generate {
+            prompt_tokens,
+            params,
+            ..
+        } => {
+            prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+                && params.max_tokens > 0
+                && u32::try_from(params.max_tokens).is_ok()
+        }
+        Request::GenerateStream {
+            prompt_tokens,
+            params,
+            soft_tokens,
+            ..
+        } => {
+            prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+                && params.max_tokens > 0
+                && u32::try_from(params.max_tokens).is_ok()
+                && soft_tokens.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn gemma4_deferred_text_prefix_len<'a>(requests: impl IntoIterator<Item = &'a Request>) -> usize {
+    requests
+        .into_iter()
+        .take_while(|request| gemma4_deferred_text_request(request))
+        .count()
+}
+
 fn gemma4_bounded_batch_prefix_len<I>(candidates: I) -> usize
 where
     I: IntoIterator<Item = Option<(Gemma4CrossBatchClass, usize)>>,
@@ -6069,6 +6102,36 @@ struct Gemma4PrefillProgress {
     cursor: usize,
     prompt_len: usize,
     stable_boundary: Option<usize>,
+}
+
+fn gemma4_prefill_batch_plans(
+    progresses: &[Gemma4PrefillProgress],
+    aggregate_tokens: usize,
+) -> Result<Vec<Gemma4PrefillPlan>> {
+    anyhow::ensure!(!progresses.is_empty(), "Gemma4 prefill batch is empty");
+    anyhow::ensure!(
+        aggregate_tokens >= progresses.len(),
+        "Gemma4 aggregate prefill budget {aggregate_tokens} is smaller than {} lanes",
+        progresses.len()
+    );
+    let mut budget = aggregate_tokens;
+    let mut plans = Vec::with_capacity(progresses.len());
+    for (index, progress) in progresses.iter().enumerate() {
+        let lanes_left = progresses.len() - index;
+        let lane_budget = (budget / lanes_left).max(1);
+        let plan = progress.plan(lane_budget)?;
+        budget = budget.saturating_sub(plan.end - plan.start);
+        plans.push(plan);
+    }
+    anyhow::ensure!(
+        plans
+            .iter()
+            .map(|plan| plan.end - plan.start)
+            .sum::<usize>()
+            <= aggregate_tokens,
+        "Gemma4 prefill batch exceeded its aggregate token budget"
+    );
+    Ok(plans)
 }
 
 impl Gemma4PrefillProgress {
@@ -6186,7 +6249,7 @@ impl Gemma4PrefillState {
 
     #[allow(clippy::too_many_arguments)]
     fn advance(
-        mut self,
+        self,
         guard: &mut Gemma4KvGuard<'_>,
         registration: Option<&super::registry::ModelRegistration>,
         max_chunk_tokens: usize,
@@ -6230,9 +6293,24 @@ impl Gemma4PrefillState {
                     )
             }
         })?;
-        self.compute_duration += started.elapsed();
+        let elapsed = started.elapsed();
         clear_gemma4_self_mounts(guard.model);
         commit_gemma4_slot_cursor(guard, self.slot_id, plan.start, plan.end)?;
+
+        self.finish_committed_transaction(guard, registration, plan, first_token, None, elapsed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_committed_transaction(
+        mut self,
+        guard: &mut Gemma4KvGuard<'_>,
+        registration: Option<&super::registry::ModelRegistration>,
+        plan: Gemma4PrefillPlan,
+        first_token: u32,
+        first_logits: Option<&[f32]>,
+        elapsed: Duration,
+    ) -> Result<Gemma4PrefillAdvance> {
+        self.compute_duration += elapsed;
 
         if plan.capture_anchor {
             let hybrid = guard.hybrid.as_ref().ok_or_else(|| {
@@ -6268,7 +6346,7 @@ impl Gemma4PrefillState {
             registration,
             self.slot_id,
             first_token,
-            None,
+            first_logits,
             self.compute_duration,
             self.cached_tokens,
         )?;
@@ -7148,7 +7226,10 @@ fn deepseek4_reconcile_cold_cohort(
     pending_nonempty: bool,
 ) -> Deepseek4ColdCohortDecision {
     let (phase, admission_open) = match phase {
-        Deepseek4ColdCohortPhase::Idle => (Deepseek4ColdCohortPhase::Idle, slots_empty),
+        // Idle means no cold-cohort barrier is active, not that every physical
+        // slot must be empty. Keep admission open while a slot is free so a
+        // staggered warm continuation can join an already decoding peer.
+        Deepseek4ColdCohortPhase::Idle => (Deepseek4ColdCohortPhase::Idle, has_free_slot),
         Deepseek4ColdCohortPhase::Filling if cohort_full => {
             (Deepseek4ColdCohortPhase::Draining, false)
         }
@@ -8220,6 +8301,17 @@ fn reset_deepseek4_session_for_reply(
     }
 }
 
+fn recover_cancelled_deepseek4_session_for_reply(
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    handle: SlotHandle,
+    reply: SlotReply,
+) -> std::result::Result<SlotReply, SlotAwareGpuFatal> {
+    match sessions[handle.slot_id.0 as usize].recover_after_cancellation() {
+        Ok(()) => Ok(reply),
+        Err(error) => Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seed_deepseek4_single(
     model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
@@ -8304,7 +8396,11 @@ fn seed_deepseek4_single(
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+            reply = match if client_closed {
+                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+            } else {
+                reset_deepseek4_session_for_reply(sessions, handle, reply)
+            } {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
@@ -8392,7 +8488,11 @@ fn advance_deepseek4_prefill(
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+            reply = match if client_closed {
+                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+            } else {
+                reset_deepseek4_session_for_reply(sessions, handle, reply)
+            } {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
@@ -8458,7 +8558,9 @@ fn decode_batch_deepseek4(
                         sessions[slot_index].committed_tokens().len(),
                         kv_bytes_per_token,
                     );
-                    if let Err(fatal) = reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                    if let Err(fatal) =
+                        recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                    {
                         return Some(fatal);
                     }
                     scheduler.release(handle);
@@ -8488,7 +8590,9 @@ fn decode_batch_deepseek4(
                     sessions[slot_index].committed_tokens().len(),
                     kv_bytes_per_token,
                 );
-                if let Err(fatal) = reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                if let Err(fatal) =
+                    recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                {
                     return Some(fatal);
                 }
                 scheduler.release(handle);
@@ -8551,7 +8655,9 @@ fn decode_batch_deepseek4(
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            if let Err(fatal) = reset_deepseek4_session_for_reply(sessions, handle, reply) {
+            if let Err(fatal) =
+                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+            {
                 return Some(fatal);
             }
             scheduler.release(handle);
@@ -9528,11 +9634,22 @@ fn run_slot_aware_gemma4(
                 }
                 let batch_prefix_len =
                     gemma4_bounded_batch_prefix_len(reqs.iter().map(gemma4_cross_batch_candidate));
+                let deferred_text_prefix_len = if batch_prefix_len == 0 {
+                    gemma4_deferred_text_prefix_len(reqs.iter())
+                } else {
+                    0
+                };
                 // A batchable prefix is one contiguous cold-or-stable class
                 // and shares one 4,096-row transaction budget. A non-batch
-                // request gets one admission quantum by itself. Everything
-                // later returns to the front in original FIFO order.
-                let process_len = batch_prefix_len.max(1).min(reqs.len());
+                // request gets one admission quantum by itself. Long plain
+                // text is GPU-free at admission, so a contiguous prefix may
+                // reserve every free slot before the scheduler forms one
+                // aggregate-bounded resumable transaction. Everything later
+                // returns to the front in original FIFO order.
+                let process_len = batch_prefix_len
+                    .max(deferred_text_prefix_len)
+                    .max(1)
+                    .min(reqs.len());
                 let deferred = reqs.split_off(process_len);
                 let mut deferred = VecDeque::from(deferred);
                 deferred.append(&mut pending);
@@ -10219,7 +10336,7 @@ fn run_slot_aware_gemma4(
                 }
             }
             SchedulerStep::Prefill { handle, n_tokens } => {
-                if let Some(fatal) = advance_gemma4_prefill(
+                if let Some(fatal) = advance_gemma4_prefill_quantum(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -10231,6 +10348,7 @@ fn run_slot_aware_gemma4(
                     n_tokens,
                     kv_bytes_per_token,
                     &supervisor,
+                    cross_slot_admit,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -10313,7 +10431,7 @@ fn run_slot_aware_gemma4(
                     );
                     break 'worker;
                 }
-                if let Some(fatal) = advance_gemma4_prefill(
+                if let Some(fatal) = advance_gemma4_prefill_quantum(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -10325,6 +10443,7 @@ fn run_slot_aware_gemma4(
                     n_prefill_tokens,
                     kv_bytes_per_token,
                     &supervisor,
+                    cross_slot_admit,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -10900,6 +11019,129 @@ fn admit_gemma4_slot(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn install_gemma4_prefill_advance(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    mut reply: SlotReply,
+    advance: Gemma4PrefillAdvance,
+) -> Option<SlotAwareGpuFatal> {
+    let slot_idx = handle.slot_id.0 as usize;
+    match advance {
+        Gemma4PrefillAdvance::Pending {
+            state,
+            advanced_tokens,
+        } => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            tracing::info!(
+                slot = handle.slot_id.0,
+                advanced_tokens,
+                committed_tokens = state.progress.cursor(),
+                prompt_tokens = state.prompt_tokens.len(),
+                "Gemma4 bounded prefill transaction complete"
+            );
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
+                    true,
+                );
+            } else {
+                scheduler.yield_prefill_turn(handle);
+                slots[slot_idx] = Some((Gemma4SlotWork::Prefill(state), reply, handle));
+            }
+        }
+        Gemma4PrefillAdvance::Ready {
+            state,
+            prompt_anchor,
+            advanced_tokens,
+        } => {
+            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
+            tracing::info!(
+                slot = handle.slot_id.0,
+                advanced_tokens,
+                prompt_tokens = state.prompt_len,
+                "Gemma4 bounded prefill transaction complete"
+            );
+            if reply.client_closed() {
+                reply.record_client_cancellation();
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
+                    true,
+                );
+                return None;
+            }
+            prompt_anchors[slot_idx] = prompt_anchor;
+            let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
+            if seed_dropped {
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                let result = Ok(state.finish(registration));
+                slot_fire_done(reply, result, true);
+            } else if state.finished_at_seed() {
+                retained_tokens[slot_idx] = state.retained_prefix();
+                record_retained_slot_kv(
+                    scheduler,
+                    handle,
+                    retained_tokens[slot_idx].len(),
+                    kv_bytes_per_token,
+                );
+                scheduler.advance_after_decode(handle);
+                scheduler.release(handle);
+                slot_fire_done(reply, Ok(state.finish(registration)), false);
+            } else {
+                slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn advance_gemma4_prefill(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
@@ -10975,108 +11217,20 @@ fn advance_gemma4_prefill(
         .min(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS)
         .max(1) as usize;
     match state.advance(guard, registration, max_chunk_tokens, supervisor) {
-        Ok(Gemma4PrefillAdvance::Pending {
-            state,
-            advanced_tokens,
-        }) => {
-            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
-            tracing::info!(
-                slot = handle.slot_id.0,
-                advanced_tokens,
-                committed_tokens = state.progress.cursor(),
-                prompt_tokens = state.prompt_tokens.len(),
-                "Gemma4 bounded prefill transaction complete"
-            );
-            if reply.client_closed() {
-                reply.record_client_cancellation();
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(fatal) => return Some(fatal),
-                };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
-                scheduler.release(handle);
-                slot_fire_done(
-                    reply,
-                    Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
-                    true,
-                );
-            } else {
-                scheduler.yield_prefill_turn(handle);
-                slots[slot_idx] = Some((Gemma4SlotWork::Prefill(state), reply, handle));
-            }
-        }
-        Ok(Gemma4PrefillAdvance::Ready {
-            state,
-            prompt_anchor,
-            advanced_tokens,
-        }) => {
-            scheduler.advance_after_prefill(handle, advanced_tokens as u32);
-            tracing::info!(
-                slot = handle.slot_id.0,
-                advanced_tokens,
-                prompt_tokens = state.prompt_len,
-                "Gemma4 bounded prefill transaction complete"
-            );
-            if reply.client_closed() {
-                reply.record_client_cancellation();
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(fatal) => return Some(fatal),
-                };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
-                scheduler.release(handle);
-                slot_fire_done(
-                    reply,
-                    Err(anyhow::anyhow!("Gemma4 bounded prefill cancelled")),
-                    true,
-                );
-                return None;
-            }
-            prompt_anchors[slot_idx] = prompt_anchor;
-            let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
-            if seed_dropped {
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(fatal) => return Some(fatal),
-                };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
-                scheduler.release(handle);
-                let result = Ok(state.finish(registration));
-                slot_fire_done(reply, result, true);
-            } else if state.finished_at_seed() {
-                retained_tokens[slot_idx] = state.retained_prefix();
-                record_retained_slot_kv(
-                    scheduler,
-                    handle,
-                    retained_tokens[slot_idx].len(),
-                    kv_bytes_per_token,
-                );
-                scheduler.advance_after_decode(handle);
-                scheduler.release(handle);
-                slot_fire_done(reply, Ok(state.finish(registration)), false);
-            } else {
-                slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
+        Ok(advance) => {
+            if let Some(fatal) = install_gemma4_prefill_advance(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                registration,
+                handle,
+                kv_bytes_per_token,
+                reply,
+                advance,
+            ) {
+                return Some(fatal);
             }
         }
         Err(error) => {
@@ -11097,6 +11251,363 @@ fn advance_gemma4_prefill(
             prompt_anchors[slot_idx] = None;
             scheduler.release(handle);
             slot_fire_done(reply, Err(error), false);
+        }
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    None
+}
+
+struct Gemma4PrefillBatchLane {
+    handle: SlotHandle,
+    state: Gemma4PrefillState,
+    reply: SlotReply,
+    plan: Gemma4PrefillPlan,
+}
+
+fn gemma4_prefill_batch_fatal(
+    lanes: Vec<Gemma4PrefillBatchLane>,
+    error: anyhow::Error,
+    kind: SlotAwareFatalKind,
+) -> SlotAwareGpuFatal {
+    let mut fatal = SlotAwareGpuFatal {
+        error,
+        kind,
+        owned: Vec::with_capacity(lanes.len()),
+    };
+    fatal.extend_slots(
+        lanes
+            .into_iter()
+            .map(|lane| (Some(lane.handle), lane.reply)),
+    );
+    fatal
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_gemma4_prefill_quantum(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    handle: SlotHandle,
+    requested_tokens: u32,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+    cross_slot_admit: bool,
+) -> Option<SlotAwareGpuFatal> {
+    let primary_index = handle.slot_id.0 as usize;
+    let Some((Gemma4SlotWork::Prefill(primary), primary_reply, installed)) =
+        slots.get(primary_index).and_then(Option::as_ref)
+    else {
+        return advance_gemma4_prefill(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            requested_tokens,
+            kv_bytes_per_token,
+            supervisor,
+        );
+    };
+    if *installed != handle || primary_reply.client_closed() {
+        return advance_gemma4_prefill(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            requested_tokens,
+            kv_bytes_per_token,
+            supervisor,
+        );
+    }
+    let start_at_zero = primary.progress.cursor() == 0;
+    let batch_supported = cross_slot_admit
+        && guard.hybrid.is_some()
+        && crate::debug::INVESTIGATION_ENV.hybrid_kv
+        && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
+    if !batch_supported {
+        return advance_gemma4_prefill(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            requested_tokens,
+            kv_bytes_per_token,
+            supervisor,
+        );
+    }
+
+    let candidate_indices: Vec<usize> = (0..slots.len())
+        .map(|offset| (primary_index + offset) % slots.len())
+        .filter(|&slot_index| {
+            matches!(
+                slots[slot_index].as_ref(),
+                Some((Gemma4SlotWork::Prefill(state), reply, _))
+                    if (state.progress.cursor() == 0) == start_at_zero
+                        && !reply.client_closed()
+            )
+        })
+        .collect();
+    if candidate_indices.len() < 2 {
+        return advance_gemma4_prefill(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            requested_tokens,
+            kv_bytes_per_token,
+            supervisor,
+        );
+    }
+
+    let mut lanes = Vec::with_capacity(candidate_indices.len());
+    for slot_index in candidate_indices {
+        let Some((work, reply, installed)) = slots[slot_index].take() else {
+            let fatal = gemma4_prefill_batch_fatal(
+                lanes,
+                anyhow::anyhow!("Gemma4 installed prefill batch lost slot {slot_index}"),
+                SlotAwareFatalKind::Invariant,
+            );
+            return Some(fatal);
+        };
+        let Gemma4SlotWork::Prefill(state) = work else {
+            let mut fatal = gemma4_prefill_batch_fatal(
+                lanes,
+                anyhow::anyhow!("Gemma4 installed prefill batch selected decode work"),
+                SlotAwareFatalKind::Invariant,
+            );
+            fatal.extend_slots([(Some(installed), reply)]);
+            return Some(fatal);
+        };
+        if installed.slot_id.0 as usize != slot_index {
+            let mut fatal = gemma4_prefill_batch_fatal(
+                lanes,
+                anyhow::anyhow!(
+                    "Gemma4 installed prefill handle {installed:?} disagrees with slot {slot_index}"
+                ),
+                SlotAwareFatalKind::Invariant,
+            );
+            fatal.extend_slots([(Some(installed), reply)]);
+            return Some(fatal);
+        }
+        lanes.push(Gemma4PrefillBatchLane {
+            handle: installed,
+            state,
+            reply,
+            plan: Gemma4PrefillPlan {
+                start: 0,
+                end: 0,
+                capture_anchor: false,
+                ready: false,
+            },
+        });
+    }
+    if lanes.first().is_none_or(|lane| lane.handle != handle) {
+        return Some(gemma4_prefill_batch_fatal(
+            lanes,
+            anyhow::anyhow!("Gemma4 installed prefill batch lost its scheduled primary handle"),
+            SlotAwareFatalKind::Invariant,
+        ));
+    }
+
+    let progresses: Vec<_> = lanes.iter().map(|lane| lane.state.progress).collect();
+    let plans =
+        match gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize) {
+            Ok(plans) => plans,
+            Err(error) => {
+                return Some(gemma4_prefill_batch_fatal(
+                    lanes,
+                    error,
+                    SlotAwareFatalKind::Invariant,
+                ));
+            }
+        };
+    for (lane, plan) in lanes.iter_mut().zip(plans) {
+        lane.plan = plan;
+        if let Err(error) = validate_gemma4_slot_cursor(guard, lane.handle.slot_id, plan.start) {
+            return Some(gemma4_prefill_batch_fatal(
+                lanes,
+                error,
+                SlotAwareFatalKind::Invariant,
+            ));
+        }
+    }
+
+    let max_decode_tokens = lanes
+        .iter()
+        .map(|lane| lane.state.params.max_tokens.max(1))
+        .max()
+        .unwrap_or(1);
+    clear_gemma4_self_mounts(guard.model);
+    let started = Instant::now();
+    let forward = if start_at_zero {
+        let seqs: Vec<_> = lanes
+            .iter()
+            .map(|lane| {
+                (
+                    lane.state.prompt_tokens[..lane.plan.end].to_vec(),
+                    lane.handle.slot_id,
+                )
+            })
+            .collect();
+        let scaffold = guard
+            .hybrid
+            .as_deref()
+            .expect("batch support checked hybrid");
+        supervised_gemma4_gpu_call(supervisor, "gemma4_installed_cold_prefill", || {
+            guard.model.weights.forward_prefill_batched_multi_seq(
+                &seqs,
+                scaffold,
+                max_decode_tokens,
+                &mut guard.model.ctx,
+            )
+        })
+    } else {
+        let seqs: Vec<_> = lanes
+            .iter()
+            .map(|lane| {
+                (
+                    lane.state.prompt_tokens[lane.plan.start..lane.plan.end].to_vec(),
+                    lane.handle.slot_id,
+                    lane.plan.start,
+                )
+            })
+            .collect();
+        let scaffold = guard
+            .hybrid
+            .as_deref()
+            .expect("batch support checked hybrid");
+        supervised_gemma4_gpu_call(supervisor, "gemma4_installed_live_prefill", || {
+            guard.model.weights.forward_prefill_batched_multi_seq_live(
+                &seqs,
+                scaffold,
+                max_decode_tokens,
+                &mut guard.model.ctx,
+            )
+        })
+    };
+    let elapsed = started.elapsed();
+    clear_gemma4_self_mounts(guard.model);
+
+    let output = match forward {
+        Ok(output) => output,
+        Err(error) if is_worker_fatal(supervisor, &error) => {
+            return Some(gemma4_prefill_batch_fatal(
+                lanes,
+                error,
+                SlotAwareFatalKind::Gpu,
+            ));
+        }
+        Err(error) => {
+            let reset_failure = lanes.iter().find_map(|lane| {
+                reset_gemma4_slot(guard, scheduler, lane.handle, kv_bytes_per_token).err()
+            });
+            if let Some(reset_error) = reset_failure {
+                return Some(gemma4_prefill_batch_fatal(
+                    lanes,
+                    reset_error,
+                    SlotAwareFatalKind::Invariant,
+                ));
+            }
+            let message = format!("Gemma4 installed prefill batch failed: {error:#}");
+            for lane in lanes {
+                let slot_index = lane.handle.slot_id.0 as usize;
+                retained_tokens[slot_index].clear();
+                prompt_anchors[slot_index] = None;
+                scheduler.release(lane.handle);
+                slot_fire_done(lane.reply, Err(anyhow::anyhow!(message.clone())), false);
+            }
+            return None;
+        }
+    };
+
+    let cursor_commits: Vec<_> = lanes
+        .iter()
+        .map(|lane| (lane.handle.slot_id, lane.plan.start, lane.plan.end))
+        .collect();
+    if let Err(error) = commit_gemma4_slot_cursors(guard, &cursor_commits) {
+        return Some(gemma4_prefill_batch_fatal(
+            lanes,
+            error,
+            SlotAwareFatalKind::Invariant,
+        ));
+    }
+
+    tracing::info!(
+        requests = lanes.len(),
+        advanced_tokens = cursor_commits
+            .iter()
+            .map(|(_, start, end)| end - start)
+            .sum::<usize>(),
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        "Gemma4 installed prefills advanced in one aggregate-bounded transaction"
+    );
+
+    let mut lanes = lanes.into_iter();
+    let mut first_tokens = output.first_tokens.into_iter();
+    let mut logits = output.logits.into_iter();
+    while let Some(lane) = lanes.next() {
+        let Gemma4PrefillBatchLane {
+            handle,
+            state,
+            reply,
+            plan,
+        } = lane;
+        let first_token = first_tokens
+            .next()
+            .expect("multi-seq prefill validated first-token count");
+        let first_logits = logits
+            .next()
+            .expect("multi-seq prefill validated logits count");
+        let advance = match state.finish_committed_transaction(
+            guard,
+            registration,
+            plan,
+            first_token,
+            Some(&first_logits),
+            elapsed,
+        ) {
+            Ok(advance) => advance,
+            Err(error) => {
+                let mut fatal = SlotAwareGpuFatal::invariant_slot(handle, reply, error);
+                fatal.extend_slots(lanes.map(|lane| (Some(lane.handle), lane.reply)));
+                return Some(fatal);
+            }
+        };
+        if let Some(mut fatal) = install_gemma4_prefill_advance(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            registration,
+            handle,
+            kv_bytes_per_token,
+            reply,
+            advance,
+        ) {
+            fatal.extend_slots(lanes.map(|lane| (Some(lane.handle), lane.reply)));
+            return Some(fatal);
         }
     }
     if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
@@ -25007,6 +25518,42 @@ mod tests {
     fn deepseek4_cold_cohort_bounds_decode_while_bounded_prefill_remains() {
         assert_eq!(
             deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Idle,
+                false,
+                false,
+                true,
+                0,
+                0,
+                false,
+                true,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Idle,
+                admission_open: true,
+                rerun_admission: true,
+            },
+            "a staggered warm continuation must join an active decoder while another slot is free"
+        );
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Idle,
+                true,
+                false,
+                false,
+                0,
+                0,
+                false,
+                true,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Idle,
+                admission_open: false,
+                rerun_admission: false,
+            },
+            "a full warm cohort must not over-admit"
+        );
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
                 Deepseek4ColdCohortPhase::Filling,
                 true,
                 false,
@@ -36343,6 +36890,82 @@ mod gemma4_bounded_prefill_tests {
         assert_eq!((cached_boundary.start, cached_boundary.end), (2_500, 3_000));
         assert!(cached_boundary.capture_anchor);
         assert_eq!(cached.cursor(), 2_500);
+    }
+
+    #[test]
+    fn gemma_installed_prefill_batch_shares_one_aggregate_transaction() {
+        let progresses = vec![
+            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+        ];
+        let plans =
+            gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
+                .unwrap();
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| (plan.start, plan.end))
+                .collect::<Vec<_>>(),
+            vec![
+                (7_174, 8_198),
+                (7_174, 8_198),
+                (7_174, 8_198),
+                (7_174, 8_198),
+            ]
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.end - plan.start)
+                .sum::<usize>(),
+            4_096
+        );
+
+        let uneven = vec![
+            Gemma4PrefillProgress::new(9_900, 10_000, None).unwrap(),
+            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+        ];
+        let plans = gemma4_prefill_batch_plans(&uneven, 4_096).unwrap();
+        assert_eq!(plans[0].end - plans[0].start, 100);
+        assert_eq!(plans[1].end - plans[1].start, 1_998);
+        assert_eq!(plans[2].end - plans[2].start, 1_998);
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.end - plan.start)
+                .sum::<usize>(),
+            4_096
+        );
+    }
+
+    #[test]
+    fn gemma_long_text_admission_cohort_is_fifo_and_gpu_free() {
+        let params = SamplingParams {
+            max_tokens: 64,
+            ..SamplingParams::default()
+        };
+        let (reply_a, _rx_a) = oneshot::channel();
+        let (reply_b, _rx_b) = oneshot::channel();
+        let requests = vec![
+            Request::Generate {
+                prompt_tokens: vec![1; 9_000],
+                params: params.clone(),
+                reply: reply_a,
+            },
+            Request::Generate {
+                prompt_tokens: vec![2; 9_000],
+                params,
+                reply: reply_b,
+            },
+            Request::Shutdown,
+        ];
+        assert_eq!(gemma4_deferred_text_prefix_len(requests.iter()), 2);
+        assert!(gemma4_deferred_text_request(&requests[0]));
+        assert!(gemma4_deferred_text_request(&requests[1]));
+        assert!(!gemma4_deferred_text_request(&requests[2]));
     }
 
     #[test]

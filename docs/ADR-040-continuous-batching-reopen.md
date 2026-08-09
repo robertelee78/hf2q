@@ -1324,6 +1324,60 @@ prefill remains unsupported because the resume surface explicitly rejects
 soft tokens. The 4,096-token cap is provisional until eager-versus-resumed
 real-model parity and the long-overlap/cancellation gates pass.
 
+### Failed Gemma aggregate-batch/coalescing spike (2026-08-09)
+
+The first exact `0.1.4` candidate kept every Gemma transaction within 4,096
+rows, but the canonical four-agent gate then processed each 13,936-token
+tool-result continuation as `4,096 + 2,223 + 4` and all four responses took
+36 seconds (16-second gate). A spike raised only the homogeneous cross-slot
+aggregate ceiling to 32,768 and held stable continuations behind the active
+cohort. It reformed two two-lane suffix batches of roughly 12,638 total rows;
+each batch took about 8.1 seconds. One fresh trial still reached 17 seconds and
+failed; an immediate same-process repeat reached the 16-second boundary.
+
+Increasing idle stable coalescing from 25 to 100 ms did form four-lane batches,
+but exposed a real ownership race: an earlier agent's 119-token cold probe
+could reserve another agent's exact retained-cache arena before that delayed
+stable continuation was admitted, producing `Gemma stable resume could not
+reserve exact cache slot`. Falling that request back to bounded cold prefill
+removed the 500 but also removed its cache credit; the fresh four-agent gate
+then observed zero reused tokens and 25--35-second tool-result turns.
+
+Those spike changes were removed. The evidence rules out a larger eager cap,
+queue timing, and cold fallback as release solutions. A future performance
+iteration must either batch the installed resumable states themselves or keep
+stable-batch cohort/terminal ownership until every member can advance without
+allowing a later turn to evict a peer's anchor. The 4,096 fail-closed candidate
+remains the source contract until that design passes the full gate.
+
+### Installed-state aggregate-bounded Gemma spike (2026-08-09)
+
+The next spike implemented the first option without reopening the unsafe eager
+ceiling. Admission installs a contiguous FIFO prefix of compatible long
+plain-text requests without GPU work. A prefill scheduling quantum then plans
+one transaction whose aggregate rows remain at or below 4,096 and divides
+those rows across the installed lanes. Four equal lanes therefore advance
+1,024 rows each; cursor validation, the single batched forward, all-regime
+cursor commit, scheduler accounting, anchor publication, and reply ownership
+remain ordered at the same transaction boundary.
+
+A functional M5 Max run of binary
+`e3a4b165d73b96fa6b63265d6ae52176b5fa116ddc87fc1de0977c1dd3b80edc`
+proved that the production path actually formed four-lane 4,096-row
+transactions. The four 14,006-token tool-result prompts each retained 7,687
+cached tokens, completed with valid responses, reported no fatal worker error,
+and shut down cleanly. Later transactions measured 2.53, 2.71, 2.81, and 2.98
+seconds for 4,096 aggregate rows before the 684-row and 16-row tails.
+
+That run drew from battery power. All four end-to-end continuations were
+reported as 17 seconds by the gate's one-second-resolution timer, one second
+above the 16-second contract. The result is therefore useful correctness and
+falsification evidence, but neither a performance pass nor a reason to relax
+the gate. The implementation remains an Unreleased candidate pending an
+unchanged AC-power rerun with clear thermals, followed by the exact parity,
+cancellation, native-population, and four-agent gates in the shipping
+contract.
+
 ## 7.DEEPSEEK-FAIRNESS — resumable cached suffixes and lopsided cohorts (2026-08-08)
 
 DeepSeek's cold path already yielded at native verifier transactions, but a
@@ -1346,6 +1400,19 @@ barrier lift consume the reply exactly once. Central phase reconciliation
 makes cancellation or ordinary failure of the last prefill return to
 `Idle`/admission rather than
 leaving an empty worker stuck in `Draining`.
+
+A focused 2026-08-09 hardware gate then caught two staggered-request cases the
+co-admitted four-agent receipt did not cover. `Idle` admission now opens when
+any slot is free, allowing a cached suffix to join an existing decoder; a
+cancelled cached suffix restores only a position-consistent, unpoisoned turn
+anchor instead of deleting the reusable prefix. On release binary
+`ee576b75e86623dd5887224450d37dcf6c9bad5d5f5f955338267ff6b9124076`, the
+suffix yielded across three transactions with two peer decode-progress events
+between them. Cancellation at transaction three stopped without another
+transaction, incremented the counter once, emitted no terminal Done, and the
+next request reused 7,174 cached tokens. `scripts/test_deepseek4_cached_suffix.sh`
+is the reproducible focused gate; clean packed-artifact and full four-agent
+receipts remain release requirements.
 
 ## 8. References
 
