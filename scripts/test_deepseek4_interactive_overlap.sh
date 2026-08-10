@@ -76,10 +76,10 @@ jq -n --arg model "$MODEL" '{
   messages: [
     {role:"system", content:"You are the interactive lane in a deterministic scheduling test."},
     {role:"assistant", content:"Ready."},
-    {role:"user", content: (([range(0; 450) | "x"] | join(" ")) + "\nWrite a short deterministic response.")}
+    {role:"user", content: (([range(0; 450) | "x"] | join(" ")) + "\nWrite the integers one through sixty-four in words, separated by spaces, then write DONE.")}
   ],
   temperature: 0,
-  max_tokens: 8,
+  max_tokens: 128,
   stream: true,
   stream_options: {include_usage: true}
 }' >"$short_request"
@@ -118,7 +118,7 @@ curl --fail-with-body --silent --show-error --no-buffer \
   --data-binary "@$long_request" "$BASE_URL/v1/chat/completions" \
   >"$long_sse" 2>"$OUT_DIR/long.stderr" &
 long_pid=$!
-short_started=$(wait_for_log 'DeepSeek-V4 request started.*max_tokens=8( |$)')
+short_started=$(wait_for_log 'DeepSeek-V4 request started.*max_tokens=128( |$)')
 short_request_id=$(sed -n 's/.*request_id=\([0-9][0-9]*\).*/\1/p' <<<"$short_started")
 long_started=$(wait_for_log 'DeepSeek-V4 request started.*max_tokens=64( |$)')
 long_request_id=$(sed -n 's/.*request_id=\([0-9][0-9]*\).*/\1/p' <<<"$long_started")
