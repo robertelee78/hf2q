@@ -29,6 +29,7 @@ exclude = [
     "tests/**",
     "!tests/continuous_batching_throughput.rs",
     "!tests/convert_integration.rs",
+    "!tests/lcp_partial_prefill_byte_identity.rs",
     "!tests/lcp_registry_unit.rs",
     "!tests/fixtures/deepseek_v4_encoding/**",
     "!tests/fixtures/ggml_quants/**",
