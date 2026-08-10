@@ -113,11 +113,13 @@ jobs:
             scripts/test_qwen36_cumulative_release.sh \
             scripts/test_deepseek4_agentic.sh \
             scripts/test_deepseek4_cached_suffix.sh \
+            scripts/test_deepseek4_cached_suffix_contract.sh \
             scripts/test_deepseek4_interactive_overlap.sh \
             scripts/test_agentic_cache_lifecycle.sh \
             scripts/test_gemma4_long_short_overlap.sh \
             scripts/run_agentic_cache_release_gate.sh
           bash scripts/test_qwen36_watchdog_harness_contract.sh
+          bash scripts/test_deepseek4_cached_suffix_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
             --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
