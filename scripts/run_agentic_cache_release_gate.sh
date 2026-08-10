@@ -167,6 +167,19 @@ wait_ready() {
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
+verify_sha256_sidecar() {
+  local receipt=$1
+  [[ -s "$receipt" ]] || {
+    echo "receipt is missing or empty: $receipt" >&2
+    return 1
+  }
+  [[ -s "$receipt.sha256" ]] || {
+    echo "receipt checksum sidecar is missing or empty: $receipt.sha256" >&2
+    return 1
+  }
+  shasum -a 256 -c "$receipt.sha256" >/dev/null
+}
+
 verify_model() {
   local family=$1
   local model=$2
@@ -308,7 +321,7 @@ run_deepseek_release_gates() {
     scripts/test_deepseek4_interactive_overlap.sh \
       >"$OUT_ROOT/deepseek/interactive.stdout" \
       2>"$OUT_ROOT/deepseek/interactive.stderr"
-  shasum -a 256 -c "$OUT_ROOT/deepseek/interactive/summary.sha256" >/dev/null
+  verify_sha256_sidecar "$OUT_ROOT/deepseek/interactive/summary.json"
 
   BASE_URL="$current_url" MODEL="Deepseek v4 Flash 0731 Source" \
   SERVER_LOG="$current_log" SERVER_PID="$server_pid" \
@@ -320,7 +333,7 @@ run_deepseek_release_gates() {
     scripts/test_deepseek4_cached_suffix.sh \
       >"$OUT_ROOT/deepseek/cached-suffix.stdout" \
       2>"$OUT_ROOT/deepseek/cached-suffix.stderr"
-  shasum -a 256 -c "$OUT_ROOT/deepseek/cached-suffix/summary.sha256" >/dev/null
+  verify_sha256_sidecar "$OUT_ROOT/deepseek/cached-suffix/summary.json"
   run_lifecycle deepseek 3230
   finish_server_phase
   run_deepseek_wave 1
@@ -337,7 +350,7 @@ run_qwen_release_gates() {
   SHORT_FIXTURE_JSON="$OUT_ROOT/fixtures/public-short.json" MAX_SLOTS=4 \
   OUT_DIR="$OUT_ROOT/qwen/cumulative" scripts/test_qwen36_cumulative_release.sh \
     >"$OUT_ROOT/qwen/cumulative.stdout" 2>"$OUT_ROOT/qwen/cumulative.stderr"
-  shasum -a 256 -c "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json.sha256" >/dev/null
+  verify_sha256_sidecar "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json"
   run_lifecycle qwen 2800
   finish_server_phase
 
@@ -351,7 +364,7 @@ run_qwen_release_gates() {
   REQUIRE_PROVENANCE=1 OUT_DIR="$OUT_ROOT/qwen/cancellation" \
     scripts/test_qwen36_prefill_cancellation.sh \
       >"$OUT_ROOT/qwen/cancellation.stdout" 2>"$OUT_ROOT/qwen/cancellation.stderr"
-  shasum -a 256 -c "$OUT_ROOT/qwen/cancellation/cancellation-summary.json.sha256" >/dev/null
+  verify_sha256_sidecar "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
   finish_server_phase
 }
 
@@ -415,7 +428,7 @@ run_gemma_release_gates() {
   MODEL_PATH="$GEMMA_MODEL" MODEL_SHA256="$GEMMA_MODEL_SHA256" MAX_SLOTS=4 \
   OUT_DIR="$OUT_ROOT/gemma/overlap" scripts/test_gemma4_long_short_overlap.sh \
     >"$OUT_ROOT/gemma/overlap.stdout" 2>"$OUT_ROOT/gemma/overlap.stderr"
-  shasum -c "$OUT_ROOT/gemma/overlap/summary.json.sha256" >/dev/null
+  verify_sha256_sidecar "$OUT_ROOT/gemma/overlap/summary.json"
   capture_gemma_heap post-overlap
   run_lifecycle gemma 2800
   capture_gemma_heap post-lifecycle
