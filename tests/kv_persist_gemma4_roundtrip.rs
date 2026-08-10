@@ -862,6 +862,10 @@ fn env_gate_predicate_is_well_formed() {
 /// or readyz timeout under `HF2Q_KV_PERSIST_E2E=1`.
 #[test]
 fn kv_persist_gemma4_roundtrip_matrix_e2e() {
+    // The always-on predicate tests below temporarily mutate the process-wide
+    // master gate. Serialize this reader with them so a normal parallel
+    // `cargo test` cannot accidentally enter the real-model branch.
+    let _guard = ENV_LOCK.lock().unwrap();
     let active = std::env::var(ENV_E2E_GATE).as_deref() == Ok("1");
     if !active {
         eprintln!(

@@ -3162,6 +3162,13 @@ fn qwen35_next_prefill_end(
 }
 
 impl Qwen35PrefillState {
+    /// Immutable rendered prompt owned by an in-flight bounded prefill. The
+    /// scheduler uses this only for busy-slot affinity: it must wait for this
+    /// request to finish before the prefix becomes reusable.
+    pub(crate) fn prompt_tokens(&self) -> &[u32] {
+        &self.prompt_tokens
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         prompt_tokens: Vec<u32>,

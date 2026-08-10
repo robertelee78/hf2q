@@ -1313,10 +1313,14 @@ The limit is per Metal transaction, not per logical lane. Cross-slot admission
 validates every lane before scheduler admission and coalesces only a contiguous
 FIFO class whose aggregate rendered rows are at most 4,096. Cold and stable
 resume classes do not reorder across each other; the overflow request and its
-tail return to the front of the worker-local queue. Both multi-sequence helper
-functions independently enforce the same aggregate bound so a direct caller
-cannot multiply it by `max_slots` (16,384 rows at the canonical four slots or
-32,768 at the supported maximum eight).
+tail return to the front of the worker-local queue. The production engine owns
+the aggregate bound: its collector, installed-state planner, and stable-resume
+planner validate the rows before either multi-sequence forward helper is
+called. The lower-level helpers validate tensor/KV shape but are not public
+serving admission APIs, so tests and hardware receipts must bind the engine
+planner rather than claim an independent helper-side limit. This prevents the
+serving path from multiplying the transaction by `max_slots` (16,384 rows at
+the canonical four slots or 32,768 at the supported maximum eight).
 
 Gemma's persistent HB, hybrid, dense, and MLX sequence cursors previously were
 not a production transaction ledger. The candidate prevalidates every engaged
@@ -1381,6 +1385,119 @@ the gate. The implementation remains an Unreleased candidate pending an
 unchanged AC-power rerun with clear thermals, followed by the exact parity,
 cancellation, native-population, and four-agent gates in the shipping
 contract.
+
+## 7.CACHE-LIFECYCLE — active-prefix ownership and cancellation rollback (2026-08-09)
+
+The first public `0.1.5` OpenCode sessions exposed a cross-family lifecycle
+failure that ordinary exact-replay tests did not cover. A completed long turn
+could retain roughly 100K prompt tokens in one physical slot while an exact
+retry or extension arrived during work that still owned that slot. The selectors
+scored only idle metadata, or scored active metadata and then excluded its slot
+at reservation time. The request was consequently admitted cold into another
+free slot. The operator saw prompt progress return to zero even though the
+shared conversation prefix had just completed.
+
+The candidate uses one tri-state affinity contract in Qwen, Gemma, and
+DeepSeek. A reusable idle prefix is runnable. A strictly stronger active or
+reserved prefix is a wait condition, not a cache hit and not a cold request.
+An equal idle match wins so an unrelated active lane cannot create needless
+head-of-line blocking. Active prefill prompt tokens participate in affinity
+even before a retained ledger or anchor has been published. Queue selection
+and physical-slot reservation consume the same classification; they may not
+independently reinterpret a request's cache state.
+
+Cancellation is a transaction boundary, not permission to erase committed
+conversation state. Each request begins with a private rollback checkpoint.
+Gemma and DeepSeek keep anchors captured while the request advances as private
+candidates until the request succeeds. Qwen has one explicit earlier commit
+point: after a bounded prefill transaction successfully reaches the stable
+pre-generation boundary, it installs that checkpoint before checking the
+post-transaction disconnect edge. That committed prompt checkpoint may
+supersede Qwen's pre-request rollback metadata; the later generation tail is
+still private. On client disconnect, each family restores only a nonempty,
+position-consistent, unpoisoned committed checkpoint and republishes its
+matching token ledger. If validation or restoration fails, the slot resets
+cold. Gemma applies commit-before-disconnect ordering to its all-regime cursor;
+DeepSeek keeps the committed turn anchor separate from the mutable in-request
+candidate.
+
+The same rollback applies to an ordinary, nonfatal resumable-prefill failure:
+Gemma restores each affected lane independently from its owned checkpoint,
+DeepSeek restores or cold-resets before reuse, and Qwen never republishes a
+cursor whose transaction did not complete. A fatal GPU or cursor invariant
+still poisons the worker; rollback is not an in-process recovery mechanism for
+an unhealthy Metal device.
+
+Two adjacent invalidation rules are part of the same contract. Inline Embed
+may borrow an idle physical slot, but it must clear that slot's retained ledger
+and prompt anchor before the embedding forward mutates or resets its KV. A dead
+stream is resolved before free-slot and active-affinity gating in every family.
+Qwen additionally resolves a deterministic terminal-response-cache hit before
+those gates because that replay needs no physical KV. Gemma and DeepSeek do not
+advertise that Qwen-only cache; they replay their retained family-specific KV
+checkpoint instead. Qwen response-cache keys include `reasoning_forced_open`;
+stable-prefix layout metadata remains excluded because it does not change
+response semantics. Requests with `logprobs=true` bypass terminal response
+caching because the cache does not retain the live per-token logprob payload;
+replaying only text would silently change the OpenAI response.
+
+The worker-owned wait queue is bounded to the public request-channel capacity
+for ordinary requests, with one non-evictable Shutdown sentinel. Intake first
+removes dead streams, then classifies cache/slot readiness. When the bound is
+full, runnable work may displace the newest active-prefix waiter, but never an
+earlier runnable request or Shutdown; every displaced request receives an
+explicit busy terminal. This keeps a full set of active-prefix waiters from
+hiding a later cache hit, free-slot request, control, or shutdown.
+
+Model-free selector, persistence, short-tail, and rollback-policy tests are
+necessary but not release authority. `scripts/test_agentic_cache_lifecycle.sh`
+is the cross-family user-shaped gate: on a fresh one-model process it builds a
+long required-tool turn, proves a cached continuation, starts a long streamed
+turn, submits its exact retry while the strongest prefix is active, cancels
+the owner, requires the queued retry to report substantial cached
+tokens, then reuses the arena for an unrelated exact-output conversation and
+rejects private-prefix-sized reuse or semantic leakage. Qwen, Gemma, and
+DeepSeek must each pass that unchanged gate from the exact packed artifact,
+one model process at a time, before this candidate is called release-worthy.
+The manual `.github/workflows/cache-lifecycle.yml` workflow is the executable
+authority for that requirement: it checks out an exact current-main SHA,
+packages it, builds from the extracted crate, holds a `caffeinate` assertion,
+checks AC power continuously, and runs one large-model process at a time. In
+addition to the shared lifecycle, it runs Qwen's deterministic overlap,
+three cold four-agent waves, native heap series, and fresh one-slot disconnect;
+Gemma's long-prefill overlap/cancellation, four- and eight-slot transaction
+caps, native heap series, and exact eager/resumed output parity; and DeepSeek's
+cached-suffix cancellation matrix, lopsided overlap with terminal parking, and
+two fresh four-agent waves. It uploads one manifest binding the source SHA,
+crate SHA-256, binary SHA-256, protected GGUF SHA-256 values, every receipt
+digest, and the load-bearing result fields. Guard-process health and the
+visible `caffeinate` assertion are checked before and after every family and
+immediately before the manifest is sealed; the text-only Gemma lane explicitly
+disables any local-default projector. `.github/workflows/release.yml` requires
+a successful run at the same SHA, rehashes every downloaded receipt, validates
+the detailed family predicates, and requires the crate digest to equal the
+newly reproduced publication artifact before `cargo publish` can execute.
+For this release the protected model identities are DeepSeek
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
+Gemma `82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`,
+and Qwen `f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`
+(SHA-256 of each GGUF). Repository variables carry both the canonical local
+path and expected digest; changing either byte identity requires a new bound
+hardware receipt.
+
+The pre-commit 0.1.6 candidate binary
+`da970f10a3866048dfb1d2ce9f727e71c2aa31402374223265be3170cf1744bf`
+passed that functional lifecycle on an M5 Max for all three families. Qwen
+reused 103,910 tokens on the seed continuation and 104,043 after cancelling
+the active owner; Gemma reused 112,115 and 112,271; DeepSeek reused 123,077 and
+123,178. Every active stream ended without `[DONE]`, and every unrelated
+conversation reported zero cached tokens and returned `ISOLATION_OK`. The
+summary SHA-256 values are `c538ca38134defda1c37292d1465ecfd2ecc872fcdaa39ee2c0d0dff9be0e8e4`
+(Qwen), `3a8622a34d6f11529f9d12d286c20c4c0dfa9a2af633eac495700f2e26c83a54`
+(Gemma), and `67d18dec8594838ed1d40a55d4a524a8bdcd6fbe5ec1c48ecdceb99047ef2f56`
+(DeepSeek). These are correctness receipts only: power was not continuously
+bound for the full sequence, and the source was not yet an immutable packed
+artifact. They do not discharge the exact-release requirement above.
 
 ## 7.DEEPSEEK-FAIRNESS — resumable cached suffixes and lopsided cohorts (2026-08-08)
 

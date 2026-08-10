@@ -43,6 +43,9 @@ on:
         required: false
         default: "1000"
 
+permissions:
+  contents: read
+
 concurrency:
   group: release-check-${{ github.ref }}
   cancel-in-progress: false
@@ -58,17 +61,23 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Resolve GGUF path
         id: gguf
         shell: bash
+        env:
+          INPUT_GGUF_PATH: ${{ inputs.gguf_path }}
+          CONFIGURED_GGUF_PATH: ${{ vars.GGUF_PATH }}
         run: |
           set -euo pipefail
-          p="${{ inputs.gguf_path }}"
+          p="$INPUT_GGUF_PATH"
           if [[ -z "$p" ]]; then
-            p="${{ vars.GGUF_PATH }}"
+            p="$CONFIGURED_GGUF_PATH"
           fi
+          [[ "$p" != *$'\n'* && "$p" != *$'\r'* ]]
           if [[ -z "$p" ]]; then
             echo "error: no GGUF path supplied (pass workflow input gguf_path or set repo variable GGUF_PATH)" >&2
             exit 1
@@ -80,12 +89,12 @@ jobs:
           echo "path=$p" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain (1.88.0, as pinned in Cargo.toml)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.88.0"
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -100,8 +109,13 @@ jobs:
       - name: scripts/release-check.sh
         env:
           GGUF_PATH: ${{ steps.gguf.outputs.path }}
+          MIN_DECODE_TPS: ${{ inputs.min_decode_tps }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
         run: |
+          set -euo pipefail
+          [[ "$MIN_DECODE_TPS" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]]
           scripts/release-check.sh \
             "$GGUF_PATH" \
-            --min-decode-tps "${{ inputs.min_decode_tps }}" \
-            --max-tokens "${{ inputs.max_tokens }}"
+            --min-decode-tps "$MIN_DECODE_TPS" \
+            --max-tokens "$MAX_TOKENS"

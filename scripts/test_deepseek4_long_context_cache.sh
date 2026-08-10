@@ -7,7 +7,9 @@ set -euo pipefail
 # miss; a tool result is then appended as the next agentic turn.  The final
 # request reserves enough generation headroom to cross the initial 131,072
 # physical-cache boundary and must still reuse nearly the whole long prefix
-# instead of prefilling the conversation again.
+# instead of prefilling the conversation again. A final tiny user turn proves
+# that a retained 9..32-token suffix takes incremental replay instead of the
+# empty-chunk failure that escaped in v0.1.5.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_URL=${BASE_URL:-http://127.0.0.1:8080}
@@ -33,6 +35,7 @@ MAX_TOKENS=${MAX_TOKENS:-128}
 # proves lossless cache growth rather than only same-capacity prefix reuse.
 CONTINUATION_MAX_TOKENS=${CONTINUATION_MAX_TOKENS:-16384}
 SENTINEL=${SENTINEL:-HF2Q_DEEPSEEK_LONG_CONTEXT_CACHE_OK}
+SHORT_TAIL_SENTINEL=${SHORT_TAIL_SENTINEL:-HF2Q_DEEPSEEK_SHORT_TAIL_OK}
 
 for command in awk curl date dirname jq mktemp rm sed; do
   command -v "$command" >/dev/null || {
@@ -70,6 +73,8 @@ long_request="$work_dir/long-request.json"
 long_response="$work_dir/long-response.json"
 continuation_request="$work_dir/continuation-request.json"
 continuation_response="$work_dir/continuation-response.json"
+short_tail_request="$work_dir/short-tail-request.json"
+short_tail_response="$work_dir/short-tail-response.json"
 
 epoch_ms() {
   echo $(( $(date +%s) * 1000 ))
@@ -268,6 +273,54 @@ if [[ "$continuation_content" != "$SENTINEL" ]] || ! jq -e --arg sentinel "$SENT
   exit 1
 fi
 
+# Follow the retained 100K+ conversation with one deliberately tiny user turn.
+# DeepSeek matrix append requires at least 33 cached-suffix tokens, while the
+# recovery checkpoint covers the final eight prompt tokens. This request must
+# therefore exercise a 9..32-token incremental segment before or across that
+# boundary instead of selecting an empty resumable-prefill chunk.
+jq -n --slurpfile base "$continuation_request" --slurpfile prior "$continuation_response" \
+  --arg sentinel "$SHORT_TAIL_SENTINEL" '
+    $base[0]
+    | .messages += [
+        {
+          role: "assistant",
+          content: $prior[0].choices[0].message.content
+        },
+        {
+          role: "user",
+          content: ("Reply exactly " + $sentinel + ".")
+        }
+      ]
+    | .tool_choice = "auto"
+    | .max_tokens = 32
+  ' >"$short_tail_request"
+
+short_tail_started=$(epoch_ms)
+post_json "$short_tail_request" "$short_tail_response"
+short_tail_response_ms=$(( $(epoch_ms) - short_tail_started ))
+short_tail_prompt_tokens=$(jq -r '.usage.prompt_tokens // 0' "$short_tail_response")
+short_tail_cached_tokens=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$short_tail_response")
+short_tail_suffix_tokens=$((short_tail_prompt_tokens - short_tail_cached_tokens))
+short_tail_content=$(jq -r '.choices[0].message.content // empty' "$short_tail_response")
+if (( short_tail_cached_tokens < minimum_continuation_cached )); then
+  echo "long-context gate failed: short follow-up reused only $short_tail_cached_tokens/$short_tail_prompt_tokens tokens" >&2
+  exit 1
+fi
+if (( short_tail_suffix_tokens < 9 || short_tail_suffix_tokens >= 33 )); then
+  echo "long-context gate failed: short follow-up suffix was $short_tail_suffix_tokens tokens; expected 9..32" >&2
+  exit 1
+fi
+if [[ "$short_tail_content" != "$SHORT_TAIL_SENTINEL" ]] || ! jq -e --arg sentinel "$SHORT_TAIL_SENTINEL" '
+  (.choices | length) == 1
+  and .choices[0].finish_reason == "stop"
+  and .choices[0].message.content == $sentinel
+  and ((.choices[0].message.tool_calls // []) | length) == 0
+' "$short_tail_response" >/dev/null; then
+  echo "long-context gate failed: short cached continuation was not one terminal sentinel response" >&2
+  jq '.choices[0]' "$short_tail_response" >&2
+  exit 1
+fi
+
 jq -n \
   --argjson calibration_tokens "$calibration_tokens" \
   --argjson long_prompt_tokens "$long_prompt_tokens" \
@@ -278,7 +331,11 @@ jq -n \
   --argjson continuation_cached_tokens "$continuation_cached_tokens" \
   --argjson continuation_max_tokens "$CONTINUATION_MAX_TOKENS" \
   --argjson continuation_ttft_ms "$continuation_ttft_ms" \
-  --argjson continuation_response_ms "$continuation_response_ms" '{
+  --argjson continuation_response_ms "$continuation_response_ms" \
+  --argjson short_tail_prompt_tokens "$short_tail_prompt_tokens" \
+  --argjson short_tail_cached_tokens "$short_tail_cached_tokens" \
+  --argjson short_tail_suffix_tokens "$short_tail_suffix_tokens" \
+  --argjson short_tail_response_ms "$short_tail_response_ms" '{
     status: "pass",
     calibration_tokens: $calibration_tokens,
     growing_prompt: {
@@ -299,5 +356,11 @@ jq -n \
       ),
       ttft_ms: $continuation_ttft_ms,
       response_ms: $continuation_response_ms
+    },
+    short_tail_continuation: {
+      prompt_tokens: $short_tail_prompt_tokens,
+      cached_tokens: $short_tail_cached_tokens,
+      suffix_tokens: $short_tail_suffix_tokens,
+      response_ms: $short_tail_response_ms
     }
   }'

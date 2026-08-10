@@ -2,10 +2,10 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-09 — the cached-suffix/cancellation gate remains valid,
-  but an OpenCode-scale 107,045-token cold overlap falsified the one-token
-  mixed-progress policy as interactive UX; the bounded mixed-work replacement
-  below is a release candidate pending exact-artifact hardware proof
+- **Updated:** 2026-08-10 — cross-family lifecycle review added active-prefix
+  affinity, request-local rollback, and the DeepSeek Busy-only admission
+  no-spin correction. The bounded mixed-work replacement and cache lifecycle
+  are release candidates pending immutable packed-artifact hardware proof.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1079,6 +1079,18 @@ prefill rate is not used for a performance claim.
 
 ### Cached-suffix overlap and cancellation revalidation (2026-08-09)
 
+A released `0.1.5` OpenCode continuation exposed a short-tail planner defect
+after reusing 107,066 tokens. The rendered request added 24 tokens, split at
+the recovery-anchor boundary into 16 and 8 tokens. DeepSeek's verifier
+correctly declines matrix append below its 33-token minimum, but the resumable
+serve adapter accepted incremental replay only for the final eight recovery
+tokens and rejected the preceding 16-token segment as an empty chunk.
+Resumable prefill now treats every nonempty sub-33-token segment as incremental
+replay and captures the recovery anchor when that replay reaches its boundary.
+The exact `107066 + 16 + 8` shape is pinned by a model-free regression; release
+authority still requires the retained-prefix OpenCode continuation on the
+packed artifact.
+
 The first focused overlap run exposed a scheduler-policy defect that the
 co-admitted four-agent gate could not see. `Idle` meant that no cold-cohort
 barrier was active, but admission reopened only when every physical slot was
@@ -1117,6 +1129,51 @@ The atomic summary is under the host temporary receipt root
 hardware evidence for the two repaired invariants, not final release
 authority: a clean packed-artifact rerun and the unchanged full four-agent
 quality/performance gate remain required.
+
+### Busy-affinity admission progress correction (2026-08-10 candidate)
+
+The cross-family lifecycle gate reproduced the operator's long-session shape
+with a 116,776-token DeepSeek prompt. The active request correctly reused
+116,725 tokens, and an exact retry correctly selected the active slot as its
+strictly strongest affinity. The worker then stopped making scheduler
+progress: `Idle` cohort reconciliation treated any nonempty pending queue as a
+reason to rerun admission while another physical slot was free. Because a
+Busy-affinity retry is deliberately not admissible until its owner releases
+the retained cache, the next admission pass selected nothing and immediately
+reran again before `scheduler.step()`. A two-second process sample placed
+essentially the entire slot-aware worker in repeated
+`deepseek4_request_affinity` scans of the 116K-token prompt. Decode,
+disconnect observation, checkpoint rollback, and shutdown were all starved.
+
+Reconciliation now distinguishes a nonempty queue from a queue containing
+runnable work. `Cold`, `Cached`, and `Control` requests may request another
+admission pass; a Busy-only queue must fall through to exactly one scheduler
+step. This preserves the strict active-prefix wait, lets the owner observe
+cancellation and restore its request-local anchor, and makes the retry
+runnable from that idle retained session on the next loop. Model-free tests
+pin Busy-only no-rerun and the unchanged runnable behavior of the other three
+affinity classes.
+
+The rebuilt candidate then passed the exact long-context lifecycle after an
+AC-power preflight, with binary SHA-256
+`da970f10a3866048dfb1d2ce9f727e71c2aa31402374223265be3170cf1744bf`.
+The base request rendered to 123,085 tokens and emitted the required
+`lifecycle_probe` tool call. Its seed continuation reused 123,077 of 123,186
+prompt tokens. An active 123,244-token stream then reused 123,193 tokens and
+was cancelled without a terminal `[DONE]`; the queued exact retry immediately
+reused 123,178 tokens rather than beginning a second cold prefill. A separate
+50-token conversation reused zero tokens and returned `ISOLATION_OK`, binding
+conversation isolation. The server subsequently completed its KV drain and
+worker join cleanly. The atomic summary is
+`/var/tmp/hf2q-cache-lifecycle.Casl3W/summary.json`, SHA-256
+`67d18dec8594838ed1d40a55d4a524a8bdcd6fbe5ec1c48ecdceb99047ef2f56`.
+
+This is exact-binary M5 Max correctness evidence for the repaired failure
+path. Because the lifecycle harness does not continuously bind power state,
+performance authority still requires a guarded AC-only rerun. Immutable
+release authority additionally requires the clean committed artifact,
+exact-SHA CI, packed-artifact validation, and the corresponding Qwen/Gemma
+lifecycle gates.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

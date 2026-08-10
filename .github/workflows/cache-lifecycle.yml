@@ -1,0 +1,122 @@
+name: Cache lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact main-branch commit to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-lifecycle-${{ inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  exact-artifact-cache-lifecycle:
+    name: exact packed artifact · DeepSeek + Gemma + Qwen
+    runs-on: [self-hosted, macOS, ARM64, hf2q-gates]
+    timeout-minutes: 300
+    env:
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      EXPECTED_VERSION: "0.1.6"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable main identity and model paths
+        shell: bash
+        env:
+          DEEPSEEK_MODEL_PATH: ${{ vars.DEEPSEEK4_MODEL_PATH }}
+          GEMMA_MODEL_PATH: ${{ vars.GEMMA4_MODEL_PATH }}
+          QWEN_MODEL_PATH: ${{ vars.QWEN36_MODEL_PATH }}
+          DEEPSEEK_MODEL_SHA256: ${{ vars.DEEPSEEK4_MODEL_SHA256 }}
+          GEMMA_MODEL_SHA256: ${{ vars.GEMMA4_MODEL_SHA256 }}
+          QWEN_MODEL_SHA256: ${{ vars.QWEN36_MODEL_SHA256 }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$EXPECTED_SHA"
+          git fetch origin main
+          test "$actual_sha" = "$(git rev-parse origin/main)"
+          git diff --exit-code
+
+          for model in "$DEEPSEEK_MODEL_PATH" "$GEMMA_MODEL_PATH" "$QWEN_MODEL_PATH"; do
+            [[ "$model" != *$'\n'* && "$model" != *$'\r'* ]]
+            test -f "$model"
+          done
+          for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" "$QWEN_MODEL_SHA256"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          done
+          {
+            printf 'DEEPSEEK_MODEL=%s\n' "$DEEPSEEK_MODEL_PATH"
+            printf 'GEMMA_MODEL=%s\n' "$GEMMA_MODEL_PATH"
+            printf 'QWEN_MODEL=%s\n' "$QWEN_MODEL_PATH"
+            printf 'DEEPSEEK_MODEL_SHA256=%s\n' "$DEEPSEEK_MODEL_SHA256"
+            printf 'GEMMA_MODEL_SHA256=%s\n' "$GEMMA_MODEL_SHA256"
+            printf 'QWEN_MODEL_SHA256=%s\n' "$QWEN_MODEL_SHA256"
+          } >> "$GITHUB_ENV"
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Package and build exact artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$actual_version" = "$EXPECTED_VERSION"
+          cargo package --locked
+          crate="$GITHUB_WORKSPACE/target/package/hf2q-${EXPECTED_VERSION}.crate"
+          package_root="$GITHUB_WORKSPACE/target/package/hf2q-${EXPECTED_VERSION}"
+          test -s "$crate"
+          crate_sha=$(shasum -a 256 "$crate" | awk '{print $1}')
+          (
+            cd "$package_root"
+            cargo build --release --locked
+          )
+          binary="$package_root/target/release/hf2q"
+          test -x "$binary"
+          {
+            printf 'PACKAGE_ROOT=%s\n' "$package_root"
+            printf 'HF2Q_BIN=%s\n' "$binary"
+            printf 'CRATE_SHA256=%s\n' "$crate_sha"
+          } >> "$GITHUB_ENV"
+
+      - name: Run guarded cross-family cache lifecycle gate
+        shell: bash
+        env:
+          OUT_ROOT: ${{ runner.temp }}/cache-lifecycle
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_ROOT"
+          EXPECTED_SHA="$EXPECTED_SHA" \
+          CRATE_SHA256="$CRATE_SHA256" \
+          HF2Q_BIN="$HF2Q_BIN" \
+          DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
+          GEMMA_MODEL="$GEMMA_MODEL" \
+          QWEN_MODEL="$QWEN_MODEL" \
+          DEEPSEEK_MODEL_SHA256="$DEEPSEEK_MODEL_SHA256" \
+          GEMMA_MODEL_SHA256="$GEMMA_MODEL_SHA256" \
+          QWEN_MODEL_SHA256="$QWEN_MODEL_SHA256" \
+          OUT_ROOT="$OUT_ROOT" \
+            scripts/run_agentic_cache_release_gate.sh
+
+      - name: Upload exact-artifact receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cache-lifecycle-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/cache-lifecycle
+          if-no-files-found: error
+          retention-days: 30

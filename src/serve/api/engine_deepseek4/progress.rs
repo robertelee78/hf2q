@@ -58,6 +58,10 @@ impl RequestProgress {
         }
     }
 
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub(super) fn plan_prefill(
         &mut self,
         cached_tokens: usize,
@@ -172,6 +176,17 @@ impl RequestProgress {
             chunk_tokens,
             window_cap,
             "DeepSeek-V4 mixed prefill slice"
+        );
+    }
+
+    /// Emit one boundary event so cancellation gates can prove they aborted
+    /// after the request-local candidate checkpoint existed, rather than only
+    /// during the early reusable suffix.
+    pub(super) fn recovery_anchor_captured(&self, anchor_tokens: usize) {
+        tracing::info!(
+            request_id = self.id,
+            anchor_tokens,
+            "DeepSeek-V4 request recovery anchor captured"
         );
     }
 

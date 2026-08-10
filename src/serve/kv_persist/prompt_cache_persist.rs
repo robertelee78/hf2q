@@ -63,7 +63,7 @@ use crate::serve::api::engine::{GrammarKind, PromptCache, PromptCacheKey, ToolCa
 
 /// On-disk schema version for prompt-cache snapshots. Bump on any
 /// breaking schema change.
-pub const PROMPT_CACHE_FORMAT_VERSION: u32 = 1;
+pub const PROMPT_CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Payload-kind tag the spiller uses to route this envelope back to
 /// `restore_prompt_cache` on `post_admit`. Distinct from the
@@ -100,6 +100,7 @@ pub struct PromptCacheKeyPersist {
     pub logprobs: bool,
     pub top_logprobs: u32,
     pub parallel_tool_calls: bool,
+    pub reasoning_forced_open: bool,
     /// `true` iff `cache.key.grammar.is_none()`. Persistence is
     /// gated on this being `true` (see `try_serialize`), so the
     /// flag's only useful state is `true`. Stored explicitly anyway
@@ -142,6 +143,7 @@ pub fn try_serialize(cache: &PromptCache) -> Option<Vec<u8>> {
             logprobs: cache.key.logprobs,
             top_logprobs: cache.key.top_logprobs,
             parallel_tool_calls: cache.key.parallel_tool_calls,
+            reasoning_forced_open: cache.key.reasoning_forced_open,
             grammar_was_none: true,
         },
         text: cache.text.clone(),
@@ -196,6 +198,7 @@ pub fn try_deserialize(bytes: &[u8]) -> Option<PromptCache> {
             logprobs: snap.key.logprobs,
             top_logprobs: snap.key.top_logprobs,
             parallel_tool_calls: snap.key.parallel_tool_calls,
+            reasoning_forced_open: snap.key.reasoning_forced_open,
         },
         text: snap.text,
         reasoning_text: snap.reasoning_text,
@@ -240,8 +243,27 @@ mod tests {
             restored.key.parallel_tool_calls,
             original.key.parallel_tool_calls
         );
+        assert_eq!(
+            restored.key.reasoning_forced_open,
+            original.key.reasoning_forced_open
+        );
         assert!(restored.key.grammar.is_none());
         assert!(restored.fragments.is_none());
+    }
+
+    #[test]
+    fn round_trip_preserves_forced_open_reasoning_identity() {
+        let mut original = fresh_cache(vec![9, 8, 7], "visible answer");
+        original.key.reasoning_forced_open = true;
+        original.reasoning_text = Some("hidden reasoning".to_string());
+
+        let bytes = try_serialize(&original).expect("serialize forced-open cache");
+        let restored = try_deserialize(&bytes).expect("deserialize forced-open cache");
+
+        assert!(restored.key.reasoning_forced_open);
+        assert_eq!(restored.text, original.text);
+        assert_eq!(restored.reasoning_text, original.reasoning_text);
+        assert_eq!(restored.key, original.key);
     }
 
     #[test]

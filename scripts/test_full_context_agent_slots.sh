@@ -9,6 +9,8 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAMILY=${FAMILY:-qwen36}
 AGENTS=${AGENTS:-4}
 OUT_DIR=${OUT_DIR:-$(mktemp -d -t hf2q-full-context-slots.XXXXXX)}
+WAVE_ID=${WAVE_ID:-default}
+REQUIRE_COLD_FIRST=${REQUIRE_COLD_FIRST:-1}
 
 case "$FAMILY" in
   qwen36)
@@ -33,6 +35,14 @@ if ! [[ "$AGENTS" =~ ^[1-9][0-9]*$ ]]; then
   echo "AGENTS must be a positive integer (got: $AGENTS)" >&2
   exit 2
 fi
+[[ "$WAVE_ID" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "WAVE_ID contains unsupported characters: $WAVE_ID" >&2
+  exit 2
+}
+[[ "$REQUIRE_COLD_FIRST" == 0 || "$REQUIRE_COLD_FIRST" == 1 ]] || {
+  echo "REQUIRE_COLD_FIRST must be 0 or 1" >&2
+  exit 2
+}
 
 # The single-agent gate's 40-second cold limit is intentionally strict. Four
 # cold DeepSeek requests share one 100 GiB verifier, so apply the independently
@@ -73,7 +83,8 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 for ((agent = 1; agent <= AGENTS; agent++)); do
-  RUN_ID="full-context-${FAMILY}-agent-${agent}" \
+  RUN_ID="full-context-${FAMILY}-${WAVE_ID}-agent-${agent}" \
+  REQUIRE_COLD_FIRST="$REQUIRE_COLD_FIRST" \
   SENTINEL="HF2Q_${FAMILY_TAG}_AGENT_${agent}_OK" \
     "$GATE" >"$OUT_DIR/agent-${agent}.json" 2>"$OUT_DIR/agent-${agent}.err" &
   pids+=("$!")
@@ -95,13 +106,16 @@ if ((failed != 0)); then
   exit 1
 fi
 
-jq -s --arg family "$FAMILY" --argjson agents "$AGENTS" '
+jq -s --arg family "$FAMILY" --arg wave_id "$WAVE_ID" \
+  --argjson require_cold_first "$REQUIRE_COLD_FIRST" --argjson agents "$AGENTS" '
   if length != $agents or any(.[]; .status != "pass") then
     error("one or more agent receipts did not pass")
   else
     {
       status: "pass",
       family: $family,
+      wave_id: $wave_id,
+      require_cold_first: $require_cold_first,
       concurrent_agents: $agents,
       minimum_cached_tokens: (map(.cached_tokens) | min),
       maximum_cached_ttft_ms: (map(.cached_ttft_ms) | max),

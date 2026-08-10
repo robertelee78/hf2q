@@ -396,6 +396,10 @@ impl Deepseek4SlotState {
         self.finished
     }
 
+    pub(crate) fn request_id(&self) -> u64 {
+        self.progress.id()
+    }
+
     pub(crate) fn finish(
         mut self,
         registration: Option<&ModelRegistration>,

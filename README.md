@@ -315,25 +315,41 @@ gates from a clean hf2q package resolving published `mlx-native 0.10.6`:
   the public 347-tool cold prompt, requires an eight-token interactive quantum
   before a legacy 2,048-token turn can monopolize the worker, and validates
   the complete long tool/SSE result under an uninterrupted AC-power window.
+- `scripts/test_agentic_cache_lifecycle.sh` is the unchanged cross-family
+  cache gate. Against a fresh Qwen, Gemma, or DeepSeek process it creates a
+  long tool conversation, queues an exact retry while the strongest retained
+  prefix is active, cancels the owner, requires the retry to reuse
+  the restored checkpoint, and checks that an unrelated conversation cannot
+  inherit private history. Run it once per process; never co-reside the large
+  family artifacts on a 128 GiB host.
+- `scripts/run_agentic_cache_release_gate.sh` is the release wrapper used by
+  the manual `Cache lifecycle` workflow. It packages the exact main commit,
+  runs DeepSeek, Gemma, and Qwen sequentially under continuous AC and
+  `caffeinate` guards, verifies each GGUF against a protected SHA-256, and
+  emits a source/crate/binary/model-bound manifest that the publication
+  workflow must download and verify.
 
 The governing decisions and the old-failure-versus-final-artifact distinction
 are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.5 serving release
+#### Test the 0.1.6 serving release
 
 Build and verify the exact checkout before loading a model:
 
 ```bash
 cargo check --locked --all-targets --all-features
 cargo build --release --locked
+cargo audit
 
 # These are the focused serving contracts. CI also runs the library,
 # conversion, LCP, fixture, readiness, and parser-negative suites listed in
 # .github/workflows/ci.yml.
 cargo test --locked --bin hf2q --all-features \
   qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+cargo test --locked --bin hf2q --all-features \
+  prompt_cache_ -- --test-threads=1
 cargo test --locked --bin hf2q --all-features \
   gemma4_bounded_prefill_tests -- --test-threads=1
 cargo test --locked --bin hf2q --all-features \

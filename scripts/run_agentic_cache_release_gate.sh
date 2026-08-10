@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exact-artifact, one-model-at-a-time cache lifecycle release authority.
+# This wrapper is intentionally macOS/Apple-Silicon only. It continuously
+# requires AC power, holds a caffeinate assertion, runs the same user-shaped
+# lifecycle fixture for DeepSeek, Gemma, and Qwen, and binds all receipts to
+# one packed crate and release binary.
+
+EXPECTED_SHA=${EXPECTED_SHA:?EXPECTED_SHA is required}
+CRATE_SHA256=${CRATE_SHA256:?CRATE_SHA256 is required}
+HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
+DEEPSEEK_MODEL=${DEEPSEEK_MODEL:?DEEPSEEK_MODEL is required}
+GEMMA_MODEL=${GEMMA_MODEL:?GEMMA_MODEL is required}
+QWEN_MODEL=${QWEN_MODEL:?QWEN_MODEL is required}
+DEEPSEEK_MODEL_SHA256=${DEEPSEEK_MODEL_SHA256:?DEEPSEEK_MODEL_SHA256 is required}
+GEMMA_MODEL_SHA256=${GEMMA_MODEL_SHA256:?GEMMA_MODEL_SHA256 is required}
+QWEN_MODEL_SHA256=${QWEN_MODEL_SHA256:?QWEN_MODEL_SHA256 is required}
+OUT_ROOT=${OUT_ROOT:-$(mktemp -d /var/tmp/hf2q-cache-release.XXXXXX)}
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
+source "$script_dir/qwen36_watchdog_validate.sh"
+
+for command in awk caffeinate cargo curl jq lsof pmset rg sed shasum stat; do
+  command -v "$command" >/dev/null || {
+    echo "missing required command: $command" >&2
+    exit 2
+  }
+done
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "EXPECTED_SHA must be a full Git SHA" >&2
+  exit 2
+}
+[[ "$CRATE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "CRATE_SHA256 must be a SHA-256 digest" >&2
+  exit 2
+}
+[[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not executable: $HF2Q_BIN" >&2; exit 2; }
+for model in "$DEEPSEEK_MODEL" "$GEMMA_MODEL" "$QWEN_MODEL"; do
+  [[ -f "$model" ]] || { echo "model not found: $model" >&2; exit 2; }
+done
+for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" "$QWEN_MODEL_SHA256"; do
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "model SHA-256 values must be lowercase 64-character digests" >&2
+    exit 2
+  }
+done
+
+mkdir -p "$OUT_ROOT"
+parent_pid=$$
+server_pid=""
+power_pid=""
+caffeinate_pid=""
+
+require_ac() {
+  local state
+  state=$(pmset -g batt)
+  printf 'sample_utc=%s\n%s\n' "$(date -u +%FT%TZ)" "$state" \
+    >> "$OUT_ROOT/power.log"
+  rg -q "Now drawing from 'AC Power'" <<<"$state" || {
+    echo "cache lifecycle release gate requires continuous AC power" >&2
+    return 1
+  }
+}
+
+ensure_guard_health() {
+  local assertions=""
+  require_ac
+  [[ ! -e "$OUT_ROOT/power-failure.txt" ]] || {
+    cat "$OUT_ROOT/power-failure.txt" >&2
+    return 1
+  }
+  if [[ -z "$power_pid" ]] || ! kill -0 "$power_pid" 2>/dev/null; then
+    echo "AC power monitor is not running" >&2
+    return 1
+  fi
+  if [[ -z "$caffeinate_pid" ]] || ! kill -0 "$caffeinate_pid" 2>/dev/null; then
+    echo "caffeinate guard is not running" >&2
+    return 1
+  fi
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    assertions=$(pmset -g assertions)
+    if rg -q "pid ${caffeinate_pid}\\(caffeinate\\):" <<<"$assertions"; then
+      printf '%s\n' "$assertions" > "$OUT_ROOT/power-assertions.current.txt"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "caffeinate process has no visible power assertion" >&2
+  return 1
+}
+
+stop_server() {
+  local deadline
+  if [[ -z "$server_pid" ]] || ! kill -0 "$server_pid" 2>/dev/null; then
+    server_pid=""
+    return 0
+  fi
+  kill -INT "$server_pid" 2>/dev/null || true
+  deadline=$((SECONDS + 180))
+  while kill -0 "$server_pid" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 1
+  done
+  if kill -0 "$server_pid" 2>/dev/null; then
+    echo "server did not stop within 180 seconds" >&2
+    kill -TERM "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+    return 1
+  fi
+  wait "$server_pid"
+  server_pid=""
+}
+
+cleanup() {
+  local cleanup_rc=0
+  stop_server || cleanup_rc=1
+  if [[ -n "$power_pid" ]]; then
+    kill -TERM "$power_pid" 2>/dev/null || true
+    wait "$power_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$caffeinate_pid" ]]; then
+    kill -TERM "$caffeinate_pid" 2>/dev/null || true
+    wait "$caffeinate_pid" 2>/dev/null || true
+  fi
+  return "$cleanup_rc"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+require_ac
+pmset -g assertions > "$OUT_ROOT/power-assertions.before.txt"
+caffeinate -dimsu -w "$parent_pid" &
+caffeinate_pid=$!
+(
+  while kill -0 "$parent_pid" 2>/dev/null; do
+    if ! require_ac; then
+      printf 'AC power lost at %s\n' "$(date -u +%FT%TZ)" > "$OUT_ROOT/power-failure.txt"
+      kill -TERM "$parent_pid" 2>/dev/null || true
+      exit 1
+    fi
+    sleep 5
+  done
+) &
+power_pid=$!
+ensure_guard_health
+
+wait_ready() {
+  local base_url=$1
+  local log=$2
+  local deadline=$((SECONDS + 360))
+  while (( SECONDS < deadline )); do
+    if curl --fail --silent --show-error --max-time 2 "$base_url/readyz" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      echo "server exited before readiness" >&2
+      sed -n '1,240p' "$log" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "server did not become ready within 360 seconds" >&2
+  sed -n '1,240p' "$log" >&2
+  return 1
+}
+
+sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+verify_model() {
+  local family=$1
+  local model=$2
+  local expected=$3
+  local actual
+  ensure_guard_health
+  actual=$(sha256_file "$model")
+  test "$actual" = "$expected"
+  mkdir -p "$OUT_ROOT/$family"
+  printf '%s  %s\n' "$actual" "$model" > "$OUT_ROOT/$family/model.sha256"
+}
+
+current_dir=""
+current_log=""
+current_url=""
+
+start_server() {
+  local family=$1
+  local phase=$2
+  local launcher=$3
+  local model=$4
+  local port=$5
+  local max_slots=$6
+  local context_len=${7:-}
+  local kv_budget=${8:-}
+  local -a launcher_env
+
+  ensure_guard_health
+  current_dir="$OUT_ROOT/$family/$phase"
+  current_log="$current_dir/server.log"
+  current_url="http://127.0.0.1:$port"
+  mkdir -p "$current_dir"
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | rg -q .; then
+    echo "release gate port already in use: $port" >&2
+    return 1
+  fi
+  launcher_env=(MODEL="$model" PORT="$port" HF2Q_BIN="$HF2Q_BIN" MAX_SLOTS="$max_slots")
+  [[ -z "$context_len" ]] || launcher_env+=(CONTEXT_LEN="$context_len")
+  [[ -z "$kv_budget" ]] || launcher_env+=(KV_CACHE_BUDGET_BYTES="$kv_budget")
+  if [[ "$family" == gemma ]]; then
+    local disabled_mmproj="$current_dir/mmproj-disabled"
+    [[ ! -e "$disabled_mmproj" ]] || return 1
+    launcher_env+=(MMPROJ="$disabled_mmproj")
+  fi
+  env "${launcher_env[@]}" "$launcher" >"$current_log" 2>&1 &
+  server_pid=$!
+  wait_ready "$current_url" "$current_log"
+}
+
+finish_server_phase() {
+  local ready_file="$current_dir/readyz.json"
+  local ready_code
+  ready_code=$(curl --silent --show-error --max-time 3 -o "$ready_file" \
+    -w '%{http_code}' "$current_url/readyz")
+  [[ "$ready_code" == 200 ]] || return 1
+  stop_server
+  if rg -n 'GPU Timeout|SubmissionsIgnored|engine_unhealthy|panicked at|fatal command.buffer' \
+    "$current_log" >"$current_dir/fatal.log"; then
+    cat "$current_dir/fatal.log" >&2
+    return 1
+  fi
+  : >"$current_dir/fatal.log"
+  sha256_file "$current_log" >"$current_dir/server.log.sha256"
+  ensure_guard_health
+}
+
+run_lifecycle() {
+  local family=$1
+  local context_lines=$2
+  local out="$OUT_ROOT/$family/lifecycle"
+  mkdir -p "$out"
+  BASE_URL="$current_url" \
+  OUT_DIR="$out" \
+  RUN_ID="release-${EXPECTED_SHA:0:12}-$family" \
+  CONTEXT_LINES="$context_lines" \
+  CURL_MAX_TIME_SECONDS=1800 \
+  SEMANTIC_WAIT_SECONDS=300 \
+    scripts/test_agentic_cache_lifecycle.sh \
+      >"$out/stdout.log" 2>"$out/stderr.log"
+  jq -e '.status == "pass"' "$out/summary.json" >/dev/null
+  sha256_file "$out/summary.json" >"$out/summary.json.sha256"
+}
+
+binary_sha=$(sha256_file "$HF2Q_BIN")
+verify_model deepseek "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256"
+verify_model gemma "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256"
+verify_model qwen "$QWEN_MODEL" "$QWEN_MODEL_SHA256"
+
+mkdir -p "$OUT_ROOT/fixtures"
+HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
+HF2Q_QWEN36_WATCHDOG_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-347.json" \
+HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-short.json" \
+  cargo test --locked --bin hf2q \
+    public_347_tool_fixture_renders_to_exact_87972_tokens -- \
+    --ignored --test-threads=1 >"$OUT_ROOT/fixtures/generator.log" 2>&1
+test "$(sha256_file "$OUT_ROOT/fixtures/public-347.json")" = \
+  "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d"
+test "$(sha256_file "$OUT_ROOT/fixtures/public-short.json")" = \
+  "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004"
+
+run_deepseek_wave() {
+  local wave=$1
+  local out="$OUT_ROOT/deepseek/full-context-$wave"
+  mkdir -p "$out"
+  start_server deepseek "process-wave-$wave" scripts/serve_deepseek4_opencode.sh \
+    "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
+  BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
+  WAVE_ID="release-$wave" REQUIRE_COLD_FIRST=1 \
+  MAX_COLD_TTFT_MS=55000 MAX_COLD_RESPONSE_MS=55000 \
+  MAX_CACHED_TTFT_MS=5000 MAX_CACHED_RESPONSE_MS=15000 \
+  MAX_CACHED_SEMANTIC_MS=15000 MAX_TOOL_RESULT_RESPONSE_MS=35000 \
+  CURL_CONNECT_TIMEOUT_SECONDS=5 CURL_MAX_TIME_SECONDS=90 \
+  OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
+    >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+  jq -e '.status == "pass" and .family == "deepseek4" and .concurrent_agents == 4 and (.agents | length) == 4' \
+    "$out/summary.json.tmp" >/dev/null
+  mv "$out/summary.json.tmp" "$out/summary.json"
+  sha256_file "$out/summary.json" >"$out/summary.json.sha256"
+  finish_server_phase
+  jq -n --argjson wave "$wave" --arg binary_sha256 "$binary_sha" \
+    --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
+    --arg summary_sha256 "$(cat "$out/summary.json.sha256")" \
+    --arg server_log_sha256 "$(cat "$current_dir/server.log.sha256")" \
+    --slurpfile receipt "$out/summary.json" \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,receipt:$receipt[0]}' \
+    >"$out/envelope.json.tmp"
+  mv "$out/envelope.json.tmp" "$out/envelope.json"
+}
+
+run_deepseek_release_gates() {
+  start_server deepseek process-a scripts/serve_deepseek4_opencode.sh \
+    "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
+  BASE_URL="$current_url" MODEL="Deepseek v4 Flash 0731 Source" \
+  MODEL_PATH="$DEEPSEEK_MODEL" FIXTURE_JSON="$OUT_ROOT/fixtures/public-347.json" \
+  SERVER_LOG="$current_log" SERVER_PID="$server_pid" \
+  OUT_DIR="$OUT_ROOT/deepseek/interactive" BINARY_PATH="$HF2Q_BIN" \
+  BINARY_SHA256="$binary_sha" MODEL_SHA256="$DEEPSEEK_MODEL_SHA256" \
+  MAX_SLOTS=4 NO_PROGRESS_SECONDS=30 \
+    scripts/test_deepseek4_interactive_overlap.sh \
+      >"$OUT_ROOT/deepseek/interactive.stdout" \
+      2>"$OUT_ROOT/deepseek/interactive.stderr"
+  shasum -a 256 -c "$OUT_ROOT/deepseek/interactive/summary.sha256" >/dev/null
+
+  BASE_URL="$current_url" MODEL="Deepseek v4 Flash 0731 Source" \
+  SERVER_LOG="$current_log" SERVER_PID="$server_pid" \
+  OUT_DIR="$OUT_ROOT/deepseek/cached-suffix" EXPECTED_PATH="$PWD/README.md" \
+  OVERLAP_TOOL_RESULT_PATH="$PWD/README.md" \
+  CANCEL_TOOL_RESULT_PATH="$PWD/docs/ADR-042-deepseek-v4-flash-rust-native.md" \
+  CURL_MAX_TIME_SECONDS=180 PREFILL_CHUNKS_BEFORE_CANCEL=3 \
+  CANCEL_SETTLE_SECONDS=15 CANCEL_STABILITY_SECONDS=10 \
+    scripts/test_deepseek4_cached_suffix.sh \
+      >"$OUT_ROOT/deepseek/cached-suffix.stdout" \
+      2>"$OUT_ROOT/deepseek/cached-suffix.stderr"
+  shasum -a 256 -c "$OUT_ROOT/deepseek/cached-suffix/summary.sha256" >/dev/null
+  run_lifecycle deepseek 3230
+  finish_server_phase
+  run_deepseek_wave 1
+  run_deepseek_wave 2
+}
+
+run_qwen_release_gates() {
+  start_server qwen process-a scripts/serve_qwen36_opencode.sh \
+    "$QWEN_MODEL" 18081 4
+  BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
+  BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
+  MODEL_PATH="$QWEN_MODEL" MODEL_SHA256="$QWEN_MODEL_SHA256" \
+  FIXTURE_JSON="$OUT_ROOT/fixtures/public-347.json" \
+  SHORT_FIXTURE_JSON="$OUT_ROOT/fixtures/public-short.json" MAX_SLOTS=4 \
+  OUT_DIR="$OUT_ROOT/qwen/cumulative" scripts/test_qwen36_cumulative_release.sh \
+    >"$OUT_ROOT/qwen/cumulative.stdout" 2>"$OUT_ROOT/qwen/cumulative.stderr"
+  shasum -a 256 -c "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json.sha256" >/dev/null
+  run_lifecycle qwen 2800
+  finish_server_phase
+
+  start_server qwen process-b scripts/serve_qwen36_opencode.sh \
+    "$QWEN_MODEL" 18081 1
+  BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
+  BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
+  MODEL_PATH="$QWEN_MODEL" MODEL_SHA256="$QWEN_MODEL_SHA256" \
+  FIXTURE_JSON="$OUT_ROOT/fixtures/public-347.json" \
+  SHORT_FIXTURE_JSON="$OUT_ROOT/fixtures/public-short.json" MAX_SLOTS=1 \
+  REQUIRE_PROVENANCE=1 OUT_DIR="$OUT_ROOT/qwen/cancellation" \
+    scripts/test_qwen36_prefill_cancellation.sh \
+      >"$OUT_ROOT/qwen/cancellation.stdout" 2>"$OUT_ROOT/qwen/cancellation.stderr"
+  shasum -a 256 -c "$OUT_ROOT/qwen/cancellation/cancellation-summary.json.sha256" >/dev/null
+  finish_server_phase
+}
+
+run_gemma_wave() {
+  local phase=$1
+  local agents=$2
+  local out="$OUT_ROOT/gemma/$phase"
+  mkdir -p "$out"
+  BASE_URL="$current_url" FAMILY=gemma4 AGENTS="$agents" \
+  WAVE_ID="$phase" REQUIRE_COLD_FIRST=1 \
+  OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
+    >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+  jq -e --argjson agents "$agents" \
+    '.status == "pass" and .family == "gemma4" and .concurrent_agents == $agents and .require_cold_first == 1 and all(.agents[]; .cold_cached_tokens == 0)' \
+    "$out/summary.json.tmp" >/dev/null
+  mv "$out/summary.json.tmp" "$out/summary.json"
+  shasum -a 256 "$out/summary.json" >"$out/summary.json.sha256"
+  shasum -c "$out/summary.json.sha256" >/dev/null
+}
+
+capture_gemma_heap() {
+  local phase=$1
+  ensure_guard_health
+  qwen36_capture_heap_summary "$server_pid" \
+    "$OUT_ROOT/gemma/heap-$phase.txt" "$OUT_ROOT/gemma/heap-$phase.json"
+}
+
+write_gemma_transaction_receipt() {
+  local phase=$1
+  local log=$2
+  local out="$OUT_ROOT/gemma/transactions-$phase.json"
+  local rows="$OUT_ROOT/gemma/transactions-$phase.rows"
+  local max_rows multi_slot nonaligned
+  rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction|stable agent suffixes prefilled in one multi-slot body)' \
+    "$log" >"$rows"
+  [[ -s "$rows" ]] || return 1
+  max_rows=$(sed -n -E 's/.*(advanced_tokens|suffix_tokens)=([0-9]+).*/\2/p' "$rows" |
+    sort -n | tail -1)
+  [[ "$max_rows" =~ ^[0-9]+$ ]] && ((max_rows <= 4096)) || return 1
+  multi_slot=$(rg -c 'requests=([2-9]|[1-9][0-9]+)( |$)' "$rows" || true)
+  ((multi_slot > 0)) || return 1
+  nonaligned=$(sed -n -E 's/.*(advanced_tokens|suffix_tokens)=([0-9]+).*/\2/p' "$rows" |
+    awk '$1 > 0 && $1 < 4096 {count++} END {print count + 0}')
+  ((nonaligned > 0)) || return 1
+  jq -n --arg status pass --arg phase "$phase" --arg rows_sha256 "$(sha256_file "$rows")" \
+    --argjson max_transaction_rows "$max_rows" --argjson multi_slot_transactions "$multi_slot" \
+    --argjson nonaligned_transactions "$nonaligned" \
+    '{status:$status,phase:$phase,transaction_cap_rows:4096,max_transaction_rows:$max_transaction_rows,multi_slot_transactions:$multi_slot_transactions,nonaligned_transactions:$nonaligned_transactions,rows_sha256:$rows_sha256}' \
+    >"$out.tmp"
+  jq -e '.status == "pass" and .max_transaction_rows <= .transaction_cap_rows and .multi_slot_transactions > 0 and .nonaligned_transactions > 0' \
+    "$out.tmp" >/dev/null
+  mv "$out.tmp" "$out"
+}
+
+run_gemma_release_gates() {
+  start_server gemma process-a scripts/serve_gemma4_opencode.sh \
+    "$GEMMA_MODEL" 18082 4
+  capture_gemma_heap baseline
+  BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
+  BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
+  MODEL_PATH="$GEMMA_MODEL" MODEL_SHA256="$GEMMA_MODEL_SHA256" MAX_SLOTS=4 \
+  OUT_DIR="$OUT_ROOT/gemma/overlap" scripts/test_gemma4_long_short_overlap.sh \
+    >"$OUT_ROOT/gemma/overlap.stdout" 2>"$OUT_ROOT/gemma/overlap.stderr"
+  shasum -c "$OUT_ROOT/gemma/overlap/summary.json.sha256" >/dev/null
+  capture_gemma_heap post-overlap
+  run_lifecycle gemma 2800
+  capture_gemma_heap post-lifecycle
+  run_gemma_wave wave1 4
+  capture_gemma_heap post-wave1
+  run_gemma_wave wave2 4
+  capture_gemma_heap post-wave2
+  qwen36_validate_heap_series \
+    "$OUT_ROOT/gemma/heap-baseline.json" "$OUT_ROOT/gemma/heap-post-overlap.json" \
+    "$OUT_ROOT/gemma/heap-post-lifecycle.json" "$OUT_ROOT/gemma/heap-post-wave1.json" \
+    "$OUT_ROOT/gemma/heap-post-wave2.json"
+  jq -n \
+    --slurpfile baseline "$OUT_ROOT/gemma/heap-baseline.json" \
+    --slurpfile overlap "$OUT_ROOT/gemma/heap-post-overlap.json" \
+    --slurpfile lifecycle "$OUT_ROOT/gemma/heap-post-lifecycle.json" \
+    --slurpfile wave1 "$OUT_ROOT/gemma/heap-post-wave1.json" \
+    --slurpfile wave2 "$OUT_ROOT/gemma/heap-post-wave2.json" \
+    '{status:"pass",snapshots:{baseline:$baseline[0],post_overlap:$overlap[0],post_lifecycle:$lifecycle[0],post_wave1:$wave1[0],post_wave2:$wave2[0]}}' \
+    >"$OUT_ROOT/gemma/heap-summary.json"
+  jq -e '.status == "pass" and all(.snapshots[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)' \
+    "$OUT_ROOT/gemma/heap-summary.json" >/dev/null
+  finish_server_phase
+  write_gemma_transaction_receipt four-slots "$current_log"
+
+  start_server gemma process-b scripts/serve_gemma4_opencode.sh \
+    "$GEMMA_MODEL" 18082 8
+  run_gemma_wave eight-slots 8
+  finish_server_phase
+  write_gemma_transaction_receipt eight-slots "$current_log"
+
+  ensure_guard_health
+  mkdir -p "$OUT_ROOT/gemma/parity"
+  HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    cargo test --locked --bin hf2q slot_aware_n4_per_slot_parity_vs_serial -- \
+      --test-threads=1 >"$OUT_ROOT/gemma/parity/n4.log" 2>&1
+  HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    cargo test --locked --bin hf2q slot_aware_n8_per_slot_parity_vs_serial -- \
+      --test-threads=1 >"$OUT_ROOT/gemma/parity/n8.log" 2>&1
+  HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    cargo test --locked --bin hf2q \
+      gemma_eager_4096_and_resumed_8193_tail_match_cold_output -- \
+      --test-threads=1 >"$OUT_ROOT/gemma/parity/boundary-tail.log" 2>&1
+  HF2Q_KV_PERSIST_PHASE_D=1 HF2Q_KV_PERSIST_E2E_MODEL_PATH="$GEMMA_MODEL" \
+    cargo test --locked --test lcp_partial_prefill_byte_identity \
+      gemma_hybrid_long_resume_byte_identity -- --test-threads=1 \
+      >"$OUT_ROOT/gemma/parity/long-resume.log" 2>&1
+  ensure_guard_health
+  jq -n --arg status pass \
+    --arg n4_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n4.log")" \
+    --arg n8_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8.log")" \
+    --arg boundary_tail_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/boundary-tail.log")" \
+    --arg long_resume_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/long-resume.log")" \
+    '{status:$status,n4_exact_output_parity:true,n8_exact_output_parity:true,eager_4096_and_resumed_8193_exact_output_parity:true,long_resume_exact_output_parity:true,n4_log_sha256:$n4_sha256,n8_log_sha256:$n8_sha256,boundary_tail_log_sha256:$boundary_tail_sha256,long_resume_log_sha256:$long_resume_sha256}' \
+    >"$OUT_ROOT/gemma/parity/summary.json"
+}
+
+# The 100 GiB DeepSeek artifact runs first. Every process fully exits before
+# another model is loaded, so this remains safe on a 128 GiB host.
+run_deepseek_release_gates
+run_gemma_release_gates
+run_qwen_release_gates
+
+ensure_guard_health
+pmset -g assertions > "$OUT_ROOT/power-assertions.after.txt"
+power_guarded_ac=true
+deepseek_bytes=$(stat -f '%z' "$DEEPSEEK_MODEL")
+gemma_bytes=$(stat -f '%z' "$GEMMA_MODEL")
+qwen_bytes=$(stat -f '%z' "$QWEN_MODEL")
+jq -n \
+  --arg status pass \
+  --arg source_sha "$EXPECTED_SHA" \
+  --arg crate_sha256 "$CRATE_SHA256" \
+  --arg binary_sha256 "$binary_sha" \
+  --arg deepseek_path "$DEEPSEEK_MODEL" \
+  --arg gemma_path "$GEMMA_MODEL" \
+  --arg qwen_path "$QWEN_MODEL" \
+  --arg deepseek_sha "$DEEPSEEK_MODEL_SHA256" \
+  --arg gemma_sha "$GEMMA_MODEL_SHA256" \
+  --arg qwen_sha "$QWEN_MODEL_SHA256" \
+  --arg deepseek_lifecycle_sha "$(sha256_file "$OUT_ROOT/deepseek/lifecycle/summary.json")" \
+  --arg deepseek_interactive_sha "$(sha256_file "$OUT_ROOT/deepseek/interactive/summary.json")" \
+  --arg deepseek_cached_sha "$(sha256_file "$OUT_ROOT/deepseek/cached-suffix/summary.json")" \
+  --arg deepseek_wave1_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/envelope.json")" \
+  --arg deepseek_wave2_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-2/envelope.json")" \
+  --arg gemma_lifecycle_sha "$(sha256_file "$OUT_ROOT/gemma/lifecycle/summary.json")" \
+  --arg gemma_overlap_sha "$(sha256_file "$OUT_ROOT/gemma/overlap/summary.json")" \
+  --arg gemma_wave1_sha "$(sha256_file "$OUT_ROOT/gemma/wave1/summary.json")" \
+  --arg gemma_wave2_sha "$(sha256_file "$OUT_ROOT/gemma/wave2/summary.json")" \
+  --arg gemma_wave8_sha "$(sha256_file "$OUT_ROOT/gemma/eight-slots/summary.json")" \
+  --arg gemma_transactions4_sha "$(sha256_file "$OUT_ROOT/gemma/transactions-four-slots.json")" \
+  --arg gemma_transactions8_sha "$(sha256_file "$OUT_ROOT/gemma/transactions-eight-slots.json")" \
+  --arg gemma_parity_sha "$(sha256_file "$OUT_ROOT/gemma/parity/summary.json")" \
+  --arg gemma_heap_sha "$(sha256_file "$OUT_ROOT/gemma/heap-summary.json")" \
+  --arg qwen_lifecycle_sha "$(sha256_file "$OUT_ROOT/qwen/lifecycle/summary.json")" \
+  --arg qwen_cumulative_sha "$(sha256_file "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json")" \
+  --arg qwen_cancellation_sha "$(sha256_file "$OUT_ROOT/qwen/cancellation/cancellation-summary.json")" \
+  --argjson power_guarded_ac "$power_guarded_ac" \
+  --argjson deepseek_bytes "$deepseek_bytes" \
+  --argjson gemma_bytes "$gemma_bytes" \
+  --argjson qwen_bytes "$qwen_bytes" \
+  --slurpfile deepseek_lifecycle "$OUT_ROOT/deepseek/lifecycle/summary.json" \
+  --slurpfile deepseek_interactive "$OUT_ROOT/deepseek/interactive/summary.json" \
+  --slurpfile deepseek_cached "$OUT_ROOT/deepseek/cached-suffix/summary.json" \
+  --slurpfile deepseek_wave1 "$OUT_ROOT/deepseek/full-context-1/envelope.json" \
+  --slurpfile deepseek_wave2 "$OUT_ROOT/deepseek/full-context-2/envelope.json" \
+  --slurpfile gemma_lifecycle "$OUT_ROOT/gemma/lifecycle/summary.json" \
+  --slurpfile gemma_overlap "$OUT_ROOT/gemma/overlap/summary.json" \
+  --slurpfile gemma_wave1 "$OUT_ROOT/gemma/wave1/summary.json" \
+  --slurpfile gemma_wave2 "$OUT_ROOT/gemma/wave2/summary.json" \
+  --slurpfile gemma_wave8 "$OUT_ROOT/gemma/eight-slots/summary.json" \
+  --slurpfile gemma_transactions4 "$OUT_ROOT/gemma/transactions-four-slots.json" \
+  --slurpfile gemma_transactions8 "$OUT_ROOT/gemma/transactions-eight-slots.json" \
+  --slurpfile gemma_parity "$OUT_ROOT/gemma/parity/summary.json" \
+  --slurpfile gemma_heap "$OUT_ROOT/gemma/heap-summary.json" \
+  --slurpfile qwen_lifecycle "$OUT_ROOT/qwen/lifecycle/summary.json" \
+  --slurpfile qwen_cumulative "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json" \
+  --slurpfile qwen_cancellation "$OUT_ROOT/qwen/cancellation/cancellation-summary.json" \
+  '{
+    status: $status,
+    source_sha: $source_sha,
+    crate_sha256: $crate_sha256,
+    binary_sha256: $binary_sha256,
+    power_guarded_ac: $power_guarded_ac,
+    models: {
+      deepseek: {path: $deepseek_path, bytes: $deepseek_bytes, sha256: $deepseek_sha},
+      gemma: {path: $gemma_path, bytes: $gemma_bytes, sha256: $gemma_sha},
+      qwen: {path: $qwen_path, bytes: $qwen_bytes, sha256: $qwen_sha}
+    },
+    receipt_sha256: {
+      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha},
+      gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,eight_slots:$gemma_wave8_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
+      qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha}
+    },
+    families: {
+      deepseek: {status:"pass",lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
+      gemma: {status:"pass",lifecycle:$gemma_lifecycle[0],overlap_and_cancellation:$gemma_overlap[0],agent_waves:[$gemma_wave1[0],$gemma_wave2[0],$gemma_wave8[0]],transactions:[$gemma_transactions4[0],$gemma_transactions8[0]],parity:$gemma_parity[0],heap:$gemma_heap[0]},
+      qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]}
+    }
+  }' > "$OUT_ROOT/manifest.json.tmp"
+mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"
+shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
+jq -e 'all(.receipt_sha256[][]; test("^[0-9a-f]{64}$"))' "$OUT_ROOT/manifest.json" >/dev/null
+jq . "$OUT_ROOT/manifest.json"

@@ -263,6 +263,7 @@ pub(in crate::serve::api) fn generate_once(
     }
 
     let (text, reasoning_text) = split_reasoning(&raw, registration, params.reasoning_forced_open);
+    loaded.commit_request_anchor();
     progress.complete(finish_reason, generated.len(), None);
     scratch_guard.complete();
     Ok(GenerationResult {

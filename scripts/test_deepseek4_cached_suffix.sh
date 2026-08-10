@@ -85,11 +85,22 @@ response_b="$OUT_DIR/base-b.response.json"
 cancel_request="$OUT_DIR/cancel.request.json"
 cancel_sse="$OUT_DIR/cancel.sse"
 cancel_err="$OUT_DIR/cancel.stderr"
+late_cancel_sse="$OUT_DIR/late-cancel.sse"
+late_cancel_err="$OUT_DIR/late-cancel.stderr"
+decode_seed_request="$OUT_DIR/decode-seed.request.json"
+decode_seed_response="$OUT_DIR/decode-seed.response.json"
+decode_cancel_request="$OUT_DIR/decode-cancel.request.json"
+decode_cancel_sse="$OUT_DIR/decode-cancel.sse"
+decode_cancel_err="$OUT_DIR/decode-cancel.stderr"
+decode_recovery_request="$OUT_DIR/decode-recovery.request.json"
+decode_recovery_response="$OUT_DIR/decode-recovery.response.json"
 control_response="$OUT_DIR/control.response.json"
 summary_tmp="$OUT_DIR/summary.json.tmp"
 summary="$OUT_DIR/summary.json"
 peer_pid=
 cancel_pid=
+late_cancel_pid=
+decode_cancel_pid=
 cleanup() {
   if [[ -n "$peer_pid" ]] && kill -0 "$peer_pid" 2>/dev/null; then
     kill -TERM "$peer_pid" 2>/dev/null || true
@@ -98,6 +109,14 @@ cleanup() {
   if [[ -n "$cancel_pid" ]] && kill -0 "$cancel_pid" 2>/dev/null; then
     kill -TERM "$cancel_pid" 2>/dev/null || true
     wait "$cancel_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$late_cancel_pid" ]] && kill -0 "$late_cancel_pid" 2>/dev/null; then
+    kill -TERM "$late_cancel_pid" 2>/dev/null || true
+    wait "$late_cancel_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$decode_cancel_pid" ]] && kill -0 "$decode_cancel_pid" 2>/dev/null; then
+    kill -TERM "$decode_cancel_pid" 2>/dev/null || true
+    wait "$decode_cancel_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -245,6 +264,41 @@ wait_for_prefill_chunks() {
     sleep 0.2
   done
   echo "request $request_id reached only $(prefill_progress_count "$request_id")/$wanted prefill chunks" >&2
+  return 1
+}
+
+wait_for_recovery_anchor_capture() {
+  local request_id=$1
+  local pid=$2
+  local deadline=$(( $(date +%s) + 180 ))
+  while (( $(date +%s) < deadline )); do
+    if rg -q "request recovery anchor captured request_id=${request_id}( |$)" "$SERVER_LOG"; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  echo "request $request_id did not capture its request-local recovery anchor" >&2
+  return 1
+}
+
+decode_progress_count() {
+  local request_id=$1
+  rg -c "decode progress request_id=${request_id}( |$)" "$SERVER_LOG" || true
+}
+
+wait_for_decode_progress() {
+  local request_id=$1
+  local pid=$2
+  local deadline=$(( $(date +%s) + 120 ))
+  while (( $(date +%s) < deadline )); do
+    if (( $(decode_progress_count "$request_id") >= 1 )); then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  echo "request $request_id emitted no decode progress before exit/deadline" >&2
   return 1
 }
 
@@ -419,6 +473,119 @@ control_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$contr
   echo "post-cancellation control did not reuse the original prefix" >&2
   exit 1
 }
+
+# Repeat the same cancelled continuation, but this time wait until the new
+# request-local recovery anchor has actually been captured. Cancelling here
+# proves that the candidate is discarded and the pre-request committed anchor
+# is restored; an early three-chunk cancellation cannot exercise that edge.
+late_cancel_counter_before=$(metric_value hf2q_sse_cancellations)
+late_cancel_log_start=$(wc -l <"$SERVER_LOG" | tr -d ' ')
+curl --fail-with-body --silent --show-error --no-buffer \
+  --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
+  -H 'Content-Type: application/json' --data-binary "@$cancel_request" \
+  "$BASE_URL/v1/chat/completions" >"$late_cancel_sse" 2>"$late_cancel_err" &
+late_cancel_pid=$!
+late_cancel_request_id=$(wait_for_request_id "$late_cancel_log_start" slot-stream-yielding-cached-prefill)
+wait_for_recovery_anchor_capture "$late_cancel_request_id" "$late_cancel_pid"
+late_chunks_at_disconnect=$(prefill_progress_count "$late_cancel_request_id")
+kill -TERM "$late_cancel_pid" 2>/dev/null || true
+wait "$late_cancel_pid" 2>/dev/null || true
+late_cancel_pid=
+late_cancel_counter_after=$(wait_for_cancellation_delta "$late_cancel_counter_before")
+sleep "$CANCEL_SETTLE_SECONDS"
+late_chunks_after_settle=$(prefill_progress_count "$late_cancel_request_id")
+(( late_chunks_after_settle <= late_chunks_at_disconnect + 1 )) || {
+  echo "late-cancelled suffix advanced too far: $late_chunks_at_disconnect -> $late_chunks_after_settle chunks" >&2
+  exit 1
+}
+sleep "$CANCEL_STABILITY_SECONDS"
+late_chunks_after_stability=$(prefill_progress_count "$late_cancel_request_id")
+(( late_chunks_after_stability == late_chunks_after_settle )) || {
+  echo "late-cancelled suffix kept advancing after stability window: $late_chunks_after_settle -> $late_chunks_after_stability" >&2
+  exit 1
+}
+late_cancel_done_count=$(rg -c '^data: \[DONE\]$' "$late_cancel_sse" || true)
+late_cancel_done_count=${late_cancel_done_count:-0}
+[[ "$late_cancel_done_count" == 0 ]] || {
+  echo "late-cancelled stream emitted [DONE]" >&2
+  exit 1
+}
+
+post_json "$request_b" "$control_response"
+assert_tool_path "$control_response" "$EXPECTED_PATH"
+late_control_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$control_response")
+(( late_control_cached > 0 )) || {
+  echo "post-late-cancellation control did not reuse the original prefix" >&2
+  exit 1
+}
+
+# Complete one cached continuation so its prompt-boundary checkpoint becomes
+# the committed pre-request anchor, then cancel a long following turn after
+# decode has made observable progress. Reissuing that cancelled prompt with a
+# one-token budget must reuse the committed checkpoint instead of retaining
+# the cancelled decode tail or going cold.
+jq '.stream = false | del(.stream_options)' "$cancel_request" >"$decode_seed_request"
+post_json "$decode_seed_request" "$decode_seed_response"
+decode_seed_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$decode_seed_response")
+(( decode_seed_cached > 0 )) || {
+  echo "decode-cancellation seed did not reuse the original retained prefix" >&2
+  exit 1
+}
+jq -n --slurpfile base "$decode_seed_request" --slurpfile prior "$decode_seed_response" '
+  $base[0]
+  | .messages += [
+      {role: "assistant", content: $prior[0].choices[0].message.content},
+      {role: "user", content: "Write at least 600 tokens explaining cache-coherent cancellation recovery. Do not call tools. End with DECODE_CANCEL_DONE."}
+    ]
+  | del(.tools, .tool_choice)
+  | .max_tokens = 768
+  | .stream = true
+  | .stream_options = {include_usage: true}
+' >"$decode_cancel_request"
+
+decode_cancel_counter_before=$(metric_value hf2q_sse_cancellations)
+decode_cancel_log_start=$(wc -l <"$SERVER_LOG" | tr -d ' ')
+curl --fail-with-body --silent --show-error --no-buffer \
+  --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
+  -H 'Content-Type: application/json' --data-binary "@$decode_cancel_request" \
+  "$BASE_URL/v1/chat/completions" >"$decode_cancel_sse" 2>"$decode_cancel_err" &
+decode_cancel_pid=$!
+decode_cancel_request_id=$(wait_for_request_id "$decode_cancel_log_start" slot-stream-yielding-cached-prefill)
+wait_for_decode_progress "$decode_cancel_request_id" "$decode_cancel_pid"
+decode_events_at_disconnect=$(decode_progress_count "$decode_cancel_request_id")
+kill -TERM "$decode_cancel_pid" 2>/dev/null || true
+wait "$decode_cancel_pid" 2>/dev/null || true
+decode_cancel_pid=
+decode_cancel_counter_after=$(wait_for_cancellation_delta "$decode_cancel_counter_before")
+sleep "$CANCEL_SETTLE_SECONDS"
+decode_events_after_settle=$(decode_progress_count "$decode_cancel_request_id")
+(( decode_events_after_settle <= decode_events_at_disconnect + 1 )) || {
+  echo "cancelled decode advanced too far: $decode_events_at_disconnect -> $decode_events_after_settle events" >&2
+  exit 1
+}
+sleep "$CANCEL_STABILITY_SECONDS"
+decode_events_after_stability=$(decode_progress_count "$decode_cancel_request_id")
+(( decode_events_after_stability == decode_events_after_settle )) || {
+  echo "cancelled decode kept advancing after stability window: $decode_events_after_settle -> $decode_events_after_stability" >&2
+  exit 1
+}
+decode_cancel_done_count=$(rg -c '^data: \[DONE\]$' "$decode_cancel_sse" || true)
+decode_cancel_done_count=${decode_cancel_done_count:-0}
+[[ "$decode_cancel_done_count" == 0 ]] || {
+  echo "decode-cancelled stream emitted [DONE]" >&2
+  exit 1
+}
+
+jq '.stream = false | del(.stream_options) | .max_tokens = 1' \
+  "$decode_cancel_request" >"$decode_recovery_request"
+post_json "$decode_recovery_request" "$decode_recovery_response"
+decode_recovery_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$decode_recovery_response")
+(( decode_recovery_cached > 0 )) || {
+  echo "post-decode-cancellation probe did not reuse the committed checkpoint" >&2
+  exit 1
+}
 ready_after=$(curl --fail-with-body --silent --show-error "$BASE_URL/readyz" | jq -r '.ready')
 [[ "$ready_after" == "true" ]]
 
@@ -446,7 +613,21 @@ jq -n \
   --argjson chunks_after_stability "$chunks_after_stability" \
   --argjson cancel_counter_before "$cancel_counter_before" \
   --argjson cancel_counter_after "$cancel_counter_after" \
-  --argjson control_cached "$control_cached" '{
+  --argjson control_cached "$control_cached" \
+  --argjson late_cancel_request_id "$late_cancel_request_id" \
+  --argjson late_chunks_at_disconnect "$late_chunks_at_disconnect" \
+  --argjson late_chunks_after_settle "$late_chunks_after_settle" \
+  --argjson late_chunks_after_stability "$late_chunks_after_stability" \
+  --argjson late_cancel_counter_before "$late_cancel_counter_before" \
+  --argjson late_cancel_counter_after "$late_cancel_counter_after" \
+  --argjson late_control_cached "$late_control_cached" \
+  --argjson decode_cancel_request_id "$decode_cancel_request_id" \
+  --argjson decode_events_at_disconnect "$decode_events_at_disconnect" \
+  --argjson decode_events_after_settle "$decode_events_after_settle" \
+  --argjson decode_events_after_stability "$decode_events_after_stability" \
+  --argjson decode_cancel_counter_before "$decode_cancel_counter_before" \
+  --argjson decode_cancel_counter_after "$decode_cancel_counter_after" \
+  --argjson decode_recovery_cached "$decode_recovery_cached" '{
     status: "pass",
     authority: "focused-hardware-probe",
     server: {pid: $server_pid, binary_path: $binary_path, binary_sha256: $binary_sha256, model: $model, max_slots: 4},
@@ -471,6 +652,26 @@ jq -n \
       emitted_done: false,
       post_cancel_cached_tokens: $control_cached
     },
+    cancellation_after_candidate_anchor: {
+      request_id: $late_cancel_request_id,
+      chunks_at_disconnect: $late_chunks_at_disconnect,
+      chunks_after_settle: $late_chunks_after_settle,
+      chunks_after_stability: $late_chunks_after_stability,
+      counter_before: $late_cancel_counter_before,
+      counter_after: $late_cancel_counter_after,
+      emitted_done: false,
+      post_cancel_cached_tokens: $late_control_cached
+    },
+    cancellation_during_decode: {
+      request_id: $decode_cancel_request_id,
+      progress_events_at_disconnect: $decode_events_at_disconnect,
+      progress_events_after_settle: $decode_events_after_settle,
+      progress_events_after_stability: $decode_events_after_stability,
+      counter_before: $decode_cancel_counter_before,
+      counter_after: $decode_cancel_counter_after,
+      emitted_done: false,
+      post_cancel_cached_tokens: $decode_recovery_cached
+    },
     ready_before: true,
     ready_after: true,
     fatal_log_signatures: 0
@@ -485,6 +686,17 @@ jq -e '
   and .cancellation.chunks_after_stability == .cancellation.chunks_after_settle
   and .cancellation.counter_after == (.cancellation.counter_before + 1)
   and .cancellation.emitted_done == false
+  and .cancellation_after_candidate_anchor.chunks_after_settle <= (.cancellation_after_candidate_anchor.chunks_at_disconnect + 1)
+  and .cancellation_after_candidate_anchor.chunks_after_stability == .cancellation_after_candidate_anchor.chunks_after_settle
+  and .cancellation_after_candidate_anchor.counter_after == (.cancellation_after_candidate_anchor.counter_before + 1)
+  and .cancellation_after_candidate_anchor.emitted_done == false
+  and .cancellation_after_candidate_anchor.post_cancel_cached_tokens > 0
+  and .cancellation_during_decode.progress_events_at_disconnect >= 1
+  and .cancellation_during_decode.progress_events_after_settle <= (.cancellation_during_decode.progress_events_at_disconnect + 1)
+  and .cancellation_during_decode.progress_events_after_stability == .cancellation_during_decode.progress_events_after_settle
+  and .cancellation_during_decode.counter_after == (.cancellation_during_decode.counter_before + 1)
+  and .cancellation_during_decode.emitted_done == false
+  and .cancellation_during_decode.post_cancel_cached_tokens > 0
   and .ready_before == true and .ready_after == true
   and .fatal_log_signatures == 0
 ' "$summary_tmp" >/dev/null

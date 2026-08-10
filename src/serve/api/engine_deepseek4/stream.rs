@@ -18,6 +18,38 @@ use super::progress::RequestProgress;
 use super::sampling::{decode_token_limit, grammar_runtime, sample, sampler_config};
 use super::{release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancellationCacheRecovery {
+    RestoredAnchor,
+    ResetCold,
+}
+
+fn finish_cancellation_cache_recovery(
+    supervisor: &EngineSupervisor,
+    recovery: Result<()>,
+    reset_after_failure: impl FnOnce() -> Result<()>,
+) -> Result<CancellationCacheRecovery> {
+    match recovery {
+        Ok(()) => Ok(CancellationCacheRecovery::RestoredAnchor),
+        Err(recovery_error) => match reset_after_failure() {
+            Ok(()) => {
+                tracing::warn!(
+                    error = %format!("{recovery_error:#}"),
+                    "DeepSeek-V4 cancellation rollback failed; cache reset cold"
+                );
+                Ok(CancellationCacheRecovery::ResetCold)
+            }
+            Err(reset_error) => {
+                supervisor.poison_now("deepseek4-serial-cancellation-recovery-failed");
+                Err(anyhow::anyhow!(
+                    "rollback DeepSeek-V4 stream after client cancellation failed: \
+                     {recovery_error:#}; mandatory cold reset also failed: {reset_error:#}"
+                ))
+            }
+        },
+    }
+}
+
 fn send_visible(
     events: &mpsc::Sender<GenerationEvent>,
     event: GenerationEvent,
@@ -589,6 +621,7 @@ pub(in crate::serve::api) fn generate_stream(
                 },
             })
             .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
+        loaded.commit_request_anchor();
         progress.complete(finish_reason, generated.len(), Some(semantic_ttft));
         Ok(())
     })();
@@ -606,6 +639,8 @@ pub(in crate::serve::api) fn generate_stream(
             if let Some(counter) = cancellation_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
+            let recovery = loaded.recover_after_cancellation();
+            finish_cancellation_cache_recovery(supervisor, recovery, || loaded.reset_live_cache())?;
             progress.cancelled();
             tracing::info!("DeepSeek-V4 SSE stream dropped; generation cancelled");
             Ok(SerialStreamEnd::ClientClosed)
@@ -619,12 +654,43 @@ pub(in crate::serve::api) fn generate_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{route_tool_content, send_visible, trigger_tool_grammar_on_raw_marker};
+    use super::{
+        finish_cancellation_cache_recovery, route_tool_content, send_visible,
+        trigger_tool_grammar_on_raw_marker, CancellationCacheRecovery,
+    };
+    use crate::serve::api::engine_supervisor::EngineSupervisor;
     use crate::serve::api::grammar::{self, GrammarRuntime};
     use crate::serve::api::registry::{self, ToolCallSplitter};
     use crate::serve::api::sse::{DeltaKind, GenerationEvent};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn cancellation_restore_failure_resets_cold_or_poisons_fail_closed() {
+        let supervisor = EngineSupervisor::new();
+        assert_eq!(
+            finish_cancellation_cache_recovery(
+                &supervisor,
+                Err(anyhow::anyhow!("partial anchor restore")),
+                || Ok(()),
+            )
+            .unwrap(),
+            CancellationCacheRecovery::ResetCold
+        );
+        assert!(supervisor.is_healthy());
+
+        let supervisor = EngineSupervisor::new();
+        let error = finish_cancellation_cache_recovery(
+            &supervisor,
+            Err(anyhow::anyhow!("partial anchor restore")),
+            || Err(anyhow::anyhow!("cache reset failed")),
+        )
+        .expect_err("double recovery failure must poison the worker");
+        assert!(!supervisor.is_healthy());
+        let detail = format!("{error:#}");
+        assert!(detail.contains("partial anchor restore"));
+        assert!(detail.contains("cache reset failed"));
+    }
 
     #[test]
     fn semantic_ttft_is_recorded_once_on_the_first_visible_event() {

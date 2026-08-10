@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-10
+
+### Fixed
+
+- Keep long agentic continuations attached to their strongest retained prefix
+  across all three SlotAware families. Admission now distinguishes an active
+  prefix from an idle reusable prefix: a continuation waits for the active
+  owner when that match is strictly better, while an equal idle match remains
+  runnable. This prevents Qwen, Gemma, and DeepSeek from admitting a 100K-token
+  continuation cold into another free slot.
+- Preserve the newest committed checkpoint when Qwen, Gemma, or DeepSeek work
+  is cancelled. Gemma and DeepSeek keep in-request candidates private until
+  success. Qwen promotes a stable pre-generation checkpoint immediately after
+  its bounded prefill transaction commits, before observing a disconnect, so
+  cancellation may safely retain newly committed prompt work without retaining
+  a partial generation tail. Recovery restores only a validated checkpoint and
+  otherwise resets cold. Inline embedding invalidates the selected slot's
+  retained metadata before touching physical KV, so a later generation cannot
+  advertise a stale cache hit.
+- Let dead requests bypass physical-slot affinity waits in every SlotAware
+  family, and let Qwen deterministic response-cache hits bypass them without
+  claiming KV. Qwen prompt-cache identity now includes `reasoning_forced_open`,
+  preventing a response split under one reasoning mode from being replayed
+  under another. Requests for token logprobs bypass Qwen terminal response
+  caching until that cache can retain and replay the full logprob payload.
+  Gemma and DeepSeek continue to reuse their family-specific KV
+  checkpoints rather than advertising a terminal-response cache they do not
+  own. Bounded wait queues keep Shutdown non-evictable and allow runnable work
+  to displace a blocked active-prefix waiter without overtaking earlier
+  runnable requests.
+- Resume DeepSeek-V4 retained-prefix continuations whose remaining suffix is
+  below the 33-token matrix-append minimum. All nonempty 1–32-token segments
+  now use incremental verifier replay, including the segment immediately
+  before the eight-token recovery boundary, instead of failing with an empty
+  resumable-prefill chunk.
+
+### Validation
+
+- Add a cross-family long-context cache-lifecycle gate that establishes an
+  agentic tool turn, starts a streamed turn on the retained prefix, queues its
+  exact retry while that prefix is active, cancels the owner, requires the
+  queued retry to reuse the restored checkpoint, and verifies an unrelated
+  conversation cannot inherit private history.
+- Add a guarded self-hosted `Cache lifecycle` workflow that packages one exact
+  main-branch commit, builds only from that extracted crate, runs DeepSeek,
+  Gemma, and Qwen one process at a time under continuously checked AC power,
+  verifies protected GGUF digests, and uploads a
+  source/crate/binary/model-bound receipt. The publication workflow now
+  requires that successful exact-SHA receipt and reproduces its crate digest
+  before publishing.
+- Make that receipt enforce the family-specific shipping gates as well as the
+  shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
+  one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193
+  exact-output parity, four/eight-slot aggregate caps, and heap waves; and
+  DeepSeek cached-suffix cancellation, terminal parking, and two fresh
+  four-agent waves. Release rehashes every downloaded receipt and validates
+  the detailed evidence before registry credentials are exposed.
+- Update vulnerable transitive dependencies (`crossbeam-epoch`,
+  `quinn-proto`, `rkyv`, `anyhow`, `memmap2`, and the legacy Rustls chain via
+  `ruvector-core 2.3`) and make a zero-vulnerability `cargo audit 0.22.2` run
+  blocking in CI and release packaging.
+
 ## [0.1.5] — 2026-08-09
 
 ### Added — foreground serving dashboard
@@ -399,7 +461,10 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/robertelee78/hf2q/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/robertelee78/hf2q/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/robertelee78/hf2q/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/robertelee78/hf2q/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/robertelee78/hf2q/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/robertelee78/hf2q/compare/v0.1.0...v0.1.1

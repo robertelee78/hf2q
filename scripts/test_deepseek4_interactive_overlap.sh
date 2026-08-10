@@ -76,10 +76,10 @@ jq -n --arg model "$MODEL" '{
   messages: [
     {role:"system", content:"You are the interactive lane in a deterministic scheduling test."},
     {role:"assistant", content:"Ready."},
-    {role:"user", content: (([range(0; 450) | "x"] | join(" ")) + "\nWrite the integers one through sixty-four in words, separated by spaces, then write DONE.")}
+    {role:"user", content: (([range(0; 450) | "x"] | join(" ")) + "\nWrite a short deterministic response.")}
   ],
   temperature: 0,
-  max_tokens: 128,
+  max_tokens: 8,
   stream: true,
   stream_options: {include_usage: true}
 }' >"$short_request"
@@ -118,7 +118,7 @@ curl --fail-with-body --silent --show-error --no-buffer \
   --data-binary "@$long_request" "$BASE_URL/v1/chat/completions" \
   >"$long_sse" 2>"$OUT_DIR/long.stderr" &
 long_pid=$!
-short_started=$(wait_for_log 'DeepSeek-V4 request started.*max_tokens=128( |$)')
+short_started=$(wait_for_log 'DeepSeek-V4 request started.*max_tokens=8( |$)')
 short_request_id=$(sed -n 's/.*request_id=\([0-9][0-9]*\).*/\1/p' <<<"$short_started")
 long_started=$(wait_for_log 'DeepSeek-V4 request started.*max_tokens=64( |$)')
 long_request_id=$(sed -n 's/.*request_id=\([0-9][0-9]*\).*/\1/p' <<<"$long_started")
@@ -157,6 +157,17 @@ done
   exit 1
 }
 
+park_record=$(wait_for_log "DeepSeek-V4 terminal completion parked behind cold prefill.*request_id=${short_request_id}( |$)" 30)
+active_cold_prefills_at_park=$(sed -n 's/.*active_cold_prefills=\([0-9][0-9]*\).*/\1/p' <<<"$park_record")
+[[ "$active_cold_prefills_at_park" =~ ^[1-9][0-9]*$ ]] || {
+  echo "terminal completion was not parked behind an active cold prefill" >&2
+  exit 1
+}
+if rg -q '^data: \[DONE\]$' "$short_sse"; then
+  echo "interactive lane emitted terminal DONE before the cold prefill drained" >&2
+  exit 1
+fi
+
 last_progress=$(date +%s)
 last_short_bytes=$(wc -c <"$short_sse" | tr -d ' ')
 last_long_processed=$first_long_processed
@@ -185,8 +196,8 @@ qwen36_extract_and_validate_sse deep-short "$short_sse" "$OUT_DIR/short.events.j
 qwen36_extract_and_validate_sse deep-long "$long_sse" "$OUT_DIR/long.events.jsonl"
 qwen36_validate_long_events "$OUT_DIR/long.events.jsonl"
 short_content=$(jq -j '.choices[0].delta.content // empty' "$OUT_DIR/short.events.jsonl")
-[[ "$short_content" == *DONE* ]] || {
-  echo "interactive lane did not finish its requested semantic response" >&2
+[[ -n "$short_content" ]] || {
+  echo "interactive lane emitted no semantic response" >&2
   exit 1
 }
 
@@ -196,6 +207,24 @@ final_lines=$(wc -l <"$SERVER_LOG" | tr -d ' ')
 [[ "$(sed -n "1,${baseline_lines}p" "$SERVER_LOG" | shasum -a 256 | awk '{print $1}')" == "$baseline_prefix_sha256" ]] || exit 1
 sed -n "$((baseline_lines + 1)),${final_lines}p" "$SERVER_LOG" >"$OUT_DIR/server.delta.log"
 qwen36_reject_fatal_log "$OUT_DIR/server.delta.log"
+park_line=$(rg -n "DeepSeek-V4 terminal completion parked behind cold prefill.*request_id=${short_request_id}( |$)" \
+  "$OUT_DIR/server.delta.log" | head -1 | cut -d: -f1)
+long_complete_line=$(rg -n "DeepSeek-V4 prefill complete.*request_id=${long_request_id}( |$)" \
+  "$OUT_DIR/server.delta.log" | head -1 | cut -d: -f1)
+release_line=$(rg -n "DeepSeek-V4 parked completion released after cold prefill.*request_id=${short_request_id}( |$)" \
+  "$OUT_DIR/server.delta.log" | head -1 | cut -d: -f1)
+request_complete_line=$(rg -n "DeepSeek-V4 request complete.*request_id=${short_request_id}( |$)" \
+  "$OUT_DIR/server.delta.log" | head -1 | cut -d: -f1)
+[[ "$park_line" =~ ^[1-9][0-9]*$ && "$long_complete_line" =~ ^[1-9][0-9]*$ && \
+   "$release_line" =~ ^[1-9][0-9]*$ && "$request_complete_line" =~ ^[1-9][0-9]*$ ]] || {
+  echo "terminal parking evidence was incomplete" >&2
+  exit 1
+}
+(( park_line < long_complete_line && long_complete_line < release_line && release_line <= request_complete_line )) || {
+  echo "terminal parking/release ordering was invalid" >&2
+  exit 1
+}
+[[ "$(rg -c '^data: \[DONE\]$' "$short_sse")" == 1 ]] || exit 1
 ready_http=$(curl --silent --show-error --max-time 3 -o "$OUT_DIR/readyz.json" -w '%{http_code}' "$BASE_URL/readyz")
 [[ "$ready_http" == 200 ]] || exit 1
 qwen36_assert_power_guard
@@ -216,6 +245,11 @@ jq -n \
   --argjson first_mixed_chunk_tokens "$first_mixed_chunk_tokens" \
   --argjson first_mixed_window_cap "$first_mixed_window_cap" \
   --argjson short_generated_at_first_window "$short_generated" \
+  --argjson terminal_park_line "$park_line" \
+  --argjson long_prefill_complete_line "$long_complete_line" \
+  --argjson terminal_release_line "$release_line" \
+  --argjson terminal_request_complete_line "$request_complete_line" \
+  --argjson active_cold_prefills_at_park "$active_cold_prefills_at_park" \
   --argjson ready_http "$ready_http" \
   --argjson power_event_delta "$((QWEN36_POWER_EVENT_FINAL - QWEN36_POWER_EVENT_BASELINE))" '{
     status:"pass",
@@ -228,13 +262,25 @@ jq -n \
     first_mixed_prefill_chunk_tokens:$first_mixed_chunk_tokens,
     first_mixed_prefill_window_cap:$first_mixed_window_cap,
     short_generated_tokens_at_first_window:$short_generated_at_first_window,
+    terminal_parking:{
+      park_observed:true,
+      terminal_absent_while_parked:true,
+      active_cold_prefills_at_park:$active_cold_prefills_at_park,
+      park_log_line:$terminal_park_line,
+      long_prefill_complete_log_line:$long_prefill_complete_line,
+      release_log_line:$terminal_release_line,
+      request_complete_log_line:$terminal_request_complete_line,
+      parked_before_long_prefill_complete:($terminal_park_line < $long_prefill_complete_line),
+      released_after_long_prefill_complete:($long_prefill_complete_line < $terminal_release_line),
+      completed_after_release:($terminal_release_line <= $terminal_request_complete_line)
+    },
     short_sse_sha256:$short_sse_sha256,
     long_sse_sha256:$long_sse_sha256,
     server_delta_sha256:$server_delta_sha256,
     ready_http:$ready_http,
     power_event_delta:$power_event_delta
   }' >"$summary.tmp"
-jq -e '.status=="pass" and .server.max_slots==4 and .long_prompt_tokens > 80000 and .first_long_prefill_report_tokens > 0 and .first_mixed_prefill_chunk_tokens > 0 and .first_mixed_prefill_chunk_tokens <= 256 and .first_mixed_prefill_window_cap == 2 and .short_generated_tokens_at_first_window >= 8 and .ready_http==200 and .power_event_delta==0' \
+jq -e '.status=="pass" and .server.max_slots==4 and .long_prompt_tokens > 80000 and .first_long_prefill_report_tokens > 0 and .first_mixed_prefill_chunk_tokens > 0 and .first_mixed_prefill_chunk_tokens <= 256 and .first_mixed_prefill_window_cap == 2 and .short_generated_tokens_at_first_window >= 8 and .terminal_parking.park_observed == true and .terminal_parking.terminal_absent_while_parked == true and .terminal_parking.active_cold_prefills_at_park >= 1 and .terminal_parking.parked_before_long_prefill_complete == true and .terminal_parking.released_after_long_prefill_complete == true and .terminal_parking.completed_after_release == true and .ready_http==200 and .power_event_delta==0' \
   "$summary.tmp" >/dev/null
 mv "$summary.tmp" "$summary"
 shasum -a 256 "$summary" >"$summary.sha256"

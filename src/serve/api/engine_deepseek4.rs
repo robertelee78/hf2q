@@ -62,6 +62,68 @@ fn resumable_matrix_prefill_chunk_len(
     }
     chunk
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumablePrefillChunk {
+    Matrix(usize),
+    Incremental(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResumablePrefillSlice {
+    chunk: ResumablePrefillChunk,
+    capture_anchor_after: bool,
+}
+
+fn plan_resumable_prefill_chunk(
+    cache_position: usize,
+    remaining: usize,
+    sliding_window: usize,
+    window_multiplier: usize,
+    recovery_position: usize,
+) -> Result<ResumablePrefillSlice> {
+    anyhow::ensure!(
+        remaining > 0,
+        "DeepSeek-V4 resumable prefill made no progress"
+    );
+    anyhow::ensure!(
+        sliding_window > 0 && window_multiplier > 0,
+        "DeepSeek-V4 resumable prefill has an invalid window plan (window={}, multiplier={})",
+        sliding_window,
+        window_multiplier
+    );
+    let batch = resumable_matrix_prefill_chunk_len(
+        cache_position,
+        remaining,
+        sliding_window,
+        window_multiplier,
+    );
+    let chunk = if batch > 0 {
+        ResumablePrefillChunk::Matrix(batch)
+    } else {
+        anyhow::ensure!(
+            remaining < MIN_MATRIX_APPEND_TOKENS,
+            "DeepSeek-V4 resumable prefill selected an empty chunk at cursor {} with {} tokens remaining (window={}, multiplier={})",
+            cache_position,
+            remaining,
+            sliding_window,
+            window_multiplier
+        );
+        ResumablePrefillChunk::Incremental(remaining)
+    };
+    let tokens = match chunk {
+        ResumablePrefillChunk::Matrix(tokens) | ResumablePrefillChunk::Incremental(tokens) => {
+            tokens
+        }
+    };
+    let end = cache_position
+        .checked_add(tokens)
+        .context("DeepSeek-V4 resumable prefill chunk end overflowed")?;
+    Ok(ResumablePrefillSlice {
+        chunk,
+        capture_anchor_after: end == recovery_position,
+    })
+}
 const MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS: usize = 32;
 const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
 const GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -206,6 +268,12 @@ pub struct Deepseek4LoadedModel {
     /// official encoder can rewrite that tail when it drops old reasoning.
     turn_anchor: Option<Deepseek4CacheSnapshot>,
     turn_anchor_tokens: Vec<u32>,
+    /// Prompt-boundary checkpoint captured by the current request. It is not
+    /// promoted to reusable affinity until that request completes.
+    pending_turn_anchor: Option<Deepseek4CacheSnapshot>,
+    pending_turn_anchor_tokens: Vec<u32>,
+    keep_turn_anchor_on_success: bool,
+    request_anchor_transaction_active: bool,
     /// Full-logical-context agent sessions provisioned only for SlotAware.
     slot_sessions: Option<Vec<Deepseek4Session>>,
 }
@@ -219,6 +287,10 @@ pub(super) struct Deepseek4Session {
     live_logits: Option<MlxBuffer>,
     turn_anchor: Option<Deepseek4CacheSnapshot>,
     turn_anchor_tokens: Vec<u32>,
+    pending_turn_anchor: Option<Deepseek4CacheSnapshot>,
+    pending_turn_anchor_tokens: Vec<u32>,
+    keep_turn_anchor_on_success: bool,
+    request_anchor_transaction_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +333,10 @@ impl Deepseek4Session {
             live_logits: None,
             turn_anchor: None,
             turn_anchor_tokens: Vec::new(),
+            pending_turn_anchor: None,
+            pending_turn_anchor_tokens: Vec::new(),
+            keep_turn_anchor_on_success: false,
+            request_anchor_transaction_active: false,
         })
     }
 
@@ -316,6 +392,10 @@ impl Deepseek4Session {
         self.live_logits = None;
         self.turn_anchor = None;
         self.turn_anchor_tokens.clear();
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+        self.request_anchor_transaction_active = false;
         Ok(())
     }
 
@@ -324,6 +404,10 @@ impl Deepseek4Session {
     /// compact checkpoint when possible; cold/no-anchor cancellation retains
     /// the conservative full-reset fallback.
     pub(super) fn recover_after_cancellation(&mut self) -> Result<()> {
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+        self.request_anchor_transaction_active = false;
         let recovery = deepseek4_cancellation_recovery(
             self.cache.is_poisoned(),
             self.turn_anchor
@@ -352,6 +436,24 @@ impl Deepseek4Session {
         Ok(())
     }
 
+    /// Publish the current request's candidate checkpoint only after its
+    /// terminal result is known to be successful.
+    pub(super) fn commit_request_anchor(&mut self) {
+        if !self.request_anchor_transaction_active {
+            return;
+        }
+        self.request_anchor_transaction_active = false;
+        if let Some(anchor) = self.pending_turn_anchor.take() {
+            self.turn_anchor = Some(anchor);
+            self.turn_anchor_tokens = std::mem::take(&mut self.pending_turn_anchor_tokens);
+        } else if !self.keep_turn_anchor_on_success {
+            self.turn_anchor = None;
+            self.turn_anchor_tokens.clear();
+        }
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+    }
+
     /// Swap this slot into the single model execution surface. The staging
     /// state in `loaded` is swapped back after the request/tick, so no KV bytes
     /// are copied and every slot retains its own compressor state.
@@ -361,6 +463,22 @@ impl Deepseek4Session {
         std::mem::swap(&mut self.live_logits, &mut loaded.live_logits);
         std::mem::swap(&mut self.turn_anchor, &mut loaded.turn_anchor);
         std::mem::swap(&mut self.turn_anchor_tokens, &mut loaded.turn_anchor_tokens);
+        std::mem::swap(
+            &mut self.pending_turn_anchor,
+            &mut loaded.pending_turn_anchor,
+        );
+        std::mem::swap(
+            &mut self.pending_turn_anchor_tokens,
+            &mut loaded.pending_turn_anchor_tokens,
+        );
+        std::mem::swap(
+            &mut self.keep_turn_anchor_on_success,
+            &mut loaded.keep_turn_anchor_on_success,
+        );
+        std::mem::swap(
+            &mut self.request_anchor_transaction_active,
+            &mut loaded.request_anchor_transaction_active,
+        );
     }
 }
 
@@ -472,6 +590,10 @@ impl Deepseek4LoadedModel {
             live_logits: None,
             turn_anchor: None,
             turn_anchor_tokens: Vec::new(),
+            pending_turn_anchor: None,
+            pending_turn_anchor_tokens: Vec::new(),
+            keep_turn_anchor_on_success: false,
+            request_anchor_transaction_active: false,
             slot_sessions: None,
         })
     }
@@ -542,6 +664,19 @@ impl Deepseek4LoadedModel {
         self.live_logits = None;
         self.turn_anchor = None;
         self.turn_anchor_tokens.clear();
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+        self.request_anchor_transaction_active = false;
+        Ok(())
+    }
+
+    fn reset_live_cache_preserving_turn_anchor(&mut self) -> Result<()> {
+        self.cache
+            .reset()
+            .context("reset DeepSeek-V4 serving cache")?;
+        self.committed_tokens.clear();
+        self.live_logits = None;
         Ok(())
     }
 
@@ -584,10 +719,72 @@ impl Deepseek4LoadedModel {
         Ok(true)
     }
 
+    fn begin_request_anchor_transaction(&mut self, prompt_tokens: &[u32]) {
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        self.request_anchor_transaction_active = true;
+        self.keep_turn_anchor_on_success = self.turn_anchor.as_ref().is_some_and(|anchor| {
+            anchor.position() == self.turn_anchor_tokens.len()
+                && !self.turn_anchor_tokens.is_empty()
+                && prompt_tokens.starts_with(&self.turn_anchor_tokens)
+        });
+    }
+
+    pub(super) fn commit_request_anchor(&mut self) {
+        if !self.request_anchor_transaction_active {
+            return;
+        }
+        self.request_anchor_transaction_active = false;
+        if let Some(anchor) = self.pending_turn_anchor.take() {
+            self.turn_anchor = Some(anchor);
+            self.turn_anchor_tokens = std::mem::take(&mut self.pending_turn_anchor_tokens);
+        } else if !self.keep_turn_anchor_on_success {
+            self.turn_anchor = None;
+            self.turn_anchor_tokens.clear();
+        }
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+    }
+
+    pub(super) fn recover_after_cancellation(&mut self) -> Result<()> {
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+        self.request_anchor_transaction_active = false;
+        let recovery = deepseek4_cancellation_recovery(
+            self.cache.is_poisoned(),
+            self.turn_anchor
+                .as_ref()
+                .map(Deepseek4CacheSnapshot::position),
+            self.turn_anchor_tokens.len(),
+        );
+        if recovery == Deepseek4CancellationRecovery::Reset {
+            return self.reset_live_cache();
+        }
+        let anchor = self
+            .turn_anchor
+            .as_ref()
+            .context("DeepSeek-V4 cancellation turn anchor disappeared")?;
+        self.cache
+            .restore(anchor)
+            .context("restore DeepSeek-V4 turn anchor after cancellation")?;
+        self.committed_tokens.clone_from(&self.turn_anchor_tokens);
+        self.live_logits = None;
+        anyhow::ensure!(
+            self.cache.position() == self.committed_tokens.len(),
+            "DeepSeek-V4 cancellation rollback cache position {} disagrees with token ledger {}",
+            self.cache.position(),
+            self.committed_tokens.len()
+        );
+        Ok(())
+    }
+
     fn capture_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
-        // Release the old fixed-capacity copy before allocating its replacement.
-        self.turn_anchor = None;
-        self.turn_anchor_tokens.clear();
+        // Release only this request's prior candidate before allocating its
+        // replacement. The committed pre-request checkpoint remains private
+        // until success promotes the new candidate.
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
         let snapshot = self
             .cache
             .snapshot()
@@ -598,8 +795,9 @@ impl Deepseek4LoadedModel {
             snapshot.position(),
             prompt_prefix.len()
         );
-        self.turn_anchor = Some(snapshot);
-        self.turn_anchor_tokens.extend_from_slice(prompt_prefix);
+        self.pending_turn_anchor = Some(snapshot);
+        self.pending_turn_anchor_tokens
+            .extend_from_slice(prompt_prefix);
         Ok(())
     }
 
@@ -636,6 +834,7 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
+        self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         progress.cache_reset_diagnostic(
             self.committed_tokens.len(),
@@ -650,7 +849,7 @@ impl Deepseek4LoadedModel {
             false,
             cache_grew,
         );
-        self.reset_live_cache()?;
+        self.reset_live_cache_preserving_turn_anchor()?;
         progress.plan_prefill(
             0,
             prompt_tokens.len(),
@@ -679,6 +878,7 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
+        self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         let cache_poisoned = self.cache.is_poisoned();
         let live_position = self.cache.position();
@@ -786,41 +986,38 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len()
         };
         let remaining = segment_end.saturating_sub(plan.cursor);
-        anyhow::ensure!(
-            remaining > 0,
-            "DeepSeek-V4 resumable prefill made no progress"
-        );
         let window_multiplier = max_matrix_prefill_windows
             .map(|limit| plan.window_multiplier.min(limit))
             .unwrap_or(plan.window_multiplier);
-        let batch = resumable_matrix_prefill_chunk_len(
+        let slice = plan_resumable_prefill_chunk(
             self.cache.position(),
             remaining,
             self.model.cfg.sliding_window as usize,
             window_multiplier,
-        );
+            plan.recovery_position,
+        )?;
+        let (batch, incremental) = match slice.chunk {
+            ResumablePrefillChunk::Matrix(batch) => (batch, false),
+            ResumablePrefillChunk::Incremental(batch) => (batch, true),
+        };
         if let Some(window_cap) = max_matrix_prefill_windows {
-            progress.mixed_prefill_slice(if batch == 0 { remaining } else { batch }, window_cap);
+            progress.mixed_prefill_slice(batch, window_cap);
         }
-        if batch == 0 {
-            anyhow::ensure!(
-                remaining <= RECOVERY_TAIL_TOKENS,
-                "DeepSeek-V4 resumable prefill selected an empty chunk at cursor {} with {} tokens remaining (window={}, multiplier={})",
-                plan.cursor,
-                remaining,
-                self.model.cfg.sliding_window,
-                window_multiplier
-            );
+        if incremental {
             let start = plan.cursor;
             let mut state = None;
             for &token in &prompt_tokens[start..segment_end] {
                 anyhow::ensure!(
                     !cancelled(),
-                    "DeepSeek-V4 generation cancelled during recovery-tail prefill"
+                    "DeepSeek-V4 generation cancelled during incremental prefill"
                 );
                 state = Some(
-                    self.supervised_verifier_one(token, supervisor, "deepseek4_recovery_prefill")
-                        .context("execute DeepSeek-V4 resumable recovery-tail token")?,
+                    self.supervised_verifier_one(
+                        token,
+                        supervisor,
+                        "deepseek4_incremental_prefill",
+                    )
+                    .context("execute DeepSeek-V4 resumable incremental token")?,
                 );
                 self.committed_tokens.push(token);
                 plan.cursor += 1;
@@ -829,12 +1026,16 @@ impl Deepseek4LoadedModel {
             let state = state.context("DeepSeek-V4 recovery-tail prefill produced no state")?;
             anyhow::ensure!(
                 !cancelled(),
-                "DeepSeek-V4 generation cancelled after committed recovery-tail prefill"
+                "DeepSeek-V4 generation cancelled after committed incremental prefill"
             );
+            if slice.capture_anchor_after {
+                self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
+                progress.recovery_anchor_captured(plan.recovery_position);
+            }
             if plan.cursor < prompt_tokens.len() {
                 drop(state);
                 return Ok(Deepseek4ResumablePrefillAdvance::Pending {
-                    advanced_tokens: remaining,
+                    advanced_tokens: batch,
                 });
             }
             let (logits, cached_tokens) =
@@ -842,7 +1043,7 @@ impl Deepseek4LoadedModel {
             return Ok(Deepseek4ResumablePrefillAdvance::Ready {
                 logits,
                 cached_tokens,
-                advanced_tokens: remaining,
+                advanced_tokens: batch,
             });
         }
         let end = plan.cursor.saturating_add(batch);
@@ -862,8 +1063,9 @@ impl Deepseek4LoadedModel {
             "DeepSeek-V4 generation cancelled after committed prefill chunk"
         );
 
-        if plan.cursor == plan.recovery_position {
+        if slice.capture_anchor_after {
             self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
+            progress.recovery_anchor_captured(plan.recovery_position);
         }
         if plan.cursor < prompt_tokens.len() {
             drop(state);
@@ -949,6 +1151,7 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
+        self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 
         let cache_poisoned = self.cache.is_poisoned();
@@ -1006,7 +1209,7 @@ impl Deepseek4LoadedModel {
                 )
             }
             PrefixReuse::Reset => {
-                self.reset_live_cache()?;
+                self.reset_live_cache_preserving_turn_anchor()?;
                 (0, if cache_grew { "grow-reset" } else { "reset" })
             }
         };
@@ -1041,6 +1244,7 @@ impl Deepseek4LoadedModel {
                 supervisor,
             )?;
             self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
+            progress.recovery_anchor_captured(recovery_position);
             self.cache
                 .reset()
                 .context("reset DeepSeek-V4 live cache after recovery prepass")?;
@@ -1064,6 +1268,7 @@ impl Deepseek4LoadedModel {
             )?;
             cursor = recovery_position;
             self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
+            progress.recovery_anchor_captured(recovery_position);
         }
         final_state = self
             .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled, progress, supervisor)?
@@ -1240,9 +1445,10 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 mod tests {
     use super::{
         balance_fresh_three_chunk_prefill, cache_capacity_for_request, common_prefix_len,
-        deepseek4_cancellation_recovery, prefer_matrix_prefill, resumable_matrix_prefill_chunk_len,
-        select_prefix_reuse, should_retain_decode_scratch, Deepseek4CancellationRecovery,
-        PrefixReuse, TransientScratchStats,
+        deepseek4_cancellation_recovery, plan_resumable_prefill_chunk, prefer_matrix_prefill,
+        resumable_matrix_prefill_chunk_len, select_prefix_reuse, should_retain_decode_scratch,
+        Deepseek4CancellationRecovery, PrefixReuse, ResumablePrefillChunk, ResumablePrefillSlice,
+        TransientScratchStats, MIN_MATRIX_APPEND_TOKENS, RECOVERY_TAIL_TOKENS,
     };
 
     #[test]
@@ -1260,6 +1466,84 @@ mod tests {
         assert_eq!(285 - 252, 33);
         assert_eq!(resumable_matrix_prefill_chunk_len(1, 264, 128, 2), 256);
         assert_eq!(264 - 256, 8);
+    }
+
+    #[test]
+    fn cached_suffix_below_matrix_minimum_replays_without_an_empty_chunk() {
+        let cached_tokens = 107_066;
+        let prompt_tokens = 107_090;
+        let recovery_position = prompt_tokens - RECOVERY_TAIL_TOKENS;
+
+        for remaining in 1..MIN_MATRIX_APPEND_TOKENS {
+            assert_eq!(
+                plan_resumable_prefill_chunk(cached_tokens, remaining, 128, 16, usize::MAX,)
+                    .unwrap(),
+                ResumablePrefillSlice {
+                    chunk: ResumablePrefillChunk::Incremental(remaining),
+                    capture_anchor_after: false,
+                }
+            );
+        }
+
+        let before_anchor = plan_resumable_prefill_chunk(
+            cached_tokens,
+            recovery_position - cached_tokens,
+            128,
+            16,
+            recovery_position,
+        )
+        .unwrap();
+        assert_eq!(
+            before_anchor,
+            ResumablePrefillSlice {
+                chunk: ResumablePrefillChunk::Incremental(16),
+                capture_anchor_after: true,
+            }
+        );
+        let ResumablePrefillChunk::Incremental(before_anchor_tokens) = before_anchor.chunk else {
+            panic!("sub-matrix suffix before the recovery anchor must replay incrementally");
+        };
+        assert_eq!(cached_tokens + before_anchor_tokens, recovery_position);
+
+        let recovery_tail = plan_resumable_prefill_chunk(
+            recovery_position,
+            prompt_tokens - recovery_position,
+            128,
+            16,
+            recovery_position,
+        )
+        .unwrap();
+        assert_eq!(
+            recovery_tail,
+            ResumablePrefillSlice {
+                chunk: ResumablePrefillChunk::Incremental(8),
+                capture_anchor_after: false,
+            }
+        );
+        let ResumablePrefillChunk::Incremental(recovery_tail_tokens) = recovery_tail.chunk else {
+            panic!("the recovery tail must replay incrementally");
+        };
+        assert_eq!(recovery_position + recovery_tail_tokens, prompt_tokens);
+        assert_eq!(
+            plan_resumable_prefill_chunk(
+                recovery_position,
+                MIN_MATRIX_APPEND_TOKENS,
+                128,
+                16,
+                usize::MAX,
+            )
+            .unwrap(),
+            ResumablePrefillSlice {
+                chunk: ResumablePrefillChunk::Matrix(MIN_MATRIX_APPEND_TOKENS),
+                capture_anchor_after: false,
+            }
+        );
+        assert!(
+            plan_resumable_prefill_chunk(cached_tokens, 16, 128, 0, recovery_position).is_err()
+        );
+        assert!(
+            plan_resumable_prefill_chunk(cached_tokens, 0, 128, 16, recovery_position).is_err()
+        );
     }
 
     #[test]

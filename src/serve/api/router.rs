@@ -356,11 +356,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_rejects_empty_messages() {
-        // Even without an engine, an empty messages array should fail
-        // validation before the engine gate — BUT the handler currently
-        // gates on engine first, so this returns model_not_loaded. The
-        // validation path is exercised once the engine is wired in iter 4
-        // tests. This test documents the current ordering.
+        // Request-shape validation intentionally runs before model resolution,
+        // so an empty conversation is rejected without loading or selecting a
+        // model.
         let app = build_router(state_default());
         let body = r#"{"model":"gemma4","messages":[]}"#;
         let req = Request::builder()
@@ -372,8 +370,13 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-        // With no engine, the handler returns model_not_loaded first.
-        assert_eq!(v["error"]["code"], "model_not_loaded");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], serde_json::Value::Null);
+        assert_eq!(v["error"]["param"], "messages");
+        assert_eq!(
+            v["error"]["message"],
+            "messages must contain at least one entry"
+        );
     }
 
     // --- /metrics (Decision #11) ---

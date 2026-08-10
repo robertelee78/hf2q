@@ -13,6 +13,7 @@ MODEL=${MODEL:-Deepseek v4 Flash 0731 Source}
 EXPECTED_PATH=${EXPECTED_PATH:-$ROOT_DIR/Cargo.toml}
 TOOL_RESULT_PATH=${TOOL_RESULT_PATH:-$EXPECTED_PATH}
 RUN_ID=${RUN_ID:-"$$-$(date +%s)"}
+REQUIRE_COLD_FIRST=${REQUIRE_COLD_FIRST:-1}
 MAX_COLD_TTFT_MS=${MAX_COLD_TTFT_MS:-30000}
 MAX_CACHED_TTFT_MS=${MAX_CACHED_TTFT_MS:-5000}
 MAX_COLD_RESPONSE_MS=${MAX_COLD_RESPONSE_MS:-40000}
@@ -43,6 +44,10 @@ for setting in MAX_TOKENS SOURCE_MAX_TOKENS CURL_CONNECT_TIMEOUT_SECONDS CURL_MA
     exit 2
   fi
 done
+[[ "$REQUIRE_COLD_FIRST" == 0 || "$REQUIRE_COLD_FIRST" == 1 ]] || {
+  echo "REQUIRE_COLD_FIRST must be 0 or 1 (got: $REQUIRE_COLD_FIRST)" >&2
+  exit 2
+}
 
 request_file=$(mktemp -t hf2q-deepseek-agentic-request.XXXXXX)
 first_file=$(mktemp -t hf2q-deepseek-agentic-first.XXXXXX)
@@ -144,7 +149,7 @@ cold_response_ms=$(( $(epoch_ms) - cold_started ))
 assert_tool_path "$first_file"
 
 cold_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$first_file")
-if (( cold_cached != 0 )); then
+if [[ "$REQUIRE_COLD_FIRST" == 1 ]] && (( cold_cached != 0 )); then
   echo "agentic gate failed: first request was not cold (cached_tokens=$cold_cached)" >&2
   exit 1
 fi
@@ -385,6 +390,8 @@ if ! jq -e --arg expected "$EXPECTED_SOURCE" '
 fi
 
 jq -n \
+  --argjson cold_cached_tokens "$cold_cached" \
+  --argjson require_cold_first "$REQUIRE_COLD_FIRST" \
   --argjson prompt_tokens "$prompt_tokens" \
   --argjson cached_tokens "$cached_tokens" \
   --argjson continuation_cached "$continuation_cached" \
@@ -398,6 +405,8 @@ jq -n \
   --argjson continuation_response_ms "$continuation_response_ms" \
   --argjson source_response_ms "$source_response_ms" '{
     status: "pass",
+    cold_cached_tokens: $cold_cached_tokens,
+    require_cold_first: $require_cold_first,
     prompt_tokens: $prompt_tokens,
     cached_tokens: $cached_tokens,
     auto_cached_tokens: $auto_cached,

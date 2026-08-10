@@ -2462,6 +2462,8 @@ impl LoadedModel {
 /// - `top_k` — > 0 bypasses cache
 /// - `repetition_penalty` — ≠ 1.0 bypasses cache
 /// - `seed` — Some(_) bypasses cache
+/// - `logprobs` — `true` bypasses cache because `PromptCache` does not retain
+///   the live per-token logprob payload required for response-equivalent replay
 /// - `token_bytes` — derived from `grammar`; identical iff `grammar` is identical
 ///
 /// **Included (affect model output or response shape):**
@@ -2480,10 +2482,13 @@ impl LoadedModel {
 /// - `tool_call_policy` — Auto vs Constrained changes error-promotion on
 ///   parse failure; a cached Auto replay served to a Constrained caller
 ///   would silently suppress error signalling
-/// - `logprobs` — changes response shape (logprob data in choices)
-/// - `top_logprobs` — changes response shape (number of top alternatives)
+/// - `logprobs` / `top_logprobs` — retained in the key as defense in depth and
+///   for persisted-schema compatibility, although `logprobs=true` requests
+///   currently bypass terminal response caching
 /// - `parallel_tool_calls` — plumbed, not yet wired; included for
 ///   forward-compatibility
+/// - `reasoning_forced_open` — changes reasoning/content splitting, so a
+///   cached response from the opposite mode is not response-equivalent
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptCacheKey {
     pub max_tokens: usize,
@@ -2521,6 +2526,9 @@ pub struct PromptCacheKey {
     /// Multi-tool-call flag. Plumbed, not yet wired; included for
     /// forward-safe wiring.
     pub parallel_tool_calls: bool,
+    /// Whether the reasoning splitter begins inside a reasoning span. This
+    /// changes the public `text` / `reasoning_text` response shape.
+    pub reasoning_forced_open: bool,
 }
 
 impl PromptCacheKey {
@@ -2545,6 +2553,7 @@ impl PromptCacheKey {
             logprobs: params.logprobs,
             top_logprobs: params.top_logprobs,
             parallel_tool_calls: params.parallel_tool_calls,
+            reasoning_forced_open: params.reasoning_forced_open,
         }
     }
 }
@@ -2819,6 +2828,7 @@ impl PromptCache {
                 logprobs: false,
                 top_logprobs: 0,
                 parallel_tool_calls: true,
+                reasoning_forced_open: false,
             },
             text: String::new(),
             reasoning_text: None,
@@ -2880,6 +2890,7 @@ impl PromptCache {
             || params.top_p < 1.0
             || params.repetition_penalty != 1.0
             || params.seed.is_some()
+            || params.logprobs
         {
             return None;
         }
@@ -2960,6 +2971,7 @@ impl PromptCache {
             || params.top_p < 1.0
             || params.repetition_penalty != 1.0
             || params.seed.is_some()
+            || params.logprobs
         {
             return;
         }
@@ -6056,6 +6068,56 @@ where
     accepted
 }
 
+/// Keep a request that depends on an active retained prefix at the head of the
+/// pending queue without parking unrelated requests collected after it. The
+/// latter may use other free slots; the blocked request remains first among
+/// work deferred to a later admission quantum.
+fn defer_gemma4_active_request<T>(
+    requests: &mut Vec<T>,
+    pending: &mut VecDeque<T>,
+    blocked_index: usize,
+) {
+    let blocked = requests.remove(blocked_index);
+    pending.push_front(blocked);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gemma4PendingDisposition {
+    ReadyShutdown,
+    ReadyControl,
+    ReadyRequest,
+    WaitForActive(Gemma4SlotPreference),
+}
+
+fn gemma4_pending_disposition(
+    request: &Request,
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    slots: &[Option<Gemma4Slot>],
+) -> Gemma4PendingDisposition {
+    if matches!(request, Request::Shutdown) {
+        return Gemma4PendingDisposition::ReadyShutdown;
+    }
+    let Some(prompt_tokens) = gemma4_request_prompt_tokens(request) else {
+        return Gemma4PendingDisposition::ReadyControl;
+    };
+    match active_gemma4_slot_affinity(retained_tokens, prompt_anchors, slots, prompt_tokens) {
+        Some(preference) => Gemma4PendingDisposition::WaitForActive(preference),
+        None => Gemma4PendingDisposition::ReadyRequest,
+    }
+}
+
+fn choose_gemma4_ready_request_index(dispositions: &[Gemma4PendingDisposition]) -> Option<usize> {
+    dispositions
+        .iter()
+        .position(|item| matches!(item, Gemma4PendingDisposition::ReadyShutdown))
+        .or_else(|| {
+            dispositions
+                .iter()
+                .position(|item| !matches!(item, Gemma4PendingDisposition::WaitForActive(_)))
+        })
+}
+
 fn gemma4_next_prefill_end(
     cursor: usize,
     prompt_len: usize,
@@ -6235,7 +6297,16 @@ enum Gemma4PrefillAdvance {
     },
 }
 
+struct Gemma4PrefillFailure {
+    rollback_anchor: Option<Gemma4PromptAnchor>,
+    error: anyhow::Error,
+}
+
 impl Gemma4PrefillState {
+    fn prompt_tokens(&self) -> &[u32] {
+        &self.prompt_tokens
+    }
+
     fn new(
         slot_id: SlotId,
         prompt_tokens: Vec<u32>,
@@ -6264,53 +6335,80 @@ impl Gemma4PrefillState {
 
     #[allow(clippy::too_many_arguments)]
     fn advance(
-        self,
+        mut self,
         guard: &mut Gemma4KvGuard<'_>,
         registration: Option<&super::registry::ModelRegistration>,
         max_chunk_tokens: usize,
         supervisor: &EngineSupervisor,
-    ) -> Result<Gemma4PrefillAdvance> {
-        let plan = self.progress.plan(max_chunk_tokens)?;
-        validate_gemma4_slot_cursor(guard, self.slot_id, plan.start)?;
+    ) -> std::result::Result<Gemma4PrefillAdvance, Gemma4PrefillFailure> {
+        let plan = match self.progress.plan(max_chunk_tokens) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(Gemma4PrefillFailure {
+                    rollback_anchor: self.pending_anchor.take(),
+                    error,
+                });
+            }
+        };
+        if let Err(error) = validate_gemma4_slot_cursor(guard, self.slot_id, plan.start) {
+            return Err(Gemma4PrefillFailure {
+                rollback_anchor: self.pending_anchor.take(),
+                error,
+            });
+        }
         let started = Instant::now();
         let max_decode_tokens = self.params.max_tokens.max(1);
-        let first_token = supervised_gemma4_gpu_call(supervisor, "gemma4_bounded_prefill", || {
-            if plan.start == 0 {
-                guard
-                    .model
-                    .weights
-                    .forward_prefill_with_soft_tokens_slot_aware(
-                        &self.prompt_tokens[..plan.end],
-                        &[],
-                        max_decode_tokens,
-                        &mut guard.model.ctx,
-                        self.slot_id,
-                        &mut guard.kv,
-                        guard.hybrid.as_mut(),
-                        guard.dense.as_mut(),
-                        guard.mlx.as_mut(),
-                    )
-            } else {
-                guard
-                    .model
-                    .weights
-                    .forward_prefill_with_soft_tokens_slot_aware_resume(
-                        &self.prompt_tokens[..plan.end],
-                        &[],
-                        max_decode_tokens,
-                        &mut guard.model.ctx,
-                        self.slot_id,
-                        &mut guard.kv,
-                        guard.hybrid.as_mut(),
-                        guard.dense.as_mut(),
-                        guard.mlx.as_mut(),
-                        plan.start,
-                    )
-            }
-        })?;
+        let first_token =
+            match supervised_gemma4_gpu_call(supervisor, "gemma4_bounded_prefill", || {
+                if plan.start == 0 {
+                    guard
+                        .model
+                        .weights
+                        .forward_prefill_with_soft_tokens_slot_aware(
+                            &self.prompt_tokens[..plan.end],
+                            &[],
+                            max_decode_tokens,
+                            &mut guard.model.ctx,
+                            self.slot_id,
+                            &mut guard.kv,
+                            guard.hybrid.as_mut(),
+                            guard.dense.as_mut(),
+                            guard.mlx.as_mut(),
+                        )
+                } else {
+                    guard
+                        .model
+                        .weights
+                        .forward_prefill_with_soft_tokens_slot_aware_resume(
+                            &self.prompt_tokens[..plan.end],
+                            &[],
+                            max_decode_tokens,
+                            &mut guard.model.ctx,
+                            self.slot_id,
+                            &mut guard.kv,
+                            guard.hybrid.as_mut(),
+                            guard.dense.as_mut(),
+                            guard.mlx.as_mut(),
+                            plan.start,
+                        )
+                }
+            }) {
+                Ok(first_token) => first_token,
+                Err(error) => {
+                    return Err(Gemma4PrefillFailure {
+                        rollback_anchor: self.pending_anchor.take(),
+                        error,
+                    });
+                }
+            };
         let elapsed = started.elapsed();
         clear_gemma4_self_mounts(guard.model);
-        commit_gemma4_slot_cursor(guard, self.slot_id, plan.start, plan.end)?;
+        if let Err(error) = commit_gemma4_slot_cursor(guard, self.slot_id, plan.start, plan.end) {
+            return Err(Gemma4PrefillFailure {
+                rollback_anchor: self.pending_anchor.take(),
+                error,
+            });
+        }
 
         self.finish_committed_transaction(guard, registration, plan, first_token, None, elapsed)
     }
@@ -6324,37 +6422,59 @@ impl Gemma4PrefillState {
         first_token: u32,
         first_logits: Option<&[f32]>,
         elapsed: Duration,
-    ) -> Result<Gemma4PrefillAdvance> {
+    ) -> std::result::Result<Gemma4PrefillAdvance, Gemma4PrefillFailure> {
+        let mut rollback_anchor = self.pending_anchor.take();
         self.compute_duration += elapsed;
 
         if plan.capture_anchor {
-            let hybrid = guard.hybrid.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("Gemma stable prompt boundary requires hybrid KV")
-            })?;
-            let kv = crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                hybrid,
-                self.slot_id,
-                plan.end,
-            )?;
-            self.pending_anchor = Some(Gemma4PromptAnchor {
+            let Some(hybrid) = guard.hybrid.as_ref() else {
+                return Err(Gemma4PrefillFailure {
+                    rollback_anchor,
+                    error: anyhow::anyhow!("Gemma stable prompt boundary requires hybrid KV"),
+                });
+            };
+            let kv =
+                match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid,
+                    self.slot_id,
+                    plan.end,
+                ) {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        return Err(Gemma4PrefillFailure {
+                            rollback_anchor,
+                            error,
+                        });
+                    }
+                };
+            rollback_anchor = Some(Gemma4PromptAnchor {
                 prompt_tokens: self.prompt_tokens[..plan.end].to_vec(),
                 kv,
             });
         }
 
-        let committed = self.progress.commit(plan)?;
+        let committed = match self.progress.commit(plan) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return Err(Gemma4PrefillFailure {
+                    rollback_anchor,
+                    error,
+                });
+            }
+        };
         let advanced_tokens = match committed {
             Gemma4PrefillCommit::Pending { advanced_tokens }
             | Gemma4PrefillCommit::Ready { advanced_tokens } => advanced_tokens,
         };
         if matches!(committed, Gemma4PrefillCommit::Pending { .. }) {
+            self.pending_anchor = rollback_anchor;
             return Ok(Gemma4PrefillAdvance::Pending {
                 state: self,
                 advanced_tokens,
             });
         }
 
-        let decode = Gemma4DecodeState::from_first_token(
+        let decode = match Gemma4DecodeState::from_first_token(
             guard.model,
             &self.prompt_tokens,
             &self.params,
@@ -6364,10 +6484,18 @@ impl Gemma4PrefillState {
             first_logits,
             self.compute_duration,
             self.cached_tokens,
-        )?;
+        ) {
+            Ok(decode) => decode,
+            Err(error) => {
+                return Err(Gemma4PrefillFailure {
+                    rollback_anchor,
+                    error,
+                });
+            }
+        };
         Ok(Gemma4PrefillAdvance::Ready {
             state: decode,
-            prompt_anchor: self.pending_anchor,
+            prompt_anchor: rollback_anchor,
             advanced_tokens,
         })
     }
@@ -6432,6 +6560,10 @@ struct Gemma4DecodeState {
 }
 
 impl Gemma4DecodeState {
+    fn prompt_tokens(&self) -> &[u32] {
+        &self.prompt_tokens
+    }
+
     fn operator_progress(&self) -> (usize, usize, f64) {
         let generated = self.generated_tokens.len();
         let rate = generated as f64
@@ -7262,7 +7394,7 @@ fn deepseek4_reconcile_cold_cohort(
     active_cold: usize,
     active_prefills: usize,
     cold_waiting: bool,
-    pending_nonempty: bool,
+    runnable_waiting: bool,
 ) -> Deepseek4ColdCohortDecision {
     let (phase, admission_open) = match phase {
         // Idle means no cold-cohort barrier is active, not that every physical
@@ -7294,7 +7426,13 @@ fn deepseek4_reconcile_cold_cohort(
     Deepseek4ColdCohortDecision {
         phase,
         admission_open,
-        rerun_admission: admission_open && has_free_slot && pending_nonempty,
+        // A continuation whose strongest reusable prefix is owned by an
+        // active slot is deliberately not admissible yet.  Treating that
+        // Busy request as runnable would spin this outer loop before
+        // `scheduler.step()`, starving the owner that must decode/cancel and
+        // release the prefix.  Only work the selector can actually dequeue
+        // may request another admission pass.
+        rerun_admission: admission_open && has_free_slot && runnable_waiting,
     }
 }
 
@@ -7520,87 +7658,136 @@ fn preferred_deepseek_session(
     )
 }
 
-fn deepseek4_request_reuse_score(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4RequestAffinity {
+    Control,
+    Busy { slot: SlotId, cached_tokens: usize },
+    Cold,
+    Cached { slot: SlotId, cached_tokens: usize },
+}
+
+fn deepseek4_request_affinity(
     request: &Request,
     sessions: &[super::engine_deepseek4::Deepseek4Session],
-    unavailable_slots: &[bool],
-) -> Option<usize> {
+    busy_slots: &[bool],
+) -> Deepseek4RequestAffinity {
     let prompt_tokens = match request {
         Request::Generate { prompt_tokens, .. } | Request::GenerateStream { prompt_tokens, .. } => {
             prompt_tokens
         }
-        _ => return None,
+        _ => return Deepseek4RequestAffinity::Control,
     };
-    Some(
+    deepseek4_affinity_from_scores(
         sessions
             .iter()
-            .zip(unavailable_slots)
-            .filter(|(_, unavailable)| !**unavailable)
-            .map(|(session, _)| session.reusable_prefix_len(prompt_tokens))
-            .max()
-            .unwrap_or(0),
+            .zip(busy_slots)
+            .enumerate()
+            .map(|(index, (session, busy))| {
+                (index, session.reusable_prefix_len(prompt_tokens), *busy)
+            }),
     )
 }
 
-fn choose_deepseek4_request_index(reuse_scores: &[Option<usize>], prefer_cached: bool) -> usize {
-    if let Some(index) = reuse_scores.iter().position(Option::is_none) {
-        return index;
-    }
-    if prefer_cached {
-        let mut best_index = None;
-        let mut best_score = 0;
-        for (index, score) in reuse_scores.iter().enumerate() {
-            let score = score.unwrap_or(0);
-            if score > best_score {
-                best_index = Some(index);
-                best_score = score;
-            }
-        }
-        if let Some(index) = best_index {
-            return index;
+fn deepseek4_affinity_from_scores(
+    scores: impl IntoIterator<Item = (usize, usize, bool)>,
+) -> Deepseek4RequestAffinity {
+    let mut best_idle = (None, 0_usize);
+    let mut best_busy = (None, 0_usize);
+    for (index, score, busy) in scores {
+        let best = if busy { &mut best_busy } else { &mut best_idle };
+        if score > best.1 {
+            *best = (Some(SlotId(index as u32)), score);
         }
     }
-    if let Some(index) = reuse_scores
-        .iter()
-        .position(|score| matches!(score, Some(0)))
-    {
-        return index;
+    // An equally good idle copy is immediately usable. Only a strictly better
+    // busy prefix creates a wait dependency.
+    if best_busy.1 > best_idle.1 {
+        return Deepseek4RequestAffinity::Busy {
+            slot: best_busy.0.expect("positive busy score has a slot"),
+            cached_tokens: best_busy.1,
+        };
     }
-    let mut best_index = 0;
-    let mut best_score = 0;
-    for (index, score) in reuse_scores.iter().enumerate() {
-        let score = score.unwrap_or(0);
-        if score > best_score {
-            best_index = index;
-            best_score = score;
+    if best_idle.1 > 0 {
+        Deepseek4RequestAffinity::Cached {
+            slot: best_idle.0.expect("positive idle score has a slot"),
+            cached_tokens: best_idle.1,
         }
+    } else {
+        Deepseek4RequestAffinity::Cold
     }
-    best_index
 }
 
 fn pop_preferred_deepseek4_request(
     pending: &mut VecDeque<Request>,
     sessions: &[super::engine_deepseek4::Deepseek4Session],
-    unavailable_slots: &[bool],
+    busy_slots: &[bool],
     prefer_cached: bool,
 ) -> Option<(Request, Option<usize>)> {
-    let reuse_scores: Vec<Option<usize>> = pending
+    let affinities: Vec<Deepseek4RequestAffinity> = pending
         .iter()
-        .map(|request| deepseek4_request_reuse_score(request, sessions, unavailable_slots))
+        .map(|request| deepseek4_request_affinity(request, sessions, busy_slots))
         .collect();
-    let index = choose_deepseek4_request_index(&reuse_scores, prefer_cached);
+    let index = choose_deepseek4_ready_request_index(&affinities, prefer_cached)?;
     let request = pending.remove(index)?;
-    let score = deepseek4_request_reuse_score(&request, sessions, unavailable_slots);
+    let score = match affinities[index] {
+        Deepseek4RequestAffinity::Control => None,
+        Deepseek4RequestAffinity::Cold => Some(0),
+        Deepseek4RequestAffinity::Cached { cached_tokens, .. } => Some(cached_tokens),
+        Deepseek4RequestAffinity::Busy { .. } => unreachable!("busy request was not selected"),
+    };
     Some((request, score))
+}
+
+fn choose_deepseek4_ready_request_index(
+    affinities: &[Deepseek4RequestAffinity],
+    prefer_cached: bool,
+) -> Option<usize> {
+    if let Some(index) = affinities
+        .iter()
+        .position(|affinity| matches!(affinity, Deepseek4RequestAffinity::Control))
+    {
+        return Some(index);
+    }
+    let best_cached = || {
+        affinities
+            .iter()
+            .enumerate()
+            .filter_map(|(index, affinity)| match affinity {
+                Deepseek4RequestAffinity::Cached { cached_tokens, .. } => {
+                    Some((index, *cached_tokens))
+                }
+                _ => None,
+            })
+            .max_by_key(|(_, score)| *score)
+            .map(|(index, _)| index)
+    };
+    if prefer_cached {
+        if let Some(index) = best_cached() {
+            return Some(index);
+        }
+    }
+    affinities
+        .iter()
+        .position(|affinity| matches!(affinity, Deepseek4RequestAffinity::Cold))
+        .or_else(best_cached)
+}
+
+fn deepseek4_has_runnable_affinity(affinities: &[Deepseek4RequestAffinity]) -> bool {
+    affinities
+        .iter()
+        .any(|affinity| !matches!(affinity, Deepseek4RequestAffinity::Busy { .. }))
 }
 
 fn pop_control_deepseek4_request(
     pending: &mut VecDeque<Request>,
     sessions: &[super::engine_deepseek4::Deepseek4Session],
-    unavailable_slots: &[bool],
+    busy_slots: &[bool],
 ) -> Option<(Request, Option<usize>, usize)> {
     if let Some(index) = pending.iter().position(|request| {
-        deepseek4_request_reuse_score(request, sessions, unavailable_slots).is_none()
+        matches!(
+            deepseek4_request_affinity(request, sessions, busy_slots),
+            Deepseek4RequestAffinity::Control
+        )
     }) {
         return pending.remove(index).map(|request| (request, None, 0));
     }
@@ -7610,12 +7797,12 @@ fn pop_control_deepseek4_request(
 fn pop_cold_deepseek4_request(
     pending: &mut VecDeque<Request>,
     sessions: &[super::engine_deepseek4::Deepseek4Session],
-    unavailable_slots: &[bool],
+    busy_slots: &[bool],
 ) -> Option<(Request, Option<usize>, usize)> {
     let index = pending.iter().position(|request| {
         matches!(
-            deepseek4_request_reuse_score(request, sessions, unavailable_slots),
-            Some(0)
+            deepseek4_request_affinity(request, sessions, busy_slots),
+            Deepseek4RequestAffinity::Cold
         )
     })?;
     pending.remove(index).map(|request| (request, Some(0), 0))
@@ -7624,15 +7811,18 @@ fn pop_cold_deepseek4_request(
 fn pop_cached_deepseek4_request(
     pending: &mut VecDeque<Request>,
     sessions: &[super::engine_deepseek4::Deepseek4Session],
-    unavailable_slots: &[bool],
+    busy_slots: &[bool],
 ) -> Option<(Request, Option<usize>, usize)> {
     let (index, score) = pending
         .iter()
         .enumerate()
         .filter_map(|(index, request)| {
-            deepseek4_request_reuse_score(request, sessions, unavailable_slots)
-                .filter(|score| *score > 0)
-                .map(|score| (index, score))
+            match deepseek4_request_affinity(request, sessions, busy_slots) {
+                Deepseek4RequestAffinity::Cached { cached_tokens, .. } => {
+                    Some((index, cached_tokens))
+                }
+                _ => None,
+            }
         })
         .max_by_key(|(_, score)| *score)?;
     pending
@@ -7768,6 +7958,7 @@ fn run_slot_aware_deepseek4(
     let mut admission_open = true;
     let mut last_prefill_slot = None;
     let mut cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
+    let mut pending_affinity_wait: Option<(SlotId, usize)> = None;
     let mut shutdown_requested = false;
     tracing::info!(
         slots = sessions.len(),
@@ -7782,7 +7973,7 @@ fn run_slot_aware_deepseek4(
     };
 
     'worker: loop {
-        while pending.len() < sessions.len() {
+        for _ in 0..rx.max_capacity() {
             match rx.try_recv() {
                 Ok(Request::Shutdown) => {
                     tracing::info!(
@@ -7792,7 +7983,23 @@ fn run_slot_aware_deepseek4(
                     shutdown_requested = true;
                     break;
                 }
-                Ok(request) => pending.push_back(request),
+                Ok(request) => {
+                    enqueue_slotaware_pending(
+                        "DeepSeek-V4",
+                        &mut pending,
+                        rx.max_capacity(),
+                        request,
+                        |candidate| {
+                            deepseek4_pending_request_is_ready(
+                                candidate,
+                                &sessions,
+                                &slots,
+                                &reserved_slots,
+                                admission_open,
+                            )
+                        },
+                    );
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     shutdown_requested = true;
@@ -7800,6 +8007,7 @@ fn run_slot_aware_deepseek4(
                 }
             }
         }
+        prune_closed_slotaware_pending("DeepSeek-V4", &mut pending);
 
         let mut wave_seeds = Vec::with_capacity(sessions.len());
         let cold_prefill_active = deepseek4_cold_prefill_active(&slots);
@@ -7809,7 +8017,7 @@ fn run_slot_aware_deepseek4(
             && slots.iter().any(Option::is_none)
             && wave_seeds.len() < sessions.len()
         {
-            while pending.len() < sessions.len() {
+            for _ in 0..rx.max_capacity() {
                 if shutdown_requested {
                     break;
                 }
@@ -7822,7 +8030,23 @@ fn run_slot_aware_deepseek4(
                         shutdown_requested = true;
                         break;
                     }
-                    Ok(request) => pending.push_back(request),
+                    Ok(request) => {
+                        enqueue_slotaware_pending(
+                            "DeepSeek-V4",
+                            &mut pending,
+                            rx.max_capacity(),
+                            request,
+                            |candidate| {
+                                deepseek4_pending_request_is_ready(
+                                    candidate,
+                                    &sessions,
+                                    &slots,
+                                    &reserved_slots,
+                                    admission_open,
+                                )
+                            },
+                        );
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         shutdown_requested = true;
@@ -7830,46 +8054,60 @@ fn run_slot_aware_deepseek4(
                     }
                 }
             }
+            prune_closed_slotaware_pending("DeepSeek-V4", &mut pending);
+            let busy_slots: Vec<bool> = slots
+                .iter()
+                .zip(&reserved_slots)
+                .map(|(slot, reserved)| slot.is_some() || *reserved)
+                .collect();
             let selected = match cold_cohort_phase {
                 Deepseek4ColdCohortPhase::Filling => pop_control_deepseek4_request(
                     &mut pending,
                     &sessions,
-                    &reserved_slots,
+                    &busy_slots,
                 )
                 .or_else(|| {
                     (cold_prefill_active + cold_wave_seeds < DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS)
-                        .then(|| {
-                            pop_cold_deepseek4_request(&mut pending, &sessions, &reserved_slots)
-                        })
+                        .then(|| pop_cold_deepseek4_request(&mut pending, &sessions, &busy_slots))
                         .flatten()
                 }),
                 Deepseek4ColdCohortPhase::Draining => {
-                    pop_control_deepseek4_request(&mut pending, &sessions, &reserved_slots)
+                    pop_control_deepseek4_request(&mut pending, &sessions, &busy_slots)
                 }
                 Deepseek4ColdCohortPhase::Idle => {
                     if cached_wave {
-                        pop_control_deepseek4_request(&mut pending, &sessions, &reserved_slots)
-                            .or_else(|| {
-                                pop_cached_deepseek4_request(
-                                    &mut pending,
-                                    &sessions,
-                                    &reserved_slots,
-                                )
-                            })
-                    } else {
-                        pop_preferred_deepseek4_request(
-                            &mut pending,
-                            &sessions,
-                            &reserved_slots,
-                            true,
+                        pop_control_deepseek4_request(&mut pending, &sessions, &busy_slots).or_else(
+                            || pop_cached_deepseek4_request(&mut pending, &sessions, &busy_slots),
                         )
-                        .map(|(request, reuse)| (request, reuse, 0))
+                    } else {
+                        pop_preferred_deepseek4_request(&mut pending, &sessions, &busy_slots, true)
+                            .map(|(request, reuse)| (request, reuse, 0))
                     }
                 }
             };
             let Some((request, reuse_score, _cached_suffix)) = selected else {
+                let waiting = pending.iter().find_map(|request| {
+                    match deepseek4_request_affinity(request, &sessions, &busy_slots) {
+                        Deepseek4RequestAffinity::Busy {
+                            slot,
+                            cached_tokens,
+                        } => Some((slot, cached_tokens)),
+                        _ => None,
+                    }
+                });
+                if waiting != pending_affinity_wait {
+                    if let Some((slot, cached_tokens)) = waiting {
+                        tracing::info!(
+                            slot = slot.0,
+                            cached_tokens,
+                            "DeepSeek-V4 continuation waiting for active retained slot"
+                        );
+                    }
+                    pending_affinity_wait = waiting;
+                }
                 break;
             };
+            pending_affinity_wait = None;
             if reuse_score.is_some_and(|score| score > 0) {
                 cached_wave = true;
             }
@@ -8034,12 +8272,18 @@ fn run_slot_aware_deepseek4(
         }
         let slots_empty = slots.iter().all(Option::is_none);
         let has_free_slot = slots.iter().any(Option::is_none);
-        let cold_waiting = pending.iter().any(|request| {
-            matches!(
-                deepseek4_request_reuse_score(request, &sessions, &reserved_slots),
-                Some(0)
-            )
-        });
+        let busy_slots: Vec<bool> = slots.iter().map(Option::is_some).collect();
+        // Score the queue once.  Besides avoiding repeated long-prefix scans,
+        // this distinguishes an actually runnable request from a Busy
+        // continuation that must yield to its active owner.
+        let pending_affinities: Vec<Deepseek4RequestAffinity> = pending
+            .iter()
+            .map(|request| deepseek4_request_affinity(request, &sessions, &busy_slots))
+            .collect();
+        let cold_waiting = pending_affinities
+            .iter()
+            .any(|affinity| matches!(affinity, Deepseek4RequestAffinity::Cold));
+        let runnable_waiting = deepseek4_has_runnable_affinity(&pending_affinities);
         let cohort = deepseek4_reconcile_cold_cohort(
             cold_cohort_phase,
             slots.iter().all(Option::is_some),
@@ -8048,7 +8292,7 @@ fn run_slot_aware_deepseek4(
             deepseek4_cold_cohort_active(&slots),
             deepseek4_cold_prefill_active(&slots),
             cold_waiting,
-            !pending.is_empty(),
+            runnable_waiting,
         );
         cold_cohort_phase = cohort.phase;
         admission_open = cohort.admission_open;
@@ -8072,7 +8316,21 @@ fn run_slot_aware_deepseek4(
                     rx.close();
                     shutdown_requested = true;
                 }
-                Some(request) => pending.push_back(request),
+                Some(request) => enqueue_slotaware_pending(
+                    "DeepSeek-V4",
+                    &mut pending,
+                    rx.max_capacity(),
+                    request,
+                    |candidate| {
+                        deepseek4_pending_request_is_ready(
+                            candidate,
+                            &sessions,
+                            &slots,
+                            &reserved_slots,
+                            admission_open,
+                        )
+                    },
+                ),
                 None => shutdown_requested = true,
             },
             Ok(SchedulerStep::Decode { handles }) => {
@@ -8778,6 +9036,17 @@ fn decode_batch_deepseek4(
         };
         match ownership {
             Deepseek4DecodeOwnership::Park { deferred_ticks } => {
+                if !was_parked {
+                    tracing::info!(
+                        target: "hf2q::serve::api::engine_deepseek4::progress",
+                        request_id = state.request_id(),
+                        slot = handle.slot_id.0,
+                        generation = handle.generation,
+                        deferred_ticks,
+                        active_cold_prefills,
+                        "DeepSeek-V4 terminal completion parked behind cold prefill"
+                    );
+                }
                 slots[slot_index] = Some((
                     Deepseek4SlotWork::ParkedCompletion {
                         state,
@@ -8788,24 +9057,66 @@ fn decode_batch_deepseek4(
                     handle,
                 ));
             }
-            Deepseek4DecodeOwnership::Finalize => match state.finish(registration, events) {
-                Ok(completion) => {
-                    scheduler.release(handle);
-                    last_used[slot_index] = *clock;
-                    *clock = clock.saturating_add(1);
-                    fire_deepseek4_completion(reply, completion);
+            Deepseek4DecodeOwnership::Finalize => {
+                if was_parked {
+                    tracing::info!(
+                        target: "hf2q::serve::api::engine_deepseek4::progress",
+                        request_id = state.request_id(),
+                        slot = handle.slot_id.0,
+                        generation = handle.generation,
+                        "DeepSeek-V4 parked completion released after cold prefill"
+                    );
                 }
-                Err(error) => {
-                    reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
-                        Ok(reply) => reply,
-                        Err(fatal) => return Some(fatal),
-                    };
-                    scheduler.release(handle);
-                    last_used[slot_index] = *clock;
-                    *clock = clock.saturating_add(1);
-                    fire_deepseek4_error(reply, error);
+                match state.finish(registration, events) {
+                    Ok(completion) => {
+                        let delivered = fire_deepseek4_completion(reply, completion);
+                        if delivered {
+                            sessions[slot_index].commit_request_anchor();
+                        } else {
+                            if let Err(error) = sessions[slot_index].recover_after_cancellation() {
+                                return Some(SlotAwareGpuFatal::invariant_handle(handle, error));
+                            }
+                            record_retained_slot_kv(
+                                scheduler,
+                                handle,
+                                sessions[slot_index].committed_tokens().len(),
+                                kv_bytes_per_token,
+                            );
+                        }
+                        scheduler.release(handle);
+                        last_used[slot_index] = *clock;
+                        *clock = clock.saturating_add(1);
+                    }
+                    Err(error) => {
+                        if reply.client_closed() {
+                            reply.record_client_cancellation();
+                            record_retained_slot_kv(
+                                scheduler,
+                                handle,
+                                sessions[slot_index].committed_tokens().len(),
+                                kv_bytes_per_token,
+                            );
+                            if let Err(fatal) = recover_cancelled_deepseek4_session_for_reply(
+                                sessions, handle, reply,
+                            ) {
+                                return Some(fatal);
+                            }
+                            scheduler.release(handle);
+                            last_used[slot_index] = *clock;
+                            *clock = clock.saturating_add(1);
+                            continue;
+                        }
+                        reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                            Ok(reply) => reply,
+                            Err(fatal) => return Some(fatal),
+                        };
+                        scheduler.release(handle);
+                        last_used[slot_index] = *clock;
+                        *clock = clock.saturating_add(1);
+                        fire_deepseek4_error(reply, error);
+                    }
                 }
-            },
+            }
             Deepseek4DecodeOwnership::Reinstall => {
                 slots[slot_index] = Some((
                     Deepseek4SlotWork::Decode { state, cold_wave },
@@ -8821,36 +9132,44 @@ fn decode_batch_deepseek4(
 fn fire_deepseek4_completion(
     reply: SlotReply,
     completion: super::engine_deepseek4::Deepseek4SlotCompletion,
-) {
+) -> bool {
     match reply {
-        SlotReply::Unary(reply) => {
-            let _ = reply.send(Ok(completion.result));
-        }
-        SlotReply::Stream { events, .. } => {
+        SlotReply::Unary(reply) => reply.send(Ok(completion.result)).is_ok(),
+        SlotReply::Stream { events, cancel, .. } => {
             let result = completion.result;
             let prefill_seconds = result.prefill_duration.as_secs_f64();
             let decode_seconds = result.decode_duration.as_secs_f64();
-            let _ = events.blocking_send(super::sse::GenerationEvent::Done {
-                finish_reason: result.finish_reason,
-                prompt_tokens: result.prompt_tokens,
-                completion_tokens: result.completion_tokens,
-                stats: super::sse::StreamStats {
-                    prefill_time_secs: Some(prefill_seconds),
-                    decode_time_secs: Some(decode_seconds),
-                    total_time_secs: Some(prefill_seconds + decode_seconds),
-                    time_to_first_token_ms: Some(completion.semantic_ttft.as_secs_f64() * 1000.0),
-                    prefill_tokens_per_sec: Some(
-                        result.prompt_tokens.saturating_sub(result.cached_tokens) as f64
-                            / prefill_seconds.max(f64::EPSILON),
-                    ),
-                    decode_tokens_per_sec: Some(
-                        result.completion_tokens as f64 / decode_seconds.max(f64::EPSILON),
-                    ),
-                    cached_prompt_tokens: Some(result.cached_tokens),
-                    reasoning_tokens: result.reasoning_tokens,
-                    ..super::sse::StreamStats::default()
-                },
-            });
+            let delivered = events
+                .blocking_send(super::sse::GenerationEvent::Done {
+                    finish_reason: result.finish_reason,
+                    prompt_tokens: result.prompt_tokens,
+                    completion_tokens: result.completion_tokens,
+                    stats: super::sse::StreamStats {
+                        prefill_time_secs: Some(prefill_seconds),
+                        decode_time_secs: Some(decode_seconds),
+                        total_time_secs: Some(prefill_seconds + decode_seconds),
+                        time_to_first_token_ms: Some(
+                            completion.semantic_ttft.as_secs_f64() * 1000.0,
+                        ),
+                        prefill_tokens_per_sec: Some(
+                            result.prompt_tokens.saturating_sub(result.cached_tokens) as f64
+                                / prefill_seconds.max(f64::EPSILON),
+                        ),
+                        decode_tokens_per_sec: Some(
+                            result.completion_tokens as f64 / decode_seconds.max(f64::EPSILON),
+                        ),
+                        cached_prompt_tokens: Some(result.cached_tokens),
+                        reasoning_tokens: result.reasoning_tokens,
+                        ..super::sse::StreamStats::default()
+                    },
+                })
+                .is_ok();
+            if !delivered {
+                if let Some(counter) = cancel {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            delivered
         }
     }
 }
@@ -9148,6 +9467,15 @@ impl Drop for Gemma4KvGuard<'_> {
 enum Gemma4SlotWork {
     Prefill(Gemma4PrefillState),
     Decode(Gemma4DecodeState),
+}
+
+impl Gemma4SlotWork {
+    fn prompt_tokens(&self) -> &[u32] {
+        match self {
+            Self::Prefill(state) => state.prompt_tokens(),
+            Self::Decode(state) => state.prompt_tokens(),
+        }
+    }
 }
 
 /// Type alias for one installed Gemma 4 slot: bounded prefill or decode work,
@@ -9624,6 +9952,7 @@ fn run_slot_aware_gemma4(
     // A request pulled off `rx` that still needs admitting (set when the
     // loop parked on Idle and blocked for one request).
     let mut pending = VecDeque::new();
+    let mut pending_affinity_wait: Option<(SlotId, usize)> = None;
     let mut shutdown_requested = false;
 
     // ADR-040 iter-G(a) — cross-slot BATCHED admit gate. When on, the admit
@@ -9662,6 +9991,50 @@ fn run_slot_aware_gemma4(
                 if shutdown_requested {
                     break;
                 }
+                // Cancellation and shutdown/control intake must not depend on a
+                // physical slot becoming free.  In particular, a disconnected
+                // stream waiting behind an active retained prefix must release
+                // its admission ownership immediately instead of occupying the
+                // bounded queue until the current cohort finishes.
+                for _ in 0..rx.max_capacity() {
+                    match rx.try_recv() {
+                        Ok(request) => enqueue_slotaware_pending(
+                            "Gemma4",
+                            &mut pending,
+                            rx.max_capacity(),
+                            request,
+                            |candidate| {
+                                gemma4_pending_request_is_ready(
+                                    candidate,
+                                    &retained_tokens,
+                                    &prompt_anchors,
+                                    &slots,
+                                )
+                            },
+                        ),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            shutdown_requested = true;
+                            break;
+                        }
+                    }
+                }
+                prune_closed_slotaware_pending("Gemma4", &mut pending);
+                if shutdown_requested {
+                    break;
+                }
+                if let Some(index) = pending
+                    .iter()
+                    .position(|request| matches!(request, Request::Shutdown))
+                {
+                    let _ = pending.remove(index);
+                    tracing::info!(
+                        "Gemma4 SlotAware worker received Shutdown; draining active slots"
+                    );
+                    rx.close();
+                    shutdown_requested = true;
+                    break;
+                }
                 let n_free = slots.iter().filter(|s| s.is_none()).count();
                 if n_free == 0 {
                     break;
@@ -9673,33 +10046,76 @@ fn run_slot_aware_gemma4(
                 let admission_budget = gemma4_admission_budget(all_slots_idle, n_free);
                 let mut reqs: Vec<Request> = Vec::with_capacity(admission_budget);
                 let mut coalesce_deadline: Option<Instant> = None;
-                while reqs.len() < admission_budget {
-                    let req = match pending.pop_front() {
-                        Some(r) => r,
-                        None => match rx.try_recv() {
-                            Ok(r) => r,
-                            Err(mpsc::error::TryRecvError::Empty) => {
-                                if all_slots_idle && !reqs.is_empty() {
-                                    let deadline = *coalesce_deadline.get_or_insert_with(|| {
-                                        Instant::now() + cross_slot_coalesce
-                                    });
-                                    if Instant::now() < deadline {
-                                        std::thread::sleep(Duration::from_micros(100));
-                                        continue;
+                if all_slots_idle {
+                    while reqs.len() < admission_budget {
+                        let req = match pending.pop_front() {
+                            Some(r) => r,
+                            None => match rx.try_recv() {
+                                Ok(r) => r,
+                                Err(mpsc::error::TryRecvError::Empty) => {
+                                    if !reqs.is_empty() {
+                                        let deadline =
+                                            *coalesce_deadline.get_or_insert_with(|| {
+                                                Instant::now() + cross_slot_coalesce
+                                            });
+                                        if Instant::now() < deadline {
+                                            std::thread::sleep(Duration::from_micros(100));
+                                            continue;
+                                        }
                                     }
+                                    break;
                                 }
-                                break;
-                            }
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                shutdown_requested = true;
-                                break;
-                            }
-                        },
-                    };
-                    reqs.push(req);
-                    if all_slots_idle && coalesce_deadline.is_none() {
-                        coalesce_deadline = Some(Instant::now() + cross_slot_coalesce);
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    shutdown_requested = true;
+                                    break;
+                                }
+                            },
+                        };
+                        let Some(req) = discard_closed_slotaware_stream("Gemma4", req) else {
+                            continue;
+                        };
+                        reqs.push(req);
+                        if coalesce_deadline.is_none() {
+                            coalesce_deadline = Some(Instant::now() + cross_slot_coalesce);
+                        }
                     }
+                    pending_affinity_wait = None;
+                } else {
+                    let dispositions: Vec<Gemma4PendingDisposition> = pending
+                        .iter()
+                        .map(|request| {
+                            gemma4_pending_disposition(
+                                request,
+                                &retained_tokens,
+                                &prompt_anchors,
+                                &slots,
+                            )
+                        })
+                        .collect();
+                    let waiting = dispositions.iter().find_map(|item| match item {
+                        Gemma4PendingDisposition::WaitForActive(preference) => {
+                            Some((preference.slot, preference.cached_tokens))
+                        }
+                        _ => None,
+                    });
+                    if waiting != pending_affinity_wait {
+                        if let Some((slot, cached_tokens)) = waiting {
+                            tracing::info!(
+                                slot = slot.0,
+                                cached_tokens,
+                                "Gemma4 continuation waiting for active retained slot"
+                            );
+                        }
+                        pending_affinity_wait = waiting;
+                    }
+                    let Some(ready_index) = choose_gemma4_ready_request_index(&dispositions) else {
+                        break;
+                    };
+                    reqs.push(
+                        pending
+                            .remove(ready_index)
+                            .expect("Gemma4 ready index came from pending dispositions"),
+                    );
                 }
                 if reqs.is_empty() {
                     break;
@@ -9723,9 +10139,26 @@ fn run_slot_aware_gemma4(
                     .max(1)
                     .min(reqs.len());
                 let deferred = reqs.split_off(process_len);
-                let mut deferred = VecDeque::from(deferred);
-                deferred.append(&mut pending);
-                pending = deferred;
+                let mut combined = VecDeque::from(deferred);
+                combined.append(&mut pending);
+                let mut bounded = VecDeque::with_capacity(rx.max_capacity().saturating_add(1));
+                while let Some(request) = combined.pop_front() {
+                    enqueue_slotaware_pending(
+                        "Gemma4",
+                        &mut bounded,
+                        rx.max_capacity(),
+                        request,
+                        |candidate| {
+                            gemma4_pending_request_is_ready(
+                                candidate,
+                                &retained_tokens,
+                                &prompt_anchors,
+                                &slots,
+                            )
+                        },
+                    );
+                }
+                pending = bounded;
                 let mut batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
                 let mut stable_batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
                 let mut reqs = reqs.into_iter();
@@ -9952,6 +10385,8 @@ fn run_slot_aware_gemma4(
                             stop_on_cross_fatal!(embed_gemma4_inline(
                                 &mut guard,
                                 &mut scheduler,
+                                &mut retained_tokens,
+                                &mut prompt_anchors,
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
@@ -10131,21 +10566,84 @@ fn run_slot_aware_gemma4(
                 if shutdown_requested {
                     break;
                 }
-                let free = slots.iter().position(|s| s.is_none());
-                let Some(free_idx) = free else { break };
-                let _ = free_idx;
-                let active_cohort_before_request = slots.iter().any(Option::is_some);
-                let req = match pending.pop_front() {
-                    Some(r) => r,
-                    None => match rx.try_recv() {
-                        Ok(r) => r,
+                // Keep cancellation/control progress independent of slot
+                // availability, matching the cross-slot collector above.
+                for _ in 0..rx.max_capacity() {
+                    match rx.try_recv() {
+                        Ok(request) => enqueue_slotaware_pending(
+                            "Gemma4",
+                            &mut pending,
+                            rx.max_capacity(),
+                            request,
+                            |candidate| {
+                                gemma4_pending_request_is_ready(
+                                    candidate,
+                                    &retained_tokens,
+                                    &prompt_anchors,
+                                    &slots,
+                                )
+                            },
+                        ),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             shutdown_requested = true;
                             break;
                         }
-                    },
+                    }
+                }
+                prune_closed_slotaware_pending("Gemma4", &mut pending);
+                if shutdown_requested {
+                    break;
+                }
+                if let Some(index) = pending
+                    .iter()
+                    .position(|request| matches!(request, Request::Shutdown))
+                {
+                    let _ = pending.remove(index);
+                    tracing::info!(
+                        "Gemma4 SlotAware worker received Shutdown; draining active slots"
+                    );
+                    rx.close();
+                    shutdown_requested = true;
+                    break;
+                }
+                let free = slots.iter().position(|s| s.is_none());
+                let Some(free_idx) = free else { break };
+                let _ = free_idx;
+                let active_cohort_before_request = slots.iter().any(Option::is_some);
+                let dispositions: Vec<Gemma4PendingDisposition> = pending
+                    .iter()
+                    .map(|request| {
+                        gemma4_pending_disposition(
+                            request,
+                            &retained_tokens,
+                            &prompt_anchors,
+                            &slots,
+                        )
+                    })
+                    .collect();
+                let waiting = dispositions.iter().find_map(|item| match item {
+                    Gemma4PendingDisposition::WaitForActive(preference) => {
+                        Some((preference.slot, preference.cached_tokens))
+                    }
+                    _ => None,
+                });
+                if waiting != pending_affinity_wait {
+                    if let Some((slot, cached_tokens)) = waiting {
+                        tracing::info!(
+                            slot = slot.0,
+                            cached_tokens,
+                            "Gemma4 continuation waiting for active retained slot"
+                        );
+                    }
+                    pending_affinity_wait = waiting;
+                }
+                let Some(ready_index) = choose_gemma4_ready_request_index(&dispositions) else {
+                    break;
                 };
+                let req = pending
+                    .remove(ready_index)
+                    .expect("Gemma4 ready index came from pending dispositions");
                 let yield_after_inline_gpu = gemma4_request_runs_inline_gpu(&req);
                 match req {
                     Request::Generate {
@@ -10321,6 +10819,8 @@ fn run_slot_aware_gemma4(
                         if let Some(fatal) = embed_gemma4_inline(
                             &mut guard,
                             &mut scheduler,
+                            &mut retained_tokens,
+                            &mut prompt_anchors,
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
@@ -10403,7 +10903,20 @@ fn run_slot_aware_gemma4(
                 // No work. Park until a request arrives, then re-loop to
                 // admit it. Disconnect ends the worker.
                 match rx.blocking_recv() {
-                    Some(r) => pending.push_back(r),
+                    Some(r) => enqueue_slotaware_pending(
+                        "Gemma4",
+                        &mut pending,
+                        rx.max_capacity(),
+                        r,
+                        |candidate| {
+                            gemma4_pending_request_is_ready(
+                                candidate,
+                                &retained_tokens,
+                                &prompt_anchors,
+                                &slots,
+                            )
+                        },
+                    ),
                     None => shutdown_requested = true,
                 }
             }
@@ -10444,6 +10957,7 @@ fn run_slot_aware_gemma4(
                     &mut scheduler,
                     &mut slots,
                     &mut retained_tokens,
+                    &mut prompt_anchors,
                     registration.as_ref(),
                     &handles,
                     kv_bytes_per_token,
@@ -10485,6 +10999,7 @@ fn run_slot_aware_gemma4(
                     &mut scheduler,
                     &mut slots,
                     &mut retained_tokens,
+                    &mut prompt_anchors,
                     registration.as_ref(),
                     &decode_handles,
                     kv_bytes_per_token,
@@ -10895,18 +11410,21 @@ fn admit_gemma4_slot(
 
     if reply.client_closed() {
         reply.record_client_cancellation();
-        reply = match reset_gemma4_slot_for_reply(
+        let slot_idx = handle.slot_id.0 as usize;
+        reply = match recover_gemma4_slot_after_cancellation_for_reply(
             guard,
             scheduler,
             handle,
             kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            None,
+            true,
             reply,
         ) {
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-        retained_tokens[handle.slot_id.0 as usize].clear();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
         scheduler.release(handle);
         slot_fire_done(
             reply,
@@ -10917,12 +11435,33 @@ fn admit_gemma4_slot(
     }
 
     if bounded_text_prefill {
-        let pending_anchor =
-            if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
-                prompt_anchors[handle.slot_id.0 as usize].take()
-            } else {
-                None
-            };
+        let slot_idx = handle.slot_id.0 as usize;
+        let pending_anchor = match take_gemma4_request_rollback_anchor(
+            guard,
+            handle.slot_id,
+            cached_tokens,
+            &prompt_tokens,
+            &mut prompt_anchors[slot_idx],
+        ) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear();
+                prompt_anchors[slot_idx] = None;
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(error), false);
+                return None;
+            }
+        };
         let stable_boundary = params
             .stable_prompt_prefix_tokens
             .filter(|_| guard.hybrid.is_some());
@@ -10958,6 +11497,32 @@ fn admit_gemma4_slot(
         return None;
     }
 
+    let slot_idx = handle.slot_id.0 as usize;
+    let request_rollback_anchor = match take_gemma4_request_rollback_anchor(
+        guard,
+        handle.slot_id,
+        cached_tokens,
+        &prompt_tokens,
+        &mut prompt_anchors[slot_idx],
+    ) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[slot_idx].clear();
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
     let seed = Gemma4DecodeState::prefill_seed(
         guard.model,
         &prompt_tokens,
@@ -10978,19 +11543,23 @@ fn admit_gemma4_slot(
             if is_worker_fatal(supervisor, &e) {
                 return Some(SlotAwareGpuFatal::slot(handle, reply, e));
             }
-            // Prefill failed: reset the slot's KV, release, fire error.
-            reply = match reset_gemma4_slot_for_reply(
+            // A returned request-local failure may have partially overwritten
+            // the suffix. Roll back to the request-start checkpoint before
+            // releasing the physical arena.
+            reply = match recover_gemma4_slot_after_cancellation_for_reply(
                 guard,
                 scheduler,
                 handle,
                 kv_bytes_per_token,
+                &mut retained_tokens[slot_idx],
+                &mut prompt_anchors[slot_idx],
+                request_rollback_anchor,
+                false,
                 reply,
             ) {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
-            retained_tokens[handle.slot_id.0 as usize].clear();
-            prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
             if let Ok(mut g) = scheduler_stats_snapshot.lock() {
                 *g = scheduler.stats();
@@ -11021,20 +11590,31 @@ fn admit_gemma4_slot(
         return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
 
+    let committed_anchor = stable_anchor.map(|kv| {
+        let boundary = kv.prompt_len();
+        Gemma4PromptAnchor {
+            prompt_tokens: prompt_tokens[..boundary].to_vec(),
+            kv,
+        }
+    });
+
     if reply.client_closed() {
         reply.record_client_cancellation();
-        reply = match reset_gemma4_slot_for_reply(
+        let slot_idx = handle.slot_id.0 as usize;
+        reply = match recover_gemma4_slot_after_cancellation_for_reply(
             guard,
             scheduler,
             handle,
             kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            committed_anchor.or(request_rollback_anchor),
+            false,
             reply,
         ) {
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-        retained_tokens[handle.slot_id.0 as usize].clear();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
         scheduler.release(handle);
         slot_fire_done(
             reply,
@@ -11044,24 +11624,18 @@ fn admit_gemma4_slot(
         return None;
     }
 
-    if let Some(kv) = stable_anchor {
-        let boundary = kv.prompt_len();
+    if let Some(anchor) = committed_anchor {
+        let boundary = anchor.prompt_tokens.len();
         tracing::debug!(
             slot = handle.slot_id.0,
             prompt_tokens = prompt_tokens.len(),
             stable_prefix_tokens = boundary,
-            anchor_bytes = kv.total_bytes(),
+            anchor_bytes = anchor.kv.total_bytes(),
             "Gemma stable pre-generation checkpoint committed"
         );
-        prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
-            prompt_tokens: prompt_tokens[..boundary].to_vec(),
-            kv,
-        });
+        prompt_anchors[handle.slot_id.0 as usize] = Some(anchor);
     } else {
-        // Never retain a post-generation-cue snapshot. Without an exact
-        // handler-derived boundary, the next turn must use a physically live
-        // prefix or start cold.
-        prompt_anchors[handle.slot_id.0 as usize] = None;
+        prompt_anchors[handle.slot_id.0 as usize] = request_rollback_anchor;
     }
 
     // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
@@ -11088,17 +11662,21 @@ fn admit_gemma4_slot(
     // first decode tick so a native Gemma tool opener is not omitted from SSE.
     let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
     if seed_dropped {
-        reply = match reset_gemma4_slot_for_reply(
+        let slot_idx = handle.slot_id.0 as usize;
+        reply = match recover_gemma4_slot_after_cancellation_for_reply(
             guard,
             scheduler,
             handle,
             kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            None,
+            false,
             reply,
         ) {
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-        retained_tokens[handle.slot_id.0 as usize].clear();
         scheduler.release(handle);
         finish_gemma4_operator_request(handle, "cancelled");
         let gr = Ok(state.finish(registration));
@@ -11143,7 +11721,7 @@ fn install_gemma4_prefill_advance(
     let slot_idx = handle.slot_id.0 as usize;
     match advance {
         Gemma4PrefillAdvance::Pending {
-            state,
+            mut state,
             advanced_tokens,
         } => {
             scheduler.advance_after_prefill(handle, advanced_tokens as u32);
@@ -11164,18 +11742,20 @@ fn install_gemma4_prefill_advance(
             );
             if reply.client_closed() {
                 reply.record_client_cancellation();
-                reply = match reset_gemma4_slot_for_reply(
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    state.pending_anchor.take(),
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 finish_gemma4_operator_request(handle, "cancelled");
                 slot_fire_done(
@@ -11218,18 +11798,20 @@ fn install_gemma4_prefill_advance(
             );
             if reply.client_closed() {
                 reply.record_client_cancellation();
-                reply = match reset_gemma4_slot_for_reply(
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    prompt_anchor,
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 finish_gemma4_operator_request(handle, "cancelled");
                 slot_fire_done(
@@ -11242,18 +11824,20 @@ fn install_gemma4_prefill_advance(
             prompt_anchors[slot_idx] = prompt_anchor;
             let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
             if seed_dropped {
-                reply = match reset_gemma4_slot_for_reply(
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    None,
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 finish_gemma4_operator_request(handle, "cancelled");
                 let result = Ok(state.finish(registration));
@@ -11312,7 +11896,7 @@ fn advance_gemma4_prefill(
             ),
         ));
     }
-    let state = match work {
+    let mut state = match work {
         Gemma4SlotWork::Prefill(state) => state,
         Gemma4SlotWork::Decode(_) => {
             return Some(SlotAwareGpuFatal::invariant_slot(
@@ -11329,18 +11913,20 @@ fn advance_gemma4_prefill(
 
     if reply.client_closed() {
         reply.record_client_cancellation();
-        reply = match reset_gemma4_slot_for_reply(
+        reply = match recover_gemma4_slot_after_cancellation_for_reply(
             guard,
             scheduler,
             handle,
             kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            state.pending_anchor.take(),
+            true,
             reply,
         ) {
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-        retained_tokens[slot_idx].clear();
-        prompt_anchors[slot_idx] = None;
         scheduler.release(handle);
         slot_fire_done(
             reply,
@@ -11370,22 +11956,28 @@ fn advance_gemma4_prefill(
                 return Some(fatal);
             }
         }
-        Err(error) => {
+        Err(failure) => {
+            let Gemma4PrefillFailure {
+                rollback_anchor,
+                error,
+            } = failure;
             if is_worker_fatal(supervisor, &error) {
                 return Some(SlotAwareGpuFatal::slot(handle, reply, error));
             }
-            reply = match reset_gemma4_slot_for_reply(
+            reply = match recover_gemma4_slot_after_cancellation_for_reply(
                 guard,
                 scheduler,
                 handle,
                 kv_bytes_per_token,
+                &mut retained_tokens[slot_idx],
+                &mut prompt_anchors[slot_idx],
+                rollback_anchor,
+                false,
                 reply,
             ) {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
-            retained_tokens[slot_idx].clear();
-            prompt_anchors[slot_idx] = None;
             scheduler.release(handle);
             slot_fire_done(reply, Err(error), false);
         }
@@ -11656,21 +12248,29 @@ fn advance_gemma4_prefill_quantum(
             ));
         }
         Err(error) => {
-            let reset_failure = lanes.iter().find_map(|lane| {
-                reset_gemma4_slot(guard, scheduler, lane.handle, kv_bytes_per_token).err()
-            });
-            if let Some(reset_error) = reset_failure {
-                return Some(gemma4_prefill_batch_fatal(
-                    lanes,
-                    reset_error,
-                    SlotAwareFatalKind::Invariant,
-                ));
-            }
             let message = format!("Gemma4 installed prefill batch failed: {error:#}");
-            for lane in lanes {
+            let mut lanes = lanes.into_iter();
+            while let Some(mut lane) = lanes.next() {
                 let slot_index = lane.handle.slot_id.0 as usize;
-                retained_tokens[slot_index].clear();
-                prompt_anchors[slot_index] = None;
+                lane.reply = match recover_gemma4_slot_after_cancellation_for_reply(
+                    guard,
+                    scheduler,
+                    lane.handle,
+                    kv_bytes_per_token,
+                    &mut retained_tokens[slot_index],
+                    &mut prompt_anchors[slot_index],
+                    lane.state.pending_anchor.take(),
+                    false,
+                    lane.reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(mut fatal) => {
+                        fatal.extend_slots(
+                            lanes.map(|remaining| (Some(remaining.handle), remaining.reply)),
+                        );
+                        return Some(fatal);
+                    }
+                };
                 scheduler.release(lane.handle);
                 slot_fire_done(lane.reply, Err(anyhow::anyhow!(message.clone())), false);
             }
@@ -11725,8 +12325,8 @@ fn advance_gemma4_prefill_quantum(
             elapsed,
         ) {
             Ok(advance) => advance,
-            Err(error) => {
-                let mut fatal = SlotAwareGpuFatal::invariant_slot(handle, reply, error);
+            Err(failure) => {
+                let mut fatal = SlotAwareGpuFatal::invariant_slot(handle, reply, failure.error);
                 fatal.extend_slots(lanes.map(|lane| (Some(lane.handle), lane.reply)));
                 return Some(fatal);
             }
@@ -12293,50 +12893,24 @@ fn admit_gemma4_slots_stable_batched(
     // second bitmap, two similar conversations could select the same longest
     // anchor before the scheduler reservation becomes visible in `slots`.
     let mut selected = vec![false; slots.len()];
-    let mut planned = Vec::with_capacity(requests.len());
-    let mut requests = requests.into_iter();
-    while let Some((prompt_tokens, params, reply)) = requests.next() {
+    let mut plan = Vec::with_capacity(requests.len());
+    for (prompt_tokens, params, reply) in &requests {
         if reply.client_closed() {
-            reply.record_client_cancellation();
-            slot_fire_done(
-                reply,
-                Err(anyhow::anyhow!(
-                    "client disconnected before Gemma4 stable admission"
-                )),
-                true,
-            );
-            continue;
+            break;
         }
-        let shape = match validate_gemma4_generation_request(
-            prompt_tokens.len(),
-            params.max_tokens,
-            max_seq_len,
-        ) {
-            Ok(shape) => shape,
-            Err(error) => {
-                slot_fire_done(reply, Err(error), false);
-                continue;
-            }
+        let Ok(shape) =
+            validate_gemma4_generation_request(prompt_tokens.len(), params.max_tokens, max_seq_len)
+        else {
+            break;
         };
         let Some(boundary) = params.stable_prompt_prefix_tokens else {
-            if let Some(mut fatal) = fallback_single(
-                guard,
-                scheduler,
-                slots,
-                retained_tokens,
-                prompt_anchors,
-                vec![(prompt_tokens, params, reply)],
-            ) {
-                fatal.extend_slots(requests.map(|(_, _, remaining_reply)| (None, remaining_reply)));
-                return Some(fatal);
-            }
-            continue;
+            break;
         };
         let preference = preferred_gemma4_slot_excluding(
             retained_tokens,
             prompt_anchors,
             slots,
-            &prompt_tokens,
+            prompt_tokens,
             &selected,
         );
         let Some(preference) = preference.filter(|p| {
@@ -12345,29 +12919,18 @@ fn admit_gemma4_slots_stable_batched(
                 && boundary > 0
                 && boundary < prompt_tokens.len()
         }) else {
-            if let Some(mut fatal) = fallback_single(
-                guard,
-                scheduler,
-                slots,
-                retained_tokens,
-                prompt_anchors,
-                vec![(prompt_tokens, params, reply)],
-            ) {
-                fatal.extend_slots(requests.map(|(_, _, remaining_reply)| (None, remaining_reply)));
-                return Some(fatal);
-            }
-            continue;
+            break;
         };
         selected[preference.slot.0 as usize] = true;
-        planned.push((prompt_tokens, params, reply, preference, boundary, shape));
+        plan.push((preference, boundary, shape));
     }
 
-    if planned.len() < 2 {
-        let requests = planned
-            .into_iter()
-            .map(|(prompt, params, reply, _, _, _)| (prompt, params, reply))
-            .collect();
-        let fatal = fallback_single(
+    // Planning is deliberately side-effect free. If any lane cannot join the
+    // stable batch, execute the entire contiguous group through the proven
+    // single-request path in original FIFO order. A later cold/incompatible
+    // lane must never run before an earlier cached lane has reserved its slot.
+    if plan.len() != requests.len() || plan.len() < 2 {
+        return fallback_single(
             guard,
             scheduler,
             slots,
@@ -12375,10 +12938,15 @@ fn admit_gemma4_slots_stable_batched(
             prompt_anchors,
             requests,
         );
-        return fatal;
     }
 
-    let mut admitted = Vec::with_capacity(planned.len());
+    let planned = requests.into_iter().zip(plan).map(
+        |((prompt, params, reply), (preference, boundary, shape))| {
+            (prompt, params, reply, preference, boundary, shape)
+        },
+    );
+
+    let mut admitted = Vec::with_capacity(selected.iter().filter(|value| **value).count());
     for (prompt_tokens, params, reply, preference, boundary, shape) in planned {
         let needed_bytes = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
             0
@@ -12769,11 +13337,16 @@ fn admit_gemma4_slots_stable_batched(
             u32::try_from(prompt.len()).expect("Gemma stable batch request was validated"),
         );
         if slot_emit_token(&mut reply, &state.seed_tick()) {
-            reply = match reset_gemma4_slot_for_reply(
+            let slot_idx = handle.slot_id.0 as usize;
+            reply = match recover_gemma4_slot_after_cancellation_for_reply(
                 guard,
                 scheduler,
                 handle,
                 kv_bytes_per_token,
+                &mut retained_tokens[slot_idx],
+                &mut prompt_anchors[slot_idx],
+                None,
+                false,
                 reply,
             ) {
                 Ok(reply) => reply,
@@ -12786,8 +13359,6 @@ fn admit_gemma4_slots_stable_batched(
                     return Some(fatal);
                 }
             };
-            retained_tokens[handle.slot_id.0 as usize].clear();
-            prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "cancelled");
             slot_fire_done(reply, Ok(state.finish(registration)), true);
@@ -12831,9 +13402,19 @@ fn fail_gemma4_stable_batch(
 ) -> Option<SlotAwareGpuFatal> {
     let message = format!("Gemma stable multi-slot prefill failed: {error:#}");
     let reset_failure = admitted.iter().find_map(|(handle, _, _, _, _, _)| {
-        reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
-            .err()
-            .map(|reset_error| (*handle, reset_error))
+        let slot_idx = handle.slot_id.0 as usize;
+        recover_gemma4_slot_after_cancellation(
+            guard,
+            scheduler,
+            *handle,
+            kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            None,
+            false,
+        )
+        .err()
+        .map(|reset_error| (*handle, reset_error))
     });
     if let Some((_failed_handle, reset_error)) = reset_failure {
         let mut fatal = SlotAwareGpuFatal {
@@ -12849,8 +13430,6 @@ fn fail_gemma4_stable_batch(
         return Some(fatal);
     }
     for (handle, _, _, reply, _, _) in admitted {
-        retained_tokens[handle.slot_id.0 as usize].clear();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
         scheduler.release(handle);
         slot_fire_done(reply, Err(anyhow::anyhow!(message.clone())), false);
     }
@@ -12866,6 +13445,8 @@ fn fail_gemma4_stable_batch(
 fn embed_gemma4_inline(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -12913,6 +13494,11 @@ fn embed_gemma4_inline(
         )));
         return None;
     };
+    // Embedding owns and resets the chosen physical sequence. Retained
+    // generation metadata must be invalidated before that first mutation.
+    let slot_idx = handle.slot_id.0 as usize;
+    retained_tokens[slot_idx].clear();
+    prompt_anchors[slot_idx] = None;
     clear_gemma4_self_mounts(guard.model);
     let result = supervised_gemma4_gpu_call(supervisor, "gemma4_embed", || {
         embed_gemma4_slot_aware(
@@ -12995,6 +13581,7 @@ fn decode_batch_gemma4(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
@@ -13113,11 +13700,15 @@ fn decode_batch_gemma4(
             };
             if reply.client_closed() {
                 reply.record_client_cancellation();
-                reply = match reset_gemma4_slot_for_reply(
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    None,
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
@@ -13130,7 +13721,6 @@ fn decode_batch_gemma4(
                         return Some(fatal);
                     }
                 };
-                retained_tokens[slot_idx].clear();
                 scheduler.release(handle);
                 slot_fire_done(reply, Ok(state.finish(registration)), true);
                 continue;
@@ -13269,6 +13859,7 @@ fn decode_batch_gemma4(
                 }
                 for (handle, _slot_idx, _state, reply) in captured.drain(..) {
                     retained_tokens[handle.slot_id.0 as usize].clear();
+                    prompt_anchors[handle.slot_id.0 as usize] = None;
                     scheduler.release(handle);
                     slot_fire_done(
                         reply,
@@ -13319,11 +13910,15 @@ fn decode_batch_gemma4(
             };
             if reply.client_closed() {
                 reply.record_client_cancellation();
-                reply = match reset_gemma4_slot_for_reply(
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    None,
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
@@ -13336,7 +13931,6 @@ fn decode_batch_gemma4(
                         return Some(fatal);
                     }
                 };
-                retained_tokens[slot_idx].clear();
                 scheduler.release(handle);
                 slot_fire_done(reply, Ok(state.finish(registration)), true);
                 continue;
@@ -13394,6 +13988,7 @@ fn decode_batch_gemma4(
                         }
                     };
                     retained_tokens[handle.slot_id.0 as usize].clear();
+                    prompt_anchors[handle.slot_id.0 as usize] = None;
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(e), false);
                 }
@@ -13457,6 +14052,7 @@ fn decode_batch_gemma4(
                 }
                 for (handle, _slot_idx, _state, reply) in captured {
                     retained_tokens[handle.slot_id.0 as usize].clear();
+                    prompt_anchors[handle.slot_id.0 as usize] = None;
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
                 }
@@ -13525,6 +14121,7 @@ fn decode_batch_gemma4(
                     }
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
+                prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -13556,6 +14153,7 @@ fn decode_batch_gemma4(
                     }
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
+                prompt_anchors[handle.slot_id.0 as usize] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -13589,11 +14187,15 @@ fn decode_batch_gemma4(
 
         if tick.finished || client_dropped {
             if client_dropped {
-                reply = match reset_gemma4_slot_for_reply(
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    None,
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
@@ -13606,7 +14208,6 @@ fn decode_batch_gemma4(
                         return Some(fatal);
                     }
                 };
-                retained_tokens[slot_idx].clear();
             }
             scheduler.release(handle);
             finish_gemma4_operator_request(
@@ -13813,13 +14414,7 @@ fn reset_gemma4_slot_for_reply(
     }
 }
 
-fn reset_gemma4_slot(
-    guard: &mut Gemma4KvGuard<'_>,
-    scheduler: &mut InflightBatchedScheduler,
-    handle: SlotHandle,
-    kv_bytes_per_token: u64,
-) -> Result<()> {
-    let slot_id = handle.slot_id;
+fn gemma4_live_slot_tokens(guard: &Gemma4KvGuard<'_>, slot_id: SlotId) -> usize {
     let slot_idx = slot_id.0 as usize;
     let mut live_tokens = guard
         .kv
@@ -13854,6 +14449,110 @@ fn reset_gemma4_slot(
                 .unwrap_or(0) as usize,
         );
     }
+    live_tokens
+}
+
+fn recover_gemma4_slot_after_cancellation(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    retained_tokens: &mut Vec<u32>,
+    prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+    rollback_anchor: Option<Gemma4PromptAnchor>,
+    preserve_unmodified_live_prefix: bool,
+) -> Result<()> {
+    let live_tokens = gemma4_live_slot_tokens(guard, handle.slot_id);
+    record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+    if preserve_unmodified_live_prefix
+        && !retained_tokens.is_empty()
+        && live_tokens == retained_tokens.len()
+        && validate_gemma4_slot_cursor(guard, handle.slot_id, live_tokens).is_ok()
+    {
+        return Ok(());
+    }
+
+    let rollback_anchor = rollback_anchor.or_else(|| prompt_anchor.take());
+    if let Some(anchor) = rollback_anchor {
+        let anchor_tokens = anchor.prompt_tokens.len();
+        let restore = (|| -> Result<()> {
+            anyhow::ensure!(anchor_tokens > 0, "Gemma4 rollback anchor is empty");
+            let hybrid = guard
+                .hybrid
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Gemma4 rollback anchor requires hybrid KV"))?;
+            crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
+                hybrid,
+                handle.slot_id,
+                &anchor.kv,
+                anchor_tokens,
+            )?;
+            install_gemma4_slot_cursor(guard, handle.slot_id, anchor_tokens)?;
+            validate_gemma4_slot_cursor(guard, handle.slot_id, anchor_tokens)
+        })();
+        match restore {
+            Ok(()) => {
+                retained_tokens.clone_from(&anchor.prompt_tokens);
+                *prompt_anchor = Some(anchor);
+                tracing::info!(
+                    slot = handle.slot_id.0,
+                    cached_tokens = anchor_tokens,
+                    "Gemma4 cancellation restored verified prompt checkpoint"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    slot = handle.slot_id.0,
+                    error = %error,
+                    "Gemma4 cancellation checkpoint restore failed; invalidating slot"
+                );
+            }
+        }
+    }
+
+    reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token)?;
+    retained_tokens.clear();
+    *prompt_anchor = None;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_gemma4_slot_after_cancellation_for_reply(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    retained_tokens: &mut Vec<u32>,
+    prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+    rollback_anchor: Option<Gemma4PromptAnchor>,
+    preserve_unmodified_live_prefix: bool,
+    reply: SlotReply,
+) -> std::result::Result<SlotReply, SlotAwareGpuFatal> {
+    match recover_gemma4_slot_after_cancellation(
+        guard,
+        scheduler,
+        handle,
+        kv_bytes_per_token,
+        retained_tokens,
+        prompt_anchor,
+        rollback_anchor,
+        preserve_unmodified_live_prefix,
+    ) {
+        Ok(()) => Ok(reply),
+        Err(error) => Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    }
+}
+
+fn reset_gemma4_slot(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+) -> Result<()> {
+    let slot_id = handle.slot_id;
+    let slot_idx = slot_id.0 as usize;
+    let live_tokens = gemma4_live_slot_tokens(guard, slot_id);
     record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
     let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
         anyhow::ensure!(
@@ -13958,6 +14657,99 @@ fn reset_qwen35_slot_for_reply(
         handle,
         reply,
         reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token),
+    )
+}
+
+/// Restore the newest verified prompt checkpoint after client cancellation.
+/// A request-local tail may already have overwritten recurrent/KV state, so
+/// the retained-token ledger is republished only after the physical cursor is
+/// restored and validated. When no checkpoint exists, the slot is reset and
+/// its metadata is invalidated.
+fn recover_qwen35_slot_after_cancellation(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    retained_tokens: &mut Vec<u32>,
+    prompt_anchor: &mut Option<Qwen35PromptAnchor>,
+    preserve_unmodified_live_prefix: bool,
+) -> Result<()> {
+    let kv = guard.kv.as_mut().expect("kv Some during loop");
+    let live_tokens = kv.sequence_len_for_slot(handle.slot_id).unwrap_or(0) as usize;
+    record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+
+    if preserve_unmodified_live_prefix
+        && !retained_tokens.is_empty()
+        && live_tokens == retained_tokens.len()
+    {
+        kv.validate_sequence_len_for_slot(handle.slot_id, retained_tokens.len())
+            .context("validate Qwen35 live cursor before cancellation preservation")?;
+        return Ok(());
+    }
+
+    if let Some(anchor) = prompt_anchor.as_ref() {
+        let anchor_tokens = anchor.prompt_tokens.len();
+        if anchor_tokens > 0 {
+            match kv.restore_slot_anchor(handle.slot_id, &anchor.kv) {
+                Ok(()) => {
+                    let restored = kv
+                        .sequence_len_for_slot(handle.slot_id)
+                        .context("read Qwen35 cursor after cancellation rollback")?
+                        as usize;
+                    anyhow::ensure!(
+                        restored == anchor_tokens,
+                        "Qwen35 cancellation rollback cursor {} != anchor tokens {}",
+                        restored,
+                        anchor_tokens
+                    );
+                    retained_tokens.clone_from(&anchor.prompt_tokens);
+                    tracing::info!(
+                        slot = handle.slot_id.0,
+                        cached_tokens = anchor_tokens,
+                        "Qwen35 cancellation restored verified prompt checkpoint"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        slot = handle.slot_id.0,
+                        error = %error,
+                        "Qwen35 cancellation checkpoint restore failed; invalidating slot"
+                    );
+                }
+            }
+        }
+    }
+
+    kv.reset_for_slot(handle.slot_id)
+        .context("reset Qwen35 slot after cancellation rollback miss")?;
+    retained_tokens.clear();
+    *prompt_anchor = None;
+    Ok(())
+}
+
+fn recover_qwen35_slot_after_cancellation_for_reply(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    kv_bytes_per_token: u64,
+    retained_tokens: &mut Vec<u32>,
+    prompt_anchor: &mut Option<Qwen35PromptAnchor>,
+    preserve_unmodified_live_prefix: bool,
+    reply: SlotReply,
+) -> std::result::Result<SlotReply, Qwen35FatalFailure> {
+    qwen35_reset_result_for_reply(
+        handle,
+        reply,
+        recover_qwen35_slot_after_cancellation(
+            guard,
+            scheduler,
+            handle,
+            kv_bytes_per_token,
+            retained_tokens,
+            prompt_anchor,
+            preserve_unmodified_live_prefix,
+        ),
     )
 }
 
@@ -14078,7 +14870,7 @@ fn fail_qwen35_fatal_reply(reply: Qwen35FatalReply, message: &str) {
 fn fail_qwen35_worker_after_gpu_fatal(
     supervisor: &EngineSupervisor,
     rx: &mut mpsc::Receiver<Request>,
-    pending: &mut Option<Request>,
+    pending: &mut VecDeque<Request>,
     slots: &mut [Option<Qwen35Slot>],
     scheduler: &mut InflightBatchedScheduler,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
@@ -14115,7 +14907,7 @@ fn fail_qwen35_worker_after_gpu_fatal(
             slot_fire_fatal(reply, &message);
         }
     }
-    if let Some(request) = pending.take() {
+    for request in pending.drain(..) {
         fail_slotaware_buffered_request(request, &message);
     }
     // `close()` prevents new permits, but a sender that acquired a permit
@@ -14174,6 +14966,15 @@ impl Drop for Qwen35KvGuard<'_> {
 enum Qwen35SlotWork {
     Prefill(super::engine_qwen35::Qwen35PrefillState),
     Decode(super::engine_qwen35::Qwen35DecodeState),
+}
+
+impl Qwen35SlotWork {
+    fn prompt_tokens(&self) -> &[u32] {
+        match self {
+            Self::Prefill(state) => state.prompt_tokens(),
+            Self::Decode(state) => state.prompt_cache_identity().0,
+        }
+    }
 }
 
 type Qwen35Slot = (Qwen35SlotWork, SlotReply, SlotHandle);
@@ -14371,6 +15172,24 @@ struct Qwen35SlotPreference {
     use_prefill_logits: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35SlotAffinity {
+    Idle(Qwen35SlotPreference),
+    Active(Qwen35SlotPreference),
+}
+
+impl Qwen35SlotAffinity {
+    fn preference(self) -> Qwen35SlotPreference {
+        match self {
+            Self::Idle(preference) | Self::Active(preference) => preference,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+}
+
 fn qwen35_operator_request_id(handle: SlotHandle) -> u64 {
     handle
         .generation
@@ -14386,15 +15205,12 @@ fn finish_qwen35_operator_request(handle: SlotHandle, outcome: &'static str) {
     );
 }
 
-fn preferred_qwen35_slot<'a>(
-    candidates: impl IntoIterator<Item = (usize, &'a [u32], Option<&'a [u32]>, bool)>,
+fn qwen35_slot_affinity<'a>(
+    candidates: impl IntoIterator<Item = (usize, &'a [u32], Option<&'a [u32]>, Option<&'a [u32]>, bool)>,
     prompt_tokens: &[u32],
-) -> Option<Qwen35SlotPreference> {
+) -> Option<Qwen35SlotAffinity> {
     let mut best = None;
-    for (index, retained, anchor, active) in candidates {
-        if active {
-            continue;
-        }
+    for (index, retained, anchor, active_prompt, active) in candidates {
         let live_tokens = (!retained.is_empty()
             && retained.len() < prompt_tokens.len()
             && prompt_tokens.starts_with(retained))
@@ -14402,8 +15218,13 @@ fn preferred_qwen35_slot<'a>(
         let anchor_tokens = anchor
             .filter(|anchor| !anchor.is_empty() && prompt_tokens.starts_with(anchor))
             .map(<[u32]>::len);
+        let active_tokens = active_prompt
+            .filter(|active_prompt| {
+                !active_prompt.is_empty() && prompt_tokens.starts_with(active_prompt)
+            })
+            .map(<[u32]>::len);
 
-        let candidate = match (live_tokens, anchor_tokens) {
+        let reusable = match (live_tokens, anchor_tokens) {
             (Some(live), Some(anchor)) if live >= anchor => Some(Qwen35SlotPreference {
                 slot: SlotId(index as u32),
                 cached_tokens: live,
@@ -14424,22 +15245,452 @@ fn preferred_qwen35_slot<'a>(
             }),
             (None, None) => None,
         };
-        if candidate.is_some_and(|candidate| {
-            best.is_none_or(|current: Qwen35SlotPreference| {
-                candidate.cached_tokens > current.cached_tokens
-            })
-        }) {
-            best = candidate;
+        let active_candidate = active_tokens.map(|cached_tokens| Qwen35SlotPreference {
+            slot: SlotId(index as u32),
+            cached_tokens,
+            restore_prompt_anchor: false,
+            use_prefill_logits: false,
+        });
+        let candidate = match (reusable, active_candidate) {
+            (Some(reusable), Some(active)) if reusable.cached_tokens >= active.cached_tokens => {
+                Some(reusable)
+            }
+            (_, Some(active)) => Some(active),
+            (Some(reusable), None) => Some(reusable),
+            (None, None) => None,
+        };
+        if let Some(candidate) = candidate {
+            let affinity = if active {
+                Qwen35SlotAffinity::Active(candidate)
+            } else {
+                Qwen35SlotAffinity::Idle(candidate)
+            };
+            if best.is_none_or(|current: Qwen35SlotAffinity| {
+                let current_preference = current.preference();
+                candidate.cached_tokens > current_preference.cached_tokens
+                    || (candidate.cached_tokens == current_preference.cached_tokens
+                        && !affinity.is_active()
+                        && current.is_active())
+            }) {
+                best = Some(affinity);
+            }
         }
     }
     best
 }
 
-#[derive(Clone, Copy)]
+fn preferred_qwen35_slot<'a>(
+    candidates: impl IntoIterator<Item = (usize, &'a [u32], Option<&'a [u32]>, Option<&'a [u32]>, bool)>,
+    prompt_tokens: &[u32],
+) -> Option<Qwen35SlotPreference> {
+    match qwen35_slot_affinity(candidates, prompt_tokens) {
+        Some(Qwen35SlotAffinity::Idle(preference)) => Some(preference),
+        Some(Qwen35SlotAffinity::Active(_)) | None => None,
+    }
+}
+
+fn qwen35_request_prompt_tokens(request: &Request) -> Option<&[u32]> {
+    match request {
+        Request::Generate { prompt_tokens, .. } | Request::GenerateStream { prompt_tokens, .. } => {
+            Some(prompt_tokens)
+        }
+        _ => None,
+    }
+}
+
+fn qwen35_request_has_response_cache_hit(request: &Request, prompt_caches: &[PromptCache]) -> bool {
+    let (prompt_tokens, params) = match request {
+        Request::Generate {
+            prompt_tokens,
+            params,
+            ..
+        } => (prompt_tokens.as_slice(), params),
+        Request::GenerateStream {
+            prompt_tokens,
+            params,
+            soft_tokens,
+            deepstack,
+            positions_flat,
+            ..
+        } if soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none() => {
+            (prompt_tokens.as_slice(), params)
+        }
+        _ => return false,
+    };
+    prompt_caches
+        .iter()
+        .any(|cache| cache.lookup(prompt_tokens, params).is_some())
+}
+
+/// Drop a stream whose HTTP receiver disappeared while it was waiting for
+/// admission. It must not claim or reset a retained KV slot first. This rule
+/// is shared by every SlotAware family even though only Qwen currently owns a
+/// deterministic terminal-response cache.
+fn discard_closed_slotaware_stream(family: &'static str, request: Request) -> Option<Request> {
+    match request {
+        Request::GenerateStream {
+            events,
+            cancellation_counter,
+            admission,
+            ..
+        } if events.is_closed() => {
+            if let Some(counter) = cancellation_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(admission) = admission {
+                let _ = admission.send(Err(anyhow::anyhow!(
+                    "request_cancelled: streaming client disconnected before {family} admission"
+                )));
+            }
+            None
+        }
+        request => Some(request),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35PendingDisposition {
+    ReadyShutdown,
+    ReadyWithoutSlot,
+    ReadyWithSlot,
+    WaitForActive(Qwen35SlotPreference),
+    WaitForFreeSlot,
+}
+
+fn qwen35_pending_disposition(
+    request: &Request,
+    response_cache_hit: bool,
+    has_free_slot: bool,
+    active_preference: Option<Qwen35SlotPreference>,
+) -> Qwen35PendingDisposition {
+    if matches!(request, Request::Shutdown) {
+        return Qwen35PendingDisposition::ReadyShutdown;
+    }
+    if response_cache_hit {
+        return Qwen35PendingDisposition::ReadyWithoutSlot;
+    }
+    let requires_slot = match request {
+        Request::Generate { .. } | Request::Embed { .. } | Request::Warmup { .. } => true,
+        Request::GenerateStream {
+            soft_tokens,
+            deepstack,
+            positions_flat,
+            ..
+        } => soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none(),
+        Request::GenerateWithSoftTokens { .. }
+        | Request::Shutdown
+        | Request::KvSnapshot { .. }
+        | Request::KvRestore { .. }
+        | Request::TqPackedKvSnapshot { .. }
+        | Request::TqPackedKvRestore { .. }
+        | Request::PromptCacheSnapshot { .. }
+        | Request::PromptCacheRestore { .. } => false,
+    };
+    if !requires_slot {
+        return Qwen35PendingDisposition::ReadyWithoutSlot;
+    }
+    if let Some(preference) = active_preference {
+        return Qwen35PendingDisposition::WaitForActive(preference);
+    }
+    if has_free_slot {
+        Qwen35PendingDisposition::ReadyWithSlot
+    } else {
+        Qwen35PendingDisposition::WaitForFreeSlot
+    }
+}
+
+fn choose_qwen35_ready_request_index(dispositions: &[Qwen35PendingDisposition]) -> Option<usize> {
+    dispositions
+        .iter()
+        .position(|item| matches!(item, Qwen35PendingDisposition::ReadyShutdown))
+        .or_else(|| {
+            dispositions.iter().position(|item| {
+                matches!(
+                    item,
+                    Qwen35PendingDisposition::ReadyWithoutSlot
+                        | Qwen35PendingDisposition::ReadyWithSlot
+                )
+            })
+        })
+}
+
+fn enqueue_slotaware_pending(
+    family: &'static str,
+    pending: &mut VecDeque<Request>,
+    max_pending: usize,
+    request: Request,
+    is_ready: impl Fn(&Request) -> bool,
+) {
+    // A stream may close after it entered the worker-owned queue. Remove and
+    // account those requests before capacity/displacement decisions so a dead
+    // active-prefix waiter cannot receive a misleading server_busy terminal.
+    prune_closed_slotaware_pending(family, pending);
+    if matches!(request, Request::Shutdown) {
+        if !pending
+            .iter()
+            .any(|request| matches!(request, Request::Shutdown))
+        {
+            pending.push_front(request);
+        }
+        return;
+    }
+    let Some(request) = discard_closed_slotaware_stream(family, request) else {
+        return;
+    };
+    let ordinary_pending = pending
+        .iter()
+        .filter(|request| !matches!(request, Request::Shutdown))
+        .count();
+    if ordinary_pending >= max_pending.max(1) {
+        // The worker queue may be full of continuations waiting for an active
+        // retained slot even though a newly visible request can complete from
+        // response cache or use another free slot.  Let ready work displace
+        // the newest blocked waiter; never evict an earlier runnable request
+        // merely because a later runnable request arrived.
+        if is_ready(&request) {
+            if let Some(index) = pending
+                .iter()
+                .rposition(|existing| !matches!(existing, Request::Shutdown) && !is_ready(existing))
+            {
+                let displaced = pending
+                    .remove(index)
+                    .expect("pending displacement index came from the same queue");
+                fail_slotaware_buffered_request(
+                    displaced,
+                    &format!(
+                        "server_busy: {family} active-prefix waiter displaced by runnable work"
+                    ),
+                );
+                pending.push_back(request);
+                return;
+            }
+        }
+        fail_slotaware_buffered_request(
+            request,
+            &format!("server_busy: {family} active-prefix wait queue reached its bounded capacity"),
+        );
+        return;
+    }
+    pending.push_back(request);
+}
+
+fn prune_closed_slotaware_pending(family: &'static str, pending: &mut VecDeque<Request>) {
+    let mut live = VecDeque::with_capacity(pending.len());
+    while let Some(request) = pending.pop_front() {
+        if let Some(request) = discard_closed_slotaware_stream(family, request) {
+            live.push_back(request);
+        }
+    }
+    *pending = live;
+}
+
+fn qwen35_pending_request_is_ready(
+    request: &Request,
+    prompt_caches: &[PromptCache],
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Qwen35PromptAnchor>],
+    slots: &[Option<Qwen35Slot>],
+) -> bool {
+    let response_cache_hit = qwen35_request_has_response_cache_hit(request, prompt_caches);
+    let active_preference = (!response_cache_hit)
+        .then(|| qwen35_request_prompt_tokens(request))
+        .flatten()
+        .and_then(|prompt_tokens| {
+            active_qwen35_slot_affinity(retained_tokens, prompt_anchors, slots, prompt_tokens)
+        });
+    matches!(
+        qwen35_pending_disposition(
+            request,
+            response_cache_hit,
+            slots.iter().any(Option::is_none),
+            active_preference,
+        ),
+        Qwen35PendingDisposition::ReadyShutdown
+            | Qwen35PendingDisposition::ReadyWithoutSlot
+            | Qwen35PendingDisposition::ReadyWithSlot
+    )
+}
+
+fn gemma4_pending_request_is_ready(
+    request: &Request,
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    slots: &[Option<Gemma4Slot>],
+) -> bool {
+    slots.iter().any(Option::is_none)
+        && !matches!(
+            gemma4_pending_disposition(request, retained_tokens, prompt_anchors, slots),
+            Gemma4PendingDisposition::WaitForActive(_)
+        )
+}
+
+fn deepseek4_pending_request_is_ready(
+    request: &Request,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    slots: &[Option<Deepseek4Slot>],
+    reserved_slots: &[bool],
+    admission_open: bool,
+) -> bool {
+    if !admission_open || !slots.iter().any(Option::is_none) {
+        return false;
+    }
+    let busy_slots: Vec<bool> = slots
+        .iter()
+        .zip(reserved_slots)
+        .map(|(slot, reserved)| slot.is_some() || *reserved)
+        .collect();
+    !matches!(
+        deepseek4_request_affinity(request, sessions, &busy_slots),
+        Deepseek4RequestAffinity::Busy { .. }
+    )
+}
+
+fn active_qwen35_slot_affinity(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Qwen35PromptAnchor>],
+    slots: &[Option<Qwen35Slot>],
+    prompt_tokens: &[u32],
+) -> Option<Qwen35SlotPreference> {
+    match qwen35_slot_affinity(
+        retained_tokens
+            .iter()
+            .zip(prompt_anchors.iter())
+            .zip(slots.iter())
+            .enumerate()
+            .map(|(index, ((retained, anchor), active))| {
+                (
+                    index,
+                    retained.as_slice(),
+                    anchor
+                        .as_ref()
+                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    active.as_ref().map(|(work, _, _)| work.prompt_tokens()),
+                    active.is_some(),
+                )
+            }),
+        prompt_tokens,
+    ) {
+        Some(Qwen35SlotAffinity::Active(preference)) => Some(preference),
+        Some(Qwen35SlotAffinity::Idle(_)) | None => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Gemma4SlotPreference {
     slot: SlotId,
     cached_tokens: usize,
     restore_prompt_anchor: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gemma4SlotAffinity {
+    Idle(Gemma4SlotPreference),
+    Active(Gemma4SlotPreference),
+}
+
+impl Gemma4SlotAffinity {
+    fn preference(self) -> Gemma4SlotPreference {
+        match self {
+            Self::Idle(preference) | Self::Active(preference) => preference,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+}
+
+fn gemma4_slot_affinity<'a>(
+    candidates: impl IntoIterator<
+        Item = (
+            usize,
+            &'a [u32],
+            Option<&'a [u32]>,
+            Option<&'a [u32]>,
+            bool,
+            bool,
+        ),
+    >,
+    prompt_tokens: &[u32],
+) -> Option<Gemma4SlotAffinity> {
+    let mut best = None;
+    for (index, retained, anchor, active_prompt, active, excluded) in candidates {
+        if excluded {
+            continue;
+        }
+        let live_tokens = (!retained.is_empty()
+            && retained.len() < prompt_tokens.len()
+            && prompt_tokens.starts_with(retained))
+        .then_some(retained.len());
+        let anchor_tokens =
+            anchor.and_then(|anchor| gemma_prompt_anchor_cached_tokens(anchor, prompt_tokens));
+        let active_tokens = active_prompt.and_then(|active_prompt| {
+            (!active_prompt.is_empty() && prompt_tokens.starts_with(active_prompt))
+                .then_some(active_prompt.len())
+        });
+
+        let (cached_tokens, restore_prompt_anchor) = match (live_tokens, anchor_tokens) {
+            (Some(live), Some(anchor)) if live >= anchor => (live, false),
+            (_, Some(anchor)) => (anchor, true),
+            (Some(live), None) => (live, false),
+            (None, None) => (0, false),
+        };
+        let (cached_tokens, restore_prompt_anchor) = match active_tokens {
+            Some(active) if active > cached_tokens => (active, false),
+            _ => (cached_tokens, restore_prompt_anchor),
+        };
+        if cached_tokens == 0 {
+            continue;
+        }
+        let preference = Gemma4SlotPreference {
+            slot: SlotId(index as u32),
+            cached_tokens,
+            restore_prompt_anchor,
+        };
+        let affinity = if active {
+            Gemma4SlotAffinity::Active(preference)
+        } else {
+            Gemma4SlotAffinity::Idle(preference)
+        };
+        if best.is_none_or(|current: Gemma4SlotAffinity| {
+            cached_tokens > current.preference().cached_tokens
+                || (cached_tokens == current.preference().cached_tokens
+                    && !affinity.is_active()
+                    && current.is_active())
+        }) {
+            best = Some(affinity);
+        }
+    }
+    best
+}
+
+fn gemma4_slot_affinity_excluding(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    active_slots: &[Option<Gemma4Slot>],
+    prompt_tokens: &[u32],
+    excluded_slots: &[bool],
+) -> Option<Gemma4SlotAffinity> {
+    gemma4_slot_affinity(
+        retained_tokens
+            .iter()
+            .zip(prompt_anchors)
+            .zip(active_slots)
+            .enumerate()
+            .map(|(index, ((retained, anchor), active))| {
+                (
+                    index,
+                    retained.as_slice(),
+                    anchor
+                        .as_ref()
+                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    active.as_ref().map(|(work, _, _)| work.prompt_tokens()),
+                    active.is_some(),
+                    excluded_slots.get(index).copied().unwrap_or(true),
+                )
+            }),
+        prompt_tokens,
+    )
 }
 
 fn preferred_gemma4_slot(
@@ -14464,49 +15715,46 @@ fn preferred_gemma4_slot_excluding(
     prompt_tokens: &[u32],
     excluded_slots: &[bool],
 ) -> Option<Gemma4SlotPreference> {
-    // A Gemma checkpoint captures the sliding-ring state at the exact prompt
-    // boundary.  It is valid both for an identical retry (rewind one token to
-    // reproduce logits) and for a normal agentic continuation whose native
-    // rendered prompt starts with that boundary.  Requiring equality here
-    // made every tool-result turn cold even though the checkpoint was valid.
-    if let Some(preference) = prompt_anchors
-        .iter()
-        .zip(active_slots)
-        .enumerate()
-        .filter_map(|(index, (anchor, active))| {
-            if active.is_some() || excluded_slots.get(index).copied().unwrap_or(true) {
-                return None;
-            }
-            let anchor = anchor.as_ref()?;
-            let cached_tokens =
-                gemma_prompt_anchor_cached_tokens(&anchor.prompt_tokens, prompt_tokens)?;
-            Some(Gemma4SlotPreference {
-                slot: SlotId(index as u32),
-                cached_tokens,
-                restore_prompt_anchor: true,
-            })
-        })
-        .max_by_key(|preference| preference.cached_tokens)
-    {
-        return Some(preference);
+    match gemma4_slot_affinity_excluding(
+        retained_tokens,
+        prompt_anchors,
+        active_slots,
+        prompt_tokens,
+        excluded_slots,
+    ) {
+        Some(Gemma4SlotAffinity::Idle(preference)) => Some(preference),
+        Some(Gemma4SlotAffinity::Active(_)) | None => None,
     }
-    retained_tokens
-        .iter()
-        .zip(active_slots)
-        .enumerate()
-        .filter(|(index, (prefix, active))| {
-            !excluded_slots.get(*index).copied().unwrap_or(true)
-                && active.is_none()
-                && !prefix.is_empty()
-                && prefix.len() < prompt_tokens.len()
-                && prompt_tokens.starts_with(prefix)
-        })
-        .max_by_key(|(_, (prefix, _))| prefix.len())
-        .map(|(index, (prefix, _))| Gemma4SlotPreference {
-            slot: SlotId(index as u32),
-            cached_tokens: prefix.len(),
-            restore_prompt_anchor: false,
-        })
+}
+
+fn gemma4_request_prompt_tokens(request: &Request) -> Option<&[u32]> {
+    match request {
+        Request::Generate { prompt_tokens, .. } => Some(prompt_tokens),
+        Request::GenerateStream {
+            prompt_tokens,
+            soft_tokens,
+            ..
+        } if soft_tokens.is_empty() => Some(prompt_tokens),
+        _ => None,
+    }
+}
+
+fn active_gemma4_slot_affinity(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    slots: &[Option<Gemma4Slot>],
+    prompt_tokens: &[u32],
+) -> Option<Gemma4SlotPreference> {
+    match gemma4_slot_affinity_excluding(
+        retained_tokens,
+        prompt_anchors,
+        slots,
+        prompt_tokens,
+        &vec![false; slots.len()],
+    ) {
+        Some(Gemma4SlotAffinity::Active(preference)) => Some(preference),
+        Some(Gemma4SlotAffinity::Idle(_)) | None => None,
+    }
 }
 
 fn gemma_prompt_anchor_cached_tokens(
@@ -14523,6 +15771,58 @@ fn gemma_prompt_anchor_cached_tokens(
     // A continuation has a real suffix, so the complete checkpoint KV is
     // reusable and the suffix itself produces next-token logits.
     Some(anchor_prompt_tokens.len())
+}
+
+fn take_gemma4_request_rollback_anchor(
+    guard: &Gemma4KvGuard<'_>,
+    slot_id: SlotId,
+    cached_tokens: usize,
+    prompt_tokens: &[u32],
+    prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+) -> Result<Option<Gemma4PromptAnchor>> {
+    if cached_tokens == 0 {
+        return Ok(None);
+    }
+    let existing_is_sufficient = prompt_anchor.as_ref().is_some_and(|anchor| {
+        prompt_tokens.starts_with(&anchor.prompt_tokens)
+            && anchor.prompt_tokens.len() >= cached_tokens
+    });
+    if existing_is_sufficient {
+        return Ok(prompt_anchor.take());
+    }
+    let Some(hybrid) = guard.hybrid.as_ref() else {
+        // Non-hybrid compatibility mode cannot materialize a rollback
+        // checkpoint. Preserve an older compatible checkpoint when present;
+        // otherwise cancellation will fail closed to a cold reset.
+        return Ok(prompt_anchor
+            .take()
+            .filter(|anchor| prompt_tokens.starts_with(&anchor.prompt_tokens)));
+    };
+    match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+        hybrid,
+        slot_id,
+        cached_tokens,
+    ) {
+        Ok(kv) => {
+            let _ = prompt_anchor.take();
+            Ok(Some(Gemma4PromptAnchor {
+                prompt_tokens: prompt_tokens[..cached_tokens].to_vec(),
+                kv,
+            }))
+        }
+        Err(error) if prompt_anchor.is_some() => {
+            tracing::warn!(
+                slot = slot_id.0,
+                cached_tokens,
+                error = %error,
+                "Gemma4 live-prefix rollback snapshot failed; retaining older checkpoint"
+            );
+            Ok(prompt_anchor
+                .take()
+                .filter(|anchor| prompt_tokens.starts_with(&anchor.prompt_tokens)))
+        }
+        Err(error) => Err(error.context("capture Gemma4 request-start rollback checkpoint")),
+    }
 }
 
 /// ADR-040 Phase F M1 (F1) — Qwen35 SlotAware admit-while-decoding loop.
@@ -14558,7 +15858,8 @@ fn run_slot_aware_qwen35(
             *g = sched.stats();
         }
     };
-    let mut pending: Option<Request> = None;
+    let mut pending = VecDeque::new();
+    let mut pending_affinity_wait: Option<(SlotId, usize)> = None;
     let mut shutdown_requested = false;
 
     'worker: loop {
@@ -14567,20 +15868,87 @@ fn run_slot_aware_qwen35(
             if shutdown_requested {
                 break;
             }
-            let Some(_free) = slots.iter().position(|s| s.is_none()) else {
-                break;
-            };
-            let req = match pending.take() {
-                Some(r) => r,
-                None => match rx.try_recv() {
-                    Ok(r) => r,
+            // Pull one bounded channel snapshot into the worker-owned queue.
+            // The ready selector below can then skip active-prefix waiters
+            // instead of letting one waiter hide cached replies, controls, or
+            // unrelated requests that are already buffered behind it.
+            for _ in 0..rx.max_capacity() {
+                match rx.try_recv() {
+                    Ok(request) => enqueue_slotaware_pending(
+                        "Qwen35",
+                        &mut pending,
+                        rx.max_capacity(),
+                        request,
+                        |candidate| {
+                            qwen35_pending_request_is_ready(
+                                candidate,
+                                &prompt_caches,
+                                &retained_tokens,
+                                &prompt_anchors,
+                                &slots,
+                            )
+                        },
+                    ),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         shutdown_requested = true;
                         break;
                     }
-                },
+                }
+            }
+            prune_closed_slotaware_pending("Qwen35", &mut pending);
+            if pending.is_empty() {
+                pending_affinity_wait = None;
+                break;
+            }
+
+            let has_free_slot = slots.iter().any(Option::is_none);
+            let dispositions: Vec<Qwen35PendingDisposition> = pending
+                .iter()
+                .map(|request| {
+                    let response_cache_hit =
+                        qwen35_request_has_response_cache_hit(request, &prompt_caches);
+                    let active_preference = (!response_cache_hit)
+                        .then(|| qwen35_request_prompt_tokens(request))
+                        .flatten()
+                        .and_then(|prompt_tokens| {
+                            active_qwen35_slot_affinity(
+                                &retained_tokens,
+                                &prompt_anchors,
+                                &slots,
+                                prompt_tokens,
+                            )
+                        });
+                    qwen35_pending_disposition(
+                        request,
+                        response_cache_hit,
+                        has_free_slot,
+                        active_preference,
+                    )
+                })
+                .collect();
+            let waiting = dispositions.iter().find_map(|item| match item {
+                Qwen35PendingDisposition::WaitForActive(preference) => {
+                    Some((preference.slot, preference.cached_tokens))
+                }
+                _ => None,
+            });
+            if waiting != pending_affinity_wait {
+                if let Some((slot, cached_tokens)) = waiting {
+                    tracing::info!(
+                        slot = slot.0,
+                        cached_tokens,
+                        "Qwen35 continuation waiting for active retained slot"
+                    );
+                }
+                pending_affinity_wait = waiting;
+            }
+            let Some(ready_index) = choose_qwen35_ready_request_index(&dispositions) else {
+                break 'admit;
             };
+            let req = pending
+                .remove(ready_index)
+                .expect("Qwen35 ready index came from pending dispositions");
             let yield_after_inline_admission = qwen35_yields_after_inline_admission(&req);
             match req {
                 Request::Generate {
@@ -14716,6 +16084,8 @@ fn run_slot_aware_qwen35(
                     if let Some(fatal) = embed_qwen35_inline(
                         &mut guard,
                         &mut scheduler,
+                        &mut retained_tokens,
+                        &mut prompt_anchors,
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
@@ -14780,6 +16150,9 @@ fn run_slot_aware_qwen35(
         if shutdown_requested && slots.iter().all(Option::is_none) {
             let message =
                 format!("{ENGINE_UNHEALTHY_SENTINEL}: Qwen35 SlotAware worker is shutting down");
+            for request in pending.drain(..) {
+                fail_slotaware_buffered_request(request, &message);
+            }
             while let Some(request) = rx.blocking_recv() {
                 fail_slotaware_buffered_request(request, &message);
             }
@@ -14813,7 +16186,21 @@ fn run_slot_aware_qwen35(
                     continue;
                 }
                 match rx.blocking_recv() {
-                    Some(r) => pending = Some(r),
+                    Some(r) => enqueue_slotaware_pending(
+                        "Qwen35",
+                        &mut pending,
+                        rx.max_capacity(),
+                        r,
+                        |candidate| {
+                            qwen35_pending_request_is_ready(
+                                candidate,
+                                &prompt_caches,
+                                &retained_tokens,
+                                &prompt_anchors,
+                                &slots,
+                            )
+                        },
+                    ),
                     None => shutdown_requested = true,
                 }
             }
@@ -15001,6 +16388,7 @@ fn admit_qwen35_slot(
                     anchor
                         .as_ref()
                         .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    active.as_ref().map(|(work, _, _)| work.prompt_tokens()),
                     active.is_some(),
                 )
             }),
@@ -15262,18 +16650,19 @@ fn advance_qwen35_prefill(
 
     if reply.client_closed() {
         reply.record_client_cancellation();
-        reply = match reset_qwen35_slot_for_reply(
+        reply = match recover_qwen35_slot_after_cancellation_for_reply(
             guard,
             scheduler,
             handle,
             kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            true,
             reply,
         ) {
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-        retained_tokens[slot_idx].clear();
-        prompt_anchors[slot_idx] = None;
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "cancelled");
         slot_fire_done(
@@ -15309,20 +16698,24 @@ fn advance_qwen35_prefill(
                 work,
                 rate,
             );
+            if let Some(checkpoint) = checkpoint {
+                install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
+            }
             if reply.client_closed() {
                 reply.record_client_cancellation();
-                reply = match reset_qwen35_slot_for_reply(
+                reply = match recover_qwen35_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 finish_qwen35_operator_request(handle, "cancelled");
                 slot_fire_done(
@@ -15331,9 +16724,6 @@ fn advance_qwen35_prefill(
                     true,
                 );
             } else {
-                if let Some(checkpoint) = checkpoint {
-                    install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
-                }
                 scheduler.yield_prefill_turn(handle);
                 slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
             }
@@ -15353,20 +16743,24 @@ fn advance_qwen35_prefill(
                 work,
                 rate,
             );
+            if let Some(checkpoint) = checkpoint {
+                install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
+            }
             if reply.client_closed() {
                 reply.record_client_cancellation();
-                reply = match reset_qwen35_slot_for_reply(
+                reply = match recover_qwen35_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 finish_qwen35_operator_request(handle, "cancelled");
                 slot_fire_done(
@@ -15375,9 +16769,6 @@ fn advance_qwen35_prefill(
                     true,
                 );
                 return None;
-            }
-            if let Some(checkpoint) = checkpoint {
-                install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
             }
             if let Some(fatal) = finish_qwen35_prefill(
                 guard,
@@ -15552,18 +16943,19 @@ fn finish_qwen35_prefill(
         },
     );
     if seed_dropped {
-        reply = match reset_qwen35_slot_for_reply(
+        reply = match recover_qwen35_slot_after_cancellation_for_reply(
             guard,
             scheduler,
             handle,
             kv_bytes_per_token,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+            false,
             reply,
         ) {
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-        retained_tokens[slot_idx].clear();
-        prompt_anchors[slot_idx] = None;
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "cancelled");
         let result = Ok(state.finish(guard.model, registration));
@@ -15607,6 +16999,8 @@ fn finish_qwen35_prefill(
 fn embed_qwen35_inline(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -15646,6 +17040,12 @@ fn embed_qwen35_inline(
         )));
         return None;
     };
+    // Embedding owns and resets the selected physical sequence. Invalidate
+    // the serving ledger before the first GPU mutation so a later generation
+    // can never advertise an anchor whose underlying cursor was reset.
+    let slot_idx = handle.slot_id.0 as usize;
+    retained_tokens[slot_idx].clear();
+    prompt_anchors[slot_idx] = None;
     let result = supervised_gpu_call(supervisor, "qwen35_slot_embed", || {
         super::engine_qwen35::embed_qwen35_slot_aware(
             guard.model,
@@ -15744,18 +17144,19 @@ fn decode_batch_qwen35(
 
         if reply.client_closed() {
             reply.record_client_cancellation();
-            reply = match reset_qwen35_slot_for_reply(
+            reply = match recover_qwen35_slot_after_cancellation_for_reply(
                 guard,
                 scheduler,
                 handle,
                 kv_bytes_per_token,
+                &mut retained_tokens[slot_idx],
+                &mut prompt_anchors[slot_idx],
+                false,
                 reply,
             ) {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
-            retained_tokens[slot_idx].clear();
-            prompt_anchors[slot_idx] = None;
             scheduler.release(handle);
             finish_qwen35_operator_request(handle, "cancelled");
             slot_fire_done(
@@ -15850,18 +17251,19 @@ fn decode_batch_qwen35(
 
         if tick.finished || client_dropped {
             if client_dropped {
-                reply = match reset_qwen35_slot_for_reply(
+                reply = match recover_qwen35_slot_after_cancellation_for_reply(
                     guard,
                     scheduler,
                     handle,
                     kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    false,
                     reply,
                 ) {
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
             }
             scheduler.release(handle);
             let (cache_prompt, cache_params) = {
@@ -25875,35 +27277,135 @@ mod tests {
 
     #[test]
     fn deepseek_queue_preserves_warm_agent_affinity_between_bounded_cold_cohorts() {
+        let cached = |slot, cached_tokens| Deepseek4RequestAffinity::Cached {
+            slot: SlotId(slot),
+            cached_tokens,
+        };
         assert_eq!(
-            choose_deepseek4_request_index(&[Some(12_000), None, Some(24_000)], true),
-            1,
+            choose_deepseek4_ready_request_index(
+                &[
+                    cached(0, 12_000),
+                    Deepseek4RequestAffinity::Control,
+                    cached(2, 24_000)
+                ],
+                true,
+            ),
+            Some(1),
             "shutdown and other control work must not wait behind generation"
         );
         assert_eq!(
-            choose_deepseek4_request_index(&[Some(0), Some(0), Some(0)], true),
-            0,
+            choose_deepseek4_ready_request_index(&[Deepseek4RequestAffinity::Cold; 3], true,),
+            Some(0),
             "equally cold requests remain FIFO"
         );
         assert_eq!(
-            choose_deepseek4_request_index(&[Some(12_000), Some(8_000), Some(24_000)], true),
-            2,
+            choose_deepseek4_ready_request_index(
+                &[cached(0, 12_000), cached(1, 8_000), cached(2, 24_000)],
+                true,
+            ),
+            Some(2),
             "the longest reusable prefix wins"
         );
         assert_eq!(
-            choose_deepseek4_request_index(&[Some(0), Some(12_000), Some(8_000)], true),
-            1,
+            choose_deepseek4_ready_request_index(
+                &[
+                    Deepseek4RequestAffinity::Cold,
+                    cached(1, 12_000),
+                    cached(2, 8_000)
+                ],
+                true,
+            ),
+            Some(1),
             "a retained continuation must run before unrelated work can evict its slot"
         );
         assert_eq!(
-            choose_deepseek4_request_index(&[Some(0), Some(0)], true),
-            0,
+            choose_deepseek4_ready_request_index(&[Deepseek4RequestAffinity::Cold; 2], true,),
+            Some(0),
             "cached preference falls back to FIFO cold work when no continuation arrives"
+        );
+        assert_eq!(
+            choose_deepseek4_ready_request_index(
+                &[
+                    Deepseek4RequestAffinity::Busy {
+                        slot: SlotId(0),
+                        cached_tokens: 99_000,
+                    },
+                    Deepseek4RequestAffinity::Cold,
+                ],
+                true,
+            ),
+            Some(1),
+            "busy continuations wait instead of being misclassified as cold"
         );
     }
 
     #[test]
+    fn deepseek_affinity_waits_for_strictly_better_busy_prefix_but_not_an_equal_idle_copy() {
+        assert_eq!(
+            deepseek4_affinity_from_scores([(0, 99_000, true), (1, 0, false)]),
+            Deepseek4RequestAffinity::Busy {
+                slot: SlotId(0),
+                cached_tokens: 99_000,
+            }
+        );
+        assert_eq!(
+            deepseek4_affinity_from_scores([(0, 99_000, true), (1, 2_048, false)]),
+            Deepseek4RequestAffinity::Busy {
+                slot: SlotId(0),
+                cached_tokens: 99_000,
+            }
+        );
+        assert_eq!(
+            deepseek4_affinity_from_scores([(0, 99_000, true), (1, 99_000, false)]),
+            Deepseek4RequestAffinity::Cached {
+                slot: SlotId(1),
+                cached_tokens: 99_000,
+            }
+        );
+
+        let busy = Deepseek4RequestAffinity::Busy {
+            slot: SlotId(0),
+            cached_tokens: 99_000,
+        };
+        assert!(
+            !deepseek4_has_runnable_affinity(&[busy]),
+            "a Busy-only queue must yield to the active owner's scheduler step"
+        );
+        for runnable in [
+            Deepseek4RequestAffinity::Cold,
+            Deepseek4RequestAffinity::Cached {
+                slot: SlotId(1),
+                cached_tokens: 2_048,
+            },
+            Deepseek4RequestAffinity::Control,
+        ] {
+            assert!(
+                deepseek4_has_runnable_affinity(&[busy, runnable]),
+                "Cold, Cached, and Control work must remain admissible beside a Busy waiter"
+            );
+        }
+    }
+
+    #[test]
     fn deepseek4_cold_cohort_bounds_decode_while_bounded_prefill_remains() {
+        assert_eq!(
+            deepseek4_reconcile_cold_cohort(
+                Deepseek4ColdCohortPhase::Idle,
+                false,
+                false,
+                true,
+                0,
+                0,
+                false,
+                false,
+            ),
+            Deepseek4ColdCohortDecision {
+                phase: Deepseek4ColdCohortPhase::Idle,
+                admission_open: true,
+                rerun_admission: false,
+            },
+            "a Busy-only continuation must yield to scheduler progress instead of spinning admission"
+        );
         assert_eq!(
             deepseek4_reconcile_cold_cohort(
                 Deepseek4ColdCohortPhase::Idle,
@@ -25920,7 +27422,7 @@ mod tests {
                 admission_open: true,
                 rerun_admission: true,
             },
-            "a staggered warm continuation must join an active decoder while another slot is free"
+            "runnable warm or cold work must join an active decoder while another slot is free"
         );
         assert_eq!(
             deepseek4_reconcile_cold_cohort(
@@ -26290,10 +27792,10 @@ mod tests {
             semantic_ttft: Duration::from_millis(25),
         };
 
-        fire_deepseek4_completion(
+        assert!(fire_deepseek4_completion(
             reply.take().expect("finalization consumes reply once"),
             completion,
-        );
+        ));
         assert!(reply.take().is_none(), "reply cannot finalize twice");
         match receiver.blocking_recv() {
             Some(super::super::sse::GenerationEvent::Done {
@@ -26310,6 +27812,37 @@ mod tests {
             other => panic!("expected one DeepSeek terminal Done, got {other:?}"),
         }
         assert!(receiver.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn deepseek4_failed_terminal_delivery_is_observed_and_counted() {
+        let (events, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let cancellations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let completion = super::super::engine_deepseek4::Deepseek4SlotCompletion {
+            result: GenerationResult {
+                text: "discarded".to_owned(),
+                reasoning_text: None,
+                prompt_tokens: 64,
+                completion_tokens: 1,
+                reasoning_tokens: None,
+                finish_reason: "stop",
+                prefill_duration: Duration::from_millis(2),
+                decode_duration: Duration::from_millis(1),
+                cached_tokens: 32,
+                logprobs: None,
+            },
+            semantic_ttft: Duration::from_millis(3),
+        };
+        assert!(!fire_deepseek4_completion(
+            SlotReply::deepseek_stream(events, Some(Arc::clone(&cancellations)), None),
+            completion,
+        ));
+        assert_eq!(
+            cancellations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "terminal delivery failure is a client cancellation, not a successful cache commit"
+        );
     }
 
     #[test]
@@ -26416,6 +27949,49 @@ mod tests {
             None,
             "a conversation with no common rendered prefix cannot reuse the checkpoint"
         );
+    }
+
+    #[test]
+    fn gemma_continuation_waits_for_strictly_better_active_prefix() {
+        let prompt = vec![41_u32; 100_000];
+        let affinity = gemma4_slot_affinity(
+            [
+                (0, &[][..], None, Some(&prompt[..99_000]), true, false),
+                (1, &prompt[..2_048], None, None, false, false),
+            ],
+            &prompt,
+        );
+        assert_eq!(
+            affinity,
+            Some(Gemma4SlotAffinity::Active(Gemma4SlotPreference {
+                slot: SlotId(0),
+                cached_tokens: 99_000,
+                restore_prompt_anchor: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn gemma_equal_idle_prefix_is_immediately_reusable() {
+        let prompt = vec![42_u32; 64];
+        let exact_retry = gemma4_slot_affinity(
+            [
+                (0, &[][..], None, Some(prompt.as_slice()), true, false),
+                (1, &[][..], Some(prompt.as_slice()), None, false, false),
+            ],
+            &prompt,
+        );
+        assert!(matches!(exact_retry, Some(Gemma4SlotAffinity::Active(_))));
+
+        let continuation = [prompt.as_slice(), &[99_u32][..]].concat();
+        let idle_tie = gemma4_slot_affinity(
+            [
+                (0, &[][..], None, Some(prompt.as_slice()), true, false),
+                (1, &[][..], Some(prompt.as_slice()), None, false, false),
+            ],
+            &continuation,
+        );
+        assert!(matches!(idle_tie, Some(Gemma4SlotAffinity::Idle(_))));
     }
 
     #[test]
@@ -28557,6 +30133,40 @@ assistant:
     }
 
     #[test]
+    fn prompt_cache_bypasses_equal_logprobs_requests() {
+        let tokens = vec![1, 2, 3];
+        let params = SamplingParams {
+            logprobs: true,
+            top_logprobs: 3,
+            ..SamplingParams::default()
+        };
+        let cache = make_cached(&tokens, &params, "hello");
+
+        assert!(
+            cache.lookup(&tokens, &params).is_none(),
+            "terminal response caching must stay disabled until it retains and replays the live logprob payload"
+        );
+        assert!(
+            cache.tokens.is_empty(),
+            "logprob-bearing results must not be stored for a later lossy replay"
+        );
+
+        // Independently pin the lookup guard. A persisted cache written by an
+        // older build can still contain a nonempty, key-compatible entry with
+        // `logprobs=true`; replay must remain disabled even when the store
+        // bypass is not involved in constructing the fixture.
+        let mut restored = PromptCache::new();
+        restored.tokens = tokens.clone();
+        restored.key = PromptCacheKey::from_params(&params);
+        restored.text = "legacy cached text".to_string();
+        restored.completion_tokens = 3;
+        assert!(
+            restored.lookup(&tokens, &params).is_none(),
+            "restored logprob-bearing entries must not replay without their per-token payload"
+        );
+    }
+
+    #[test]
     fn prompt_cache_miss_on_different_top_logprobs() {
         let tokens: Vec<u32> = vec![1, 2, 3];
         let mut base = SamplingParams::default();
@@ -28586,6 +30196,40 @@ assistant:
         assert!(
             cache.lookup(&tokens, &req).is_none(),
             "same prompt + different parallel_tool_calls must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_reasoning_forced_open() {
+        let tokens = vec![1, 2, 3];
+        let base = SamplingParams {
+            reasoning_forced_open: false,
+            ..SamplingParams::default()
+        };
+        let cache = make_cached(&tokens, &base, "answer");
+        let request = SamplingParams {
+            reasoning_forced_open: true,
+            ..base
+        };
+        assert!(
+            cache.lookup(&tokens, &request).is_none(),
+            "reasoning/content split state is part of response-cache identity"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_hit_when_reasoning_forced_open_matches() {
+        let tokens = vec![1, 2, 3];
+        let params = SamplingParams {
+            reasoning_forced_open: true,
+            ..SamplingParams::default()
+        };
+        let cache = make_cached(&tokens, &params, "answer");
+
+        assert_eq!(
+            cache.lookup(&tokens, &params).map(|hit| hit.text),
+            Some("answer".to_string()),
+            "matching forced-open reasoning state remains response-cache eligible"
         );
     }
 
@@ -28620,8 +30264,8 @@ assistant:
         params.presence_penalty = 0.2;
         params.min_p = 0.05;
         params.tool_call_policy = ToolCallPolicy::Auto;
-        params.logprobs = true;
-        params.top_logprobs = 3;
+        params.logprobs = false;
+        params.top_logprobs = 0;
         params.parallel_tool_calls = false;
         let cache = make_cached(&tokens, &params, "full-inventory-hit");
 
@@ -28636,8 +30280,8 @@ assistant:
         same.presence_penalty = 0.2;
         same.min_p = 0.05;
         same.tool_call_policy = ToolCallPolicy::Auto;
-        same.logprobs = true;
-        same.top_logprobs = 3;
+        same.logprobs = false;
+        same.top_logprobs = 0;
         same.parallel_tool_calls = false;
 
         let hit = cache.lookup(&tokens, &same);
@@ -31157,6 +32801,86 @@ assistant:
             );
         }
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
+    /// Exact real-model parity across the production 4,096-token Gemma
+    /// transaction boundary. The first request takes the eager 4,096-token
+    /// path; the independent 8,193-token request must execute two complete
+    /// resumable transactions plus a one-token tail and emit the same greedy
+    /// output as an independent monolithic slot-aware reference.
+    #[test]
+    fn gemma_eager_4096_and_resumed_8193_tail_match_cold_output() {
+        if byte_equiv_skip_unless_gated("gemma_eager_4096_and_resumed_8193_tail_match_cold_output")
+        {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let eager_prompt = vec![42u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize];
+        let resumed_prompt = vec![43u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize * 2 + 1];
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 8,
+            ..Default::default()
+        };
+        let eager_cold = gemma4_serial_slot_aware_ref(&load_opts, &eager_prompt, &params);
+        let resumed_cold = gemma4_serial_slot_aware_ref(&load_opts, &resumed_prompt, &params);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let engine = Engine::spawn_with_mode(
+            LoadedModel::load(&load_opts).expect("load bounded Gemma model"),
+            2,
+            None,
+            EngineMode::SlotAware { max_slots: 1 },
+        )
+        .expect("spawn bounded Gemma engine");
+        let eager = rt
+            .block_on(engine.generate(eager_prompt, params.clone()))
+            .expect("eager boundary generation");
+        let resumed = rt
+            .block_on(engine.generate(resumed_prompt, params))
+            .expect("resumed non-aligned tail generation");
+
+        for (label, actual, expected) in [
+            ("eager-4096", &eager, &eager_cold),
+            ("resumed-8193", &resumed, &resumed_cold),
+        ] {
+            assert_eq!(actual.text, expected.text, "{label} text diverged");
+            assert_eq!(
+                actual.reasoning_text, expected.reasoning_text,
+                "{label} reasoning diverged"
+            );
+            assert_eq!(
+                actual.finish_reason, expected.finish_reason,
+                "{label} finish reason diverged"
+            );
+            assert_eq!(
+                actual.completion_tokens, expected.completion_tokens,
+                "{label} completion count diverged"
+            );
+            assert_eq!(
+                actual.logprobs, expected.logprobs,
+                "{label} logprobs diverged"
+            );
+        }
+        assert_eq!(eager.cached_tokens, 0, "eager boundary must be cold");
+        assert_eq!(
+            resumed.cached_tokens, 0,
+            "independent resumable prompt must remain a cold parity case"
+        );
+        rt.block_on(engine.shutdown()).expect("shutdown engine");
     }
 
     /// ADR-040 §0.16 `iter-F-batched-determinism-residual` FALSIFIER (2026-06-25).
@@ -37440,6 +39164,51 @@ mod gemma4_bounded_prefill_tests {
             1,
             "active decode peers must see the scheduler after one admission"
         );
+        let waiting = Gemma4PendingDisposition::WaitForActive(Gemma4SlotPreference {
+            slot: SlotId(0),
+            cached_tokens: 99_000,
+            restore_prompt_anchor: true,
+        });
+        assert_eq!(
+            choose_gemma4_ready_request_index(&[waiting, Gemma4PendingDisposition::ReadyRequest,]),
+            Some(1),
+            "an unrelated request must remain runnable behind an active-prefix waiter"
+        );
+        assert_eq!(
+            choose_gemma4_ready_request_index(&[waiting, Gemma4PendingDisposition::ReadyControl,]),
+            Some(1),
+            "control work must not be hidden by an active-prefix waiter"
+        );
+        assert_eq!(
+            choose_gemma4_ready_request_index(&[
+                Gemma4PendingDisposition::ReadyRequest,
+                Gemma4PendingDisposition::ReadyControl,
+            ]),
+            Some(0),
+            "later GPU/control-shaped work must not leapfrog an earlier runnable request"
+        );
+        assert_eq!(
+            choose_gemma4_ready_request_index(&[
+                waiting,
+                Gemma4PendingDisposition::ReadyRequest,
+                Gemma4PendingDisposition::ReadyControl,
+            ]),
+            Some(1),
+            "the first runnable request wins after skipping an active-prefix waiter"
+        );
+        assert_eq!(
+            choose_gemma4_ready_request_index(&[
+                Gemma4PendingDisposition::ReadyControl,
+                Gemma4PendingDisposition::ReadyShutdown,
+            ]),
+            Some(1),
+            "shutdown is always selected before ordinary control work"
+        );
+        assert_eq!(
+            choose_gemma4_ready_request_index(&[waiting]),
+            None,
+            "a sole continuation waits for its active owner instead of cold-admitting"
+        );
     }
 
     #[test]
@@ -37482,6 +39251,16 @@ mod gemma4_bounded_prefill_tests {
             gemma4_bounded_batch_prefix_len([Some((Cold, 2_048)), Some((Stable, 2_048))]),
             1,
             "one admission quantum contains one contiguous batch class"
+        );
+
+        let mut collected = vec!["ready-a", "active-prefix", "ready-b", "ready-c"];
+        let mut pending = VecDeque::from(["later-a", "later-b"]);
+        defer_gemma4_active_request(&mut collected, &mut pending, 1);
+        assert_eq!(collected, vec!["ready-a", "ready-b", "ready-c"]);
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec!["active-prefix", "later-a", "later-b"],
+            "one active-prefix dependency must not park unrelated collected work"
         );
 
         assert!(validate_gemma4_generation_request(0, 1, 262_144).is_err());
@@ -38418,15 +40197,16 @@ mod qwen35_bounded_prefill_watchdog_tests {
 
         let preference = preferred_qwen35_slot(
             [
-                (0, empty, None, false),
+                (0, empty, None, None, false),
                 (
                     1,
                     divergent_live_tail.as_slice(),
                     Some(old_prompt.as_slice()),
+                    None,
                     false,
                 ),
-                (2, empty, None, false),
-                (3, empty, None, false),
+                (2, empty, None, None, false),
+                (3, empty, None, None, false),
             ],
             &followup,
         )
@@ -38445,7 +40225,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
     fn qwen_slot_preference_uses_exact_logits_and_longest_live_prefix() {
         let prompt = vec![11_u32; 32];
         let exact = preferred_qwen35_slot(
-            [(0, &prompt[..20], Some(prompt.as_slice()), false)],
+            [(0, &prompt[..20], Some(prompt.as_slice()), None, false)],
             &prompt,
         )
         .expect("exact prompt-boundary retry");
@@ -38457,8 +40237,8 @@ mod qwen35_bounded_prefill_watchdog_tests {
         followup.extend([12, 13, 14, 15]);
         let longer_live = preferred_qwen35_slot(
             [
-                (0, &followup[..34], Some(prompt.as_slice()), false),
-                (1, &followup[..33], Some(prompt.as_slice()), false),
+                (0, &followup[..34], Some(prompt.as_slice()), None, false),
+                (1, &followup[..33], Some(prompt.as_slice()), None, false),
             ],
             &followup,
         )
@@ -38470,12 +40250,272 @@ mod qwen35_bounded_prefill_watchdog_tests {
     }
 
     #[test]
-    fn qwen_slot_preference_never_selects_an_active_anchor() {
+    fn qwen_continuation_waits_for_the_strongest_active_anchor() {
         let prompt = vec![21_u32; 64];
         assert_eq!(
-            preferred_qwen35_slot([(0, &[][..], Some(prompt.as_slice()), true)], &prompt,),
-            None
+            qwen35_slot_affinity([(0, &[][..], Some(prompt.as_slice()), None, true)], &prompt,),
+            Some(Qwen35SlotAffinity::Active(Qwen35SlotPreference {
+                slot: SlotId(0),
+                cached_tokens: prompt.len(),
+                restore_prompt_anchor: true,
+                use_prefill_logits: true,
+            }))
         );
+    }
+
+    #[test]
+    fn qwen_idle_equal_prefix_wins_without_waiting() {
+        let prompt = vec![22_u32; 64];
+        let affinity = qwen35_slot_affinity(
+            [
+                (0, &[][..], Some(prompt.as_slice()), None, true),
+                (1, &[][..], Some(prompt.as_slice()), None, false),
+            ],
+            &prompt,
+        )
+        .expect("an idle exact cache copy is immediately reusable");
+
+        assert_eq!(
+            affinity,
+            Qwen35SlotAffinity::Idle(Qwen35SlotPreference {
+                slot: SlotId(1),
+                cached_tokens: prompt.len(),
+                restore_prompt_anchor: true,
+                use_prefill_logits: true,
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_long_active_prefix_beats_shorter_idle_prefix() {
+        let prompt = vec![23_u32; 100_000];
+        let affinity = qwen35_slot_affinity(
+            [
+                (0, &[][..], Some(&prompt[..99_000]), None, true),
+                (1, &[][..], Some(&prompt[..2_048]), None, false),
+            ],
+            &prompt,
+        )
+        .expect("the active retained conversation must remain visible");
+
+        assert!(matches!(affinity, Qwen35SlotAffinity::Active(_)));
+        assert_eq!(affinity.preference().cached_tokens, 99_000);
+    }
+
+    #[test]
+    fn qwen_cold_active_prompt_is_visible_before_any_checkpoint_exists() {
+        let prompt = vec![24_u32; 100_000];
+        let affinity = qwen35_slot_affinity(
+            [
+                (0, &[][..], None, Some(prompt.as_slice()), true),
+                (1, &[][..], None, None, false),
+            ],
+            &prompt,
+        );
+        assert_eq!(
+            affinity,
+            Some(Qwen35SlotAffinity::Active(Qwen35SlotPreference {
+                slot: SlotId(0),
+                cached_tokens: prompt.len(),
+                restore_prompt_anchor: false,
+                use_prefill_logits: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn qwen_ready_selector_skips_active_affinity_without_hiding_control_or_cache_hits() {
+        let params = SamplingParams {
+            max_tokens: 8,
+            ..SamplingParams::default()
+        };
+        let (busy_reply, _busy_rx) = oneshot::channel();
+        let busy = Request::Generate {
+            prompt_tokens: vec![1; 64],
+            params: params.clone(),
+            reply: busy_reply,
+        };
+        let preference = Qwen35SlotPreference {
+            slot: SlotId(0),
+            cached_tokens: 64,
+            restore_prompt_anchor: true,
+            use_prefill_logits: true,
+        };
+        let (cold_reply, _cold_rx) = oneshot::channel();
+        let cold = Request::Generate {
+            prompt_tokens: vec![2; 8],
+            params: params.clone(),
+            reply: cold_reply,
+        };
+        let (cached_reply, _cached_rx) = oneshot::channel();
+        let cached = Request::Generate {
+            prompt_tokens: vec![3; 8],
+            params,
+            reply: cached_reply,
+        };
+        let dispositions = [
+            qwen35_pending_disposition(&busy, false, true, Some(preference)),
+            qwen35_pending_disposition(&cold, false, true, None),
+            qwen35_pending_disposition(&cached, true, false, None),
+            qwen35_pending_disposition(&Request::Shutdown, false, false, None),
+        ];
+        assert_eq!(
+            choose_qwen35_ready_request_index(&dispositions),
+            Some(3),
+            "shutdown is non-evictable and outranks every ordinary request"
+        );
+        assert_eq!(
+            choose_qwen35_ready_request_index(&dispositions[..3]),
+            Some(1),
+            "cache replay skips an active-prefix waiter without overtaking earlier runnable work"
+        );
+        assert_eq!(
+            choose_qwen35_ready_request_index(&dispositions[1..3]),
+            Some(0),
+            "a later slotless cache hit cannot starve an earlier runnable generation"
+        );
+        assert_eq!(
+            choose_qwen35_ready_request_index(&[dispositions[0], dispositions[2]]),
+            Some(1),
+            "a cache hit remains runnable behind an active-prefix waiter"
+        );
+        assert_eq!(
+            choose_qwen35_ready_request_index(&dispositions[..2]),
+            Some(1),
+            "an unrelated cold request may use a free slot while the strongest active prefix waits"
+        );
+        assert_eq!(
+            choose_qwen35_ready_request_index(&dispositions[..1]),
+            None,
+            "one active-prefix waiter must yield to its owner instead of cold-admitting"
+        );
+        assert_eq!(
+            choose_qwen35_ready_request_index(&dispositions[3..]),
+            Some(0),
+            "shutdown/control work must remain runnable with every slot occupied"
+        );
+
+        let (kept_reply, _kept_rx) = oneshot::channel();
+        let (evicted_reply, evicted_rx) = oneshot::channel();
+        let mut bounded = VecDeque::new();
+        enqueue_slotaware_pending(
+            "Qwen35",
+            &mut bounded,
+            1,
+            Request::Warmup { reply: kept_reply },
+            |_| true,
+        );
+        enqueue_slotaware_pending("Qwen35", &mut bounded, 1, Request::Shutdown, |_| true);
+        enqueue_slotaware_pending(
+            "Qwen35",
+            &mut bounded,
+            1,
+            Request::Warmup {
+                reply: evicted_reply,
+            },
+            |_| true,
+        );
+        assert!(bounded
+            .iter()
+            .any(|request| matches!(request, Request::Shutdown)));
+        assert_eq!(
+            bounded.len(),
+            2,
+            "one ordinary waiter plus shutdown stays bounded"
+        );
+        let error = evicted_rx
+            .blocking_recv()
+            .expect("evicted non-shutdown request receives a terminal result")
+            .expect_err("bounded queue eviction is explicit");
+        assert!(format!("{error:#}").contains("server_busy"));
+
+        let (waiter_one_reply, mut waiter_one_rx) = oneshot::channel();
+        let (waiter_two_reply, mut waiter_two_rx) = oneshot::channel();
+        let (ready_reply, _ready_rx) = oneshot::channel();
+        let mut saturated = VecDeque::new();
+        enqueue_slotaware_pending(
+            "Qwen35",
+            &mut saturated,
+            2,
+            Request::Warmup {
+                reply: waiter_one_reply,
+            },
+            |_| false,
+        );
+        enqueue_slotaware_pending(
+            "Qwen35",
+            &mut saturated,
+            2,
+            Request::Warmup {
+                reply: waiter_two_reply,
+            },
+            |_| false,
+        );
+        enqueue_slotaware_pending(
+            "Qwen35",
+            &mut saturated,
+            2,
+            Request::Generate {
+                prompt_tokens: vec![7; 8],
+                params: SamplingParams {
+                    max_tokens: 8,
+                    ..SamplingParams::default()
+                },
+                reply: ready_reply,
+            },
+            |request| matches!(request, Request::Generate { .. }),
+        );
+        assert_eq!(saturated.len(), 2);
+        assert!(saturated
+            .iter()
+            .any(|request| matches!(request, Request::Generate { .. })));
+        assert!(
+            waiter_one_rx.try_recv().is_ok() || waiter_two_rx.try_recv().is_ok(),
+            "runnable work displaces one blocked waiter instead of being rejected unseen"
+        );
+    }
+
+    #[test]
+    fn closed_slotaware_stream_is_cancelled_before_cache_affinity() {
+        let (events, receiver) = mpsc::channel(1);
+        let cancellation_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (admission, admission_rx) = oneshot::channel();
+        let request = Request::GenerateStream {
+            prompt_tokens: vec![1; 64],
+            params: SamplingParams {
+                max_tokens: 8,
+                ..SamplingParams::default()
+            },
+            events,
+            cancellation_counter: Some(Arc::clone(&cancellation_counter)),
+            admission: Some(admission),
+            soft_tokens: Vec::new(),
+            deepstack: None,
+            positions_flat: None,
+        };
+        let mut pending = VecDeque::new();
+        enqueue_slotaware_pending("DeepSeek-V4", &mut pending, 1, request, |_| false);
+        assert_eq!(pending.len(), 1);
+        drop(receiver);
+        let (ready_reply, _ready_rx) = oneshot::channel();
+        enqueue_slotaware_pending(
+            "DeepSeek-V4",
+            &mut pending,
+            1,
+            Request::Warmup { reply: ready_reply },
+            |candidate| matches!(candidate, Request::Warmup { .. }),
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending.front(), Some(Request::Warmup { .. })));
+        assert_eq!(
+            cancellation_counter.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let error = admission_rx
+            .blocking_recv()
+            .expect("closed request receives an explicit admission result")
+            .expect_err("closed request must be rejected");
+        assert!(format!("{error:#}").contains("before DeepSeek-V4 admission"));
     }
 
     #[test]
@@ -38951,7 +40991,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
         let worker = std::thread::spawn(move || {
             let supervisor = EngineSupervisor::new();
             let mut rx = rx;
-            let mut pending = None;
+            let mut pending = VecDeque::new();
             let mut slots: Vec<Option<Qwen35Slot>> = Vec::new();
             let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(1, 1, 0);
             let stats = Arc::new(Mutex::new(scheduler.stats()));

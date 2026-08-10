@@ -22,6 +22,18 @@ const EVENT_CAPACITY: usize = 256;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const FINISHED_RETENTION: Duration = Duration::from_secs(4);
 const MAX_LOG_LINES: usize = 4;
+const STRUCTURED_PROGRESS_MESSAGES: &[&str] = &[
+    "chat completion request received",
+    "chat completion prepared; dispatching",
+    "streaming request submitted",
+    "streaming request enqueued",
+    "bounded prefill chunk complete",
+    "request started",
+    "prefill planned",
+    "prefill progress",
+    "decode started",
+    "decode progress",
+];
 
 static EVENT_SINK: Mutex<Option<SyncSender<Event>>> = Mutex::new(None);
 
@@ -469,18 +481,6 @@ fn apply_event(state: &mut DashboardState, event: Event) -> bool {
 }
 
 fn operator_log_is_not_request_progress(line: &str) -> bool {
-    const STRUCTURED_PROGRESS_MESSAGES: &[&str] = &[
-        "chat completion request received",
-        "chat completion prepared; dispatching",
-        "streaming request submitted",
-        "streaming request enqueued",
-        "bounded prefill chunk complete",
-        "request started",
-        "prefill planned",
-        "prefill progress",
-        "decode started",
-        "decode progress",
-    ];
     !STRUCTURED_PROGRESS_MESSAGES
         .iter()
         .any(|message| line.contains(message))

@@ -82,7 +82,7 @@ from a clean packed artifact that resolves the published, checksum-pinned
 | Exact overlap | The deterministic 552-token SSE lane is enqueued immediately before the 87,972-token/347-tool lane; the short lane makes semantic progress while the long lane completes exactly 42×2,048 + 1,956 prompt tokens. |
 | Disconnect | Dropping the long SSE is observed at a transaction boundary, releases the same physical slot once, and a following request succeeds. |
 | Agentic four-slot gate | Required/automatic tools, unary/SSE, tool-result continuation, exact arguments, and retained-prefix reuse pass for four independent slots. |
-| Native lifetime/fatal recovery | Command-buffer and CFString populations remain bounded; no timeout, ignored submission, or post-fatal GPU submission occurs; `/health` remains liveness and `/readyz` fails closed after an injected fatal error. |
+| Native lifetime/fatal recovery | Exact-artifact hardware waves keep command-buffer and CFString populations bounded and reject every timeout or ignored-submission signature. Packed model-free fail-stop and supervisor tests inject the fatal return/dead-worker state, prove no post-fatal submission, preserve `/health` as process liveness, and require `/readyz` plus new generation to fail closed. The hardware gate does not intentionally poison Metal. |
 
 The shared cross-family changes additionally require:
 

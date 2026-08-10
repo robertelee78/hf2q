@@ -11,6 +11,10 @@ on:
         description: Exact crate version to publish
         required: true
         type: string
+      cache_gate_run_id:
+        description: Successful exact-SHA Cache lifecycle workflow run ID
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -23,17 +27,20 @@ concurrency:
 jobs:
   publish:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
-      GH_TOKEN: ${{ github.token }}
+      EXPECTED_CACHE_GATE_RUN_ID: ${{ inputs.cache_gate_run_id }}
+      EXPECTED_DEEPSEEK_MODEL_SHA256: ${{ vars.DEEPSEEK4_MODEL_SHA256 }}
+      EXPECTED_GEMMA_MODEL_SHA256: ${{ vars.GEMMA4_MODEL_SHA256 }}
+      EXPECTED_QWEN_MODEL_SHA256: ${{ vars.QWEN36_MODEL_SHA256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify immutable release identity
         shell: bash
@@ -45,11 +52,12 @@ jobs:
           test "$actual_sha" = "$(git rev-parse origin/main)"
           actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$actual_version" = "$EXPECTED_VERSION"
-          test -n "$CARGO_REGISTRY_TOKEN"
           git diff --exit-code
 
       - name: Require successful exact-SHA CI
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           successes=$(gh run list \
@@ -59,10 +67,225 @@ jobs:
             --jq '[.[] | select(.event == "push" and .conclusion == "success")] | length')
           test "$successes" -ge 1
 
+      - name: Require exact-artifact cross-family cache lifecycle proof
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_json=$(gh run view "$EXPECTED_CACHE_GATE_RUN_ID" \
+            --json conclusion,event,headSha,workflowName,url)
+          test "$(jq -r .workflowName <<<"$run_json")" = "Cache lifecycle"
+          test "$(jq -r .event <<<"$run_json")" = "workflow_dispatch"
+          test "$(jq -r .headSha <<<"$run_json")" = "$EXPECTED_SHA"
+          test "$(jq -r .conclusion <<<"$run_json")" = "success"
+
+          gate_dir="$RUNNER_TEMP/cache-lifecycle-proof"
+          gh run download "$EXPECTED_CACHE_GATE_RUN_ID" \
+            --name "cache-lifecycle-$EXPECTED_SHA" \
+            --dir "$gate_dir"
+          manifest="$gate_dir/manifest.json"
+          test -s "$manifest"
+          check_receipt() {
+            local path=$1
+            local selector=$2
+            local expected actual
+            expected=$(jq -er "$selector" "$manifest")
+            actual=$(shasum -a 256 "$gate_dir/$path" | awk '{print $1}')
+            test "$actual" = "$expected"
+          }
+          check_receipt deepseek/lifecycle/summary.json '.receipt_sha256.deepseek.lifecycle'
+          check_receipt deepseek/interactive/summary.json '.receipt_sha256.deepseek.interactive'
+          check_receipt deepseek/cached-suffix/summary.json '.receipt_sha256.deepseek.cached_suffix'
+          check_receipt deepseek/full-context-1/envelope.json '.receipt_sha256.deepseek.wave1'
+          check_receipt deepseek/full-context-2/envelope.json '.receipt_sha256.deepseek.wave2'
+          check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
+          check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
+          check_receipt gemma/wave1/summary.json '.receipt_sha256.gemma.wave1'
+          check_receipt gemma/wave2/summary.json '.receipt_sha256.gemma.wave2'
+          check_receipt gemma/eight-slots/summary.json '.receipt_sha256.gemma.eight_slots'
+          check_receipt gemma/transactions-four-slots.json '.receipt_sha256.gemma.transactions4'
+          check_receipt gemma/transactions-eight-slots.json '.receipt_sha256.gemma.transactions8'
+          check_receipt gemma/parity/summary.json '.receipt_sha256.gemma.parity'
+          check_receipt gemma/heap-summary.json '.receipt_sha256.gemma.heap'
+          check_receipt qwen/lifecycle/summary.json '.receipt_sha256.qwen.lifecycle'
+          check_receipt qwen/cumulative/cumulative-release-summary.json '.receipt_sha256.qwen.cumulative'
+          check_receipt qwen/cancellation/cancellation-summary.json '.receipt_sha256.qwen.cancellation'
+          for digest in \
+            "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
+            "$EXPECTED_GEMMA_MODEL_SHA256" \
+            "$EXPECTED_QWEN_MODEL_SHA256"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          done
+          jq -e \
+            --arg source_sha "$EXPECTED_SHA" \
+            --arg deepseek_sha "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
+            --arg gemma_sha "$EXPECTED_GEMMA_MODEL_SHA256" \
+            --arg qwen_sha "$EXPECTED_QWEN_MODEL_SHA256" \
+            '. as $root
+             | .status == "pass"
+             and .source_sha == $source_sha
+             and .power_guarded_ac == true
+             and (.binary_sha256 | test("^[0-9a-f]{64}$"))
+             and .models.deepseek.sha256 == $deepseek_sha
+             and .models.gemma.sha256 == $gemma_sha
+             and .models.qwen.sha256 == $qwen_sha
+             and (.families.deepseek as $d
+               | $d.status == "pass"
+               and $d.lifecycle.status == "pass"
+               and $d.lifecycle.active_stream_cancelled_without_done == true
+               and $d.lifecycle.queued_exact_retry_cached_tokens > 0
+               and $d.lifecycle.unrelated_conversation_content == "ISOLATION_OK"
+               and $d.interactive_overlap.status == "pass"
+               and $d.interactive_overlap.server.binary_sha256 == $root.binary_sha256
+               and $d.interactive_overlap.server.model_sha256 == $deepseek_sha
+               and $d.interactive_overlap.server.max_slots == 4
+               and $d.interactive_overlap.fixture_sha256 == "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d"
+               and $d.interactive_overlap.long_prompt_tokens > 80000
+               and $d.interactive_overlap.first_mixed_prefill_chunk_tokens > 0
+               and $d.interactive_overlap.first_mixed_prefill_chunk_tokens <= 256
+               and $d.interactive_overlap.first_mixed_prefill_window_cap == 2
+               and $d.interactive_overlap.short_generated_tokens_at_first_window >= 8
+               and $d.interactive_overlap.terminal_parking.park_observed == true
+               and $d.interactive_overlap.terminal_parking.terminal_absent_while_parked == true
+               and $d.interactive_overlap.terminal_parking.active_cold_prefills_at_park >= 1
+               and $d.interactive_overlap.terminal_parking.park_log_line < $d.interactive_overlap.terminal_parking.long_prefill_complete_log_line
+               and $d.interactive_overlap.terminal_parking.long_prefill_complete_log_line < $d.interactive_overlap.terminal_parking.release_log_line
+               and $d.interactive_overlap.terminal_parking.release_log_line <= $d.interactive_overlap.terminal_parking.request_complete_log_line
+               and $d.interactive_overlap.ready_http == 200
+               and $d.interactive_overlap.power_event_delta == 0
+               and $d.cached_suffix.status == "pass"
+               and $d.cached_suffix.server.binary_sha256 == $root.binary_sha256
+               and $d.cached_suffix.overlap.cached_prefill_transactions >= 3
+               and $d.cached_suffix.overlap.peer_decode_progress_events_between_transactions >= 1
+               and $d.cached_suffix.overlap.peer_terminal_done_exactly_once == true
+               and $d.cached_suffix.cancellation.counter_after == ($d.cached_suffix.cancellation.counter_before + 1)
+               and $d.cached_suffix.cancellation.chunks_after_stability == $d.cached_suffix.cancellation.chunks_after_settle
+               and $d.cached_suffix.cancellation.emitted_done == false
+               and $d.cached_suffix.cancellation_after_candidate_anchor.counter_after == ($d.cached_suffix.cancellation_after_candidate_anchor.counter_before + 1)
+               and $d.cached_suffix.cancellation_after_candidate_anchor.chunks_after_stability == $d.cached_suffix.cancellation_after_candidate_anchor.chunks_after_settle
+               and $d.cached_suffix.cancellation_after_candidate_anchor.post_cancel_cached_tokens > 0
+               and $d.cached_suffix.cancellation_during_decode.counter_after == ($d.cached_suffix.cancellation_during_decode.counter_before + 1)
+               and $d.cached_suffix.cancellation_during_decode.progress_events_after_stability == $d.cached_suffix.cancellation_during_decode.progress_events_after_settle
+               and $d.cached_suffix.cancellation_during_decode.post_cancel_cached_tokens > 0
+               and $d.cached_suffix.ready_before == true and $d.cached_suffix.ready_after == true
+               and $d.cached_suffix.fatal_log_signatures == 0
+               and ($d.full_context_waves | length) == 2
+               and all($d.full_context_waves[];
+                 .status == "pass" and .binary_sha256 == $root.binary_sha256
+                 and .model_sha256 == $deepseek_sha and .ready_http == 200
+                 and .fatal_log_signatures == 0 and .receipt.status == "pass"
+                 and .receipt.family == "deepseek4" and .receipt.concurrent_agents == 4
+                 and .receipt.require_cold_first == 1 and (.receipt.agents | length) == 4
+                 and all(.receipt.agents[];
+                   .status == "pass" and .cold_cached_tokens == 0
+                   and .cached_tokens >= (.prompt_tokens - 32)
+                   and .auto_cached_tokens >= (.prompt_tokens - 32)
+                   and .continuation_cached_tokens >= (.prompt_tokens - 32)
+                   and .cached_ttft_ms <= 5000
+                   and .cached_semantic_response_ms <= 15000
+                   and .auto_semantic_response_ms <= 15000
+                   and .cached_sse_tool_call_ms <= 15000
+                   and .tool_result_response_ms <= 35000)))
+             and (.families.gemma as $g
+               | $g.status == "pass" and $g.lifecycle.status == "pass"
+               and $g.lifecycle.active_stream_cancelled_without_done == true
+               and $g.lifecycle.queued_exact_retry_cached_tokens > 0
+               and $g.lifecycle.unrelated_conversation_content == "ISOLATION_OK"
+               and $g.overlap_and_cancellation.status == "pass"
+               and $g.overlap_and_cancellation.binary_sha256 == $root.binary_sha256
+               and $g.overlap_and_cancellation.model_sha256 == $gemma_sha
+               and $g.overlap_and_cancellation.max_slots == 4
+               and $g.overlap_and_cancellation.primary_context_sha256 == "07b147e9c6ac26a0c9c4a719391c0772b2d27b9d77499479014b9ace88b6b11e"
+               and $g.overlap_and_cancellation.cancellation_context_sha256 == "f0b264eedae315618941d8fa6fb16454c4eac03b5793e213b613d66ccb7b6e4a"
+               and $g.overlap_and_cancellation.long_prompt_tokens > 80000
+               and $g.overlap_and_cancellation.short_semantic_during_long_prefill == true
+               and $g.overlap_and_cancellation.committed_tokens_when_short_progressed < $g.overlap_and_cancellation.long_prompt_tokens
+               and $g.overlap_and_cancellation.cancellation_delta == 1
+               and $g.overlap_and_cancellation.chunks_after_cancel == $g.overlap_and_cancellation.chunks_after_stability
+               and $g.overlap_and_cancellation.rollback_restores >= 1
+               and $g.overlap_and_cancellation.transaction_cap_tokens == 4096
+               and $g.overlap_and_cancellation.ready_http == 200
+               and $g.overlap_and_cancellation.power_event_delta == 0
+               and ($g.agent_waves | length) == 3
+               and ($g.agent_waves | map(.concurrent_agents) | sort) == [4,4,8]
+               and all($g.agent_waves[];
+                 .status == "pass" and .family == "gemma4" and .require_cold_first == 1
+                 and all(.agents[]; .status == "pass" and .cold_cached_tokens == 0
+                   and .cached_tokens >= (.prompt_tokens - 32)
+                   and .auto_cached_tokens >= (.prompt_tokens - 32)
+                   and .continuation_cached_tokens >= (.prompt_tokens - 32)))
+               and ($g.transactions | length) == 2
+               and all($g.transactions[]; .status == "pass" and .transaction_cap_rows == 4096
+                 and .max_transaction_rows <= 4096 and .multi_slot_transactions > 0
+                 and .nonaligned_transactions > 0)
+               and $g.parity.status == "pass"
+               and $g.parity.n4_exact_output_parity == true
+               and $g.parity.n8_exact_output_parity == true
+               and $g.parity.eager_4096_and_resumed_8193_exact_output_parity == true
+               and $g.parity.long_resume_exact_output_parity == true
+               and $g.heap.status == "pass"
+               and all($g.heap.snapshots[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)
+               and ($g.heap.snapshots.post_overlap.cfstring_count - $g.heap.snapshots.baseline.cfstring_count) <= 512
+               and ($g.heap.snapshots.post_lifecycle.cfstring_count - $g.heap.snapshots.post_overlap.cfstring_count) <= 512
+               and ($g.heap.snapshots.post_wave1.cfstring_count - $g.heap.snapshots.post_lifecycle.cfstring_count) <= 256
+               and ($g.heap.snapshots.post_wave2.cfstring_count - $g.heap.snapshots.post_wave1.cfstring_count) <= 256)
+             and (.families.qwen as $q
+               | $q.status == "pass" and $q.lifecycle.status == "pass"
+               and $q.lifecycle.active_stream_cancelled_without_done == true
+               and $q.lifecycle.queued_exact_retry_cached_tokens > 0
+               and $q.lifecycle.unrelated_conversation_content == "ISOLATION_OK"
+               and $q.cumulative.status == "pass"
+               and $q.cumulative.binary_sha256 == $root.binary_sha256
+               and $q.cumulative.model_sha256 == $qwen_sha
+               and $q.cumulative.max_slots == 4 and $q.cumulative.ready_http == 200
+               and $q.cumulative.power_event_delta == 0 and $q.cumulative.heap_bounds_valid == true
+               and $q.cumulative.overlap.prompt_tokens == 87972
+               and $q.cumulative.overlap.short_prompt_tokens == 552
+               and $q.cumulative.overlap.tools == 347
+               and $q.cumulative.overlap.chunks == 44
+               and $q.cumulative.overlap.full_chunks == 42
+               and $q.cumulative.overlap.short_semantic_before_long_chunk == true
+               and $q.cumulative.overlap.continuation_cached_tokens > 80000
+               and $q.cumulative.overlap.continuation_first_chunk_start == $q.cumulative.overlap.continuation_cached_tokens
+               and all($q.cumulative.agent_waves[];
+                 .status == "pass" and .family == "qwen36" and .concurrent_agents == 4
+                 and .require_cold_first == 1 and all(.agents[]; .cold_cached_tokens == 0))
+               and $q.cumulative.agent_waves.warmup.maximum_tool_result_ms <= 15000
+               and $q.cumulative.agent_waves.wave1.maximum_tool_result_ms <= 10000
+               and $q.cumulative.agent_waves.wave2.maximum_tool_result_ms <= 10000
+               and all($q.cumulative.heap[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)
+               and $q.cumulative.heap_deltas.cfstring_baseline_to_warmup <= 1024
+               and $q.cumulative.heap_deltas.cfstring_warmup_to_wave2 <= 512
+               and $q.cumulative.heap_deltas.pool_baseline_to_warmup <= 16
+               and $q.cumulative.heap_deltas.pool_warmup_to_wave2 <= 16
+               and $q.cancellation.status == "pass"
+               and $q.cancellation.binary_sha256 == $root.binary_sha256
+               and $q.cancellation.model_sha256 == $qwen_sha
+               and $q.cancellation.max_slots == 1
+               and $q.cancellation.chunks_at_disconnect == 3
+               and $q.cancellation.cancellation_delta == 1
+               and $q.cancellation.cancelled_success_terminal == false
+               and $q.cancellation.same_slot_reuse == true
+               and $q.cancellation.chunks_after_cancel == $q.cancellation.chunks_after_stability
+               and $q.cancellation.pre_tiny_ready_http == 200
+               and $q.cancellation.ready_http == 200
+               and $q.cancellation.power_event_delta == 0)' \
+            "$manifest" >/dev/null
+          expected_crate_sha=$(jq -er '.crate_sha256' "$manifest")
+          [[ "$expected_crate_sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "EXPECTED_CRATE_SHA256=$expected_crate_sha" >> "$GITHUB_ENV"
+
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.88.0"
+
+      - name: cargo audit
+        shell: bash
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2 --no-default-features
+          cargo audit
 
       - name: Package exact source
         shell: bash
@@ -71,7 +294,10 @@ jobs:
           cargo package --locked
           crate="target/package/hf2q-${EXPECTED_VERSION}.crate"
           test -s "$crate"
-          shasum -a 256 "$crate" | tee "$RUNNER_TEMP/release-crate.sha256"
+          actual_crate_sha=$(shasum -a 256 "$crate" | awk '{print $1}')
+          test "$actual_crate_sha" = "$EXPECTED_CRATE_SHA256"
+          printf '%s  %s\n' "$actual_crate_sha" "$crate" \
+            | tee "$RUNNER_TEMP/release-crate.sha256"
 
       - name: Install and smoke-test packed artifact
         shell: bash
@@ -86,6 +312,7 @@ jobs:
             cargo test --locked --test lcp_registry_unit --all-features
             cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
             cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features prompt_cache_ -- --test-threads=1
             cargo test --locked --bin hf2q --all-features gemma4_bounded_prefill_tests -- --test-threads=1
             cargo test --locked --bin hf2q --all-features slotaware_fail_stop_tests -- --test-threads=1
             cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1
@@ -97,7 +324,10 @@ jobs:
               scripts/test_qwen36_cumulative_release.sh \
               scripts/test_deepseek4_agentic.sh \
               scripts/test_deepseek4_cached_suffix.sh \
-              scripts/test_deepseek4_interactive_overlap.sh
+              scripts/test_deepseek4_interactive_overlap.sh \
+              scripts/test_agentic_cache_lifecycle.sh \
+              scripts/test_gemma4_long_short_overlap.sh \
+              scripts/run_agentic_cache_release_gate.sh
             bash scripts/test_qwen36_watchdog_harness_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \
@@ -123,15 +353,21 @@ jobs:
 
       - name: Publish exact package
         shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          test -n "$CARGO_REGISTRY_TOKEN"
           published="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}-published.crate"
           if curl --fail --location --silent --show-error \
             "https://static.crates.io/crates/hf2q/hf2q-${EXPECTED_VERSION}.crate" \
             --output "$published"; then
             echo "hf2q ${EXPECTED_VERSION} is already published; verifying exact bytes"
           else
-            cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+            # The exact package was already compiled and tested above. Avoid
+            # re-running dependency build scripts while the registry token is
+            # present in this narrowly scoped step.
+            cargo publish --locked --no-verify --token "$CARGO_REGISTRY_TOKEN"
           fi
 
       - name: Verify crates.io bytes
@@ -152,17 +388,60 @@ jobs:
           done
           exit 1
 
-      - name: Tag and create GitHub release
+      - name: Install and smoke-test crates.io artifact
         shell: bash
         run: |
           set -euo pipefail
+          downloaded="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}.crate"
+          registry_root="$RUNNER_TEMP/hf2q-registry"
+          install_root="$RUNNER_TEMP/hf2q-registry-install"
+          mkdir -p "$registry_root"
+          tar -xzf "$downloaded" -C "$registry_root"
+          cargo install \
+            --path "$registry_root/hf2q-${EXPECTED_VERSION}" \
+            --locked \
+            --root "$install_root"
+          "$install_root/bin/hf2q" --help >/dev/null
+
+      - name: Tag and create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           tag="v${EXPECTED_VERSION}"
-          git tag "$tag" "$EXPECTED_SHA"
-          git push origin "$tag"
-          gh release create "$tag" \
-            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
-            "$RUNNER_TEMP/release-crate.sha256" \
-            --target "$EXPECTED_SHA" \
-            --title "hf2q ${EXPECTED_VERSION}" \
-            --generate-notes \
-            --verify-tag
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null || true)
+          if [[ -n "$tag_sha" ]]; then
+            test "$tag_sha" = "$EXPECTED_SHA"
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$EXPECTED_SHA" >/dev/null
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$EXPECTED_SHA"
+          else
+            gh release create "$tag" \
+              "target/package/hf2q-${EXPECTED_VERSION}.crate" \
+              "$RUNNER_TEMP/release-crate.sha256" \
+              --target "$EXPECTED_SHA" \
+              --title "hf2q ${EXPECTED_VERSION}" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+      - name: Verify GitHub release bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${EXPECTED_VERSION}"
+          expected=$(awk '{print $1}' "$RUNNER_TEMP/release-crate.sha256")
+          release_dir="$RUNNER_TEMP/github-release"
+          mkdir -p "$release_dir"
+          gh release download "$tag" \
+            --pattern "hf2q-${EXPECTED_VERSION}.crate" \
+            --dir "$release_dir"
+          actual=$(shasum -a 256 "$release_dir/hf2q-${EXPECTED_VERSION}.crate" | awk '{print $1}')
+          test "$actual" = "$expected"

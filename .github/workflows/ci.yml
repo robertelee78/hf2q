@@ -28,6 +28,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -43,16 +46,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (1.88.0, as pinned in Cargo.toml)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.88.0"
           components: rustfmt, clippy
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -78,6 +83,11 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --locked
 
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2 --no-default-features
+          cargo audit
+
       # GitHub's hosted macOS VM returns nil from Metal residency-set
       # creation. Keep the hosted gate blocking and deterministic by running
       # the library, native conversion, and non-Metal DeepSeek contracts here.
@@ -91,6 +101,7 @@ jobs:
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
           cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features prompt_cache_ -- --test-threads=1
           cargo test --locked --bin hf2q --all-features gemma4_bounded_prefill_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features slotaware_fail_stop_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1
@@ -102,7 +113,10 @@ jobs:
             scripts/test_qwen36_cumulative_release.sh \
             scripts/test_deepseek4_agentic.sh \
             scripts/test_deepseek4_cached_suffix.sh \
-            scripts/test_deepseek4_interactive_overlap.sh
+            scripts/test_deepseek4_interactive_overlap.sh \
+            scripts/test_agentic_cache_lifecycle.sh \
+            scripts/test_gemma4_long_short_overlap.sh \
+            scripts/run_agentic_cache_release_gate.sh
           bash scripts/test_qwen36_watchdog_harness_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
