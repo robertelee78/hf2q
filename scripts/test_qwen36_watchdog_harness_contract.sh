@@ -3,7 +3,7 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=qwen36_watchdog_validate.sh
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
 for command in jq awk sed wc tr mktemp seq shasum stat find; do
@@ -181,6 +181,34 @@ for ordinal in $(seq 0 42); do
 done
 qwen36_validate_chunk_lines "$valid_chunks"
 
+stable_chunks="$test_dir/stable-chunks.log"
+for ordinal in $(seq 0 41); do
+  start=$((ordinal * 2048))
+  end=$((start + 2048))
+  printf 'INFO Qwen35 bounded prefill chunk complete slot=0 chunk_start=%s chunk_end=%s chunk_tokens=2048 prompt_tokens=87972\n' \
+    "$start" "$end" >>"$stable_chunks"
+done
+printf 'INFO Qwen35 bounded prefill chunk complete slot=0 chunk_start=86016 chunk_end=87965 chunk_tokens=1949 prompt_tokens=87972\n' \
+  >>"$stable_chunks"
+printf 'INFO Qwen35 bounded prefill chunk complete slot=0 chunk_start=87965 chunk_end=87972 chunk_tokens=7 prompt_tokens=87972\n' \
+  >>"$stable_chunks"
+qwen36_validate_stable_boundary_chunk_lines "$stable_chunks" 87965
+[[ "$(qwen36_count_chunks_with_tokens "$stable_chunks" 2048)" == 42 ]]
+[[ "$(qwen36_count_chunks_with_tokens "$stable_chunks" 7)" == 1 ]]
+expect_fail qwen36_count_chunks_with_tokens "$stable_chunks" not-a-number
+expect_fail qwen36_validate_stable_boundary_chunk_lines "$stable_chunks" 87964
+cache_hit_line='INFO cache hit slot=1 prompt_tokens=88040 cached_tokens=87965 suffix_tokens=75'
+[[ "$(qwen36_log_uint_field "$cache_hit_line" prompt_tokens)" == 88040 ]]
+expect_fail qwen36_log_uint_field "$cache_hit_line" missing_field
+expect_fail qwen36_log_uint_field \
+  "$cache_hit_line prompt_tokens=1" prompt_tokens
+expect_fail qwen36_log_uint_field \
+  'INFO cache hit prompt_tokens=not-a-number' prompt_tokens
+cp "$stable_chunks" "$test_dir/stable-cross-slot.log"
+sed -i '' '43s/slot=0/slot=1/' "$test_dir/stable-cross-slot.log"
+expect_fail qwen36_validate_stable_boundary_chunk_lines \
+  "$test_dir/stable-cross-slot.log" 87965
+
 head -42 "$valid_chunks" >"$test_dir/missing-tail.log"
 expect_fail qwen36_validate_chunk_lines "$test_dir/missing-tail.log"
 cp "$valid_chunks" "$test_dir/discontinuous.log"
@@ -262,6 +290,12 @@ data: [DONE]
 EOF
 qwen36_extract_and_validate_sse long "$long_sse" "$test_dir/long.jsonl"
 qwen36_validate_long_events "$test_dir/long.jsonl"
+
+jq 'if .choices[0].delta.tool_calls then
+      .choices[0].delta.tool_calls[0].function.arguments =
+        "{\"path\": \"src/serve/api/engine.rs\"}"
+    else . end' "$test_dir/long.jsonl" >"$test_dir/spaced-args.jsonl"
+qwen36_validate_long_events "$test_dir/spaced-args.jsonl"
 
 jq 'if .choices[0].delta.tool_calls then .choices[0].delta.tool_calls[0].index = 1 else . end' \
   "$test_dir/long.jsonl" >"$test_dir/second-index.jsonl"

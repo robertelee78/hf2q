@@ -27,6 +27,7 @@ pub mod multi_model;
 // Production callsite activation gated on Phase A iter-2+ per-model impls.
 #[allow(dead_code)]
 pub mod multi_seq_kv;
+pub(crate) mod operator_ui;
 // ADR-040 Phase B iter-1 scaffolding — Scheduler trait + FifoSchedulerAdapter +
 // InflightBatchedScheduler signature stub. Production activation gated on
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
@@ -4067,9 +4068,11 @@ pub(crate) fn parse_kv_cache_budget(
     }
 }
 
-pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
+pub fn cmd_serve(args: cli::ServeArgs, log_format: cli::LogFormat) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
+
+    operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
 
     // --- Resolve config ---
     let auth_token = args.auth_token.clone().or_else(|| {
@@ -4943,6 +4946,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
 
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let quiet = args.quiet;
+    let operator_ui_mode = args.operator_ui;
 
     rt.block_on(async move {
         let bind = format!("{}:{}", config.host, config.port);
@@ -4959,6 +4963,13 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             maybe_print_serve_banner(engine.info(), &mut stdout, stdout_is_tty, quiet)
                 .context("print serve load banner")?;
         }
+        let operator_identity = startup_engine_for_banner.as_ref().map(|engine| {
+            (
+                engine.info().model_id.clone(),
+                engine.info().arch_family.as_str().to_owned(),
+                engine.max_slots(),
+            )
+        });
         // ADR-017 Closure iter-10 (2026-05-05): drop the banner-only
         // Engine clone NOW. Without this, the clone (an `Arc<EngineInner>`
         // ref) lived for the entire `rt.block_on` async block — i.e. the
@@ -4973,6 +4984,18 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // afterwards.
         drop(startup_engine_for_banner);
         eprintln!("hf2q serving on http://{}", bind);
+        let _operator_ui = if let Some((model, family, max_slots)) = operator_identity {
+            operator_ui::start(
+                operator_ui_mode,
+                matches!(log_format, cli::LogFormat::Text),
+                model,
+                family,
+                format!("http://{bind}"),
+                max_slots,
+            )?
+        } else {
+            None
+        };
 
         // Iter-209: warmup ran SYNCHRONOUSLY at pre-warm time (when
         // `--model` was supplied) inside `pool.load_or_get` →

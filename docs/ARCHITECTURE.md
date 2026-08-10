@@ -318,6 +318,13 @@ publication. DeepSeek uses its native verifier transaction width instead of a
 generic token cap. Both cold work and meaningful retained-prefix suffixes are
 resumable; cached suffixes remain outside the cold-cohort policy.
 
+DeepSeek's `Mixed` step has a separate interactive budget. While a real decode
+lane is runnable, one prefill transaction is capped at two 128-token verifier
+windows and decode receives up to eight tokens before the next prefill slice.
+If all decode owners are parked or absent, the cap is removed and the proven
+2,048-token solo-prefill plan resumes. This avoids applying the latency cost of
+small transactions to bulk work that has no interactive peer.
+
 ### 4.3 Decode
 
 `serve/forward_mlx.rs` is the per-token decode hot loop. It:
@@ -461,6 +468,12 @@ every new arch paid pre-`src/arch/`. The canonical reference is
 - **Logging.** `--log-format text|json` with `--log-level
   debug|info|warn|error`. JSON logs are one object per line; safe for
   Loki / Datadog ingest.
+- **Serve dashboard.** `--operator-ui auto|dashboard|plain`. `auto` uses an
+  alternate-screen live view only for interactive text stderr. Engine events
+  enter a bounded `try_send` channel, never the inference critical path. Each
+  request exposes family-local identity, slot, phase, cache/new-token split,
+  prefill completion/rate/ETA, and decode rate without exposing prompt or tool
+  contents. Pipes, CI, services, and JSON logging retain plain output.
 - **Progress.** `indicatif` bars at convert time; suppressed when
   stderr is not a TTY.
 - **Metrics.** Prometheus exposition on `GET /metrics` covering

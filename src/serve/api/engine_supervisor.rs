@@ -326,6 +326,7 @@ impl EngineSupervisorInner {
             if let Ok(mut reason) = self.reason.lock() {
                 *reason = Some(message.clone());
             }
+            crate::serve::operator_ui::engine_unhealthy(message.clone());
             tracing::error!(
                 transaction = expired.kind,
                 epoch = expired.epoch,

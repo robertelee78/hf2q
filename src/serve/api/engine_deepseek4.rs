@@ -28,7 +28,7 @@ use crate::inference::models::deepseek4::{
     cache::{Deepseek4Cache, Deepseek4CacheSnapshot},
     decode_scratch_stats, matrix_prefill_chunk_len, prefill_scratch_stats, release_decode_scratch,
     release_prefill_scratch, tokenizer as deepseek_tokenizer, Deepseek4Model,
-    TransientScratchStats,
+    TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
 };
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
@@ -45,6 +45,23 @@ use super::engine_supervisor::EngineSupervisor;
 pub const DEFAULT_CONTEXT_LENGTH: usize = 131_072;
 const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
+
+fn resumable_matrix_prefill_chunk_len(
+    cache_position: usize,
+    remaining: usize,
+    sliding_window: usize,
+    window_multiplier: usize,
+) -> usize {
+    let mut chunk =
+        matrix_prefill_chunk_len(cache_position, remaining, sliding_window, window_multiplier);
+    if remaining > chunk {
+        let tail = remaining - chunk;
+        if tail > RECOVERY_TAIL_TOKENS && tail < MIN_MATRIX_APPEND_TOKENS {
+            chunk = chunk.saturating_sub(MIN_MATRIX_APPEND_TOKENS - tail);
+        }
+    }
+    chunk
+}
 const MAX_CHEAP_INCREMENTAL_SUFFIX_TOKENS: usize = 32;
 const MIN_MATRIX_REUSE_PREFIX_TOKENS: usize = 128;
 const GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -744,6 +761,7 @@ impl Deepseek4LoadedModel {
         plan: &mut Deepseek4ResumablePrefill,
         cancelled: &impl Fn() -> bool,
         progress: &mut RequestProgress,
+        max_matrix_prefill_windows: Option<usize>,
         supervisor: &EngineSupervisor,
     ) -> Result<Deepseek4ResumablePrefillAdvance> {
         anyhow::ensure!(
@@ -772,12 +790,18 @@ impl Deepseek4LoadedModel {
             remaining > 0,
             "DeepSeek-V4 resumable prefill made no progress"
         );
-        let batch = matrix_prefill_chunk_len(
+        let window_multiplier = max_matrix_prefill_windows
+            .map(|limit| plan.window_multiplier.min(limit))
+            .unwrap_or(plan.window_multiplier);
+        let batch = resumable_matrix_prefill_chunk_len(
             self.cache.position(),
             remaining,
             self.model.cfg.sliding_window as usize,
-            plan.window_multiplier,
+            window_multiplier,
         );
+        if let Some(window_cap) = max_matrix_prefill_windows {
+            progress.mixed_prefill_slice(if batch == 0 { remaining } else { batch }, window_cap);
+        }
         if batch == 0 {
             anyhow::ensure!(
                 remaining <= RECOVERY_TAIL_TOKENS,
@@ -785,7 +809,7 @@ impl Deepseek4LoadedModel {
                 plan.cursor,
                 remaining,
                 self.model.cfg.sliding_window,
-                plan.window_multiplier
+                window_multiplier
             );
             let start = plan.cursor;
             let mut state = None;
@@ -1216,9 +1240,9 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 mod tests {
     use super::{
         balance_fresh_three_chunk_prefill, cache_capacity_for_request, common_prefix_len,
-        deepseek4_cancellation_recovery, prefer_matrix_prefill, select_prefix_reuse,
-        should_retain_decode_scratch, Deepseek4CancellationRecovery, PrefixReuse,
-        TransientScratchStats,
+        deepseek4_cancellation_recovery, prefer_matrix_prefill, resumable_matrix_prefill_chunk_len,
+        select_prefix_reuse, should_retain_decode_scratch, Deepseek4CancellationRecovery,
+        PrefixReuse, TransientScratchStats,
     };
 
     #[test]
@@ -1228,6 +1252,14 @@ mod tests {
         assert_eq!(balance_fresh_three_chunk_prefill(0, 6_144, 128, 16), 16);
         assert_eq!(balance_fresh_three_chunk_prefill(0, 119_821, 128, 16), 16);
         assert_eq!(balance_fresh_three_chunk_prefill(1, 4_987, 128, 16), 16);
+    }
+
+    #[test]
+    fn interactive_prefill_cap_leaves_a_legal_matrix_or_recovery_tail() {
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 285, 128, 2), 252);
+        assert_eq!(285 - 252, 33);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 264, 128, 2), 256);
+        assert_eq!(264 - 256, 8);
     }
 
     #[test]

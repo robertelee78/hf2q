@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 
-use crate::inference::models::qwen35::kv_cache::{HybridKvCache, HybridKvCacheSnapshot};
+use crate::inference::models::qwen35::kv_cache::{
+    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor,
+};
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
@@ -3117,12 +3119,20 @@ pub(crate) enum Qwen35PrefillAdvance {
     Pending {
         state: Qwen35PrefillState,
         advanced_tokens: usize,
+        checkpoint: Option<Qwen35StablePromptCheckpoint>,
     },
     Ready {
         state: Qwen35DecodeState,
         prefill_logits: Vec<f32>,
         advanced_tokens: usize,
+        checkpoint: Option<Qwen35StablePromptCheckpoint>,
     },
+}
+
+pub(crate) struct Qwen35StablePromptCheckpoint {
+    pub prompt_tokens: Vec<u32>,
+    pub kv: HybridKvSlotAnchor,
+    pub prefill_logits: Vec<f32>,
 }
 
 pub(crate) struct Qwen35PrefillState {
@@ -3132,7 +3142,23 @@ pub(crate) struct Qwen35PrefillState {
     cached_tokens: usize,
     next_token_index: usize,
     cached_prefill_logits: Option<Vec<f32>>,
+    stable_prompt_prefix_tokens: Option<usize>,
     prefill_started: Instant,
+}
+
+fn qwen35_next_prefill_end(
+    cursor: usize,
+    prompt_len: usize,
+    max_chunk_tokens: usize,
+    stable_prompt_prefix_tokens: Option<usize>,
+) -> usize {
+    let mut end = cursor.saturating_add(max_chunk_tokens).min(prompt_len);
+    if let Some(boundary) = stable_prompt_prefix_tokens {
+        if cursor < boundary && boundary < end {
+            end = boundary;
+        }
+    }
+    end
 }
 
 impl Qwen35PrefillState {
@@ -3195,6 +3221,10 @@ impl Qwen35PrefillState {
             .validate_sequence_len_for_slot(slot_id, cached_tokens)
             .context("Qwen35PrefillState::begin: validate cache/ledger boundary")?;
 
+        let stable_prompt_prefix_tokens = params
+            .stable_prompt_prefix_tokens
+            .filter(|&boundary| boundary > cached_tokens && boundary < prompt_len);
+
         Ok(Self {
             slot_id,
             prompt_tokens,
@@ -3202,6 +3232,7 @@ impl Qwen35PrefillState {
             cached_tokens,
             next_token_index: cached_tokens,
             cached_prefill_logits,
+            stable_prompt_prefix_tokens,
             prefill_started: Instant::now(),
         })
     }
@@ -3214,7 +3245,7 @@ impl Qwen35PrefillState {
         max_chunk_tokens: usize,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35PrefillAdvance> {
-        let (prefill_logits, advanced_tokens) =
+        let (prefill_logits, advanced_tokens, checkpoint) =
             if let Some(logits) = self.cached_prefill_logits.take() {
                 anyhow::ensure!(
                     logits.len() == qwen.vocab_size,
@@ -3222,7 +3253,7 @@ impl Qwen35PrefillState {
                     logits.len(),
                     qwen.vocab_size
                 );
-                (logits, 0)
+                (logits, 0, None)
             } else {
                 anyhow::ensure!(
                     max_chunk_tokens > 0,
@@ -3231,10 +3262,12 @@ impl Qwen35PrefillState {
                 kv_cache
                     .validate_sequence_len_for_slot(self.slot_id, self.next_token_index)
                     .context("validate Qwen35 slot cursors before bounded prefill")?;
-                let end = self
-                    .next_token_index
-                    .saturating_add(max_chunk_tokens)
-                    .min(self.prompt_tokens.len());
+                let end = qwen35_next_prefill_end(
+                    self.next_token_index,
+                    self.prompt_tokens.len(),
+                    max_chunk_tokens,
+                    self.stable_prompt_prefix_tokens,
+                );
                 anyhow::ensure!(
                     end > self.next_token_index,
                     "Qwen35 bounded prefill has no suffix without cached logits"
@@ -3265,13 +3298,25 @@ impl Qwen35PrefillState {
                 );
                 let advanced = end - self.next_token_index;
                 self.next_token_index = end;
-                (logits, advanced)
+                let checkpoint = if self.stable_prompt_prefix_tokens == Some(end) {
+                    Some(Qwen35StablePromptCheckpoint {
+                        prompt_tokens: self.prompt_tokens[..end].to_vec(),
+                        kv: kv_cache
+                            .snapshot_slot_anchor(self.slot_id, end)
+                            .context("capture Qwen35 stable prompt boundary")?,
+                        prefill_logits: logits.clone(),
+                    })
+                } else {
+                    None
+                };
+                (logits, advanced, checkpoint)
             };
 
         if self.next_token_index < self.prompt_tokens.len() {
             return Ok(Qwen35PrefillAdvance::Pending {
                 state: self,
                 advanced_tokens,
+                checkpoint,
             });
         }
 
@@ -3290,7 +3335,20 @@ impl Qwen35PrefillState {
             state,
             prefill_logits,
             advanced_tokens,
+            checkpoint,
         })
+    }
+
+    pub(crate) fn operator_progress(&self) -> (usize, usize, f64) {
+        let completed = self.next_token_index.saturating_sub(self.cached_tokens);
+        let work = self.prompt_tokens.len().saturating_sub(self.cached_tokens);
+        let rate = completed as f64
+            / self
+                .prefill_started
+                .elapsed()
+                .as_secs_f64()
+                .max(f64::EPSILON);
+        (completed, work, rate)
     }
 }
 
@@ -3598,6 +3656,18 @@ impl Qwen35DecodeState {
             self.semantic_fragment_reported = true;
             true
         }
+    }
+
+    pub(crate) fn operator_progress(&self) -> (usize, usize, f64) {
+        let generated = self.generated_tokens.len();
+        let rate = generated as f64 / self.decode_start.elapsed().as_secs_f64().max(f64::EPSILON);
+        (generated, self.max_tokens, rate)
+    }
+
+    pub(crate) fn operator_prefill_progress(&self) -> (usize, usize, f64) {
+        let work = self.prompt_len.saturating_sub(self.cached_tokens);
+        let rate = work as f64 / self.prefill_duration.as_secs_f64().max(f64::EPSILON);
+        (work, work, rate)
     }
 
     /// Advance this slot by exactly one decode token — mirror of the serial
@@ -7265,6 +7335,20 @@ mod tests {
     };
     use mlx_native::MlxDevice;
     use std::cell::Cell;
+
+    #[test]
+    fn bounded_prefill_splits_exactly_at_the_rewriteable_prompt_boundary() {
+        assert_eq!(qwen35_next_prefill_end(0, 9_000, 4_096, Some(3_000)), 3_000);
+        assert_eq!(
+            qwen35_next_prefill_end(3_000, 9_000, 4_096, Some(3_000)),
+            7_096
+        );
+        assert_eq!(
+            qwen35_next_prefill_end(7_096, 9_000, 4_096, Some(3_000)),
+            9_000
+        );
+        assert_eq!(qwen35_next_prefill_end(0, 9_000, 4_096, None), 4_096);
+    }
 
     #[test]
     fn failed_embed_forward_never_resets_a_potentially_poisoned_slot() {

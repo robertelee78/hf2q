@@ -77,10 +77,10 @@ qwen36_extract_append_only_log_delta() {
     return 1
   }
   final_lines=$(wc -l <"$log_path" | tr -d ' ')
-  [[ "$final_lines" =~ ^[0-9]+$ ]] && (( final_lines >= baseline_lines )) || {
+  if [[ ! "$final_lines" =~ ^[0-9]+$ ]] || (( final_lines < baseline_lines )); then
     echo "server log was truncated during Qwen gate" >&2
     return 1
-  }
+  fi
   current_prefix=$(qwen36_log_prefix_sha256 "$log_path" "$baseline_lines") || return 1
   [[ "$current_prefix" == "$expected_prefix" ]] || {
     echo "server log baseline changed during Qwen gate" >&2
@@ -188,10 +188,10 @@ qwen36_capture_heap_summary() {
     echo "Qwen release gate requires /usr/bin/heap" >&2
     return 1
   }
-  [[ "$server_pid" =~ ^[0-9]+$ ]] && kill -0 "$server_pid" 2>/dev/null || {
+  if [[ ! "$server_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$server_pid" 2>/dev/null; then
     echo "cannot capture heap from non-live server PID: $server_pid" >&2
     return 1
-  }
+  fi
   heap -q "$server_pid" >"$raw_path" 2>"$raw_path.err" &
   local heap_pid=$!
   local heap_deadline=$(( $(date +%s) + 20 ))
@@ -263,11 +263,42 @@ qwen36_validate_power_event_counts() {
   }
 }
 
+qwen36_bound_caffeinate_pid() {
+  local target_pid="$1"
+  local assertions="$2"
+  local preferred_pid="${3:-}"
+  local asserted_pid asserted_command
+
+  # Multiple release receipts may be nested around one long-lived server. Bind
+  # each shell to the caffeinate process it launched instead of selecting the
+  # numerically first matching assertion and later killing another receipt's
+  # guard during cleanup.
+  if [[ "$preferred_pid" =~ ^[1-9][0-9]*$ ]]; then
+    asserted_command=$(ps -ww -p "$preferred_pid" -o command= 2>/dev/null || true)
+    if rg -q "pid ${preferred_pid}\\(caffeinate\\)" <<<"$assertions" \
+      && [[ "$asserted_command" == *caffeinate* \
+        && " $asserted_command " == *" -w $target_pid "* ]]; then
+      printf '%s\n' "$preferred_pid"
+      return 0
+    fi
+  fi
+
+  while read -r asserted_pid; do
+    [[ "$asserted_pid" =~ ^[0-9]+$ ]] || continue
+    asserted_command=$(ps -ww -p "$asserted_pid" -o command= 2>/dev/null || true)
+    if [[ "$asserted_command" == *caffeinate* \
+      && " $asserted_command " == *" -w $target_pid "* ]]; then
+      printf '%s\n' "$asserted_pid"
+      return 0
+    fi
+  done < <(sed -n 's/.*pid \([0-9][0-9]*\)(caffeinate).*/\1/p' <<<"$assertions" | sort -u)
+  return 1
+}
+
 qwen36_start_power_guard() {
   local target_pid="$1"
   local guard_log="$2"
-  local attempt
-
+  local assertions asserted_pid
   command -v caffeinate >/dev/null || {
     echo "Qwen hardware gate requires caffeinate" >&2
     return 1
@@ -276,10 +307,10 @@ qwen36_start_power_guard() {
     echo "Qwen hardware gate requires pmset" >&2
     return 1
   }
-  [[ "$target_pid" =~ ^[0-9]+$ ]] && kill -0 "$target_pid" 2>/dev/null || {
+  if [[ ! "$target_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$target_pid" 2>/dev/null; then
     echo "Qwen hardware gate power-guard target PID is not live: $target_pid" >&2
     return 1
-  }
+  fi
   pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
     echo "Qwen hardware gate requires AC power" >&2
     return 1
@@ -287,33 +318,47 @@ qwen36_start_power_guard() {
 
   QWEN36_POWER_EVENT_BASELINE=$(qwen36_power_event_count)
   caffeinate -dimsu -w "$target_pid" >"$guard_log" 2>&1 &
-  QWEN36_POWER_GUARD_PID=$!
-  for attempt in $(seq 1 50); do
-    if ! kill -0 "$QWEN36_POWER_GUARD_PID" 2>/dev/null; then
-      wait "$QWEN36_POWER_GUARD_PID" 2>/dev/null || true
-      echo "Qwen hardware gate caffeinate guard exited during startup" >&2
-      return 1
-    fi
-    if pmset -g assertions \
-      | grep -Eq "pid ${QWEN36_POWER_GUARD_PID}\\(caffeinate\\)"; then
+  QWEN36_POWER_GUARD_LAUNCH_PID=$!
+  QWEN36_POWER_GUARD_TARGET_PID=$target_pid
+  for _ in $(seq 1 50); do
+    assertions=$(pmset -g assertions)
+    asserted_pid=$(qwen36_bound_caffeinate_pid \
+      "$target_pid" "$assertions" "$QWEN36_POWER_GUARD_LAUNCH_PID" || true)
+    if [[ -n "$asserted_pid" ]]; then
+      QWEN36_POWER_GUARD_PID=$asserted_pid
+      printf '%s\n' "$assertions" >"${guard_log}.assertions"
       return 0
     fi
     sleep 0.02
   done
 
-  kill "$QWEN36_POWER_GUARD_PID" 2>/dev/null || true
-  wait "$QWEN36_POWER_GUARD_PID" 2>/dev/null || true
+  pmset -g assertions >"${guard_log}.assertions" 2>&1 || true
+  kill "$QWEN36_POWER_GUARD_LAUNCH_PID" 2>/dev/null || true
+  wait "$QWEN36_POWER_GUARD_LAUNCH_PID" 2>/dev/null || true
   QWEN36_POWER_GUARD_PID=
+  QWEN36_POWER_GUARD_LAUNCH_PID=
+  QWEN36_POWER_GUARD_TARGET_PID=
   echo "Qwen hardware gate could not verify the caffeinate assertion" >&2
   return 1
 }
 
 qwen36_assert_power_guard() {
-  [[ -n "${QWEN36_POWER_GUARD_PID:-}" ]] \
-    && kill -0 "$QWEN36_POWER_GUARD_PID" 2>/dev/null || {
-      echo "Qwen hardware gate lost its caffeinate assertion" >&2
-      return 1
-    }
+  local assertions asserted_pid
+  for _ in $(seq 1 50); do
+    assertions=$(pmset -g assertions)
+    asserted_pid=$(qwen36_bound_caffeinate_pid \
+      "${QWEN36_POWER_GUARD_TARGET_PID:-}" "$assertions" \
+      "${QWEN36_POWER_GUARD_PID:-${QWEN36_POWER_GUARD_LAUNCH_PID:-}}" || true)
+    if [[ -n "$asserted_pid" ]]; then
+      QWEN36_POWER_GUARD_PID=$asserted_pid
+      break
+    fi
+    sleep 0.02
+  done
+  [[ -n "${asserted_pid:-}" ]] || {
+    echo "Qwen hardware gate lost its bound caffeinate assertion" >&2
+    return 1
+  }
   pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
     echo "Qwen hardware gate lost AC power" >&2
     return 1
@@ -329,6 +374,12 @@ qwen36_stop_power_guard() {
     wait "$QWEN36_POWER_GUARD_PID" 2>/dev/null || true
     QWEN36_POWER_GUARD_PID=
   fi
+  if [[ -n "${QWEN36_POWER_GUARD_LAUNCH_PID:-}" ]]; then
+    kill "$QWEN36_POWER_GUARD_LAUNCH_PID" 2>/dev/null || true
+    wait "$QWEN36_POWER_GUARD_LAUNCH_PID" 2>/dev/null || true
+    QWEN36_POWER_GUARD_LAUNCH_PID=
+  fi
+  QWEN36_POWER_GUARD_TARGET_PID=
 }
 
 qwen36_bind_server_process() {
@@ -383,6 +434,103 @@ qwen36_validate_chunk_lines() {
     return 1
   }
   qwen36_validate_chunk_prefix_lines "$chunk_lines" 43
+}
+
+qwen36_validate_stable_boundary_chunk_lines() {
+  local chunk_lines="$1"
+  local stable_boundary="$2"
+  [[ "$stable_boundary" =~ ^[0-9]+$ \
+    && "$stable_boundary" -gt 86016 \
+    && "$stable_boundary" -lt 87972 ]] || {
+    echo "invalid Qwen stable prompt boundary: $stable_boundary" >&2
+    return 1
+  }
+  [[ "$(wc -l <"$chunk_lines" | tr -d ' ')" == 44 ]] || {
+    echo "expected exactly 44 stable-boundary request chunks" >&2
+    return 1
+  }
+  awk -v stable_boundary="$stable_boundary" '
+    {
+      delete field
+      delete seen
+      for (i = 1; i <= NF; i++) {
+        delete pair
+        parts = split($i, pair, "=")
+        if (pair[1] ~ /^(slot|chunk_start|chunk_end|chunk_tokens|prompt_tokens)$/) {
+          if (parts != 2 || pair[2] !~ /^[0-9]+$/ || ++seen[pair[1]] != 1) {
+            print "invalid stable-boundary field at line " NR ": " $i > "/dev/stderr"
+            exit 1
+          }
+          field[pair[1]] = pair[2] + 0
+        }
+      }
+      if (!("slot" in field) || !("chunk_start" in field) ||
+          !("chunk_end" in field) || !("chunk_tokens" in field) ||
+          !("prompt_tokens" in field)) {
+        print "missing stable-boundary field at line " NR ": " $0 > "/dev/stderr"
+        exit 1
+      }
+      if (NR == 1) expected_slot = field["slot"]
+      if (NR <= 42) {
+        expected_start = (NR - 1) * 2048
+        expected_end = expected_start + 2048
+      } else if (NR == 43) {
+        expected_start = 86016
+        expected_end = stable_boundary
+      } else {
+        expected_start = stable_boundary
+        expected_end = 87972
+      }
+      if (field["slot"] != expected_slot ||
+          field["chunk_start"] != expected_start ||
+          field["chunk_end"] != expected_end ||
+          field["chunk_tokens"] != expected_end - expected_start ||
+          field["prompt_tokens"] != 87972) {
+        print "invalid stable-boundary chunk at line " NR ": " $0 > "/dev/stderr"
+        exit 1
+      }
+    }
+    END { if (NR != 44) exit 1 }
+  ' "$chunk_lines"
+}
+
+qwen36_count_chunks_with_tokens() {
+  local chunk_lines="$1"
+  local expected_tokens="$2"
+  [[ "$expected_tokens" =~ ^[0-9]+$ ]] || return 1
+  awk -v expected_tokens="$expected_tokens" '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^chunk_tokens=[0-9]+$/) {
+          split($i, pair, "=")
+          if (pair[2] == expected_tokens) count++
+        }
+      }
+    }
+    END { print count + 0 }
+  ' "$chunk_lines"
+}
+
+qwen36_log_uint_field() {
+  local line="$1"
+  local field_name="$2"
+  [[ "$field_name" =~ ^[a-z_]+$ ]] || return 1
+  awk -v field_name="$field_name" '
+    {
+      for (i = 1; i <= NF; i++) {
+        delete pair
+        parts = split($i, pair, "=")
+        if (pair[1] == field_name) {
+          if (parts != 2 || pair[2] !~ /^[0-9]+$/ || ++seen != 1) exit 1
+          value = pair[2]
+        }
+      }
+    }
+    END {
+      if (seen != 1) exit 1
+      print value
+    }
+  ' <<<"$line"
 }
 
 qwen36_validate_chunk_prefix_lines() {
@@ -496,14 +644,15 @@ qwen36_validate_long_events() {
   local json_stream="$1"
   local tool_name tool_args finish_count
   tool_name=$(jq -cs '[.[] | .choices[0].delta.tool_calls[]?.function.name // empty] | join("")' "$json_stream")
-  tool_args=$(jq -cs '[.[] | .choices[0].delta.tool_calls[]?.function.arguments // empty] | join("")' "$json_stream")
+  tool_args=$(jq -r -s '[.[] | .choices[0].delta.tool_calls[]?.function.arguments // empty] | join("")' "$json_stream")
   finish_count=$(jq -r '.choices[0].finish_reason // empty' "$json_stream" \
     | awk '$0 == "tool_calls" { count++ } END { print count + 0 }')
   [[ "$tool_name" == '"fixture_tool_346"' ]] || {
     echo "unexpected tool name: $tool_name" >&2
     return 1
   }
-  [[ "$tool_args" == '"{\"path\":\"src/serve/api/engine.rs\"}"' ]] || {
+  jq -e 'type == "object" and keys == ["path"] and .path == "src/serve/api/engine.rs"' \
+    <<<"$tool_args" >/dev/null 2>&1 || {
     echo "unexpected tool arguments: $tool_args" >&2
     return 1
   }

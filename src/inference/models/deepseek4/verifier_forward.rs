@@ -876,6 +876,11 @@ mod prompt_chunk_tests {
         assert_eq!(matrix_prefill_chunk_len(0, 6_000, 128, 16), 2_048);
         assert_eq!(matrix_prefill_chunk_len(2_048, 3_952, 128, 16), 2_048);
         assert_eq!(matrix_prefill_chunk_len(0, 6_000, 128, 32), 4_096);
+        assert_eq!(
+            matrix_prefill_chunk_len(0, 6_000, 128, 2),
+            256,
+            "interactive mixed work caps a transaction without changing the solo plan"
+        );
     }
 
     #[test]

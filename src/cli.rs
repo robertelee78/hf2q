@@ -813,6 +813,13 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
 
+    /// Interactive operator surface for a foreground server. `auto` uses a
+    /// stable live dashboard when stderr is a terminal and preserves plain
+    /// logs for pipes, services, CI, and JSON logging. `plain` always emits
+    /// normal logs; `dashboard` requests the terminal UI explicitly.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub operator_ui: OperatorUiArg,
+
     /// ADR-005 Phase 3 item 3/4 — skip pre-load cache integrity
     /// verification of the cached GGUF on disk.
     ///
@@ -892,6 +899,13 @@ pub struct ServeArgs {
     /// `HF2Q_KV_CACHE_BUDGET_BYTES`; the CLI flag wins.
     #[arg(long = "kv-cache-budget-bytes", value_name = "BYTES")]
     pub kv_cache_budget_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OperatorUiArg {
+    Auto,
+    Dashboard,
+    Plain,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to
@@ -1058,6 +1072,21 @@ mod tests {
             panic!("expected Serve");
         };
         assert!(args.no_integrity);
+    }
+
+    #[test]
+    fn serve_operator_ui_defaults_to_auto_and_accepts_plain() {
+        let cli = Cli::parse_from(["hf2q", "serve"]);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(args.operator_ui, OperatorUiArg::Auto);
+
+        let cli = Cli::parse_from(["hf2q", "serve", "--operator-ui", "plain"]);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(args.operator_ui, OperatorUiArg::Plain);
     }
 
     #[test]

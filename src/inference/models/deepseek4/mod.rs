@@ -39,7 +39,7 @@ pub(crate) use forward_support::{
 };
 pub use model::Deepseek4Model;
 pub use residency::Deepseek4Weights;
-pub(crate) use verifier_forward::matrix_prefill_chunk_len;
+pub(crate) use verifier_forward::{matrix_prefill_chunk_len, MIN_MATRIX_APPEND_TOKENS};
 
 #[cfg(test)]
 mod attention_forward_tests;

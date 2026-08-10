@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
-| **Status** | hf2q 0.1.3 is the current public Cargo release for Apple Silicon. The serving corrections described here are the **0.1.4 release candidate**; it resolves published, checksum-pinned `mlx-native 0.10.6`, but still requires clean packed-artifact and family hardware proof before publication. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.5 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.10.6`. Public availability is authoritative only when the `v0.1.5` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
@@ -206,6 +206,15 @@ MODEL=./out/DeepSeek-V4-Flash-0731.gguf PORT=8090 \
 curl http://127.0.0.1:8080/v1/models
 ```
 
+Foreground launchers use the live operator dashboard automatically when
+stderr is an interactive terminal. Runtime work stays in place instead of
+forming a log wall: each request shows its slot and phase, cached/new prompt
+tokens, prefill percentage and ETA, and decode rate. Use
+`--operator-ui plain` for the traditional log stream, or
+`--operator-ui dashboard` to require the dashboard and fail early when the
+terminal cannot support it. Pipes, CI, services, and `--log-format json`
+remain plain and machine-readable automatically.
+
 Point the client's OpenAI-compatible base URL at the selected launcher's
 `http://127.0.0.1:<port>/v1` endpoint and select the model ID returned by
 `/v1/models` (normally the GGUF file stem). Set `MAX_SLOTS=1` for one agent or
@@ -269,12 +278,15 @@ another family or runtime.
 
 DeepSeek cold and meaningful retained-prefix suffix work advances at native
 atomic verifier boundaries. At most two cold prefills own the single scratch
-arena concurrently. In a lopsided cohort, a decode-ready lane advances one
-token before each remaining cold-prefill transaction; if it becomes terminal,
-completion stays parked until the barrier lifts so its physical cache cannot
-be reused before a tool-result continuation. Cached-suffix work is not counted
-as cold-cohort work. With no cold barrier active, staggered warm work may join
-an existing decoder whenever another physical slot is free. Cancelling a
+arena concurrently. In a lopsided cohort with a runnable decoder, mixed work
+caps the next prefill slice at two 128-token native windows and runs up to the
+normal eight-token decode quantum before the next slice. Once no runnable
+decoder remains, prefill returns to the proven 2,048-token transaction. If a
+decoder becomes terminal, completion stays parked until the barrier lifts so
+its physical cache cannot be reused before a tool-result continuation.
+Cached-suffix work is not counted as cold-cohort work. With no cold barrier
+active, staggered warm work may join an existing decoder whenever another
+physical slot is free. Cancelling a
 cached suffix rolls back to a valid, position-consistent pre-request turn
 anchor; poisoned or inconsistent state still resets fully.
 
@@ -293,19 +305,23 @@ gates from a clean hf2q package resolving published `mlx-native 0.10.6`:
 
 - `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
   552-token SSE lane immediately before the public 87,972-token/347-tool lane,
-  requires decode-first progress and the exact 43-chunk plan, and validates the
-  complete tool/SSE response.
+  requires decode-first progress, and validates the exact 44-transaction
+  stable-boundary plan plus the complete tool/SSE response.
 - `scripts/test_qwen36_prefill_cancellation.sh` runs with `MAX_SLOTS=1`, drops
   the long stream at a transaction boundary, and proves exact slot reuse.
 - `scripts/test_qwen36_watchdog_harness_contract.sh` is the model-free negative
   test for the receipt parser.
+- `scripts/test_deepseek4_interactive_overlap.sh` pairs a short decoder with
+  the public 347-tool cold prompt, requires an eight-token interactive quantum
+  before a legacy 2,048-token turn can monopolize the worker, and validates
+  the complete long tool/SSE result under an uninterrupted AC-power window.
 
 The governing decisions and the old-failure-versus-final-artifact distinction
 are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.4 serving candidate
+#### Test the 0.1.5 serving release
 
 Build and verify the exact checkout before loading a model:
 
@@ -537,6 +553,8 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.
 - `docs/operating-kv-cache.md` — TurboQuant KV cache operator guide.
 - `docs/operator-env-vars.md` — every `HF2Q_*` env var, what it gates.
+- `docs/ADR-043-foreground-serve-dashboard.md` — live foreground serve UX,
+  nonblocking telemetry, privacy, and terminal acceptance contract.
 - `docs/shipping-contract.md` — default, supported, experimental, and
   investigation-only product surfaces.
 - `docs/ADR-019-mlx-native-encoder-architecture.md` — Metal encoder ownership

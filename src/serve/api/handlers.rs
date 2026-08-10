@@ -1311,15 +1311,17 @@ where
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
-    // Gemma's native template appends a generation cue whose tokens are
-    // rewritten by the next tool-result turn. A checkpoint taken after that
-    // cue cannot safely be rewound once the sliding ring has advanced. Render
-    // the same request without the cue and accept the boundary only when it is
-    // a strict token prefix of the actual prompt. Overflow rewrites that used
-    // a different message list fail this check and therefore stay cold.
-    let stable_prompt_prefix_tokens = if engine.info().arch_family
-        == crate::serve::load_info::ArchFamily::Gemma4
-        && vision_embeddings.is_empty()
+    // Gemma and Qwen native templates append a generation cue whose tokens
+    // can be rewritten by the next tool-result turn (notably when a client
+    // restores reasoning_content). A checkpoint taken after that cue may no
+    // longer be a prefix of the continuation. Render the same request without
+    // the cue and accept the boundary only when it is a strict token prefix of
+    // the actual prompt. Overflow rewrites that used a different message list
+    // fail this check and therefore stay cold.
+    let stable_prompt_prefix_tokens = if matches!(
+        engine.info().arch_family,
+        crate::serve::load_info::ArchFamily::Gemma4 | crate::serve::load_info::ArchFamily::Qwen35
+    ) && vision_embeddings.is_empty()
     {
         let stable = render_chat_prompt_or_400_with_generation_prompt(
             engine.chat_template(),

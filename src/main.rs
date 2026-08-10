@@ -120,7 +120,7 @@ fn main() -> ExitCode {
         cli::LogFormat::Text => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
-                .with_writer(std::io::stderr)
+                .with_writer(serve::operator_ui::LogMakeWriter)
                 .with_ansi(stderr_is_tty)
                 .without_time()
                 .init();
@@ -148,13 +148,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {
+    let log_format = cli.log_format;
     match cli.command {
         Command::GgufPatch(args) => cmd_gguf_patch(args),
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
-        Command::Serve(args) => serve::cmd_serve(args).map_err(AppError::Conversion),
+        Command::Serve(args) => serve::cmd_serve(args, log_format).map_err(AppError::Conversion),
         Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
         Command::Smoke(args) => cmd_smoke(args),
         // ADR-005 Phase 3 iter-205 (AC line 5351): operator-facing

@@ -910,3 +910,62 @@ The proven Qwen3.6 autoregressive graph is now the default serving and CLI
 route; `HF2Q_QWEN36_AUTOREG` is retired from the investigation surface and the
 canonical launcher no longer sets it. This graduation does not promote the
 separate unsafe chunk-scan kernel.
+
+## Prompt-boundary continuation affinity correction (2026-08-09)
+
+A released-0.1.4 OpenCode session completed a 99,007-token/347-tool prompt,
+captured its prompt-boundary checkpoint, and then submitted the 99,029-token
+tool-result turn. The worker nevertheless selected a fresh slot and began a
+second cold prefill at token zero. The selector considered the generated live
+tail, which need not byte-prefix the client's next native tool-call rendering,
+and used the checkpoint only for an exactly equal retry. That made a valid
+99,007-token native checkpoint invisible to the normal continuation it exists
+to accelerate.
+
+The handler now identifies the stable native transcript boundary before the
+rewriteable generation cue for Qwen as well as Gemma. Bounded prefill splits
+exactly there and captures the recurrent/conv state plus the full-attention
+cursor before finishing the cue. Affinity accepts both exact retries and
+strict continuations whose rendered tokens start with that saved stable
+boundary. The longest valid live prefix still wins. Otherwise the worker
+restores the stable-boundary KV, credits that verified cursor once, and
+evaluates only the changed cue/assistant/tool-result suffix. An exact boundary
+hit may reuse its saved logits; a continuation obtains new logits from its
+real suffix. Active slots remain ineligible, and every
+restore/snapshot/forward/cursor failure retains the existing reset or
+fail-stop rules.
+
+The production-shaped selector regression pins a saved 99,007-token prefix and
+a 22-token suffix when the generated live tail diverges; a second pure test
+pins an exact transaction split at the stable boundary. A fresh AC-powered
+real-model gate then rendered the public 347-tool prompt at 87,972 tokens,
+committed 42 full 2,048-token transactions plus a 1,949-token stable-boundary
+tail and seven-token generation cue, and completed the exact tool call. Its
+88,040-token rewritten tool-result continuation restored 87,965 cached tokens,
+ran only 68 + 7 new tokens, completed in 1.512 seconds, and preserved exact
+tool arguments, final `OK`, readiness 200, and zero power events. The final
+0.1.5 source-candidate binary SHA-256 was
+`cd8867820898eb33beb5523894084ed5af5a8cdbba92c4aaa8ca4bbb48150784`;
+the model SHA-256 was
+`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`.
+The cold request completed in 102.793 seconds and the atomic gate summary
+SHA-256 was
+`220b7b27dff84e060bcd5677ef89bb922cc17c0560e3caa21794c7a1f76fdc07`.
+Immutable-release authority still binds the same gate to the final committed
+and packed artifact rather than promoting this working-tree receipt by
+assertion.
+
+The same candidate then passed the stronger continuously powered cumulative
+gate: a fresh incident overlap, one four-agent warmup wave, two measured
+four-agent waves, and a final tiny control in one `MAX_SLOTS=4` process.
+CFString deltas were +91, +2, 0, and 0 across the five heap checkpoints;
+autorelease-pool content deltas were +2, +1, 0, and 0; exact command-buffer and
+implementation populations were zero at every checkpoint. The cumulative
+summary SHA-256 was
+`d72a94844a5f689a32acdba79f22a368fe671a5abdecc6dc6428171088e41336`.
+A separate fresh `MAX_SLOTS=1` gate disconnected after exactly three commits,
+allowed one already-submitted fourth commit, incremented the cancellation
+counter exactly once, emitted no successful terminal response, and reused the
+same slot for exact `OK` in 0.388 seconds. Its summary SHA-256 was
+`205166d91a28ff49ab7237a8ca59f6def6eeb5e1a63847645df55216c4222d9b`.
+Both receipts retained readiness 200 and recorded zero power events.

@@ -2,8 +2,9 @@
 # Reproduce the exact public equivalent of the Qwen 3.6 incident: enqueue a
 # 552-token SSE request, then enqueue the 87,972-token/347-tool SSE request
 # before the short lane emits semantic content. The bounded driver must decode
-# the short lane before every long-prefill transaction and complete the long
-# prompt as exactly 42 * 2,048 + 1,956 tokens.
+# the short lane before every long-prefill transaction. The long prompt has
+# 42 full 2,048-token transactions, then splits once at the stable native
+# transcript boundary before processing the rewriteable generation cue.
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:18081}"
@@ -28,12 +29,13 @@ TOOLS_SHA256="586e09658c8d4d69b1ad451c8218199e405eeb72de4e550741730e83ed653766"
 TEMPLATE_SHA256="e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
 LONG_PATTERN='Qwen35 bounded prefill chunk complete.*prompt_tokens=87972'
 LONG_RECEIVED_PATTERN='chat completion request received.*messages=2 tools=347'
+CONTINUATION_RECEIVED_PATTERN='chat completion request received.*messages=4 tools=347'
 SHORT_SUBMIT_PATTERN='streaming request submitted to inference channel.*prompt_tokens=552'
 LONG_SUBMIT_PATTERN='streaming request submitted to inference channel.*prompt_tokens=87972'
 SHORT_SEMANTIC_PATTERN='Qwen35 semantic fragment ready.*prompt_tokens=552'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=qwen36_watchdog_validate.sh
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
 for command in curl jq rg sed awk date shasum sample wc ps cut lsof sort seq caffeinate pmset stat find; do
@@ -75,7 +77,7 @@ qwen36_bind_server_process "$BASE_URL" "$SERVER_PID" "$BINARY_PATH" \
   "$FIXTURE_MODEL" "$MAX_SLOTS"
 
 cleanup() {
-  for pid in "${short_pid:-}" "${long_pid:-}"; do
+  for pid in "${short_pid:-}" "${long_pid:-}" "${continuation_pid:-}"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
   done
   qwen36_stop_power_guard
@@ -158,6 +160,8 @@ short_metrics="$OUT_DIR/short-curl.metrics"
 short_sse="$OUT_DIR/short-response.sse"
 long_metrics="$OUT_DIR/long-curl.metrics"
 long_sse="$OUT_DIR/long-response.sse"
+continuation_metrics="$OUT_DIR/continuation-curl.metrics"
+continuation_sse="$OUT_DIR/continuation-response.sse"
 
 # Give the expensive long request's render/tokenize phase a head start, then
 # let the small request reach the worker first. The load-bearing order is
@@ -309,13 +313,34 @@ first_long_chunk_line=$(rg -n -m1 "$LONG_PATTERN" "$new_log" | cut -d: -f1)
   exit 1
 }
 
-chunk_lines="$OUT_DIR/long-chunks.log"
-rg "$LONG_PATTERN" "$SERVER_LOG" | sed -n "$((baseline_chunks + 1)),\$p" >"$chunk_lines"
-[[ "$(wc -l <"$chunk_lines" | tr -d ' ')" == 43 ]] || {
-  echo "expected exactly 43 request-scoped long chunks" >&2
+stable_anchor_line=$(rg -m1 'Qwen35 slot-local stable prompt boundary captured.*prompt_tokens=[0-9]{5}' \
+  "$new_log" || true)
+long_anchor_tokens=$(sed -n 's/.*prompt_tokens=\([0-9][0-9]*\).*/\1/p' \
+  <<<"$stable_anchor_line")
+[[ "$long_anchor_tokens" =~ ^[0-9]+$ ]] || {
+  echo "long request did not publish a stable pre-generation prompt boundary" >&2
   exit 1
 }
-qwen36_validate_chunk_lines "$chunk_lines"
+(( long_anchor_tokens > 80000 && long_anchor_tokens < 87972 )) || {
+  echo "unexpected long stable boundary: $long_anchor_tokens" >&2
+  exit 1
+}
+
+chunk_lines="$OUT_DIR/long-chunks.log"
+rg "$LONG_PATTERN" "$SERVER_LOG" | sed -n "$((baseline_chunks + 1)),\$p" >"$chunk_lines"
+chunk_count=$(wc -l <"$chunk_lines" | tr -d ' ')
+[[ "$chunk_count" == 44 ]] || {
+  echo "expected exactly 44 request-scoped long chunks including the stable-boundary split" >&2
+  exit 1
+}
+qwen36_validate_stable_boundary_chunk_lines "$chunk_lines" "$long_anchor_tokens"
+full_chunk_count=$(qwen36_count_chunks_with_tokens "$chunk_lines" 2048)
+stable_tail_tokens=$((long_anchor_tokens - 86016))
+generation_cue_tokens=$((87972 - long_anchor_tokens))
+[[ "$full_chunk_count" == 42 && "$stable_tail_tokens" -gt 0 && "$generation_cue_tokens" -gt 0 ]] || {
+  echo "unexpected Qwen stable-boundary transaction plan" >&2
+  exit 1
+}
 
 qwen36_extract_and_validate_sse short "$short_sse" "$OUT_DIR/short-events.jsonl"
 qwen36_extract_and_validate_sse long "$long_sse" "$OUT_DIR/long-events.jsonl"
@@ -333,12 +358,100 @@ tool_name=$(jq -j '.choices[0].delta.tool_calls[]?.function.name // empty' "$OUT
 tool_args=$(jq -j '.choices[0].delta.tool_calls[]?.function.arguments // empty' "$OUT_DIR/long-events.jsonl")
 finish_count=$(jq -r '.choices[0].finish_reason // empty' "$OUT_DIR/long-events.jsonl" | awk '$0 == "tool_calls" { count++ } END { print count + 0 }')
 [[ "$tool_name" == fixture_tool_346 ]] || { echo "unexpected tool name: $tool_name" >&2; exit 1; }
-[[ "$tool_args" == '{"path":"src/serve/api/engine.rs"}' ]] || {
+jq -e 'type == "object" and keys == ["path"] and .path == "src/serve/api/engine.rs"' \
+  <<<"$tool_args" >/dev/null 2>&1 || {
   echo "unexpected tool arguments: $tool_args" >&2
   exit 1
 }
 [[ "$finish_count" == 1 ]] || { echo "expected one tool_calls finish, observed $finish_count" >&2; exit 1; }
 qwen36_validate_long_events "$OUT_DIR/long-events.jsonl"
+
+# Reproduce the user-visible cache failure, not merely an exact replay. The
+# next native turn includes the assistant tool call and its tool result, so
+# the rendered prompt extends the saved prompt boundary but can diverge from
+# the generated live tail. It must restore that boundary and prefill only the
+# suffix; restarting at token zero is a hard failure.
+tool_id=$(jq -rs '[.[] | .choices[0].delta.tool_calls[]?.id? | select(type == "string" and length > 0)] | unique | .[0]' \
+  "$OUT_DIR/long-events.jsonl")
+[[ -n "$tool_id" && "$tool_id" != null ]] || {
+  echo "long response did not expose one tool-call id for continuation" >&2
+  exit 1
+}
+continuation_request="$OUT_DIR/continuation-request.json"
+# Restore a client-owned reasoning field and re-serialize the same semantic
+# arguments with ordinary JSON whitespace. Native clients can preserve fields
+# that were not part of the model's visible tool-call delta; this deliberately
+# invalidates the byte-exact generated live tail while leaving the saved
+# prompt boundary as a valid native-template prefix.
+continuation_input_args='{"path": "src/serve/api/engine.rs"}'
+jq --arg tool_id "$tool_id" --arg tool_name "$tool_name" --arg tool_args "$continuation_input_args" '
+  .messages += [
+    {role: "assistant", content: null, reasoning_content: "Client-restored reasoning trace.", tool_calls: [{
+      id: $tool_id,
+      type: "function",
+      function: {name: $tool_name, arguments: $tool_args}
+    }]},
+    {role: "tool", tool_call_id: $tool_id, content: "Deterministic fixture result: source inspection succeeded."}
+  ]
+  | .max_tokens = 64
+  | .stream_options = {include_usage: true}
+' "$long_request" >"$continuation_request"
+[[ "$(jq '.messages | length' "$continuation_request")" == 4 ]] || exit 2
+[[ "$(jq '.tools | length' "$continuation_request")" == 347 ]] || exit 2
+
+continuation_log_start=$(wc -l <"$SERVER_LOG" | tr -d ' ')
+curl --fail-with-body --silent --show-error --no-buffer \
+  --connect-timeout 5 --max-time 120 \
+  -H 'Content-Type: application/json' --data-binary "@$continuation_request" \
+  -o "$continuation_sse" \
+  -w 'http_code=%{http_code}\ntotal_seconds=%{time_total}\n' \
+  "$BASE_URL/v1/chat/completions" >"$continuation_metrics" \
+  2>"$OUT_DIR/continuation-curl.err"
+grep -qx 'http_code=200' "$continuation_metrics"
+qwen36_extract_and_validate_sse continuation "$continuation_sse" \
+  "$OUT_DIR/continuation-events.jsonl"
+qwen36_validate_long_events "$OUT_DIR/continuation-events.jsonl"
+
+continuation_delta="$OUT_DIR/continuation-server.log"
+sed -n "$((continuation_log_start + 1)),\$p" "$SERVER_LOG" >"$continuation_delta"
+qwen36_reject_fatal_log "$continuation_delta"
+continuation_shape_count=$(rg -c "$CONTINUATION_RECEIVED_PATTERN" "$continuation_delta" || true)
+[[ "$continuation_shape_count" == 1 ]] || {
+  echo "expected exactly one 4-message/347-tool continuation, observed $continuation_shape_count" >&2
+  exit 1
+}
+cache_hit_line=$(rg -m1 "Qwen35 slot-local prompt-boundary cache hit.*cached_tokens=${long_anchor_tokens}( |$)" \
+  "$continuation_delta" || true)
+[[ -n "$cache_hit_line" ]] || {
+  echo "tool-result continuation did not restore the ${long_anchor_tokens}-token stable prompt boundary" >&2
+  exit 1
+}
+continuation_prompt_tokens=$(qwen36_log_uint_field "$cache_hit_line" prompt_tokens || true)
+[[ "$continuation_prompt_tokens" =~ ^[0-9]+$ ]] || {
+  echo "could not parse continuation prompt size from cache-hit telemetry" >&2
+  exit 1
+}
+(( continuation_prompt_tokens > long_anchor_tokens )) || {
+  echo "continuation did not extend the saved prompt boundary" >&2
+  exit 1
+}
+continuation_chunks="$OUT_DIR/continuation-chunks.log"
+rg "Qwen35 bounded prefill chunk complete.*prompt_tokens=${continuation_prompt_tokens}( |$)" \
+  "$continuation_delta" >"$continuation_chunks"
+[[ -s "$continuation_chunks" ]] || {
+  echo "continuation emitted no suffix-prefill transaction telemetry" >&2
+  exit 1
+}
+if rg 'chunk_start=0( |$)' "$continuation_chunks" >/dev/null; then
+  echo "tool-result continuation restarted cold at token zero" >&2
+  exit 1
+fi
+continuation_first_chunk_start=$(sed -n '1s/.*chunk_start=\([0-9][0-9]*\).*/\1/p' \
+  "$continuation_chunks")
+[[ "$continuation_first_chunk_start" == "$long_anchor_tokens" ]] || {
+  echo "continuation suffix began at $continuation_first_chunk_start, expected $long_anchor_tokens" >&2
+  exit 1
+}
 
 # Prove the worker remains ready and the same four-slot process can serve a
 # fresh exact control after the cumulative long-prefill transaction stream.
@@ -373,8 +486,9 @@ qwen36_extract_append_only_log_delta "$SERVER_LOG" \
   "$OUT_DIR/server-log-baseline.json" "$new_log"
 final_short_shape_count=$(rg -c 'chat completion request received.*messages=3 tools=0' "$new_log" || true)
 final_long_shape_count=$(rg -c 'chat completion request received.*messages=2 tools=347' "$new_log" || true)
-[[ "$final_short_shape_count" == 2 && "$final_long_shape_count" == 1 ]] || {
-  echo "unexpected final request topology: short=$final_short_shape_count long=$final_long_shape_count" >&2
+final_continuation_shape_count=$(rg -c "$CONTINUATION_RECEIVED_PATTERN" "$new_log" || true)
+[[ "$final_short_shape_count" == 2 && "$final_long_shape_count" == 1 && "$final_continuation_shape_count" == 1 ]] || {
+  echo "unexpected final request topology: short=$final_short_shape_count long=$final_long_shape_count continuation=$final_continuation_shape_count" >&2
   exit 1
 }
 qwen36_reject_fatal_log "$new_log"
@@ -382,6 +496,7 @@ qwen36_reject_fatal_log "$new_log"
 short_sse_sha256=$(sha256_file "$short_sse")
 long_sse_sha256=$(sha256_file "$long_sse")
 post_sse_sha256=$(sha256_file "$OUT_DIR/post-response.sse")
+continuation_sse_sha256=$(sha256_file "$continuation_sse")
 server_log_delta_sha256=$(sha256_file "$new_log")
 chunk_log_sha256=$(sha256_file "$chunk_lines")
 
@@ -400,6 +515,7 @@ jq -n \
   --arg short_sse_sha256 "$short_sse_sha256" \
   --arg long_sse_sha256 "$long_sse_sha256" \
   --arg post_sse_sha256 "$post_sse_sha256" \
+  --arg continuation_sse_sha256 "$continuation_sse_sha256" \
   --arg server_log_delta_sha256 "$server_log_delta_sha256" \
   --arg chunk_log_sha256 "$chunk_log_sha256" \
   --argjson server_pid "${SERVER_PID:-0}" \
@@ -418,23 +534,30 @@ jq -n \
   --argjson long_shape_count "$long_shape_count" \
   --argjson final_short_shape_count "$final_short_shape_count" \
   --argjson final_long_shape_count "$final_long_shape_count" \
+  --argjson continuation_shape_count "$continuation_shape_count" \
+  --argjson final_continuation_shape_count "$final_continuation_shape_count" \
+  --argjson continuation_prompt_tokens "$continuation_prompt_tokens" \
+  --argjson continuation_cached_tokens "$long_anchor_tokens" \
+  --argjson continuation_first_chunk_start "$continuation_first_chunk_start" \
   --argjson ready_http "$ready_code" \
   --argjson power_event_baseline "$QWEN36_POWER_EVENT_BASELINE" \
   --argjson power_event_final "$QWEN36_POWER_EVENT_FINAL" \
   --argjson power_event_delta "$((QWEN36_POWER_EVENT_FINAL - QWEN36_POWER_EVENT_BASELINE))" \
   --arg post_content "$post_content" \
   --argjson tools 347 \
-  --argjson chunks 43 \
-  --argjson full_chunks 42 \
-  --argjson tail_tokens 1956 \
+  --argjson chunks "$chunk_count" \
+  --argjson full_chunks "$full_chunk_count" \
+  --argjson stable_tail_tokens "$stable_tail_tokens" \
+  --argjson generation_cue_tokens "$generation_cue_tokens" \
   --arg tool_name "$tool_name" \
   --arg tool_args "$tool_args" \
   --argjson short_total_seconds "$(awk -F= '$1 == "total_seconds" { print $2 }' "$short_metrics")" \
   --argjson long_total_seconds "$(awk -F= '$1 == "total_seconds" { print $2 }' "$long_metrics")" \
   --argjson post_total_seconds "$(awk -F= '$1 == "total_seconds" { print $2 }' "$OUT_DIR/post-curl.metrics")" \
-  '{status:$status,out_dir:$out_dir,binary_path:$binary_path,binary_sha256:$binary_sha256,model_sha256:$model_sha256,server_pid:$server_pid,max_slots:$max_slots,long_render_headstart_seconds:$long_render_headstart_seconds,baseline_log_lines:$baseline_log_lines,long_fixture_sha256:$long_fixture_sha256,long_runtime_sha256:$long_runtime_sha256,short_fixture_sha256:$short_fixture_sha256,tools_sha256:$tools_sha256,template_sha256:$template_sha256,short_sse_sha256:$short_sse_sha256,long_sse_sha256:$long_sse_sha256,post_sse_sha256:$post_sse_sha256,server_log_delta_sha256:$server_log_delta_sha256,chunk_log_sha256:$chunk_log_sha256,short_prompt_tokens:$short_prompt_tokens,prompt_tokens:$prompt_tokens,short_shape_count:$short_shape_count,long_shape_count:$long_shape_count,final_short_shape_count:$final_short_shape_count,final_long_shape_count:$final_long_shape_count,tools:$tools,chunks:$chunks,full_chunks:$full_chunks,tail_tokens:$tail_tokens,short_semantic_before_long_chunk:$short_semantic_before_long_chunk,short_submit_line:$short_submit_line,long_submit_line:$long_submit_line,short_semantic_line:$short_semantic_line,first_long_chunk_line:$first_long_chunk_line,short_content:$short_content,post_content:$post_content,ready_http:$ready_http,power_event_baseline:$power_event_baseline,power_event_final:$power_event_final,power_event_delta:$power_event_delta,tool_name:$tool_name,tool_args:$tool_args,short_total_seconds:$short_total_seconds,long_total_seconds:$long_total_seconds,post_total_seconds:$post_total_seconds}' \
+  --argjson continuation_total_seconds "$(awk -F= '$1 == "total_seconds" { print $2 }' "$continuation_metrics")" \
+  '{status:$status,out_dir:$out_dir,binary_path:$binary_path,binary_sha256:$binary_sha256,model_sha256:$model_sha256,server_pid:$server_pid,max_slots:$max_slots,long_render_headstart_seconds:$long_render_headstart_seconds,baseline_log_lines:$baseline_log_lines,long_fixture_sha256:$long_fixture_sha256,long_runtime_sha256:$long_runtime_sha256,short_fixture_sha256:$short_fixture_sha256,tools_sha256:$tools_sha256,template_sha256:$template_sha256,short_sse_sha256:$short_sse_sha256,long_sse_sha256:$long_sse_sha256,continuation_sse_sha256:$continuation_sse_sha256,post_sse_sha256:$post_sse_sha256,server_log_delta_sha256:$server_log_delta_sha256,chunk_log_sha256:$chunk_log_sha256,short_prompt_tokens:$short_prompt_tokens,prompt_tokens:$prompt_tokens,short_shape_count:$short_shape_count,long_shape_count:$long_shape_count,continuation_shape_count:$continuation_shape_count,final_short_shape_count:$final_short_shape_count,final_long_shape_count:$final_long_shape_count,final_continuation_shape_count:$final_continuation_shape_count,tools:$tools,chunks:$chunks,full_chunks:$full_chunks,stable_tail_tokens:$stable_tail_tokens,generation_cue_tokens:$generation_cue_tokens,short_semantic_before_long_chunk:$short_semantic_before_long_chunk,short_submit_line:$short_submit_line,long_submit_line:$long_submit_line,short_semantic_line:$short_semantic_line,first_long_chunk_line:$first_long_chunk_line,continuation_prompt_tokens:$continuation_prompt_tokens,continuation_cached_tokens:$continuation_cached_tokens,continuation_first_chunk_start:$continuation_first_chunk_start,short_content:$short_content,post_content:$post_content,ready_http:$ready_http,power_event_baseline:$power_event_baseline,power_event_final:$power_event_final,power_event_delta:$power_event_delta,tool_name:$tool_name,tool_args:$tool_args,short_total_seconds:$short_total_seconds,long_total_seconds:$long_total_seconds,continuation_total_seconds:$continuation_total_seconds,post_total_seconds:$post_total_seconds}' \
   >"$summary.tmp"
-jq -e '.status == "pass" and .max_slots == 4 and .short_semantic_before_long_chunk and .chunks == 43 and .short_shape_count == 1 and .long_shape_count == 1 and .final_short_shape_count == 2 and .final_long_shape_count == 1 and .post_content == "OK" and .ready_http == 200 and .power_event_delta == 0' "$summary.tmp" >/dev/null
+jq -e '.status == "pass" and .max_slots == 4 and .short_semantic_before_long_chunk and .chunks == 44 and .full_chunks == 42 and .stable_tail_tokens > 0 and .generation_cue_tokens > 0 and (.full_chunks * 2048 + .stable_tail_tokens + .generation_cue_tokens) == .prompt_tokens and .short_shape_count == 1 and .long_shape_count == 1 and .continuation_shape_count == 1 and .final_short_shape_count == 2 and .final_long_shape_count == 1 and .final_continuation_shape_count == 1 and .continuation_prompt_tokens > .continuation_cached_tokens and .continuation_cached_tokens > 80000 and .continuation_cached_tokens < .prompt_tokens and .continuation_first_chunk_start == .continuation_cached_tokens and .post_content == "OK" and .ready_http == 200 and .power_event_delta == 0' "$summary.tmp" >/dev/null
 mv "$summary.tmp" "$summary"
 shasum -a 256 "$summary" >"$summary.sha256"
 shasum -c "$summary.sha256" >/dev/null

@@ -2,10 +2,10 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-09 — a focused cached-suffix overlap and cancellation
-  gate proved that staggered warm work can join a decoding peer, yields between
-  native verifier transactions, and restores the valid pre-request turn anchor
-  after client cancellation
+- **Updated:** 2026-08-09 — the cached-suffix/cancellation gate remains valid,
+  but an OpenCode-scale 107,045-token cold overlap falsified the one-token
+  mixed-progress policy as interactive UX; the bounded mixed-work replacement
+  below is a release candidate pending exact-artifact hardware proof
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1016,14 +1016,56 @@ The accepted scheduling policy uses an eight-token decode quantum and
 resumable cold prefill at atomic cache+ledger commit boundaries. At most two
 active cold prefills alternate complete matrix transactions through the one
 shared prefill scratch arena. The next-release fairness correction advances a
-decode-ready member by one token before each remaining transaction and parks
-only its terminal completion until the cohort drains. This prevents early
+decode-ready member between remaining transactions and parks only its terminal
+completion until the cohort drains. This prevents early
 responses from producing cached traffic that delays the remaining cold agents
 while bounding the short lane's semantic gaps. Once the cohort drains,
 longest-prefix continuations run before unrelated cold work can evict a
 retained agent cache. A paired long-row graph exceeded Metal memory, and a
 batched-output-head-only spike did not improve the cold tail; neither failed
 experiment is present in the landing code.
+
+### Interactive mixed-work correction (2026-08-09 measured candidate)
+
+A real foreground OpenCode run on released 0.1.4 admitted a 523-token decoder
+beside a 107,045-token/347-tool cold prefill. The long lane committed 2,048
+tokens every 6.27–6.98 seconds. The short lane advanced exactly one token after
+each commit and its reported decode rate fell from 0.313 to 0.181 tok/s. This
+falsifies the weaker assumption that any bounded semantic progress is usable
+interactive progress: the scheduler was live, but the experience was not.
+
+The replacement preserves the proven bulk-prefill plan and changes only a
+genuinely mixed quantum:
+
+- while at least one `Decode` owner is runnable, cap the next matrix prefill
+  transaction at two native 128-token windows and run the configured decode
+  quantum, clamped to at most eight tokens;
+- when every decode owner is absent or `ParkedCompletion`, remove the mixed
+  cap and resume the plan's normal 16-window/2,048-token transaction;
+- rebalance a capped slice that would leave an illegal 9–32-token matrix tail,
+  leaving either at least 33 matrix tokens or at most the eight-token recovery
+  tail;
+- retain terminal parking and the cold-cohort cache barrier unchanged.
+
+The exact release-candidate hardware gate passed on AC power with binary
+SHA-256 `cd8867820898eb33beb5523894084ed5af5a8cdbba92c4aaa8ca4bbb48150784`,
+model SHA-256
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
+and public 347-tool fixture SHA-256
+`6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d`.
+The cold prompt rendered to 94,576 tokens. Its first genuinely mixed prefill
+transaction was 256 tokens/two native windows, while the short lane generated
+49 tokens in that first reporting window at about 9.16 tok/s and completed its
+128-token response before the cold prefill ended. The long lane completed at
+303.29 prompt tok/s, emitted the exact `fixture_tool_346` call with semantic
+arguments `{ "path": "src/serve/api/engine.rs" }`, and left `/readyz` at 200.
+The power-log delta was zero. The atomic summary SHA-256 is
+`6f93283e07f65952bbd314cc01b791e439875ed0ca7a8a72b4553378ae9c177c`.
+
+This receipt proves the user-visible overlap correction on the exact candidate
+binary. The original 2,048-token plan remains selected whenever no Decode
+owner is runnable, as pinned by the pure scheduler tests; public release
+authority still requires the immutable packed artifact and exact-main CI.
 
 The slot-aware long-cache falsifier first exposed an affinity defect: a
 tool-result continuation matched the native recovery anchor but not the raw

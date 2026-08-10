@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-09
+
+### Added — foreground serving dashboard
+
+- Add a TTY-only live operator dashboard for foreground `hf2q serve` runs.
+  It keeps one stable row per active request with slot, phase, cached versus
+  new prompt tokens, prefill percentage/rate/ETA, and decode rate instead of
+  printing one log line per transaction. `--operator-ui auto` is the default;
+  `plain` preserves the traditional stream and `dashboard` fails early when
+  stderr is not interactive or JSON logging is selected. Inference publishes
+  through a bounded nonblocking channel, so terminal rendering cannot delay
+  GPU or scheduler work.
+
 ### Fixed — bounded multi-agent prefill and Metal command-buffer lifetime
 
 - Advance Qwen 3.5/3.6 slot-aware prefill in bounded, scheduler-yielding
@@ -51,10 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache, scheduler, and reply ownership. Long soft-token requests remain
   fail-closed until their own resumable path is proven.
 - Route meaningful DeepSeek retained-prefix suffixes through the existing
-  atomic resumable-prefill machinery. During a lopsided cold cohort, one
-  decode token runs before each remaining prefill transaction; a terminal
-  response stays parked until the cold-prefill barrier lifts, preserving the
-  retained cache for its continuation. Cancellation and ordinary failure now
+  atomic resumable-prefill machinery. During a lopsided cold cohort, an
+  interactive mixed-work budget runs up to eight decode tokens between
+  prefill slices capped at two native windows; when no runnable decoder
+  remains, the proven full 2,048-token prefill transaction is restored. A
+  terminal response stays parked until the cold-prefill barrier lifts,
+  preserving the retained cache for its continuation. Cancellation and ordinary failure now
   reconcile the cohort back to an admissible phase instead of stranding an
   idle worker. Staggered warm continuations can join an existing decoder while
   another physical slot is free, and cancellation restores a valid,
@@ -63,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transactions with peer decode progress between them, exact middle-transaction
   cancellation accounting, no terminal Done after disconnect, retained-prefix
   reuse after rollback, readiness, and a clean fatal-log delta.
+- Capture Qwen's stable native transcript boundary before the rewriteable
+  generation cue and reuse it for normal continuations even when the generated
+  live tail does not prefix-match the client's restored reasoning/tool history.
+  Continuations restore that verified KV and prefill only the changed tail.
 
 ## [0.1.3] — 2026-08-08
 
