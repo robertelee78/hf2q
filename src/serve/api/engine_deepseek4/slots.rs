@@ -139,6 +139,7 @@ impl Deepseek4PrefillState {
         loaded: &mut Deepseek4LoadedModel,
         registration: Option<&ModelRegistration>,
         cancelled: impl Fn() -> bool,
+        max_matrix_prefill_windows: Option<usize>,
         supervisor: &EngineSupervisor,
     ) -> Result<Deepseek4PrefillAdvance> {
         let cold_wave = self.plan.is_cold_wave();
@@ -147,6 +148,7 @@ impl Deepseek4PrefillState {
             &mut self.plan,
             &cancelled,
             &mut self.progress,
+            max_matrix_prefill_windows,
             supervisor,
         ) {
             Ok(advance) => advance,

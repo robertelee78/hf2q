@@ -9,6 +9,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::serve::operator_ui;
+
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22,6 +24,7 @@ pub(super) struct RequestProgress {
     prefill_completed_tokens: usize,
     last_prefill_report: Duration,
     last_prefill_report_tokens: usize,
+    mixed_prefill_reported: bool,
     decode_started: Option<Instant>,
     last_decode_report: Duration,
     first_semantic_reported: bool,
@@ -37,6 +40,7 @@ impl RequestProgress {
             max_tokens,
             "DeepSeek-V4 request started"
         );
+        operator_ui::request_started("deepseek4", id, None, mode, prompt_tokens, max_tokens);
         Self {
             id,
             started: Instant::now(),
@@ -47,6 +51,7 @@ impl RequestProgress {
             prefill_completed_tokens: 0,
             last_prefill_report: Duration::ZERO,
             last_prefill_report_tokens: 0,
+            mixed_prefill_reported: false,
             decode_started: None,
             last_decode_report: Duration::ZERO,
             first_semantic_reported: false,
@@ -73,6 +78,7 @@ impl RequestProgress {
             cache = cache_action,
             "DeepSeek-V4 prefill planned"
         );
+        operator_ui::prefill_planned("deepseek4", self.id, cached_tokens, work_tokens);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -110,6 +116,14 @@ impl RequestProgress {
             .saturating_add(tokens)
             .min(self.prefill_work_tokens);
         let elapsed = self.started.elapsed();
+        let rate = tokens_per_second(self.prefill_completed_tokens, elapsed);
+        operator_ui::prefill_progress(
+            "deepseek4",
+            self.id,
+            self.prefill_completed_tokens,
+            self.prefill_work_tokens,
+            rate,
+        );
         if !should_report(
             self.last_prefill_report,
             elapsed,
@@ -122,7 +136,6 @@ impl RequestProgress {
             .prefill_completed_tokens
             .saturating_sub(self.last_prefill_report_tokens);
         let interval_elapsed = elapsed.saturating_sub(self.last_prefill_report);
-        let rate = tokens_per_second(self.prefill_completed_tokens, elapsed);
         let interval_rate = tokens_per_second(interval_tokens, interval_elapsed);
         let percent = if self.prefill_work_tokens == 0 {
             100.0
@@ -143,6 +156,23 @@ impl RequestProgress {
         );
         self.last_prefill_report = elapsed;
         self.last_prefill_report_tokens = self.prefill_completed_tokens;
+    }
+
+    /// Seal the first scheduler-capped prefill transaction for a genuinely
+    /// mixed decode/prefill turn. The ordinary five-second progress record is
+    /// cumulative and may include earlier solo work, so it cannot prove the
+    /// peer-visible transaction boundary by itself.
+    pub(super) fn mixed_prefill_slice(&mut self, chunk_tokens: usize, window_cap: usize) {
+        if self.mixed_prefill_reported {
+            return;
+        }
+        self.mixed_prefill_reported = true;
+        tracing::info!(
+            request_id = self.id,
+            chunk_tokens,
+            window_cap,
+            "DeepSeek-V4 mixed prefill slice"
+        );
     }
 
     pub(super) fn finish_prefill(&mut self, duration: Duration) {
@@ -167,6 +197,7 @@ impl RequestProgress {
             max_tokens = self.max_tokens,
             "DeepSeek-V4 decode started"
         );
+        operator_ui::decode_progress("deepseek4", self.id, 0, self.max_tokens, 0.0);
     }
 
     pub(super) fn advance_decode(&mut self, generated_tokens: usize) {
@@ -174,6 +205,14 @@ impl RequestProgress {
             return;
         };
         let elapsed = started.elapsed();
+        let rate = tokens_per_second(generated_tokens, elapsed);
+        operator_ui::decode_progress(
+            "deepseek4",
+            self.id,
+            generated_tokens,
+            self.max_tokens,
+            rate,
+        );
         if !should_report(
             self.last_decode_report,
             elapsed,
@@ -183,7 +222,6 @@ impl RequestProgress {
             return;
         }
         self.last_decode_report = elapsed;
-        let rate = tokens_per_second(generated_tokens, elapsed);
         tracing::info!(
             request_id = self.id,
             generated_tokens,
@@ -229,6 +267,7 @@ impl RequestProgress {
             decode_tokens_per_second = decode_rate,
             "DeepSeek-V4 request complete"
         );
+        operator_ui::request_finished("deepseek4", self.id, "complete");
     }
 
     pub(super) fn cancelled(&self) {
@@ -237,6 +276,7 @@ impl RequestProgress {
             elapsed_seconds = self.started.elapsed().as_secs_f64(),
             "DeepSeek-V4 request cancelled"
         );
+        operator_ui::request_finished("deepseek4", self.id, "cancelled");
     }
 
     pub(super) fn failed(&self, error: &anyhow::Error) {
@@ -247,6 +287,7 @@ impl RequestProgress {
             error = %error_chain,
             "DeepSeek-V4 request failed"
         );
+        operator_ui::request_finished("deepseek4", self.id, "failed");
     }
 }
 

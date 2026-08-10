@@ -7,7 +7,9 @@
 //! and verifies it through the exact GGUF chat template and tokenizer used by
 //! production serving. No model tensors or Metal kernels are loaded.
 
-use super::engine::render_chat_prompt_with_tools;
+use super::engine::{
+    render_chat_prompt_with_tools, render_chat_prompt_with_tools_generation_prompt,
+};
 use super::schema::{ChatMessage, MessageContent, Tool, ToolFunction};
 use crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf;
 use mlx_native::gguf::GgufFile;
@@ -21,6 +23,7 @@ const SHORT_OUTPUT_ENV: &str = "HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT";
 const MODEL_ID: &str = "qwen36-abliterix-t63-APEX";
 const TOOL_COUNT: usize = 347;
 const TARGET_PROMPT_TOKENS: usize = 87_972;
+const STABLE_PROMPT_TOKENS: usize = 87_965;
 const SHORT_PROMPT_TOKENS: usize = 552;
 const LONG_PADDING_REPETITIONS: usize = 56_122;
 const SHORT_PADDING_REPETITIONS: usize = 496;
@@ -239,6 +242,46 @@ fn public_347_tool_fixture_renders_to_exact_87972_tokens() {
     );
 
     let messages = fixture_messages(repetitions);
+    let full = render_chat_prompt_with_tools_generation_prompt(
+        template,
+        &messages,
+        Some(&tools),
+        false,
+        None,
+        true,
+    )
+    .expect("render full Qwen fixture");
+    let stable = render_chat_prompt_with_tools_generation_prompt(
+        template,
+        &messages,
+        Some(&tools),
+        false,
+        None,
+        false,
+    )
+    .expect("render Qwen fixture without generation cue");
+    let full_tokens = tokenizer
+        .encode(full, false)
+        .expect("tokenize full fixture");
+    let stable_tokens = tokenizer
+        .encode(stable, false)
+        .expect("tokenize stable fixture");
+    let common_prefix_tokens = full_tokens
+        .get_ids()
+        .iter()
+        .zip(stable_tokens.get_ids())
+        .take_while(|(left, right)| left == right)
+        .count();
+    assert_eq!(stable_tokens.len(), STABLE_PROMPT_TOKENS);
+    assert_eq!(common_prefix_tokens, STABLE_PROMPT_TOKENS);
+    assert!(full_tokens.get_ids().starts_with(stable_tokens.get_ids()));
+    eprintln!(
+        "Qwen fixture stable layout: full={} without_cue={} common_prefix={}",
+        full_tokens.len(),
+        stable_tokens.len(),
+        common_prefix_tokens
+    );
+
     let tools_value = serde_json::to_value(&tools).expect("serialize tools");
     let request = fixture_request(&messages, &tools);
     if let Some(output) = std::env::var_os(OUTPUT_ENV) {

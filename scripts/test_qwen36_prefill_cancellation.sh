@@ -26,7 +26,7 @@ TEMPLATE_SHA256="e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea283957425
 LONG_PATTERN='Qwen35 bounded prefill chunk complete.*prompt_tokens=87972'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=qwen36_watchdog_validate.sh
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
 for command in curl jq rg sed awk date shasum sample wc ps lsof sort seq caffeinate pmset stat find; do

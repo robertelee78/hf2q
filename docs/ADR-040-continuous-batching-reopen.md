@@ -154,11 +154,15 @@ from the clean-artifact gates in §7.QWEN rather than the older Qwen row.
 DeepSeek uses a bounded decode quantum of eight tokens and resumable cold
 prefill at the verifier's atomic cache-commit boundary. At most two active cold
 prefills alternate complete matrix transactions through one scratch arena. A
-decode-ready member advances by one token before each remaining cold-prefill
-transaction; if it becomes terminal, completion remains parked until the
-cohort finishes prefill. That preserves bounded semantic progress without
-allowing early cached continuation work to steal the remaining cold agents'
-deadline or evict the completed member's cache.
+2026-08-09 OpenCode trace falsified the original one-token-per-transaction
+fairness rule: 6–7 second 2,048-token prefill transactions reduced the short
+lane to 0.18–0.31 tok/s. The candidate mixed policy therefore caps prefill at
+two 128-token windows only while a decoder is runnable and grants that decoder
+up to the normal eight-token quantum. Solo/parked-only prefill immediately
+returns to 2,048-token transactions. If a decoder becomes terminal, completion
+remains parked until the cohort finishes prefill. That preserves the cache
+barrier without describing technically live starvation as interactive
+responsiveness.
 After the cold cohort drains, cache-bearing requests take precedence over
 unrelated cold requests so a retained agent slot cannot be evicted between a
 tool call and its result. Within every wave, each slot retains independent
@@ -1413,6 +1417,17 @@ transaction, incremented the counter once, emitted no terminal Done, and the
 next request reused 7,174 cached tokens. `scripts/test_deepseek4_cached_suffix.sh`
 is the reproducible focused gate; clean packed-artifact and full four-agent
 receipts remain release requirements.
+
+The subsequent public lopsided-overlap gate bound the interactive policy to
+the 0.1.5 candidate binary
+`cd8867820898eb33beb5523894084ed5af5a8cdbba92c4aaa8ca4bbb48150784`.
+A 488-token short lane decoded beside a 94,576-token/347-tool cold prompt. The
+first mixed cold transaction was capped at 256 tokens/two native windows; the
+short lane generated 49 tokens in the first reporting window at about 9.16
+tok/s and finished before the cold prefill. The long request retained exact
+tool/SSE semantics, `/readyz` remained 200, and the powered receipt recorded
+zero sleep or thermal events. Its atomic summary SHA-256 is
+`6f93283e07f65952bbd314cc01b791e439875ed0ca7a8a72b4553378ae9c177c`.
 
 ## 8. References
 

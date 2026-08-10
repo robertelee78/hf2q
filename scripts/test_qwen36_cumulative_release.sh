@@ -18,7 +18,7 @@ MAX_SLOTS="${MAX_SLOTS:-4}"
 OUT_DIR="${OUT_DIR:-$(mktemp -d -t hf2q-qwen36-cumulative.XXXXXX)}"
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=qwen36_watchdog_validate.sh
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
 for command in curl jq rg sed awk date shasum wc ps lsof sort seq caffeinate pmset heap stat find; do
@@ -80,7 +80,7 @@ BASE_URL="$BASE_URL" SERVER_PID="$SERVER_PID" SERVER_LOG="$SERVER_LOG" \
   FIXTURE_JSON="$FIXTURE_JSON" SHORT_FIXTURE_JSON="$SHORT_FIXTURE_JSON" \
   MAX_SLOTS=4 REQUIRE_PROVENANCE=1 OUT_DIR="$overlap_dir" \
   "$script_dir/test_qwen36_prefill_watchdog.sh" >"$OUT_DIR/overlap.stdout"
-jq -e '.status == "pass" and .max_slots == 4 and .chunks == 43 and .ready_http == 200' \
+jq -e '.status == "pass" and .max_slots == 4 and .chunks == 44 and .full_chunks == 42 and .stable_tail_tokens > 0 and .generation_cue_tokens > 0 and .ready_http == 200' \
   "$overlap_dir/long-watchdog-summary.json" >/dev/null
 shasum -c "$overlap_dir/long-watchdog-summary.json.sha256" >/dev/null
 capture_heap post-overlap

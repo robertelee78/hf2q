@@ -91,6 +91,13 @@ jobs:
             cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1
             cargo test --locked --bin hf2q --all-features public_watchdog_fixture_bytes_are_stable_without_a_model -- --test-threads=1
             cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
+            bash -n scripts/qwen36_watchdog_validate.sh \
+              scripts/test_qwen36_prefill_watchdog.sh \
+              scripts/test_qwen36_prefill_cancellation.sh \
+              scripts/test_qwen36_cumulative_release.sh \
+              scripts/test_deepseek4_agentic.sh \
+              scripts/test_deepseek4_cached_suffix.sh \
+              scripts/test_deepseek4_interactive_overlap.sh
             bash scripts/test_qwen36_watchdog_harness_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \
