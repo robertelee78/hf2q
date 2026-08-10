@@ -162,12 +162,20 @@ jobs:
                and $d.cached_suffix.cancellation.counter_after == ($d.cached_suffix.cancellation.counter_before + 1)
                and $d.cached_suffix.cancellation.chunks_after_stability == $d.cached_suffix.cancellation.chunks_after_settle
                and $d.cached_suffix.cancellation.emitted_done == false
+               and (($d.cached_suffix.cancellation.expected_anchor_tokens | type) == "number")
+               and $d.cached_suffix.cancellation.expected_anchor_tokens > 0
                and $d.cached_suffix.cancellation.post_cancel_cached_tokens == $d.cached_suffix.cancellation.expected_anchor_tokens
                and $d.cached_suffix.cancellation_after_candidate_anchor.counter_after == ($d.cached_suffix.cancellation_after_candidate_anchor.counter_before + 1)
                and $d.cached_suffix.cancellation_after_candidate_anchor.chunks_after_stability == $d.cached_suffix.cancellation_after_candidate_anchor.chunks_after_settle
+               and (($d.cached_suffix.cancellation_after_candidate_anchor.expected_anchor_tokens | type) == "number")
+               and $d.cached_suffix.cancellation_after_candidate_anchor.expected_anchor_tokens > 0
                and $d.cached_suffix.cancellation_after_candidate_anchor.post_cancel_cached_tokens == $d.cached_suffix.cancellation_after_candidate_anchor.expected_anchor_tokens
                and $d.cached_suffix.cancellation_during_decode.counter_after == ($d.cached_suffix.cancellation_during_decode.counter_before + 1)
                and $d.cached_suffix.cancellation_during_decode.progress_events_after_stability == $d.cached_suffix.cancellation_during_decode.progress_events_after_settle
+               and (($d.cached_suffix.cancellation_during_decode.seed_request_id | type) == "number")
+               and $d.cached_suffix.cancellation_during_decode.seed_request_id > 0
+               and (($d.cached_suffix.cancellation_during_decode.expected_anchor_tokens | type) == "number")
+               and $d.cached_suffix.cancellation_during_decode.expected_anchor_tokens > 0
                and $d.cached_suffix.cancellation_during_decode.post_cancel_cached_tokens == $d.cached_suffix.cancellation_during_decode.expected_anchor_tokens
                and $d.cached_suffix.ready_before == true and $d.cached_suffix.ready_after == true
                and $d.cached_suffix.fatal_log_signatures == 0

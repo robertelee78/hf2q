@@ -725,17 +725,25 @@ jq -e '
   and .cancellation.chunks_after_stability == .cancellation.chunks_after_settle
   and .cancellation.counter_after == (.cancellation.counter_before + 1)
   and .cancellation.emitted_done == false
+  and ((.cancellation.expected_anchor_tokens | type) == "number")
+  and .cancellation.expected_anchor_tokens > 0
   and .cancellation.post_cancel_cached_tokens == .cancellation.expected_anchor_tokens
   and .cancellation_after_candidate_anchor.chunks_after_settle <= (.cancellation_after_candidate_anchor.chunks_at_disconnect + 1)
   and .cancellation_after_candidate_anchor.chunks_after_stability == .cancellation_after_candidate_anchor.chunks_after_settle
   and .cancellation_after_candidate_anchor.counter_after == (.cancellation_after_candidate_anchor.counter_before + 1)
   and .cancellation_after_candidate_anchor.emitted_done == false
+  and ((.cancellation_after_candidate_anchor.expected_anchor_tokens | type) == "number")
+  and .cancellation_after_candidate_anchor.expected_anchor_tokens > 0
   and .cancellation_after_candidate_anchor.post_cancel_cached_tokens == .cancellation_after_candidate_anchor.expected_anchor_tokens
   and .cancellation_during_decode.progress_events_at_disconnect >= 1
   and .cancellation_during_decode.progress_events_after_settle <= (.cancellation_during_decode.progress_events_at_disconnect + 1)
   and .cancellation_during_decode.progress_events_after_stability == .cancellation_during_decode.progress_events_after_settle
   and .cancellation_during_decode.counter_after == (.cancellation_during_decode.counter_before + 1)
   and .cancellation_during_decode.emitted_done == false
+  and ((.cancellation_during_decode.seed_request_id | type) == "number")
+  and .cancellation_during_decode.seed_request_id > 0
+  and ((.cancellation_during_decode.expected_anchor_tokens | type) == "number")
+  and .cancellation_during_decode.expected_anchor_tokens > 0
   and .cancellation_during_decode.post_cancel_cached_tokens == .cancellation_during_decode.expected_anchor_tokens
   and .ready_before == true and .ready_after == true
   and .fatal_log_signatures == 0
