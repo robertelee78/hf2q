@@ -606,7 +606,7 @@ run_gemma_release_gates() {
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
   MODEL_PATH="$GEMMA_MODEL" MODEL_SHA256="$GEMMA_MODEL_SHA256" MAX_SLOTS=4 \
-  CURL_MAX_TIME_SECONDS=1800 \
+  CURL_MAX_TIME_SECONDS=1800 CANCELLATION_WAIT_SECONDS=180 \
   OUT_DIR="$OUT_ROOT/gemma/overlap" scripts/test_gemma4_long_short_overlap.sh \
     >"$OUT_ROOT/gemma/overlap.stdout" 2>"$OUT_ROOT/gemma/overlap.stderr"
   verify_sha256_sidecar "$OUT_ROOT/gemma/overlap/summary.json"

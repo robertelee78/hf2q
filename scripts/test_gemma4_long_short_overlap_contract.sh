@@ -27,6 +27,17 @@ if SERVER_PID=1 SERVER_LOG=/dev/null BINARY_PATH=/bin/true \
 fi
 rg -q '^CURL_MAX_TIME_SECONDS must be a positive integer$' "$invalid_stderr"
 
+if SERVER_PID=1 SERVER_LOG=/dev/null BINARY_PATH=/bin/true \
+  BINARY_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+  MODEL_PATH=/dev/null \
+  MODEL_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+  OUT_DIR=/dev/null CURL_MAX_TIME_SECONDS=1 CANCELLATION_WAIT_SECONDS=0 \
+  bash "$HARNESS" 2>"$invalid_stderr"; then
+  echo "Gemma overlap accepted a non-positive cancellation wait" >&2
+  exit 1
+fi
+rg -q '^CANCELLATION_WAIT_SECONDS must be a positive integer$' "$invalid_stderr"
+
 [[ "$(rg -c -- '--max-time "\$CURL_MAX_TIME_SECONDS"' "$HARNESS")" == 3 ]] || {
   echo "every long-running Gemma curl must use the validated timeout" >&2
   exit 1
@@ -38,7 +49,7 @@ fi
 
 awk '
   /^run_gemma_release_gates\(\)/ { in_gemma=1 }
-  in_gemma && /CURL_MAX_TIME_SECONDS=1800/ { armed=1; next }
+  in_gemma && /CURL_MAX_TIME_SECONDS=1800 CANCELLATION_WAIT_SECONDS=180/ { armed=1; next }
   armed && /scripts\/test_gemma4_long_short_overlap.sh/ { found=1; exit }
   armed && substr($0, length($0), 1) != "\\" { exit 1 }
   END { exit(found ? 0 : 1) }

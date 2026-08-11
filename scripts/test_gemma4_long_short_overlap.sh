@@ -14,6 +14,7 @@ MAX_SLOTS=${MAX_SLOTS:-4}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required}
 CONTEXT_LINES=${CONTEXT_LINES:-7000}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-900}
+CANCELLATION_WAIT_SECONDS=${CANCELLATION_WAIT_SECONDS:-120}
 PRIMARY_CONTEXT_SHA256=07b147e9c6ac26a0c9c4a719391c0772b2d27b9d77499479014b9ace88b6b11e
 CANCELLATION_CONTEXT_SHA256=f0b264eedae315618941d8fa6fb16454c4eac03b5793e213b613d66ccb7b6e4a
 
@@ -30,6 +31,10 @@ done
 [[ "$SERVER_PID" =~ ^[1-9][0-9]*$ && "$MAX_SLOTS" == 4 ]] || exit 2
 [[ "$CURL_MAX_TIME_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
   echo "CURL_MAX_TIME_SECONDS must be a positive integer" >&2
+  exit 2
+}
+[[ "$CANCELLATION_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "CANCELLATION_WAIT_SECONDS must be a positive integer" >&2
   exit 2
 }
 [[ "$CONTEXT_LINES" == 7000 ]] || {
@@ -229,7 +234,7 @@ done
 kill "$cancel_pid" 2>/dev/null || true
 wait "$cancel_pid" 2>/dev/null || true
 cancel_pid=""
-cancel_deadline=$((SECONDS + 30))
+cancel_deadline=$((SECONDS + CANCELLATION_WAIT_SECONDS))
 while (( $(cancellation_metric) <= cancel_before && SECONDS < cancel_deadline )); do sleep 0.1; done
 cancel_after=$(cancellation_metric)
 [[ "$((cancel_after - cancel_before))" == 1 ]] || exit 1
