@@ -22,12 +22,6 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
-for command in awk curl jq rg sed shasum stat wc caffeinate pmset; do
-  command -v "$command" >/dev/null || {
-    echo "missing required command: $command" >&2
-    exit 2
-  }
-done
 [[ "$SERVER_PID" =~ ^[1-9][0-9]*$ && "$MAX_SLOTS" == 4 ]] || exit 2
 [[ "$CURL_MAX_TIME_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
   echo "CURL_MAX_TIME_SECONDS must be a positive integer" >&2
@@ -37,6 +31,12 @@ done
   echo "CANCELLATION_WAIT_SECONDS must be a positive integer" >&2
   exit 2
 }
+for command in awk curl jq rg sed shasum stat wc caffeinate pmset; do
+  command -v "$command" >/dev/null || {
+    echo "missing required command: $command" >&2
+    exit 2
+  }
+done
 [[ "$CONTEXT_LINES" == 7000 ]] || {
   echo "release-authority Gemma overlap requires CONTEXT_LINES=7000" >&2
   exit 2

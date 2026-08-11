@@ -89,7 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full-attention prompt instead of inheriting a non-overridable 900-second
   curl cutoff. It also allows 180 seconds to observe cancellation at the next
   transaction boundary when a 4,096-token Metal call is already in flight at
-  a 183K-token cursor; invalid or non-positive values fail before model traffic.
+  a 183K-token cursor; invalid or non-positive values fail before dependency
+  discovery or model traffic. Its hosted contract uses platform `grep` rather
+  than assuming a runner has ripgrep installed.
 - Make that receipt enforce the family-specific shipping gates as well as the
   shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
   one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193
