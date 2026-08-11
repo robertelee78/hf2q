@@ -303,6 +303,16 @@ post-cancellation prefix reuse, readiness, and a clean fatal-log delta. Its
 focused receipt complements rather than replaces the unchanged four-agent
 agentic gate.
 
+`scripts/run_deepseek4_matched_peer.sh` is the developer-only same-input
+llama.cpp discriminator for the frozen four-agent cold workload. It starts a
+fresh pinned peer for each wave, disables prompt caching, binds binary/model/
+fixture/request identity, requires exact `read_file` semantics and zero-cache
+usage, and records monotonic response/cohort timing under continuous AC and
+thermal telemetry. The peer renders the byte-identical request as 6,695 prompt
+tokens versus hf2q's 6,685, so both runtime-specific counts remain explicit.
+The script is reference evidence only; it never participates in production
+serving and cannot replace hf2q's exact packed-artifact cache gate.
+
 The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
 they are not final hf2q artifact authority. Release requires rerunning the same
