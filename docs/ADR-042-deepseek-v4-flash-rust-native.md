@@ -1021,11 +1021,11 @@ The 0.1.6 candidate scheduling policy uses resumable cold prefill at atomic
 cache+ledger commit boundaries. At most two active cold prefills alternate
 complete matrix transactions through the one shared prefill scratch arena. A
 decode-ready member advances with an eight-token quantum between bounded
-prefill transactions in the lopsided interactive case. Once a full cold cohort
-enters `Draining`, cold-wave unary decoders instead defer while any cold
-prefill remains and bulk prefill resumes; unary output could not be delivered
-before the barrier. Streaming and warm decoders remain responsive. Once the
-cohort drains,
+prefill transactions in the lopsided interactive case. When a filling cohort
+still has another cold request queued, cold-wave unary decoders instead defer
+through `Draining` while any cold prefill remains and bulk prefill resumes;
+unary output could not be delivered before the barrier. Streaming and warm
+decoders remain responsive. Once the cohort drains,
 longest-prefix continuations run before unrelated cold work can evict a
 retained agent cache. A paired long-row graph exceeded Metal memory, and a
 batched-output-head-only spike did not improve the cold tail; neither failed
@@ -1043,10 +1043,10 @@ interactive progress: the scheduler was live, but the experience was not.
 The replacement preserves the proven bulk-prefill plan and changes only a
 genuinely mixed quantum:
 
-- once a full cold cohort enters `Draining`, defer cold-wave unary decode while
-  any cold prefill remains and restore the plan's normal
-  16-window/2,048-token transaction; streaming and warm decode remain visible
-  and keep the interactive budget;
+- when a filling cohort still has another cold request queued, defer cold-wave
+  unary decode through `Draining` while any cold prefill remains and restore
+  the plan's normal 16-window/2,048-token transaction; streaming and warm
+  decode remain visible and keep the interactive budget;
 - while at least one `Decode` owner is runnable, cap the next matrix prefill
   transaction at two native 128-token windows and run the configured decode
   quantum, clamped to at most eight tokens, except for the saturated case;
@@ -1230,11 +1230,28 @@ without improving any user-visible completion. Cache reuse itself was healthy
 before fail-fast cleanup: the next two requests reused 6,677/6,685 tokens and
 finished their eight-token suffix prefills in 0.271 and 0.864 seconds.
 
+The first draining-only correction then reached exact `main` as
+`e9887cceeee9c69543e5b69193434db6602f4c9d`. Its protected packed-artifact run
+`31484992493` used crate SHA-256
+`b68d8f946c051c641d04da17505cf6c8d214e3f75a027eb64a9df8abb4082a44`.
+All four individual cold responses met the unchanged 55-second limit at
+54.476, 54.311, 54.642, and 53.377 seconds, and every cached, automatic, and
+tool-result continuation reused exactly 6,677/6,685 tokens. The monotonic
+cohort wall was nevertheless 55.250 seconds, so the release gate correctly
+failed by 250 milliseconds. The server trace exposed the remaining transition:
+after request 1 finished prefill, request 3 was admitted while request 4 was
+still queued, but the cohort was still `Filling`; request 1 therefore consumed
+an eight-token decode quantum and imposed the two-window prefill cap before the
+cohort entered `Draining`. Request 2 then consumed one decode token at the same
+boundary. That unary work was still not deliverable before all four cold
+prefills crossed the cohort barrier.
+
 The correction distinguishes this saturated state from the lopsided
-interactive case. Once the full cold cohort enters `Draining`, cold-wave unary
-decode handles remain installed but are omitted from GPU decode while any cold
-prefill remains, including the `1 prefill + 3 decoders` tail. Streaming and
-warm decode handles remain runnable and preserve the measured eight-token
+interactive case. When the filling cohort still has another cold request
+queued, cold-wave unary decode handles remain installed but are omitted from
+GPU decode while any cold prefill remains; that deferral continues through
+`Draining`, including the `1 prefill + 3 decoders` tail. Streaming and warm
+decode handles remain runnable and preserve the measured eight-token
 decode/two-window prefill budget. At zero active cold prefills, every deferred
 decode resumes. Model-free scheduler tests pin those transitions. This is
 source-level candidate evidence only; the exact packed four-agent wave must

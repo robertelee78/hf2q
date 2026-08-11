@@ -281,8 +281,9 @@ DeepSeek cold and meaningful retained-prefix suffix work advances at native
 atomic verifier boundaries. At most two cold prefills own the single scratch
 arena concurrently. In a lopsided cohort with a runnable decoder, mixed work
 caps the next prefill slice at two 128-token native windows and runs up to the
-normal eight-token decode quantum before the next slice. In a full cold cohort,
-unary cold-wave decode is deferred while any cold prefill remains because its
+normal eight-token decode quantum before the next slice. When a filling cold
+cohort still has another cold request queued, unary cold-wave decode is
+deferred through the draining phase while any cold prefill remains because its
 output cannot be delivered before the cohort barrier; full 2,048-token prefill
 transactions resume. Streaming and warm decode remain responsive. Once no
 runnable visible decoder remains, prefill also returns to the full transaction.

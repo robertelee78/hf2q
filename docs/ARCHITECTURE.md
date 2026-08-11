@@ -321,12 +321,13 @@ resumable; cached suffixes remain outside the cold-cohort policy.
 DeepSeek's `Mixed` step has a separate interactive budget. While a visible
 decode lane is runnable, one prefill transaction is capped at two 128-token
 verifier windows and decode receives up to eight tokens before the next
-prefill slice. Once a full cold cohort enters `Draining`, cold-wave unary
-decoders are deferred while any cold prefill remains because unary output
-cannot be delivered before that barrier; streaming and warm decoders remain
-visible. If every decode owner is deferred, parked, or absent, the cap is
-removed and the proven 2,048-token bulk-prefill plan resumes. This avoids the
-latency cost of small transactions when no peer can expose semantic progress.
+prefill slice. When a filling cohort still has another cold request queued,
+cold-wave unary decoders are deferred through `Draining` while any cold
+prefill remains because unary output cannot be delivered before that barrier;
+streaming and warm decoders remain visible. If every decode owner is deferred,
+parked, or absent, the cap is removed and the proven 2,048-token bulk-prefill
+plan resumes. This avoids the latency cost of small transactions when no peer
+can expose semantic progress.
 
 ### 4.3 Decode
 
