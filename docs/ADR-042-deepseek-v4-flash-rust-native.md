@@ -1305,6 +1305,36 @@ remains blocked. The next accepted experiment is the family-neutral paired
 MoE gate/up schedule for large prefill; decode-sized work remains a separate
 measurement.
 
+### Family-neutral paired MoE schedule (2026-08-11 candidate)
+
+That experiment is now implemented without adopting the rejected literal
+gate/up arithmetic megakernel. Published `mlx-native 0.10.8` comes from exact
+main `0733dfbb280b3ceb8a8526489f1aebcdf454ee60`; the crates.io archive,
+GitHub release asset, and local Cargo-1.96 seal all have SHA-256
+`f2257d5afd2b0e246049e79b4857b0edc1554e93c81d7d2d2d1bcd64c73e22a9`.
+Its family-neutral pair primitive builds one expert-ID routing schedule and
+encodes two existing quantized projections with distinct weights and outputs.
+
+hf2q selects that primitive only for rows above the native routing threshold,
+automatic routing, available scratch, and no
+`HF2Q_MM_ID_ROUTING_THRESHOLD` diagnostic override. Small/decode work,
+forced matvec, slotted matrix routing, and calls without scratch preserve the
+independent gate/up path. The paired call reuses the first routing scratch for
+the pair; the routed down projection may reuse it only after both outputs have
+been encoded. The existing graph barriers cover the input, both weights,
+sanitized IDs, and both outputs.
+
+The exact packed native benchmark passed on AC power under Nominal thermal
+state and remained positive across eight covered shapes: Qwen Q5 pairs measured
+1.0396–1.0657x and DeepSeek Q2 pairs 1.0102–1.0332x against the independent
+schedule. Those are primitive measurements, not hf2q serving claims. The
+published dependency, selector regression, broad model-free DeepSeek suite,
+and locked all-target/all-feature check establish reproducibility and routing
+safety only. Acceptance still requires two thermally valid exact-packed
+6,685-token four-agent waves, unchanged 6,677-token retained-prefix reuse and
+tool semantics, plus the 94,576-token overlap/lifecycle gate. Decode-sized
+fusion remains a later, separately measured experiment.
+
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 
 The cross-family lifecycle gate reproduced the operator's long-session shape

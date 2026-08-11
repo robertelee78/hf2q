@@ -58,6 +58,10 @@ family's graph, cache, or scheduler contract by approximation.
   Outside a cold-cohort barrier, staggered warm work may occupy any free
   physical slot. Cancellation restores only a valid, position-consistent
   pre-request turn anchor; poisoned or inconsistent state resets fully.
+  The Unreleased 0.1.6 candidate also pairs large automatic MoE gate/up
+  projections through the published `mlx-native 0.10.8` routing-schedule
+  primitive. Decode-sized and forced diagnostic routes remain independent;
+  native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
   independently observed transaction deadline that never returns, fails the
   affected Qwen, Gemma, or DeepSeek worker closed. Every owned reply
@@ -97,7 +101,7 @@ The shared cross-family changes additionally require:
 | Family | Candidate artifact gate |
 |---|---|
 | Gemma 4 | Eager-versus-resumed exact output parity at 4,096 boundaries and non-aligned tails; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
-| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v1` fixture (SHA-256 `2c894c9e…b4ef`), exactly 6,685 rendered prompt tokens per agent, zero cold reuse, and the literal 55-second cold bounds. Each calibrated wave starts only after at least 60 seconds of Nominal samples at five-second cadence with no hf2q/llama model runtime loaded, then remains under fail-closed two-second thermal sampling throughout measurement. |
+| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v1` fixture (SHA-256 `2c894c9e…b4ef`), exactly 6,685 rendered prompt tokens per agent, zero cold reuse, and the literal 55-second cold bounds. Each calibrated wave starts only after at least 60 seconds of Nominal samples at five-second cadence with no hf2q/llama model runtime loaded, then remains under fail-closed two-second thermal sampling throughout measurement. The server log must prove the paired large-prefill route engaged, while semantic/tool parity and retained-prefix counts remain unchanged. |
 | All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 
 ---

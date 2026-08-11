@@ -48,7 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unary output cannot be delivered before that barrier. Full 2,048-token
   prefill transactions resume; streaming and warm decoders remain responsive,
   as does the lopsided eight-token decode/two-window prefill case.
-- Resolve the published, checksum-pinned `mlx-native 0.10.7` command-buffer
+- Pair large DeepSeek routed-expert gate/up projections through the
+  family-neutral `mlx-native 0.10.8` schedule primitive. Eligible prefill work
+  builds one expert-routing schedule for both existing quantized projections;
+  decode-sized work and forced diagnostic routes remain independent. This is
+  not an arithmetic-fusion claim, and exact packed hf2q hardware acceptance
+  remains required before publishing an end-to-end speedup.
+- Resolve the published, checksum-pinned `mlx-native 0.10.8` backend, retaining
+  the 0.10.7 command-buffer
   lifetime correction. Internal unlabeled GraphSession command buffers retain
   direct owner release, while labeled or publicly escaped buffers preserve the
   autorelease scope required by external Objective-C ownership. No local Cargo
@@ -61,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact retry while that prefix is active, cancels the owner, requires the
   queued retry to reuse the restored checkpoint, and verifies an unrelated
   conversation cannot inherit private history.
+- Pin the DeepSeek paired-prefill selector to large automatic routes with
+  scratch and no diagnostic threshold override. The published native package
+  and broad DeepSeek model-free suite are locked gates; real-model quality,
+  cache, overlap, and calibrated cold-wave performance remain hardware gates.
 - Add a guarded self-hosted `Cache lifecycle` workflow that packages one exact
   main-branch commit, builds only from that extracted crate, runs DeepSeek,
   Gemma, and Qwen one process at a time under continuously checked AC power,
