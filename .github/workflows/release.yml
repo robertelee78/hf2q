@@ -452,17 +452,18 @@ jobs:
               -f ref="refs/tags/$tag" \
               -f sha="$EXPECTED_SHA" >/dev/null
           fi
-          if gh release view "$tag" >/dev/null 2>&1; then
-            test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$EXPECTED_SHA"
-          else
+          if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" \
-              "target/package/hf2q-${EXPECTED_VERSION}.crate" \
-              "$RUNNER_TEMP/release-crate.sha256" \
               --target "$EXPECTED_SHA" \
               --title "hf2q ${EXPECTED_VERSION}" \
               --generate-notes \
               --verify-tag
           fi
+          test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$EXPECTED_SHA"
+          gh release upload "$tag" \
+            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
+            "$RUNNER_TEMP/release-crate.sha256" \
+            --clobber
 
       - name: Verify GitHub release bytes
         shell: bash
@@ -476,6 +477,12 @@ jobs:
           mkdir -p "$release_dir"
           gh release download "$tag" \
             --pattern "hf2q-${EXPECTED_VERSION}.crate" \
+            --pattern "release-crate.sha256" \
             --dir "$release_dir"
           actual=$(shasum -a 256 "$release_dir/hf2q-${EXPECTED_VERSION}.crate" | awk '{print $1}')
           test "$actual" = "$expected"
+          checksum="$release_dir/release-crate.sha256"
+          test "$(grep -cve '^[[:space:]]*$' "$checksum")" -eq 1
+          test "$(awk 'NF {print $1}' "$checksum")" = "$expected"
+          test "$(awk 'NF {print $2}' "$checksum")" = \
+            "target/package/hf2q-${EXPECTED_VERSION}.crate"
