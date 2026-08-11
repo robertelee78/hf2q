@@ -92,6 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a 183K-token cursor; invalid or non-positive values fail before dependency
   discovery or model traffic. Its hosted contract uses platform `grep` rather
   than assuming a runner has ripgrep installed.
+- Keep Gemma's four-slot release-default agentic latency limits unchanged,
+  while giving the experimental eight-slot correctness/aggregate-cap probe an
+  explicit 40-second cold-TTFT and 30-second tool-result completion envelope.
+  On the exact M5 Max discriminator the eight-slot wave measured 25.279 seconds
+  cold and 23.932 seconds at the slowest tool-result turn; every receipt keeps
+  the actual timing, cache, and semantic fields rather than converting this
+  experiment into an eight-slot latency claim.
 - Make that receipt enforce the family-specific shipping gates as well as the
   shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
   one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193

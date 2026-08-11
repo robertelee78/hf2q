@@ -552,7 +552,18 @@ run_gemma_wave() {
   local phase=$1
   local agents=$2
   local out="$OUT_ROOT/gemma/$phase"
+  local -a wave_limits=()
+  # Four slots are the release-validated operator default and keep the shared
+  # agentic latency limits. Eight slots are an explicitly experimental
+  # correctness/aggregate-transaction-cap probe. Give only that probe a
+  # functional completion envelope sized from the exact M5 Max discriminator
+  # (25.279 s cold TTFT, 23.932 s worst tool-result response); the measured
+  # values still remain in every per-agent receipt.
+  if [[ "$agents" == 8 ]]; then
+    wave_limits=(MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000)
+  fi
   mkdir -p "$out"
+  env "${wave_limits[@]}" \
   BASE_URL="$current_url" FAMILY=gemma4 AGENTS="$agents" \
   WAVE_ID="$phase" REQUIRE_COLD_FIRST=1 \
   OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \

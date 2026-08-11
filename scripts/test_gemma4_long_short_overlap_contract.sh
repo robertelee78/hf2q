@@ -58,4 +58,15 @@ awk '
   END { exit(found ? 0 : 1) }
 ' "$RELEASE_GATE"
 
-echo "Gemma long/short overlap timeout contract passed"
+awk '
+  /^run_gemma_wave\(\)/ { in_wave=1 }
+  in_wave && /if \[\[ "\$agents" == 8 \]\]/ { in_eight=1 }
+  in_eight && /wave_limits=\(MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000\)/ {
+    limits=1
+  }
+  limits && /env "\$\{wave_limits\[@\]\}"/ { forwards=1 }
+  forwards && /scripts\/test_full_context_agent_slots.sh/ { found=1; exit }
+  END { exit(found ? 0 : 1) }
+' "$RELEASE_GATE"
+
+echo "Gemma release harness contract passed"

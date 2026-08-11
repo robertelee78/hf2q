@@ -1477,6 +1477,14 @@ disables any local-default projector. `.github/workflows/release.yml` requires
 a successful run at the same SHA, rehashes every downloaded receipt, validates
 the detailed family predicates, and requires the crate digest to equal the
 newly reproduced publication artifact before `cargo publish` can execute.
+Gemma's four-slot waves retain the release-default agentic latency limits. The
+eight-slot lane is the README's experimental correctness and aggregate-row-cap
+probe, not an eight-slot latency SLO: it uses explicit 40-second cold-TTFT and
+30-second tool-result functional ceilings while retaining the measured values
+in each agent receipt. An exact M5 Max discriminator after 60 seconds of
+Nominal thermal state measured 25.279 seconds cold and 23.932 seconds for the
+slowest concurrent tool-result turn; the full packed-artifact gate remains the
+authority for accepting that calibration.
 For this release the protected model identities are DeepSeek
 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
 Gemma `82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`,
