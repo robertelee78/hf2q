@@ -6,9 +6,11 @@
   affinity, request-local rollback, and the DeepSeek Busy-only admission
   no-spin correction. The four-agent performance workload is now an immutable,
   SHA-bound 6,685-token fixture after mutable README growth invalidated one
-  release run. A later exact-packed wave exposed and corrected a thermal-order
-  defect in that release gate. The bounded mixed-work replacement and cache lifecycle remain
-  release candidates pending immutable packed-artifact hardware proof.
+  release run. One exact-packed wave exposed and corrected a thermal-order
+  defect in that release gate; the next thermally valid wave isolated a
+  saturated-cold scheduling regression. The bounded mixed-work replacement,
+  saturated-cold barrier, and cache lifecycle remain release candidates
+  pending immutable packed-artifact hardware proof.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1015,14 +1017,15 @@ allocation did not fit beside the 100 GiB artifact on this 128 GiB host. hf2q
 therefore met the matched wall-clock bar while providing 524,288 logical
 tokens to every slot through demand-grown physical admission.
 
-The accepted scheduling policy uses an eight-token decode quantum and
-resumable cold prefill at atomic cache+ledger commit boundaries. At most two
-active cold prefills alternate complete matrix transactions through the one
-shared prefill scratch arena. The next-release fairness correction advances a
-decode-ready member between remaining transactions and parks only its terminal
-completion until the cohort drains. This prevents early
-responses from producing cached traffic that delays the remaining cold agents
-while bounding the short lane's semantic gaps. Once the cohort drains,
+The 0.1.6 candidate scheduling policy uses resumable cold prefill at atomic
+cache+ledger commit boundaries. At most two active cold prefills alternate
+complete matrix transactions through the one shared prefill scratch arena. A
+decode-ready member advances with an eight-token quantum between bounded
+prefill transactions in the lopsided interactive case. Once a full cold cohort
+enters `Draining`, cold-wave unary decoders instead defer while any cold
+prefill remains and bulk prefill resumes; unary output could not be delivered
+before the barrier. Streaming and warm decoders remain responsive. Once the
+cohort drains,
 longest-prefix continuations run before unrelated cold work can evict a
 retained agent cache. A paired long-row graph exceeded Metal memory, and a
 batched-output-head-only spike did not improve the cold tail; neither failed
@@ -1040,9 +1043,13 @@ interactive progress: the scheduler was live, but the experience was not.
 The replacement preserves the proven bulk-prefill plan and changes only a
 genuinely mixed quantum:
 
+- once a full cold cohort enters `Draining`, defer cold-wave unary decode while
+  any cold prefill remains and restore the plan's normal
+  16-window/2,048-token transaction; streaming and warm decode remain visible
+  and keep the interactive budget;
 - while at least one `Decode` owner is runnable, cap the next matrix prefill
   transaction at two native 128-token windows and run the configured decode
-  quantum, clamped to at most eight tokens;
+  quantum, clamped to at most eight tokens, except for the saturated case;
 - when every decode owner is absent or `ParkedCompletion`, remove the mixed
   cap and resume the plan's normal 16-window/2,048-token transaction;
 - rebalance a capped slice that would leave an illegal 9–32-token matrix tail,
@@ -1198,6 +1205,41 @@ envelope records the settle and measurement sample counts and SHA-256 digests,
 and publication independently rehashes and validates the measurement log.
 The 55-second bound is unchanged. Two thermally valid exact-packed passes are
 still required before release authority is restored.
+
+### Saturated four-cold bulk-prefill correction (2026-08-11 candidate)
+
+Exact-main run `31477280331` exercised source
+`c92d0b251bd49e43f9a1a70c41985b4ba45ae8fd`, crate SHA-256
+`726966f381637fdc7eb63a123fd63b42836237ecdac8ef4fa2f08ee800829662`,
+and packed binary SHA-256
+`1a796156a073f69d85a33b36f5de6d367d541994e03ae914be2327048bea616b`.
+The host was continuously Nominal for the required 60-second settle and the
+whole measured wave. The run therefore supplies valid performance evidence,
+and it failed the unchanged bound: two clients completed at 53.351 seconds,
+while one client failed at 56.662 seconds.
+
+Server clocks isolate the failure. The first two 6,685-token cold prefills
+completed in 22.180 and 22.751 seconds at 301.39 and 293.84 prompt tok/s. The
+second pair was then admitted alongside both decode-ready first-pair lanes and
+took 30.382 and 30.434 seconds at about 220 prompt tok/s. Their cohort
+endpoints were therefore about 56.444 and 56.941 seconds before small HTTP
+overhead. The first pair's early 61-token responses could not be published:
+they became terminal while the second pair was still prefilling and were
+parked behind the cold-cohort barrier. The work delayed the second pair
+without improving any user-visible completion. Cache reuse itself was healthy
+before fail-fast cleanup: the next two requests reused 6,677/6,685 tokens and
+finished their eight-token suffix prefills in 0.271 and 0.864 seconds.
+
+The correction distinguishes this saturated state from the lopsided
+interactive case. Once the full cold cohort enters `Draining`, cold-wave unary
+decode handles remain installed but are omitted from GPU decode while any cold
+prefill remains, including the `1 prefill + 3 decoders` tail. Streaming and
+warm decode handles remain runnable and preserve the measured eight-token
+decode/two-window prefill budget. At zero active cold prefills, every deferred
+decode resumes. Model-free scheduler tests pin those transitions. This is
+source-level candidate evidence only; the exact packed four-agent wave must
+pass twice and the 94,576-token interactive overlap must remain green before
+the correction is accepted for publication.
 
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 

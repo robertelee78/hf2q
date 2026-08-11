@@ -7436,13 +7436,15 @@ fn deepseek4_reconcile_cold_cohort(
     }
 }
 
-// DeepSeek's native matrix window is 128 tokens. During a genuinely mixed
-// turn, two windows keep the peer-visible silence well below the measured
-// 6–7 second 2,048-token transaction while retaining enough matrix work to
-// amortize submission overhead. Solo prefill deliberately receives no cap.
+// DeepSeek's native matrix window is 128 tokens. During a lopsided mixed turn,
+// two windows keep the peer-visible silence well below the measured 6–7
+// second 2,048-token transaction while retaining enough matrix work to
+// amortize submission overhead. Solo prefill and a draining cold cohort whose
+// only runnable decode work is unary deliberately receive no cap.
 const DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS: usize = 2;
-// Eight is the canonical DeepSeek decode quantum. The old cold-prefill policy
-// forced it down to one, producing the observed ~0.18 tok/s interactive lane.
+// Eight is the canonical interactive DeepSeek decode quantum. A draining cold
+// cohort defers only cold-wave unary decoders whose output cannot be delivered
+// before the barrier; streaming and warm decode remain responsive.
 const DEEPSEEK4_INTERACTIVE_DECODE_QUANTUM_MAX: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7462,6 +7464,24 @@ fn deepseek4_mixed_work_budget(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4MixedDecodeKind {
+    ColdUnary,
+    ColdStream,
+    Warm,
+    ParkedOrInvariant,
+}
+
+fn deepseek4_should_run_mixed_decode(
+    phase: Deepseek4ColdCohortPhase,
+    active_cold_prefills: usize,
+    kind: Deepseek4MixedDecodeKind,
+) -> bool {
+    !(phase == Deepseek4ColdCohortPhase::Draining
+        && active_cold_prefills > 0
+        && kind == Deepseek4MixedDecodeKind::ColdUnary)
+}
+
 fn deepseek4_has_runnable_decode(slots: &[Option<Deepseek4Slot>], handles: &[SlotHandle]) -> bool {
     handles.iter().any(|handle| {
         slots
@@ -7471,6 +7491,46 @@ fn deepseek4_has_runnable_decode(slots: &[Option<Deepseek4Slot>], handles: &[Slo
                 *installed == *handle && matches!(work, Deepseek4SlotWork::Decode { .. })
             })
     })
+}
+
+fn deepseek4_mixed_decode_handles(
+    slots: &[Option<Deepseek4Slot>],
+    handles: &[SlotHandle],
+    phase: Deepseek4ColdCohortPhase,
+    active_cold_prefills: usize,
+) -> Vec<SlotHandle> {
+    handles
+        .iter()
+        .copied()
+        .filter(|handle| {
+            let Some((work, reply, installed)) = slots
+                .get(handle.slot_id.0 as usize)
+                .and_then(Option::as_ref)
+            else {
+                // Preserve the handle so decode_batch_deepseek4 owns and
+                // reports the missing-slot invariant instead of hiding it.
+                return true;
+            };
+            if *installed != *handle {
+                return true;
+            }
+            let kind = match work {
+                Deepseek4SlotWork::Decode {
+                    cold_wave: true, ..
+                } if matches!(reply, SlotReply::Stream { .. }) => {
+                    Deepseek4MixedDecodeKind::ColdStream
+                }
+                Deepseek4SlotWork::Decode {
+                    cold_wave: true, ..
+                } => Deepseek4MixedDecodeKind::ColdUnary,
+                Deepseek4SlotWork::Decode { .. } => Deepseek4MixedDecodeKind::Warm,
+                Deepseek4SlotWork::Prefill(_) | Deepseek4SlotWork::ParkedCompletion { .. } => {
+                    Deepseek4MixedDecodeKind::ParkedOrInvariant
+                }
+            };
+            deepseek4_should_run_mixed_decode(phase, active_cold_prefills, kind)
+        })
+        .collect()
 }
 
 fn deepseek4_should_park_completion(cold_wave: bool, active_cold_prefills: usize) -> bool {
@@ -7919,12 +7979,14 @@ fn choose_full_context_slot(
 /// DeepSeek-V4 full-context slot worker. Each physical slot retains independent
 /// compressed KV and recurrent state. Cold matrix prefill yields only after an
 /// atomic cache+ledger commit. A bounded cold cohort runs at most two active
-/// prefills at a time. When a shorter member becomes decode-ready, `Mixed`
-/// advances it by one token before each remaining cold-prefill transaction;
-/// a terminal completion remains parked until the cold cohort drains, so its
-/// physical cache cannot be reused before a tool-result continuation arrives.
-/// No more than one prefill transaction owns the shared scratch arena at any
-/// instant.
+/// prefills at a time. Lopsided `Mixed` work advances a visible decoder by up
+/// to eight tokens between two-window prefill slices. Once a full cold cohort
+/// enters `Draining`, unary cold-wave decode is deferred until its last cold
+/// prefill commits because no unary output can be delivered before that
+/// barrier; streaming and warm decode remain responsive. A terminal completion
+/// stays parked so its physical cache cannot be reused before a tool-result
+/// continuation arrives. No more than one prefill transaction owns the shared
+/// scratch arena at any instant.
 #[allow(clippy::too_many_arguments)]
 fn run_slot_aware_deepseek4(
     mut model: super::engine_deepseek4::Deepseek4LoadedModel,
@@ -8397,6 +8459,12 @@ fn run_slot_aware_deepseek4(
                 ..
             }) => {
                 let active_cold_prefills = deepseek4_cold_prefill_active(&slots);
+                let decode_handles = deepseek4_mixed_decode_handles(
+                    &slots,
+                    &decode_handles,
+                    cold_cohort_phase,
+                    active_cold_prefills,
+                );
                 let mixed_budget = deepseek4_mixed_work_budget(
                     decode_quantum,
                     deepseek4_has_runnable_decode(&slots, &decode_handles),
@@ -27544,6 +27612,41 @@ mod tests {
             deepseek4_mixed_work_budget(8, false).max_prefill_windows,
             None
         );
+        assert!(!deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            2,
+            Deepseek4MixedDecodeKind::ColdUnary,
+        ));
+        assert!(!deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            1,
+            Deepseek4MixedDecodeKind::ColdUnary,
+        ));
+        assert!(deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            0,
+            Deepseek4MixedDecodeKind::ColdUnary,
+        ));
+        assert!(deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Filling,
+            1,
+            Deepseek4MixedDecodeKind::ColdUnary,
+        ));
+        assert!(deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            2,
+            Deepseek4MixedDecodeKind::ColdStream,
+        ));
+        assert!(deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            2,
+            Deepseek4MixedDecodeKind::Warm,
+        ));
+        assert!(deepseek4_should_run_mixed_decode(
+            Deepseek4ColdCohortPhase::Draining,
+            2,
+            Deepseek4MixedDecodeKind::ParkedOrInvariant,
+        ));
         assert!(deepseek4_should_park_completion(true, 1));
         assert!(!deepseek4_should_park_completion(true, 0));
         assert!(!deepseek4_should_park_completion(false, 1));
@@ -27601,6 +27704,101 @@ mod tests {
             SchedulerStep::Decode { handles } => assert_eq!(handles, vec![short]),
             other => panic!("expected surviving short Decode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deepseek4_draining_cold_unary_wave_restores_bulk_prefill_until_last_prefill() {
+        let request = |prompt_tokens, max_tokens| AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+
+        let first_decode = scheduler
+            .admit(request(6_685, 64))
+            .expect("admit first cold-wave decoder")
+            .handle
+            .expect("first decode handle");
+        scheduler.advance_after_prefill(first_decode, 6_685);
+        let second_decode = scheduler
+            .admit(request(6_685, 64))
+            .expect("admit second cold-wave decoder")
+            .handle
+            .expect("second decode handle");
+        scheduler.advance_after_prefill(second_decode, 6_685);
+        let first_prefill = scheduler
+            .admit(request(6_685, 64))
+            .expect("admit first saturated prefill")
+            .handle
+            .expect("first prefill handle");
+        let second_prefill = scheduler
+            .admit(request(6_685, 64))
+            .expect("admit second saturated prefill")
+            .handle
+            .expect("second prefill handle");
+
+        let decode_handles = match scheduler.step().expect("saturated Mixed step") {
+            SchedulerStep::Mixed {
+                prefill,
+                decode_handles,
+                ..
+            } => {
+                assert!(prefill == first_prefill || prefill == second_prefill);
+                assert_eq!(decode_handles, vec![first_decode, second_decode]);
+                decode_handles
+            }
+            other => panic!("expected saturated Mixed, got {other:?}"),
+        };
+        assert!(decode_handles.iter().all(|_| {
+            !deepseek4_should_run_mixed_decode(
+                Deepseek4ColdCohortPhase::Draining,
+                2,
+                Deepseek4MixedDecodeKind::ColdUnary,
+            )
+        }));
+        assert_eq!(
+            deepseek4_mixed_work_budget(8, false),
+            Deepseek4MixedWorkBudget {
+                decode_quantum: 8,
+                max_prefill_windows: None,
+            },
+            "with every unary cold decoder deferred, prefill must restore its full transaction"
+        );
+        assert!(
+            !deepseek4_should_run_mixed_decode(
+                Deepseek4ColdCohortPhase::Draining,
+                1,
+                Deepseek4MixedDecodeKind::ColdUnary,
+            ),
+            "the 1-prefill/3-decode tail remains behind the same cold barrier"
+        );
+        assert!(
+            deepseek4_should_run_mixed_decode(
+                Deepseek4ColdCohortPhase::Draining,
+                0,
+                Deepseek4MixedDecodeKind::ColdUnary,
+            ),
+            "all cold decode resumes as soon as the final prefill commits"
+        );
+
+        let missing = SlotHandle {
+            slot_id: SlotId(0),
+            generation: 7,
+        };
+        assert_eq!(
+            deepseek4_mixed_decode_handles(
+                &[None],
+                &[missing],
+                Deepseek4ColdCohortPhase::Draining,
+                2,
+            ),
+            vec![missing],
+            "a missing installed slot must still reach decode_batch_deepseek4's invariant path"
+        );
     }
 
     #[test]

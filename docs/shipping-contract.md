@@ -49,12 +49,14 @@ family's graph, cache, or scheduler contract by approximation.
   meaningful cached suffixes use the same
   atomic resumable verifier transactions as cold prefill. Lopsided cold waves
   use an interactive budget of up to eight decode tokens between prefill slices
-  capped at two native windows; without a runnable decoder, the full
-  2,048-token prefill transaction is restored. Terminal completion remains
-  parked until the cohort barrier lifts. Outside a cold barrier, staggered warm
-  work may occupy any free physical slot. Cancellation restores only a valid,
-  position-consistent pre-request turn anchor; poisoned or inconsistent state
-  resets fully.
+  capped at two native windows. Once a full cold cohort enters its draining
+  phase, cold-wave unary decode is deferred while any cold prefill remains and
+  full 2,048-token transactions resume; unary output could not be delivered
+  before that barrier. Streaming and warm decode remain responsive. Without a
+  runnable visible decoder, the full prefill transaction is also restored.
+  Outside a cold-cohort barrier, staggered warm work may occupy any free
+  physical slot. Cancellation restores only a valid, position-consistent
+  pre-request turn anchor; poisoned or inconsistent state resets fully.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
   independently observed transaction deadline that never returns, fails the
   affected Qwen, Gemma, or DeepSeek worker closed. Every owned reply
