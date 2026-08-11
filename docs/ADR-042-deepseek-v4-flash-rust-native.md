@@ -9,8 +9,9 @@
   release run. One exact-packed wave exposed and corrected a thermal-order
   defect in that release gate; the next thermally valid wave isolated a
   saturated-cold scheduling regression. The bounded mixed-work replacement,
-  saturated-cold barrier, and cache lifecycle remain release candidates
-  pending immutable packed-artifact hardware proof.
+  saturated-cold barrier, paired-prefill schedule, and cold-cohort thermal
+  evidence boundary remain release candidates pending immutable
+  packed-artifact hardware proof.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1343,6 +1344,41 @@ The canonical launcher now refines only processes whose RSS crosses the 8 GiB
 ceiling and falls back to that conservative RSS value if `footprint` is absent,
 fails, exits during inspection, or returns malformed output. This changes no
 model/cache budget and does not authorize co-resident inference runtimes.
+
+### Cold-cohort thermal evidence boundary (2026-08-11 candidate)
+
+Local exact-packed probes of hf2q source `db2d7750d0e2a5b2b364fe2324cca9334cdcf652`
+used packed binary SHA-256
+`3a4202c26b66c8dae1a4a2e8b9f6364b7906792cd0708f5b21005d7857ce4093`.
+The paired large-prefill route engaged in every fresh process. Four diagnostic
+waves published all four atomic cold receipts with zero reuse and maximum cold
+semantic walls of 52.875, 52.848, 51.132, and 51.193 seconds. Their first
+non-Nominal samples arrived only at 80, 79, 84, and 77 seconds respectively,
+after the calibrated cold cohort had finished. The fourth attempt began after
+304 uninterrupted seconds of unloaded-host Nominal samples, so residual heat
+and the remote-inference coding client were not the cause. The combined
+cold/cached/SSE/tool sequence itself eventually moved macOS to `fair`.
+
+Those runs are diagnostic, not acceptance receipts: the then-current wrapper
+defined the thermal envelope as the complete 24-request functional sequence
+and correctly invalidated every non-Nominal run. They exposed an evidence
+boundary that was broader than the comparative claim. The paired primitive is
+selected only by large prefill; later cached, SSE, and tool-result turns prove
+cache and semantic correctness under independent upper bounds rather than the
+55-second cold comparison.
+
+The candidate wrapper therefore preserves the exact workload and request
+ordering but ends calibrated thermal measurement only after all four nonempty
+`agent-*.cold.json` receipts exist. It does not pause agents: cached work may
+still overlap the cold tail exactly as before. Any non-Nominal sample, probe
+failure, telemetry gap, producer exit, timeout, missing receipt, or excess
+receipt before that boundary fails closed. The thermal receipt records and
+rehashes the four cold-receipt filenames and SHA-256 digests. The same live
+server and KV sessions must then finish cached unary/SSE, automatic tool
+choice, and tool-result continuation under the unchanged latency, reuse, and
+semantic gates. Two thermally valid waves from the newly sealed exact package,
+plus the 94,576-token overlap/lifecycle gate, remain required before this
+optimization is accepted.
 
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 

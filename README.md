@@ -309,6 +309,15 @@ path. This is a candidate prefill optimization until the exact packed hf2q
 hardware gates below prove end-to-end quality and latency; the native
 primitive's focused benchmark is not a substitute.
 
+The calibrated DeepSeek release envelope measures macOS thermal state through
+the four atomic cold receipts, which is the phase that exercises large
+prefill. It does not pause or reorder the agents: cached requests may still
+overlap the cold tail exactly as in the frozen workload. The same live server
+then completes cached unary/SSE, automatic tool choice, and tool-result
+continuation under their unchanged latency and semantic limits. Receipt names
+and hashes bind the thermal boundary; any non-Nominal sample before all four
+cold receipts still fails closed.
+
 `scripts/test_deepseek4_cached_suffix.sh` is the focused Apple-Silicon gate for
 that contract. It overlaps a three-transaction cached tool-result suffix with
 a live SSE decoder, then disconnects a separate cached suffix at transaction

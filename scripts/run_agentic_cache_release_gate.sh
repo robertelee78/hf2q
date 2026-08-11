@@ -68,6 +68,7 @@ power_pid=""
 caffeinate_pid=""
 thermal_pid=""
 thermal_stop_file=""
+wave_harness_pid=""
 
 require_ac() {
   local state
@@ -131,6 +132,14 @@ stop_server() {
 
 cleanup() {
   local cleanup_rc=0
+  if [[ -n "$wave_harness_pid" ]]; then
+    kill -TERM "$wave_harness_pid" 2>/dev/null || true
+    # Closing the server makes any in-flight curl return promptly before the
+    # harness parent is reaped. A second stop_server below is then a no-op.
+    stop_server || cleanup_rc=1
+    wait "$wave_harness_pid" 2>/dev/null || true
+    wave_harness_pid=""
+  fi
   if [[ -n "$thermal_stop_file" ]]; then
     : >"$thermal_stop_file"
   fi
@@ -329,6 +338,7 @@ run_deepseek_wave() {
   local thermal_measurement_log="$thermal_dir/measurement.log"
   local thermal_settle_log="$thermal_dir/settle.log"
   local thermal_summary="$thermal_dir/summary.json"
+  local cold_receipts_json
   local measurement_samples
   local measurement_duration_seconds
   local non_nominal_measurement_samples
@@ -340,26 +350,19 @@ run_deepseek_wave() {
   local maximum_sample_gap_seconds=5
   local settle_sample_interval_seconds=5
   local maximum_settle_sample_gap_seconds=8
-  mkdir -p "$out"
-  mkdir -p "$thermal_dir"
+  mkdir -p "$out" "$thermal_dir"
+  thermal_prepare_cold_receipt_dir "$out/agents"
   require_no_model_runtime
   thermal_wait_for_nominal "$thermal_settle_log" "deepseek-wave-${wave}-settle" \
     60 900 "$settle_sample_interval_seconds"
   start_server deepseek "process-wave-$wave" scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
-  thermal_stop_file="$thermal_dir/stop"
-  rm -f "$thermal_stop_file"
   : >"$thermal_measurement_log"
   thermal_sample "$thermal_measurement_log" \
     "deepseek-wave-${wave}-measurement-start"
   test "$THERMAL_STATE" = nominal
-  thermal_monitor_nominal "$thermal_measurement_log" \
-    "deepseek-wave-${wave}-measurement" "$thermal_stop_file" \
-    "$sample_interval_seconds" &
-  thermal_pid=$!
   # Preserve the prompt-visible path used by the exact 863ea423 calibration.
   # The simulated tool result still comes from the packed candidate below.
-  set +e
   BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
   WAVE_ID=default REQUIRE_COLD_FIRST=1 \
   EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
@@ -372,22 +375,23 @@ run_deepseek_wave() {
   MAX_CACHED_SEMANTIC_MS=15000 MAX_TOOL_RESULT_RESPONSE_MS=35000 \
   CURL_CONNECT_TIMEOUT_SECONDS=5 CURL_MAX_TIME_SECONDS=90 \
   OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
-    >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+    >"$out/summary.json.tmp" 2>"$out/harness.stderr" &
+  wave_harness_pid=$!
+  set +e
+  thermal_monitor_nominal_until_cold_receipts "$thermal_measurement_log" \
+    "deepseek-wave-${wave}-measurement" "$out/agents" 4 \
+    "$sample_interval_seconds" 120 "$wave_harness_pid"
+  thermal_rc=$?
+  if ((thermal_rc != 0)); then
+    kill -TERM "$wave_harness_pid" 2>/dev/null || true
+    stop_server || true
+  fi
+  wait "$wave_harness_pid"
   harness_rc=$?
+  wave_harness_pid=""
   set -e
-  : >"$thermal_stop_file"
-  if ! wait "$thermal_pid"; then
-    thermal_rc=1
-  fi
-  if ! thermal_sample "$thermal_measurement_log" \
-    "deepseek-wave-${wave}-measurement-end" \
-    || [[ "$THERMAL_STATE" != nominal ]]; then
-    thermal_rc=1
-  fi
-  thermal_pid=""
-  thermal_stop_file=""
   ((thermal_rc == 0)) || {
-    echo "DeepSeek wave $wave thermal monitor failed" >&2
+    echo "DeepSeek wave $wave cold-cohort thermal monitor failed" >&2
     return 1
   }
   ((harness_rc == 0)) || return "$harness_rc"
@@ -402,6 +406,24 @@ run_deepseek_wave() {
   settle_samples=$THERMAL_LOG_SAMPLES
   settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
   settle_telemetry_gaps=$THERMAL_LOG_GAPS
+  cold_receipts_json=$(
+    for receipt in "$out"/agents/agent-*.cold.json; do
+      [[ -s "$receipt" ]] || {
+        echo "missing DeepSeek cold receipt: $receipt" >&2
+        exit 1
+      }
+      jq -n --arg name "$(basename "$receipt")" \
+        --arg sha256 "$(sha256_file "$receipt")" \
+        '{name:$name,sha256:$sha256}'
+    done | jq -s 'sort_by(.name)'
+  )
+  jq -e '
+    length == 4
+    and ([.[].name] | unique | length) == 4
+    and all(.[];
+      (.name | test("^agent-[1-4]\\.cold\\.json$"))
+      and (.sha256 | test("^[0-9a-f]{64}$")))
+  ' <<<"$cold_receipts_json" >/dev/null
   jq -n --arg status pass --arg phase "deepseek-wave-$wave" \
     --arg settle_log_sha256 "$(sha256_file "$thermal_settle_log")" \
     --arg measurement_log_sha256 "$(sha256_file "$thermal_measurement_log")" \
@@ -417,7 +439,9 @@ run_deepseek_wave() {
     --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
     --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
     --argjson telemetry_gaps "$telemetry_gaps" \
+    --argjson cold_receipts "$cold_receipts_json" \
     '{status:$status,phase:$phase,required_state:"nominal",runtime_preflight:"pass",
+      measurement_scope:"cold-cohort",cold_receipts:$cold_receipts,
       settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
       settle_samples:$settle_samples,measurement_samples:$measurement_samples,
       measurement_duration_seconds:$measurement_duration_seconds,
@@ -458,7 +482,8 @@ run_deepseek_wave() {
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
   scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \
-    "$thermal_summary" "$thermal_measurement_log" "$thermal_settle_log"
+    "$thermal_summary" "$thermal_measurement_log" "$thermal_settle_log" \
+    "$out/agents"
 }
 
 run_deepseek_release_gates() {

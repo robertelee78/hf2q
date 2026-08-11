@@ -81,6 +81,76 @@ if thermal_monitor_nominal "$tmp_dir/probe-failure.log" probe-failure \
   exit 1
 fi
 
+# Cold-cohort measurement ends only after the exact number of non-empty,
+# atomically published cold receipts exists. Later functional phases are not
+# part of the calibrated thermal envelope.
+cold_prepared="$tmp_dir/cold-prepared"
+thermal_prepare_cold_receipt_dir "$cold_prepared"
+test -d "$cold_prepared"
+printf '{}\n' >"$cold_prepared/agent-1.cold.json"
+if thermal_prepare_cold_receipt_dir "$cold_prepared"; then
+  echo "cold thermal setup accepted stale receipt evidence" >&2
+  exit 1
+fi
+
+cold_receipts="$tmp_dir/cold-receipts"
+mkdir -p "$cold_receipts"
+printf '{}\n' >"$cold_receipts/agent-1.cold.json"
+printf '{}\n' >"$cold_receipts/agent-2.cold.json"
+thermal_read_state() { THERMAL_STATE=nominal; }
+thermal_monitor_nominal_until_cold_receipts \
+  "$tmp_dir/cold-complete.log" cold-complete "$cold_receipts" 2 0 1
+test "$(tail -1 "$tmp_dir/cold-complete.log" | awk -F '\t' '{print $3}')" = \
+  cold-complete-end
+
+cold_partial="$tmp_dir/cold-partial"
+mkdir -p "$cold_partial"
+printf '{}\n' >"$cold_partial/agent-1.cold.json"
+if thermal_monitor_nominal_until_cold_receipts \
+  "$tmp_dir/cold-partial.log" cold-partial "$cold_partial" 2 0 0; then
+  echo "cold thermal monitor accepted an incomplete receipt cohort" >&2
+  exit 1
+fi
+
+cold_excess="$tmp_dir/cold-excess"
+mkdir -p "$cold_excess"
+for agent in 1 2 3; do
+  printf '{}\n' >"$cold_excess/agent-${agent}.cold.json"
+done
+if thermal_monitor_nominal_until_cold_receipts \
+  "$tmp_dir/cold-excess.log" cold-excess "$cold_excess" 2 0 1; then
+  echo "cold thermal monitor accepted excess receipts" >&2
+  exit 1
+fi
+
+cold_wrong_set="$tmp_dir/cold-wrong-set"
+mkdir -p "$cold_wrong_set"
+printf '{}\n' >"$cold_wrong_set/agent-1.cold.json"
+printf '{}\n' >"$cold_wrong_set/agent-3.cold.json"
+if thermal_monitor_nominal_until_cold_receipts \
+  "$tmp_dir/cold-wrong-set.log" cold-wrong-set "$cold_wrong_set" 2 0 1; then
+  echo "cold thermal monitor accepted the wrong exact receipt set" >&2
+  exit 1
+fi
+
+thermal_read_state() { THERMAL_STATE=fair; }
+if thermal_monitor_nominal_until_cold_receipts \
+  "$tmp_dir/cold-fair.log" cold-fair "$cold_receipts" 2 0 1; then
+  echo "cold thermal monitor accepted non-Nominal terminal telemetry" >&2
+  exit 1
+fi
+
+thermal_read_state() { THERMAL_STATE=nominal; }
+(exit 0) &
+dead_producer=$!
+wait "$dead_producer"
+if thermal_monitor_nominal_until_cold_receipts \
+  "$tmp_dir/cold-dead.log" cold-dead "$cold_partial" 2 0 1 \
+  "$dead_producer"; then
+  echo "cold thermal monitor waited after its receipt producer exited" >&2
+  exit 1
+fi
+
 # Malformed telemetry and probe failure are fail-closed.
 thermal_read_state() { THERMAL_STATE=unknown; return 1; }
 if thermal_wait_for_nominal "$tmp_dir/malformed.log" malformed-test 0 1 0; then
@@ -127,7 +197,11 @@ fi
 # A complete receipt binds path, wave, summary object, hashes, schema, and log
 # phase columns. Stale or cross-wave objects must fail even when re-hashed.
 receipt_dir="$tmp_dir/receipt"
-mkdir -p "$receipt_dir"
+mkdir -p "$receipt_dir/agents"
+for agent in 1 2 3 4; do
+  printf '{"agent":%s,"status":"pass"}\n' "$agent" \
+    >"$receipt_dir/agents/agent-${agent}.cold.json"
+done
 for epoch in $(seq 100 5 160); do
   printf '%s\tnominal\tdeepseek-wave-1-settle\n' "$epoch"
 done >"$receipt_dir/settle.log"
@@ -139,10 +213,19 @@ printf '204\tnominal\tdeepseek-wave-1-measurement-end\n' \
   >>"$receipt_dir/measurement.log"
 settle_sha=$(shasum -a 256 "$receipt_dir/settle.log" | awk '{print $1}')
 measurement_sha=$(shasum -a 256 "$receipt_dir/measurement.log" | awk '{print $1}')
-jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" '
+cold_receipts=$(
+  for receipt in "$receipt_dir"/agents/agent-*.cold.json; do
+    jq -n --arg name "$(basename "$receipt")" \
+      --arg sha256 "$(shasum -a 256 "$receipt" | awk '{print $1}')" \
+      '{name:$name,sha256:$sha256}'
+  done | jq -s 'sort_by(.name)'
+)
+jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" \
+  --argjson cold_receipts "$cold_receipts" '
   {
     status:"pass", phase:"deepseek-wave-1", required_state:"nominal",
-    runtime_preflight:"pass",
+    runtime_preflight:"pass", measurement_scope:"cold-cohort",
+    cold_receipts:$cold_receipts,
     settle_seconds:60, settle_duration_seconds:60, settle_samples:13,
     measurement_samples:3, measurement_duration_seconds:4,
     sample_interval_seconds:2, maximum_sample_gap_seconds:5,
@@ -156,12 +239,14 @@ jq -n --argjson wave 1 --slurpfile thermal "$receipt_dir/summary.json" \
   '{wave:$wave,thermal:$thermal[0]}' >"$receipt_dir/envelope.json"
 bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/envelope.json" "$receipt_dir/summary.json" \
-  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" >/dev/null
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
+  "$receipt_dir/agents" >/dev/null
 
 jq '.wave = 2' "$receipt_dir/envelope.json" >"$receipt_dir/wrong-wave.json"
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/wrong-wave.json" "$receipt_dir/summary.json" \
-  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" >/dev/null 2>&1; then
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
+  "$receipt_dir/agents" >/dev/null 2>&1; then
   echo "thermal receipt accepted the wrong wave" >&2
   exit 1
 fi
@@ -172,10 +257,35 @@ jq --slurpfile thermal "$receipt_dir/stale-summary.json" \
   >"$receipt_dir/stale-envelope.json"
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/stale-envelope.json" "$receipt_dir/stale-summary.json" \
-  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" >/dev/null 2>&1; then
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
+  "$receipt_dir/agents" >/dev/null 2>&1; then
   echo "thermal receipt accepted a stale schema" >&2
   exit 1
 fi
+jq 'del(.measurement_scope)' "$receipt_dir/summary.json" \
+  >"$receipt_dir/no-scope-summary.json"
+jq --slurpfile thermal "$receipt_dir/no-scope-summary.json" \
+  '.thermal = $thermal[0]' "$receipt_dir/envelope.json" \
+  >"$receipt_dir/no-scope-envelope.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/no-scope-envelope.json" "$receipt_dir/no-scope-summary.json" \
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
+  "$receipt_dir/agents" >/dev/null 2>&1; then
+  echo "thermal receipt accepted a missing cold-cohort scope" >&2
+  exit 1
+fi
+printf '{"agent":1,"status":"mutated"}\n' \
+  >"$receipt_dir/agents/agent-1.cold.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/envelope.json" "$receipt_dir/summary.json" \
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
+  "$receipt_dir/agents" >/dev/null 2>&1; then
+  echo "thermal receipt accepted mutated cold evidence" >&2
+  exit 1
+fi
+# Restore the valid cold receipt for the remaining phase-column mutation.
+printf '{"agent":1,"status":"pass"}\n' \
+  >"$receipt_dir/agents/agent-1.cold.json"
 awk -F '\t' 'BEGIN { OFS = "\t" } NR == 2 { $3 = "deepseek-wave-2-measurement" } { print }' \
   "$receipt_dir/measurement.log" >"$receipt_dir/wrong-phase.log"
 wrong_phase_sha=$(shasum -a 256 "$receipt_dir/wrong-phase.log" | awk '{print $1}')
@@ -186,7 +296,8 @@ jq --slurpfile thermal "$receipt_dir/wrong-phase-summary.json" \
   >"$receipt_dir/wrong-phase-envelope.json"
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/wrong-phase-envelope.json" "$receipt_dir/wrong-phase-summary.json" \
-  "$receipt_dir/wrong-phase.log" "$receipt_dir/settle.log" >/dev/null 2>&1; then
+  "$receipt_dir/wrong-phase.log" "$receipt_dir/settle.log" \
+  "$receipt_dir/agents" >/dev/null 2>&1; then
   echo "thermal receipt accepted a cross-wave log phase" >&2
   exit 1
 fi

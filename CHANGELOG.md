@@ -100,12 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Run the two calibrated DeepSeek four-agent waves before the long functional
   lifecycle heat-soaks the M5 runner. Each wave now requires at least 60
   seconds of Nominal samples at five-second cadence with no hf2q/llama model
-  runtime loaded,
-  then fails if two-second in-wave telemetry
-  becomes non-Nominal, malformed, or unavailable during measurement. Receipts
-  bind the thermal sample logs, while curl supplies high-resolution response
-  timing, and the cohort parent immediately reports a child that exits before
-  publishing its cold receipt.
+  runtime loaded, then fails if two-second telemetry becomes non-Nominal,
+  malformed, or unavailable before all four atomic cold receipts arrive. The
+  workload is not paused or reordered; cached work may overlap the cold tail as
+  before. Thermal receipts bind all four cold-receipt names and hashes, while
+  the same live cache must still finish cached unary/SSE, automatic tool
+  choice, and tool-result continuation under unchanged limits. The cohort
+  parent immediately reports a child that exits before publishing its cold
+  receipt.
 - Add a developer-only matched llama.cpp cold-wave discriminator for the
   frozen DeepSeek fixture. It binds peer binary/model/request identity, exact
   zero-cache `read_file` semantics, runtime-specific prompt-token counts,

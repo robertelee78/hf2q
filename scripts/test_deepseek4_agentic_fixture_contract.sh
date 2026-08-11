@@ -6,6 +6,8 @@ BUILDER="$ROOT_DIR/scripts/deepseek4_agentic_request.jq"
 FIXTURE="$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt"
 FIXTURE_SHA256=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
 FIXTURE_CHARS=20584
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 
 for command in cmp grep head jq ln shasum tail; do
   command -v "$command" >/dev/null || {
@@ -246,6 +248,7 @@ cat >"$aggregate_root/scripts/test_deepseek4_agentic.sh" <<'EOF'
 set -euo pipefail
 jq -n '{status:"pass", prompt_tokens:6685, cold_cached_tokens:0}' \
   >"$COLD_RESULT_PATH"
+sleep 2
 jq -n --arg run_id "$RUN_ID" '{
   status:"pass",
   fixture_id:"full-context-agentic-v1",
@@ -262,9 +265,22 @@ jq -n --arg run_id "$RUN_ID" '{
 }'
 EOF
 chmod +x "$aggregate_root/scripts/test_deepseek4_agentic.sh"
+thermal_read_state() { THERMAL_STATE=nominal; }
+mkdir -p "$aggregate_root/receipts"
 FAMILY=deepseek4 AGENTS=4 OUT_DIR="$aggregate_root/receipts" \
   bash "$aggregate_root/scripts/test_full_context_agent_slots.sh" \
-  >"$aggregate_root/summary.json"
+  >"$aggregate_root/summary.json" &
+aggregate_pid=$!
+thermal_monitor_nominal_until_cold_receipts \
+  "$aggregate_root/cold-measurement.log" fixture-cold \
+  "$aggregate_root/receipts" 4 0 5 "$aggregate_pid"
+if ! kill -0 "$aggregate_pid" 2>/dev/null; then
+  echo "cold thermal scope did not end before functional receipts" >&2
+  exit 1
+fi
+wait "$aggregate_pid"
+test "$(tail -1 "$aggregate_root/cold-measurement.log" \
+  | awk -F '\t' '{print $3}')" = fixture-cold-end
 jq -e '
   .status == "pass"
   and .concurrent_agents == 4

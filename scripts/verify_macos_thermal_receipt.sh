@@ -6,6 +6,7 @@ envelope=${2:?envelope path is required}
 summary=${3:?thermal summary path is required}
 measurement_log=${4:?measurement log path is required}
 settle_log=${5:?settle log path is required}
+cold_receipt_dir=${6:?cold receipt directory is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -21,6 +22,10 @@ for path in "$envelope" "$summary" "$measurement_log" "$settle_log"; do
     exit 1
   }
 done
+[[ -d "$cold_receipt_dir" ]] || {
+  echo "cold receipt directory is missing: $cold_receipt_dir" >&2
+  exit 1
+}
 
 phase="deepseek-wave-$wave"
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -34,6 +39,14 @@ jq -e --arg phase "$phase" '
   and .phase == $phase
   and .required_state == "nominal"
   and .runtime_preflight == "pass"
+  and .measurement_scope == "cold-cohort"
+  and (.cold_receipts | type) == "array"
+  and (.cold_receipts | length) == 4
+  and ([.cold_receipts[].name] | unique | length) == 4
+  and all(.cold_receipts[];
+    (.name | test("^agent-[1-4]\\.cold\\.json$"))
+    and (.sha256 | type) == "string"
+    and (.sha256 | test("^[0-9a-f]{64}$")))
   and (.settle_seconds | type) == "number" and .settle_seconds == 60
   and (.settle_duration_seconds | type) == "number"
   and .settle_duration_seconds >= .settle_seconds
@@ -64,6 +77,10 @@ test "$(sha256_file "$measurement_log")" = \
   "$(jq -er .measurement_log_sha256 "$summary")"
 test "$(sha256_file "$settle_log")" = \
   "$(jq -er .settle_log_sha256 "$summary")"
+while IFS=$'\t' read -r name expected_sha; do
+  [[ "$name" =~ ^agent-[1-4]\.cold\.json$ ]]
+  test "$(sha256_file "$cold_receipt_dir/$name")" = "$expected_sha"
+done < <(jq -r '.cold_receipts[] | [.name, .sha256] | @tsv' "$summary")
 
 thermal_validate_measurement_log "$measurement_log" 5
 test "$THERMAL_LOG_SAMPLES" = "$(jq -er .measurement_samples "$summary")"

@@ -112,7 +112,7 @@ jobs:
             thermal_settle_log="$wave_dir/thermal/settle.log"
             bash scripts/verify_macos_thermal_receipt.sh "$wave" \
               "$wave_dir/envelope.json" "$thermal_summary" \
-              "$thermal_log" "$thermal_settle_log"
+              "$thermal_log" "$thermal_settle_log" "$wave_dir/agents"
           done
           check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
           check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
@@ -203,6 +203,13 @@ jobs:
                  and .thermal.status == "pass"
                  and .thermal.required_state == "nominal"
                  and .thermal.runtime_preflight == "pass"
+                 and .thermal.measurement_scope == "cold-cohort"
+                 and (.thermal.cold_receipts | type) == "array"
+                 and (.thermal.cold_receipts | length) == 4
+                 and ([.thermal.cold_receipts[].name] | unique | length) == 4
+                 and all(.thermal.cold_receipts[];
+                   (.name | test("^agent-[1-4]\\.cold\\.json$"))
+                   and (.sha256 | test("^[0-9a-f]{64}$")))
                  and (.thermal.settle_seconds | type) == "number"
                  and .thermal.settle_seconds >= 60
                  and (.thermal.settle_duration_seconds | type) == "number"
