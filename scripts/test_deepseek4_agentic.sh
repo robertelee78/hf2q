@@ -20,14 +20,20 @@ MAX_COLD_RESPONSE_MS=${MAX_COLD_RESPONSE_MS:-40000}
 MAX_CACHED_RESPONSE_MS=${MAX_CACHED_RESPONSE_MS:-10000}
 MAX_CACHED_SEMANTIC_MS=${MAX_CACHED_SEMANTIC_MS:-10000}
 MAX_TOOL_RESULT_RESPONSE_MS=${MAX_TOOL_RESULT_RESPONSE_MS:-$MAX_CACHED_RESPONSE_MS}
+AGENTIC_CONTEXT_FIXTURE=${AGENTIC_CONTEXT_FIXTURE:-$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt}
+AGENTIC_CONTEXT_FIXTURE_SHA256=${AGENTIC_CONTEXT_FIXTURE_SHA256:-2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef}
+AGENTIC_FIXTURE_ID=${AGENTIC_FIXTURE_ID:-full-context-agentic-v1}
+EXPECTED_PROMPT_TOKENS=${EXPECTED_PROMPT_TOKENS:-0}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-60}
 MAX_TOKENS=${MAX_TOKENS:-128}
 SOURCE_MAX_TOKENS=${SOURCE_MAX_TOKENS:-256}
 SENTINEL=${SENTINEL:-SENTINEL_CARGO_HF2Q_AGENTIC}
 EXPECTED_SOURCE=${EXPECTED_SOURCE:-"fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result"}
+HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT=${HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT:-}
+COLD_RESULT_PATH=${COLD_RESULT_PATH:-}
 
-for command in curl date jq rg; do
+for command in curl date jq rg shasum; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -44,10 +50,32 @@ for setting in MAX_TOKENS SOURCE_MAX_TOKENS CURL_CONNECT_TIMEOUT_SECONDS CURL_MA
     exit 2
   fi
 done
+[[ "$EXPECTED_PROMPT_TOKENS" == 0 || "$EXPECTED_PROMPT_TOKENS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "EXPECTED_PROMPT_TOKENS must be zero or a positive integer (got: $EXPECTED_PROMPT_TOKENS)" >&2
+  exit 2
+}
+[[ "$AGENTIC_FIXTURE_ID" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "AGENTIC_FIXTURE_ID contains unsupported characters: $AGENTIC_FIXTURE_ID" >&2
+  exit 2
+}
 [[ "$REQUIRE_COLD_FIRST" == 0 || "$REQUIRE_COLD_FIRST" == 1 ]] || {
   echo "REQUIRE_COLD_FIRST must be 0 or 1 (got: $REQUIRE_COLD_FIRST)" >&2
   exit 2
 }
+[[ -r "$AGENTIC_CONTEXT_FIXTURE" ]] || {
+  echo "agentic context fixture is not readable: $AGENTIC_CONTEXT_FIXTURE" >&2
+  exit 2
+}
+[[ "$AGENTIC_CONTEXT_FIXTURE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "AGENTIC_CONTEXT_FIXTURE_SHA256 must be a lowercase SHA-256 digest" >&2
+  exit 2
+}
+actual_context_fixture_sha256=$(shasum -a 256 "$AGENTIC_CONTEXT_FIXTURE" | awk '{print $1}')
+if [[ "$actual_context_fixture_sha256" != "$AGENTIC_CONTEXT_FIXTURE_SHA256" ]]; then
+  echo "agentic context fixture SHA-256 mismatch: expected $AGENTIC_CONTEXT_FIXTURE_SHA256, got $actual_context_fixture_sha256" >&2
+  exit 2
+fi
+agentic_context_fixture_bytes=$(wc -c <"$AGENTIC_CONTEXT_FIXTURE" | tr -d '[:space:]')
 
 request_file=$(mktemp -t hf2q-deepseek-agentic-request.XXXXXX)
 first_file=$(mktemp -t hf2q-deepseek-agentic-first.XXXXXX)
@@ -71,39 +99,17 @@ trap cleanup EXIT
 
 cd "$ROOT_DIR"
 
-jq -n --rawfile repo README.md \
+repository_context_chars=$(jq -Rs 'length' "$AGENTIC_CONTEXT_FIXTURE")
+
+jq -n --rawfile repo "$AGENTIC_CONTEXT_FIXTURE" \
   --argjson max_tokens "$MAX_TOKENS" \
   --arg model "$MODEL" --arg expected_path "$EXPECTED_PATH" --arg run_id "$RUN_ID" \
-  --arg sentinel "$SENTINEL" '{
-    model: $model,
-    messages: [
-      {
-        role: "system",
-        content: "You are an agentic coding assistant. Use the provided tool to inspect files before answering."
-      },
-      {
-        role: "user",
-        content: ("Agentic acceptance run " + $run_id + ". Inspect this Rust repository context and read " + $expected_path + " before making any recommendation. The requested manifest is intentionally not embedded; use read_file with exactly that absolute path. After read_file succeeds, reply with exactly " + $sentinel + " and nothing else. Repository context follows:\n\n" + $repo)
-      }
-    ],
-    tools: [{
-      type: "function",
-      function: {
-        name: "read_file",
-        description: "Read a UTF-8 text file from the local workspace",
-        parameters: {
-          type: "object",
-          properties: {path: {type: "string", description: "Absolute file path"}},
-          required: ["path"],
-          additionalProperties: false
-        }
-      }
-    }],
-    tool_choice: "required",
-    temperature: 0,
-    max_tokens: $max_tokens,
-    stream: false
-  }' >"$request_file"
+  --arg sentinel "$SENTINEL" \
+  -f scripts/deepseek4_agentic_request.jq >"$request_file"
+if [[ -n "$HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT" ]]; then
+  cp "$request_file" "$HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT"
+  exit 0
+fi
 
 post_json() {
   local input=$1
@@ -149,6 +155,11 @@ cold_response_ms=$(( $(epoch_ms) - cold_started ))
 assert_tool_path "$first_file"
 
 cold_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$first_file")
+prompt_tokens=$(jq -r '.usage.prompt_tokens' "$first_file")
+if (( EXPECTED_PROMPT_TOKENS > 0 && prompt_tokens != EXPECTED_PROMPT_TOKENS )); then
+  echo "agentic gate failed: rendered prompt has $prompt_tokens tokens; expected exactly $EXPECTED_PROMPT_TOKENS" >&2
+  exit 1
+fi
 if [[ "$REQUIRE_COLD_FIRST" == 1 ]] && (( cold_cached != 0 )); then
   echo "agentic gate failed: first request was not cold (cached_tokens=$cold_cached)" >&2
   exit 1
@@ -161,6 +172,23 @@ awk -v actual="$cold_ttft" -v limit="$MAX_COLD_TTFT_MS" 'BEGIN { exit !(actual >
 if (( cold_response_ms > MAX_COLD_RESPONSE_MS )); then
   echo "agentic gate failed: cold semantic response took ${cold_response_ms}ms; limit is ${MAX_COLD_RESPONSE_MS}ms" >&2
   exit 1
+fi
+if [[ -n "$COLD_RESULT_PATH" ]]; then
+  cold_result_tmp="${COLD_RESULT_PATH}.tmp.$$"
+  jq -n \
+    --arg fixture_id "$AGENTIC_FIXTURE_ID" \
+    --arg fixture_sha256 "$actual_context_fixture_sha256" \
+    --argjson fixture_bytes "$agentic_context_fixture_bytes" \
+    --argjson prompt_tokens "$prompt_tokens" \
+    --argjson cold_cached_tokens "$cold_cached" \
+    --argjson cold_ttft_ms "$cold_ttft" \
+    --argjson cold_semantic_response_ms "$cold_response_ms" \
+    '{status:"pass",fixture_id:$fixture_id,fixture_sha256:$fixture_sha256,
+      fixture_bytes:$fixture_bytes,prompt_tokens:$prompt_tokens,
+      cold_cached_tokens:$cold_cached_tokens,cold_ttft_ms:$cold_ttft_ms,
+      cold_semantic_response_ms:$cold_semantic_response_ms}' \
+    >"$cold_result_tmp"
+  mv "$cold_result_tmp" "$COLD_RESULT_PATH"
 fi
 
 cached_started=$(epoch_ms)
@@ -183,7 +211,11 @@ if ! jq -e -n --slurpfile cold "$first_file" --slurpfile cached "$second_file" '
   exit 1
 fi
 
-prompt_tokens=$(jq -r '.usage.prompt_tokens' "$second_file")
+cached_prompt_tokens=$(jq -r '.usage.prompt_tokens' "$second_file")
+if (( cached_prompt_tokens != prompt_tokens )); then
+  echo "agentic gate failed: repeated request token count changed from $prompt_tokens to $cached_prompt_tokens" >&2
+  exit 1
+fi
 cached_tokens=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$second_file")
 cached_ttft=$(jq -r '.x_hf2q_timing.time_to_first_token_ms // -1' "$second_file")
 minimum_cached=$((prompt_tokens - 32))
@@ -390,6 +422,12 @@ if ! jq -e --arg expected "$EXPECTED_SOURCE" '
 fi
 
 jq -n \
+  --arg fixture_id "$AGENTIC_FIXTURE_ID" \
+  --arg agentic_context_fixture_sha256 "$actual_context_fixture_sha256" \
+  --argjson agentic_context_fixture_bytes "$agentic_context_fixture_bytes" \
+  --argjson repository_context_chars "$repository_context_chars" \
+  --arg expected_path "$EXPECTED_PATH" \
+  --argjson expected_prompt_tokens "$EXPECTED_PROMPT_TOKENS" \
   --argjson cold_cached_tokens "$cold_cached" \
   --argjson require_cold_first "$REQUIRE_COLD_FIRST" \
   --argjson prompt_tokens "$prompt_tokens" \
@@ -405,6 +443,18 @@ jq -n \
   --argjson continuation_response_ms "$continuation_response_ms" \
   --argjson source_response_ms "$source_response_ms" '{
     status: "pass",
+    fixture_id: $fixture_id,
+    agentic_context_fixture_sha256: $agentic_context_fixture_sha256,
+    agentic_context_fixture_bytes: $agentic_context_fixture_bytes,
+    repository_context_chars: $repository_context_chars,
+    expected_path: $expected_path,
+    expected_prompt_tokens: $expected_prompt_tokens,
+    tool_semantics_pass: true,
+    cached_replay_equal: true,
+    automatic_tool_call_pass: true,
+    sse_tool_call_pass: true,
+    tool_result_continuation_pass: true,
+    source_tool_syntax_pass: true,
     cold_cached_tokens: $cold_cached_tokens,
     require_cold_first: $require_cold_first,
     prompt_tokens: $prompt_tokens,

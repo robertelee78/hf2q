@@ -89,7 +89,7 @@ The shared cross-family changes additionally require:
 | Family | Candidate artifact gate |
 |---|---|
 | Gemma 4 | Eager-versus-resumed exact output parity at 4,096 boundaries and non-aligned tails; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
-| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the unchanged four-agent cold/cached/tool gate twice. |
+| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v1` fixture (SHA-256 `2c894c9e…b4ef`), exactly 6,685 rendered prompt tokens per agent, zero cold reuse, and the literal 55-second cold bounds. |
 | All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 
 ---

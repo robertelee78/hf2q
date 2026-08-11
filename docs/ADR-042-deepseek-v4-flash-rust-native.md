@@ -4,8 +4,10 @@
   cache growth revalidated 2026-08-08
 - **Updated:** 2026-08-10 — cross-family lifecycle review added active-prefix
   affinity, request-local rollback, and the DeepSeek Busy-only admission
-  no-spin correction. The bounded mixed-work replacement and cache lifecycle
-  are release candidates pending immutable packed-artifact hardware proof.
+  no-spin correction. The four-agent performance workload is now an immutable,
+  SHA-bound 6,685-token fixture after mutable README growth invalidated one
+  release run. The bounded mixed-work replacement and cache lifecycle remain
+  release candidates pending immutable packed-artifact hardware proof.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1129,6 +1131,36 @@ The atomic summary is under the host temporary receipt root
 hardware evidence for the two repaired invariants, not final release
 authority: a clean packed-artifact rerun and the unchanged full four-agent
 quality/performance gate remain required.
+
+### Four-agent workload identity correction (2026-08-10 candidate)
+
+Release run `31443407887` passed DeepSeek interactive overlap, terminal
+parking, three-transaction cached suffixes, three cancellation/rollback
+positions, and the generic 116K-token lifecycle, then failed the first
+four-agent cold wave at 80–85 seconds. That result was not comparable to the
+55-second calibration: `scripts/test_deepseek4_agentic.sh` embedded the entire
+mutable `README.md`, which had grown from 21,204 to 29,882 bytes. The rendered
+DeepSeek prompt therefore grew from 6,685 to 8,573 tokens. Scheduler policy had
+also changed since the earlier 52–54-second evidence, so the unmatched failure
+does not prove or clear a scheduler regression.
+
+The gate now reads the exact 21,204-byte calibration context from
+`scripts/fixtures/deepseek4-agentic-repo-context.txt`, SHA-256
+`2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef`.
+The release wrapper verifies that artifact before model startup, uses the
+stable logical tool path `/opt/hf2q/Cargo.toml`, and requires every cold agent
+to render exactly 6,685 tokens. Producer, aggregate, and publication checks all
+bind the fixture ID, digest, byte/character counts, exact prompt count, zero
+cold reuse, semantic/tool assertions, and literal 55,000 ms cold bounds. A
+model-free negative matrix rejects missing, mistyped, stale, off-by-one, or
+over-limit receipts.
+
+The 55-second bound is intentionally unchanged. A fresh exact-packed M5 Max
+rerun of the frozen request twice is the discriminator: success restores
+matched release authority; failure leaves a current-scheduler performance
+blocker that must be optimized or re-baselined against a same-input llama.cpp
+peer. This section records a candidate correction, not a passing hardware
+claim.
 
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 

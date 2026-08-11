@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DeepSeek cached-suffix cancellation, terminal parking, and two fresh
   four-agent waves. Release rehashes every downloaded receipt and validates
   the detailed evidence before registry credentials are exposed.
+- Freeze the four-agent agentic repository context to the exact 21,204-byte
+  calibration fixture instead of embedding the growing live README. The
+  producer and protected release path now require its fixture ID, SHA-256,
+  byte/character counts, exact 6,685-token DeepSeek render, zero cold reuse,
+  semantic/tool proof, and the literal 55-second cold limits; a model-free
+  negative matrix rejects stale or incomplete receipts.
 - Update vulnerable transitive dependencies (`crossbeam-epoch`,
   `quinn-proto`, `rkyv`, `anyhow`, `memmap2`, and the legacy Rustls chain via
   `ruvector-core 2.3`) and make a zero-vulnerability `cargo audit 0.22.2` run

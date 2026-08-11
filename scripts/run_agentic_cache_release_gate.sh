@@ -264,6 +264,11 @@ run_lifecycle() {
 }
 
 binary_sha=$(sha256_file "$HF2Q_BIN")
+agentic_fixture="$PWD/scripts/fixtures/deepseek4-agentic-repo-context.txt"
+agentic_fixture_sha=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
+test -f "$agentic_fixture"
+test "$(sha256_file "$agentic_fixture")" = "$agentic_fixture_sha"
+test "$(stat -f %z "$agentic_fixture")" = 21204
 verify_model deepseek "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256"
 verify_model gemma "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256"
 verify_model qwen "$QWEN_MODEL" "$QWEN_MODEL_SHA256"
@@ -287,24 +292,42 @@ run_deepseek_wave() {
   start_server deepseek "process-wave-$wave" scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
   BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
-  WAVE_ID="release-$wave" REQUIRE_COLD_FIRST=1 \
+  WAVE_ID=default REQUIRE_COLD_FIRST=1 \
+  EXPECTED_PATH=/opt/hf2q/Cargo.toml TOOL_RESULT_PATH="$PWD/Cargo.toml" \
+  AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6685 \
+  AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
+  AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
   MAX_COLD_TTFT_MS=55000 MAX_COLD_RESPONSE_MS=55000 \
   MAX_CACHED_TTFT_MS=5000 MAX_CACHED_RESPONSE_MS=15000 \
   MAX_CACHED_SEMANTIC_MS=15000 MAX_TOOL_RESULT_RESPONSE_MS=35000 \
   CURL_CONNECT_TIMEOUT_SECONDS=5 CURL_MAX_TIME_SECONDS=90 \
   OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
     >"$out/summary.json.tmp" 2>"$out/harness.stderr"
-  jq -e '.status == "pass" and .family == "deepseek4" and .concurrent_agents == 4 and (.agents | length) == 4' \
+  jq -e -f scripts/deepseek4_full_context_receipt.jq \
     "$out/summary.json.tmp" >/dev/null
   mv "$out/summary.json.tmp" "$out/summary.json"
   sha256_file "$out/summary.json" >"$out/summary.json.sha256"
   finish_server_phase
+  cold_prefill_rates_json=$(
+    for request_id in 1 2 3 4; do
+      rate=$(rg "DeepSeek-V4 prefill complete request_id=${request_id}( |$)" "$current_log" \
+        | head -1 | sed -n 's/.*tokens_per_second=\([^ ]*\).*/\1/p')
+      [[ "$rate" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        echo "missing DeepSeek cold prefill rate for request $request_id" >&2
+        exit 1
+      }
+      printf '%s\n' "$rate"
+    done | jq -Rsc 'split("\n") | map(select(length > 0) | tonumber)'
+  )
+  jq -e 'length == 4 and all(.[]; type == "number" and . > 0)' \
+    <<<"$cold_prefill_rates_json" >/dev/null
   jq -n --argjson wave "$wave" --arg binary_sha256 "$binary_sha" \
     --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
     --arg summary_sha256 "$(cat "$out/summary.json.sha256")" \
     --arg server_log_sha256 "$(cat "$current_dir/server.log.sha256")" \
+    --argjson cold_prefill_tokens_per_second "$cold_prefill_rates_json" \
     --slurpfile receipt "$out/summary.json" \
-    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,receipt:$receipt[0]}' \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,receipt:$receipt[0]}' \
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
 }

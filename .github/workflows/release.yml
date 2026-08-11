@@ -99,6 +99,13 @@ jobs:
           check_receipt deepseek/cached-suffix/summary.json '.receipt_sha256.deepseek.cached_suffix'
           check_receipt deepseek/full-context-1/envelope.json '.receipt_sha256.deepseek.wave1'
           check_receipt deepseek/full-context-2/envelope.json '.receipt_sha256.deepseek.wave2'
+          for wave in 1 2; do
+            wave_dir="$gate_dir/deepseek/full-context-$wave"
+            summary_sha=$(shasum -a 256 "$wave_dir/summary.json" | awk '{print $1}')
+            test "$summary_sha" = "$(jq -er .summary_sha256 "$wave_dir/envelope.json")"
+            jq -e -f scripts/deepseek4_full_context_receipt.jq \
+              "$wave_dir/summary.json" >/dev/null
+          done
           check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
           check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
           check_receipt gemma/wave1/summary.json '.receipt_sha256.gemma.wave1'
@@ -184,10 +191,24 @@ jobs:
                  .status == "pass" and .binary_sha256 == $root.binary_sha256
                  and .model_sha256 == $deepseek_sha and .ready_http == 200
                  and .fatal_log_signatures == 0 and .receipt.status == "pass"
+                 and (.cold_prefill_tokens_per_second | type) == "array"
+                 and (.cold_prefill_tokens_per_second | length) == 4
+                 and all(.cold_prefill_tokens_per_second[]; type == "number" and . > 0)
                  and .receipt.family == "deepseek4" and .receipt.concurrent_agents == 4
                  and .receipt.require_cold_first == 1 and (.receipt.agents | length) == 4
+                 and .receipt.agentic_context_fixture_sha256 == "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef"
+                 and .receipt.agentic_context_fixture_bytes == 21204
+                 and .receipt.repository_context_chars == 20584
+                 and .receipt.prompt_tokens == 6685
                  and all(.receipt.agents[];
                    .status == "pass" and .cold_cached_tokens == 0
+                   and .agentic_context_fixture_sha256 == "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef"
+                   and .agentic_context_fixture_bytes == 21204
+                   and .repository_context_chars == 20584
+                   and .expected_path == "/opt/hf2q/Cargo.toml"
+                   and .prompt_tokens == 6685
+                   and .cold_ttft_ms <= 55000
+                   and .cold_semantic_response_ms <= 55000
                    and .cached_tokens >= (.prompt_tokens - 32)
                    and .auto_cached_tokens >= (.prompt_tokens - 32)
                    and .continuation_cached_tokens >= (.prompt_tokens - 32)
@@ -332,6 +353,7 @@ jobs:
               scripts/test_qwen36_prefill_cancellation.sh \
               scripts/test_qwen36_cumulative_release.sh \
               scripts/test_deepseek4_agentic.sh \
+              scripts/test_deepseek4_agentic_fixture_contract.sh \
               scripts/test_deepseek4_cached_suffix.sh \
               scripts/test_deepseek4_cached_suffix_contract.sh \
               scripts/test_deepseek4_interactive_overlap.sh \
@@ -340,6 +362,7 @@ jobs:
               scripts/run_agentic_cache_release_gate.sh
             bash scripts/test_qwen36_watchdog_harness_contract.sh
             bash scripts/test_deepseek4_cached_suffix_contract.sh
+            bash scripts/test_deepseek4_agentic_fixture_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \
               --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
