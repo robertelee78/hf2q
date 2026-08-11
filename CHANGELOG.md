@@ -90,6 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bind the thermal sample logs, while curl supplies high-resolution response
   timing, and the cohort parent immediately reports a child that exits before
   publishing its cold receipt.
+- Add a developer-only matched llama.cpp cold-wave discriminator for the
+  frozen DeepSeek fixture. It binds peer binary/model/request identity, exact
+  zero-cache `read_file` semantics, runtime-specific prompt-token counts,
+  monotonic timing, AC power, and fail-closed thermal telemetry without making
+  the reference runtime part of hf2q serving or release authority.
 - Update vulnerable transitive dependencies (`crossbeam-epoch`,
   `quinn-proto`, `rkyv`, `anyhow`, `memmap2`, and the legacy Rustls chain via
   `ruvector-core 2.3`) and make a zero-vulnerability `cargo audit 0.22.2` run
