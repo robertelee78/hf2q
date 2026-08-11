@@ -49,11 +49,12 @@ family's graph, cache, or scheduler contract by approximation.
   meaningful cached suffixes use the same
   atomic resumable verifier transactions as cold prefill. Lopsided cold waves
   use an interactive budget of up to eight decode tokens between prefill slices
-  capped at two native windows. Once a full cold cohort enters its draining
-  phase, cold-wave unary decode is deferred while any cold prefill remains and
-  full 2,048-token transactions resume; unary output could not be delivered
-  before that barrier. Streaming and warm decode remain responsive. Without a
-  runnable visible decoder, the full prefill transaction is also restored.
+  capped at two native windows. When a filling cold cohort still has another
+  cold request queued, cold-wave unary decode is deferred through its draining
+  phase while any cold prefill remains and full 2,048-token transactions
+  resume; unary output could not be delivered before that barrier. Streaming
+  and warm decode remain responsive. Without a runnable visible decoder, the
+  full prefill transaction is also restored.
   Outside a cold-cohort barrier, staggered warm work may occupy any free
   physical slot. Cancellation restores only a valid, position-consistent
   pre-request turn anchor; poisoned or inconsistent state resets fully.

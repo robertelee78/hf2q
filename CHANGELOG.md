@@ -42,12 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now use incremental verifier replay, including the segment immediately
   before the eight-token recovery boundary, instead of failing with an empty
   resumable-prefill chunk.
-- Restore bulk prefill for a saturated DeepSeek four-cold cohort. Once the
-  full cold cohort enters its draining phase, cold-wave unary decode is
-  deferred while any cold prefill remains because unary output cannot be
-  delivered before that barrier. Full 2,048-token prefill transactions resume;
-  streaming and warm decoders remain responsive, as does the lopsided
-  eight-token decode/two-window prefill case.
+- Restore bulk prefill for a saturated DeepSeek four-cold cohort. Once a
+  filling cohort still has another cold request queued, cold-wave unary decode
+  is deferred through its draining phase while any cold prefill remains because
+  unary output cannot be delivered before that barrier. Full 2,048-token
+  prefill transactions resume; streaming and warm decoders remain responsive,
+  as does the lopsided eight-token decode/two-window prefill case.
 - Resolve the published, checksum-pinned `mlx-native 0.10.7` command-buffer
   lifetime correction. Internal unlabeled GraphSession command buffers retain
   direct owner release, while labeled or publicly escaped buffers preserve the
