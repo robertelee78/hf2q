@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source/crate/binary/model-bound receipt. The publication workflow now
   requires that successful exact-SHA receipt and reproduces its crate digest
   before publishing.
+- Make the release-authority Gemma overlap timeout explicit and overridable.
+  The protected gate now supplies 1,800 seconds for its fixed 175K-token
+  full-attention prompt instead of inheriting a non-overridable 900-second
+  curl cutoff; invalid or non-positive values fail before model traffic.
 - Make that receipt enforce the family-specific shipping gates as well as the
   shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
   one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193
