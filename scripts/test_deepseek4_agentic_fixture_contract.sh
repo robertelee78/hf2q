@@ -7,7 +7,7 @@ FIXTURE="$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt"
 FIXTURE_SHA256=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
 FIXTURE_CHARS=20584
 
-for command in cmp grep head jq shasum tail; do
+for command in cmp grep head jq ln shasum tail; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -30,6 +30,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+no_rg_bin="$tmp_dir/no-rg-bin"
+mkdir -p "$no_rg_bin"
+ln -s "$(command -v jq)" "$no_rg_bin/jq"
+no_rg_path="$no_rg_bin:/usr/bin:/bin"
+if PATH="$no_rg_path" command -v rg >/dev/null; then
+  echo "no-rg contract PATH unexpectedly resolves rg" >&2
+  exit 1
+fi
+
 request_file="$tmp_dir/request.json"
 rendered_context="$tmp_dir/rendered-context.txt"
 invalid_stderr="$tmp_dir/invalid.stderr"
@@ -37,7 +46,7 @@ positive_receipt="$tmp_dir/positive-receipt.json"
 mutated_receipt="$tmp_dir/mutated-receipt.json"
 isolated_root="$tmp_dir/isolated"
 
-HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$request_file" \
+PATH="$no_rg_path" HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$request_file" \
 AGENTIC_CONTEXT_FIXTURE="$FIXTURE" \
 AGENTIC_CONTEXT_FIXTURE_SHA256="$FIXTURE_SHA256" \
 EXPECTED_PATH="$ROOT_DIR/Cargo.toml" \

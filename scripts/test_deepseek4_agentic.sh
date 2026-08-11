@@ -33,7 +33,7 @@ EXPECTED_SOURCE=${EXPECTED_SOURCE:-"fn fmt(&self, f: &mut fmt::Formatter<'_>) ->
 HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT=${HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT:-}
 COLD_RESULT_PATH=${COLD_RESULT_PATH:-}
 
-for command in curl date jq rg shasum; do
+for command in curl date grep jq shasum; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -269,13 +269,13 @@ jq '.stream = true | .stream_options = {include_usage: true}' "$request_file" |
     fi
   done
 
-done_count=$(rg -c '^data: \[DONE\]$' "$stream_file" || true)
-last_event=$(rg '^data: ' "$stream_file" | tail -1 || true)
+done_count=$(grep -c '^data: \[DONE\]$' "$stream_file" || true)
+last_event=$(grep '^data: ' "$stream_file" | tail -1 || true)
 if [[ "$done_count" != "1" || "$last_event" != "data: [DONE]" ]]; then
   echo "agentic gate failed: SSE stream did not end with exactly one [DONE]" >&2
   exit 1
 fi
-sed -n 's/^data: //p' "$stream_file" | rg -v '^\[DONE\]$' >"$stream_json_file"
+sed -n 's/^data: //p' "$stream_file" | grep -v '^\[DONE\]$' >"$stream_json_file"
 if ! jq -s 'all(.[]; type == "object")' "$stream_json_file" >/dev/null; then
   echo "agentic gate failed: SSE contained a malformed JSON event" >&2
   exit 1
