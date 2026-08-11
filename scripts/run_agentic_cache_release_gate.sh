@@ -291,9 +291,12 @@ run_deepseek_wave() {
   mkdir -p "$out"
   start_server deepseek "process-wave-$wave" scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
+  # Preserve the prompt-visible path used by the exact 863ea423 calibration.
+  # The simulated tool result still comes from the packed candidate below.
   BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
   WAVE_ID=default REQUIRE_COLD_FIRST=1 \
-  EXPECTED_PATH=/opt/hf2q/Cargo.toml TOOL_RESULT_PATH="$PWD/Cargo.toml" \
+  EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
+  TOOL_RESULT_PATH="$PWD/Cargo.toml" \
   AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6685 \
   AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
   AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \

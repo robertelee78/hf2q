@@ -109,9 +109,10 @@ thiserror = "2"
 
 # ADR-008: mlx-native is the sole inference/compute backend.
 # DeepSeek-V4 Q3_K, Q8 embeddings, scalable indexer, sparse decode, and
-# long-lived SlotAware Metal object and copied-label lifetime safety require mlx-native 0.10.6.
+# long-lived SlotAware Metal lifetime safety plus unlabeled GraphSession
+# command-buffer drop performance require mlx-native 0.10.7.
 # Pin the immutable registry release so clean builds cannot drift.
-mlx-native = "=0.10.6"
+mlx-native = "=0.10.7"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

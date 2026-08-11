@@ -45,6 +45,7 @@ invalid_stderr="$tmp_dir/invalid.stderr"
 positive_receipt="$tmp_dir/positive-receipt.json"
 mutated_receipt="$tmp_dir/mutated-receipt.json"
 isolated_root="$tmp_dir/isolated"
+aggregate_root="$tmp_dir/aggregate"
 
 PATH="$no_rg_path" HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$request_file" \
 AGENTIC_CONTEXT_FIXTURE="$FIXTURE" \
@@ -84,7 +85,7 @@ cp "$FIXTURE" "$isolated_root/scripts/fixtures/"
 cp "$ROOT_DIR/Cargo.toml" "$isolated_root/"
 printf 'first mutable README\n' >"$isolated_root/README.md"
 HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$tmp_dir/readme-before.json" \
-EXPECTED_PATH=/opt/hf2q/Cargo.toml \
+EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
 TOOL_RESULT_PATH="$isolated_root/Cargo.toml" \
 RUN_ID=full-context-deepseek4-agent-1 \
 SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
@@ -92,7 +93,7 @@ SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
 printf 'completely different mutable README content that must be ignored\n' \
   >"$isolated_root/README.md"
 HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$tmp_dir/readme-after.json" \
-EXPECTED_PATH=/opt/hf2q/Cargo.toml \
+EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
 TOOL_RESULT_PATH="$isolated_root/Cargo.toml" \
 RUN_ID=full-context-deepseek4-agent-1 \
 SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
@@ -143,7 +144,7 @@ jq -n '
     agentic_context_fixture_sha256: "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
     agentic_context_fixture_bytes: 21204,
     repository_context_chars: 20584,
-    expected_path: "/opt/hf2q/Cargo.toml",
+    expected_path: "/opt/hf2q-worktrees/full-context-slots/Cargo.toml",
     expected_prompt_tokens: 6685,
     prompt_tokens: 6685,
     cold_cached_tokens: 0,
@@ -211,5 +212,41 @@ expect_receipt_failure over_boundary '.agents[1].cold_semantic_response_ms = 550
 expect_receipt_failure cohort_over_boundary '.cohort_cold_wall_ms = 55001'
 expect_receipt_failure wrong_agent_count '.agents = .agents[0:3]'
 expect_receipt_failure missing_semantics 'del(.agents[0].sse_tool_call_pass)'
+
+# The live gate writes both `agent-N.json` and `agent-N.cold.json`. Prove the
+# aggregate summary consumes only the four final receipts rather than matching
+# both shapes through an over-broad glob.
+mkdir -p "$aggregate_root/scripts"
+cp "$ROOT_DIR/scripts/test_full_context_agent_slots.sh" "$aggregate_root/scripts/"
+cat >"$aggregate_root/scripts/test_deepseek4_agentic.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -n '{status:"pass", prompt_tokens:6685, cold_cached_tokens:0}' \
+  >"$COLD_RESULT_PATH"
+jq -n --arg run_id "$RUN_ID" '{
+  status:"pass",
+  fixture_id:"full-context-agentic-v1",
+  agentic_context_fixture_sha256:"2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
+  agentic_context_fixture_bytes:21204,
+  repository_context_chars:20584,
+  expected_prompt_tokens:6685,
+  prompt_tokens:6685,
+  cold_ttft_ms:1,
+  cold_semantic_response_ms:1,
+  cached_tokens:6677,
+  tool_result_response_ms:1,
+  run_id:$run_id
+}'
+EOF
+chmod +x "$aggregate_root/scripts/test_deepseek4_agentic.sh"
+FAMILY=deepseek4 AGENTS=4 OUT_DIR="$aggregate_root/receipts" \
+  bash "$aggregate_root/scripts/test_full_context_agent_slots.sh" \
+  >"$aggregate_root/summary.json"
+jq -e '
+  .status == "pass"
+  and .concurrent_agents == 4
+  and (.agents | length) == 4
+  and ([.agents[].run_id] | unique | length) == 4
+' "$aggregate_root/summary.json" >/dev/null
 
 echo "DeepSeek agentic fixture contract: pass"

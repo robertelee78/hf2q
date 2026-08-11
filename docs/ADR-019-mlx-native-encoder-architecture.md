@@ -1505,17 +1505,30 @@ three trials. Those trials also exposed deterministic label-string growth from
 accepted native diff includes the label scope, and a clean-artifact heap gate
 must prove that final seam before landing.
 
-The final native correction is published as `mlx-native 0.10.6` from merged
-commit `94bf1055ddb487430b22307f064b40c24689beb1`; the crates.io archive
+The final native correction is published as `mlx-native 0.10.7` from merged
+commit `7ef792b2d5a0e21f5355df3767c9ccc119cfeec0`; the crates.io archive
 checksum is
-`2652aadc2712ee588168382f62dfe3964e2c205fc4430fa4dc1e40e913fa308e`.
+`136e88142a35bd9ffe3e2157794f8190fff9c9312af7ec6ede3098500bcac395`.
 Version 0.10.5 closed the live command-buffer cliff but did not close the
 copied-label lifetime: repeated identical waves still grew live CFStrings by
-47,486 and 47,484. Version 0.10.6 pools Rust-owned command-buffer destruction,
-clears the compute-encoder copied label before release, removes the redundant
-high-rate counter-descriptor label, and adds a fail-closed 0/N/2N heap slope
-test with an unpooled negative control. Exact Metal System Trace evidence pins
-normal synchronous, asynchronous, and fenced command-buffer/encoder labels.
+47,486 and 47,484. Version 0.10.6 pooled every Rust-owned command-buffer
+destruction; the matched DeepSeek gate then exposed a regression on the
+high-rate unlabeled GraphSession path. Version 0.10.7 keeps pooled destruction
+for labeled or publicly escaped command buffers and directly releases internal
+unlabeled owners. It retains the compute-encoder copied-label cleanup, removes
+the redundant high-rate counter-descriptor label, and keeps the fail-closed
+0/N/2N heap slope test with an unpooled negative control. Exact immutable-commit
+Metal System Trace evidence pins normal synchronous, asynchronous, and fenced
+command-buffer/encoder labels.
+
+The protected native release workflow packed and tested the public archive,
+tested its registry download, and verified byte-identical crates.io and GitHub
+assets. Its Cargo version reordered keys in two generated metadata tables, so
+the public archive digest differs from the earlier locally graded package even
+though the other 540 archive files and canonical Cargo metadata are identical.
+Two post-publication graders passed the public archive at 98/100; this closes
+technical artifact uncertainty but remains a documented process-only
+publication degradation rather than retroactive pre-publication authority.
 hf2q still must repeat the applicable packed-artifact and family heap gates
 from a clean source tree resolving that exact registry pin. Raising the queue
 cap, reducing slot count, or restarting periodically is rejected as a fix.

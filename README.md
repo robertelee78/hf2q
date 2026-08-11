@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
-| **Status** | hf2q 0.1.5 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.10.6`. Public availability is authoritative only when the `v0.1.5` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.6 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.10.7`. Public availability is authoritative only when the `v0.1.6` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
@@ -301,7 +301,7 @@ agentic gate.
 The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
 they are not final hf2q artifact authority. Release requires rerunning the same
-gates from a clean hf2q package resolving published `mlx-native 0.10.6`:
+gates from a clean hf2q package resolving published `mlx-native 0.10.7`:
 
 - `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
   552-token SSE lane immediately before the public 87,972-token/347-tool lane,

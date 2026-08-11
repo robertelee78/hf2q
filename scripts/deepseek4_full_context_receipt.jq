@@ -7,7 +7,7 @@ def valid_agent:
   and .agentic_context_fixture_sha256 == "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef"
   and .agentic_context_fixture_bytes == 21204
   and .repository_context_chars == 20584
-  and .expected_path == "/opt/hf2q/Cargo.toml"
+  and .expected_path == "/opt/hf2q-worktrees/full-context-slots/Cargo.toml"
   and .expected_prompt_tokens == 6685
   and .prompt_tokens == 6685
   and .cold_cached_tokens == 0

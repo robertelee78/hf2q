@@ -883,15 +883,17 @@ There were zero timeouts, ignored submissions, command-buffer errors, or
 CFString label leak, fixed afterward by pooling Metal label setters. They are
 spike evidence, not final-artifact release proof.
 
-The native prerequisite is now published and immutable: `mlx-native 0.10.6`,
+The native prerequisite is now published and immutable: `mlx-native 0.10.7`,
 registry checksum
-`2652aadc2712ee588168382f62dfe3964e2c205fc4430fa4dc1e40e913fa308e`,
-from merged commit `94bf1055ddb487430b22307f064b40c24689beb1`.
+`136e88142a35bd9ffe3e2157794f8190fff9c9312af7ec6ede3098500bcac395`,
+from merged commit `7ef792b2d5a0e21f5355df3767c9ccc119cfeec0`.
 The intermediate 0.10.5 artifact eliminated the live AGX command-buffer cliff
 but retained copied Metal labels: identical waves grew CFStrings by 47,486
-and 47,484. The 0.10.6 regression therefore measures both zero live command
-buffers and bounded 0/N/2N CFString/autorelease-pool slopes, with an unpooled
-negative control and exact Metal System Trace label proof.
+and 47,484. Version 0.10.6 closed that lifetime seam but pooled destruction on
+the high-rate unlabeled GraphSession path. Version 0.10.7 preserves the bounded
+0/N/2N command-buffer, CFString, and autorelease-pool slopes while directly
+releasing internal unlabeled owners; the regression retains an unpooled
+negative control and exact immutable-commit Metal System Trace label proof.
 hf2q release authority still requires clean packed-artifact verification and a
 fresh no-env run of the exact 552 + 87,972 overlap plus disconnect
 cancellation. The final heap must keep both AGX command buffers and CFStrings

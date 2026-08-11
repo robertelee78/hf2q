@@ -114,9 +114,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine returns 503 instead of collapsing these cases into a generic 500.
 - End Qwen's final encoder-session stage without opening an unused replacement
   command buffer. The companion `mlx-native` correction scopes Objective-C
-  autoreleases at command-buffer, compute-encoder, and label-string seams.
-  hf2q now resolves the published, checksum-pinned `mlx-native 0.10.6`; no
-  local Cargo patch participates in the candidate.
+  autoreleases at command-buffer, compute-encoder, and label-string seams, and
+  preserves direct owner release for internal unlabeled GraphSession command
+  buffers. hf2q now resolves the published, checksum-pinned `mlx-native
+  0.10.7`; no local Cargo patch participates in the candidate.
 - Graduate the validated Qwen3.6 autoregressive route to the default product
   surface. The canonical launcher no longer sets the investigation-only
   `HF2Q_QWEN36_AUTOREG` gate; unsafe chunk-scan remains a separate experiment.

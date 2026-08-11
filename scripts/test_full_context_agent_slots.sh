@@ -74,6 +74,7 @@ done
 
 mkdir -p "$OUT_DIR"
 pids=()
+agent_receipts=()
 epoch_ms() {
   echo $(( $(date +%s) * 1000 ))
 }
@@ -100,6 +101,7 @@ for ((agent = 1; agent <= AGENTS; agent++)); do
   SENTINEL="HF2Q_${FAMILY_TAG}_AGENT_${agent}_OK" \
     "$GATE" >"$OUT_DIR/agent-${agent}.json" 2>"$OUT_DIR/agent-${agent}.err" &
   pids+=("$!")
+  agent_receipts+=("$OUT_DIR/agent-${agent}.json")
 done
 
 failed=0
@@ -166,6 +168,6 @@ jq -s --arg family "$FAMILY" --arg wave_id "$WAVE_ID" \
       agents: .
     }
   end
-' "$OUT_DIR"/agent-*.json
+' "${agent_receipts[@]}"
 
 echo "full-context agent-slot receipts: $OUT_DIR" >&2

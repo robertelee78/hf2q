@@ -1147,9 +1147,13 @@ does not prove or clear a scheduler regression.
 The gate now reads the exact 21,204-byte calibration context from
 `scripts/fixtures/deepseek4-agentic-repo-context.txt`, SHA-256
 `2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef`.
-The release wrapper verifies that artifact before model startup, uses the
-stable logical tool path `/opt/hf2q/Cargo.toml`, and requires every cold agent
-to render exactly 6,685 tokens. Producer, aggregate, and publication checks all
+The release wrapper verifies that artifact before model startup and preserves
+the prompt-visible calibration path
+`/opt/hf2q-worktrees/full-context-slots/Cargo.toml` from exact commit
+`863ea423`; the simulated tool result itself is still read from the packed
+candidate's `Cargo.toml`. This is workload identity, not a runtime dependency
+on that local path. Every cold agent must render exactly 6,685 tokens.
+Producer, aggregate, and publication checks all
 bind the fixture ID, digest, byte/character counts, exact prompt count, zero
 cold reuse, semantic/tool assertions, and literal 55,000 ms cold bounds. A
 model-free negative matrix rejects missing, mistyped, stale, off-by-one, or
