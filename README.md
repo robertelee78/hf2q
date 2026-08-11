@@ -226,8 +226,9 @@ high-water. Requests that cannot safely fit wait or fail explicitly instead of
 silently receiving a shorter context.
 
 Use `/readyz`, not merely `/health` or `/v1/models`, as the generation
-readiness probe. `/health` is process liveness. In the Unreleased SlotAware
-correction, a fatal Metal command-buffer/watchdog/ignored-submission error
+readiness probe. `/health` is process liveness. Present by public 0.1.5 and
+strengthened in the 0.1.6 candidate, a fatal Metal
+command-buffer/watchdog/ignored-submission error
 (including device-loss reports), or an independently observed transaction
 deadline, terminates every active and queued request for the affected Qwen,
 Gemma, or DeepSeek worker once, rejects new work with HTTP 503, and keeps
@@ -247,7 +248,7 @@ prefill and decode are scheduler-yielding; the separate SerialFifo primitive
 retains the historical multimodal path. Qwen3-VL remains a distinct model
 family rather than an approximate fallback through Qwen3.6 text serving.
 
-Long Gemma 4 text prefills use candidate 4,096-token transactions and split at
+Long Gemma 4 text prefills use 4,096-token transactions and split at
 the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and
 all configured HB, hybrid, dense, and MLX per-slot cursors are committed only
 after the complete transaction succeeds. Cross-slot cold and retained-prefix
@@ -255,9 +256,9 @@ batches share the same 4,096-row aggregate Metal-transaction ceiling; lanes
 over that bound remain FIFO and return to scheduler-backed resumable states.
 When several compatible long-text states are installed, one transaction
 shares the 4,096 rows across those lanes instead of multiplying the bound by
-the number of slots. The 4,096-token ceiling is a
-family-specific candidate that must pass exact eager-versus-resumed real-model
-parity before release; it is not inherited from Qwen. Long Gemma soft-token
+the number of slots. The 4,096-token ceiling is present by public 0.1.5 and
+must pass exact eager-versus-resumed real-model parity again from the packed
+0.1.6 candidate before release; it is not inherited from Qwen. Long Gemma soft-token
 prefill remains fail-closed until it has a resumable graph.
 
 On the target M5 Max host, the launcher defaults to the schema-v2,

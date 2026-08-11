@@ -1,6 +1,6 @@
 # hf2q Shipping Contract
 
-This document defines the public hf2q 0.1.3 product surface and the
+This document defines the public hf2q 0.1.5 product surface and the
 **Unreleased next-release candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
@@ -27,7 +27,8 @@ family's graph, cache, or scheduler contract by approximation.
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
   `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
   otherwise F16.
-- **Unreleased candidate:** Qwen3.5/Qwen3.6 generation and OpenAI-compatible
+- **Public by 0.1.5; strengthened in the Unreleased 0.1.6 candidate:**
+  Qwen3.5/Qwen3.6 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
   Slot-aware Qwen prefill
   is bounded and scheduler-yielding; no `HF2Q_QWEN36_AUTOREG` activation is
@@ -37,19 +38,23 @@ family's graph, cache, or scheduler contract by approximation.
   before Qwen LM scheduler/SSE admission until their own prefill and decode are scheduler-yielding;
   the historical multimodal primitive remains available only under
   SerialFifo. The separate chunk-scan prefill experiment remains Category 3.
-- **Unreleased candidate:** long plain-text Gemma SlotAware prefill advances in
+- **Public by 0.1.5; strengthened in the Unreleased 0.1.6 candidate:** long
+  plain-text Gemma SlotAware prefill advances in
   at most 4,096-token transactions, split at the stable-prefix boundary. The
   transaction publishes all configured per-layer cache cursors together.
   Compatible installed prefill states may share those 4,096 aggregate rows;
   the bound never multiplies by the number of slots. Long soft-token work
   remains fail-closed until a resumable graph is proven.
-- **Unreleased candidate:** DeepSeek meaningful cached suffixes use the same
+- **Public by 0.1.5; strengthened in the Unreleased 0.1.6 candidate:** DeepSeek
+  meaningful cached suffixes use the same
   atomic resumable verifier transactions as cold prefill. Lopsided cold waves
-  allow one decode token between prefill transactions but park terminal
-  completion until the cohort barrier lifts. Outside a cold barrier, staggered
-  warm work may occupy any free physical slot. Cancellation restores only a
-  valid, position-consistent pre-request turn anchor; poisoned or inconsistent
-  state resets fully.
+  use an interactive budget of up to eight decode tokens between prefill slices
+  capped at two native windows; without a runnable decoder, the full
+  2,048-token prefill transaction is restored. Terminal completion remains
+  parked until the cohort barrier lifts. Outside a cold barrier, staggered warm
+  work may occupy any free physical slot. Cancellation restores only a valid,
+  position-consistent pre-request turn anchor; poisoned or inconsistent state
+  resets fully.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
   independently observed transaction deadline that never returns, fails the
   affected Qwen, Gemma, or DeepSeek worker closed. Every owned reply
@@ -70,8 +75,8 @@ Every Gemma change that could affect the forward pass or lm_head must pass
 | `sliding_wrap` common-byte-prefix with locked hf2q reference | ≥ 700 bytes |
 | Decode perf sanity on the sourdough prompt | ≥ 95 tok/s |
 
-Before that Unreleased Qwen candidate may ship, every Qwen SlotAware serving
-change must additionally pass all of these gates
+Before the Unreleased 0.1.6 Qwen cache-lifecycle corrections may ship, every
+Qwen SlotAware serving change must additionally pass all of these gates
 from a clean packed artifact that resolves the published, checksum-pinned
 `mlx-native` dependency:
 
