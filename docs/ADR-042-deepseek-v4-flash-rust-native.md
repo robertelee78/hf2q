@@ -2,11 +2,12 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-10 — cross-family lifecycle review added active-prefix
+- **Updated:** 2026-08-11 — cross-family lifecycle review added active-prefix
   affinity, request-local rollback, and the DeepSeek Busy-only admission
   no-spin correction. The four-agent performance workload is now an immutable,
   SHA-bound 6,685-token fixture after mutable README growth invalidated one
-  release run. The bounded mixed-work replacement and cache lifecycle remain
+  release run. A later exact-packed wave exposed and corrected a thermal-order
+  defect in that release gate. The bounded mixed-work replacement and cache lifecycle remain
   release candidates pending immutable packed-artifact hardware proof.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
@@ -1165,6 +1166,38 @@ matched release authority; failure leaves a current-scheduler performance
 blocker that must be optimized or re-baselined against a same-input llama.cpp
 peer. This section records a candidate correction, not a passing hardware
 claim.
+
+### Thermal validity of calibrated four-agent waves (2026-08-11 candidate)
+
+Exact-main run `31468849847` passed the 94,576-token interactive overlap,
+cached-suffix cancellation matrix, and 119,855-token generic lifecycle before
+the first frozen 6,685-token wave reported 61–65 seconds and failed the literal
+55-second limit. The workload and scheduler shape were correct: all four
+requests were cold, generated the same 61-token tool result, used the expected
+two-prefill/mixed-decode/terminal-parking sequence, and emitted no fatal Metal
+signature.
+
+macOS unified logging made the measurement invalid as performance evidence.
+Thermal pressure was level 2/Heavy from `00:45:25.617` through `00:51:34.616`;
+the timed wave began only after the preceding lifecycle completed at about
+`00:49:44`. Nominal returned at `00:51:54`, immediately after work stopped.
+Against the cool-host control traces, the first pair fell from roughly 315–322
+prompt tok/s to 256–261 tok/s and the mixed pair fell from about 232 to 197
+tok/s; the separate published-0.10.6 decode control fell from roughly
+17.2–17.5 to 15.1 tok/s. AC power and caffeinate remained valid, so AC presence
+alone was insufficient evidence of an unthrottled host.
+
+The corrected wrapper runs both calibrated waves before the long functional
+workloads. Before each fresh server starts, with no hf2q/llama model runtime
+loaded, the host
+must report `ProcessInfo.thermalState == nominal` at five-second cadence for at
+least 60 seconds. Thermal state is then sampled every two seconds throughout
+the wave; any observed non-Nominal state,
+malformed read, monitor failure, or telemetry gap invalidates the run. Each
+envelope records the settle and measurement sample counts and SHA-256 digests,
+and publication independently rehashes and validates the measurement log.
+The 55-second bound is unchanged. Two thermally valid exact-packed passes are
+still required before release authority is restored.
 
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 

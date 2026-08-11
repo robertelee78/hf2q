@@ -67,6 +67,14 @@ for command in jq curl; do
     exit 2
   }
 done
+[[ -x /usr/bin/perl ]] || {
+  echo "required monotonic timer is unavailable: /usr/bin/perl" >&2
+  exit 2
+}
+[[ -x /usr/bin/pgrep ]] || {
+  echo "required child-process enumerator is unavailable: /usr/bin/pgrep" >&2
+  exit 2
+}
 [[ -x "$GATE" ]] || {
   echo "agentic gate is not executable: $GATE" >&2
   exit 2
@@ -75,8 +83,9 @@ done
 mkdir -p "$OUT_DIR"
 pids=()
 agent_receipts=()
-epoch_ms() {
-  echo $(( $(date +%s) * 1000 ))
+monotonic_us() {
+  /usr/bin/perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.0f\n", 1000000 * clock_gettime(CLOCK_MONOTONIC)'
 }
 cleanup() {
   local pid
@@ -86,9 +95,33 @@ cleanup() {
     fi
   done
 }
+terminate_running_agents() {
+  local child
+  local pid
+  local -a descendants=()
+
+  # Freeze live gate roots first so they cannot spawn more curl/jq children
+  # while the failure path enumerates the process tree.
+  for pid in "${pids[@]:-}"; do
+    kill -STOP "$pid" 2>/dev/null || true
+  done
+  for pid in "${pids[@]:-}"; do
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      kill -STOP "$child" 2>/dev/null || true
+      descendants+=("$child")
+    done < <(/usr/bin/pgrep -P "$pid" 2>/dev/null || true)
+  done
+  for child in "${descendants[@]:-}"; do
+    kill -KILL "$child" 2>/dev/null || true
+  done
+  for pid in "${pids[@]:-}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
 trap cleanup INT TERM EXIT
 
-cohort_started_ms=$(epoch_ms)
+cohort_started_us=$(monotonic_us)
 for ((agent = 1; agent <= AGENTS; agent++)); do
   if [[ "$WAVE_ID" == default ]]; then
     request_run_id="full-context-${FAMILY}-agent-${agent}"
@@ -109,9 +142,21 @@ cold_deadline=$((SECONDS + cold_wait_seconds + 30))
 while :; do
   cold_receipts=$(find "$OUT_DIR" -maxdepth 1 -name 'agent-*.cold.json' | wc -l | tr -d '[:space:]')
   if (( cold_receipts == AGENTS )); then
-    cohort_cold_wall_ms=$(( $(epoch_ms) - cohort_started_ms ))
+    cohort_finished_us=$(monotonic_us)
+    cohort_cold_wall_ms=$(( \
+      (cohort_finished_us - cohort_started_us + 999) / 1000 \
+    ))
     break
   fi
+  for ((agent = 1; agent <= AGENTS; agent++)); do
+    if [[ ! -s "$OUT_DIR/agent-${agent}.cold.json" ]] \
+      && ! kill -0 "${pids[$((agent - 1))]}" 2>/dev/null; then
+      echo "agent $agent exited before publishing its cold receipt" >&2
+      failed=1
+      cohort_cold_wall_ms=-1
+      break 2
+    fi
+  done
   if (( SECONDS >= cold_deadline )); then
     echo "full-context cold cohort did not finish within $((cold_wait_seconds + 30)) seconds" >&2
     failed=1
@@ -120,6 +165,9 @@ while :; do
   fi
   sleep 0.1
 done
+if ((failed != 0)); then
+  terminate_running_agents
+fi
 for ((agent = 1; agent <= AGENTS; agent++)); do
   if ! wait "${pids[$((agent - 1))]}"; then
     failed=1

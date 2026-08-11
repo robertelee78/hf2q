@@ -99,12 +99,20 @@ jobs:
           check_receipt deepseek/cached-suffix/summary.json '.receipt_sha256.deepseek.cached_suffix'
           check_receipt deepseek/full-context-1/envelope.json '.receipt_sha256.deepseek.wave1'
           check_receipt deepseek/full-context-2/envelope.json '.receipt_sha256.deepseek.wave2'
+          check_receipt deepseek/full-context-1/thermal/summary.json '.receipt_sha256.deepseek.wave1_thermal'
+          check_receipt deepseek/full-context-2/thermal/summary.json '.receipt_sha256.deepseek.wave2_thermal'
           for wave in 1 2; do
             wave_dir="$gate_dir/deepseek/full-context-$wave"
             summary_sha=$(shasum -a 256 "$wave_dir/summary.json" | awk '{print $1}')
             test "$summary_sha" = "$(jq -er .summary_sha256 "$wave_dir/envelope.json")"
             jq -e -f scripts/deepseek4_full_context_receipt.jq \
               "$wave_dir/summary.json" >/dev/null
+            thermal_summary="$wave_dir/thermal/summary.json"
+            thermal_log="$wave_dir/thermal/measurement.log"
+            thermal_settle_log="$wave_dir/thermal/settle.log"
+            bash scripts/verify_macos_thermal_receipt.sh "$wave" \
+              "$wave_dir/envelope.json" "$thermal_summary" \
+              "$thermal_log" "$thermal_settle_log"
           done
           check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
           check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
@@ -187,10 +195,42 @@ jobs:
                and $d.cached_suffix.ready_before == true and $d.cached_suffix.ready_after == true
                and $d.cached_suffix.fatal_log_signatures == 0
                and ($d.full_context_waves | length) == 2
+               and ([$d.full_context_waves[].wave] | sort) == [1, 2]
                and all($d.full_context_waves[];
                  .status == "pass" and .binary_sha256 == $root.binary_sha256
                  and .model_sha256 == $deepseek_sha and .ready_http == 200
                  and .fatal_log_signatures == 0 and .receipt.status == "pass"
+                 and .thermal.status == "pass"
+                 and .thermal.required_state == "nominal"
+                 and .thermal.runtime_preflight == "pass"
+                 and (.thermal.settle_seconds | type) == "number"
+                 and .thermal.settle_seconds >= 60
+                 and (.thermal.settle_duration_seconds | type) == "number"
+                 and .thermal.settle_duration_seconds >= .thermal.settle_seconds
+                 and (.thermal.settle_samples | type) == "number"
+                 and .thermal.settle_samples > 0
+                 and (.thermal.measurement_samples | type) == "number"
+                 and .thermal.measurement_samples >= 2
+                 and (.thermal.measurement_duration_seconds | type) == "number"
+                 and .thermal.measurement_duration_seconds > 0
+                 and (.thermal.sample_interval_seconds | type) == "number"
+                 and .thermal.sample_interval_seconds == 2
+                 and (.thermal.maximum_sample_gap_seconds | type) == "number"
+                 and .thermal.maximum_sample_gap_seconds > 0
+                 and .thermal.maximum_sample_gap_seconds <= 5
+                 and (.thermal.settle_sample_interval_seconds | type) == "number"
+                 and .thermal.settle_sample_interval_seconds == 5
+                 and (.thermal.maximum_settle_sample_gap_seconds | type) == "number"
+                 and .thermal.maximum_settle_sample_gap_seconds > 0
+                 and .thermal.maximum_settle_sample_gap_seconds <= 8
+                 and (.thermal.non_nominal_measurement_samples | type) == "number"
+                 and .thermal.non_nominal_measurement_samples == 0
+                 and (.thermal.settle_telemetry_gaps | type) == "number"
+                 and .thermal.settle_telemetry_gaps == 0
+                 and (.thermal.telemetry_gaps | type) == "number"
+                 and .thermal.telemetry_gaps == 0
+                 and (.thermal.settle_log_sha256 | test("^[0-9a-f]{64}$"))
+                 and (.thermal.measurement_log_sha256 | test("^[0-9a-f]{64}$"))
                  and (.cold_prefill_tokens_per_second | type) == "array"
                  and (.cold_prefill_tokens_per_second | length) == 4
                  and all(.cold_prefill_tokens_per_second[]; type == "number" and . > 0)
@@ -354,6 +394,9 @@ jobs:
               scripts/test_qwen36_cumulative_release.sh \
               scripts/test_deepseek4_agentic.sh \
               scripts/test_deepseek4_agentic_fixture_contract.sh \
+              scripts/macos_thermal_guard.sh \
+              scripts/verify_macos_thermal_receipt.sh \
+              scripts/test_macos_thermal_guard_contract.sh \
               scripts/test_deepseek4_cached_suffix.sh \
               scripts/test_deepseek4_cached_suffix_contract.sh \
               scripts/test_deepseek4_interactive_overlap.sh \
@@ -363,6 +406,7 @@ jobs:
             bash scripts/test_qwen36_watchdog_harness_contract.sh
             bash scripts/test_deepseek4_cached_suffix_contract.sh
             bash scripts/test_deepseek4_agentic_fixture_contract.sh
+            bash scripts/test_macos_thermal_guard_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \
               --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \

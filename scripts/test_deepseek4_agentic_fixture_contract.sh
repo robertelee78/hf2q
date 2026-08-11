@@ -46,6 +46,29 @@ positive_receipt="$tmp_dir/positive-receipt.json"
 mutated_receipt="$tmp_dir/mutated-receipt.json"
 isolated_root="$tmp_dir/isolated"
 aggregate_root="$tmp_dir/aggregate"
+early_exit_root="$tmp_dir/early-exit"
+
+grep -F -- "--write-out '%{time_total}\\n'" \
+  "$ROOT_DIR/scripts/test_deepseek4_agentic.sh" >/dev/null
+
+printf '54.999999\n' >"$tmp_dir/time-below.txt"
+test "$(HF2Q_AGENTIC_TIME_TOTAL_INPUT="$tmp_dir/time-below.txt" \
+  bash "$ROOT_DIR/scripts/test_deepseek4_agentic.sh")" = 55000
+printf '55.000001\n' >"$tmp_dir/time-above.txt"
+test "$(HF2Q_AGENTIC_TIME_TOTAL_INPUT="$tmp_dir/time-above.txt" \
+  bash "$ROOT_DIR/scripts/test_deepseek4_agentic.sh")" = 55001
+printf 'not-a-time\n' >"$tmp_dir/time-invalid.txt"
+if HF2Q_AGENTIC_TIME_TOTAL_INPUT="$tmp_dir/time-invalid.txt" \
+  bash "$ROOT_DIR/scripts/test_deepseek4_agentic.sh" >/dev/null 2>&1; then
+  echo "DeepSeek timing parser accepted malformed curl output" >&2
+  exit 1
+fi
+printf '1.0\n2.0\n' >"$tmp_dir/time-multiple.txt"
+if HF2Q_AGENTIC_TIME_TOTAL_INPUT="$tmp_dir/time-multiple.txt" \
+  bash "$ROOT_DIR/scripts/test_deepseek4_agentic.sh" >/dev/null 2>&1; then
+  echo "DeepSeek timing parser accepted multiple curl timing rows" >&2
+  exit 1
+fi
 
 PATH="$no_rg_path" HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$request_file" \
 AGENTIC_CONTEXT_FIXTURE="$FIXTURE" \
@@ -248,5 +271,42 @@ jq -e '
   and (.agents | length) == 4
   and ([.agents[].run_id] | unique | length) == 4
 ' "$aggregate_root/summary.json" >/dev/null
+
+# A child that fails the cold bound exits before writing agent-N.cold.json.
+# The parent must report that exit immediately rather than waiting for the
+# unrelated curl deadline plus its former 30-second receipt grace period.
+mkdir -p "$early_exit_root/scripts"
+cp "$ROOT_DIR/scripts/test_full_context_agent_slots.sh" "$early_exit_root/scripts/"
+cat >"$early_exit_root/scripts/test_deepseek4_agentic.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${SENTINEL:-} == *_1_OK ]]; then
+  exit 1
+fi
+exec sleep 30
+EOF
+chmod +x "$early_exit_root/scripts/test_deepseek4_agentic.sh"
+early_exit_started_us=$(/usr/bin/perl \
+  -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+  -e 'printf "%.0f\n", 1000000 * clock_gettime(CLOCK_MONOTONIC)')
+if FAMILY=deepseek4 AGENTS=2 CURL_MAX_TIME_SECONDS=5 \
+  OUT_DIR="$early_exit_root/receipts" \
+  bash "$early_exit_root/scripts/test_full_context_agent_slots.sh" \
+    >"$early_exit_root/stdout" 2>"$early_exit_root/stderr"; then
+  echo "full-context parent accepted a child without a cold receipt" >&2
+  exit 1
+fi
+early_exit_finished_us=$(/usr/bin/perl \
+  -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+  -e 'printf "%.0f\n", 1000000 * clock_gettime(CLOCK_MONOTONIC)')
+early_exit_elapsed_ms=$(( \
+  (early_exit_finished_us - early_exit_started_us + 999) / 1000 \
+))
+((early_exit_elapsed_ms < 3000)) || {
+  echo "full-context parent took ${early_exit_elapsed_ms}ms to notice child exit" >&2
+  exit 1
+}
+grep -F 'exited before publishing its cold receipt' \
+  "$early_exit_root/stderr" >/dev/null
 
 echo "DeepSeek agentic fixture contract: pass"

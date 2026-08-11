@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
+
+tmp_dir=$(mktemp -d -t hf2q-thermal-guard.XXXXXX)
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+if [[ $(uname -s) == Darwin ]]; then
+  thermal_read_state
+  [[ "$THERMAL_STATE" =~ ^(nominal|fair|serious|critical)$ ]]
+fi
+
+sequence_index=0
+sequence=()
+read_sequence_state() {
+  local last_index=$(( ${#sequence[@]} - 1 ))
+  local index=$sequence_index
+  ((index <= last_index)) || index=$last_index
+  THERMAL_STATE=${sequence[$index]}
+  sequence_index=$((sequence_index + 1))
+}
+
+# A non-nominal host must wait until the probe reports Nominal.
+sequence=(serious fair nominal)
+sequence_index=0
+thermal_read_state() { read_sequence_state; }
+thermal_wait_for_nominal "$tmp_dir/wait.log" wait-test 0 5 0
+test "$(tail -1 "$tmp_dir/wait.log" | awk -F '\t' '{print $2}')" = nominal
+test "$(wc -l <"$tmp_dir/wait.log" | tr -d '[:space:]')" = 3
+
+# A non-Nominal transition resets the settle window. Advance Bash's monotonic
+# timer without sleeping so the contract proves a trailing continuous window.
+sequence=(nominal serious nominal nominal nominal)
+sequence_index=0
+thermal_read_state() {
+  read_sequence_state
+  SECONDS=$((SECONDS + 1))
+}
+thermal_wait_for_nominal "$tmp_dir/reset.log" reset-test 2 10 0
+test "$(wc -l <"$tmp_dir/reset.log" | tr -d '[:space:]')" = 5
+test "$(tail -1 "$tmp_dir/reset.log" | awk -F '\t' '{print $2}')" = nominal
+
+# A host that never becomes Nominal must fail at the timeout.
+sequence=(serious)
+sequence_index=0
+if thermal_wait_for_nominal "$tmp_dir/timeout.log" timeout-test 0 0 0; then
+  echo "thermal guard accepted a serious host at timeout" >&2
+  exit 1
+fi
+
+# Any in-wave transition away from Nominal invalidates the measurement.
+sequence=(nominal serious)
+sequence_index=0
+if thermal_monitor_nominal "$tmp_dir/monitor.log" monitor-test \
+  "$tmp_dir/never-stop" 0; then
+  echo "thermal monitor accepted a mid-wave serious state" >&2
+  exit 1
+fi
+test "$(tail -1 "$tmp_dir/monitor.log" | awk -F '\t' '{print $2}')" = serious
+
+# A normal stop file exits cleanly, while a probe failure exits nonzero.
+normal_stop="$tmp_dir/normal-stop"
+thermal_read_state() {
+  THERMAL_STATE=nominal
+  : >"$normal_stop"
+}
+thermal_monitor_nominal "$tmp_dir/normal-monitor.log" normal-monitor \
+  "$normal_stop" 0
+test "$(wc -l <"$tmp_dir/normal-monitor.log" | tr -d '[:space:]')" = 1
+
+thermal_read_state() { return 1; }
+if thermal_monitor_nominal "$tmp_dir/probe-failure.log" probe-failure \
+  "$tmp_dir/never-stop-probe" 0; then
+  echo "thermal monitor accepted probe failure" >&2
+  exit 1
+fi
+
+# Malformed telemetry and probe failure are fail-closed.
+thermal_read_state() { THERMAL_STATE=unknown; return 1; }
+if thermal_wait_for_nominal "$tmp_dir/malformed.log" malformed-test 0 1 0; then
+  echo "thermal guard accepted malformed telemetry" >&2
+  exit 1
+fi
+
+# The receipt validators reject missing cadence, backwards time, non-Nominal
+# measurement state, and a nominal-looking settle interval with a 60s hole.
+printf '100\tnominal\tstart\n102\tnominal\tmiddle\n104\tnominal\tend\n' \
+  >"$tmp_dir/valid-measurement.log"
+thermal_validate_measurement_log "$tmp_dir/valid-measurement.log" 5
+test "$THERMAL_LOG_SAMPLES" = 3
+test "$THERMAL_LOG_DURATION_SECONDS" = 4
+
+printf '100\tnominal\tstart\n99\tnominal\tend\n' \
+  >"$tmp_dir/backwards.log"
+if thermal_validate_measurement_log "$tmp_dir/backwards.log" 5; then
+  echo "thermal validator accepted decreasing timestamps" >&2
+  exit 1
+fi
+printf '100\tnominal\tstart\n106\tnominal\tend\n' >"$tmp_dir/gap.log"
+if thermal_validate_measurement_log "$tmp_dir/gap.log" 5; then
+  echo "thermal validator accepted an in-wave telemetry gap" >&2
+  exit 1
+fi
+printf '100\tnominal\tstart\n102\tfair\tend\n' >"$tmp_dir/non-nominal.log"
+if thermal_validate_measurement_log "$tmp_dir/non-nominal.log" 5; then
+  echo "thermal validator accepted a non-Nominal measurement" >&2
+  exit 1
+fi
+printf '100\tnominal\tsettle\n160\tnominal\tsettle\n' >"$tmp_dir/settle-gap.log"
+if thermal_validate_settle_log "$tmp_dir/settle-gap.log" 60 8; then
+  echo "thermal validator accepted a 60-second settle telemetry hole" >&2
+  exit 1
+fi
+printf '100\tnominal\tsettle\n99\tnominal\tsettle\n' \
+  >"$tmp_dir/settle-backwards.log"
+if thermal_validate_settle_log "$tmp_dir/settle-backwards.log" 0 8; then
+  echo "thermal settle validator accepted decreasing timestamps" >&2
+  exit 1
+fi
+
+# A complete receipt binds path, wave, summary object, hashes, schema, and log
+# phase columns. Stale or cross-wave objects must fail even when re-hashed.
+receipt_dir="$tmp_dir/receipt"
+mkdir -p "$receipt_dir"
+for epoch in $(seq 100 5 160); do
+  printf '%s\tnominal\tdeepseek-wave-1-settle\n' "$epoch"
+done >"$receipt_dir/settle.log"
+printf '200\tnominal\tdeepseek-wave-1-measurement-start\n' \
+  >"$receipt_dir/measurement.log"
+printf '202\tnominal\tdeepseek-wave-1-measurement\n' \
+  >>"$receipt_dir/measurement.log"
+printf '204\tnominal\tdeepseek-wave-1-measurement-end\n' \
+  >>"$receipt_dir/measurement.log"
+settle_sha=$(shasum -a 256 "$receipt_dir/settle.log" | awk '{print $1}')
+measurement_sha=$(shasum -a 256 "$receipt_dir/measurement.log" | awk '{print $1}')
+jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" '
+  {
+    status:"pass", phase:"deepseek-wave-1", required_state:"nominal",
+    runtime_preflight:"pass",
+    settle_seconds:60, settle_duration_seconds:60, settle_samples:13,
+    measurement_samples:3, measurement_duration_seconds:4,
+    sample_interval_seconds:2, maximum_sample_gap_seconds:5,
+    settle_sample_interval_seconds:5, maximum_settle_sample_gap_seconds:8,
+    non_nominal_measurement_samples:0, settle_telemetry_gaps:0,
+    telemetry_gaps:0, settle_log_sha256:$settle_sha,
+    measurement_log_sha256:$measurement_sha
+  }
+' >"$receipt_dir/summary.json"
+jq -n --argjson wave 1 --slurpfile thermal "$receipt_dir/summary.json" \
+  '{wave:$wave,thermal:$thermal[0]}' >"$receipt_dir/envelope.json"
+bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/envelope.json" "$receipt_dir/summary.json" \
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" >/dev/null
+
+jq '.wave = 2' "$receipt_dir/envelope.json" >"$receipt_dir/wrong-wave.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/wrong-wave.json" "$receipt_dir/summary.json" \
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" >/dev/null 2>&1; then
+  echo "thermal receipt accepted the wrong wave" >&2
+  exit 1
+fi
+jq 'del(.maximum_sample_gap_seconds)' "$receipt_dir/summary.json" \
+  >"$receipt_dir/stale-summary.json"
+jq --slurpfile thermal "$receipt_dir/stale-summary.json" \
+  '.thermal = $thermal[0]' "$receipt_dir/envelope.json" \
+  >"$receipt_dir/stale-envelope.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/stale-envelope.json" "$receipt_dir/stale-summary.json" \
+  "$receipt_dir/measurement.log" "$receipt_dir/settle.log" >/dev/null 2>&1; then
+  echo "thermal receipt accepted a stale schema" >&2
+  exit 1
+fi
+awk -F '\t' 'BEGIN { OFS = "\t" } NR == 2 { $3 = "deepseek-wave-2-measurement" } { print }' \
+  "$receipt_dir/measurement.log" >"$receipt_dir/wrong-phase.log"
+wrong_phase_sha=$(shasum -a 256 "$receipt_dir/wrong-phase.log" | awk '{print $1}')
+jq --arg sha "$wrong_phase_sha" '.measurement_log_sha256 = $sha' \
+  "$receipt_dir/summary.json" >"$receipt_dir/wrong-phase-summary.json"
+jq --slurpfile thermal "$receipt_dir/wrong-phase-summary.json" \
+  '.thermal = $thermal[0]' "$receipt_dir/envelope.json" \
+  >"$receipt_dir/wrong-phase-envelope.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/wrong-phase-envelope.json" "$receipt_dir/wrong-phase-summary.json" \
+  "$receipt_dir/wrong-phase.log" "$receipt_dir/settle.log" >/dev/null 2>&1; then
+  echo "thermal receipt accepted a cross-wave log phase" >&2
+  exit 1
+fi
+
+echo "macOS thermal guard contract: pass"

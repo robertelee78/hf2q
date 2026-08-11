@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte/character counts, exact 6,685-token DeepSeek render, zero cold reuse,
   semantic/tool proof, and the literal 55-second cold limits; a model-free
   negative matrix rejects stale or incomplete receipts.
+- Run the two calibrated DeepSeek four-agent waves before the long functional
+  lifecycle heat-soaks the M5 runner. Each wave now requires at least 60
+  seconds of Nominal samples at five-second cadence with no hf2q/llama model
+  runtime loaded,
+  then fails if two-second in-wave telemetry
+  becomes non-Nominal, malformed, or unavailable during measurement. Receipts
+  bind the thermal sample logs, while curl supplies high-resolution response
+  timing, and the cohort parent immediately reports a child that exits before
+  publishing its cold receipt.
 - Update vulnerable transitive dependencies (`crossbeam-epoch`,
   `quinn-proto`, `rkyv`, `anyhow`, `memmap2`, and the legacy Rustls chain via
   `ruvector-core 2.3`) and make a zero-vulnerability `cargo audit 0.22.2` run

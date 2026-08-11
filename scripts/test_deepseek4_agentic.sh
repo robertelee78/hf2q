@@ -32,13 +32,38 @@ SENTINEL=${SENTINEL:-SENTINEL_CARGO_HF2Q_AGENTIC}
 EXPECTED_SOURCE=${EXPECTED_SOURCE:-"fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result"}
 HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT=${HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT:-}
 COLD_RESULT_PATH=${COLD_RESULT_PATH:-}
+HF2Q_AGENTIC_TIME_TOTAL_INPUT=${HF2Q_AGENTIC_TIME_TOTAL_INPUT:-}
 
-for command in curl date grep jq shasum; do
+for command in awk curl date grep jq shasum; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
   }
 done
+[[ -x /usr/bin/perl ]] || {
+  echo "required monotonic timer is unavailable: /usr/bin/perl" >&2
+  exit 2
+}
+parse_curl_time_total_ms() {
+  local timing_file=$1
+
+  awk '
+    NR == 1 && $0 ~ /^[0-9]+([.][0-9]+)?$/ {
+      milliseconds = $1 * 1000
+      rounded = int(milliseconds)
+      if (milliseconds > rounded) rounded++
+      print rounded
+      valid = 1
+      next
+    }
+    { invalid = 1 }
+    END { if (NR != 1 || !valid || invalid) exit 1 }
+  ' "$timing_file"
+}
+if [[ -n "$HF2Q_AGENTIC_TIME_TOTAL_INPUT" ]]; then
+  parse_curl_time_total_ms "$HF2Q_AGENTIC_TIME_TOTAL_INPUT"
+  exit 0
+fi
 [[ -r "$TOOL_RESULT_PATH" ]] || {
   echo "tool result fixture is not readable: $TOOL_RESULT_PATH" >&2
   exit 2
@@ -89,11 +114,13 @@ continuation_file=$(mktemp -t hf2q-deepseek-agentic-continuation.XXXXXX)
 continuation_response=$(mktemp -t hf2q-deepseek-agentic-continuation-response.XXXXXX)
 source_request_file=$(mktemp -t hf2q-deepseek-agentic-source-request.XXXXXX)
 source_response_file=$(mktemp -t hf2q-deepseek-agentic-source-response.XXXXXX)
+post_timing_file=$(mktemp -t hf2q-deepseek-agentic-post-timing.XXXXXX)
 cleanup() {
   rm -f "$request_file" "$first_file" "$second_file" "$auto_request_file" \
     "$auto_file" "$stream_file" \
     "$stream_json_file" "$stream_timing_file" "$continuation_file" \
     "$continuation_response" "$source_request_file" "$source_response_file"
+  rm -f "$post_timing_file"
 }
 trap cleanup EXIT
 
@@ -119,15 +146,19 @@ post_json() {
     --max-time "$CURL_MAX_TIME_SECONDS" \
     -H 'Content-Type: application/json' \
     --data-binary "@$input" \
-    "$BASE_URL/v1/chat/completions" >"$output"; then
+    --output "$output" --write-out '%{time_total}\n' \
+    "$BASE_URL/v1/chat/completions" >"$post_timing_file"; then
     echo "chat completion request failed; response body:" >&2
     sed -n '1,120p' "$output" >&2
     return 1
   fi
+  POST_JSON_TIME_MS=$(parse_curl_time_total_ms "$post_timing_file")
+  [[ "$POST_JSON_TIME_MS" =~ ^[0-9]+$ ]]
 }
 
-epoch_ms() {
-  echo $(( $(date +%s) * 1000 ))
+monotonic_us() {
+  /usr/bin/perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.0f\n", 1000000 * clock_gettime(CLOCK_MONOTONIC)'
 }
 
 assert_tool_path() {
@@ -149,9 +180,8 @@ assert_tool_path() {
   fi
 }
 
-cold_started=$(epoch_ms)
 post_json "$request_file" "$first_file"
-cold_response_ms=$(( $(epoch_ms) - cold_started ))
+cold_response_ms=$POST_JSON_TIME_MS
 assert_tool_path "$first_file"
 
 cold_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$first_file")
@@ -191,9 +221,8 @@ if [[ -n "$COLD_RESULT_PATH" ]]; then
   mv "$cold_result_tmp" "$COLD_RESULT_PATH"
 fi
 
-cached_started=$(epoch_ms)
 post_json "$request_file" "$second_file"
-cached_response_ms=$(( $(epoch_ms) - cached_started ))
+cached_response_ms=$POST_JSON_TIME_MS
 assert_tool_path "$second_file"
 
 # Temperature-zero recovery from the cached anchor must be semantically
@@ -236,9 +265,8 @@ fi
 # proves the structured body, but only Auto proves that the model recognizes
 # the task and elects to open DeepSeek's DSML tool block on its own.
 jq '.tool_choice = "auto"' "$request_file" >"$auto_request_file"
-auto_started=$(epoch_ms)
 post_json "$auto_request_file" "$auto_file"
-auto_response_ms=$(( $(epoch_ms) - auto_started ))
+auto_response_ms=$POST_JSON_TIME_MS
 assert_tool_path "$auto_file"
 auto_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$auto_file")
 if (( auto_cached < minimum_cached )); then
@@ -250,7 +278,7 @@ if (( auto_response_ms > MAX_CACHED_RESPONSE_MS )); then
   exit 1
 fi
 
-stream_started=$(epoch_ms)
+stream_started_us=$(monotonic_us)
 jq '.stream = true | .stream_options = {include_usage: true}' "$request_file" |
   curl --fail-with-body --silent --show-error --no-buffer \
     --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
@@ -264,7 +292,9 @@ jq '.stream = true | .stream_options = {include_usage: true}' "$request_file" |
       printf '%s\n' "$payload" | jq -e \
         'any(.choices[]?; ((.delta.tool_calls // []) | length) > 0)' >/dev/null; then
       if [[ ! -s "$stream_timing_file" ]]; then
-        echo $(( $(epoch_ms) - stream_started )) >"$stream_timing_file"
+        stream_finished_us=$(monotonic_us)
+        echo $(( (stream_finished_us - stream_started_us + 999) / 1000 )) \
+          >"$stream_timing_file"
       fi
     fi
   done
@@ -344,9 +374,8 @@ jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
     | .stream = false
   ' >"$continuation_file"
 
-continuation_started=$(epoch_ms)
 post_json "$continuation_file" "$continuation_response"
-continuation_response_ms=$(( $(epoch_ms) - continuation_started ))
+continuation_response_ms=$POST_JSON_TIME_MS
 continuation_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$continuation_response")
 continuation_content=$(jq -r '.choices[0].message.content // empty' "$continuation_response")
 if (( continuation_cached < minimum_cached )); then
@@ -406,9 +435,8 @@ jq -n \
     stream: false
   }' >"$source_request_file"
 
-source_started=$(epoch_ms)
 post_json "$source_request_file" "$source_response_file"
-source_response_ms=$(( $(epoch_ms) - source_started ))
+source_response_ms=$POST_JSON_TIME_MS
 if ! jq -e --arg expected "$EXPECTED_SOURCE" '
   (.choices | length) == 1
   and .choices[0].finish_reason == "tool_calls"

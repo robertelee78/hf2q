@@ -20,7 +20,22 @@ OUT_ROOT=${OUT_ROOT:-$(mktemp -d /var/tmp/hf2q-cache-release.XXXXXX)}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$script_dir/macos_thermal_guard.sh"
 
+if [[ ${HF2Q_THERMAL_SWIFT_BIN+x} ]]; then
+  echo "HF2Q_THERMAL_SWIFT_BIN is reserved for isolated contract tests" >&2
+  exit 2
+fi
+readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
+[[ -x "$HF2Q_THERMAL_SWIFT_BIN" ]] || {
+  echo "required system Swift probe is unavailable: $HF2Q_THERMAL_SWIFT_BIN" >&2
+  exit 2
+}
+[[ -x /usr/bin/pgrep ]] || {
+  echo "required model-runtime probe is unavailable: /usr/bin/pgrep" >&2
+  exit 2
+}
 for command in awk caffeinate cargo curl jq lsof pmset rg sed shasum stat; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
@@ -51,6 +66,8 @@ parent_pid=$$
 server_pid=""
 power_pid=""
 caffeinate_pid=""
+thermal_pid=""
+thermal_stop_file=""
 
 require_ac() {
   local state
@@ -114,6 +131,13 @@ stop_server() {
 
 cleanup() {
   local cleanup_rc=0
+  if [[ -n "$thermal_stop_file" ]]; then
+    : >"$thermal_stop_file"
+  fi
+  if [[ -n "$thermal_pid" ]]; then
+    kill -TERM "$thermal_pid" 2>/dev/null || true
+    wait "$thermal_pid" 2>/dev/null || true
+  fi
   stop_server || cleanup_rc=1
   if [[ -n "$power_pid" ]]; then
     kill -TERM "$power_pid" 2>/dev/null || true
@@ -166,6 +190,17 @@ wait_ready() {
 }
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+require_no_model_runtime() {
+  local name
+  for name in hf2q llama-server llama-cli; do
+    if /usr/bin/pgrep -x "$name" >/dev/null 2>&1; then
+      echo "calibrated wave requires no existing $name runtime" >&2
+      /usr/bin/pgrep -flx "$name" >&2 || true
+      return 1
+    fi
+  done
+}
 
 verify_sha256_sidecar() {
   local receipt=$1
@@ -288,11 +323,43 @@ test "$(sha256_file "$OUT_ROOT/fixtures/public-short.json")" = \
 run_deepseek_wave() {
   local wave=$1
   local out="$OUT_ROOT/deepseek/full-context-$wave"
+  local harness_rc=0
+  local thermal_rc=0
+  local thermal_dir="$out/thermal"
+  local thermal_measurement_log="$thermal_dir/measurement.log"
+  local thermal_settle_log="$thermal_dir/settle.log"
+  local thermal_summary="$thermal_dir/summary.json"
+  local measurement_samples
+  local measurement_duration_seconds
+  local non_nominal_measurement_samples
+  local settle_samples
+  local settle_duration_seconds
+  local settle_telemetry_gaps
+  local telemetry_gaps
+  local sample_interval_seconds=2
+  local maximum_sample_gap_seconds=5
+  local settle_sample_interval_seconds=5
+  local maximum_settle_sample_gap_seconds=8
   mkdir -p "$out"
+  mkdir -p "$thermal_dir"
+  require_no_model_runtime
+  thermal_wait_for_nominal "$thermal_settle_log" "deepseek-wave-${wave}-settle" \
+    60 900 "$settle_sample_interval_seconds"
   start_server deepseek "process-wave-$wave" scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
+  thermal_stop_file="$thermal_dir/stop"
+  rm -f "$thermal_stop_file"
+  : >"$thermal_measurement_log"
+  thermal_sample "$thermal_measurement_log" \
+    "deepseek-wave-${wave}-measurement-start"
+  test "$THERMAL_STATE" = nominal
+  thermal_monitor_nominal "$thermal_measurement_log" \
+    "deepseek-wave-${wave}-measurement" "$thermal_stop_file" \
+    "$sample_interval_seconds" &
+  thermal_pid=$!
   # Preserve the prompt-visible path used by the exact 863ea423 calibration.
   # The simulated tool result still comes from the packed candidate below.
+  set +e
   BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
   WAVE_ID=default REQUIRE_COLD_FIRST=1 \
   EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
@@ -306,6 +373,62 @@ run_deepseek_wave() {
   CURL_CONNECT_TIMEOUT_SECONDS=5 CURL_MAX_TIME_SECONDS=90 \
   OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
     >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+  harness_rc=$?
+  set -e
+  : >"$thermal_stop_file"
+  if ! wait "$thermal_pid"; then
+    thermal_rc=1
+  fi
+  if ! thermal_sample "$thermal_measurement_log" \
+    "deepseek-wave-${wave}-measurement-end" \
+    || [[ "$THERMAL_STATE" != nominal ]]; then
+    thermal_rc=1
+  fi
+  thermal_pid=""
+  thermal_stop_file=""
+  ((thermal_rc == 0)) || {
+    echo "DeepSeek wave $wave thermal monitor failed" >&2
+    return 1
+  }
+  ((harness_rc == 0)) || return "$harness_rc"
+  thermal_validate_measurement_log "$thermal_measurement_log" \
+    "$maximum_sample_gap_seconds"
+  measurement_samples=$THERMAL_LOG_SAMPLES
+  measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+  non_nominal_measurement_samples=$THERMAL_LOG_NON_NOMINAL_SAMPLES
+  telemetry_gaps=$THERMAL_LOG_GAPS
+  thermal_validate_settle_log "$thermal_settle_log" 60 \
+    "$maximum_settle_sample_gap_seconds"
+  settle_samples=$THERMAL_LOG_SAMPLES
+  settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+  settle_telemetry_gaps=$THERMAL_LOG_GAPS
+  jq -n --arg status pass --arg phase "deepseek-wave-$wave" \
+    --arg settle_log_sha256 "$(sha256_file "$thermal_settle_log")" \
+    --arg measurement_log_sha256 "$(sha256_file "$thermal_measurement_log")" \
+    --argjson settle_seconds 60 \
+    --argjson settle_duration_seconds "$settle_duration_seconds" \
+    --argjson settle_samples "$settle_samples" \
+    --argjson measurement_samples "$measurement_samples" \
+    --argjson measurement_duration_seconds "$measurement_duration_seconds" \
+    --argjson sample_interval_seconds "$sample_interval_seconds" \
+    --argjson maximum_sample_gap_seconds "$maximum_sample_gap_seconds" \
+    --argjson settle_sample_interval_seconds "$settle_sample_interval_seconds" \
+    --argjson maximum_settle_sample_gap_seconds "$maximum_settle_sample_gap_seconds" \
+    --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
+    --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
+    --argjson telemetry_gaps "$telemetry_gaps" \
+    '{status:$status,phase:$phase,required_state:"nominal",runtime_preflight:"pass",
+      settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
+      settle_samples:$settle_samples,measurement_samples:$measurement_samples,
+      measurement_duration_seconds:$measurement_duration_seconds,
+      sample_interval_seconds:$sample_interval_seconds,
+      maximum_sample_gap_seconds:$maximum_sample_gap_seconds,
+      settle_sample_interval_seconds:$settle_sample_interval_seconds,
+      maximum_settle_sample_gap_seconds:$maximum_settle_sample_gap_seconds,
+      non_nominal_measurement_samples:$non_nominal_measurement_samples,
+      settle_telemetry_gaps:$settle_telemetry_gaps,
+      telemetry_gaps:$telemetry_gaps,settle_log_sha256:$settle_log_sha256,
+      measurement_log_sha256:$measurement_log_sha256}' >"$thermal_summary"
   jq -e -f scripts/deepseek4_full_context_receipt.jq \
     "$out/summary.json.tmp" >/dev/null
   mv "$out/summary.json.tmp" "$out/summary.json"
@@ -329,13 +452,21 @@ run_deepseek_wave() {
     --arg summary_sha256 "$(cat "$out/summary.json.sha256")" \
     --arg server_log_sha256 "$(cat "$current_dir/server.log.sha256")" \
     --argjson cold_prefill_tokens_per_second "$cold_prefill_rates_json" \
+    --slurpfile thermal "$thermal_summary" \
     --slurpfile receipt "$out/summary.json" \
-    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,receipt:$receipt[0]}' \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
+  scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \
+    "$thermal_summary" "$thermal_measurement_log" "$thermal_settle_log"
 }
 
 run_deepseek_release_gates() {
+  # Run calibrated performance waves on a thermally settled host before the
+  # 94K/119K functional workloads heat-soak the shared M5 runner.
+  run_deepseek_wave 1
+  run_deepseek_wave 2
+
   start_server deepseek process-a scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
   BASE_URL="$current_url" MODEL="Deepseek v4 Flash 0731 Source" \
@@ -362,8 +493,6 @@ run_deepseek_release_gates() {
   verify_sha256_sidecar "$OUT_ROOT/deepseek/cached-suffix/summary.json"
   run_lifecycle deepseek 3230
   finish_server_phase
-  run_deepseek_wave 1
-  run_deepseek_wave 2
 }
 
 run_qwen_release_gates() {
@@ -539,6 +668,8 @@ jq -n \
   --arg deepseek_cached_sha "$(sha256_file "$OUT_ROOT/deepseek/cached-suffix/summary.json")" \
   --arg deepseek_wave1_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/envelope.json")" \
   --arg deepseek_wave2_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-2/envelope.json")" \
+  --arg deepseek_wave1_thermal_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/thermal/summary.json")" \
+  --arg deepseek_wave2_thermal_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-2/thermal/summary.json")" \
   --arg gemma_lifecycle_sha "$(sha256_file "$OUT_ROOT/gemma/lifecycle/summary.json")" \
   --arg gemma_overlap_sha "$(sha256_file "$OUT_ROOT/gemma/overlap/summary.json")" \
   --arg gemma_wave1_sha "$(sha256_file "$OUT_ROOT/gemma/wave1/summary.json")" \
@@ -584,7 +715,7 @@ jq -n \
       qwen: {path: $qwen_path, bytes: $qwen_bytes, sha256: $qwen_sha}
     },
     receipt_sha256: {
-      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha},
+      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha},
       gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,eight_slots:$gemma_wave8_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha}
     },
