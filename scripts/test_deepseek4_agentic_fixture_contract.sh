@@ -7,7 +7,7 @@ FIXTURE="$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt"
 FIXTURE_SHA256=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
 FIXTURE_CHARS=20584
 
-for command in cmp head jq rg shasum tail; do
+for command in cmp grep head jq shasum tail; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -98,7 +98,7 @@ if AGENTIC_CONTEXT_FIXTURE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   echo "DeepSeek agentic gate accepted a mismatched fixture digest" >&2
   exit 1
 fi
-rg -F 'agentic context fixture SHA-256 mismatch' \
+grep -F 'agentic context fixture SHA-256 mismatch' \
   "$invalid_stderr" >/dev/null
 
 expect_fixture_rejected() {
@@ -112,7 +112,7 @@ expect_fixture_rejected() {
     echo "DeepSeek agentic gate accepted mutated fixture: $label" >&2
     exit 1
   fi
-  rg -F 'agentic context fixture SHA-256 mismatch' \
+  grep -F 'agentic context fixture SHA-256 mismatch' \
     "$tmp_dir/$label.stderr" >/dev/null
 }
 
