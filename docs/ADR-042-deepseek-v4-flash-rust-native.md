@@ -1237,14 +1237,17 @@ The first draining-only correction then reached exact `main` as
 All four individual cold responses met the unchanged 55-second limit at
 54.476, 54.311, 54.642, and 53.377 seconds, and every cached, automatic, and
 tool-result continuation reused exactly 6,677/6,685 tokens. The monotonic
-cohort wall was nevertheless 55.250 seconds, so the release gate correctly
-failed by 250 milliseconds. The server trace exposed the remaining transition:
-after request 1 finished prefill, request 3 was admitted while request 4 was
-still queued, but the cohort was still `Filling`; request 1 therefore consumed
-an eight-token decode quantum and imposed the two-window prefill cap before the
-cohort entered `Draining`. Request 2 then consumed one decode token at the same
-boundary. That unary work was still not deliverable before all four cold
-prefills crossed the cohort barrier.
+cohort wall was nevertheless 55.250 seconds. The workflow itself failed closed
+first when its thermal monitor observed a `fair` sample, before receipt
+validation; the preserved temporary receipt was also 250 milliseconds over the
+unchanged limit and would have failed that validator independently. The server
+trace exposed the remaining transition: after request 1 finished prefill,
+request 3 was admitted while request 4 was still queued, but the cohort was
+still `Filling`; request 1 therefore consumed an eight-token decode quantum and
+imposed the two-window prefill cap before the cohort entered `Draining`.
+Request 2 then consumed one decode token at the same boundary. That unary work
+was still not deliverable before all four cold prefills crossed the cohort
+barrier.
 
 The correction distinguishes this saturated state from the lopsided
 interactive case. When the filling cohort still has another cold request
