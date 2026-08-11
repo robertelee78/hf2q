@@ -1335,6 +1335,15 @@ safety only. Acceptance still requires two thermally valid exact-packed
 tool semantics, plus the 94,576-token overlap/lifecycle gate. Decode-sized
 fusion remains a later, separately measured experiment.
 
+The local acceptance setup exposed an independent launcher false positive:
+the remote-inference OpenCode process reported 10.5 GiB RSS, while macOS
+`footprint` measured 1.7 GiB physical use and 9.5 GiB reclaimable mappings.
+System memory remained 93% free with 2.4 GiB compressor use and 3.2 GiB swap.
+The canonical launcher now refines only processes whose RSS crosses the 8 GiB
+ceiling and falls back to that conservative RSS value if `footprint` is absent,
+fails, exits during inspection, or returns malformed output. This changes no
+model/cache budget and does not authorize co-resident inference runtimes.
+
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 
 The cross-family lifecycle gate reproduced the operator's long-session shape

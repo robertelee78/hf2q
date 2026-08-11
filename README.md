@@ -265,7 +265,11 @@ On the target M5 Max host, the launcher defaults to the schema-v2,
 source-bound `deepseek4-agentic-q2` reproduction that passed the strict
 coherence, throughput, tool-use, and long-prefix cache gates. It enables
 operator progress telemetry and rejects unsafe port or memory state before
-mapping the approximately 100 GiB model.
+mapping the approximately 100 GiB model. When a competing process exceeds the
+8 GiB RSS ceiling, the macOS launcher refines that value with physical
+`footprint` so reclaimable WebKit/IOAccelerator mappings do not create a false
+positive. If the probe is unavailable or malformed, the original RSS upper
+bound remains authoritative and the launcher still fails closed.
 
 Unary and streaming chat completions support reasoning content, OpenAI tools,
 required/automatic tool choice, parallel DSML invokes, cancellation, and usage

@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decode-sized work and forced diagnostic routes remain independent. This is
   not an arithmetic-fusion claim, and exact packed hf2q hardware acceptance
   remains required before publishing an end-to-end speedup.
+- Refine an over-ceiling macOS process RSS with `footprint` before rejecting a
+  100 GiB DeepSeek load. This avoids treating reclaimable WebKit and
+  IOAccelerator mappings from a remote-inference coding client as private
+  resident memory; a missing, failed, or malformed footprint probe keeps the
+  conservative RSS value and still fails closed.
 - Resolve the published, checksum-pinned `mlx-native 0.10.8` backend, retaining
   the 0.10.7 command-buffer
   lifetime correction. Internal unlabeled GraphSession command buffers retain

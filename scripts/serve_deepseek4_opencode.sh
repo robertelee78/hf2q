@@ -68,9 +68,12 @@ KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-8589934592}" # 8 GiB shared
 
 # A ~100 GiB resident model leaves little margin on a 128 GiB host. Refuse a
 # load when prior inference has left the compressor/swap saturated or one
-# competing process already consumes a material part of that margin. These
-# limits are intentionally conservative; the explicit unsafe override exists
-# for controlled diagnostics, not normal OpenCode serving.
+# competing process already consumes a material part of that margin. macOS
+# RSS includes reclaimable WebKit and IOAccelerator mappings, so an RSS value
+# above the ceiling is refined with `footprint` when available; failure to
+# obtain a physical footprint keeps the conservative RSS value. These limits
+# are intentionally conservative; the explicit unsafe override exists for
+# controlled diagnostics, not normal OpenCode serving.
 MAX_SWAP_USED_GIB="${MAX_SWAP_USED_GIB:-8}"
 MAX_COMPRESSOR_USED_GIB="${MAX_COMPRESSOR_USED_GIB:-8}"
 MAX_OTHER_PROCESS_RSS_GIB="${MAX_OTHER_PROCESS_RSS_GIB:-8}"
@@ -157,11 +160,6 @@ if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
             }
         }
     }')
-    read -r LARGEST_PID LARGEST_RSS_KIB LARGEST_COMMAND < <(
-        ps -axo pid=,rss=,comm= | awk -v self="$$" '$1 != self && $2 > max {
-            max = $2; pid = $1; command = $3
-        } END { print pid + 0, max + 0, command }'
-    )
     [[ -n "$PAGE_BYTES" && -n "$COMPRESSOR_PAGES" && -n "$SWAP_USED_MIB" ]] || {
         echo "could not read macOS memory pressure counters" >&2
         exit 4
@@ -169,17 +167,41 @@ if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
 
     COMPRESSOR_BYTES=$((COMPRESSOR_PAGES * PAGE_BYTES))
     SWAP_USED_BYTES=$((SWAP_USED_MIB * 1024 * 1024))
-    LARGEST_RSS_BYTES=$((LARGEST_RSS_KIB * 1024))
     MAX_SWAP_USED_BYTES=$((MAX_SWAP_USED_GIB * 1024 * 1024 * 1024))
     MAX_COMPRESSOR_USED_BYTES=$((MAX_COMPRESSOR_USED_GIB * 1024 * 1024 * 1024))
     MAX_OTHER_PROCESS_RSS_BYTES=$((MAX_OTHER_PROCESS_RSS_GIB * 1024 * 1024 * 1024))
 
-    printf 'hf2q memory preflight: model=%.2f GiB swap_used=%.2f GiB compressor=%.2f GiB largest_process=%.2f GiB (%s pid %s)\n' \
+    LARGEST_PID=0
+    LARGEST_PROCESS_BYTES=0
+    LARGEST_PROCESS_METRIC="RSS upper bound"
+    LARGEST_COMMAND="unknown"
+    while read -r PROCESS_PID PROCESS_RSS_KIB PROCESS_COMMAND; do
+        (( PROCESS_PID == $$ )) && continue
+        PROCESS_BYTES=$((PROCESS_RSS_KIB * 1024))
+        PROCESS_METRIC="RSS upper bound"
+        if (( PROCESS_BYTES > MAX_OTHER_PROCESS_RSS_BYTES )) && command -v footprint >/dev/null 2>&1; then
+            PHYSICAL_BYTES=$(footprint -p "$PROCESS_PID" -f bytes --noCategories 2>/dev/null | awk '
+                $1 == "phys_footprint:" && $2 ~ /^[0-9]+$/ { print $2; exit }
+            ' || true)
+            if [[ "$PHYSICAL_BYTES" =~ ^[0-9]+$ ]]; then
+                PROCESS_BYTES=$PHYSICAL_BYTES
+                PROCESS_METRIC="physical footprint"
+            fi
+        fi
+        if (( PROCESS_BYTES > LARGEST_PROCESS_BYTES )); then
+            LARGEST_PID=$PROCESS_PID
+            LARGEST_PROCESS_BYTES=$PROCESS_BYTES
+            LARGEST_PROCESS_METRIC=$PROCESS_METRIC
+            LARGEST_COMMAND=$PROCESS_COMMAND
+        fi
+    done < <(ps -axo pid=,rss=,comm=)
+
+    printf 'hf2q memory preflight: model=%.2f GiB swap_used=%.2f GiB compressor=%.2f GiB largest_process=%.2f GiB (%s pid %s, %s)\n' \
         "$(awk -v bytes="$MODEL_BYTES" 'BEGIN { print bytes / 1073741824 }')" \
         "$(awk -v bytes="$SWAP_USED_BYTES" 'BEGIN { print bytes / 1073741824 }')" \
         "$(awk -v bytes="$COMPRESSOR_BYTES" 'BEGIN { print bytes / 1073741824 }')" \
-        "$(awk -v bytes="$LARGEST_RSS_BYTES" 'BEGIN { print bytes / 1073741824 }')" \
-        "$LARGEST_COMMAND" "$LARGEST_PID"
+        "$(awk -v bytes="$LARGEST_PROCESS_BYTES" 'BEGIN { print bytes / 1073741824 }')" \
+        "$LARGEST_COMMAND" "$LARGEST_PID" "$LARGEST_PROCESS_METRIC"
 
     MEMORY_FAILURES=()
     if (( SWAP_USED_BYTES > MAX_SWAP_USED_BYTES )); then
@@ -188,8 +210,8 @@ if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
     if (( COMPRESSOR_BYTES > MAX_COMPRESSOR_USED_BYTES )); then
         MEMORY_FAILURES+=("compressor use exceeds ${MAX_COMPRESSOR_USED_GIB} GiB")
     fi
-    if (( LARGEST_RSS_BYTES > MAX_OTHER_PROCESS_RSS_BYTES )); then
-        MEMORY_FAILURES+=("process $LARGEST_COMMAND (pid $LARGEST_PID) exceeds ${MAX_OTHER_PROCESS_RSS_GIB} GiB RSS")
+    if (( LARGEST_PROCESS_BYTES > MAX_OTHER_PROCESS_RSS_BYTES )); then
+        MEMORY_FAILURES+=("process $LARGEST_COMMAND (pid $LARGEST_PID) exceeds ${MAX_OTHER_PROCESS_RSS_GIB} GiB by $LARGEST_PROCESS_METRIC")
     fi
     if (( ${#MEMORY_FAILURES[@]} > 0 )); then
         printf 'unsafe host memory state for this model:\n' >&2
