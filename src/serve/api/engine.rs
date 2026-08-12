@@ -20618,17 +20618,16 @@ fn gemma_retained_live_prefix_tokens(
 fn gemma_live_batched_append_allowed(
     serve_batched_env: Option<&str>,
     suffix_tokens: usize,
-    n_attention_heads: usize,
 ) -> bool {
-    if suffix_tokens < 32 {
+    if suffix_tokens == 0 {
         return false;
     }
     match serve_batched_env {
         Some(value) => !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
-        None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
-            suffix_tokens,
-            n_attention_heads,
-        ),
+        // Live append uses bounded vector attention and a 1x1 placeholder
+        // setup mask, so the cold route's O(n²) viability estimate does not
+        // apply to its suffix length.
+        None => true,
     }
 }
 
@@ -20646,6 +20645,7 @@ fn gemma_live_prefix_resume(
     prompt_tokens: &[u32],
     max_tokens: usize,
     has_soft_tokens: bool,
+    serve_batched_env: Option<&str>,
 ) -> Option<usize> {
     if has_soft_tokens
         || loaded.live_prefix_tokens.is_empty()
@@ -20662,27 +20662,35 @@ fn gemma_live_prefix_resume(
     }
 
     let required_capacity = prompt_tokens.len().checked_add(max_tokens.max(1))?;
-    let dense = loaded.weights.dense_kvs.as_ref()?;
-    if dense.len() != loaded.weights.layers.len() {
-        return None;
-    }
-    let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
-        mlx_native::DType::F16
-    } else {
-        mlx_native::DType::F32
-    };
-    let dense_ok = dense
-        .iter()
-        .zip(loaded.weights.layers.iter())
-        .all(|(cache, layer)| {
-            let is_sliding = matches!(layer.layer_type, crate::serve::config::LayerType::Sliding);
-            cache.capacity >= required_capacity
-                && cache.is_sliding == is_sliding
-                && cache.dtype == model_kv_dtype
-                && std::sync::Arc::strong_count(cache) == 1
-        });
-    if !dense_ok {
-        return None;
+    let hybrid_batched_resume = crate::debug::INVESTIGATION_ENV.hybrid_kv
+        && gemma_live_batched_append_allowed(
+            serve_batched_env,
+            prompt_tokens.len().saturating_sub(k),
+        );
+    if !hybrid_batched_resume {
+        let dense = loaded.weights.dense_kvs.as_ref()?;
+        if dense.len() != loaded.weights.layers.len() {
+            return None;
+        }
+        let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+            mlx_native::DType::F16
+        } else {
+            mlx_native::DType::F32
+        };
+        let dense_ok = dense
+            .iter()
+            .zip(loaded.weights.layers.iter())
+            .all(|(cache, layer)| {
+                let is_sliding =
+                    matches!(layer.layer_type, crate::serve::config::LayerType::Sliding);
+                cache.capacity >= required_capacity
+                    && cache.is_sliding == is_sliding
+                    && cache.dtype == model_kv_dtype
+                    && std::sync::Arc::strong_count(cache) == 1
+            });
+        if !dense_ok {
+            return None;
+        }
     }
 
     if crate::debug::INVESTIGATION_ENV.hybrid_kv {
@@ -20794,8 +20802,13 @@ fn generate_once_with_soft_tokens(
     //      partial-prefill resume entry point. Otherwise (any gate
     //      fails) the path falls back to the pre-iter-3 wholesale
     //      reset + fresh allocation.
-    let live_resume =
-        gemma_live_prefix_resume(loaded, prompt_tokens, max_tokens, !soft_tokens.is_empty());
+    let live_resume = gemma_live_prefix_resume(
+        loaded,
+        prompt_tokens,
+        max_tokens,
+        !soft_tokens.is_empty(),
+        serve_batched_env.as_deref(),
+    );
     // Fail closed before this request mutates any KV bytes. Only a fully
     // successful request below republishes a live recovery anchor.
     loaded.live_prefix_tokens.clear();
@@ -21261,11 +21274,11 @@ fn generate_once_with_soft_tokens(
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
-        soft_tokens.is_empty()
+        crate::debug::INVESTIGATION_ENV.hybrid_kv
+            && soft_tokens.is_empty()
             && gemma_live_batched_append_allowed(
                 serve_batched_env.as_deref(),
                 prompt_tokens.len().saturating_sub(k),
-                loaded.weights.num_attention_heads,
             )
     });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
@@ -25725,8 +25738,13 @@ fn generate_stream_once(
     //
     // Mirrors `generate_once_with_soft_tokens`'s probe + iter-3
     // resume gate. See that site for the full design contract.
-    let live_resume =
-        gemma_live_prefix_resume(loaded, prompt_tokens, max_tokens, !soft_tokens.is_empty());
+    let live_resume = gemma_live_prefix_resume(
+        loaded,
+        prompt_tokens,
+        max_tokens,
+        !soft_tokens.is_empty(),
+        serve_batched_env.as_deref(),
+    );
     // A dropped SSE receiver or any later error must not publish partially
     // mutated KV as a future prefix. Commit happens only after Done.
     loaded.live_prefix_tokens.clear();
@@ -26311,11 +26329,11 @@ fn generate_stream_once(
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
-        soft_tokens.is_empty()
+        crate::debug::INVESTIGATION_ENV.hybrid_kv
+            && soft_tokens.is_empty()
             && gemma_live_batched_append_allowed(
                 serve_batched_env.as_deref(),
                 prompt_tokens.len().saturating_sub(k),
-                loaded.weights.num_attention_heads,
             )
     });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
@@ -28223,9 +28241,11 @@ mod tests {
 
     #[test]
     fn gemma_live_batched_append_respects_operator_and_suffix_size() {
-        assert!(!gemma_live_batched_append_allowed(Some("0"), 6_000, 16));
-        assert!(gemma_live_batched_append_allowed(Some("1"), 6_000, 16));
-        assert!(!gemma_live_batched_append_allowed(Some("1"), 31, 16));
+        assert!(!gemma_live_batched_append_allowed(Some("0"), 6_000));
+        assert!(gemma_live_batched_append_allowed(Some("1"), 6_000));
+        assert!(gemma_live_batched_append_allowed(Some("1"), 1));
+        assert!(gemma_live_batched_append_allowed(None, 1));
+        assert!(!gemma_live_batched_append_allowed(None, 0));
     }
 
     #[test]

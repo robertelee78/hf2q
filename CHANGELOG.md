@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct owner release, while labeled or publicly escaped buffers preserve the
   autorelease scope required by external Objective-C ownership. No local Cargo
   patch participates in the release candidate.
+- Keep Gemma SerialFifo long-prefix continuations on the bounded live-append
+  graph even for 1–31-token suffixes. Sliding-cache staging now derives each
+  query position from the actual staged cache capacity rather than capping it
+  independently at the 1,024-token semantic window. This preserves the
+  current suffix K/V and chronological history beyond the window, and lets a
+  successful append publish a reusable latest anchor for the following turn.
 
 ### Validation
 
@@ -88,6 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parity checks with the optimized release profile and bind that profile in
   the hardware receipt. Metal command scheduling is profile-sensitive; a
   debug-only timing divergence must not be mislabeled as production evidence.
+- Compare Gemma long-resume output with a cold request through the same
+  production graph, require two consecutive LCP engagements, and verify both
+  resumed turns byte-for-byte. The former forced-linear control compared two
+  numerically distinct prefill graphs and could report cache corruption when
+  only the graph choice differed.
 - Make the release-authority Gemma overlap timeout explicit and overridable.
   The protected gate now supplies 1,800 seconds for its fixed 175K-token
   full-attention prompt instead of inheriting a non-overridable 900-second
@@ -326,8 +337,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Sliding layers allocate linear buffers on both prefill routes;
   hybrid encode writes slot=logical at prefill and decode (capacity-
   derived predicate); the hybrid SDPA kernel's `mask_type=2` windowing
-  composes byte-identically with the non-batched reference
-  (`gemma_hybrid_long_resume_byte_identity`, engagement-asserted).
+  is covered by `gemma_hybrid_long_resume_byte_identity`. The current
+  release-candidate correction compares resumed and cold requests through
+  the same production graph; the earlier forced-linear control was not a
+  same-graph cache-coherence oracle.
   `HF2Q_KV_LCP_RESUME_CAPACITY=8g` is the documented envelope knob
   (snapshots carry +4096/turn multi-turn headroom).
 - **Fixed: SerialFifo consume-gate 500 on growing conversations** — a

@@ -65,6 +65,16 @@ fn gemma_live_query_chunk_len(start_pos: usize, remaining: usize) -> usize {
     len.max(1)
 }
 
+/// Logical query offset inside a chronological sliding-cache staging buffer.
+///
+/// The stage copies up to `cache_capacity - 1` history rows before the current
+/// suffix chunk. Its per-query position must use that exact history length;
+/// capping at the model sliding-window size would point long linear-resume
+/// queries at the wrong staged rows.
+fn gemma_live_stage_history_len(absolute_start: usize, cache_capacity: usize) -> usize {
+    absolute_start.min(cache_capacity.saturating_sub(1))
+}
+
 fn gemma_batched_mask_seq_len(seq_len: usize, live_prefix_resume: bool) -> usize {
     if live_prefix_resume {
         // Live resume uses the hybrid KV kernel with absolute query positions
@@ -1267,6 +1277,33 @@ impl MlxModelWeights {
             } else {
                 None
             };
+        let live_sliding_cache_capacity = if live_prefix_resume {
+            let capacities: Vec<usize> = if let Some(ms) = self.multi_seq_prefill.as_ref() {
+                ms.full_views_hybrid
+                    .iter()
+                    .filter(|cache| cache.is_sliding)
+                    .map(|cache| cache.capacity)
+                    .collect()
+            } else {
+                self.hybrid_kv
+                    .as_ref()
+                    .into_iter()
+                    .flatten()
+                    .filter(|cache| cache.is_sliding)
+                    .map(|cache| cache.capacity)
+                    .collect()
+            };
+            let capacity = capacities.first().copied().ok_or_else(|| {
+                anyhow::anyhow!("batched live resume has no sliding hybrid cache")
+            })?;
+            anyhow::ensure!(
+                capacities.iter().all(|&candidate| candidate == capacity),
+                "batched live resume sliding cache capacities differ"
+            );
+            capacity
+        } else {
+            sliding_layer_capacity
+        };
         let live_linear_positions: Option<MlxBuffer> = if live_prefix_resume {
             let mut positions = alloc_u32(seq_len, "pf_live_linear_positions")?;
             let values = positions
@@ -1283,7 +1320,10 @@ impl MlxModelWeights {
                             start_i + local_start,
                             seq_len_i - local_start,
                         );
-                        let history_len = (start_i + local_start).min(sw.saturating_sub(1));
+                        let history_len = gemma_live_stage_history_len(
+                            start_i + local_start,
+                            live_sliding_cache_capacity,
+                        );
                         for local in 0..chunk_len {
                             values[seq_offset + local_start + local] = (history_len + local) as u32;
                         }
@@ -1295,7 +1335,10 @@ impl MlxModelWeights {
                 while chunk_start < seq_len {
                     let chunk_len =
                         gemma_live_query_chunk_len(start_pos + chunk_start, seq_len - chunk_start);
-                    let history_len = (start_pos + chunk_start).min(sw.saturating_sub(1));
+                    let history_len = gemma_live_stage_history_len(
+                        start_pos + chunk_start,
+                        live_sliding_cache_capacity,
+                    );
                     for local in 0..chunk_len {
                         values[chunk_start + local] = (history_len + local) as u32;
                     }
@@ -7569,7 +7612,7 @@ mod block_diagonal_mask_tests {
 mod route_viability_tests {
     use super::{
         batched_route_overhead_bytes as overhead, gemma_batched_mask_seq_len,
-        gemma_lcp_resume_worthwhile, gemma_live_query_chunk_len,
+        gemma_lcp_resume_worthwhile, gemma_live_query_chunk_len, gemma_live_stage_history_len,
     };
 
     #[test]
@@ -7587,6 +7630,13 @@ mod route_viability_tests {
         assert_eq!(gemma_live_query_chunk_len(1000, 900), 24);
         assert_eq!(gemma_live_query_chunk_len(1024, 900), 256);
         assert_eq!(gemma_live_query_chunk_len(7_000, 17), 17);
+    }
+
+    #[test]
+    fn live_stage_positions_follow_the_actual_cache_history() {
+        assert_eq!(gemma_live_stage_history_len(2_005, 18_404), 2_005);
+        assert_eq!(gemma_live_stage_history_len(2_005, 1_024), 1_023);
+        assert_eq!(gemma_live_stage_history_len(0, 0), 0);
     }
 
     #[test]
