@@ -33031,14 +33031,21 @@ assistant:
     }
 
     /// Exact real-model parity across the production 4,096-token Gemma
-    /// transaction boundary. The first request takes the eager 4,096-token
-    /// path; the independent 8,193-token request must execute two complete
-    /// resumable transactions plus a one-token tail and emit the same greedy
-    /// output as an independent monolithic slot-aware reference.
+    /// transaction boundary. Fresh one-slot workers provide the references:
+    /// 4,096 tokens take the eager path, while 8,193 tokens take the same
+    /// `4,096 + 4,096 + 1` bounded plan used in production. A second worker
+    /// first completes the eager request and then reuses that physical slot
+    /// for the independent 8,193-token request. Both results must match their
+    /// fresh-worker counterparts with zero advertised prefix reuse.
+    ///
+    /// A monolithic 8,193-token prefill is deliberately not the oracle. It is
+    /// mathematically equivalent, but it uses a different Metal reduction
+    /// graph and can flip a later near-tie after selecting the same first
+    /// decode token. The cache/reset contract is same-plan fresh-vs-reused
+    /// identity, not byte identity between different floating-point graphs.
     #[test]
-    fn gemma_eager_4096_and_resumed_8193_tail_match_cold_output() {
-        if byte_equiv_skip_unless_gated("gemma_eager_4096_and_resumed_8193_tail_match_cold_output")
-        {
+    fn gemma_fresh_and_reused_4096_8193_bounded_outputs_match() {
+        if byte_equiv_skip_unless_gated("gemma_fresh_and_reused_4096_8193_bounded_outputs_match") {
             return;
         }
         let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
@@ -33059,8 +33066,28 @@ assistant:
             max_tokens: 8,
             ..Default::default()
         };
-        let eager_cold = gemma4_serial_slot_aware_ref(&load_opts, &eager_prompt, &params);
-        let resumed_cold = gemma4_serial_slot_aware_ref(&load_opts, &resumed_prompt, &params);
+
+        let run_fresh_bounded = |prompt_tokens: Vec<u32>| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fresh bounded runtime");
+            let engine = Engine::spawn_with_mode(
+                LoadedModel::load(&load_opts).expect("load fresh bounded Gemma model"),
+                2,
+                None,
+                EngineMode::SlotAware { max_slots: 1 },
+            )
+            .expect("spawn fresh bounded Gemma engine");
+            let result = rt
+                .block_on(engine.generate(prompt_tokens, params.clone()))
+                .expect("fresh bounded generation");
+            rt.block_on(engine.shutdown())
+                .expect("fresh bounded shutdown");
+            result
+        };
+        let eager_fresh = run_fresh_bounded(eager_prompt.clone());
+        let resumed_fresh = run_fresh_bounded(resumed_prompt.clone());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -33081,8 +33108,8 @@ assistant:
             .expect("resumed non-aligned tail generation");
 
         for (label, actual, expected) in [
-            ("eager-4096", &eager, &eager_cold),
-            ("resumed-8193", &resumed, &resumed_cold),
+            ("reused-slot-eager-4096", &eager, &eager_fresh),
+            ("reused-slot-bounded-8193", &resumed, &resumed_fresh),
         ] {
             assert_eq!(actual.text, expected.text, "{label} text diverged");
             assert_eq!(
@@ -33102,10 +33129,21 @@ assistant:
                 "{label} logprobs diverged"
             );
         }
-        assert_eq!(eager.cached_tokens, 0, "eager boundary must be cold");
+        assert_eq!(
+            eager_fresh.cached_tokens, 0,
+            "fresh eager reference must be cold"
+        );
+        assert_eq!(
+            resumed_fresh.cached_tokens, 0,
+            "fresh bounded reference must be cold"
+        );
+        assert_eq!(
+            eager.cached_tokens, 0,
+            "reused-worker eager boundary must be cold"
+        );
         assert_eq!(
             resumed.cached_tokens, 0,
-            "independent resumable prompt must remain a cold parity case"
+            "independent bounded prompt must not inherit the prior slot prefix"
         );
         rt.block_on(engine.shutdown()).expect("shutdown engine");
     }

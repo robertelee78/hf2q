@@ -672,7 +672,7 @@ run_gemma_release_gates() {
       --test-threads=1 >"$OUT_ROOT/gemma/parity/n8.log" 2>&1
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
     cargo test --release --locked --bin hf2q \
-      gemma_eager_4096_and_resumed_8193_tail_match_cold_output -- \
+      gemma_fresh_and_reused_4096_8193_bounded_outputs_match -- \
       --test-threads=1 >"$OUT_ROOT/gemma/parity/boundary-tail.log" 2>&1
   HF2Q_KV_PERSIST_PHASE_D=1 HF2Q_KV_PERSIST_E2E_MODEL_PATH="$GEMMA_MODEL" \
     cargo test --release --locked --test lcp_partial_prefill_byte_identity \
@@ -684,7 +684,7 @@ run_gemma_release_gates() {
     --arg n8_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8.log")" \
     --arg boundary_tail_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/boundary-tail.log")" \
     --arg long_resume_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/long-resume.log")" \
-    '{status:$status,profile:"release",n4_exact_output_parity:true,n8_exact_output_parity:true,eager_4096_and_resumed_8193_exact_output_parity:true,long_resume_exact_output_parity:true,n4_log_sha256:$n4_sha256,n8_log_sha256:$n8_sha256,boundary_tail_log_sha256:$boundary_tail_sha256,long_resume_log_sha256:$long_resume_sha256}' \
+    '{status:$status,profile:"release",n4_exact_output_parity:true,n8_exact_output_parity:true,fresh_and_reused_4096_8193_bounded_output_parity:true,long_resume_exact_output_parity:true,n4_log_sha256:$n4_sha256,n8_log_sha256:$n8_sha256,boundary_tail_log_sha256:$boundary_tail_sha256,long_resume_log_sha256:$long_resume_sha256}' \
     >"$OUT_ROOT/gemma/parity/summary.json"
 }
 

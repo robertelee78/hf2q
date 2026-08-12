@@ -300,7 +300,7 @@ jobs:
                and $g.parity.profile == "release"
                and $g.parity.n4_exact_output_parity == true
                and $g.parity.n8_exact_output_parity == true
-               and $g.parity.eager_4096_and_resumed_8193_exact_output_parity == true
+               and $g.parity.fresh_and_reused_4096_8193_bounded_output_parity == true
                and $g.parity.long_resume_exact_output_parity == true
                and $g.heap.status == "pass"
                and all($g.heap.snapshots[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)

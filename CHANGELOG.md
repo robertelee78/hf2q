@@ -110,8 +110,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported as a successful workflow step after servers and guards are reaped.
 - Make that receipt enforce the family-specific shipping gates as well as the
   shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
-  one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193
-  exact-output parity, four/eight-slot aggregate caps, and heap waves; and
+  one-slot disconnect; Gemma long-prefill overlap/cancellation, fresh-versus-
+  reused 4,096/8,193 bounded-output parity, four/eight-slot aggregate caps,
+  and heap waves; and
   DeepSeek cached-suffix cancellation, terminal parking, and two fresh
   four-agent waves. Release rehashes every downloaded receipt and validates
   the detailed evidence before registry credentials are exposed.

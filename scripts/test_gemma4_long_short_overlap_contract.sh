@@ -99,12 +99,31 @@ grep -qF "profile:\"release\"" "$RELEASE_GATE" || {
   echo "Gemma parity receipt does not bind the release profile" >&2
   exit 1
 }
+grep -qF 'gemma_fresh_and_reused_4096_8193_bounded_outputs_match' "$RELEASE_GATE" || {
+  echo "Gemma release gate does not run the bounded fresh-versus-reused parity test" >&2
+  exit 1
+}
+grep -qF 'fresh_and_reused_4096_8193_bounded_output_parity:true' "$RELEASE_GATE" || {
+  echo "Gemma parity receipt does not bind bounded fresh-versus-reused output" >&2
+  exit 1
+}
 # jq variable is a literal workflow contract.
 # shellcheck disable=SC2016
 grep -qF 'and $g.parity.profile == "release"' "$RELEASE_WORKFLOW" || {
   echo "publication does not require release-profile Gemma parity" >&2
   exit 1
 }
+# shellcheck disable=SC2016
+grep -qF 'and $g.parity.fresh_and_reused_4096_8193_bounded_output_parity == true' \
+  "$RELEASE_WORKFLOW" || {
+  echo "publication does not require bounded fresh-versus-reused Gemma parity" >&2
+  exit 1
+}
+if grep -qF 'eager_4096_and_resumed_8193_exact_output_parity' \
+  "$RELEASE_GATE" "$RELEASE_WORKFLOW"; then
+  echo "stale monolithic-versus-bounded Gemma parity schema remains accepted" >&2
+  exit 1
+fi
 
 write_exit_probe() {
   local cleanup_status=$1

@@ -1329,8 +1329,20 @@ advancing scheduler accounting. Cursor disagreement or reset failure is a
 worker invariant failure; a typed Metal command-buffer failure enters the
 shared fail-stop path without any reset or later submission. Long soft-token
 prefill remains unsupported because the resume surface explicitly rejects
-soft tokens. The 4,096-token cap is provisional until eager-versus-resumed
-real-model parity and the long-overlap/cancellation gates pass.
+soft tokens. The 4,096-token cap is provisional until fresh-versus-reused
+bounded real-model parity and the long-overlap/cancellation gates pass.
+
+The original boundary falsifier compared the production `4,096 + 4,096 + 1`
+plan with one monolithic 8,193-token prefill. On the exact packed `4dcd5430`
+candidate, the two computations selected the same first decode token (`122154`)
+but later produced different greedy continuations; forcing global layers onto
+flash attention did not remove the split. This is a floating-point graph
+comparison, not a cache/reset test: monolithic and transaction-bounded prefills
+use different reduction shapes. The release falsifier therefore uses a fresh
+one-slot bounded worker as the reference and compares it with the same bounded
+plan after the physical slot has completed an unrelated 4,096-token request.
+Both requests must advertise zero cached tokens. Any stale KV, cursor, mounted
+view, or prompt ledger still fails that same-plan fresh-versus-reused identity.
 
 ### Failed Gemma aggregate-batch/coalescing spike (2026-08-09)
 
@@ -1466,7 +1478,7 @@ checks AC power continuously, and runs one large-model process at a time. In
 addition to the shared lifecycle, it runs Qwen's deterministic overlap,
 three cold four-agent waves, native heap series, and fresh one-slot disconnect;
 Gemma's long-prefill overlap/cancellation, four- and eight-slot transaction
-caps, native heap series, and exact eager/resumed output parity; and DeepSeek's
+caps, native heap series, and exact fresh/reused bounded output parity; and DeepSeek's
 cached-suffix cancellation matrix, lopsided overlap with terminal parking, and
 two fresh four-agent waves. It uploads one manifest binding the source SHA,
 crate SHA-256, binary SHA-256, protected GGUF SHA-256 values, every receipt
@@ -1485,7 +1497,7 @@ in each agent receipt. An exact M5 Max discriminator after 60 seconds of
 Nominal thermal state measured 25.279 seconds cold and 23.932 seconds for the
 slowest concurrent tool-result turn; the full packed-artifact gate remains the
 authority for accepting that calibration.
-The accompanying real-model Gemma N=4/N=8, eager/resumed-boundary, and
+The accompanying real-model Gemma N=4/N=8, fresh/reused bounded-boundary, and
 long-resume parity tests run in Cargo's optimized `release` profile, and their
 receipt records `profile: "release"`. This is load-bearing: Metal scheduling
 and command-buffer timing differ in debug builds, while production serves the

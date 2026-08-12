@@ -257,7 +257,7 @@ over that bound remain FIFO and return to scheduler-backed resumable states.
 When several compatible long-text states are installed, one transaction
 shares the 4,096 rows across those lanes instead of multiplying the bound by
 the number of slots. The 4,096-token ceiling is present by public 0.1.5 and
-must pass exact eager-versus-resumed real-model parity again from the packed
+must pass exact fresh-versus-reused bounded real-model parity again from the packed
 0.1.6 candidate before release; it is not inherited from Qwen. Long Gemma soft-token
 prefill remains fail-closed until it has a resumable graph.
 
