@@ -99,6 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cold and 23.932 seconds at the slowest tool-result turn; every receipt keeps
   the actual timing, cache, and semantic fields rather than converting this
   experiment into an eight-slot latency claim.
+- Keep that dispatch compatible with macOS Bash 3.2 under `set -u` by using
+  explicit four-slot and eight-slot command branches instead of expanding an
+  empty array. The release wrapper now also preserves the originating failure
+  status through its cleanup trap, so a pre-manifest harness error cannot be
+  reported as a successful workflow step after servers and guards are reaped.
 - Make that receipt enforce the family-specific shipping gates as well as the
   shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
   one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193

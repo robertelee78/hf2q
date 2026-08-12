@@ -15,7 +15,11 @@ done
 bash -n "$HARNESS" "$RELEASE_GATE"
 
 invalid_stderr=$(mktemp)
-trap 'rm -f "$invalid_stderr"' EXIT
+exit_probe_script=$(mktemp)
+cleanup_contract() {
+  rm -f "$invalid_stderr" "$exit_probe_script"
+}
+trap cleanup_contract EXIT
 if SERVER_PID=1 SERVER_LOG=/dev/null BINARY_PATH=/bin/true \
   BINARY_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
   MODEL_PATH=/dev/null \
@@ -61,12 +65,61 @@ awk '
 awk '
   /^run_gemma_wave\(\)/ { in_wave=1 }
   in_wave && /if \[\[ "\$agents" == 8 \]\]/ { in_eight=1 }
-  in_eight && /wave_limits=\(MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000\)/ {
+  in_eight && /MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000/ {
     limits=1
   }
-  limits && /env "\$\{wave_limits\[@\]\}"/ { forwards=1 }
-  forwards && /scripts\/test_full_context_agent_slots.sh/ { found=1; exit }
-  END { exit(found ? 0 : 1) }
+  limits && /scripts\/test_full_context_agent_slots.sh/ { eight_harness=1 }
+  eight_harness && /^[[:space:]]*else[[:space:]]*$/ { in_default=1 }
+  in_default && /BASE_URL="\$current_url" FAMILY=gemma4 AGENTS="\$agents"/ {
+    default_env=1
+  }
+  default_env && /scripts\/test_full_context_agent_slots.sh/ { found=1; exit }
+  END { exit(found && limits && eight_harness ? 0 : 1) }
 ' "$RELEASE_GATE"
+
+awk '
+  /^on_exit\(\)/ { in_exit=1 }
+  in_exit && /local original_rc=\$\?/ { captures=1 }
+  captures && /trap - EXIT/ { clears=1 }
+  clears && /if ! cleanup && \(\( original_rc == 0 \)\)/ { promotes_cleanup=1 }
+  promotes_cleanup && /exit "\$original_rc"/ { exits=1 }
+  exits && /^}/ { complete=1; exit }
+  END { exit(complete ? 0 : 1) }
+' "$RELEASE_GATE"
+
+write_exit_probe() {
+  local cleanup_status=$1
+  local command_status=$2
+  {
+    printf '#!/usr/bin/env bash\nset -u\ncleanup() { return %s; }\n' "$cleanup_status"
+    awk '/^on_exit\(\)/ { copy=1 } copy { print } copy && /^}/ { exit }' \
+      "$RELEASE_GATE"
+    printf 'trap on_exit EXIT\nexit %s\n' "$command_status"
+  } >"$exit_probe_script"
+}
+
+write_exit_probe 0 7
+if bash "$exit_probe_script"; then
+  echo "release cleanup trap swallowed the originating failure" >&2
+  exit 1
+else
+  probe_status=$?
+fi
+[[ "$probe_status" == 7 ]] || {
+  echo "release cleanup trap changed originating status 7 to $probe_status" >&2
+  exit 1
+}
+
+write_exit_probe 1 0
+if bash "$exit_probe_script"; then
+  echo "release cleanup failure did not fail a successful command" >&2
+  exit 1
+else
+  probe_status=$?
+fi
+[[ "$probe_status" == 1 ]] || {
+  echo "release cleanup failure returned unexpected status $probe_status" >&2
+  exit 1
+}
 
 echo "Gemma release harness contract passed"

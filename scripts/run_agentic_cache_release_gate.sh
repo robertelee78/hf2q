@@ -158,7 +158,15 @@ cleanup() {
   fi
   return "$cleanup_rc"
 }
-trap cleanup EXIT
+on_exit() {
+  local original_rc=$?
+  trap - EXIT
+  if ! cleanup && (( original_rc == 0 )); then
+    original_rc=1
+  fi
+  exit "$original_rc"
+}
+trap on_exit EXIT
 trap 'exit 1' INT TERM
 
 require_ac
@@ -552,22 +560,25 @@ run_gemma_wave() {
   local phase=$1
   local agents=$2
   local out="$OUT_ROOT/gemma/$phase"
-  local -a wave_limits=()
   # Four slots are the release-validated operator default and keep the shared
   # agentic latency limits. Eight slots are an explicitly experimental
   # correctness/aggregate-transaction-cap probe. Give only that probe a
   # functional completion envelope sized from the exact M5 Max discriminator
   # (25.279 s cold TTFT, 23.932 s worst tool-result response); the measured
   # values still remain in every per-agent receipt.
-  if [[ "$agents" == 8 ]]; then
-    wave_limits=(MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000)
-  fi
   mkdir -p "$out"
-  env "${wave_limits[@]}" \
-  BASE_URL="$current_url" FAMILY=gemma4 AGENTS="$agents" \
-  WAVE_ID="$phase" REQUIRE_COLD_FIRST=1 \
-  OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
-    >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+  if [[ "$agents" == 8 ]]; then
+    MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000 \
+    BASE_URL="$current_url" FAMILY=gemma4 AGENTS="$agents" \
+    WAVE_ID="$phase" REQUIRE_COLD_FIRST=1 \
+    OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
+      >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+  else
+    BASE_URL="$current_url" FAMILY=gemma4 AGENTS="$agents" \
+    WAVE_ID="$phase" REQUIRE_COLD_FIRST=1 \
+    OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \
+      >"$out/summary.json.tmp" 2>"$out/harness.stderr"
+  fi
   jq -e --argjson agents "$agents" \
     '.status == "pass" and .family == "gemma4" and .concurrent_agents == $agents and .require_cold_first == 1 and all(.agents[]; .cold_cached_tokens == 0)' \
     "$out/summary.json.tmp" >/dev/null
