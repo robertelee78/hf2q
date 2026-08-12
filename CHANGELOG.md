@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source/crate/binary/model-bound receipt. The publication workflow now
   requires that successful exact-SHA receipt and reproduces its crate digest
   before publishing.
+- Run the real-model Gemma N=4/N=8, transaction-boundary, and long-resume
+  parity checks with the optimized release profile and bind that profile in
+  the hardware receipt. Metal command scheduling is profile-sensitive; a
+  debug-only timing divergence must not be mislabeled as production evidence.
 - Make the release-authority Gemma overlap timeout explicit and overridable.
   The protected gate now supplies 1,800 seconds for its fixed 175K-token
   full-attention prompt instead of inheriting a non-overridable 900-second

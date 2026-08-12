@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HARNESS="$ROOT_DIR/scripts/test_gemma4_long_short_overlap.sh"
 RELEASE_GATE="$ROOT_DIR/scripts/run_agentic_cache_release_gate.sh"
+RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
 
 for command in awk bash grep; do
   command -v "$command" >/dev/null || {
@@ -86,6 +87,24 @@ awk '
   exits && /^}/ { complete=1; exit }
   END { exit(complete ? 0 : 1) }
 ' "$RELEASE_GATE"
+
+# Metal scheduling and command-buffer ordering are profile-sensitive. The
+# release-authority parity suite must exercise the optimized production profile
+# rather than treating a debug-only timing outcome as production evidence.
+[[ "$(grep -cF 'cargo test --release --locked' "$RELEASE_GATE")" -ge 4 ]] || {
+  echo "Gemma release parity checks must run in the release profile" >&2
+  exit 1
+}
+grep -qF "profile:\"release\"" "$RELEASE_GATE" || {
+  echo "Gemma parity receipt does not bind the release profile" >&2
+  exit 1
+}
+# jq variable is a literal workflow contract.
+# shellcheck disable=SC2016
+grep -qF 'and $g.parity.profile == "release"' "$RELEASE_WORKFLOW" || {
+  echo "publication does not require release-profile Gemma parity" >&2
+  exit 1
+}
 
 write_exit_probe() {
   local cleanup_status=$1

@@ -297,6 +297,7 @@ jobs:
                  and .max_transaction_rows <= 4096 and .multi_slot_transactions > 0
                  and .nonaligned_transactions > 0)
                and $g.parity.status == "pass"
+               and $g.parity.profile == "release"
                and $g.parity.n4_exact_output_parity == true
                and $g.parity.n8_exact_output_parity == true
                and $g.parity.eager_4096_and_resumed_8193_exact_output_parity == true

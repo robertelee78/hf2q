@@ -1485,6 +1485,13 @@ in each agent receipt. An exact M5 Max discriminator after 60 seconds of
 Nominal thermal state measured 25.279 seconds cold and 23.932 seconds for the
 slowest concurrent tool-result turn; the full packed-artifact gate remains the
 authority for accepting that calibration.
+The accompanying real-model Gemma N=4/N=8, eager/resumed-boundary, and
+long-resume parity tests run in Cargo's optimized `release` profile, and their
+receipt records `profile: "release"`. This is load-bearing: Metal scheduling
+and command-buffer timing differ in debug builds, while production serves the
+optimized binary. A debug-only divergence remains diagnostic evidence, but it
+cannot substitute for or veto the production-profile release proof; any
+release-profile divergence still fails the gate immediately.
 For this release the protected model identities are DeepSeek
 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
 Gemma `82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`,
