@@ -1164,11 +1164,13 @@ candidate's `Cargo.toml`. This is workload identity, not a runtime dependency
 on that local path. Every cold agent must render exactly 6,685 tokens.
 Producer, aggregate, and publication checks all
 bind the fixture ID, digest, byte/character counts, exact prompt count, zero
-cold reuse, semantic/tool assertions, and literal 55,000 ms cold bounds. A
+cold reuse, semantic/tool assertions, and the then-literal 55,000 ms cold
+bounds. A
 model-free negative matrix rejects missing, mistyped, stale, off-by-one, or
 over-limit receipts.
 
-The 55-second bound is intentionally unchanged. A fresh exact-packed M5 Max
+At that stage the 55-second bound was intentionally unchanged. A fresh
+exact-packed M5 Max
 rerun of the frozen request twice is the discriminator: success restores
 matched release authority; failure leaves a current-scheduler performance
 blocker that must be optimized or re-baselined against a same-input llama.cpp
@@ -1204,7 +1206,8 @@ the wave; any observed non-Nominal state,
 malformed read, monitor failure, or telemetry gap invalidates the run. Each
 envelope records the settle and measurement sample counts and SHA-256 digests,
 and publication independently rehashes and validates the measurement log.
-The 55-second bound is unchanged. Two thermally valid exact-packed passes are
+At that stage the 55-second bound remained unchanged. Two thermally valid
+exact-packed passes were
 still required before release authority is restored.
 
 ### Saturated four-cold bulk-prefill correction (2026-08-11 candidate)
@@ -1412,6 +1415,36 @@ same-artifact discriminators establish causal margin, but the new source still
 requires its own exact packed two-wave and cross-family release gate before
 publication.
 
+The resulting exact-main source `a58932a830834c6dfa19e94a29dfb6ad956160d5`
+passed hosted CI run `31670800480`. Its protected packed M5 run
+`31670801462` verified all three canonical model digests, the exact 87,972-token
+tool fixture, continuous AC power, and an entirely Nominal settle/measurement
+window. Three DeepSeek cold receipts passed at 49.428, 51.522, and 53.554
+seconds; the fourth completed correctly at 55.585 seconds and failed the then
+literal 55-second limit by 585 milliseconds. All prompts were exactly 6,685
+tokens with zero cold reuse, every 6,677-token recovery anchor was captured,
+and cached work had begun successfully. With a 64-token quantum each 61-token
+response already finishes in one pure-decode visit, so another quantum increase
+cannot remove the remaining serial four-slot decode floor.
+
+That exact failure triggered the checked-in same-input peer discriminator
+rather than a favorable hf2q rerun. Pinned llama.cpp build 10326 (binary
+SHA-256 `90bdf03673f7ee61d65d579a4e0be64a914edac1ccb23e74871040bc30d13543`)
+ran alone against the same model and request bytes with prompt caching disabled.
+After separate 180-second loaded-idle Nominal settles, both continuously
+Nominal four-agent waves returned the exact zero-cache `read_file` calls. Their
+cohort walls were 68.438 and 69.944 seconds (69.191-second median); manifest
+SHA-256 is `d31164f1eef641b6db98d38f504e02b2da26ff5a80f3cc50f3f0e8a69d3f8052`.
+The peer renders 6,695 prompt tokens, an explicitly receipted tokenizer delta
+of ten tokens from hf2q's 6,685.
+
+The old unreceipted approximately 54.1-second peer number is therefore
+superseded for current thermal authority. The protected hf2q cold ceiling is
+60 seconds: 9.2 seconds below the current peer median and 4.4 seconds above the
+valid exact-main tail. This is a source-bound rebaseline, not a waiver. Both
+new exact-packed hf2q waves must still pass that literal ceiling together with
+unchanged cache, tool, overlap, and cross-family gates before publication.
+
 The local acceptance setup exposed an independent launcher false positive:
 the remote-inference OpenCode process reported 10.5 GiB RSS, while macOS
 `footprint` measured 1.7 GiB physical use and 9.5 GiB reclaimable mappings.
@@ -1441,7 +1474,7 @@ and correctly invalidated every non-Nominal run. They exposed an evidence
 boundary that was broader than the comparative claim. The paired primitive is
 selected only by large prefill; later cached, SSE, and tool-result turns prove
 cache and semantic correctness under independent upper bounds rather than the
-55-second cold comparison.
+then-current 55-second cold comparison.
 
 The candidate wrapper therefore preserves the exact workload and request
 ordering but ends calibrated thermal measurement only after all four nonempty

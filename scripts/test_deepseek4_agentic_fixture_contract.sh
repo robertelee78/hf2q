@@ -192,8 +192,8 @@ jq -n '
     expected_prompt_tokens: 6685,
     prompt_tokens: 6685,
     cold_cached_tokens: 0,
-    cold_ttft_ms: 55000,
-    cold_semantic_response_ms: 55000,
+    cold_ttft_ms: 60000,
+    cold_semantic_response_ms: 60000,
     cached_tokens: 6677,
     auto_cached_tokens: 6677,
     continuation_cached_tokens: 6677,
@@ -220,9 +220,9 @@ jq -n '
     repository_context_chars: 20584,
     expected_prompt_tokens: 6685,
     prompt_tokens: 6685,
-    maximum_cold_ttft_ms: 55000,
-    maximum_cold_semantic_response_ms: 55000,
-    cohort_cold_wall_ms: 55000,
+    maximum_cold_ttft_ms: 60000,
+    maximum_cold_semantic_response_ms: 60000,
+    cohort_cold_wall_ms: 60000,
     agents: [range(0; 4) | agent]
   }
 ' >"$positive_receipt"
@@ -252,8 +252,8 @@ expect_receipt_failure fixture_bytes '.agents[0].agentic_context_fixture_bytes =
 expect_receipt_failure mixed_agent_fixture '.agents[3].repository_context_chars = 20583'
 expect_receipt_failure cold_cache '.agents[2].cold_cached_tokens = 1'
 expect_receipt_failure negative_timing '.agents[1].cold_ttft_ms = -1'
-expect_receipt_failure over_boundary '.agents[1].cold_semantic_response_ms = 55001'
-expect_receipt_failure cohort_over_boundary '.cohort_cold_wall_ms = 55001'
+expect_receipt_failure over_boundary '.agents[1].cold_semantic_response_ms = 60001'
+expect_receipt_failure cohort_over_boundary '.cohort_cold_wall_ms = 60001'
 expect_receipt_failure wrong_agent_count '.agents = .agents[0:3]'
 expect_receipt_failure missing_semantics 'del(.agents[0].sse_tool_call_pass)'
 

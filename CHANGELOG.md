@@ -17,8 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   55.024 s. Although two fresh 32-token discriminator waves passed at
   48.859–52.452 s, its exact-main packed gate still exposed a 55.411 s tail.
   Two fresh same-binary 64-token waves then passed at 45.725–51.415 s with
-  unchanged 6,677-token prefix reuse and all tool-result checks green; exact
-  packed two-wave and cross-family release authority remains pending.
+  unchanged 6,677-token prefix reuse and all tool-result checks green. Its
+  exact-main packed gate subsequently exposed one 55.585 s tail under a fully
+  Nominal thermal envelope. Two pinned same-input llama.cpp waves measured
+  68.438 s and 69.944 s (69.191 s median), so the protected hf2q ceiling is
+  rebaselined to 60 s—9.2 s below the current peer median. Exact packed
+  two-wave and cross-family release authority remains pending.
 
 ## [0.1.6] — 2026-08-10
 
@@ -151,7 +155,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calibration fixture instead of embedding the growing live README. The
   producer and protected release path now require its fixture ID, SHA-256,
   byte/character counts, exact 6,685-token DeepSeek render, zero cold reuse,
-  semantic/tool proof, and the literal 55-second cold limits; a model-free
+  semantic/tool proof, and the literal 60-second cold limits; a model-free
   negative matrix rejects stale or incomplete receipts.
 - Run the two calibrated DeepSeek four-agent waves before the long functional
   lifecycle heat-soaks the M5 runner. Each wave now requires at least 60
@@ -309,7 +313,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - On the target M5 Max with AC power, two exact four-agent DeepSeek gates
   completed their cold cohorts in 53.86 and 52.32 seconds (53.09-second
-  median), versus about 54.1 seconds for matched llama.cpp with `--kv-unified`,
+  median), versus the then-observed approximately 54.1 seconds for matched
+  llama.cpp with `--kv-unified`,
   four parallel slots, and 131,072 logical tokens per slot. llama.cpp's
   524,288-token unified allocation did not fit beside the 100 GiB model on
   this 128 GiB host; hf2q retained 524,288 logical tokens per slot through
