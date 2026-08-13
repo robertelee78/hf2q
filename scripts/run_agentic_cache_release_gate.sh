@@ -583,10 +583,26 @@ run_gemma_wave() {
   shasum -c "$out/summary.json.sha256" >/dev/null
 }
 
-run_gemma_calibrated_wave() {
+run_gemma_thermally_guarded_wave() {
   local wave=$1
-  local phase="wave$wave"
-  local phase_name="gemma-wave-$wave"
+  local agents=$2
+  local phase phase_name name_pattern
+  case "$wave:$agents" in
+  1:4 | 2:4)
+    phase="wave$wave"
+    phase_name="gemma-wave-$wave"
+    name_pattern='^agent-[1-4]\.cold\.json$'
+    ;;
+  eight-slots:8)
+    phase=eight-slots
+    phase_name=gemma-eight-slots
+    name_pattern='^agent-[1-8]\.cold\.json$'
+    ;;
+  *)
+    echo "unsupported Gemma thermal wave: wave=$wave agents=$agents" >&2
+    return 2
+    ;;
+  esac
   local out="$OUT_ROOT/gemma/$phase"
   local thermal_dir="$out/thermal"
   local thermal_measurement_log="$thermal_dir/measurement.log"
@@ -609,7 +625,7 @@ run_gemma_calibrated_wave() {
   : >"$thermal_measurement_log"
   thermal_sample "$thermal_measurement_log" "$phase_name-measurement-start"
   test "$THERMAL_STATE" = nominal
-  run_gemma_wave "$phase" 4 &
+  run_gemma_wave "$phase" "$agents" &
   wave_harness_pid=$!
 
   # Keep thermal supervision in the release-gate process. A separate monitor
@@ -621,7 +637,7 @@ run_gemma_calibrated_wave() {
   if ! thermal_monitor_nominal_while_pid "$thermal_measurement_log" \
     "$phase_name-measurement" "$wave_harness_pid" \
     "$sample_interval_seconds"; then
-    echo "Gemma wave $wave thermal supervision failed" >&2
+    echo "Gemma wave $phase thermal supervision failed" >&2
     # Closing the server makes the harness's direct curl children return;
     # the harness then reaps its complete process tree itself.
     stop_server || true
@@ -663,11 +679,11 @@ run_gemma_calibrated_wave() {
         '{name:$name,sha256:$sha256}'
     done | jq -s 'sort_by(.name)'
   )
-  jq -e '
-    length == 4
-    and ([.[].name] | unique | length) == 4
+  jq -e --arg name_pattern "$name_pattern" --argjson agents "$agents" '
+    length == $agents
+    and ([.[].name] | unique | length) == $agents
     and all(.[];
-      (.name | test("^agent-[1-4]\\.cold\\.json$"))
+      (.name | test($name_pattern))
       and (.sha256 | test("^[0-9a-f]{64}$")))
   ' <<<"$cold_receipts_json" >/dev/null
   jq -n --arg status pass --arg phase "$phase_name" \
@@ -685,8 +701,10 @@ run_gemma_calibrated_wave() {
     --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
     --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
     --argjson telemetry_gaps "$telemetry_gaps" \
+    --argjson concurrent_agents "$agents" \
     --argjson cold_receipts "$cold_receipts_json" \
-    '{status:$status,phase:$phase,required_state:"nominal",
+    '{status:$status,phase:$phase,concurrent_agents:$concurrent_agents,
+      required_state:"nominal",
       measurement_scope:"full-agent-wave",cold_receipts:$cold_receipts,
       settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
       settle_samples:$settle_samples,measurement_samples:$measurement_samples,
@@ -707,6 +725,10 @@ run_gemma_calibrated_wave() {
   bash scripts/verify_gemma4_wave_thermal_receipt.sh "$wave" \
     "$out/summary.json" "$thermal_summary" "$thermal_measurement_log" \
     "$thermal_settle_log" "$out/agents"
+  if [[ "$wave" == eight-slots ]]; then
+    jq -e -f scripts/gemma4_eight_slot_receipt.jq \
+      "$out/summary.json" >/dev/null
+  fi
 }
 
 capture_gemma_heap() {
@@ -753,9 +775,9 @@ run_gemma_release_gates() {
   start_server gemma process-a scripts/serve_gemma4_opencode.sh \
     "$GEMMA_MODEL" 18082 4
   capture_gemma_heap baseline
-  run_gemma_calibrated_wave 1
+  run_gemma_thermally_guarded_wave 1 4
   capture_gemma_heap post-wave1
-  run_gemma_calibrated_wave 2
+  run_gemma_thermally_guarded_wave 2 4
   capture_gemma_heap post-wave2
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
@@ -803,7 +825,10 @@ run_gemma_release_gates() {
 
   start_server gemma process-b scripts/serve_gemma4_opencode.sh \
     "$GEMMA_MODEL" 18082 8
-  run_gemma_wave eight-slots 8
+  # The experimental eight-slot correctness wave runs after the destructive
+  # four-slot soak, so it gets its own independent Nominal settle and
+  # continuous full-wave receipt rather than inheriting the prior host state.
+  run_gemma_thermally_guarded_wave eight-slots 8
   finish_server_phase
   write_gemma_transaction_receipt eight-slots "$current_log"
 
@@ -870,6 +895,7 @@ jq -n \
   --arg gemma_wave1_thermal_sha "$(sha256_file "$OUT_ROOT/gemma/wave1/thermal/summary.json")" \
   --arg gemma_wave2_thermal_sha "$(sha256_file "$OUT_ROOT/gemma/wave2/thermal/summary.json")" \
   --arg gemma_wave8_sha "$(sha256_file "$OUT_ROOT/gemma/eight-slots/summary.json")" \
+  --arg gemma_wave8_thermal_sha "$(sha256_file "$OUT_ROOT/gemma/eight-slots/thermal/summary.json")" \
   --arg gemma_transactions4_sha "$(sha256_file "$OUT_ROOT/gemma/transactions-four-slots.json")" \
   --arg gemma_transactions8_sha "$(sha256_file "$OUT_ROOT/gemma/transactions-eight-slots.json")" \
   --arg gemma_parity_sha "$(sha256_file "$OUT_ROOT/gemma/parity/summary.json")" \
@@ -911,7 +937,7 @@ jq -n \
     },
     receipt_sha256: {
       deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha},
-      gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
+      gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,eight_slots_thermal:$gemma_wave8_thermal_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha}
     },
     families: {

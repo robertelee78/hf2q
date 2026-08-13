@@ -121,6 +121,7 @@ jobs:
             scripts/verify_gemma4_wave_thermal_receipt.sh \
             scripts/test_macos_thermal_guard_contract.sh \
             scripts/test_gemma4_wave_thermal_contract.sh \
+            scripts/test_gemma4_eight_slot_receipt_contract.sh \
             scripts/test_deepseek4_cached_suffix.sh \
             scripts/test_deepseek4_cached_suffix_contract.sh \
             scripts/test_deepseek4_interactive_overlap.sh \
@@ -134,6 +135,7 @@ jobs:
           bash scripts/test_deepseek4_peer_cold_wave_contract.sh
           bash scripts/test_macos_thermal_guard_contract.sh
           bash scripts/test_gemma4_wave_thermal_contract.sh
+          bash scripts/test_gemma4_eight_slot_receipt_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \

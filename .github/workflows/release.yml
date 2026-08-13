@@ -128,6 +128,15 @@ jobs:
               "$wave_dir/thermal/settle.log" "$wave_dir/agents"
           done
           check_receipt gemma/eight-slots/summary.json '.receipt_sha256.gemma.eight_slots'
+          check_receipt gemma/eight-slots/thermal/summary.json '.receipt_sha256.gemma.eight_slots_thermal'
+          bash scripts/verify_gemma4_wave_thermal_receipt.sh eight-slots \
+            "$gate_dir/gemma/eight-slots/summary.json" \
+            "$gate_dir/gemma/eight-slots/thermal/summary.json" \
+            "$gate_dir/gemma/eight-slots/thermal/measurement.log" \
+            "$gate_dir/gemma/eight-slots/thermal/settle.log" \
+            "$gate_dir/gemma/eight-slots/agents"
+          jq -e -f scripts/gemma4_eight_slot_receipt.jq \
+            "$gate_dir/gemma/eight-slots/summary.json" >/dev/null
           check_receipt gemma/transactions-four-slots.json '.receipt_sha256.gemma.transactions4'
           check_receipt gemma/transactions-eight-slots.json '.receipt_sha256.gemma.transactions8'
           check_receipt gemma/parity/summary.json '.receipt_sha256.gemma.parity'
@@ -305,6 +314,7 @@ jobs:
                and all($g.agent_waves[] | select(.concurrent_agents == 4);
                  (.wave_id == "wave1" or .wave_id == "wave2")
                  and .thermal.status == "pass"
+                 and .thermal.concurrent_agents == 4
                  and .thermal.required_state == "nominal"
                  and .thermal.measurement_scope == "full-agent-wave"
                  and .thermal.settle_seconds == 60
@@ -322,13 +332,44 @@ jobs:
                  and (.thermal.cold_receipts | length) == 4)
                and all($g.agent_waves[] | select(.concurrent_agents == 8);
                  .wave_id == "eight-slots"
+                 and (.agents | type) == "array" and (.agents | length) == 8
+                 and .thermal.status == "pass"
+                 and .thermal.phase == "gemma-eight-slots"
+                 and .thermal.concurrent_agents == 8
+                 and .thermal.required_state == "nominal"
+                 and .thermal.measurement_scope == "full-agent-wave"
+                 and .thermal.settle_seconds == 60
+                 and .thermal.settle_duration_seconds >= 60
+                 and .thermal.settle_samples > 0
+                 and .thermal.measurement_samples >= 2
+                 and .thermal.measurement_duration_seconds > 0
+                 and .thermal.sample_interval_seconds == 2
+                 and .thermal.maximum_sample_gap_seconds == 5
+                 and .thermal.settle_sample_interval_seconds == 5
+                 and .thermal.maximum_settle_sample_gap_seconds == 8
+                 and .thermal.non_nominal_measurement_samples == 0
+                 and .thermal.settle_telemetry_gaps == 0
+                 and .thermal.telemetry_gaps == 0
+                 and (.thermal.cold_receipts | length) == 8
                  and (.maximum_cold_ttft_ms | type) == "number"
                  and .maximum_cold_ttft_ms >= 0 and .maximum_cold_ttft_ms <= 40000
                  and (.maximum_cold_semantic_response_ms | type) == "number"
                  and .maximum_cold_semantic_response_ms >= 0
                  and .maximum_cold_semantic_response_ms <= 60000
                  and (.maximum_tool_result_ms | type) == "number"
-                 and .maximum_tool_result_ms >= 0 and .maximum_tool_result_ms <= 30000)
+                 and .maximum_tool_result_ms >= 0 and .maximum_tool_result_ms <= 30000
+                 and all(.agents[];
+                   (.cold_ttft_ms | type) == "number"
+                   and .cold_ttft_ms >= 0 and .cold_ttft_ms <= 40000
+                   and (.cold_semantic_response_ms | type) == "number"
+                   and .cold_semantic_response_ms >= 0
+                   and .cold_semantic_response_ms <= 60000
+                   and (.tool_result_response_ms | type) == "number"
+                   and .tool_result_response_ms >= 0
+                   and .tool_result_response_ms <= 30000)
+                 and .maximum_cold_ttft_ms == ([.agents[].cold_ttft_ms] | max)
+                 and .maximum_cold_semantic_response_ms == ([.agents[].cold_semantic_response_ms] | max)
+                 and .maximum_tool_result_ms == ([.agents[].tool_result_response_ms] | max))
                and ($g.transactions | length) == 2
                and all($g.transactions[]; .status == "pass" and .transaction_cap_rows == 4096
                  and .max_transaction_rows <= 4096 and .multi_slot_transactions > 0
@@ -467,6 +508,7 @@ jobs:
               scripts/verify_gemma4_wave_thermal_receipt.sh \
               scripts/test_macos_thermal_guard_contract.sh \
               scripts/test_gemma4_wave_thermal_contract.sh \
+              scripts/test_gemma4_eight_slot_receipt_contract.sh \
               scripts/test_deepseek4_cached_suffix.sh \
               scripts/test_deepseek4_cached_suffix_contract.sh \
               scripts/test_deepseek4_interactive_overlap.sh \
@@ -480,6 +522,7 @@ jobs:
             bash scripts/test_deepseek4_peer_cold_wave_contract.sh
             bash scripts/test_macos_thermal_guard_contract.sh
             bash scripts/test_gemma4_wave_thermal_contract.sh
+            bash scripts/test_gemma4_eight_slot_receipt_contract.sh
             bash scripts/test_gemma4_long_short_overlap_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \

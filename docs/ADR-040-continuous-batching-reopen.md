@@ -1529,7 +1529,23 @@ of continuously Nominal state, completed all eight cold responses in
 27.943–28.023 seconds with 25.520-second TTFT, 7,112-token reuse, and
 11.340–25.316-second tool-result turns. This is evidence for an explicit
 functional envelope, not an eight-slot latency claim; the full packed-artifact
-gate remains the authority for accepting the calibration.
+gate remains the authority for accepting the calibration. Exact-main protected
+run `31714959928` then passed the complete preceding DeepSeek matrix and both
+four-slot Gemma waves, overlap/cancellation, cache lifecycle, isolation, and
+heap checks. Its fresh eight-slot process produced correct 7,119-token cold
+requests with zero cold reuse, but that wave started after the destructive
+Gemma soak without its own thermal settle or telemetry and reached first
+semantic output at 40.882 seconds, 882 ms above the unchanged 40-second
+functional ceiling. The missing telemetry means this run does not prove
+thermal throttling; the passing semantics likewise do not make its timing
+acceptable. The eight-slot path now reuses the same foreground-supervised
+full-agent-wave contract as the calibrated four-slot waves: after process-b
+has loaded the eight-slot model, it requires a new trailing 60 seconds of
+Nominal state and then samples every two seconds through cold, cached,
+automatic-tool, SSE, and tool-result completion. The atomic receipt binds its
+phase, agent count, raw settle/measurement logs, and all eight cold-receipt
+hashes; the release workflow independently rehashes and replays them. A new
+exact-main packed run remains mandatory authority.
 The accompanying real-model Gemma N=4/N=8, fresh/reused bounded-boundary, and
 long-resume parity tests run in Cargo's optimized `release` profile, and their
 receipt records `profile: "release"`. This is load-bearing: Metal scheduling
