@@ -1517,11 +1517,19 @@ failure evidence, not release authority; a new exact-main packed run remains
 mandatory. The
 eight-slot lane is the README's experimental correctness and aggregate-row-cap
 probe, not an eight-slot latency SLO: it uses explicit 40-second cold-TTFT and
-30-second tool-result functional ceilings while retaining the measured values
-in each agent receipt. An exact M5 Max discriminator after 60 seconds of
-Nominal thermal state measured 25.279 seconds cold and 23.932 seconds for the
-slowest concurrent tool-result turn; the full packed-artifact gate remains the
-authority for accepting that calibration.
+60-second whole-response and 30-second tool-result functional ceilings while
+retaining the measured values in each agent receipt. An exact M5 Max
+discriminator after 60 seconds of Nominal thermal state measured 25.279 seconds
+cold and 23.932 seconds for the slowest concurrent tool-result turn. Protected
+run `31701418005` then exposed that the wrapper had omitted the whole-response
+override and inherited the shared 40-second default after the destructive
+long-context soak: two cold responses took 40.965 and 40.979 seconds. A fresh
+discriminator using that exact packed binary and model, again after 60 seconds
+of continuously Nominal state, completed all eight cold responses in
+27.943–28.023 seconds with 25.520-second TTFT, 7,112-token reuse, and
+11.340–25.316-second tool-result turns. This is evidence for an explicit
+functional envelope, not an eight-slot latency claim; the full packed-artifact
+gate remains the authority for accepting the calibration.
 The accompanying real-model Gemma N=4/N=8, fresh/reused bounded-boundary, and
 long-resume parity tests run in Cargo's optimized `release` profile, and their
 receipt records `profile: "release"`. This is load-bearing: Metal scheduling
