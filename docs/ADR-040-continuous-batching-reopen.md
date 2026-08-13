@@ -1501,7 +1501,20 @@ trailing 60 seconds of Nominal state, with fail-closed two-second sampling
 through the entire cold/cached/tool-result wave. The destructive 175K/120K
 soak follows only after both calibrated waves pass, and publication replays
 the thermal logs and binds their digests. Full exact-artifact rerun authority
-remains pending. The
+remains pending. Exact-main run `31691093129` independently passed both
+DeepSeek calibrated waves and its complete overlap/cancellation/lifecycle
+matrix. Gemma wave 1 also passed inference (13.886–14.008-second tool-result
+turns, 7,111 retained tokens for all four agents) under entirely Nominal
+telemetry, but the gate failed after the harness and before sealing the
+terminal thermal summary: valid logs and the cleanup-created stop sentinel existed,
+while the terminal thermal summary had not yet been written. The old
+unsheltered process-state assignment could trigger `set -e` exactly as the
+harness disappeared. Thermal supervision now runs in the release-gate process
+around the background harness, retaining start-to-exit two-second sampling
+without a stop-file/join handoff and treating a live-process probe failure as
+fatal. That run is focused
+failure evidence, not release authority; a new exact-main packed run remains
+mandatory. The
 eight-slot lane is the README's experimental correctness and aggregate-row-cap
 probe, not an eight-slot latency SLO: it uses explicit 40-second cold-TTFT and
 30-second tool-result functional ceilings while retaining the measured values

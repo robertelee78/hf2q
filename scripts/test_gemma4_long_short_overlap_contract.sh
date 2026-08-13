@@ -89,10 +89,20 @@ grep -qF 'thermal_wait_for_nominal "$thermal_settle_log" "$phase_name-settle"' \
   exit 1
 }
 # shellcheck disable=SC2016
-grep -qF 'thermal_monitor_nominal "$thermal_measurement_log"' "$RELEASE_GATE" || {
+grep -qF 'thermal_monitor_nominal_while_pid "$thermal_measurement_log"' \
+  "$RELEASE_GATE" || {
   echo "Gemma calibrated waves lack continuous full-wave thermal monitoring" >&2
   exit 1
 }
+if awk '
+  /^run_gemma_calibrated_wave\(\)/ { in_wave=1 }
+  in_wave && /thermal_monitor_nominal .*&/ { found=1 }
+  in_wave && /^}/ { exit }
+  END { exit(found ? 0 : 1) }
+' "$RELEASE_GATE"; then
+  echo "Gemma calibrated waves still use a racy background thermal monitor" >&2
+  exit 1
+fi
 grep -qF 'measurement_scope:"full-agent-wave"' "$RELEASE_GATE" || {
   echo "Gemma thermal receipt does not bind the complete agent wave" >&2
   exit 1

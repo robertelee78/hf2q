@@ -66,8 +66,6 @@ parent_pid=$$
 server_pid=""
 power_pid=""
 caffeinate_pid=""
-thermal_pid=""
-thermal_stop_file=""
 wave_harness_pid=""
 
 require_ac() {
@@ -139,13 +137,6 @@ cleanup() {
     stop_server || cleanup_rc=1
     wait "$wave_harness_pid" 2>/dev/null || true
     wave_harness_pid=""
-  fi
-  if [[ -n "$thermal_stop_file" ]]; then
-    : >"$thermal_stop_file"
-  fi
-  if [[ -n "$thermal_pid" ]]; then
-    kill -TERM "$thermal_pid" 2>/dev/null || true
-    wait "$thermal_pid" 2>/dev/null || true
   fi
   stop_server || cleanup_rc=1
   if [[ -n "$power_pid" ]]; then
@@ -600,8 +591,7 @@ run_gemma_calibrated_wave() {
   local thermal_measurement_log="$thermal_dir/measurement.log"
   local thermal_settle_log="$thermal_dir/settle.log"
   local thermal_summary="$thermal_dir/summary.json"
-  local harness_state monitor_state
-  local harness_rc=0 monitor_rc=0
+  local harness_rc=0
   local measurement_samples measurement_duration_seconds
   local non_nominal_measurement_samples telemetry_gaps
   local settle_samples settle_duration_seconds settle_telemetry_gaps
@@ -618,72 +608,35 @@ run_gemma_calibrated_wave() {
   : >"$thermal_measurement_log"
   thermal_sample "$thermal_measurement_log" "$phase_name-measurement-start"
   test "$THERMAL_STATE" = nominal
-  thermal_stop_file="$thermal_dir/stop"
-  [[ ! -e "$thermal_stop_file" ]] || {
-    echo "Gemma wave $wave thermal stop file already exists" >&2
-    return 1
-  }
-  thermal_monitor_nominal "$thermal_measurement_log" \
-    "$phase_name-measurement" "$thermal_stop_file" \
-    "$sample_interval_seconds" >"$thermal_dir/monitor.stdout" \
-    2>"$thermal_dir/monitor.stderr" &
-  thermal_pid=$!
   run_gemma_wave "$phase" 4 &
   wave_harness_pid=$!
 
-  while :; do
-    harness_state=$(ps -p "$wave_harness_pid" -o state= 2>/dev/null \
-      | tr -d '[:space:]')
-    monitor_state=$(ps -p "$thermal_pid" -o state= 2>/dev/null \
-      | tr -d '[:space:]')
-    if [[ -z "$monitor_state" || "$monitor_state" == Z* ]]; then
-      set +e
-      wait "$thermal_pid"
-      monitor_rc=$?
-      set -e
-      thermal_pid=""
-      if ((monitor_rc != 0)); then
-        echo "Gemma wave $wave thermal monitor failed" >&2
-        # Closing the server makes the harness's direct curl children return;
-        # the harness then reaps its complete process tree itself.
-        stop_server || true
-        wait "$wave_harness_pid" 2>/dev/null || true
-        wave_harness_pid=""
-        thermal_stop_file=""
-        return 1
-      fi
-      echo "Gemma wave $wave thermal monitor exited before the harness" >&2
-      stop_server || true
-      wait "$wave_harness_pid" 2>/dev/null || true
-      wave_harness_pid=""
-      thermal_stop_file=""
-      return 1
-    fi
-    if [[ -z "$harness_state" || "$harness_state" == Z* ]]; then
-      break
-    fi
-    sleep 1
-  done
+  # Keep thermal supervision in the release-gate process. A separate monitor
+  # used to require a stop-file/join handoff after the harness completed; a
+  # passing exact-artifact wave could then fail between writing that sentinel
+  # and publishing its terminal thermal receipt. Foreground sampling has one
+  # owner and covers the same start-to-harness-exit interval without that
+  # process-lifecycle race.
+  if ! thermal_monitor_nominal_while_pid "$thermal_measurement_log" \
+    "$phase_name-measurement" "$wave_harness_pid" \
+    "$sample_interval_seconds"; then
+    echo "Gemma wave $wave thermal supervision failed" >&2
+    # Closing the server makes the harness's direct curl children return;
+    # the harness then reaps its complete process tree itself.
+    stop_server || true
+    wait "$wave_harness_pid" 2>/dev/null || true
+    wave_harness_pid=""
+    return 1
+  fi
 
   set +e
   wait "$wave_harness_pid"
   harness_rc=$?
   set -e
   wave_harness_pid=""
-  : >"$thermal_stop_file"
-  set +e
-  wait "$thermal_pid"
-  monitor_rc=$?
-  set -e
-  thermal_pid=""
-  thermal_stop_file=""
   ((harness_rc == 0)) || return "$harness_rc"
-  ((monitor_rc == 0)) || {
-    echo "Gemma wave $wave thermal monitor failed" >&2
-    return 1
-  }
-  # Append the terminal sample only after the monitor has stopped, so no
-  # concurrent telemetry row can appear after the receipt's end marker.
+  # Append the terminal sample after the harness has been reaped. No other
+  # process writes this log, so the end marker is necessarily the final row.
   thermal_sample "$thermal_measurement_log" "$phase_name-measurement-end"
   test "$THERMAL_STATE" = nominal
 

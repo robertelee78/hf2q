@@ -81,6 +81,58 @@ if thermal_monitor_nominal "$tmp_dir/probe-failure.log" probe-failure \
   exit 1
 fi
 
+# Foreground process supervision exits cleanly after its producer and fails
+# immediately on a non-Nominal transition without a background stop/join
+# handoff.
+thermal_read_state() { THERMAL_STATE=nominal; }
+(sleep 0.1) &
+supervised_pid=$!
+thermal_monitor_nominal_while_pid "$tmp_dir/supervised.log" \
+  supervised "$supervised_pid" 0
+wait "$supervised_pid"
+test -s "$tmp_dir/supervised.log"
+
+(sleep 5) &
+supervised_pid=$!
+if (
+  thermal_read_process_state() { return 1; }
+  thermal_monitor_nominal_while_pid "$tmp_dir/supervised-ps-failure.log" \
+    supervised-ps-failure "$supervised_pid" 0
+); then
+  echo "foreground thermal supervision accepted process-state probe failure" >&2
+  kill -TERM "$supervised_pid" 2>/dev/null || true
+  wait "$supervised_pid" 2>/dev/null || true
+  exit 1
+fi
+kill -TERM "$supervised_pid" 2>/dev/null || true
+wait "$supervised_pid" 2>/dev/null || true
+test ! -s "$tmp_dir/supervised-ps-failure.log"
+
+(sleep 5) &
+supervised_pid=$!
+thermal_read_process_state "$supervised_pid"
+test -n "$THERMAL_PROCESS_STATE"
+kill -TERM "$supervised_pid" 2>/dev/null || true
+wait "$supervised_pid" 2>/dev/null || true
+thermal_read_process_state "$supervised_pid"
+test -z "$THERMAL_PROCESS_STATE"
+
+sequence=(nominal fair)
+sequence_index=0
+thermal_read_state() { read_sequence_state; }
+(sleep 5) &
+supervised_pid=$!
+if thermal_monitor_nominal_while_pid "$tmp_dir/supervised-fair.log" \
+  supervised-fair "$supervised_pid" 0; then
+  echo "foreground thermal supervision accepted a fair state" >&2
+  kill -TERM "$supervised_pid" 2>/dev/null || true
+  wait "$supervised_pid" 2>/dev/null || true
+  exit 1
+fi
+kill -TERM "$supervised_pid" 2>/dev/null || true
+wait "$supervised_pid" 2>/dev/null || true
+test "$(tail -1 "$tmp_dir/supervised-fair.log" | awk -F '\t' '{print $2}')" = fair
+
 # Cold-cohort measurement ends only after the exact number of non-empty,
 # atomically published cold receipts exists. Later functional phases are not
 # part of the calibrated thermal envelope.

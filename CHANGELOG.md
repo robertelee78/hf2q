@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged 16-second default limit; historical fresh waves are 12.156–14.399
   seconds. This fixes the calibration order and receipt authority rather than
   weakening the user-facing limit.
+- Keep Gemma's full-wave thermal supervisor in the release-gate process. The
+  first exact-main rerun (`31691093129`) completed wave 1 with all four
+  tool-result turns at 13.886–14.008 seconds under entirely Nominal telemetry,
+  but failed after the harness and before sealing the terminal thermal summary.
+  The old unsheltered process-state assignment could trigger `set -e` exactly
+  as the harness disappeared; cleanup then wrote the observed stop sentinel.
+  Foreground supervision preserves the same two-second coverage while removing
+  that receipt-lifecycle race; inference limits and acceptance predicates are
+  unchanged.
 - Increase DeepSeek-V4's default pure-decode slot quantum from 8 to 64 after
   the cold-prefill barrier lifts, amortizing session swaps and scheduler
   publication across saturated cohorts. Genuinely mixed prefill/decode work
