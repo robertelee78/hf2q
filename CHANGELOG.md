@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-13
+
 ### Changed
 
 - Run Gemma's two calibrated four-slot agent waves before its destructive
@@ -33,8 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   68.438 s and 69.944 s (69.191 s median), so the protected hf2q ceiling is
   rebaselined to 60 s—9.2 s below the current peer median. Exact packed
   two-wave and cross-family release authority remains pending.
-
-## [0.1.6] — 2026-08-10
 
 ### Fixed
 
