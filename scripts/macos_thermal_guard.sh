@@ -109,6 +109,54 @@ thermal_monitor_nominal() {
   done
 }
 
+thermal_read_process_state() {
+  local producer_pid=$1
+  local state
+
+  if ! state=$(/bin/ps -p "$producer_pid" -o state= 2>/dev/null \
+    | tr -d '[:space:]'); then
+    if kill -0 "$producer_pid" 2>/dev/null; then
+      echo "failed to read live thermal producer state: $producer_pid" >&2
+      return 1
+    fi
+    THERMAL_PROCESS_STATE=""
+    return 0
+  fi
+  if [[ -z "$state" ]] && kill -0 "$producer_pid" 2>/dev/null; then
+    echo "thermal producer state was empty for live pid: $producer_pid" >&2
+    return 1
+  fi
+  THERMAL_PROCESS_STATE=$state
+}
+
+thermal_monitor_nominal_while_pid() {
+  local log_file=$1
+  local phase=$2
+  local producer_pid=$3
+  local sample_seconds=$4
+
+  [[ "$producer_pid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "thermal producer pid must be a positive integer" >&2
+    return 2
+  }
+  [[ "$sample_seconds" =~ ^[0-9]+$ ]] || {
+    echo "thermal sample interval must be a non-negative integer" >&2
+    return 2
+  }
+  while :; do
+    thermal_read_process_state "$producer_pid" || return 1
+    if [[ -z "$THERMAL_PROCESS_STATE" || "$THERMAL_PROCESS_STATE" == Z* ]]; then
+      return 0
+    fi
+    thermal_sample "$log_file" "$phase" || return 1
+    if [[ "$THERMAL_STATE" != nominal ]]; then
+      echo "calibrated phase $phase observed non-nominal thermal state: $THERMAL_STATE" >&2
+      return 1
+    fi
+    sleep "$sample_seconds"
+  done
+}
+
 thermal_prepare_cold_receipt_dir() {
   local receipt_dir=$1
   local existing_receipt
