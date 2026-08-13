@@ -7661,7 +7661,7 @@ const DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV: &str = "HF2Q_DEEPSEEK_SLOT_DECODE_QUANT
 // amortizes slot/session swaps and scheduler publication across a full cold
 // cohort. `deepseek4_mixed_work_budget` still clamps genuinely mixed work to
 // eight tokens, preserving the measured interactive response bound.
-const DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 32;
+const DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 64;
 const MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 64;
 /// Keep at most two independent cold conversations in the prefill/decode
 /// pipeline. Their matrix chunks execute sequentially through one scratch
@@ -27358,8 +27358,8 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_slot_decode_quantum_is_bounded_and_defaults_to_thirty_two() {
-        assert_eq!(parse_deepseek4_slot_decode_quantum(None), Ok(32));
+    fn deepseek_slot_decode_quantum_is_bounded_and_defaults_to_sixty_four() {
+        assert_eq!(parse_deepseek4_slot_decode_quantum(None), Ok(64));
         assert_eq!(parse_deepseek4_slot_decode_quantum(Some("1")), Ok(1));
         assert_eq!(parse_deepseek4_slot_decode_quantum(Some("16")), Ok(16));
         assert_eq!(parse_deepseek4_slot_decode_quantum(Some("32")), Ok(32));
