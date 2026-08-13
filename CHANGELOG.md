@@ -164,7 +164,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds completed all eight cold responses in 27.943–28.023 seconds, reused
   7,112 tokens, and completed tool-result turns in 11.340–25.316 seconds. The
   explicit 60-second functional ceiling fixes the wiring mismatch without
-  weakening the separate TTFT or tool-result bounds.
+  weakening the separate TTFT or tool-result bounds. Exact-main protected run
+  `31714959928` then passed every preceding DeepSeek and four-slot Gemma gate,
+  but process-b's eight-slot wave started after the destructive Gemma soak
+  without its own thermal settle or telemetry and measured 40.882 seconds to
+  first semantic output, 882 ms above the unchanged functional ceiling. This
+  does not prove thermal throttling, and the correct cold responses/zero-cold-
+  reuse state do not erase the timing failure; cached and tool continuations
+  never ran. The eight-slot lane now gets an independent
+  trailing 60 seconds of Nominal state after its eight-slot model is loaded,
+  plus fail-closed two-second monitoring through the entire cold, cached,
+  automatic-tool, SSE, and tool-result wave. Its thermal summary, raw logs,
+  and exact eight cold-receipt hashes are independently bound and replayed at
+  publication; a new exact packed run remains required authority.
 - Keep that dispatch compatible with macOS Bash 3.2 under `set -u` by using
   explicit four-slot and eight-slot command branches instead of expanding an
   empty array. The release wrapper now also preserves the originating failure

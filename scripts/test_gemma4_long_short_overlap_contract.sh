@@ -68,8 +68,8 @@ awk '
 # full-wave thermal wrapper, never the unmonitored generic helper.
 awk '
   /^run_gemma_release_gates\(\)/ { in_gemma=1; next }
-  in_gemma && /run_gemma_calibrated_wave 1/ { wave1=NR }
-  in_gemma && /run_gemma_calibrated_wave 2/ { wave2=NR }
+  in_gemma && /run_gemma_thermally_guarded_wave 1 4/ { wave1=NR }
+  in_gemma && /run_gemma_thermally_guarded_wave 2 4/ { wave2=NR }
   in_gemma && /scripts\/test_gemma4_long_short_overlap\.sh/ { overlap=NR }
   in_gemma && /run_lifecycle gemma/ { lifecycle=NR }
   in_gemma && /^}/ { exit }
@@ -94,7 +94,7 @@ grep -qF 'thermal_monitor_nominal_while_pid "$thermal_measurement_log"' \
   exit 1
 }
 if awk '
-  /^run_gemma_calibrated_wave\(\)/ { in_wave=1 }
+  /^run_gemma_thermally_guarded_wave\(\)/ { in_wave=1 }
   in_wave && /thermal_monitor_nominal .*&/ { found=1 }
   in_wave && /^}/ { exit }
   END { exit(found ? 0 : 1) }
@@ -135,6 +135,59 @@ awk '
   default_env && /scripts\/test_full_context_agent_slots.sh/ { found=1; exit }
   END { exit(found && limits && tool_limit && eight_harness ? 0 : 1) }
 ' "$RELEASE_GATE"
+
+awk '
+  /^run_gemma_release_gates\(\)/ { in_gemma=1; next }
+  in_gemma && /scripts\/test_gemma4_long_short_overlap\.sh/ { overlap=NR }
+  in_gemma && /run_lifecycle gemma/ { lifecycle=NR }
+  in_gemma && /finish_server_phase/ && lifecycle > 0 && process_a_finish == 0 {
+    process_a_finish=NR
+  }
+  in_gemma && /start_server gemma process-b/ { process_b=NR }
+  in_gemma && /run_gemma_thermally_guarded_wave eight-slots 8/ { guarded=NR }
+  in_gemma && /^}/ { exit }
+  END {
+    ordered = overlap > 0 && overlap < lifecycle
+    ordered = ordered && lifecycle < process_a_finish
+    ordered = ordered && process_a_finish < process_b && process_b < guarded
+    exit(ordered ? 0 : 1)
+  }
+' "$RELEASE_GATE" || {
+  echo "Gemma eight-slot wave must be independently guarded after the process-a soak" >&2
+  exit 1
+}
+if awk '
+  /^run_gemma_release_gates\(\)/ { in_gemma=1; next }
+  in_gemma && /run_gemma_wave eight-slots 8/ { found=1 }
+  in_gemma && /^}/ { exit }
+  END { exit(found ? 0 : 1) }
+' "$RELEASE_GATE"; then
+  echo "Gemma eight-slot wave still bypasses thermal supervision" >&2
+  exit 1
+fi
+grep -qF 'gemma_wave8_thermal_sha' "$RELEASE_GATE" || {
+  echo "Gemma manifest does not bind the eight-slot thermal summary" >&2
+  exit 1
+}
+grep -qF 'jq -e -f scripts/gemma4_eight_slot_receipt.jq' \
+  "$RELEASE_GATE" || {
+  echo "Gemma release producer does not validate the N=8 summary before sealing" >&2
+  exit 1
+}
+grep -qF "'.receipt_sha256.gemma.eight_slots_thermal'" "$RELEASE_WORKFLOW" || {
+  echo "publication does not rehash the eight-slot thermal summary" >&2
+  exit 1
+}
+grep -qF 'verify_gemma4_wave_thermal_receipt.sh eight-slots' \
+  "$RELEASE_WORKFLOW" || {
+  echo "publication does not independently replay the eight-slot thermal receipt" >&2
+  exit 1
+}
+grep -qF 'jq -e -f scripts/gemma4_eight_slot_receipt.jq' \
+  "$RELEASE_WORKFLOW" || {
+  echo "publication does not replay the N=8 summary schema" >&2
+  exit 1
+}
 
 for predicate in \
   'and .maximum_cold_ttft_ms <= 40000' \
