@@ -299,6 +299,11 @@ physical slot is free. Cancelling a
 cached suffix rolls back to a valid, position-consistent pre-request turn
 anchor; poisoned or inconsistent state still resets fully.
 
+After prefill drains, pure decode advances in 16-token slot quanta to amortize
+session swaps and scheduler publication across a full cohort. This does not
+widen genuinely mixed work: a runnable decoder beside prefill remains clamped
+to the eight-token/two-window interactive budget above.
+
 Large DeepSeek MoE prefills also pair the routed expert gate and up
 projections through the family-neutral `mlx-native 0.10.8` schedule primitive.
 That primitive constructs the expert routing schedule once, then encodes the

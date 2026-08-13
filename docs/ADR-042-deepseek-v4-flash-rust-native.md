@@ -1336,6 +1336,35 @@ safety only. Acceptance still requires two thermally valid exact-packed
 tool semantics, plus the 94,576-token overlap/lifecycle gate. Decode-sized
 fusion remains a later, separately measured experiment.
 
+### Pure-decode cohort quantum correction (2026-08-12 candidate)
+
+Exact-main packed-artifact run `31660507971` exercised merge commit
+`6ba436442a3fb86fe2e732913ebf237cb0d7fe0f` under continuous AC power and a
+Nominal thermal settle/measurement window. Model identity, the 6,685-token
+four-agent fixture, tool semantics, and 6,677-token recovery anchors were
+correct, but the unchanged release gate failed closed when one cold semantic
+response took 55.438 seconds against the 55.000-second limit. Server timing
+put the first pair at 55.306 and 55.470 seconds and the delayed second pair at
+cohort endpoints in the same range. This was a scheduling-performance miss,
+not a cache or tool-semantic failure.
+
+A same-binary, same-model, same-fixture discriminator changed only
+`HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM` from 8 to 16. All four cold, cached,
+automatic-tool, SSE, and tool-result conversations passed: cold semantic
+responses were 50.520–51.691 seconds, the monotonic cohort wall was 51.841
+seconds, and every continuation reused 6,677/6,685 tokens. The corresponding
+server totals were 50.477, 50.865, 30.127, and 30.288 seconds. Thermal samples
+remained Nominal throughout the cold receipts.
+
+The candidate therefore changes the default *pure-decode* slot quantum to 16
+to amortize session swaps and scheduler publication after prefill drains.
+`deepseek4_mixed_work_budget` still clamps any genuinely mixed prefill/decode
+turn to eight tokens and two native prefill windows, so the 94,576-token
+interactive-overlap contract is unchanged. The environment override remains
+bounded to 1–64. This focused discriminator is causal evidence, not release
+authority: two exact packed thermal waves and the complete cross-family
+lifecycle gate must still pass before publication.
+
 The local acceptance setup exposed an independent launcher false positive:
 the remote-inference OpenCode process reported 10.5 GiB RSS, while macOS
 `footprint` measured 1.7 GiB physical use and 9.5 GiB reclaimable mappings.

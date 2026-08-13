@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Increase DeepSeek-V4's default pure-decode slot quantum from 8 to 16 after
+  the cold-prefill barrier lifts, amortizing session swaps and scheduler
+  publication across saturated cohorts. Genuinely mixed prefill/decode work
+  remains clamped to the measured eight-token/two-window interactive budget.
+  On the exact 6,685-token four-agent discriminator this changed a 55.438 s
+  fail-closed result into a full semantic/cache pass at 50.520–51.691 s with a
+  51.841 s cohort wall and unchanged 6,677-token prefix reuse; exact packed
+  two-wave and cross-family release authority remains pending.
+
 ## [0.1.6] — 2026-08-10
 
 ### Fixed
