@@ -7657,7 +7657,11 @@ struct Deepseek4PendingSeed {
 }
 
 const DEEPSEEK4_SLOT_DECODE_QUANTUM_ENV: &str = "HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM";
-const DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 8;
+// Pure decode has no competing prefill transaction, so a wider quantum
+// amortizes slot/session swaps and scheduler publication across a full cold
+// cohort. `deepseek4_mixed_work_budget` still clamps genuinely mixed work to
+// eight tokens, preserving the measured interactive response bound.
+const DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 16;
 const MAX_DEEPSEEK4_SLOT_DECODE_QUANTUM: usize = 64;
 /// Keep at most two independent cold conversations in the prefill/decode
 /// pipeline. Their matrix chunks execute sequentially through one scratch
@@ -27354,8 +27358,8 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_slot_decode_quantum_is_bounded_and_defaults_to_eight() {
-        assert_eq!(parse_deepseek4_slot_decode_quantum(None), Ok(8));
+    fn deepseek_slot_decode_quantum_is_bounded_and_defaults_to_sixteen() {
+        assert_eq!(parse_deepseek4_slot_decode_quantum(None), Ok(16));
         assert_eq!(parse_deepseek4_slot_decode_quantum(Some("1")), Ok(1));
         assert_eq!(parse_deepseek4_slot_decode_quantum(Some("16")), Ok(16));
         assert_eq!(parse_deepseek4_slot_decode_quantum(Some("64")), Ok(64));
@@ -27365,6 +27369,14 @@ mod tests {
                 "invalid quantum {invalid:?} must fail closed"
             );
         }
+        assert_eq!(
+            deepseek4_mixed_work_budget(DEFAULT_DEEPSEEK4_SLOT_DECODE_QUANTUM, true),
+            Deepseek4MixedWorkBudget {
+                decode_quantum: 8,
+                max_prefill_windows: Some(2),
+            },
+            "the wider pure-decode default must not widen interactive Mixed work"
+        );
     }
 
     #[test]

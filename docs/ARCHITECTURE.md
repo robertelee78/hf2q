@@ -329,6 +329,11 @@ parked, or absent, the cap is removed and the proven 2,048-token bulk-prefill
 plan resumes. This avoids the latency cost of small transactions when no peer
 can expose semantic progress.
 
+When no prefill transaction remains, DeepSeek pure decode uses a separate
+16-token slot quantum to amortize session swaps and scheduler publication.
+That wider pure-decode quantum never enters the `Mixed` budget above, which
+continues to clamp visible decode to eight tokens.
+
 Large automatic DeepSeek MoE prefills use the family-neutral paired expert
 projection primitive in `mlx-native 0.10.8`: gate and up share one routing
 schedule while retaining their existing quantized arithmetic and distinct
