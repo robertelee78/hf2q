@@ -1473,8 +1473,10 @@ DeepSeek must each pass that unchanged gate from the exact packed artifact,
 one model process at a time, before this candidate is called release-worthy.
 The manual `.github/workflows/cache-lifecycle.yml` workflow is the executable
 authority for that requirement: it checks out an exact current-main SHA,
-packages it, builds from the extracted crate, holds a `caffeinate` assertion,
-checks AC power continuously, and runs one large-model process at a time. In
+packages it, builds from the extracted crate, copies the executable to an
+evidence path sealed outside Cargo's target directory, holds a `caffeinate`
+assertion, checks AC power continuously, and runs one large-model process at a
+time. In
 addition to the shared lifecycle, it runs Qwen's deterministic overlap,
 three cold four-agent waves, native heap series, and fresh one-slot disconnect;
 Gemma's long-prefill overlap/cancellation, four- and eight-slot transaction
@@ -1489,6 +1491,26 @@ disables any local-default projector. `.github/workflows/release.yml` requires
 a successful run at the same SHA, rehashes every downloaded receipt, validates
 the detailed family predicates, and requires the crate digest to equal the
 newly reproduced publication artifact before `cargo publish` can execute.
+
+Exact-main run `31730699128` passed the complete DeepSeek and Gemma matrices,
+including both thermally guarded four-slot waves, the independently settled
+eight-slot wave, long-context rollback/cache tests, and release-profile Gemma
+parity. It then failed before Qwen inference. The final Gemma Cargo integration
+test had legitimately relinked the package-local `target/release/hf2q`: the
+gate's original receipt-bound executable was
+`9760d41e1ea1776e04c4c1096b0feef6cc86fa05a681a5c8a76edc11df5d7c16`,
+while that pathname became
+`cabb3c0848577135ae0451e37c8d8109e4beb1402b92556b1453ba8b313195ee`.
+The Qwen server loaded and became ready, received zero chat requests, and was
+cleanly stopped after the cumulative harness rejected the binary identity.
+This is artifact-provenance failure evidence, not a Qwen cache or inference
+failure. The workflow now executes a digest-verified copy under runner temp,
+passes its build-time digest as a separate required wrapper input, and rechecks
+that external digest before startup and every model load; a model-free
+contract mutates the original Cargo target and proves the sealed copy remains
+executable and byte-identical. Run `31730699128` is not release authority, and
+a new exact-main packed hardware run remains mandatory.
+
 Gemma's four-slot waves retain the release-default agentic latency limits. An
 exact packed `fbcf46374f0cfa26ccc50080d1ed387f400536a2` M5 gate first passed
 the 175,040-token overlap, cancellation rollback, 120,528-token cache lifecycle,

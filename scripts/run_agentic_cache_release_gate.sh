@@ -10,6 +10,7 @@ set -euo pipefail
 EXPECTED_SHA=${EXPECTED_SHA:?EXPECTED_SHA is required}
 CRATE_SHA256=${CRATE_SHA256:?CRATE_SHA256 is required}
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
+EXPECTED_BINARY_SHA256=${EXPECTED_BINARY_SHA256:?EXPECTED_BINARY_SHA256 is required}
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL:?DEEPSEEK_MODEL is required}
 GEMMA_MODEL=${GEMMA_MODEL:?GEMMA_MODEL is required}
 QWEN_MODEL=${QWEN_MODEL:?QWEN_MODEL is required}
@@ -51,6 +52,10 @@ done
   exit 2
 }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not executable: $HF2Q_BIN" >&2; exit 2; }
+[[ "$EXPECTED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "EXPECTED_BINARY_SHA256 must be a lowercase 64-character digest" >&2
+  exit 2
+}
 for model in "$DEEPSEEK_MODEL" "$GEMMA_MODEL" "$QWEN_MODEL"; do
   [[ -f "$model" ]] || { echo "model not found: $model" >&2; exit 2; }
 done
@@ -199,6 +204,15 @@ wait_ready() {
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
+assert_exact_binary() {
+  [[ -n "${binary_sha:-}" && -x "$HF2Q_BIN" ]] || {
+    echo "release binary is missing or non-executable: $HF2Q_BIN" >&2
+    return 1
+  }
+  "$script_dir/seal_release_binary.sh" --verify "$HF2Q_BIN" "$binary_sha" \
+    >/dev/null
+}
+
 require_no_model_runtime() {
   local name
   for name in hf2q llama-server llama-cli; do
@@ -250,6 +264,9 @@ start_server() {
   local kv_budget=${8:-}
   local -a launcher_env
 
+  # Cargo parity tests later in this gate may relink package-local bin targets.
+  # Every model must execute the immutable copy sealed outside Cargo's target.
+  assert_exact_binary
   ensure_guard_health
   current_dir="$OUT_ROOT/$family/$phase"
   current_log="$current_dir/server.log"
@@ -306,7 +323,8 @@ run_lifecycle() {
   sha256_file "$out/summary.json" >"$out/summary.json.sha256"
 }
 
-binary_sha=$(sha256_file "$HF2Q_BIN")
+binary_sha=$EXPECTED_BINARY_SHA256
+assert_exact_binary
 agentic_fixture="$PWD/scripts/fixtures/deepseek4-agentic-repo-context.txt"
 agentic_fixture_sha=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
 test -f "$agentic_fixture"
