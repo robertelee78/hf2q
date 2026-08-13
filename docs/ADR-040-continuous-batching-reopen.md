@@ -1489,7 +1489,19 @@ disables any local-default projector. `.github/workflows/release.yml` requires
 a successful run at the same SHA, rehashes every downloaded receipt, validates
 the detailed family predicates, and requires the crate digest to equal the
 newly reproduced publication artifact before `cargo publish` can execute.
-Gemma's four-slot waves retain the release-default agentic latency limits. The
+Gemma's four-slot waves retain the release-default agentic latency limits. An
+exact packed `fbcf46374f0cfa26ccc50080d1ed387f400536a2` M5 gate first passed
+the 175,040-token overlap, cancellation rollback, 120,528-token cache lifecycle,
+and isolation checks, then failed all four tool-result turns uniformly at
+16.562–16.686 seconds against the unchanged 16-second ceiling. Historical
+fresh four-slot waves at the same limit measured 12.156–14.399 seconds. That
+failure is a gate-order defect, not authority to relax the SLO: the two
+calibrated waves now run first on the fresh four-slot process, each after a
+trailing 60 seconds of Nominal state, with fail-closed two-second sampling
+through the entire cold/cached/tool-result wave. The destructive 175K/120K
+soak follows only after both calibrated waves pass, and publication replays
+the thermal logs and binds their digests. Full exact-artifact rerun authority
+remains pending. The
 eight-slot lane is the README's experimental correctness and aggregate-row-cap
 probe, not an eight-slot latency SLO: it uses explicit 40-second cold-TTFT and
 30-second tool-result functional ceilings while retaining the measured values

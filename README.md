@@ -370,7 +370,10 @@ gates from a clean hf2q package resolving published `mlx-native 0.10.8`:
   runs DeepSeek, Gemma, and Qwen sequentially under continuous AC and
   `caffeinate` guards, verifies each GGUF against a protected SHA-256, and
   emits a source/crate/binary/model-bound manifest that the publication
-  workflow must download and verify.
+  workflow must download and verify. Its calibrated four-slot Gemma waves run
+  before the long overlap/lifecycle soak, retain the default latency limits,
+  and bind continuous Nominal thermal telemetry across every cold, cached,
+  automatic-tool, and tool-result turn.
 
 The governing decisions and the old-failure-versus-final-artifact distinction
 are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,

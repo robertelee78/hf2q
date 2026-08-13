@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Run Gemma's two calibrated four-slot agent waves before its destructive
+  175K-token overlap/cancellation and 120K-token lifecycle soak. Each wave now
+  requires a trailing 60 seconds of Nominal thermal state and remains under
+  fail-closed two-second sampling through the complete cold, cached, automatic-
+  tool, and tool-result sequence. The exact packed `fbcf4637` gate had already
+  proved Gemma overlap, rollback, isolation, and retained-prefix correctness,
+  but all four post-soak tool turns took 16.562–16.686 seconds against the
+  unchanged 16-second default limit; historical fresh waves are 12.156–14.399
+  seconds. This fixes the calibration order and receipt authority rather than
+  weakening the user-facing limit.
 - Increase DeepSeek-V4's default pure-decode slot quantum from 8 to 64 after
   the cold-prefill barrier lifts, amortizing session swaps and scheduler
   publication across saturated cohorts. Genuinely mixed prefill/decode work

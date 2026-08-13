@@ -591,6 +591,170 @@ run_gemma_wave() {
   shasum -c "$out/summary.json.sha256" >/dev/null
 }
 
+run_gemma_calibrated_wave() {
+  local wave=$1
+  local phase="wave$wave"
+  local phase_name="gemma-wave-$wave"
+  local out="$OUT_ROOT/gemma/$phase"
+  local thermal_dir="$out/thermal"
+  local thermal_measurement_log="$thermal_dir/measurement.log"
+  local thermal_settle_log="$thermal_dir/settle.log"
+  local thermal_summary="$thermal_dir/summary.json"
+  local harness_state monitor_state
+  local harness_rc=0 monitor_rc=0
+  local measurement_samples measurement_duration_seconds
+  local non_nominal_measurement_samples telemetry_gaps
+  local settle_samples settle_duration_seconds settle_telemetry_gaps
+  local cold_receipts_json
+  local sample_interval_seconds=2
+  local maximum_sample_gap_seconds=5
+  local settle_sample_interval_seconds=5
+  local maximum_settle_sample_gap_seconds=8
+
+  mkdir -p "$out" "$thermal_dir"
+  thermal_prepare_cold_receipt_dir "$out/agents"
+  thermal_wait_for_nominal "$thermal_settle_log" "$phase_name-settle" \
+    60 900 "$settle_sample_interval_seconds"
+  : >"$thermal_measurement_log"
+  thermal_sample "$thermal_measurement_log" "$phase_name-measurement-start"
+  test "$THERMAL_STATE" = nominal
+  thermal_stop_file="$thermal_dir/stop"
+  [[ ! -e "$thermal_stop_file" ]] || {
+    echo "Gemma wave $wave thermal stop file already exists" >&2
+    return 1
+  }
+  thermal_monitor_nominal "$thermal_measurement_log" \
+    "$phase_name-measurement" "$thermal_stop_file" \
+    "$sample_interval_seconds" >"$thermal_dir/monitor.stdout" \
+    2>"$thermal_dir/monitor.stderr" &
+  thermal_pid=$!
+  run_gemma_wave "$phase" 4 &
+  wave_harness_pid=$!
+
+  while :; do
+    harness_state=$(ps -p "$wave_harness_pid" -o state= 2>/dev/null \
+      | tr -d '[:space:]')
+    monitor_state=$(ps -p "$thermal_pid" -o state= 2>/dev/null \
+      | tr -d '[:space:]')
+    if [[ -z "$monitor_state" || "$monitor_state" == Z* ]]; then
+      set +e
+      wait "$thermal_pid"
+      monitor_rc=$?
+      set -e
+      thermal_pid=""
+      if ((monitor_rc != 0)); then
+        echo "Gemma wave $wave thermal monitor failed" >&2
+        # Closing the server makes the harness's direct curl children return;
+        # the harness then reaps its complete process tree itself.
+        stop_server || true
+        wait "$wave_harness_pid" 2>/dev/null || true
+        wave_harness_pid=""
+        thermal_stop_file=""
+        return 1
+      fi
+      echo "Gemma wave $wave thermal monitor exited before the harness" >&2
+      stop_server || true
+      wait "$wave_harness_pid" 2>/dev/null || true
+      wave_harness_pid=""
+      thermal_stop_file=""
+      return 1
+    fi
+    if [[ -z "$harness_state" || "$harness_state" == Z* ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  set +e
+  wait "$wave_harness_pid"
+  harness_rc=$?
+  set -e
+  wave_harness_pid=""
+  : >"$thermal_stop_file"
+  set +e
+  wait "$thermal_pid"
+  monitor_rc=$?
+  set -e
+  thermal_pid=""
+  thermal_stop_file=""
+  ((harness_rc == 0)) || return "$harness_rc"
+  ((monitor_rc == 0)) || {
+    echo "Gemma wave $wave thermal monitor failed" >&2
+    return 1
+  }
+  # Append the terminal sample only after the monitor has stopped, so no
+  # concurrent telemetry row can appear after the receipt's end marker.
+  thermal_sample "$thermal_measurement_log" "$phase_name-measurement-end"
+  test "$THERMAL_STATE" = nominal
+
+  thermal_validate_measurement_log "$thermal_measurement_log" \
+    "$maximum_sample_gap_seconds"
+  measurement_samples=$THERMAL_LOG_SAMPLES
+  measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+  non_nominal_measurement_samples=$THERMAL_LOG_NON_NOMINAL_SAMPLES
+  telemetry_gaps=$THERMAL_LOG_GAPS
+  thermal_validate_settle_log "$thermal_settle_log" 60 \
+    "$maximum_settle_sample_gap_seconds"
+  settle_samples=$THERMAL_LOG_SAMPLES
+  settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+  settle_telemetry_gaps=$THERMAL_LOG_GAPS
+  cold_receipts_json=$(
+    for receipt in "$out"/agents/agent-*.cold.json; do
+      [[ -s "$receipt" ]] || {
+        echo "missing Gemma cold receipt: $receipt" >&2
+        exit 1
+      }
+      jq -n --arg name "$(basename "$receipt")" \
+        --arg sha256 "$(sha256_file "$receipt")" \
+        '{name:$name,sha256:$sha256}'
+    done | jq -s 'sort_by(.name)'
+  )
+  jq -e '
+    length == 4
+    and ([.[].name] | unique | length) == 4
+    and all(.[];
+      (.name | test("^agent-[1-4]\\.cold\\.json$"))
+      and (.sha256 | test("^[0-9a-f]{64}$")))
+  ' <<<"$cold_receipts_json" >/dev/null
+  jq -n --arg status pass --arg phase "$phase_name" \
+    --arg settle_log_sha256 "$(sha256_file "$thermal_settle_log")" \
+    --arg measurement_log_sha256 "$(sha256_file "$thermal_measurement_log")" \
+    --argjson settle_seconds 60 \
+    --argjson settle_duration_seconds "$settle_duration_seconds" \
+    --argjson settle_samples "$settle_samples" \
+    --argjson measurement_samples "$measurement_samples" \
+    --argjson measurement_duration_seconds "$measurement_duration_seconds" \
+    --argjson sample_interval_seconds "$sample_interval_seconds" \
+    --argjson maximum_sample_gap_seconds "$maximum_sample_gap_seconds" \
+    --argjson settle_sample_interval_seconds "$settle_sample_interval_seconds" \
+    --argjson maximum_settle_sample_gap_seconds "$maximum_settle_sample_gap_seconds" \
+    --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
+    --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
+    --argjson telemetry_gaps "$telemetry_gaps" \
+    --argjson cold_receipts "$cold_receipts_json" \
+    '{status:$status,phase:$phase,required_state:"nominal",
+      measurement_scope:"full-agent-wave",cold_receipts:$cold_receipts,
+      settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
+      settle_samples:$settle_samples,measurement_samples:$measurement_samples,
+      measurement_duration_seconds:$measurement_duration_seconds,
+      sample_interval_seconds:$sample_interval_seconds,
+      maximum_sample_gap_seconds:$maximum_sample_gap_seconds,
+      settle_sample_interval_seconds:$settle_sample_interval_seconds,
+      maximum_settle_sample_gap_seconds:$maximum_settle_sample_gap_seconds,
+      non_nominal_measurement_samples:$non_nominal_measurement_samples,
+      settle_telemetry_gaps:$settle_telemetry_gaps,telemetry_gaps:$telemetry_gaps,
+      settle_log_sha256:$settle_log_sha256,
+      measurement_log_sha256:$measurement_log_sha256}' >"$thermal_summary"
+  jq --slurpfile thermal "$thermal_summary" '. + {thermal:$thermal[0]}' \
+    "$out/summary.json" >"$out/summary.json.tmp"
+  mv "$out/summary.json.tmp" "$out/summary.json"
+  shasum -a 256 "$out/summary.json" >"$out/summary.json.sha256"
+  shasum -c "$out/summary.json.sha256" >/dev/null
+  bash scripts/verify_gemma4_wave_thermal_receipt.sh "$wave" \
+    "$out/summary.json" "$thermal_summary" "$thermal_measurement_log" \
+    "$thermal_settle_log" "$out/agents"
+}
+
 capture_gemma_heap() {
   local phase=$1
   ensure_guard_health
@@ -626,9 +790,19 @@ write_gemma_transaction_receipt() {
 }
 
 run_gemma_release_gates() {
+  # The four-slot latency waves are calibration work, not soak work. Run them
+  # first on one fresh server, after a nominal settle for each wave, and keep
+  # thermal monitoring live through every cold/cached/tool-result turn. The
+  # destructive 175K overlap and 120K lifecycle follow only after both limits
+  # have passed.
+  require_no_model_runtime
   start_server gemma process-a scripts/serve_gemma4_opencode.sh \
     "$GEMMA_MODEL" 18082 4
   capture_gemma_heap baseline
+  run_gemma_calibrated_wave 1
+  capture_gemma_heap post-wave1
+  run_gemma_calibrated_wave 2
+  capture_gemma_heap post-wave2
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
   MODEL_PATH="$GEMMA_MODEL" MODEL_SHA256="$GEMMA_MODEL_SHA256" MAX_SLOTS=4 \
@@ -639,21 +813,34 @@ run_gemma_release_gates() {
   capture_gemma_heap post-overlap
   run_lifecycle gemma 2800
   capture_gemma_heap post-lifecycle
-  run_gemma_wave wave1 4
-  capture_gemma_heap post-wave1
-  run_gemma_wave wave2 4
-  capture_gemma_heap post-wave2
-  qwen36_validate_heap_series \
-    "$OUT_ROOT/gemma/heap-baseline.json" "$OUT_ROOT/gemma/heap-post-overlap.json" \
-    "$OUT_ROOT/gemma/heap-post-lifecycle.json" "$OUT_ROOT/gemma/heap-post-wave1.json" \
-    "$OUT_ROOT/gemma/heap-post-wave2.json"
+  jq -e -s '
+    length == 5
+    and all(.[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)
+    and all(.[]; .cfstring_count >= 0 and .autoreleasepool_content_count >= 0)
+    and (.[1].cfstring_count - .[0].cfstring_count <= 256)
+    and (.[2].cfstring_count - .[1].cfstring_count <= 256)
+    and (.[2].cfstring_count - .[0].cfstring_count <= 512)
+    and (.[3].cfstring_count - .[2].cfstring_count <= 512)
+    and (.[4].cfstring_count - .[3].cfstring_count <= 512)
+    and (.[4].cfstring_count - .[2].cfstring_count <= 1024)
+    and (.[1].autoreleasepool_content_count - .[0].autoreleasepool_content_count <= 8)
+    and (.[2].autoreleasepool_content_count - .[1].autoreleasepool_content_count <= 8)
+    and (.[2].autoreleasepool_content_count - .[0].autoreleasepool_content_count <= 16)
+    and (.[3].autoreleasepool_content_count - .[2].autoreleasepool_content_count <= 8)
+    and (.[4].autoreleasepool_content_count - .[3].autoreleasepool_content_count <= 8)
+    and (.[4].autoreleasepool_content_count - .[2].autoreleasepool_content_count <= 16)
+  ' "$OUT_ROOT/gemma/heap-baseline.json" \
+    "$OUT_ROOT/gemma/heap-post-wave1.json" \
+    "$OUT_ROOT/gemma/heap-post-wave2.json" \
+    "$OUT_ROOT/gemma/heap-post-overlap.json" \
+    "$OUT_ROOT/gemma/heap-post-lifecycle.json" >/dev/null
   jq -n \
     --slurpfile baseline "$OUT_ROOT/gemma/heap-baseline.json" \
-    --slurpfile overlap "$OUT_ROOT/gemma/heap-post-overlap.json" \
-    --slurpfile lifecycle "$OUT_ROOT/gemma/heap-post-lifecycle.json" \
     --slurpfile wave1 "$OUT_ROOT/gemma/heap-post-wave1.json" \
     --slurpfile wave2 "$OUT_ROOT/gemma/heap-post-wave2.json" \
-    '{status:"pass",snapshots:{baseline:$baseline[0],post_overlap:$overlap[0],post_lifecycle:$lifecycle[0],post_wave1:$wave1[0],post_wave2:$wave2[0]}}' \
+    --slurpfile overlap "$OUT_ROOT/gemma/heap-post-overlap.json" \
+    --slurpfile lifecycle "$OUT_ROOT/gemma/heap-post-lifecycle.json" \
+    '{status:"pass",snapshot_order:["baseline","post_wave1","post_wave2","post_overlap","post_lifecycle"],snapshots:{baseline:$baseline[0],post_wave1:$wave1[0],post_wave2:$wave2[0],post_overlap:$overlap[0],post_lifecycle:$lifecycle[0]}}' \
     >"$OUT_ROOT/gemma/heap-summary.json"
   jq -e '.status == "pass" and all(.snapshots[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)' \
     "$OUT_ROOT/gemma/heap-summary.json" >/dev/null
@@ -726,6 +913,8 @@ jq -n \
   --arg gemma_overlap_sha "$(sha256_file "$OUT_ROOT/gemma/overlap/summary.json")" \
   --arg gemma_wave1_sha "$(sha256_file "$OUT_ROOT/gemma/wave1/summary.json")" \
   --arg gemma_wave2_sha "$(sha256_file "$OUT_ROOT/gemma/wave2/summary.json")" \
+  --arg gemma_wave1_thermal_sha "$(sha256_file "$OUT_ROOT/gemma/wave1/thermal/summary.json")" \
+  --arg gemma_wave2_thermal_sha "$(sha256_file "$OUT_ROOT/gemma/wave2/thermal/summary.json")" \
   --arg gemma_wave8_sha "$(sha256_file "$OUT_ROOT/gemma/eight-slots/summary.json")" \
   --arg gemma_transactions4_sha "$(sha256_file "$OUT_ROOT/gemma/transactions-four-slots.json")" \
   --arg gemma_transactions8_sha "$(sha256_file "$OUT_ROOT/gemma/transactions-eight-slots.json")" \
@@ -768,7 +957,7 @@ jq -n \
     },
     receipt_sha256: {
       deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha},
-      gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,eight_slots:$gemma_wave8_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
+      gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha}
     },
     families: {
