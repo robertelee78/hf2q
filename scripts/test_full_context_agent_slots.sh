@@ -46,13 +46,14 @@ fi
 
 # The single-agent gate's 40-second cold limit is intentionally strict. Four
 # cold DeepSeek requests share one 100 GiB verifier. The checked-in 21,204-byte
-# context fixture preserves the 6,685-token workload used to calibrate the
-# independently measured llama.cpp np4 wall-clock result (about 54.1 s on this
-# M5 Max), plus a narrow scheduling margin. Cached turns remain tightly bounded.
+# context fixture preserves the 6,685-token workload used for the exact matched
+# peer comparison. Two thermally valid llama.cpp np4 waves measured 68.438 s
+# and 69.944 s on this M5 Max; the 60 s hf2q ceiling keeps a 9.2 s margin below
+# the peer median. Cached turns remain tightly bounded.
 # Explicit operator values always win.
 if [[ "$FAMILY" == deepseek4 && "$AGENTS" -gt 1 ]]; then
-  MAX_COLD_TTFT_MS=${MAX_COLD_TTFT_MS:-55000}
-  MAX_COLD_RESPONSE_MS=${MAX_COLD_RESPONSE_MS:-55000}
+  MAX_COLD_TTFT_MS=${MAX_COLD_TTFT_MS:-60000}
+  MAX_COLD_RESPONSE_MS=${MAX_COLD_RESPONSE_MS:-60000}
   MAX_CACHED_RESPONSE_MS=${MAX_CACHED_RESPONSE_MS:-15000}
   MAX_CACHED_SEMANTIC_MS=${MAX_CACHED_SEMANTIC_MS:-15000}
   MAX_TOOL_RESULT_RESPONSE_MS=${MAX_TOOL_RESULT_RESPONSE_MS:-35000}

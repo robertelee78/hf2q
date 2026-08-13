@@ -11,8 +11,8 @@ def valid_agent:
   and .expected_prompt_tokens == 6685
   and .prompt_tokens == 6685
   and .cold_cached_tokens == 0
-  and (.cold_ttft_ms | number_between(0; 55000))
-  and (.cold_semantic_response_ms | number_between(0; 55000))
+  and (.cold_ttft_ms | number_between(0; 60000))
+  and (.cold_semantic_response_ms | number_between(0; 60000))
   and (.cached_tokens | type == "number" and . >= 6653)
   and (.auto_cached_tokens | type == "number" and . >= 6653)
   and (.continuation_cached_tokens | type == "number" and . >= 6653)
@@ -38,8 +38,8 @@ and .agentic_context_fixture_bytes == 21204
 and .repository_context_chars == 20584
 and .expected_prompt_tokens == 6685
 and .prompt_tokens == 6685
-and (.maximum_cold_ttft_ms | number_between(0; 55000))
-and (.maximum_cold_semantic_response_ms | number_between(0; 55000))
-and (.cohort_cold_wall_ms | number_between(0; 55000))
+and (.maximum_cold_ttft_ms | number_between(0; 60000))
+and (.maximum_cold_semantic_response_ms | number_between(0; 60000))
+and (.cohort_cold_wall_ms | number_between(0; 60000))
 and (.agents | type == "array" and length == 4)
 and all(.agents[]; valid_agent)
