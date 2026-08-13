@@ -14,6 +14,7 @@ for command in awk bash grep; do
 done
 
 bash -n "$HARNESS" "$RELEASE_GATE"
+bash -n "$ROOT_DIR/scripts/verify_gemma4_wave_thermal_receipt.sh"
 
 invalid_stderr=$(mktemp)
 exit_probe_script=$(mktemp)
@@ -62,6 +63,53 @@ awk '
   armed && substr($0, length($0), 1) != "\\" { exit 1 }
   END { exit(found ? 0 : 1) }
 ' "$RELEASE_GATE"
+
+# The two calibrated four-slot waves must run before the destructive 175K
+# overlap and 120K lifecycle soak. Each wave is accepted only through the
+# full-wave thermal wrapper, never the unmonitored generic helper.
+awk '
+  /^run_gemma_release_gates\(\)/ { in_gemma=1; next }
+  in_gemma && /run_gemma_calibrated_wave 1/ { wave1=NR }
+  in_gemma && /run_gemma_calibrated_wave 2/ { wave2=NR }
+  in_gemma && /scripts\/test_gemma4_long_short_overlap\.sh/ { overlap=NR }
+  in_gemma && /run_lifecycle gemma/ { lifecycle=NR }
+  in_gemma && /^}/ { exit }
+  END {
+    exit(wave1 > 0 && wave1 < wave2 && wave2 < overlap && overlap < lifecycle ? 0 : 1)
+  }
+' "$RELEASE_GATE" || {
+  echo "Gemma calibrated waves must precede destructive overlap/lifecycle work" >&2
+  exit 1
+}
+# The following checks intentionally match literal shell variables.
+# shellcheck disable=SC2016
+grep -qF 'thermal_wait_for_nominal "$thermal_settle_log" "$phase_name-settle"' \
+  "$RELEASE_GATE" || {
+  echo "Gemma calibrated waves lack the nominal-settle gate" >&2
+  exit 1
+}
+# shellcheck disable=SC2016
+grep -qF 'thermal_monitor_nominal "$thermal_measurement_log"' "$RELEASE_GATE" || {
+  echo "Gemma calibrated waves lack continuous full-wave thermal monitoring" >&2
+  exit 1
+}
+grep -qF 'measurement_scope:"full-agent-wave"' "$RELEASE_GATE" || {
+  echo "Gemma thermal receipt does not bind the complete agent wave" >&2
+  exit 1
+}
+# shellcheck disable=SC2016
+grep -qF 'bash scripts/verify_gemma4_wave_thermal_receipt.sh "$wave"' \
+  "$RELEASE_GATE" || {
+  echo "Gemma release producer does not verify its thermal receipt" >&2
+  exit 1
+}
+# jq variables below are literal publication contracts.
+# shellcheck disable=SC2016
+grep -qF 'and .thermal.measurement_scope == "full-agent-wave"' \
+  "$RELEASE_WORKFLOW" || {
+  echo "publication does not require full-wave Gemma thermal evidence" >&2
+  exit 1
+}
 
 awk '
   /^run_gemma_wave\(\)/ { in_wave=1 }
