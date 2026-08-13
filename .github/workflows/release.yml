@@ -333,10 +333,22 @@ jobs:
                and $g.heap.status == "pass"
                and $g.heap.snapshot_order == ["baseline","post_wave1","post_wave2","post_overlap","post_lifecycle"]
                and all($g.heap.snapshots[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)
+               and all($g.heap.snapshots[];
+                 (.cfstring_count | type) == "number" and .cfstring_count >= 0
+                 and (.autoreleasepool_content_count | type) == "number"
+                 and .autoreleasepool_content_count >= 0)
                and ($g.heap.snapshots.post_wave1.cfstring_count - $g.heap.snapshots.baseline.cfstring_count) <= 256
                and ($g.heap.snapshots.post_wave2.cfstring_count - $g.heap.snapshots.post_wave1.cfstring_count) <= 256
+               and ($g.heap.snapshots.post_wave2.cfstring_count - $g.heap.snapshots.baseline.cfstring_count) <= 512
                and ($g.heap.snapshots.post_overlap.cfstring_count - $g.heap.snapshots.post_wave2.cfstring_count) <= 512
-               and ($g.heap.snapshots.post_lifecycle.cfstring_count - $g.heap.snapshots.post_overlap.cfstring_count) <= 512)
+               and ($g.heap.snapshots.post_lifecycle.cfstring_count - $g.heap.snapshots.post_overlap.cfstring_count) <= 512
+               and ($g.heap.snapshots.post_lifecycle.cfstring_count - $g.heap.snapshots.post_wave2.cfstring_count) <= 1024
+               and ($g.heap.snapshots.post_wave1.autoreleasepool_content_count - $g.heap.snapshots.baseline.autoreleasepool_content_count) <= 8
+               and ($g.heap.snapshots.post_wave2.autoreleasepool_content_count - $g.heap.snapshots.post_wave1.autoreleasepool_content_count) <= 8
+               and ($g.heap.snapshots.post_wave2.autoreleasepool_content_count - $g.heap.snapshots.baseline.autoreleasepool_content_count) <= 16
+               and ($g.heap.snapshots.post_overlap.autoreleasepool_content_count - $g.heap.snapshots.post_wave2.autoreleasepool_content_count) <= 8
+               and ($g.heap.snapshots.post_lifecycle.autoreleasepool_content_count - $g.heap.snapshots.post_overlap.autoreleasepool_content_count) <= 8
+               and ($g.heap.snapshots.post_lifecycle.autoreleasepool_content_count - $g.heap.snapshots.post_wave2.autoreleasepool_content_count) <= 16)
              and (.families.qwen as $q
                | $q.status == "pass" and $q.lifecycle.status == "pass"
                and $q.lifecycle.active_stream_cancelled_without_done == true

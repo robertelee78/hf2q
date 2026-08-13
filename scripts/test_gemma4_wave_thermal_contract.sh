@@ -68,4 +68,14 @@ if bash "$VERIFIER" 1 "$tmp/receipt.invalid.json" "$tmp/thermal.json" \
   exit 1
 fi
 
+mkdir -p "$tmp/agents-extra"
+cp "$tmp"/agents/agent-*.cold.json "$tmp/agents-extra/"
+cp "$tmp/agents/agent-1.cold.json" "$tmp/agents-extra/agent-5.cold.json"
+if bash "$VERIFIER" 1 "$tmp/receipt.json" "$tmp/thermal.json" \
+  "$tmp/measurement.log" "$tmp/settle.log" "$tmp/agents-extra" \
+  >/dev/null 2>&1; then
+  echo "Gemma thermal verifier accepted an extra cold receipt" >&2
+  exit 1
+fi
+
 echo "Gemma full-wave thermal contract passed"
