@@ -85,11 +85,17 @@ jobs:
             cd "$package_root"
             cargo build --release --locked
           )
-          binary="$package_root/target/release/hf2q"
-          test -x "$binary"
+          built_binary="$package_root/target/release/hf2q"
+          test -x "$built_binary"
+          built_sha=$(shasum -a 256 "$built_binary" | awk '{print $1}')
+          sealed_binary="$RUNNER_TEMP/cache-lifecycle-sealed-$EXPECTED_SHA/hf2q"
+          "$package_root/scripts/seal_release_binary.sh" \
+            "$built_binary" "$sealed_binary" "$built_sha"
+          test "$(shasum -a 256 "$sealed_binary" | awk '{print $1}')" = "$built_sha"
           {
             printf 'PACKAGE_ROOT=%s\n' "$package_root"
-            printf 'HF2Q_BIN=%s\n' "$binary"
+            printf 'HF2Q_BIN=%s\n' "$sealed_binary"
+            printf 'EXPECTED_BINARY_SHA256=%s\n' "$built_sha"
             printf 'CRATE_SHA256=%s\n' "$crate_sha"
           } >> "$GITHUB_ENV"
 
@@ -103,6 +109,7 @@ jobs:
           EXPECTED_SHA="$EXPECTED_SHA" \
           CRATE_SHA256="$CRATE_SHA256" \
           HF2Q_BIN="$HF2Q_BIN" \
+          EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256" \
           DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
           GEMMA_MODEL="$GEMMA_MODEL" \
           QWEN_MODEL="$QWEN_MODEL" \

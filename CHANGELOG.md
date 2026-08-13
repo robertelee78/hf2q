@@ -126,6 +126,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source/crate/binary/model-bound receipt. The publication workflow now
   requires that successful exact-SHA receipt and reproduces its crate digest
   before publishing.
+- Seal the packed `hf2q` executable into the runner's temporary evidence
+  directory before any hardware work, export its build-time digest as a
+  distinct immutable input, and recheck the copy against that digest before
+  every model load. Exact-main run `31730699128` proved the need for this boundary:
+  all DeepSeek and Gemma gates passed, including the thermally guarded
+  eight-slot wave and release-profile parity, but Gemma's final Cargo
+  integration test relinked the package-local `target/release/hf2q` path.
+  Qwen loaded the replacement bytes but its cumulative harness correctly
+  rejected the changed digest before sending a request. The original
+  receipt-bound bytes remained available under Cargo's hashed dependency
+  output, so this is an artifact-identity/harness failure—not Qwen inference
+  or cache evidence.
+  A new exact packed run remains required.
 - Run the real-model Gemma N=4/N=8, transaction-boundary, and long-resume
   parity checks with the optimized release profile and bind that profile in
   the hardware receipt. Metal command scheduling is profile-sensitive; a
