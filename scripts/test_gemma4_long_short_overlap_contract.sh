@@ -12,7 +12,6 @@ for command in awk bash grep; do
     exit 2
   }
 done
-
 bash -n "$HARNESS" "$RELEASE_GATE"
 bash -n "$ROOT_DIR/scripts/verify_gemma4_wave_thermal_receipt.sh"
 
@@ -124,17 +123,37 @@ grep -qF 'and .thermal.measurement_scope == "full-agent-wave"' \
 awk '
   /^run_gemma_wave\(\)/ { in_wave=1 }
   in_wave && /if \[\[ "\$agents" == 8 \]\]/ { in_eight=1 }
-  in_eight && /MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000/ {
+  in_eight && /MAX_COLD_TTFT_MS=40000 MAX_COLD_RESPONSE_MS=60000/ {
     limits=1
   }
+  limits && /MAX_TOOL_RESULT_RESPONSE_MS=30000/ { tool_limit=1 }
   limits && /scripts\/test_full_context_agent_slots.sh/ { eight_harness=1 }
   eight_harness && /^[[:space:]]*else[[:space:]]*$/ { in_default=1 }
   in_default && /BASE_URL="\$current_url" FAMILY=gemma4 AGENTS="\$agents"/ {
     default_env=1
   }
   default_env && /scripts\/test_full_context_agent_slots.sh/ { found=1; exit }
-  END { exit(found && limits && eight_harness ? 0 : 1) }
+  END { exit(found && limits && tool_limit && eight_harness ? 0 : 1) }
 ' "$RELEASE_GATE"
+
+for predicate in \
+  'and .maximum_cold_ttft_ms <= 40000' \
+  'and .maximum_cold_semantic_response_ms <= 60000' \
+  'and .maximum_tool_result_ms <= 30000'; do
+  grep -qF "$predicate" "$RELEASE_WORKFLOW" || {
+    echo "publication does not enforce the eight-slot timing envelope: $predicate" >&2
+    exit 1
+  }
+done
+for field in \
+  maximum_cold_ttft_ms \
+  maximum_cold_semantic_response_ms \
+  maximum_tool_result_ms; do
+  grep -qF "and (.$field | type) == \"number\"" "$RELEASE_WORKFLOW" || {
+    echo "publication accepts a missing/non-numeric eight-slot timing: $field" >&2
+    exit 1
+  }
+done
 
 awk '
   /^on_exit\(\)/ { in_exit=1 }

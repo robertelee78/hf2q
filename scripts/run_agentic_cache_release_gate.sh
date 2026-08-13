@@ -563,7 +563,8 @@ run_gemma_wave() {
   # values still remain in every per-agent receipt.
   mkdir -p "$out"
   if [[ "$agents" == 8 ]]; then
-    MAX_COLD_TTFT_MS=40000 MAX_TOOL_RESULT_RESPONSE_MS=30000 \
+    MAX_COLD_TTFT_MS=40000 MAX_COLD_RESPONSE_MS=60000 \
+    MAX_TOOL_RESULT_RESPONSE_MS=30000 \
     BASE_URL="$current_url" FAMILY=gemma4 AGENTS="$agents" \
     WAVE_ID="$phase" REQUIRE_COLD_FIRST=1 \
     OUT_DIR="$out/agents" scripts/test_full_context_agent_slots.sh \

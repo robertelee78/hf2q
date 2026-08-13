@@ -152,11 +152,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects a different path, prompt, or result envelope.
 - Keep Gemma's four-slot release-default agentic latency limits unchanged,
   while giving the experimental eight-slot correctness/aggregate-cap probe an
-  explicit 40-second cold-TTFT and 30-second tool-result completion envelope.
+  explicit 40-second cold-TTFT, 60-second whole-response, and 30-second
+  tool-result functional envelope.
   On the exact M5 Max discriminator the eight-slot wave measured 25.279 seconds
   cold and 23.932 seconds at the slowest tool-result turn; every receipt keeps
   the actual timing, cache, and semantic fields rather than converting this
-  experiment into an eight-slot latency claim.
+  experiment into an eight-slot latency claim. Protected run `31701418005`
+  exposed that the wrapper had omitted the whole-response override and therefore
+  inherited the shared 40-second default after the destructive long-context
+  soak. A fresh exact-binary/model discriminator after 60 continuously Nominal
+  seconds completed all eight cold responses in 27.943–28.023 seconds, reused
+  7,112 tokens, and completed tool-result turns in 11.340–25.316 seconds. The
+  explicit 60-second functional ceiling fixes the wiring mismatch without
+  weakening the separate TTFT or tool-result bounds.
 - Keep that dispatch compatible with macOS Bash 3.2 under `set -u` by using
   explicit four-slot and eight-slot command branches instead of expanding an
   empty array. The release wrapper now also preserves the originating failure
