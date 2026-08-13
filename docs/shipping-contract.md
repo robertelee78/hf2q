@@ -58,6 +58,10 @@ family's graph, cache, or scheduler contract by approximation.
   Outside a cold-cohort barrier, staggered warm work may occupy any free
   physical slot. Cancellation restores only a valid, position-consistent
   pre-request turn anchor; poisoned or inconsistent state resets fully.
+  The Unreleased 0.1.6 candidate also pairs large automatic MoE gate/up
+  projections through the published `mlx-native 0.10.8` routing-schedule
+  primitive. Decode-sized and forced diagnostic routes remain independent;
+  native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
   independently observed transaction deadline that never returns, fails the
   affected Qwen, Gemma, or DeepSeek worker closed. Every owned reply
@@ -89,15 +93,15 @@ from a clean packed artifact that resolves the published, checksum-pinned
 | Apple-Silicon artifact gates | Cross-layer/MTP cursor-ledger coherence and transaction-boundary cancellation pass against the packed candidate; these require the native cache/model path and are not inferred from hosted scheduler tests. |
 | Exact overlap | The deterministic 552-token SSE lane is enqueued immediately before the 87,972-token/347-tool lane; the short lane makes semantic progress while the long lane completes exactly 42×2,048 + 1,956 prompt tokens. |
 | Disconnect | Dropping the long SSE is observed at a transaction boundary, releases the same physical slot once, and a following request succeeds. |
-| Agentic four-slot gate | Required/automatic tools, unary/SSE, tool-result continuation, exact arguments, and retained-prefix reuse pass for four independent slots. |
+| Agentic four-slot gate | Required/automatic tools, unary/SSE, tool-result continuation, exact arguments, and retained-prefix reuse pass for four independent slots. Qwen uses the canonical prompt-visible `/opt/hf2q/Cargo.toml` path, a direct-tool system instruction, and an unambiguous completed-tool-result envelope; their SHA-256 identities are receipt-bound so an ephemeral package path or prompt rewrite cannot silently change the workload. |
 | Native lifetime/fatal recovery | Exact-artifact hardware waves keep command-buffer and CFString populations bounded and reject every timeout or ignored-submission signature. Packed model-free fail-stop and supervisor tests inject the fatal return/dead-worker state, prove no post-fatal submission, preserve `/health` as process liveness, and require `/readyz` plus new generation to fail closed. The hardware gate does not intentionally poison Metal. |
 
 The shared cross-family changes additionally require:
 
 | Family | Candidate artifact gate |
 |---|---|
-| Gemma 4 | Eager-versus-resumed exact output parity at 4,096 boundaries and non-aligned tails; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
-| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v1` fixture (SHA-256 `2c894c9e…b4ef`), exactly 6,685 rendered prompt tokens per agent, zero cold reuse, and the literal 55-second cold bounds. Each calibrated wave starts only after at least 60 seconds of Nominal samples at five-second cadence with no hf2q/llama model runtime loaded, then remains under fail-closed two-second thermal sampling throughout measurement. |
+| Gemma 4 | Fresh-versus-reused bounded output parity at the 4,096 boundary and the non-aligned 8,193-token tail; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The transaction cap is not accepted until this passes. |
+| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v1` fixture (SHA-256 `2c894c9e…b4ef`), exactly 6,685 rendered prompt tokens per agent, zero cold reuse, and the literal 55-second cold bounds. Each calibrated wave starts only after at least 60 seconds of Nominal samples at five-second cadence with no hf2q/llama model runtime loaded, then remains under fail-closed two-second thermal sampling until all four atomic cold receipts exist. The request schedule is unchanged: cached work may overlap the cold tail, and the same live cache must finish cached unary/SSE, automatic tool choice, and tool-result continuation under the existing bounds. The thermal receipt binds the four cold-receipt names and hashes. The server log must prove the paired large-prefill route engaged, while semantic/tool parity and retained-prefix counts remain unchanged. |
 | All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 
 ---

@@ -124,12 +124,14 @@ jobs:
             scripts/test_deepseek4_interactive_overlap.sh \
             scripts/test_agentic_cache_lifecycle.sh \
             scripts/test_gemma4_long_short_overlap.sh \
+            scripts/test_gemma4_long_short_overlap_contract.sh \
             scripts/run_agentic_cache_release_gate.sh
           bash scripts/test_qwen36_watchdog_harness_contract.sh
           bash scripts/test_deepseek4_cached_suffix_contract.sh
           bash scripts/test_deepseek4_agentic_fixture_contract.sh
           bash scripts/test_deepseek4_peer_cold_wave_contract.sh
           bash scripts/test_macos_thermal_guard_contract.sh
+          bash scripts/test_gemma4_long_short_overlap_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
             --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \

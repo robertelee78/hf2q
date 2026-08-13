@@ -79,6 +79,7 @@ const PORT_52401: u16 = 52401;
 const PORT_52402: u16 = 52402;
 const PORT_52403: u16 = 52403;
 const PORT_52404: u16 = 52404;
+const PORT_52405: u16 = 52405;
 const HOST: &str = "127.0.0.1";
 const READYZ_BUDGET: Duration = Duration::from_secs(180);
 
@@ -325,7 +326,12 @@ fn fetch_canonical_model_id(server: &ServerGuard) -> String {
 /// happens to contain a `content` field somewhere in the error
 /// message — the prior helper would have extracted that and compared
 /// equal between servers.
-fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32) -> String {
+fn chat_decode_with_usage(
+    server: &ServerGuard,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> (String, usize) {
     use std::io::{Read, Write};
     let body = format!(
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":{max_tokens},"temperature":0,"stream":false}}"#
@@ -369,6 +375,10 @@ fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32)
         "[chat_decode] response body lacks `\"choices\":[` — likely an \
          error response. Body:\n{body}"
     );
+    let cached_tokens = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|response| response["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0) as usize;
 
     // Naive JSON content extractor — sufficient for the well-known
     // shape `{"choices":[{"message":{"content":"...","role":"assistant"...}}]}`.
@@ -397,12 +407,16 @@ fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32)
                 None => break,
             }
         } else if c == '"' {
-            return out;
+            return (out, cached_tokens);
         } else {
             out.push(c);
         }
     }
-    out
+    (out, cached_tokens)
+}
+
+fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32) -> String {
+    chat_decode_with_usage(server, model, prompt, max_tokens).0
 }
 
 /// ADR-017 Phase E option (a) iter-3 — K<N partial-prefix byte-identity
@@ -1859,17 +1873,18 @@ fn gemma_hybrid_lcp_partial_prefix_byte_identity() {
 ///   * the hybrid leg's encode writes slot=logical-position at prefill
 ///     (both routes) AND at decode (capacity-derived predicate in
 ///     `gpu_full_attn.rs`);
-///   * the hybrid SDPA kernel's `mask_type=2 + sliding_window` windowing
-///     over linear buffers (verified at
-///     `/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal:490-491,914-915`)
-///     composes byte-identically with a cold fresh prefill of the same
-///     long prompt.
+///   * bounded live append's staged `mask_type=3` positions use the exact
+///     chronological history length copied from the mounted cache;
+///   * two consecutive appends publish and consume the latest coherent
+///     anchor, and each composes byte-identically with a cold production
+///     prefill of the same long prompt.
 ///
 /// Servers: A = `HF2Q_KV_LCP_RESUME=1 + HF2Q_KV_LCP_LONG_RESUME=1`
-/// (hybrid default, primed with Q_long then probed with P_long);
-/// B = control (no env, cold P_long).
-/// Falsifiers: `lcp_detected_total < 1` on A (engagement), or
-/// `decoded_A(P) != decoded_B(P)` (coherence).
+/// (hybrid default, primed with Q_long then probed with P_long and R_long);
+/// B = control (no env, fresh process for cold P_long and cold R_long).
+/// Falsifiers: `lcp_detected_total < 2` on A, a non-increasing second
+/// `cached_tokens` value (latest-anchor publication failed), or either
+/// resumed output differing from its cold production control.
 #[test]
 fn gemma_hybrid_long_resume_byte_identity() {
     let model_path = match resolve_model_path_or_skip() {
@@ -1884,6 +1899,9 @@ fn gemma_hybrid_long_resume_byte_identity() {
 
     let prompt_q = iter36_build_prompt("Question Q ending here distinctively.");
     let prompt_p = iter36_build_prompt("Question P with different ending text continuing onward.");
+    let prompt_r = iter36_build_prompt(
+        "Question P with different ending text continuing onward and one final clarification.",
+    );
 
     let server_a = spawn_server_with_base(
         &bin,
@@ -1907,41 +1925,46 @@ fn gemma_hybrid_long_resume_byte_identity() {
     let q_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_q, ITER36_MAX_TOKENS);
     assert!(!q_decoded_a.is_empty(), "Q decoded empty on server A");
 
-    let p_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_p, ITER36_MAX_TOKENS);
+    let (p_decoded_a, p_cached_tokens) =
+        chat_decode_with_usage(&server_a, &canonical_a, &prompt_p, ITER36_MAX_TOKENS);
     assert!(!p_decoded_a.is_empty(), "P decoded empty on server A");
+    let (r_decoded_a, r_cached_tokens) =
+        chat_decode_with_usage(&server_a, &canonical_a, &prompt_r, ITER36_MAX_TOKENS);
+    assert!(!r_decoded_a.is_empty(), "R decoded empty on server A");
+    assert!(
+        p_cached_tokens > 0 && r_cached_tokens > p_cached_tokens,
+        "[gemma-hybrid-long-resume] FALSIFIED #1 — latest live anchor was not consumed: P cached_tokens={p_cached_tokens}, R cached_tokens={r_cached_tokens}"
+    );
 
     let metrics_body_a = fetch_metrics(&server_a);
     let lcp_detected_a = metric_lcp_detected_total(&metrics_body_a);
     assert!(
-        lcp_detected_a >= 1,
-        "[gemma-hybrid-long-resume] FALSIFIED #1 — detected_total={} (expected ≥1): \
-         hybrid long-resume did NOT engage (store-side linear alloc / snapshot \
-         guard / engine guard / capacity formula).",
+        lcp_detected_a >= 2,
+        "[gemma-hybrid-long-resume] FALSIFIED #2 — detected_total={} (expected ≥2): \
+         both consecutive hybrid long-resume turns did not engage (store-side \
+         linear alloc / snapshot guard / engine guard / capacity formula).",
         lcp_detected_a
     );
 
-    // Control = the NON-BATCHED route (parity reference). The batched
-    // ring path itself DIVERGES from the non-batched reference at
-    // seq>sw on this exact prompt shape — pre-existing batched-prefill
-    // sliding-layer divergence, confirmed at clean main 2026-08-03
-    // (A==C==D="while maintaining", B(batched ring)="effectively,").
-    // Comparing against the reference path is what makes this gate a
-    // resume-coherence falsifier rather than a batched-route-vs-
-    // reference comparator. Server B gets the SAME lr_long+hybrid env
-    // but no priming (cold P, empty registry).
-    let server_b = spawn_server_with_base(
-        &bin,
-        &model_path,
-        PORT_52404,
-        &[("HF2Q_SERVE_BATCHED_PREFILL", "0")],
-        &[
-            ("HF2Q_KV_LCP_RESUME", "1"),
-            ("HF2Q_KV_LCP_LONG_RESUME", "1"),
-        ],
-    );
-    wait_for_readyz(&server_b);
-    let canonical_b = fetch_canonical_model_id(&server_b);
-    let p_decoded_b = chat_decode(&server_b, &canonical_b, &prompt_p, ITER36_MAX_TOKENS);
+    // Controls use the same production-default bounded graph, but a fresh
+    // process for each prompt. This keeps P and R genuinely cold and scopes
+    // the falsifier to cache coherence instead of comparing the resumed graph
+    // with the numerically distinct legacy per-token graph.
+    let p_decoded_b = {
+        let server_b = spawn_server_with_base(
+            &bin,
+            &model_path,
+            PORT_52405,
+            &[],
+            &[
+                ("HF2Q_KV_LCP_RESUME", "1"),
+                ("HF2Q_KV_LCP_LONG_RESUME", "1"),
+            ],
+        );
+        wait_for_readyz(&server_b);
+        let canonical_b = fetch_canonical_model_id(&server_b);
+        chat_decode(&server_b, &canonical_b, &prompt_p, ITER36_MAX_TOKENS)
+    };
     assert!(
         !p_decoded_b.is_empty(),
         "P decoded empty on server B (control)"
@@ -1949,9 +1972,29 @@ fn gemma_hybrid_long_resume_byte_identity() {
 
     assert_eq!(
         p_decoded_a, p_decoded_b,
-        "[gemma-hybrid-long-resume] FALSIFIED #2 — hybrid long-resume output \
-         diverged from non-batched cold control: A (resumed): {:?} | B (cold): {:?}",
+        "[gemma-hybrid-long-resume] FALSIFIED #3 — hybrid long-resume output \
+         diverged from production cold control: A (resumed): {:?} | B (cold): {:?}",
         p_decoded_a, p_decoded_b
+    );
+    let r_decoded_b = {
+        let server_b = spawn_server_with_base(
+            &bin,
+            &model_path,
+            PORT_52404,
+            &[],
+            &[
+                ("HF2Q_KV_LCP_RESUME", "1"),
+                ("HF2Q_KV_LCP_LONG_RESUME", "1"),
+            ],
+        );
+        wait_for_readyz(&server_b);
+        let canonical_b = fetch_canonical_model_id(&server_b);
+        chat_decode(&server_b, &canonical_b, &prompt_r, ITER36_MAX_TOKENS)
+    };
+    assert_eq!(
+        r_decoded_a, r_decoded_b,
+        "[gemma-hybrid-long-resume] FALSIFIED #4 — the third turn did not reuse a coherent latest live anchor: A (resumed): {:?} | B (cold): {:?}",
+        r_decoded_a, r_decoded_b
     );
     eprintln!(
         "[gemma-hybrid-long-resume] PASS — byte-identical ({} bytes) with engagement",

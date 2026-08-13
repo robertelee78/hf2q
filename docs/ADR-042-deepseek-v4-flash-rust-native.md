@@ -9,8 +9,9 @@
   release run. One exact-packed wave exposed and corrected a thermal-order
   defect in that release gate; the next thermally valid wave isolated a
   saturated-cold scheduling regression. The bounded mixed-work replacement,
-  saturated-cold barrier, and cache lifecycle remain release candidates
-  pending immutable packed-artifact hardware proof.
+  saturated-cold barrier, paired-prefill schedule, and cold-cohort thermal
+  evidence boundary remain release candidates pending immutable
+  packed-artifact hardware proof.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1304,6 +1305,80 @@ but it does not authorize a rebaseline from thermally invalid data. The release
 remains blocked. The next accepted experiment is the family-neutral paired
 MoE gate/up schedule for large prefill; decode-sized work remains a separate
 measurement.
+
+### Family-neutral paired MoE schedule (2026-08-11 candidate)
+
+That experiment is now implemented without adopting the rejected literal
+gate/up arithmetic megakernel. Published `mlx-native 0.10.8` comes from exact
+main `0733dfbb280b3ceb8a8526489f1aebcdf454ee60`; the crates.io archive,
+GitHub release asset, and local Cargo-1.96 seal all have SHA-256
+`f2257d5afd2b0e246049e79b4857b0edc1554e93c81d7d2d2d1bcd64c73e22a9`.
+Its family-neutral pair primitive builds one expert-ID routing schedule and
+encodes two existing quantized projections with distinct weights and outputs.
+
+hf2q selects that primitive only for rows above the native routing threshold,
+automatic routing, available scratch, and no
+`HF2Q_MM_ID_ROUTING_THRESHOLD` diagnostic override. Small/decode work,
+forced matvec, slotted matrix routing, and calls without scratch preserve the
+independent gate/up path. The paired call reuses the first routing scratch for
+the pair; the routed down projection may reuse it only after both outputs have
+been encoded. The existing graph barriers cover the input, both weights,
+sanitized IDs, and both outputs.
+
+The exact packed native benchmark passed on AC power under Nominal thermal
+state and remained positive across eight covered shapes: Qwen Q5 pairs measured
+1.0396–1.0657x and DeepSeek Q2 pairs 1.0102–1.0332x against the independent
+schedule. Those are primitive measurements, not hf2q serving claims. The
+published dependency, selector regression, broad model-free DeepSeek suite,
+and locked all-target/all-feature check establish reproducibility and routing
+safety only. Acceptance still requires two thermally valid exact-packed
+6,685-token four-agent waves, unchanged 6,677-token retained-prefix reuse and
+tool semantics, plus the 94,576-token overlap/lifecycle gate. Decode-sized
+fusion remains a later, separately measured experiment.
+
+The local acceptance setup exposed an independent launcher false positive:
+the remote-inference OpenCode process reported 10.5 GiB RSS, while macOS
+`footprint` measured 1.7 GiB physical use and 9.5 GiB reclaimable mappings.
+System memory remained 93% free with 2.4 GiB compressor use and 3.2 GiB swap.
+The canonical launcher now refines only processes whose RSS crosses the 8 GiB
+ceiling and falls back to that conservative RSS value if `footprint` is absent,
+fails, exits during inspection, or returns malformed output. This changes no
+model/cache budget and does not authorize co-resident inference runtimes.
+
+### Cold-cohort thermal evidence boundary (2026-08-11 candidate)
+
+Local exact-packed probes of hf2q source `db2d7750d0e2a5b2b364fe2324cca9334cdcf652`
+used packed binary SHA-256
+`3a4202c26b66c8dae1a4a2e8b9f6364b7906792cd0708f5b21005d7857ce4093`.
+The paired large-prefill route engaged in every fresh process. Four diagnostic
+waves published all four atomic cold receipts with zero reuse and maximum cold
+semantic walls of 52.875, 52.848, 51.132, and 51.193 seconds. Their first
+non-Nominal samples arrived only at 80, 79, 84, and 77 seconds respectively,
+after the calibrated cold cohort had finished. The fourth attempt began after
+304 uninterrupted seconds of unloaded-host Nominal samples, so residual heat
+and the remote-inference coding client were not the cause. The combined
+cold/cached/SSE/tool sequence itself eventually moved macOS to `fair`.
+
+Those runs are diagnostic, not acceptance receipts: the then-current wrapper
+defined the thermal envelope as the complete 24-request functional sequence
+and correctly invalidated every non-Nominal run. They exposed an evidence
+boundary that was broader than the comparative claim. The paired primitive is
+selected only by large prefill; later cached, SSE, and tool-result turns prove
+cache and semantic correctness under independent upper bounds rather than the
+55-second cold comparison.
+
+The candidate wrapper therefore preserves the exact workload and request
+ordering but ends calibrated thermal measurement only after all four nonempty
+`agent-*.cold.json` receipts exist. It does not pause agents: cached work may
+still overlap the cold tail exactly as before. Any non-Nominal sample, probe
+failure, telemetry gap, producer exit, timeout, missing receipt, or excess
+receipt before that boundary fails closed. The thermal receipt records and
+rehashes the four cold-receipt filenames and SHA-256 digests. The same live
+server and KV sessions must then finish cached unary/SSE, automatic tool
+choice, and tool-result continuation under the unchanged latency, reuse, and
+semantic gates. Two thermally valid waves from the newly sealed exact package,
+plus the 94,576-token overlap/lifecycle gate, remain required before this
+optimization is accepted.
 
 ### Busy-affinity admission progress correction (2026-08-10 candidate)
 

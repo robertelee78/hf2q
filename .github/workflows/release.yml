@@ -112,7 +112,7 @@ jobs:
             thermal_settle_log="$wave_dir/thermal/settle.log"
             bash scripts/verify_macos_thermal_receipt.sh "$wave" \
               "$wave_dir/envelope.json" "$thermal_summary" \
-              "$thermal_log" "$thermal_settle_log"
+              "$thermal_log" "$thermal_settle_log" "$wave_dir/agents"
           done
           check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
           check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
@@ -203,6 +203,13 @@ jobs:
                  and .thermal.status == "pass"
                  and .thermal.required_state == "nominal"
                  and .thermal.runtime_preflight == "pass"
+                 and .thermal.measurement_scope == "cold-cohort"
+                 and (.thermal.cold_receipts | type) == "array"
+                 and (.thermal.cold_receipts | length) == 4
+                 and ([.thermal.cold_receipts[].name] | unique | length) == 4
+                 and all(.thermal.cold_receipts[];
+                   (.name | test("^agent-[1-4]\\.cold\\.json$"))
+                   and (.sha256 | test("^[0-9a-f]{64}$")))
                  and (.thermal.settle_seconds | type) == "number"
                  and .thermal.settle_seconds >= 60
                  and (.thermal.settle_duration_seconds | type) == "number"
@@ -290,9 +297,10 @@ jobs:
                  and .max_transaction_rows <= 4096 and .multi_slot_transactions > 0
                  and .nonaligned_transactions > 0)
                and $g.parity.status == "pass"
+               and $g.parity.profile == "release"
                and $g.parity.n4_exact_output_parity == true
                and $g.parity.n8_exact_output_parity == true
-               and $g.parity.eager_4096_and_resumed_8193_exact_output_parity == true
+               and $g.parity.fresh_and_reused_4096_8193_bounded_output_parity == true
                and $g.parity.long_resume_exact_output_parity == true
                and $g.heap.status == "pass"
                and all($g.heap.snapshots[]; .command_buffer_objects == 0 and .command_buffer_impls == 0)
@@ -320,7 +328,14 @@ jobs:
                and $q.cumulative.overlap.continuation_first_chunk_start == $q.cumulative.overlap.continuation_cached_tokens
                and all($q.cumulative.agent_waves[];
                  .status == "pass" and .family == "qwen36" and .concurrent_agents == 4
-                 and .require_cold_first == 1 and all(.agents[]; .cold_cached_tokens == 0))
+                 and .require_cold_first == 1
+                 and .agentic_system_prompt_sha256 == "dbedef4c2efa20e51603355def14af7f11658a03fd0dcda6de9d900588f7cb3c"
+                 and .tool_result_success_prefix_sha256 == "2d73b080a69f15d8cac736b264d82fdb4e8fe40e6cff6ed6bf099565f499ef5a"
+                 and all(.agents[];
+                   .cold_cached_tokens == 0
+                   and .expected_path == "/opt/hf2q/Cargo.toml"
+                   and .agentic_system_prompt_sha256 == "dbedef4c2efa20e51603355def14af7f11658a03fd0dcda6de9d900588f7cb3c"
+                   and .tool_result_success_prefix_sha256 == "2d73b080a69f15d8cac736b264d82fdb4e8fe40e6cff6ed6bf099565f499ef5a"))
                and $q.cumulative.agent_waves.warmup.maximum_tool_result_ms <= 15000
                and $q.cumulative.agent_waves.wave1.maximum_tool_result_ms <= 10000
                and $q.cumulative.agent_waves.wave2.maximum_tool_result_ms <= 10000
@@ -405,12 +420,14 @@ jobs:
               scripts/test_deepseek4_interactive_overlap.sh \
               scripts/test_agentic_cache_lifecycle.sh \
               scripts/test_gemma4_long_short_overlap.sh \
+              scripts/test_gemma4_long_short_overlap_contract.sh \
               scripts/run_agentic_cache_release_gate.sh
             bash scripts/test_qwen36_watchdog_harness_contract.sh
             bash scripts/test_deepseek4_cached_suffix_contract.sh
             bash scripts/test_deepseek4_agentic_fixture_contract.sh
             bash scripts/test_deepseek4_peer_cold_wave_contract.sh
             bash scripts/test_macos_thermal_guard_contract.sh
+            bash scripts/test_gemma4_long_short_overlap_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \
               --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \

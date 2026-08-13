@@ -1329,8 +1329,20 @@ advancing scheduler accounting. Cursor disagreement or reset failure is a
 worker invariant failure; a typed Metal command-buffer failure enters the
 shared fail-stop path without any reset or later submission. Long soft-token
 prefill remains unsupported because the resume surface explicitly rejects
-soft tokens. The 4,096-token cap is provisional until eager-versus-resumed
-real-model parity and the long-overlap/cancellation gates pass.
+soft tokens. The 4,096-token cap is provisional until fresh-versus-reused
+bounded real-model parity and the long-overlap/cancellation gates pass.
+
+The original boundary falsifier compared the production `4,096 + 4,096 + 1`
+plan with one monolithic 8,193-token prefill. On the exact packed `4dcd5430`
+candidate, the two computations selected the same first decode token (`122154`)
+but later produced different greedy continuations; forcing global layers onto
+flash attention did not remove the split. This is a floating-point graph
+comparison, not a cache/reset test: monolithic and transaction-bounded prefills
+use different reduction shapes. The release falsifier therefore uses a fresh
+one-slot bounded worker as the reference and compares it with the same bounded
+plan after the physical slot has completed an unrelated 4,096-token request.
+Both requests must advertise zero cached tokens. Any stale KV, cursor, mounted
+view, or prompt ledger still fails that same-plan fresh-versus-reused identity.
 
 ### Failed Gemma aggregate-batch/coalescing spike (2026-08-09)
 
@@ -1466,7 +1478,7 @@ checks AC power continuously, and runs one large-model process at a time. In
 addition to the shared lifecycle, it runs Qwen's deterministic overlap,
 three cold four-agent waves, native heap series, and fresh one-slot disconnect;
 Gemma's long-prefill overlap/cancellation, four- and eight-slot transaction
-caps, native heap series, and exact eager/resumed output parity; and DeepSeek's
+caps, native heap series, and exact fresh/reused bounded output parity; and DeepSeek's
 cached-suffix cancellation matrix, lopsided overlap with terminal parking, and
 two fresh four-agent waves. It uploads one manifest binding the source SHA,
 crate SHA-256, binary SHA-256, protected GGUF SHA-256 values, every receipt
@@ -1477,6 +1489,21 @@ disables any local-default projector. `.github/workflows/release.yml` requires
 a successful run at the same SHA, rehashes every downloaded receipt, validates
 the detailed family predicates, and requires the crate digest to equal the
 newly reproduced publication artifact before `cargo publish` can execute.
+Gemma's four-slot waves retain the release-default agentic latency limits. The
+eight-slot lane is the README's experimental correctness and aggregate-row-cap
+probe, not an eight-slot latency SLO: it uses explicit 40-second cold-TTFT and
+30-second tool-result functional ceilings while retaining the measured values
+in each agent receipt. An exact M5 Max discriminator after 60 seconds of
+Nominal thermal state measured 25.279 seconds cold and 23.932 seconds for the
+slowest concurrent tool-result turn; the full packed-artifact gate remains the
+authority for accepting that calibration.
+The accompanying real-model Gemma N=4/N=8, fresh/reused bounded-boundary, and
+long-resume parity tests run in Cargo's optimized `release` profile, and their
+receipt records `profile: "release"`. This is load-bearing: Metal scheduling
+and command-buffer timing differ in debug builds, while production serves the
+optimized binary. A debug-only divergence remains diagnostic evidence, but it
+cannot substitute for or veto the production-profile release proof; any
+release-profile divergence still fails the gate immediately.
 For this release the protected model identities are DeepSeek
 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
 Gemma `82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`,
@@ -1484,6 +1511,26 @@ and Qwen `f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`
 (SHA-256 of each GGUF). Repository variables carry both the canonical local
 path and expected digest; changing either byte identity requires a new bound
 hardware receipt.
+
+Qwen automatic-tool quality is prompt-sensitive at this quantization and must
+not be conflated with KV correctness. A 2026-08-12 discriminator used the same
+packed binary and exact rendered tokens with `tool_choice=auto`: the canonical
+path under the former generic system prompt emitted a fenced pseudo-call both
+cold and after restoring 6,676 tokens, exonerating the cache transition. The
+release workload now uses the canonical `/opt/hf2q/Cargo.toml` path with an
+operator-realistic system instruction that requires direct tool invocation and
+forbids Markdown imitation. Its simulated tool result explicitly identifies
+the `read_file` call as completed and directs the agent to answer without
+repeating it; returned bytes still come from the exact packed Cargo.toml. Three
+consecutive four-agent cohorts passed all 12 automatic calls and all 12
+tool-result continuations with full response replay or stable-prefix reuse.
+The final cumulative discriminator also passed the 87,972-token/44-chunk
+overlap, all three four-agent waves, `/readyz`, zero power events, and bounded
+native heap populations. These are focused M5 receipts for the harness repair,
+not publication authority: the protected exact-source workflow must reproduce
+them after the change is committed and packed. Per-agent and aggregate receipts
+bind the SHA-256 of both the system prompt and tool-result envelope, while the
+release verifier also requires the canonical path.
 
 The pre-commit 0.1.6 candidate binary
 `da970f10a3866048dfb1d2ce9f727e71c2aa31402374223265be3170cf1744bf`

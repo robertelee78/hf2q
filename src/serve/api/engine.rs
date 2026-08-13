@@ -20618,17 +20618,16 @@ fn gemma_retained_live_prefix_tokens(
 fn gemma_live_batched_append_allowed(
     serve_batched_env: Option<&str>,
     suffix_tokens: usize,
-    n_attention_heads: usize,
 ) -> bool {
-    if suffix_tokens < 32 {
+    if suffix_tokens == 0 {
         return false;
     }
     match serve_batched_env {
         Some(value) => !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
-        None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
-            suffix_tokens,
-            n_attention_heads,
-        ),
+        // Live append uses bounded vector attention and a 1x1 placeholder
+        // setup mask, so the cold route's O(n²) viability estimate does not
+        // apply to its suffix length.
+        None => true,
     }
 }
 
@@ -20646,6 +20645,7 @@ fn gemma_live_prefix_resume(
     prompt_tokens: &[u32],
     max_tokens: usize,
     has_soft_tokens: bool,
+    serve_batched_env: Option<&str>,
 ) -> Option<usize> {
     if has_soft_tokens
         || loaded.live_prefix_tokens.is_empty()
@@ -20662,27 +20662,35 @@ fn gemma_live_prefix_resume(
     }
 
     let required_capacity = prompt_tokens.len().checked_add(max_tokens.max(1))?;
-    let dense = loaded.weights.dense_kvs.as_ref()?;
-    if dense.len() != loaded.weights.layers.len() {
-        return None;
-    }
-    let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
-        mlx_native::DType::F16
-    } else {
-        mlx_native::DType::F32
-    };
-    let dense_ok = dense
-        .iter()
-        .zip(loaded.weights.layers.iter())
-        .all(|(cache, layer)| {
-            let is_sliding = matches!(layer.layer_type, crate::serve::config::LayerType::Sliding);
-            cache.capacity >= required_capacity
-                && cache.is_sliding == is_sliding
-                && cache.dtype == model_kv_dtype
-                && std::sync::Arc::strong_count(cache) == 1
-        });
-    if !dense_ok {
-        return None;
+    let hybrid_batched_resume = crate::debug::INVESTIGATION_ENV.hybrid_kv
+        && gemma_live_batched_append_allowed(
+            serve_batched_env,
+            prompt_tokens.len().saturating_sub(k),
+        );
+    if !hybrid_batched_resume {
+        let dense = loaded.weights.dense_kvs.as_ref()?;
+        if dense.len() != loaded.weights.layers.len() {
+            return None;
+        }
+        let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+            mlx_native::DType::F16
+        } else {
+            mlx_native::DType::F32
+        };
+        let dense_ok = dense
+            .iter()
+            .zip(loaded.weights.layers.iter())
+            .all(|(cache, layer)| {
+                let is_sliding =
+                    matches!(layer.layer_type, crate::serve::config::LayerType::Sliding);
+                cache.capacity >= required_capacity
+                    && cache.is_sliding == is_sliding
+                    && cache.dtype == model_kv_dtype
+                    && std::sync::Arc::strong_count(cache) == 1
+            });
+        if !dense_ok {
+            return None;
+        }
     }
 
     if crate::debug::INVESTIGATION_ENV.hybrid_kv {
@@ -20794,8 +20802,13 @@ fn generate_once_with_soft_tokens(
     //      partial-prefill resume entry point. Otherwise (any gate
     //      fails) the path falls back to the pre-iter-3 wholesale
     //      reset + fresh allocation.
-    let live_resume =
-        gemma_live_prefix_resume(loaded, prompt_tokens, max_tokens, !soft_tokens.is_empty());
+    let live_resume = gemma_live_prefix_resume(
+        loaded,
+        prompt_tokens,
+        max_tokens,
+        !soft_tokens.is_empty(),
+        serve_batched_env.as_deref(),
+    );
     // Fail closed before this request mutates any KV bytes. Only a fully
     // successful request below republishes a live recovery anchor.
     loaded.live_prefix_tokens.clear();
@@ -21261,11 +21274,11 @@ fn generate_once_with_soft_tokens(
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
-        soft_tokens.is_empty()
+        crate::debug::INVESTIGATION_ENV.hybrid_kv
+            && soft_tokens.is_empty()
             && gemma_live_batched_append_allowed(
                 serve_batched_env.as_deref(),
                 prompt_tokens.len().saturating_sub(k),
-                loaded.weights.num_attention_heads,
             )
     });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
@@ -25725,8 +25738,13 @@ fn generate_stream_once(
     //
     // Mirrors `generate_once_with_soft_tokens`'s probe + iter-3
     // resume gate. See that site for the full design contract.
-    let live_resume =
-        gemma_live_prefix_resume(loaded, prompt_tokens, max_tokens, !soft_tokens.is_empty());
+    let live_resume = gemma_live_prefix_resume(
+        loaded,
+        prompt_tokens,
+        max_tokens,
+        !soft_tokens.is_empty(),
+        serve_batched_env.as_deref(),
+    );
     // A dropped SSE receiver or any later error must not publish partially
     // mutated KV as a future prefix. Commit happens only after Done.
     loaded.live_prefix_tokens.clear();
@@ -26311,11 +26329,11 @@ fn generate_stream_once(
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
-        soft_tokens.is_empty()
+        crate::debug::INVESTIGATION_ENV.hybrid_kv
+            && soft_tokens.is_empty()
             && gemma_live_batched_append_allowed(
                 serve_batched_env.as_deref(),
                 prompt_tokens.len().saturating_sub(k),
-                loaded.weights.num_attention_heads,
             )
     });
     let use_batched_serve = soft_tokens.is_empty() && resume_lcp.is_none() && batched_allowed;
@@ -28223,9 +28241,11 @@ mod tests {
 
     #[test]
     fn gemma_live_batched_append_respects_operator_and_suffix_size() {
-        assert!(!gemma_live_batched_append_allowed(Some("0"), 6_000, 16));
-        assert!(gemma_live_batched_append_allowed(Some("1"), 6_000, 16));
-        assert!(!gemma_live_batched_append_allowed(Some("1"), 31, 16));
+        assert!(!gemma_live_batched_append_allowed(Some("0"), 6_000));
+        assert!(gemma_live_batched_append_allowed(Some("1"), 6_000));
+        assert!(gemma_live_batched_append_allowed(Some("1"), 1));
+        assert!(gemma_live_batched_append_allowed(None, 1));
+        assert!(!gemma_live_batched_append_allowed(None, 0));
     }
 
     #[test]
@@ -33031,14 +33051,21 @@ assistant:
     }
 
     /// Exact real-model parity across the production 4,096-token Gemma
-    /// transaction boundary. The first request takes the eager 4,096-token
-    /// path; the independent 8,193-token request must execute two complete
-    /// resumable transactions plus a one-token tail and emit the same greedy
-    /// output as an independent monolithic slot-aware reference.
+    /// transaction boundary. Fresh one-slot workers provide the references:
+    /// 4,096 tokens take the eager path, while 8,193 tokens take the same
+    /// `4,096 + 4,096 + 1` bounded plan used in production. A second worker
+    /// first completes the eager request and then reuses that physical slot
+    /// for the independent 8,193-token request. Both results must match their
+    /// fresh-worker counterparts with zero advertised prefix reuse.
+    ///
+    /// A monolithic 8,193-token prefill is deliberately not the oracle. It is
+    /// mathematically equivalent, but it uses a different Metal reduction
+    /// graph and can flip a later near-tie after selecting the same first
+    /// decode token. The cache/reset contract is same-plan fresh-vs-reused
+    /// identity, not byte identity between different floating-point graphs.
     #[test]
-    fn gemma_eager_4096_and_resumed_8193_tail_match_cold_output() {
-        if byte_equiv_skip_unless_gated("gemma_eager_4096_and_resumed_8193_tail_match_cold_output")
-        {
+    fn gemma_fresh_and_reused_4096_8193_bounded_outputs_match() {
+        if byte_equiv_skip_unless_gated("gemma_fresh_and_reused_4096_8193_bounded_outputs_match") {
             return;
         }
         let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
@@ -33059,8 +33086,28 @@ assistant:
             max_tokens: 8,
             ..Default::default()
         };
-        let eager_cold = gemma4_serial_slot_aware_ref(&load_opts, &eager_prompt, &params);
-        let resumed_cold = gemma4_serial_slot_aware_ref(&load_opts, &resumed_prompt, &params);
+
+        let run_fresh_bounded = |prompt_tokens: Vec<u32>| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fresh bounded runtime");
+            let engine = Engine::spawn_with_mode(
+                LoadedModel::load(&load_opts).expect("load fresh bounded Gemma model"),
+                2,
+                None,
+                EngineMode::SlotAware { max_slots: 1 },
+            )
+            .expect("spawn fresh bounded Gemma engine");
+            let result = rt
+                .block_on(engine.generate(prompt_tokens, params.clone()))
+                .expect("fresh bounded generation");
+            rt.block_on(engine.shutdown())
+                .expect("fresh bounded shutdown");
+            result
+        };
+        let eager_fresh = run_fresh_bounded(eager_prompt.clone());
+        let resumed_fresh = run_fresh_bounded(resumed_prompt.clone());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -33081,8 +33128,8 @@ assistant:
             .expect("resumed non-aligned tail generation");
 
         for (label, actual, expected) in [
-            ("eager-4096", &eager, &eager_cold),
-            ("resumed-8193", &resumed, &resumed_cold),
+            ("reused-slot-eager-4096", &eager, &eager_fresh),
+            ("reused-slot-bounded-8193", &resumed, &resumed_fresh),
         ] {
             assert_eq!(actual.text, expected.text, "{label} text diverged");
             assert_eq!(
@@ -33102,10 +33149,21 @@ assistant:
                 "{label} logprobs diverged"
             );
         }
-        assert_eq!(eager.cached_tokens, 0, "eager boundary must be cold");
+        assert_eq!(
+            eager_fresh.cached_tokens, 0,
+            "fresh eager reference must be cold"
+        );
+        assert_eq!(
+            resumed_fresh.cached_tokens, 0,
+            "fresh bounded reference must be cold"
+        );
+        assert_eq!(
+            eager.cached_tokens, 0,
+            "reused-worker eager boundary must be cold"
+        );
         assert_eq!(
             resumed.cached_tokens, 0,
-            "independent resumable prompt must remain a cold parity case"
+            "independent bounded prompt must not inherit the prior slot prefix"
         );
         rt.block_on(engine.shutdown()).expect("shutdown engine");
     }

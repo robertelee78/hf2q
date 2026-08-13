@@ -642,6 +642,82 @@ pub(super) enum ExpertMatmulRoute {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn expert_matmul_pair(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    first_weight: &RawMatrixRef<'_>,
+    second_weight: &RawMatrixRef<'_>,
+    safe_ids: &MlxBuffer,
+    first_output: &MlxBuffer,
+    second_output: &MlxBuffer,
+    n_tokens: usize,
+    top_k: usize,
+    experts: usize,
+    n: usize,
+    k: usize,
+    scratch: &mut IdMmScratch,
+    label: &str,
+) -> Result<()> {
+    let expected_shape = [experts, n, k];
+    if first_weight.shape != expected_shape || second_weight.shape != expected_shape {
+        bail!(
+            "DeepSeek-V4 {label} shape drift: first {:?}, second {:?}, expected [{experts}, {n}, {k}]",
+            first_weight.shape,
+            second_weight.shape,
+        );
+    }
+    if first_weight.ggml_type != second_weight.ggml_type {
+        bail!(
+            "DeepSeek-V4 {label} quantization drift: first {:?}, second {:?}",
+            first_weight.ggml_type,
+            second_weight.ggml_type,
+        );
+    }
+    if safe_ids.dtype() != DType::U32 {
+        bail!("DeepSeek-V4 {label} expert IDs must be sanitized U32");
+    }
+    let block = first_weight.ggml_type.block_values() as usize;
+    if k % block != 0 {
+        bail!("DeepSeek-V4 {label} input dimension is not quant-block aligned");
+    }
+    let expert_stride = n
+        .checked_mul(k / block)
+        .and_then(|blocks| blocks.checked_mul(first_weight.ggml_type.block_bytes() as usize))
+        .context("DeepSeek-V4 paired expert stride overflow")?;
+    let params = GgmlQuantizedMatmulIdParams {
+        n_tokens: u32::try_from(n_tokens)
+            .context("DeepSeek-V4 paired expert token count exceeds u32")?,
+        top_k: u32::try_from(top_k).context("DeepSeek-V4 paired expert top-k exceeds u32")?,
+        n: u32::try_from(n).context("DeepSeek-V4 paired expert output width exceeds u32")?,
+        k: u32::try_from(k).context("DeepSeek-V4 paired expert input width exceeds u32")?,
+        n_experts: u32::try_from(experts).context("DeepSeek-V4 paired expert count exceeds u32")?,
+        expert_stride: u64::try_from(expert_stride)
+            .context("DeepSeek-V4 paired expert stride exceeds u64")?,
+        ggml_type: first_weight.ggml_type,
+    };
+    session.barrier_between(
+        &[input, first_weight.buffer, second_weight.buffer, safe_ids],
+        &[first_output, second_output],
+    );
+    session
+        .quantized_matmul_id_ggml_pooled_pair(
+            registry,
+            device,
+            input,
+            first_weight.buffer,
+            second_weight.buffer,
+            safe_ids,
+            first_output,
+            second_output,
+            scratch,
+            &params,
+        )
+        .with_context(|| format!("encode DeepSeek-V4 {label}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn expert_matmul(
     session: &mut GraphSession<'_>,
     registry: &mut KernelRegistry,

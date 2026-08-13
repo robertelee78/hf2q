@@ -48,11 +48,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unary output cannot be delivered before that barrier. Full 2,048-token
   prefill transactions resume; streaming and warm decoders remain responsive,
   as does the lopsided eight-token decode/two-window prefill case.
-- Resolve the published, checksum-pinned `mlx-native 0.10.7` command-buffer
+- Pair large DeepSeek routed-expert gate/up projections through the
+  family-neutral `mlx-native 0.10.8` schedule primitive. Eligible prefill work
+  builds one expert-routing schedule for both existing quantized projections;
+  decode-sized work and forced diagnostic routes remain independent. This is
+  not an arithmetic-fusion claim, and exact packed hf2q hardware acceptance
+  remains required before publishing an end-to-end speedup.
+- Refine an over-ceiling macOS process RSS with `footprint` before rejecting a
+  100 GiB DeepSeek load. This avoids treating reclaimable WebKit and
+  IOAccelerator mappings from a remote-inference coding client as private
+  resident memory; a missing, failed, or malformed footprint probe keeps the
+  conservative RSS value and still fails closed.
+- Resolve the published, checksum-pinned `mlx-native 0.10.8` backend, retaining
+  the 0.10.7 command-buffer
   lifetime correction. Internal unlabeled GraphSession command buffers retain
   direct owner release, while labeled or publicly escaped buffers preserve the
   autorelease scope required by external Objective-C ownership. No local Cargo
   patch participates in the release candidate.
+- Keep Gemma SerialFifo long-prefix continuations on the bounded live-append
+  graph even for 1–31-token suffixes. Sliding-cache staging now derives each
+  query position from the actual staged cache capacity rather than capping it
+  independently at the 1,024-token semantic window. This preserves the
+  current suffix K/V and chronological history beyond the window, and lets a
+  successful append publish a reusable latest anchor for the following turn.
 
 ### Validation
 
@@ -61,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact retry while that prefix is active, cancels the owner, requires the
   queued retry to reuse the restored checkpoint, and verifies an unrelated
   conversation cannot inherit private history.
+- Pin the DeepSeek paired-prefill selector to large automatic routes with
+  scratch and no diagnostic threshold override. The published native package
+  and broad DeepSeek model-free suite are locked gates; real-model quality,
+  cache, overlap, and calibrated cold-wave performance remain hardware gates.
 - Add a guarded self-hosted `Cache lifecycle` workflow that packages one exact
   main-branch commit, builds only from that extracted crate, runs DeepSeek,
   Gemma, and Qwen one process at a time under continuously checked AC power,
@@ -68,10 +90,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source/crate/binary/model-bound receipt. The publication workflow now
   requires that successful exact-SHA receipt and reproduces its crate digest
   before publishing.
+- Run the real-model Gemma N=4/N=8, transaction-boundary, and long-resume
+  parity checks with the optimized release profile and bind that profile in
+  the hardware receipt. Metal command scheduling is profile-sensitive; a
+  debug-only timing divergence must not be mislabeled as production evidence.
+- Compare Gemma long-resume output with a cold request through the same
+  production graph, require two consecutive LCP engagements, and verify both
+  resumed turns byte-for-byte. The former forced-linear control compared two
+  numerically distinct prefill graphs and could report cache corruption when
+  only the graph choice differed.
+- Make the release-authority Gemma overlap timeout explicit and overridable.
+  The protected gate now supplies 1,800 seconds for its fixed 175K-token
+  full-attention prompt instead of inheriting a non-overridable 900-second
+  curl cutoff. It also allows 180 seconds to observe cancellation at the next
+  transaction boundary when a 4,096-token Metal call is already in flight at
+  a 183K-token cursor; invalid or non-positive values fail before dependency
+  discovery or model traffic. Its hosted contract uses platform `grep` rather
+  than assuming a runner has ripgrep installed.
+- Stabilize Qwen's automatic-tool acceptance prompt around the real operator
+  path `/opt/hf2q/Cargo.toml`: the system turn now tells the coding agent to
+  invoke tools directly instead of imitating them in Markdown, and the mock
+  tool result explicitly says the completed `read_file` call must not be
+  repeated. The packed candidate still supplies the returned Cargo.toml bytes.
+  Receipts bind SHA-256 identities for both prompt surfaces, and publication
+  rejects a different path, prompt, or result envelope.
+- Keep Gemma's four-slot release-default agentic latency limits unchanged,
+  while giving the experimental eight-slot correctness/aggregate-cap probe an
+  explicit 40-second cold-TTFT and 30-second tool-result completion envelope.
+  On the exact M5 Max discriminator the eight-slot wave measured 25.279 seconds
+  cold and 23.932 seconds at the slowest tool-result turn; every receipt keeps
+  the actual timing, cache, and semantic fields rather than converting this
+  experiment into an eight-slot latency claim.
+- Keep that dispatch compatible with macOS Bash 3.2 under `set -u` by using
+  explicit four-slot and eight-slot command branches instead of expanding an
+  empty array. The release wrapper now also preserves the originating failure
+  status through its cleanup trap, so a pre-manifest harness error cannot be
+  reported as a successful workflow step after servers and guards are reaped.
 - Make that receipt enforce the family-specific shipping gates as well as the
   shared lifecycle: Qwen overlap/continuation, cold four-agent heap waves, and
-  one-slot disconnect; Gemma long-prefill overlap/cancellation, 4,096/8,193
-  exact-output parity, four/eight-slot aggregate caps, and heap waves; and
+  one-slot disconnect; Gemma long-prefill overlap/cancellation, fresh-versus-
+  reused 4,096/8,193 bounded-output parity, four/eight-slot aggregate caps,
+  and heap waves; and
   DeepSeek cached-suffix cancellation, terminal parking, and two fresh
   four-agent waves. Release rehashes every downloaded receipt and validates
   the detailed evidence before registry credentials are exposed.
@@ -84,12 +143,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Run the two calibrated DeepSeek four-agent waves before the long functional
   lifecycle heat-soaks the M5 runner. Each wave now requires at least 60
   seconds of Nominal samples at five-second cadence with no hf2q/llama model
-  runtime loaded,
-  then fails if two-second in-wave telemetry
-  becomes non-Nominal, malformed, or unavailable during measurement. Receipts
-  bind the thermal sample logs, while curl supplies high-resolution response
-  timing, and the cohort parent immediately reports a child that exits before
-  publishing its cold receipt.
+  runtime loaded, then fails if two-second telemetry becomes non-Nominal,
+  malformed, or unavailable before all four atomic cold receipts arrive. The
+  workload is not paused or reordered; cached work may overlap the cold tail as
+  before. Thermal receipts bind all four cold-receipt names and hashes, while
+  the same live cache must still finish cached unary/SSE, automatic tool
+  choice, and tool-result continuation under unchanged limits. The cohort
+  parent immediately reports a child that exits before publishing its cold
+  receipt.
 - Add a developer-only matched llama.cpp cold-wave discriminator for the
   frozen DeepSeek fixture. It binds peer binary/model/request identity, exact
   zero-cache `read_file` semantics, runtime-specific prompt-token counts,
@@ -283,8 +344,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Sliding layers allocate linear buffers on both prefill routes;
   hybrid encode writes slot=logical at prefill and decode (capacity-
   derived predicate); the hybrid SDPA kernel's `mask_type=2` windowing
-  composes byte-identically with the non-batched reference
-  (`gemma_hybrid_long_resume_byte_identity`, engagement-asserted).
+  is covered by `gemma_hybrid_long_resume_byte_identity`. The current
+  release-candidate correction compares resumed and cold requests through
+  the same production graph; the earlier forced-linear control was not a
+  same-graph cache-coherence oracle.
   `HF2Q_KV_LCP_RESUME_CAPACITY=8g` is the documented envelope knob
   (snapshots carry +4096/turn multi-turn headroom).
 - **Fixed: SerialFifo consume-gate 500 on growing conversations** — a

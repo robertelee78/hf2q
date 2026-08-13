@@ -1,5 +1,7 @@
 //! Exact one-token DeepSeek-V4 hash- and score-routed MoE layers.
 
+use std::sync::Once;
+
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_hyper_connection::{
@@ -16,11 +18,13 @@ use mlx_native::ops::deepseek_moe_routing::{
 use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 
 use super::forward_support::{
-    alloc, alloc_host_input, alloc_persistent, expert_matmul, raw_matmul, rms_params,
-    ExpertMatmulRoute,
+    alloc, alloc_host_input, alloc_persistent, expert_matmul, expert_matmul_pair, raw_matmul,
+    rms_params, ExpertMatmulRoute,
 };
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
+
+static PAIRED_MOE_PREFILL_LOG: Once = Once::new();
 
 fn split_profile_stage(session: &mut GraphSession<'_>, label: &str) -> Result<()> {
     if std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1") {
@@ -30,6 +34,18 @@ fn split_profile_stage(session: &mut GraphSession<'_>, label: &str) -> Result<()
             .with_context(|| format!("profile DeepSeek-V4 {label}"))?;
     }
     Ok(())
+}
+
+fn use_paired_expert_prefill(
+    rows: usize,
+    route: ExpertMatmulRoute,
+    has_scratch: bool,
+    threshold_override_present: bool,
+) -> bool {
+    rows > MM_ID_ROUTING_THRESHOLD as usize
+        && route == ExpertMatmulRoute::Auto
+        && has_scratch
+        && !threshold_override_present
 }
 
 impl Deepseek4Model {
@@ -349,40 +365,76 @@ impl Deepseek4Model {
                 rows,
             )?;
             split_profile_stage(session, "DeepSeek-V4 FFN router")?;
-            expert_matmul(
-                session,
-                registry,
-                &device,
-                &ffn_norm,
-                &gate_experts,
-                &safe_indices,
-                &routed_gate,
+            if use_paired_expert_prefill(
                 rows,
-                top_k,
-                experts,
-                inter,
-                hidden,
                 routed_projection,
-                id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[0]),
-                "routed gate",
-            )?;
-            expert_matmul(
-                session,
-                registry,
-                &device,
-                &ffn_norm,
-                &up_experts,
-                &safe_indices,
-                &routed_up,
-                rows,
-                top_k,
-                experts,
-                inter,
-                hidden,
-                routed_projection,
-                id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[1]),
-                "routed up",
-            )?;
+                id_mm_scratch.is_some(),
+                std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some(),
+            ) {
+                let scratch = id_mm_scratch
+                    .as_deref_mut()
+                    .context("DeepSeek-V4 paired routed projections require scratch")?;
+                PAIRED_MOE_PREFILL_LOG.call_once(|| {
+                    tracing::info!(
+                        rows,
+                        layer,
+                        "DeepSeek-V4 paired MoE gate/up schedule enabled for large prefill"
+                    );
+                });
+                expert_matmul_pair(
+                    session,
+                    registry,
+                    &device,
+                    &ffn_norm,
+                    &gate_experts,
+                    &up_experts,
+                    &safe_indices,
+                    &routed_gate,
+                    &routed_up,
+                    rows,
+                    top_k,
+                    experts,
+                    inter,
+                    hidden,
+                    &mut scratch[0],
+                    "paired routed gate/up",
+                )?;
+            } else {
+                expert_matmul(
+                    session,
+                    registry,
+                    &device,
+                    &ffn_norm,
+                    &gate_experts,
+                    &safe_indices,
+                    &routed_gate,
+                    rows,
+                    top_k,
+                    experts,
+                    inter,
+                    hidden,
+                    routed_projection,
+                    id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[0]),
+                    "routed gate",
+                )?;
+                expert_matmul(
+                    session,
+                    registry,
+                    &device,
+                    &ffn_norm,
+                    &up_experts,
+                    &safe_indices,
+                    &routed_up,
+                    rows,
+                    top_k,
+                    experts,
+                    inter,
+                    hidden,
+                    routed_projection,
+                    id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[1]),
+                    "routed up",
+                )?;
+            }
             raw_matmul(
                 session,
                 registry,
@@ -528,5 +580,51 @@ impl Deepseek4Model {
             )?;
         }
         Ok(output_state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paired_expert_prefill_is_large_auto_scratch_only() {
+        let large = MM_ID_ROUTING_THRESHOLD as usize + 1;
+        assert!(use_paired_expert_prefill(
+            large,
+            ExpertMatmulRoute::Auto,
+            true,
+            false,
+        ));
+        assert!(!use_paired_expert_prefill(
+            MM_ID_ROUTING_THRESHOLD as usize,
+            ExpertMatmulRoute::Auto,
+            true,
+            false,
+        ));
+        assert!(!use_paired_expert_prefill(
+            large,
+            ExpertMatmulRoute::ForceMv,
+            true,
+            false,
+        ));
+        assert!(!use_paired_expert_prefill(
+            large,
+            ExpertMatmulRoute::SlottedMm,
+            true,
+            false,
+        ));
+        assert!(!use_paired_expert_prefill(
+            large,
+            ExpertMatmulRoute::Auto,
+            false,
+            false,
+        ));
+        assert!(!use_paired_expert_prefill(
+            large,
+            ExpertMatmulRoute::Auto,
+            true,
+            true,
+        ));
     }
 }

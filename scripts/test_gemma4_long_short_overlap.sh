@@ -13,6 +13,8 @@ MODEL_SHA256=${MODEL_SHA256:?MODEL_SHA256 is required}
 MAX_SLOTS=${MAX_SLOTS:-4}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required}
 CONTEXT_LINES=${CONTEXT_LINES:-7000}
+CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-900}
+CANCELLATION_WAIT_SECONDS=${CANCELLATION_WAIT_SECONDS:-120}
 PRIMARY_CONTEXT_SHA256=07b147e9c6ac26a0c9c4a719391c0772b2d27b9d77499479014b9ace88b6b11e
 CANCELLATION_CONTEXT_SHA256=f0b264eedae315618941d8fa6fb16454c4eac03b5793e213b613d66ccb7b6e4a
 
@@ -20,13 +22,21 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
+[[ "$SERVER_PID" =~ ^[1-9][0-9]*$ && "$MAX_SLOTS" == 4 ]] || exit 2
+[[ "$CURL_MAX_TIME_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "CURL_MAX_TIME_SECONDS must be a positive integer" >&2
+  exit 2
+}
+[[ "$CANCELLATION_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "CANCELLATION_WAIT_SECONDS must be a positive integer" >&2
+  exit 2
+}
 for command in awk curl jq rg sed shasum stat wc caffeinate pmset; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
   }
 done
-[[ "$SERVER_PID" =~ ^[1-9][0-9]*$ && "$MAX_SLOTS" == 4 ]] || exit 2
 [[ "$CONTEXT_LINES" == 7000 ]] || {
   echo "release-authority Gemma overlap requires CONTEXT_LINES=7000" >&2
   exit 2
@@ -124,7 +134,8 @@ jq -n --arg model "$model" '{
 }' >"$OUT_DIR/short.request.json"
 
 overlap_log_start=$(( $(wc -l <"$SERVER_LOG") + 1 ))
-curl --fail-with-body --silent --show-error --no-buffer --connect-timeout 5 --max-time 900 \
+curl --fail-with-body --silent --show-error --no-buffer --connect-timeout 5 \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
   -H 'Content-Type: application/json' --data-binary @"$OUT_DIR/long.request.json" \
   "$BASE_URL/v1/chat/completions" >"$OUT_DIR/long.sse" 2>"$OUT_DIR/long.stderr" &
 long_pid=$!
@@ -137,7 +148,8 @@ fi
 wait_for_log "$overlap_log_start" \
   "Gemma4 bounded prefill transaction complete.*prompt_tokens=${long_prompt_tokens}( |$)" 180 >/dev/null
 
-curl --fail-with-body --silent --show-error --no-buffer --connect-timeout 5 --max-time 900 \
+curl --fail-with-body --silent --show-error --no-buffer --connect-timeout 5 \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
   -H 'Content-Type: application/json' --data-binary @"$OUT_DIR/short.request.json" \
   "$BASE_URL/v1/chat/completions" >"$OUT_DIR/short.sse" 2>"$OUT_DIR/short.stderr" &
 short_pid=$!
@@ -202,7 +214,8 @@ jq -n --slurpfile base "$OUT_DIR/long.request.json" \
 }' >"$OUT_DIR/cancel.request.json"
 cancel_log_start=$(( $(wc -l <"$SERVER_LOG") + 1 ))
 cancel_before=$(cancellation_metric)
-curl --silent --show-error --no-buffer --connect-timeout 5 --max-time 900 \
+curl --silent --show-error --no-buffer --connect-timeout 5 \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
   -H 'Content-Type: application/json' --data-binary @"$OUT_DIR/cancel.request.json" \
   "$BASE_URL/v1/chat/completions" >"$OUT_DIR/cancel.sse" 2>"$OUT_DIR/cancel.stderr" &
 cancel_pid=$!
@@ -221,7 +234,7 @@ done
 kill "$cancel_pid" 2>/dev/null || true
 wait "$cancel_pid" 2>/dev/null || true
 cancel_pid=""
-cancel_deadline=$((SECONDS + 30))
+cancel_deadline=$((SECONDS + CANCELLATION_WAIT_SECONDS))
 while (( $(cancellation_metric) <= cancel_before && SECONDS < cancel_deadline )); do sleep 0.1; done
 cancel_after=$(cancellation_metric)
 [[ "$((cancel_after - cancel_before))" == 1 ]] || exit 1

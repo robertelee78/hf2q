@@ -14,6 +14,10 @@ MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to the exact Qwen GGUF}"
 MODEL_SHA256="${MODEL_SHA256:?set MODEL_SHA256}"
 FIXTURE_JSON="${FIXTURE_JSON:?set FIXTURE_JSON to the canonical long fixture}"
 SHORT_FIXTURE_JSON="${SHORT_FIXTURE_JSON:?set SHORT_FIXTURE_JSON to the canonical short fixture}"
+EXPECTED_PATH="${EXPECTED_PATH:?set EXPECTED_PATH to the stable prompt-visible file path}"
+TOOL_RESULT_PATH="${TOOL_RESULT_PATH:?set TOOL_RESULT_PATH to the packed tool-result file}"
+TOOL_RESULT_SUCCESS_PREFIX="${TOOL_RESULT_SUCCESS_PREFIX:?set TOOL_RESULT_SUCCESS_PREFIX}"
+AGENTIC_SYSTEM_PROMPT="${AGENTIC_SYSTEM_PROMPT:?set AGENTIC_SYSTEM_PROMPT}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 OUT_DIR="${OUT_DIR:-$(mktemp -d -t hf2q-qwen36-cumulative.XXXXXX)}"
 
@@ -33,6 +37,7 @@ done
 }
 [[ -x "$BINARY_PATH" && -f "$MODEL_PATH" && -f "$SERVER_LOG" ]] || exit 2
 [[ -f "$FIXTURE_JSON" && -f "$SHORT_FIXTURE_JSON" ]] || exit 2
+[[ -r "$TOOL_RESULT_PATH" ]] || exit 2
 qwen36_require_empty_receipt_dir "$OUT_DIR"
 
 sha256_file() { shasum -a 256 "$1" | awk '{ print $1 }'; }
@@ -62,6 +67,10 @@ run_agent_wave() {
   BASE_URL="$BASE_URL" FAMILY=qwen36 AGENTS=4 \
     WAVE_ID="$phase" \
     REQUIRE_COLD_FIRST=1 \
+    EXPECTED_PATH="$EXPECTED_PATH" \
+    TOOL_RESULT_PATH="$TOOL_RESULT_PATH" \
+    TOOL_RESULT_SUCCESS_PREFIX="$TOOL_RESULT_SUCCESS_PREFIX" \
+    AGENTIC_SYSTEM_PROMPT="$AGENTIC_SYSTEM_PROMPT" \
     MAX_TOOL_RESULT_RESPONSE_MS="$max_tool_result_ms" \
     OUT_DIR="$wave_dir/agents" \
     "$script_dir/test_full_context_agent_slots.sh" >"$wave_dir/summary.json.tmp" \

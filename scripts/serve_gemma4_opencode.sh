@@ -11,8 +11,9 @@
 #   HF2Q_KV_LCP_LONG_RESUME=1
 #                           Extends LCP to prompts > sliding_window (1024) —
 #                           sliding layers allocate LINEAR buffers + the
-#                           hybrid SDPA kernel applies mask_type=2 windowing
-#                           (byte-identity-gated vs the non-batched reference
+#                           hybrid SDPA kernel applies bounded chronological
+#                           staging (byte-identity-gated vs a cold request
+#                           through the same production graph
 #                           in tests/lcp_partial_prefill_byte_identity.rs::
 #                           gemma_hybrid_long_resume_byte_identity).
 #   HF2Q_KV_LCP_RESUME_CAPACITY=8g

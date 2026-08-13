@@ -12,6 +12,8 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:8080}
 MODEL=${MODEL:-Deepseek v4 Flash 0731 Source}
 EXPECTED_PATH=${EXPECTED_PATH:-$ROOT_DIR/Cargo.toml}
 TOOL_RESULT_PATH=${TOOL_RESULT_PATH:-$EXPECTED_PATH}
+TOOL_RESULT_SUCCESS_PREFIX=${TOOL_RESULT_SUCCESS_PREFIX:-$'Successful read_file result. File follows:\n'}
+AGENTIC_SYSTEM_PROMPT=${AGENTIC_SYSTEM_PROMPT:-You are an agentic coding assistant. Use the provided tool to inspect files before answering.}
 RUN_ID=${RUN_ID:-"$$-$(date +%s)"}
 REQUIRE_COLD_FIRST=${REQUIRE_COLD_FIRST:-1}
 MAX_COLD_TTFT_MS=${MAX_COLD_TTFT_MS:-30000}
@@ -101,6 +103,8 @@ if [[ "$actual_context_fixture_sha256" != "$AGENTIC_CONTEXT_FIXTURE_SHA256" ]]; 
   exit 2
 fi
 agentic_context_fixture_bytes=$(wc -c <"$AGENTIC_CONTEXT_FIXTURE" | tr -d '[:space:]')
+agentic_system_prompt_sha256=$(printf '%s' "$AGENTIC_SYSTEM_PROMPT" | shasum -a 256 | awk '{print $1}')
+tool_result_success_prefix_sha256=$(printf '%s' "$TOOL_RESULT_SUCCESS_PREFIX" | shasum -a 256 | awk '{print $1}')
 
 request_file=$(mktemp -t hf2q-deepseek-agentic-request.XXXXXX)
 first_file=$(mktemp -t hf2q-deepseek-agentic-first.XXXXXX)
@@ -131,7 +135,7 @@ repository_context_chars=$(jq -Rs 'length' "$AGENTIC_CONTEXT_FIXTURE")
 jq -n --rawfile repo "$AGENTIC_CONTEXT_FIXTURE" \
   --argjson max_tokens "$MAX_TOKENS" \
   --arg model "$MODEL" --arg expected_path "$EXPECTED_PATH" --arg run_id "$RUN_ID" \
-  --arg sentinel "$SENTINEL" \
+  --arg sentinel "$SENTINEL" --arg system_prompt "$AGENTIC_SYSTEM_PROMPT" \
   -f scripts/deepseek4_agentic_request.jq >"$request_file"
 if [[ -n "$HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT" ]]; then
   cp "$request_file" "$HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT"
@@ -356,7 +360,8 @@ if (( stream_semantic_ms > MAX_CACHED_SEMANTIC_MS )); then
 fi
 
 jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
-  --rawfile tool_result "$TOOL_RESULT_PATH" '
+  --rawfile tool_result "$TOOL_RESULT_PATH" \
+  --arg tool_result_success_prefix "$TOOL_RESULT_SUCCESS_PREFIX" '
     $base[0]
     | .messages += [
         {
@@ -367,7 +372,7 @@ jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
         {
           role: "tool",
           tool_call_id: $prior[0].choices[0].message.tool_calls[0].id,
-          content: ("Successful read_file result. File follows:\n" + $tool_result)
+          content: ($tool_result_success_prefix + $tool_result)
         }
       ]
     | .tool_choice = "auto"
@@ -455,6 +460,8 @@ jq -n \
   --argjson agentic_context_fixture_bytes "$agentic_context_fixture_bytes" \
   --argjson repository_context_chars "$repository_context_chars" \
   --arg expected_path "$EXPECTED_PATH" \
+  --arg agentic_system_prompt_sha256 "$agentic_system_prompt_sha256" \
+  --arg tool_result_success_prefix_sha256 "$tool_result_success_prefix_sha256" \
   --argjson expected_prompt_tokens "$EXPECTED_PROMPT_TOKENS" \
   --argjson cold_cached_tokens "$cold_cached" \
   --argjson require_cold_first "$REQUIRE_COLD_FIRST" \
@@ -476,6 +483,8 @@ jq -n \
     agentic_context_fixture_bytes: $agentic_context_fixture_bytes,
     repository_context_chars: $repository_context_chars,
     expected_path: $expected_path,
+    agentic_system_prompt_sha256: $agentic_system_prompt_sha256,
+    tool_result_success_prefix_sha256: $tool_result_success_prefix_sha256,
     expected_prompt_tokens: $expected_prompt_tokens,
     tool_semantics_pass: true,
     cached_replay_equal: true,

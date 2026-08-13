@@ -329,6 +329,14 @@ parked, or absent, the cap is removed and the proven 2,048-token bulk-prefill
 plan resumes. This avoids the latency cost of small transactions when no peer
 can expose semantic progress.
 
+Large automatic DeepSeek MoE prefills use the family-neutral paired expert
+projection primitive in `mlx-native 0.10.8`: gate and up share one routing
+schedule while retaining their existing quantized arithmetic and distinct
+outputs. Small/decode work, forced routing diagnostics, and threshold-override
+measurements stay on the independent projection path. This is an hf2q
+candidate optimization until the exact packed real-model gates in ADR-042 and
+the shipping contract pass.
+
 ### 4.3 Decode
 
 `serve/forward_mlx.rs` is the per-token decode hot loop. It:

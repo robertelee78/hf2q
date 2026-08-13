@@ -109,6 +109,100 @@ thermal_monitor_nominal() {
   done
 }
 
+thermal_prepare_cold_receipt_dir() {
+  local receipt_dir=$1
+  local existing_receipt
+
+  mkdir -p "$receipt_dir" || return 1
+  existing_receipt=$(find "$receipt_dir" -maxdepth 1 -type f \
+    -name 'agent-*.cold.json' -print -quit) || return 1
+  if [[ -n "$existing_receipt" ]]; then
+    echo "cold-cohort receipt directory contains stale evidence: $existing_receipt" >&2
+    return 1
+  fi
+}
+
+thermal_monitor_nominal_until_cold_receipts() {
+  local log_file=$1
+  local phase=$2
+  local receipt_dir=$3
+  local expected_receipts=$4
+  local sample_seconds=$5
+  local timeout_seconds=$6
+  local producer_pid=${7:-}
+  local deadline
+  local producer_state
+  local receipt_index
+  local receipt_count
+  local receipt_set_complete
+
+  for value in "$expected_receipts" "$sample_seconds" "$timeout_seconds"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || {
+      echo "cold-cohort thermal values must be non-negative integers" >&2
+      return 2
+    }
+  done
+  ((expected_receipts > 0)) || {
+    echo "cold-cohort thermal monitor requires at least one receipt" >&2
+    return 2
+  }
+  [[ -d "$receipt_dir" ]] || {
+    echo "cold-cohort receipt directory is missing: $receipt_dir" >&2
+    return 1
+  }
+
+  deadline=$((SECONDS + timeout_seconds))
+  while :; do
+    if [[ -n "$producer_pid" ]]; then
+      producer_state=$(ps -p "$producer_pid" -o state= 2>/dev/null \
+        | tr -d '[:space:]')
+      if [[ -z "$producer_state" || "$producer_state" == Z* ]]; then
+        echo "cold-cohort producer exited before publishing all receipts" >&2
+        return 1
+      fi
+    fi
+    thermal_sample "$log_file" "$phase" || return 1
+    if [[ "$THERMAL_STATE" != nominal ]]; then
+      echo "calibrated phase $phase observed non-nominal thermal state: $THERMAL_STATE" >&2
+      return 1
+    fi
+    receipt_count=$(find "$receipt_dir" -maxdepth 1 -type f \
+      -name 'agent-*.cold.json' -size +0c | wc -l | tr -d '[:space:]')
+    [[ "$receipt_count" =~ ^[0-9]+$ ]] || {
+      echo "failed to count cold-cohort receipts" >&2
+      return 1
+    }
+    receipt_set_complete=1
+    for ((receipt_index = 1; receipt_index <= expected_receipts; receipt_index++)); do
+      if [[ ! -s "$receipt_dir/agent-${receipt_index}.cold.json" ]]; then
+        receipt_set_complete=0
+        break
+      fi
+    done
+    if ((receipt_count == expected_receipts && receipt_set_complete == 0)); then
+      echo "cold-cohort receipts do not match agent-1 through agent-${expected_receipts}" >&2
+      return 1
+    fi
+    if ((receipt_count == expected_receipts && receipt_set_complete == 1)); then
+      thermal_sample "$log_file" "$phase-end" || return 1
+      [[ "$THERMAL_STATE" == nominal ]] || {
+        echo "calibrated phase $phase ended in non-nominal thermal state: $THERMAL_STATE" >&2
+        return 1
+      }
+      return 0
+    fi
+    if ((receipt_count > expected_receipts)); then
+      echo "cold-cohort receipt count exceeded ${expected_receipts}: $receipt_count" >&2
+      return 1
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "cold cohort did not publish ${expected_receipts} receipts within ${timeout_seconds}s" >&2
+      return 1
+    fi
+    sleep "$sample_seconds"
+  done
+}
+
 thermal_validate_measurement_log() {
   local log_file=$1
   local maximum_gap_seconds=$2
