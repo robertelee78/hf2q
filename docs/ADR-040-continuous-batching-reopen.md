@@ -1512,6 +1512,26 @@ and Qwen `f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`
 path and expected digest; changing either byte identity requires a new bound
 hardware receipt.
 
+Qwen automatic-tool quality is prompt-sensitive at this quantization and must
+not be conflated with KV correctness. A 2026-08-12 discriminator used the same
+packed binary and exact rendered tokens with `tool_choice=auto`: the canonical
+path under the former generic system prompt emitted a fenced pseudo-call both
+cold and after restoring 6,676 tokens, exonerating the cache transition. The
+release workload now uses the canonical `/opt/hf2q/Cargo.toml` path with an
+operator-realistic system instruction that requires direct tool invocation and
+forbids Markdown imitation. Its simulated tool result explicitly identifies
+the `read_file` call as completed and directs the agent to answer without
+repeating it; returned bytes still come from the exact packed Cargo.toml. Three
+consecutive four-agent cohorts passed all 12 automatic calls and all 12
+tool-result continuations with full response replay or stable-prefix reuse.
+The final cumulative discriminator also passed the 87,972-token/44-chunk
+overlap, all three four-agent waves, `/readyz`, zero power events, and bounded
+native heap populations. These are focused M5 receipts for the harness repair,
+not publication authority: the protected exact-source workflow must reproduce
+them after the change is committed and packed. Per-agent and aggregate receipts
+bind the SHA-256 of both the system prompt and tool-result envelope, while the
+release verifier also requires the canonical path.
+
 The pre-commit 0.1.6 candidate binary
 `da970f10a3866048dfb1d2ce9f727e71c2aa31402374223265be3170cf1744bf`
 passed that functional lifecycle on an M5 Max for all three families. Qwen

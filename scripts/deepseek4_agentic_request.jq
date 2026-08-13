@@ -3,7 +3,7 @@
   messages: [
     {
       role: "system",
-      content: "You are an agentic coding assistant. Use the provided tool to inspect files before answering."
+      content: $system_prompt
     },
     {
       role: "user",

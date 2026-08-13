@@ -107,6 +107,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a 183K-token cursor; invalid or non-positive values fail before dependency
   discovery or model traffic. Its hosted contract uses platform `grep` rather
   than assuming a runner has ripgrep installed.
+- Stabilize Qwen's automatic-tool acceptance prompt around the real operator
+  path `/opt/hf2q/Cargo.toml`: the system turn now tells the coding agent to
+  invoke tools directly instead of imitating them in Markdown, and the mock
+  tool result explicitly says the completed `read_file` call must not be
+  repeated. The packed candidate still supplies the returned Cargo.toml bytes.
+  Receipts bind SHA-256 identities for both prompt surfaces, and publication
+  rejects a different path, prompt, or result envelope.
 - Keep Gemma's four-slot release-default agentic latency limits unchanged,
   while giving the experimental eight-slot correctness/aggregate-cap probe an
   explicit 40-second cold-TTFT and 30-second tool-result completion envelope.

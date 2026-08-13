@@ -328,7 +328,14 @@ jobs:
                and $q.cumulative.overlap.continuation_first_chunk_start == $q.cumulative.overlap.continuation_cached_tokens
                and all($q.cumulative.agent_waves[];
                  .status == "pass" and .family == "qwen36" and .concurrent_agents == 4
-                 and .require_cold_first == 1 and all(.agents[]; .cold_cached_tokens == 0))
+                 and .require_cold_first == 1
+                 and .agentic_system_prompt_sha256 == "dbedef4c2efa20e51603355def14af7f11658a03fd0dcda6de9d900588f7cb3c"
+                 and .tool_result_success_prefix_sha256 == "2d73b080a69f15d8cac736b264d82fdb4e8fe40e6cff6ed6bf099565f499ef5a"
+                 and all(.agents[];
+                   .cold_cached_tokens == 0
+                   and .expected_path == "/opt/hf2q/Cargo.toml"
+                   and .agentic_system_prompt_sha256 == "dbedef4c2efa20e51603355def14af7f11658a03fd0dcda6de9d900588f7cb3c"
+                   and .tool_result_success_prefix_sha256 == "2d73b080a69f15d8cac736b264d82fdb4e8fe40e6cff6ed6bf099565f499ef5a"))
                and $q.cumulative.agent_waves.warmup.maximum_tool_result_ms <= 15000
                and $q.cumulative.agent_waves.wave1.maximum_tool_result_ms <= 10000
                and $q.cumulative.agent_waves.wave2.maximum_tool_result_ms <= 10000

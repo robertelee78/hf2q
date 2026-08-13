@@ -536,6 +536,10 @@ run_qwen_release_gates() {
   MODEL_PATH="$QWEN_MODEL" MODEL_SHA256="$QWEN_MODEL_SHA256" \
   FIXTURE_JSON="$OUT_ROOT/fixtures/public-347.json" \
   SHORT_FIXTURE_JSON="$OUT_ROOT/fixtures/public-short.json" MAX_SLOTS=4 \
+  EXPECTED_PATH=/opt/hf2q/Cargo.toml \
+  TOOL_RESULT_PATH="$PWD/Cargo.toml" \
+  TOOL_RESULT_SUCCESS_PREFIX=$'Result from the completed read_file call. The call succeeded; use this result to answer the user without calling read_file again. File follows:\n' \
+  AGENTIC_SYSTEM_PROMPT='You are an agentic coding assistant. Use the provided tools directly whenever they are needed. Never describe, imitate, or wrap a tool call in Markdown or a code fence.' \
   OUT_DIR="$OUT_ROOT/qwen/cumulative" scripts/test_qwen36_cumulative_release.sh \
     >"$OUT_ROOT/qwen/cumulative.stdout" 2>"$OUT_ROOT/qwen/cumulative.stderr"
   verify_sha256_sidecar "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json"

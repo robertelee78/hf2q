@@ -125,6 +125,25 @@ SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
   bash "$isolated_root/scripts/test_deepseek4_agentic.sh"
 cmp -s "$tmp_dir/readme-before.json" "$tmp_dir/readme-after.json"
 
+# Qwen's automatic-tool gate uses the canonical operator path and explicitly
+# tells the coding agent to invoke tools rather than imitate them in Markdown.
+# The release gate runs from an ephemeral extracted Cargo package, so the
+# simulated tool result still comes from the exact packed candidate.
+HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$tmp_dir/qwen-stable-path.json" \
+EXPECTED_PATH=/opt/hf2q/Cargo.toml \
+TOOL_RESULT_PATH="$ROOT_DIR/Cargo.toml" \
+TOOL_RESULT_SUCCESS_PREFIX=$'Result from the completed read_file call. The call succeeded; use this result to answer the user without calling read_file again. File follows:\n' \
+AGENTIC_SYSTEM_PROMPT='You are an agentic coding assistant. Use the provided tools directly whenever they are needed. Never describe, imitate, or wrap a tool call in Markdown or a code fence.' \
+RUN_ID=full-context-qwen36-np4-warmup-agent-1 \
+SENTINEL=HF2Q_QWEN36_AGENT_1_OK \
+  bash "$ROOT_DIR/scripts/test_qwen36_agentic.sh"
+jq -e '
+  .model == "qwen36-abliterix-t63-APEX"
+  and .messages[0].content == "You are an agentic coding assistant. Use the provided tools directly whenever they are needed. Never describe, imitate, or wrap a tool call in Markdown or a code fence."
+  and (.messages[1].content | contains("/opt/hf2q/Cargo.toml"))
+  and (.messages[1].content | contains("/private/var/tmp/") | not)
+' "$tmp_dir/qwen-stable-path.json" >/dev/null
+
 if AGENTIC_CONTEXT_FIXTURE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   BASE_URL=http://127.0.0.1:1 \
   TOOL_RESULT_PATH="$ROOT_DIR/Cargo.toml" \

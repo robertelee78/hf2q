@@ -203,6 +203,10 @@ jq -s --arg family "$FAMILY" --arg wave_id "$WAVE_ID" \
         | if length == 1 then .[0] else error("agentic context fixture sizes differ") end),
       repository_context_chars: (map(.repository_context_chars) | unique
         | if length == 1 then .[0] else error("agentic context character counts differ") end),
+      agentic_system_prompt_sha256: (map(.agentic_system_prompt_sha256) | unique
+        | if length == 1 then .[0] else error("agentic system prompts differ") end),
+      tool_result_success_prefix_sha256: (map(.tool_result_success_prefix_sha256) | unique
+        | if length == 1 then .[0] else error("tool-result success envelopes differ") end),
       expected_prompt_tokens: (map(.expected_prompt_tokens) | unique
         | if length == 1 then .[0] else error("expected prompt token counts differ") end),
       prompt_tokens: (map(.prompt_tokens) | unique
