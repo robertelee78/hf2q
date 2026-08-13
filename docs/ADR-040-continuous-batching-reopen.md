@@ -151,7 +151,7 @@ from the clean-artifact gates in §7.QWEN rather than the older Qwen row.
 | Qwen 3.6 | 262,144 | 6,684/6,684 minimum prefix reuse on a fresh persistent-KV directory; four native ChatML tool/result conversations, SSE, and source arguments passed. |
 | DeepSeek-V4 | 524,288 | Two powered gates passed: 6,677/6,685 minimum prefix reuse; maximum cached TTFT 268.68 ms; cached unary/SSE turns completed in 6-13 s and every tool-result turn completed within 20-32 s. Exact server-side cold-cohort makespans were 53.86 s and 52.32 s (53.09 s median), versus about 54.1 s for matched llama.cpp with four unified 131,072-token slots. llama.cpp's 524,288-token unified allocation did not fit beside the 100 GiB artifact on this 128 GiB host; hf2q retained 524,288 logical tokens per slot under demand-grown physical admission. |
 
-DeepSeek uses a bounded 16-token pure-decode quantum and resumable cold prefill
+DeepSeek uses a bounded 32-token pure-decode quantum and resumable cold prefill
 at the verifier's atomic cache-commit boundary. At most two active cold
 prefills alternate complete matrix transactions through one scratch arena. A
 2026-08-09 OpenCode trace falsified the original one-token-per-transaction
