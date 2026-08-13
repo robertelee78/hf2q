@@ -29,8 +29,8 @@ done
 
 phase="gemma-wave-$wave"
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
-cold_receipt_count=$(find "$cold_receipt_dir" -maxdepth 1 -type f \
-  -name 'agent-*.cold.json' -size +0c | wc -l | tr -d '[:space:]')
+cold_receipt_count=$(find "$cold_receipt_dir" -maxdepth 1 -mindepth 1 \
+  -name 'agent-*.cold.json' | wc -l | tr -d '[:space:]')
 [[ "$cold_receipt_count" == 4 ]] || {
   echo "Gemma cold receipt directory must contain exactly four receipts" >&2
   exit 1
