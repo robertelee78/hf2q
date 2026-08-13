@@ -1356,7 +1356,7 @@ seconds, and every continuation reused 6,677/6,685 tokens. The corresponding
 server totals were 50.477, 50.865, 30.127, and 30.288 seconds. Thermal samples
 remained Nominal throughout the cold receipts.
 
-The candidate therefore changes the default *pure-decode* slot quantum to 16
+The candidate initially changed the default *pure-decode* slot quantum to 16
 to amortize session swaps and scheduler publication after prefill drains.
 `deepseek4_mixed_work_budget` still clamps any genuinely mixed prefill/decode
 turn to eight tokens and two native prefill windows, so the 94,576-token
@@ -1364,6 +1364,25 @@ interactive-overlap contract is unchanged. The environment override remains
 bounded to 1–64. This focused discriminator is causal evidence, not release
 authority: two exact packed thermal waves and the complete cross-family
 lifecycle gate must still pass before publication.
+
+The exact-main packed gate at source
+`2929a00145c6a59484fe54f0be8a88162ab5127c` then falsified 16 as a stable
+default. All thermal samples were Nominal and three cold receipts completed in
+53.745–54.601 seconds, but the fourth took 55.024 seconds and correctly failed
+the unchanged 55.000-second limit by 24 milliseconds. Server completion times
+were 53.620, 54.044, 32.009, and 32.189 seconds; cached work had already begun
+with 6,677/6,685 tokens reused. This remained a cohort-tail scheduling miss,
+not a cache, tool-semantic, power, or thermal failure.
+
+Two fresh-server same-binary discriminators changed only
+`HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM` from 16 to 32. Both completed the entire
+four-agent cold, cached, automatic-tool, SSE, and tool-result sequence under
+continuous Nominal thermal samples. Wave one cold semantic responses were
+49.827–52.452 seconds; wave two was 48.859–51.485 seconds. Every continuation
+reused 6,677/6,685 tokens, and every tool-result turn passed. The default is
+therefore 32 for pure decode while `Mixed` remains clamped to eight. These two
+discriminator passes provide repeatable causal margin, but they are not a
+substitute for the exact packed two-wave and cross-family release gate.
 
 The local acceptance setup exposed an independent launcher false positive:
 the remote-inference OpenCode process reported 10.5 GiB RSS, while macOS
