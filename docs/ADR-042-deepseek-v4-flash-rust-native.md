@@ -1384,6 +1384,34 @@ therefore 32 for pure decode while `Mixed` remains clamped to eight. These two
 discriminator passes provide repeatable causal margin, but they are not a
 substitute for the exact packed two-wave and cross-family release gate.
 
+The exact-main packed gate then falsified 32 as a stable default. Run
+`31667493067` built crate SHA-256
+`ded71757e823bcc6a24830332918b191959bb2bcbae2657a35fde285feda19f5`
+from source `eec6900d501f656ae8bb3862ad4c31d0d1a1c8fe`, verified all three
+canonical model digests, and measured the DeepSeek cold cohort under a
+continuous Nominal thermal window. Three cold receipts completed in
+52.497–54.435 seconds, but the fourth took 55.411 seconds and correctly failed
+the unchanged 55.000-second limit. Every request used the exact 6,685-token
+fixture with zero cold reuse; 6,677-token recovery anchors were captured and
+cached requests had already begun successfully. This remained a pure-decode
+cohort-tail miss, not a cache, tool, power, thermal, or artifact-identity
+failure.
+
+Two fresh-server discriminators then changed only
+`HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM` from 32 to 64 on that exact packed binary
+(SHA-256
+`a2bd042ece84a5fb54059a7089d47a0bef9087599b3c62525f59aaa8b1db9187`).
+Both completed the full cold, cached, automatic-tool, SSE, and tool-result
+sequence under independent 60-second Nominal settles and continuous Nominal
+measurement samples. Wave one cold semantic responses were 45.812–51.415
+seconds with a 51.641-second cohort wall; wave two was 45.725–51.337 seconds
+with a 51.503-second cohort wall. All eight cached, automatic-tool, and
+continuation turns reused 6,677/6,685 tokens. The default is therefore 64 for
+pure decode while `Mixed` remains clamped to eight. These repeated
+same-artifact discriminators establish causal margin, but the new source still
+requires its own exact packed two-wave and cross-family release gate before
+publication.
+
 The local acceptance setup exposed an independent launcher false positive:
 the remote-inference OpenCode process reported 10.5 GiB RSS, while macOS
 `footprint` measured 1.7 GiB physical use and 9.5 GiB reclaimable mappings.

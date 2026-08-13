@@ -330,7 +330,7 @@ plan resumes. This avoids the latency cost of small transactions when no peer
 can expose semantic progress.
 
 When no prefill transaction remains, DeepSeek pure decode uses a separate
-32-token slot quantum to amortize session swaps and scheduler publication.
+64-token slot quantum to amortize session swaps and scheduler publication.
 That wider pure-decode quantum never enters the `Mixed` budget above, which
 continues to clamp visible decode to eight tokens.
 
