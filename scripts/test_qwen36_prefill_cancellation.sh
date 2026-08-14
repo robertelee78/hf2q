@@ -56,9 +56,7 @@ sha256_file() { shasum -a 256 "$1" | awk '{ print $1 }'; }
 qwen36_bind_server_process "$BASE_URL" "$SERVER_PID" "$BINARY_PATH" \
   "$MODEL_PATH" "$MAX_SLOTS"
 count_chunks() {
-  local count
-  count=$(rg -c "$LONG_PATTERN" "$SERVER_LOG" 2>/dev/null || true)
-  printf '%s\n' "${count:-0}"
+  qwen36_count_matching_lines "$LONG_PATTERN" "$SERVER_LOG"
 }
 cancellation_metric() {
   curl --fail --silent --show-error --max-time 2 "$BASE_URL/metrics" \
@@ -82,6 +80,11 @@ cp "$SHORT_FIXTURE_JSON" "$OUT_DIR/tiny-request.json"
 baseline_chunks=$(count_chunks)
 baseline_cancel=$(cancellation_metric)
 qwen36_write_log_baseline "$SERVER_LOG" "$OUT_DIR/server-log-baseline.json"
+# The power snapshot is intentionally outside the exact-boundary polling loop.
+# On the release host a complete `pmset -g log` scan can take longer than one
+# 2,048-token GPU transaction; the terminal assertion below still detects any
+# event recorded across the entire request/disconnect interval.
+qwen36_assert_power_guard
 curl --silent --show-error --no-buffer --connect-timeout 5 --max-time 300 \
   -H 'Content-Type: application/json' --data-binary "@$OUT_DIR/cancel-request.json" \
   -o "$OUT_DIR/cancel-response.sse" \
@@ -89,31 +92,29 @@ curl --silent --show-error --no-buffer --connect-timeout 5 --max-time 300 \
 cancel_pid=$!
 
 progress_deadline=$(( $(date +%s) + NO_PROGRESS_SECONDS ))
-while (( $(count_chunks) - baseline_chunks < 3 )); do
-  qwen36_assert_power_guard
-  kill -0 "$cancel_pid" 2>/dev/null || {
-    wait "$cancel_pid" || true
-    echo "long cancellation request ended before three chunks" >&2
-    exit 1
-  }
-  if (( $(date +%s) >= progress_deadline )); then
-    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-      sample "$SERVER_PID" 5 2 -file "$OUT_DIR/no-progress.sample" >/dev/null 2>&1 || true
-    fi
-    echo "no long-prefill progress before cancellation" >&2
-    exit 1
+if ! chunks_at_disconnect=$(qwen36_wait_for_exact_progress_count \
+  count_chunks "$baseline_chunks" 3 "$cancel_pid" "$progress_deadline"); then
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    sample "$SERVER_PID" 5 2 -file "$OUT_DIR/no-progress.sample" >/dev/null 2>&1 || true
   fi
-  sleep 0.05
-done
-
-chunks_at_disconnect=$(( $(count_chunks) - baseline_chunks ))
-[[ "$chunks_at_disconnect" == 3 ]] || {
-  echo "cancellation did not occur at the exact third committed boundary: $chunks_at_disconnect" >&2
+  exit 1
+fi
+# Disconnect immediately from the first observation of the third committed
+# boundary. A transaction already submitted to Metal may still finish; the
+# post-cancellation bound below permits exactly that one atomic transaction.
+kill "$cancel_pid" 2>/dev/null || {
+  wait "$cancel_pid" 2>/dev/null || true
+  cancel_pid=
+  echo "long request exited before the harness could issue its disconnect" >&2
   exit 1
 }
-kill "$cancel_pid" 2>/dev/null || true
-wait "$cancel_pid" 2>/dev/null || true
+if wait "$cancel_pid" 2>/dev/null; then
+  cancel_pid=
+  echo "long request completed successfully instead of being disconnected" >&2
+  exit 1
+fi
 cancel_pid=
+qwen36_assert_power_guard
 
 cancel_deadline=$(( $(date +%s) + 15 ))
 while (( $(cancellation_metric) <= baseline_cancel )); do
@@ -231,7 +232,8 @@ jq -n \
   --argjson tiny_total_seconds "$(awk -F= '$1 == "total_seconds" { print $2 }' "$OUT_DIR/tiny-curl.metrics")" \
   '{status:$status,out_dir:$out_dir,binary_path:$binary_path,binary_sha256:$binary_sha256,model_path:$model_path,model_sha256:$model_sha256,server_pid:$server_pid,long_fixture_sha256:$long_fixture_sha256,long_runtime_sha256:$long_runtime_sha256,short_fixture_sha256:$short_fixture_sha256,tools_sha256:$tools_sha256,template_sha256:$template_sha256,max_slots:$max_slots,chunks_at_disconnect:$chunks_at_disconnect,chunks_after_cancel:$chunks_after_cancel,chunks_after_stability:$chunks_after_stability,baseline_cancellation_counter:$baseline_cancellation_counter,final_cancellation_counter:$final_cancellation_counter,cancellation_delta:$cancellation_delta,short_shape_count:$short_shape_count,long_shape_count:$long_shape_count,cancelled_success_terminal:$cancelled_success_terminal,same_slot_reuse:$same_slot_reuse,pre_tiny_ready_http:$pre_tiny_ready_http,ready_http:$ready_http,power_event_baseline:$power_event_baseline,power_event_final:$power_event_final,power_event_delta:$power_event_delta,tiny_content:$tiny_content,tiny_sse_sha256:$tiny_sse_sha256,canceled_sse_sha256:$canceled_sse_sha256,server_log_delta_sha256:$server_log_delta_sha256,chunk_log_sha256:$chunk_log_sha256,tiny_total_seconds:$tiny_total_seconds}' \
   >"$summary.tmp"
-jq -e '.status == "pass" and .server_pid > 0 and .max_slots == 1 and (.binary_sha256 | test("^[0-9a-f]{64}$")) and (.model_sha256 | test("^[0-9a-f]{64}$")) and .chunks_at_disconnect == 3 and .cancellation_delta == 1 and .cancelled_success_terminal == false and .same_slot_reuse == true and .tiny_content == "OK" and .pre_tiny_ready_http == 200 and .ready_http == 200 and .short_shape_count == 1 and .long_shape_count == 1 and .chunks_after_cancel == .chunks_after_stability and .power_event_delta == 0' "$summary.tmp" >/dev/null
+qwen36_validate_cancellation_transaction_counts "$summary.tmp"
+jq -e '.status == "pass" and .server_pid > 0 and .max_slots == 1 and (.binary_sha256 | test("^[0-9a-f]{64}$")) and (.model_sha256 | test("^[0-9a-f]{64}$")) and (.chunks_at_disconnect | type) == "number" and (.chunks_after_cancel | type) == "number" and (.chunks_after_stability | type) == "number" and .chunks_at_disconnect == (.chunks_at_disconnect | floor) and .chunks_after_cancel == (.chunks_after_cancel | floor) and .chunks_after_stability == (.chunks_after_stability | floor) and .chunks_at_disconnect == 3 and .cancellation_delta == 1 and .cancelled_success_terminal == false and .same_slot_reuse == true and .tiny_content == "OK" and .pre_tiny_ready_http == 200 and .ready_http == 200 and .short_shape_count == 1 and .long_shape_count == 1 and .chunks_after_cancel >= .chunks_at_disconnect and .chunks_after_cancel <= (.chunks_at_disconnect + 1) and .chunks_after_cancel == .chunks_after_stability and .power_event_delta == 0' "$summary.tmp" >/dev/null
 qwen36_assert_power_guard
 mv "$summary.tmp" "$summary"
 shasum -a 256 "$summary" >"$summary.sha256"

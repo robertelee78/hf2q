@@ -163,6 +163,8 @@ jobs:
           check_receipt qwen/lifecycle/summary.json '.receipt_sha256.qwen.lifecycle'
           check_receipt qwen/cumulative/cumulative-release-summary.json '.receipt_sha256.qwen.cumulative'
           check_receipt qwen/cancellation/cancellation-summary.json '.receipt_sha256.qwen.cancellation'
+          qwen36_validate_cancellation_transaction_counts \
+            "$gate_dir/qwen/cancellation/cancellation-summary.json"
           for digest in \
             "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
             "$EXPECTED_GEMMA_MODEL_SHA256" \
@@ -459,7 +461,15 @@ jobs:
                and $q.cancellation.binary_sha256 == $root.binary_sha256
                and $q.cancellation.model_sha256 == $qwen_sha
                and $q.cancellation.max_slots == 1
+               and ($q.cancellation.chunks_at_disconnect | type) == "number"
+               and ($q.cancellation.chunks_after_cancel | type) == "number"
+               and ($q.cancellation.chunks_after_stability | type) == "number"
+               and $q.cancellation.chunks_at_disconnect == ($q.cancellation.chunks_at_disconnect | floor)
+               and $q.cancellation.chunks_after_cancel == ($q.cancellation.chunks_after_cancel | floor)
+               and $q.cancellation.chunks_after_stability == ($q.cancellation.chunks_after_stability | floor)
                and $q.cancellation.chunks_at_disconnect == 3
+               and $q.cancellation.chunks_after_cancel >= $q.cancellation.chunks_at_disconnect
+               and $q.cancellation.chunks_after_cancel <= ($q.cancellation.chunks_at_disconnect + 1)
                and $q.cancellation.cancellation_delta == 1
                and $q.cancellation.cancelled_success_terminal == false
                and $q.cancellation.same_slot_reuse == true

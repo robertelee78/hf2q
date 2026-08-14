@@ -6,7 +6,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
-for command in jq awk cmp diff sed wc tr mktemp seq shasum stat find grep; do
+for command in jq awk cmp diff sed wc tr mktemp seq shasum stat find grep date sleep cat; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -34,6 +34,115 @@ expect_fail qwen36_require_empty_receipt_dir "$test_dir/empty-receipt"
 qwen36_validate_power_event_counts 12 12
 expect_fail qwen36_validate_power_event_counts 12 13
 expect_fail qwen36_validate_power_event_counts not-a-number 12
+
+# Exact cancellation triggering must return the first observed transaction
+# boundary without running heavyweight power-log work in the hot poll. The
+# release harness brackets this helper with the shared power guard and permits
+# at most one already-submitted transaction to finish after disconnect.
+progress_sequence="$test_dir/progress-sequence"
+progress_index="$test_dir/progress-index"
+printf '%s\n' 10 11 12 13 14 >"$progress_sequence"
+printf '1\n' >"$progress_index"
+# Invoked indirectly by name through qwen36_wait_for_exact_progress_count.
+# shellcheck disable=SC2329
+fixture_progress_count() {
+  local index value
+  index=$(cat "$progress_index")
+  value=$(sed -n "${index}p" "$progress_sequence")
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$((index + 1))" >"$progress_index"
+  printf '%s\n' "$value"
+}
+exact_progress=$(qwen36_wait_for_exact_progress_count \
+  fixture_progress_count 10 3 $$ "$(( $(date +%s) + 5 ))")
+[[ "$exact_progress" == 3 ]]
+[[ "$(cat "$progress_index")" == 5 ]]
+
+printf '%s\n' 10 12 14 >"$progress_sequence"
+printf '1\n' >"$progress_index"
+expect_fail qwen36_wait_for_exact_progress_count \
+  fixture_progress_count 10 3 $$ "$(( $(date +%s) + 5 ))"
+printf 'not-a-count\n' >"$progress_sequence"
+printf '1\n' >"$progress_index"
+expect_fail qwen36_wait_for_exact_progress_count \
+  fixture_progress_count 10 3 $$ "$(( $(date +%s) + 5 ))"
+
+printf '9\n' >"$progress_sequence"
+printf '1\n' >"$progress_index"
+expect_fail qwen36_wait_for_exact_progress_count \
+  fixture_progress_count 10 3 $$ "$(( $(date +%s) + 5 ))"
+
+# A count callback may emit plausible output and still fail. Its nonzero
+# status must remain load-bearing even through Bash conditional contexts.
+# shellcheck disable=SC2329
+fixture_progress_error() {
+  printf '13\n'
+  return 42
+}
+expect_fail qwen36_wait_for_exact_progress_count \
+  fixture_progress_error 10 3 $$ "$(( $(date +%s) + 5 ))"
+
+# Neither an incidental request exit nor a stale target observed after the
+# deadline may be relabeled as the harness's intentional disconnect.
+true &
+dead_progress_pid=$!
+wait "$dead_progress_pid"
+if kill -0 "$dead_progress_pid" 2>/dev/null; then
+  echo "dead progress fixture PID unexpectedly remained live" >&2
+  exit 1
+fi
+printf '13\n' >"$progress_sequence"
+printf '1\n' >"$progress_index"
+expect_fail qwen36_wait_for_exact_progress_count \
+  fixture_progress_count 10 3 "$dead_progress_pid" "$(( $(date +%s) + 5 ))"
+printf '1\n' >"$progress_index"
+if expired_progress=$(qwen36_wait_for_exact_progress_count \
+  fixture_progress_count 10 3 $$ "$(( $(date +%s) - 1 ))" 2>/dev/null); then
+  echo "expired Qwen progress target was accepted: $expired_progress" >&2
+  exit 1
+fi
+unset -f fixture_progress_count
+unset -f fixture_progress_error
+
+progress_log="$test_dir/progress.log"
+printf '%s\n' 'chunk complete' 'other' 'chunk complete' >"$progress_log"
+[[ "$(qwen36_count_matching_lines 'chunk complete' "$progress_log")" == 2 ]]
+[[ "$(qwen36_count_matching_lines 'no such chunk' "$progress_log")" == 0 ]]
+# A scanner that emits a plausible count and then fails must not be accepted.
+# shellcheck disable=SC2329
+rg() {
+  printf '2\n'
+  return 42
+}
+expect_fail qwen36_count_matching_lines 'chunk complete' "$progress_log"
+unset -f rg
+
+cancellation_counts="$test_dir/cancellation-counts.json"
+jq -n '{chunks_at_disconnect:3,chunks_after_cancel:4,chunks_after_stability:4}' \
+  >"$cancellation_counts"
+qwen36_validate_cancellation_transaction_counts "$cancellation_counts"
+jq '.chunks_after_cancel = 3.5 | .chunks_after_stability = 3.5' \
+  "$cancellation_counts" >"$cancellation_counts.fractional"
+expect_fail qwen36_validate_cancellation_transaction_counts \
+  "$cancellation_counts.fractional"
+jq '.chunks_at_disconnect = "3"' "$cancellation_counts" \
+  >"$cancellation_counts.string"
+expect_fail qwen36_validate_cancellation_transaction_counts \
+  "$cancellation_counts.string"
+jq 'del(.chunks_after_stability)' "$cancellation_counts" \
+  >"$cancellation_counts.missing"
+expect_fail qwen36_validate_cancellation_transaction_counts \
+  "$cancellation_counts.missing"
+jq '.chunks_after_cancel = 3.5 | .chunks_after_stability = 3.5' \
+  "$cancellation_counts" >"$cancellation_counts.invalid-document"
+cat "$cancellation_counts.invalid-document" "$cancellation_counts" \
+  >"$cancellation_counts.invalid-then-valid"
+expect_fail qwen36_validate_cancellation_transaction_counts \
+  "$cancellation_counts.invalid-then-valid"
+cat "$cancellation_counts" "$cancellation_counts.invalid-document" \
+  >"$cancellation_counts.valid-then-invalid"
+expect_fail qwen36_validate_cancellation_transaction_counts \
+  "$cancellation_counts.valid-then-invalid"
 
 power_baseline="$test_dir/power-events.baseline"
 power_final="$test_dir/power-events.final"
@@ -226,6 +335,50 @@ for powered_script in \
     exit 1
   }
 done
+
+grep -Fq 'qwen36_wait_for_exact_progress_count' \
+  "$script_dir/test_qwen36_prefill_cancellation.sh"
+grep -Fq 'qwen36_count_matching_lines' \
+  "$script_dir/test_qwen36_prefill_cancellation.sh"
+# Literal shell source; `$cancel_pid` must not expand in this contract.
+# shellcheck disable=SC2016
+grep -Fq 'kill "$cancel_pid" 2>/dev/null || {' \
+  "$script_dir/test_qwen36_prefill_cancellation.sh"
+grep -Fq '.chunks_after_cancel <= (.chunks_at_disconnect + 1)' \
+  "$script_dir/test_qwen36_prefill_cancellation.sh"
+grep -Fq '.chunks_after_cancel == (.chunks_after_cancel | floor)' \
+  "$script_dir/test_qwen36_prefill_cancellation.sh"
+# Literal jq source; `$q` is the release verifier binding, not a shell value.
+# shellcheck disable=SC2016
+grep -Fq '$q.cancellation.chunks_after_cancel <= ($q.cancellation.chunks_at_disconnect + 1)' \
+  "$script_dir/../.github/workflows/release.yml"
+# Literal jq source; `$q` is the release verifier binding, not a shell value.
+# shellcheck disable=SC2016
+grep -Fq '$q.cancellation.chunks_after_cancel == ($q.cancellation.chunks_after_cancel | floor)' \
+  "$script_dir/../.github/workflows/release.yml"
+grep -Fq 'qwen36_validate_cancellation_transaction_counts' \
+  "$script_dir/../.github/workflows/release.yml"
+# Literal jq source; `$qwen_cancellation` must not expand in this contract.
+# shellcheck disable=SC2016
+grep -Fq '($qwen_cancellation | length) != 1' \
+  "$script_dir/run_agentic_cache_release_gate.sh"
+awk '
+  /qwen36_wait_for_exact_progress_count/ { wait_line = NR }
+  /qwen36_assert_power_guard/ {
+    if (!wait_line) pre_assert = NR
+    else if (!post_assert) post_assert = NR
+  }
+  /kill "\$cancel_pid"/ && wait_line && !disconnect { disconnect = NR }
+  END {
+    ok = pre_assert && wait_line && disconnect && post_assert
+    ok = ok && pre_assert < wait_line && wait_line < disconnect
+    ok = ok && disconnect < post_assert
+    exit(ok ? 0 : 1)
+  }
+' "$script_dir/test_qwen36_prefill_cancellation.sh" || {
+  echo "Qwen cancellation trigger is not bracketed by power assertions" >&2
+  exit 1
+}
 
 grep -Fq 'power_event_snapshots_sha256' \
   "$script_dir/run_agentic_cache_release_gate.sh"

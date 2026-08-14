@@ -122,6 +122,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Validation
 
+- Keep the Qwen one-slot cancellation trigger on its first observed third
+  2,048-token transaction without weakening the atomic cancellation bound.
+  Exact-main run `31804314143` passed the full DeepSeek and Gemma matrices,
+  Qwen's 87,972-token overlap, three four-agent cache waves, and Qwen's shared
+  lifecycle, then the final cancellation harness observed four transactions
+  and stopped before testing rollback. The runtime had received no disconnect;
+  the harness was scanning the complete macOS power log inside its 50 ms poll,
+  a measured 2.06-second operation versus 1.36–1.58 seconds per transaction.
+  Power validation now brackets the low-latency exact-boundary observer, and
+  the unchanged post-disconnect contract still permits at most one in-flight
+  transaction, requires exactly one cancellation, rejects a successful SSE
+  terminal, and proves fresh one-slot reuse. A new exact packed run remains
+  required. A focused same-model discriminator with the repaired script passed
+  at `3 -> 4 -> 4` transactions, cancellation delta 1, no terminal, ready 200,
+  exact one-slot `OK` reuse in 0.415 seconds, and zero power events; it is
+  focused evidence, not exact packed release authority.
 - Add a cross-family long-context cache-lifecycle gate that establishes an
   agentic tool turn, starts a streamed turn on the retained prefix, queues its
   exact retry while that prefix is active, cancels the owner, requires the

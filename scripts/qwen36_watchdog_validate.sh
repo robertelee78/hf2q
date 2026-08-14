@@ -245,6 +245,123 @@ qwen36_validate_heap_series() {
     }
 }
 
+# Poll a cheap, request-local progress counter and return the first exact
+# target boundary observed. Power/log snapshot validation deliberately stays
+# outside this loop: `pmset -g log` can take longer than one bounded GPU
+# transaction, which would make the observer itself skip the requested
+# disconnect boundary. The caller brackets this helper with the shared power
+# guard, then proves that at most one already-submitted transaction completed
+# after disconnect.
+qwen36_wait_for_exact_progress_count() {
+  local count_command="$1"
+  local baseline="$2"
+  local target="$3"
+  local request_pid="$4"
+  local deadline_epoch="$5"
+  local current completed now
+
+  [[ -n "$count_command" \
+    && "$baseline" =~ ^[0-9]+$ \
+    && "$target" =~ ^[1-9][0-9]*$ \
+    && "$request_pid" =~ ^[1-9][0-9]*$ \
+    && "$deadline_epoch" =~ ^[1-9][0-9]*$ ]] || {
+      echo "Qwen exact-progress wait received invalid arguments" >&2
+      return 1
+    }
+
+  while :; do
+    current=$("$count_command") || {
+      echo "Qwen exact-progress counter failed" >&2
+      return 1
+    }
+    [[ "$current" =~ ^[0-9]+$ ]] || {
+      echo "Qwen exact-progress counter returned a non-integer: $current" >&2
+      return 1
+    }
+    (( current >= baseline )) || {
+      echo "Qwen exact-progress counter moved backwards: $baseline -> $current" >&2
+      return 1
+    }
+    completed=$((current - baseline))
+    if (( completed > target )); then
+      echo "Qwen exact-progress observer skipped boundary $target and saw $completed" >&2
+      return 1
+    fi
+    now=$(date +%s) || return 1
+    [[ "$now" =~ ^[1-9][0-9]*$ ]] || {
+      echo "Qwen exact-progress clock returned a non-integer: $now" >&2
+      return 1
+    }
+    (( now < deadline_epoch )) || {
+      echo "Qwen request made no progress to boundary $target before the deadline" >&2
+      return 1
+    }
+    kill -0 "$request_pid" 2>/dev/null || {
+      echo "Qwen request ended before progress boundary $target" >&2
+      return 1
+    }
+    if (( completed == target )); then
+      printf '%s\n' "$completed"
+      return 0
+    fi
+    sleep 0.05 || return 1
+  done
+}
+
+qwen36_count_matching_lines() {
+  local pattern="$1"
+  local path="$2"
+  local count status
+
+  [[ -n "$pattern" && -f "$path" && -r "$path" ]] || {
+    echo "Qwen progress log is missing, unreadable, or has an empty pattern" >&2
+    return 1
+  }
+  if count=$(rg -c -- "$pattern" "$path" 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) ;;
+    1) count=0 ;;
+    *)
+      echo "Qwen progress-log scan failed with status $status" >&2
+      return 1
+      ;;
+  esac
+  [[ "$count" =~ ^[0-9]+$ ]] || {
+    echo "Qwen progress-log scan returned a non-integer: $count" >&2
+    return 1
+  }
+  printf '%s\n' "$count"
+}
+
+qwen36_validate_cancellation_transaction_counts() {
+  local receipt_path="$1"
+
+  [[ -f "$receipt_path" && -r "$receipt_path" ]] || {
+    echo "Qwen cancellation receipt is missing or unreadable: $receipt_path" >&2
+    return 1
+  }
+  if ! jq -s -e '
+    def nonnegative_integer:
+      type == "number" and . >= 0 and . == floor;
+    length == 1 and (.[0] |
+      (.chunks_at_disconnect | nonnegative_integer)
+      and (.chunks_after_cancel | nonnegative_integer)
+      and (.chunks_after_stability | nonnegative_integer)
+      and .chunks_at_disconnect == 3
+      and .chunks_after_cancel >= .chunks_at_disconnect
+      and .chunks_after_cancel <= (.chunks_at_disconnect + 1)
+      and .chunks_after_stability == .chunks_after_cancel
+    )
+  ' "$receipt_path" >/dev/null; then
+    echo "Qwen cancellation receipt has invalid transaction counts" >&2
+    return 1
+  fi
+}
+
 qwen36_capture_power_events() {
   local output_path="$1"
   local tmp_path="${output_path}.tmp.$$"
