@@ -566,6 +566,8 @@ run_qwen_release_gates() {
     scripts/test_qwen36_prefill_cancellation.sh \
       >"$OUT_ROOT/qwen/cancellation.stdout" 2>"$OUT_ROOT/qwen/cancellation.stderr"
   verify_sha256_sidecar "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
+  qwen36_validate_cancellation_transaction_counts \
+    "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
   finish_server_phase
 }
 
@@ -898,6 +900,8 @@ power_snapshot_manifest_sha=$(sha256_file "$power_snapshot_manifest")
 deepseek_bytes=$(stat -f '%z' "$DEEPSEEK_MODEL")
 gemma_bytes=$(stat -f '%z' "$GEMMA_MODEL")
 qwen_bytes=$(stat -f '%z' "$QWEN_MODEL")
+qwen36_validate_cancellation_transaction_counts \
+  "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
 jq -n \
   --arg status pass \
   --arg source_sha "$EXPECTED_SHA" \
@@ -953,7 +957,9 @@ jq -n \
   --slurpfile qwen_lifecycle "$OUT_ROOT/qwen/lifecycle/summary.json" \
   --slurpfile qwen_cumulative "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json" \
   --slurpfile qwen_cancellation "$OUT_ROOT/qwen/cancellation/cancellation-summary.json" \
-  '{
+  'if ($qwen_cancellation | length) != 1 then
+    error("Qwen cancellation receipt must contain exactly one JSON document")
+  else {
     status: $status,
     source_sha: $source_sha,
     crate_sha256: $crate_sha256,
@@ -975,7 +981,7 @@ jq -n \
       gemma: {status:"pass",lifecycle:$gemma_lifecycle[0],overlap_and_cancellation:$gemma_overlap[0],agent_waves:[$gemma_wave1[0],$gemma_wave2[0],$gemma_wave8[0]],transactions:[$gemma_transactions4[0],$gemma_transactions8[0]],parity:$gemma_parity[0],heap:$gemma_heap[0]},
       qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]}
     }
-  }' > "$OUT_ROOT/manifest.json.tmp"
+  } end' > "$OUT_ROOT/manifest.json.tmp"
 mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"
 shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
 jq -e '

@@ -1528,6 +1528,41 @@ inner assertions at 22:58:37 and the outer assertion at 22:58:38, after which
 macOS recorded the full two-second Sleep state. The run is not release
 authority.
 
+Exact-main packed run `31804314143` subsequently passed every DeepSeek and
+Gemma release gate, including both Deep cold waves, Gemma's N=4/N=8 waves and
+parity suite, and the cross-family cache lifecycle. Qwen then passed its public
+87,972-token/347-tool overlap, all three four-agent cache waves, heap bounds,
+and its shared active-prefix cancellation/retry/isolation lifecycle. The final
+fresh one-slot prefill-cancellation harness stopped before exercising recovery:
+it expected to observe exactly three 2,048-token transactions but first read
+four. No disconnect or Qwen cancellation had yet reached the server, and the
+partial SSE had no successful terminal.
+
+The failure was in the observer. Its nominal 50 ms progress loop performed a
+complete `pmset -g log` capture on every iteration. That capture measured 2.06
+seconds on the release host while the four observed Qwen transactions took
+1.36–1.58 seconds each, so the guard itself could advance the observation from
+two committed transactions to four. The cancellation gate now validates power
+immediately before the request, polls only the append-only transaction log,
+freezes the first observed third boundary, disconnects immediately, and then
+validates power again. This does not relax runtime acceptance: the existing
+post-disconnect checks still allow at most one already-submitted atomic
+transaction, require the cancellation metric to advance exactly once, require
+stability, reject `[DONE]`/terminal success, and prove the same single physical
+slot returns an exact `OK` control response. Run `31804314143` is strong
+cross-family partial evidence but not release authority; the repaired unchanged
+packed gate must pass from a new exact-main SHA. A focused discriminator then
+ran the repaired script against the same Qwen GGUF
+(`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`)
+and source-equivalent 0.1.6 runtime bytes
+(`eb82f8bc45bb543d962acfe998c461e1d37e94bd6c73f0e1b7ea1f0d4414e635`).
+It passed with transaction counts `3 -> 4 -> 4`, cancellation delta 1, no
+successful terminal, ready 200 before and after, exact `OK` reuse in the same
+single slot in 0.415 seconds, and power-event delta 0. Its summary SHA-256 is
+`69486118aaafc58daeaf890f3e89a5aae5f4d9e7df1387304e56083058078d1f`.
+Because the repaired scripts were not yet an immutable packed candidate, this
+is focused causal confirmation only, not release authority.
+
 That interruption also exposed a defect in the old power-event evidence: it
 compared the total number of matching rows in the rolling `pmset -g log`.
 The old matcher did not include `Entering DarkWake state`, and older matching
