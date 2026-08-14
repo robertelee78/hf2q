@@ -37,7 +37,7 @@ readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
   echo "required model-runtime probe is unavailable: /usr/bin/pgrep" >&2
   exit 2
 }
-for command in awk caffeinate cargo curl jq lsof pmset rg sed shasum stat; do
+for command in awk caffeinate cargo cmp curl diff find jq lsof pmset rg sed shasum stat; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -885,6 +885,16 @@ run_qwen_release_gates
 ensure_guard_health
 pmset -g assertions > "$OUT_ROOT/power-assertions.after.txt"
 power_guarded_ac=true
+power_snapshot_manifest="$OUT_ROOT/power-event-snapshots.sha256"
+power_snapshot_prefixes=()
+while IFS= read -r prefix; do
+  power_snapshot_prefixes+=("$prefix")
+done < <(qwen36_release_power_snapshot_prefixes)
+qwen36_write_power_snapshot_manifest \
+  "$OUT_ROOT" "$power_snapshot_manifest" "${power_snapshot_prefixes[@]}"
+qwen36_verify_power_snapshot_manifest \
+  "$OUT_ROOT" "$power_snapshot_manifest" "${power_snapshot_prefixes[@]}"
+power_snapshot_manifest_sha=$(sha256_file "$power_snapshot_manifest")
 deepseek_bytes=$(stat -f '%z' "$DEEPSEEK_MODEL")
 gemma_bytes=$(stat -f '%z' "$GEMMA_MODEL")
 qwen_bytes=$(stat -f '%z' "$QWEN_MODEL")
@@ -893,6 +903,7 @@ jq -n \
   --arg source_sha "$EXPECTED_SHA" \
   --arg crate_sha256 "$CRATE_SHA256" \
   --arg binary_sha256 "$binary_sha" \
+  --arg power_event_snapshots_sha256 "$power_snapshot_manifest_sha" \
   --arg deepseek_path "$DEEPSEEK_MODEL" \
   --arg gemma_path "$GEMMA_MODEL" \
   --arg qwen_path "$QWEN_MODEL" \
@@ -948,6 +959,7 @@ jq -n \
     crate_sha256: $crate_sha256,
     binary_sha256: $binary_sha256,
     power_guarded_ac: $power_guarded_ac,
+    power_event_snapshots_sha256: $power_event_snapshots_sha256,
     models: {
       deepseek: {path: $deepseek_path, bytes: $deepseek_bytes, sha256: $deepseek_sha},
       gemma: {path: $gemma_path, bytes: $gemma_bytes, sha256: $gemma_sha},
@@ -966,5 +978,8 @@ jq -n \
   }' > "$OUT_ROOT/manifest.json.tmp"
 mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"
 shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
-jq -e 'all(.receipt_sha256[][]; test("^[0-9a-f]{64}$"))' "$OUT_ROOT/manifest.json" >/dev/null
+jq -e '
+  (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
+  and all(.receipt_sha256[][]; test("^[0-9a-f]{64}$"))
+' "$OUT_ROOT/manifest.json" >/dev/null
 jq . "$OUT_ROOT/manifest.json"

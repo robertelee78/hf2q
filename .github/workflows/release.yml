@@ -86,6 +86,25 @@ jobs:
             --dir "$gate_dir"
           manifest="$gate_dir/manifest.json"
           test -s "$manifest"
+          # Recompute every powered sub-gate's baseline/final multiset delta
+          # from the downloaded raw snapshots. Summary counts alone are not
+          # release authority.
+          source scripts/qwen36_watchdog_validate.sh
+          power_snapshot_manifest="$gate_dir/power-event-snapshots.sha256"
+          expected_power_snapshot_sha=$(
+            jq -er '.power_event_snapshots_sha256' "$manifest"
+          )
+          actual_power_snapshot_sha=$(
+            shasum -a 256 "$power_snapshot_manifest" | awk '{print $1}'
+          )
+          test "$actual_power_snapshot_sha" = "$expected_power_snapshot_sha"
+          power_snapshot_prefixes=()
+          while IFS= read -r prefix; do
+            power_snapshot_prefixes+=("$prefix")
+          done < <(qwen36_release_power_snapshot_prefixes)
+          qwen36_verify_power_snapshot_manifest \
+            "$gate_dir" "$power_snapshot_manifest" \
+            "${power_snapshot_prefixes[@]}"
           check_receipt() {
             local path=$1
             local selector=$2
@@ -159,6 +178,7 @@ jobs:
              | .status == "pass"
              and .source_sha == $source_sha
              and .power_guarded_ac == true
+             and (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
              and (.binary_sha256 | test("^[0-9a-f]{64}$"))
              and .models.deepseek.sha256 == $deepseek_sha
              and .models.gemma.sha256 == $gemma_sha

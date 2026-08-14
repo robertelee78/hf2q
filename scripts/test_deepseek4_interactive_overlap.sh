@@ -95,7 +95,7 @@ wait_for_log() {
   while (( $(date +%s) < deadline )); do
     found=$(sed -n "${first_line},\$p" "$SERVER_LOG" | rg -m1 "$pattern" || true)
     if [[ -n "$found" ]]; then printf '%s\n' "$found"; return 0; fi
-    qwen36_assert_power_guard
+    qwen36_assert_power_guard || return 1
     sleep 0.1
   done
   echo "timed out waiting for log pattern: $pattern" >&2
@@ -282,6 +282,7 @@ jq -n \
   }' >"$summary.tmp"
 jq -e '.status=="pass" and .server.max_slots==4 and .long_prompt_tokens > 80000 and .first_long_prefill_report_tokens > 0 and .first_mixed_prefill_chunk_tokens > 0 and .first_mixed_prefill_chunk_tokens <= 256 and .first_mixed_prefill_window_cap == 2 and .short_generated_tokens_at_first_window >= 8 and .terminal_parking.park_observed == true and .terminal_parking.terminal_absent_while_parked == true and .terminal_parking.active_cold_prefills_at_park >= 1 and .terminal_parking.parked_before_long_prefill_complete == true and .terminal_parking.released_after_long_prefill_complete == true and .terminal_parking.completed_after_release == true and .ready_http==200 and .power_event_delta==0' \
   "$summary.tmp" >/dev/null
+qwen36_assert_power_guard
 mv "$summary.tmp" "$summary"
 shasum -a 256 "$summary" >"$summary.sha256"
 shasum -c "$summary.sha256" >/dev/null

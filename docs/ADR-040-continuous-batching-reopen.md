@@ -1511,6 +1511,42 @@ contract mutates the original Cargo target and proves the sealed copy remains
 executable and byte-identical. Run `31730699128` is not release authority, and
 a new exact-main packed hardware run remains mandatory.
 
+Exact-main run `31755150906` attempt 4 proved that sealed handoff under the
+real Cargo relink: the package-local executable changed from
+`6cdccd987f30f7d5fd0a6a2fa0894a99bb44dbef03a5e19a4fe4d6c1e242bdd5`
+to `4008fe23462ffaa9716851b0a3947baef6f9444bdee17add08584e54fbfbf889`
+during the final Gemma integration test, while the external serving copy
+remained `6cdccd987f30f7d5fd0a6a2fa0894a99bb44dbef03a5e19a4fe4d6c1e242bdd5`.
+The run completed the full DeepSeek and Gemma matrices, including Gemma's
+eight-agent wave and all four exact-output parity tests. Qwen then loaded that
+sealed executable, accepted its 552-token short lane and 87,972-token overlap
+lane, emitted the short semantic response, and advanced the long lane through
+16,384 prompt tokens. At `2026-08-13 22:58:33 -0700`, macOS entered
+`Clamshell Sleep` DarkWake on AC power while all three bound `caffeinate`
+guards were still live. The gate stopped at 22:58:36; cleanup released the
+inner assertions at 22:58:37 and the outer assertion at 22:58:38, after which
+macOS recorded the full two-second Sleep state. The run is not release
+authority.
+
+That interruption also exposed a defect in the old power-event evidence: it
+compared the total number of matching rows in the rolling `pmset -g log`.
+The old matcher did not include `Entering DarkWake state`, and older matching
+rows expired during the run, producing the false-failure diagnostic
+`402 -> 401` before the later full-sleep row existed. A rollover without a new
+event could false-fail, and equal numbers of expired and new matching rows
+could fail open. The shared Qwen/DeepSeek/Gemma guard now captures full Sleep,
+DarkWake, and thermal rows in baseline and final snapshots and compares them as
+multisets. Rows removed by rollover do not count; every added row does. The
+existing receipt fields are retained with a logical monotonic final count, and
+model-free regressions cover pruning-only, pruning-plus-new-event, the exact
+DarkWake shape, duplicate rows, empty baselines, missing snapshots, and capture
+failure under Bash conditional/command-substitution contexts. Each powered
+leaf gate takes one final snapshot after validating its temporary receipt and
+before the atomic commit. The root manifest binds a sorted inventory of all
+five expected baseline/final/new triplets; protected release replay rehashes
+those bytes, recomputes every multiset delta, and requires every delta to be
+empty. A new exact-main packed run remains mandatory.
+
 Gemma's four-slot waves retain the release-default agentic latency limits. An
 exact packed `fbcf46374f0cfa26ccc50080d1ed387f400536a2` M5 gate first passed
 the 175,040-token overlap, cancellation rollback, 120,528-token cache lifecycle,

@@ -245,9 +245,274 @@ qwen36_validate_heap_series() {
     }
 }
 
-qwen36_power_event_count() {
-  pmset -g log \
-    | awk '/Entering Sleep state|ThermalEvent/ { count++ } END { print count + 0 }'
+qwen36_capture_power_events() {
+  local output_path="$1"
+  local tmp_path="${output_path}.tmp.$$"
+
+  if ! pmset -g log \
+    | awk '/Entering Sleep state|Entering DarkWake state|ThermalEvent/ { print }' \
+      >"$tmp_path"; then
+    rm -f "$tmp_path"
+    echo "Qwen gate could not capture the macOS power-event log" >&2
+    return 1
+  fi
+  mv "$tmp_path" "$output_path"
+}
+
+qwen36_extract_new_power_events() {
+  local baseline_path="$1"
+  local final_path="$2"
+  local new_path="$3"
+  local tmp_path="${new_path}.tmp.$$"
+
+  [[ -f "$baseline_path" && -r "$baseline_path" \
+    && -f "$final_path" && -r "$final_path" ]] || {
+    echo "Qwen gate power-event snapshots are missing or unreadable" >&2
+    return 1
+  }
+
+  # `pmset -g log` is a rolling history. Comparing its total row count can
+  # fail in either direction when old rows expire while a gate is running.
+  # Treat the baseline as a multiset: rows removed by rollover are harmless,
+  # while every newly added sleep/dark-wake/thermal row remains load-bearing
+  # evidence.
+  if ! awk -v baseline_path="$baseline_path" '
+    FILENAME == baseline_path {
+      baseline[$0]++
+      next
+    }
+    baseline[$0] > 0 {
+      baseline[$0]--
+      next
+    }
+    { print }
+  ' "$baseline_path" "$final_path" >"$tmp_path"; then
+    rm -f "$tmp_path"
+    echo "Qwen gate could not compare the macOS power-event snapshots" >&2
+    return 1
+  fi
+  mv "$tmp_path" "$new_path"
+}
+
+qwen36_power_snapshot_paths() {
+  local prefix
+  for prefix in "$@"; do
+    printf '%s\n' \
+      "${prefix}.power-events.baseline" \
+      "${prefix}.power-events.final" \
+      "${prefix}.power-events.new"
+  done
+}
+
+qwen36_release_power_snapshot_prefixes() {
+  printf '%s\n' \
+    deepseek/interactive/caffeinate.log \
+    gemma/overlap/caffeinate.log \
+    qwen/cancellation/caffeinate.log \
+    qwen/cumulative/caffeinate.log \
+    qwen/cumulative/overlap/caffeinate.log
+}
+
+qwen36_write_sorted_power_snapshot_paths() {
+  local output_path="$1"
+  shift
+  local unsorted_path="${output_path}.unsorted.$$"
+
+  qwen36_power_snapshot_paths "$@" >"$unsorted_path" || {
+    rm -f "$unsorted_path"
+    return 1
+  }
+  sort "$unsorted_path" >"$output_path" || {
+    rm -f "$unsorted_path" "$output_path"
+    return 1
+  }
+  rm -f "$unsorted_path"
+}
+
+qwen36_validate_power_snapshot_inventory() {
+  local root="$1"
+  shift
+  local expected_path actual_path actual_raw_path actual_relative_path
+  local inventory_invalid=0
+  expected_path=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-expected.XXXXXX") || return 1
+  actual_path=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-actual.XXXXXX") || {
+    rm -f "$expected_path"
+    return 1
+  }
+  actual_raw_path=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-raw.XXXXXX") || {
+    rm -f "$expected_path" "$actual_path"
+    return 1
+  }
+  actual_relative_path=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-relative.XXXXXX") || {
+    rm -f "$expected_path" "$actual_path" "$actual_raw_path"
+    return 1
+  }
+
+  qwen36_write_sorted_power_snapshot_paths "$expected_path" "$@" || {
+    rm -f "$expected_path" "$actual_path" "$actual_raw_path" \
+      "$actual_relative_path"
+    return 1
+  }
+  if ! (
+    cd "$root" || exit 1
+    find . \
+      \( -name '*.power-events.baseline' \
+        -o -name '*.power-events.final' \
+        -o -name '*.power-events.new' \) \
+      -print
+  ) >"$actual_raw_path"; then
+    echo "Qwen gate could not enumerate the power-event snapshots" >&2
+    rm -f "$expected_path" "$actual_path" "$actual_raw_path" \
+      "$actual_relative_path"
+    return 1
+  fi
+  sed 's#^\./##' "$actual_raw_path" >"$actual_relative_path" || {
+    rm -f "$expected_path" "$actual_path" "$actual_raw_path" \
+      "$actual_relative_path"
+    return 1
+  }
+  sort "$actual_relative_path" >"$actual_path" || {
+    rm -f "$expected_path" "$actual_path" "$actual_raw_path" \
+      "$actual_relative_path"
+    return 1
+  }
+  rm -f "$actual_raw_path" "$actual_relative_path"
+  if ! cmp -s "$expected_path" "$actual_path"; then
+    echo "Qwen gate power-event snapshot inventory does not match the release contract" >&2
+    diff -u "$expected_path" "$actual_path" >&2 || true
+    rm -f "$expected_path" "$actual_path"
+    return 1
+  fi
+  while IFS= read -r relative_path; do
+    [[ -f "$root/$relative_path" && ! -L "$root/$relative_path" ]] || {
+      echo "Qwen gate power-event snapshot is not a regular file: $relative_path" >&2
+      inventory_invalid=1
+      break
+    }
+    case "$relative_path" in
+      *.power-events.new)
+        [[ ! -s "$root/$relative_path" ]] || {
+          echo "Qwen gate power-event delta is not empty: $relative_path" >&2
+          inventory_invalid=1
+          break
+        }
+        ;;
+    esac
+  done <"$expected_path"
+  rm -f "$expected_path" "$actual_path"
+  ((inventory_invalid == 0))
+}
+
+qwen36_write_power_snapshot_manifest() {
+  local root="$1"
+  local manifest="$2"
+  shift 2
+  local tmp_path="${manifest}.tmp.$$"
+  local paths_path relative_path manifest_failed=0
+
+  qwen36_validate_power_snapshot_inventory "$root" "$@" || return 1
+  paths_path=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-paths.XXXXXX") || return 1
+  qwen36_write_sorted_power_snapshot_paths "$paths_path" "$@" || {
+    rm -f "$paths_path"
+    return 1
+  }
+  : >"$tmp_path" || {
+    rm -f "$paths_path" "$tmp_path"
+    return 1
+  }
+  while IFS= read -r relative_path; do
+    (
+      cd "$root" || exit 1
+      shasum -a 256 "$relative_path"
+    ) >>"$tmp_path" || {
+      manifest_failed=1
+      break
+    }
+  done <"$paths_path"
+  rm -f "$paths_path"
+  if ((manifest_failed != 0)); then
+    rm -f "$tmp_path"
+    return 1
+  fi
+  mv "$tmp_path" "$manifest" || {
+    rm -f "$tmp_path"
+    return 1
+  }
+}
+
+qwen36_verify_power_snapshot_manifest() {
+  local root="$1"
+  local manifest="$2"
+  shift 2
+  local expected_paths manifest_paths manifest_paths_unsorted
+  local prefix recomputed_path
+
+  [[ -f "$manifest" && ! -L "$manifest" && -s "$manifest" ]] || {
+    echo "Qwen gate power-event snapshot manifest is missing or invalid" >&2
+    return 1
+  }
+  qwen36_validate_power_snapshot_inventory "$root" "$@" || return 1
+  expected_paths=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-expected.XXXXXX") || return 1
+  manifest_paths=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-manifest.XXXXXX") || {
+    rm -f "$expected_paths"
+    return 1
+  }
+  manifest_paths_unsorted=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-manifest-raw.XXXXXX") || {
+    rm -f "$expected_paths" "$manifest_paths"
+    return 1
+  }
+  qwen36_write_sorted_power_snapshot_paths "$expected_paths" "$@" || {
+    rm -f "$expected_paths" "$manifest_paths" "$manifest_paths_unsorted"
+    return 1
+  }
+  if ! awk '
+    $1 !~ /^[0-9a-f]+$/ || length($1) != 64 || $2 == "" || NF != 2 { exit 1 }
+    { print $2 }
+  ' "$manifest" >"$manifest_paths_unsorted"; then
+    echo "Qwen gate power-event snapshot manifest has an invalid row" >&2
+    rm -f "$expected_paths" "$manifest_paths" "$manifest_paths_unsorted"
+    return 1
+  fi
+  sort "$manifest_paths_unsorted" >"$manifest_paths" || {
+    rm -f "$expected_paths" "$manifest_paths" "$manifest_paths_unsorted"
+    return 1
+  }
+  rm -f "$manifest_paths_unsorted"
+  if ! cmp -s "$expected_paths" "$manifest_paths"; then
+    echo "Qwen gate power-event snapshot manifest paths do not match the release contract" >&2
+    rm -f "$expected_paths" "$manifest_paths"
+    return 1
+  fi
+  rm -f "$expected_paths" "$manifest_paths"
+  (
+    cd "$root" || exit 1
+    shasum -a 256 -c "$manifest" >/dev/null
+  ) || {
+    echo "Qwen gate power-event snapshot digest verification failed" >&2
+    return 1
+  }
+  for prefix in "$@"; do
+    recomputed_path=$(mktemp "${TMPDIR:-/tmp}/hf2q-power-recomputed.XXXXXX") \
+      || return 1
+    qwen36_extract_new_power_events \
+      "$root/${prefix}.power-events.baseline" \
+      "$root/${prefix}.power-events.final" \
+      "$recomputed_path" || {
+        rm -f "$recomputed_path"
+        return 1
+      }
+    if ! cmp -s "$recomputed_path" "$root/${prefix}.power-events.new"; then
+      echo "Qwen gate power-event snapshot delta does not match: $prefix" >&2
+      rm -f "$recomputed_path"
+      return 1
+    fi
+    if [[ -s "$recomputed_path" ]]; then
+      echo "Qwen gate power-event snapshot records an interruption: $prefix" >&2
+      rm -f "$recomputed_path"
+      return 1
+    fi
+    rm -f "$recomputed_path"
+  done
 }
 
 qwen36_validate_power_event_counts() {
@@ -311,12 +576,20 @@ qwen36_start_power_guard() {
     echo "Qwen hardware gate power-guard target PID is not live: $target_pid" >&2
     return 1
   fi
+  QWEN36_POWER_EVENT_BASELINE_PATH="${guard_log}.power-events.baseline"
+  QWEN36_POWER_EVENT_FINAL_PATH="${guard_log}.power-events.final"
+  QWEN36_POWER_EVENT_NEW_PATH="${guard_log}.power-events.new"
+  qwen36_capture_power_events "$QWEN36_POWER_EVENT_BASELINE_PATH" || return 1
+  QWEN36_POWER_EVENT_BASELINE=$(wc -l <"$QWEN36_POWER_EVENT_BASELINE_PATH" | tr -d ' ') \
+    || return 1
+  [[ "$QWEN36_POWER_EVENT_BASELINE" =~ ^[0-9]+$ ]] || {
+    echo "Qwen gate could not count the baseline macOS power events" >&2
+    return 1
+  }
   pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
     echo "Qwen hardware gate requires AC power" >&2
     return 1
   }
-
-  QWEN36_POWER_EVENT_BASELINE=$(qwen36_power_event_count)
   caffeinate -dimsu -w "$target_pid" >"$guard_log" 2>&1 &
   QWEN36_POWER_GUARD_LAUNCH_PID=$!
   QWEN36_POWER_GUARD_TARGET_PID=$target_pid
@@ -363,9 +636,27 @@ qwen36_assert_power_guard() {
     echo "Qwen hardware gate lost AC power" >&2
     return 1
   }
-  QWEN36_POWER_EVENT_FINAL=$(qwen36_power_event_count)
+  qwen36_capture_power_events "$QWEN36_POWER_EVENT_FINAL_PATH" || return 1
+  qwen36_extract_new_power_events \
+    "$QWEN36_POWER_EVENT_BASELINE_PATH" \
+    "$QWEN36_POWER_EVENT_FINAL_PATH" \
+    "$QWEN36_POWER_EVENT_NEW_PATH" || return 1
+  QWEN36_POWER_EVENT_NEW_COUNT=$(wc -l <"$QWEN36_POWER_EVENT_NEW_PATH" | tr -d ' ') \
+    || return 1
+  [[ "$QWEN36_POWER_EVENT_NEW_COUNT" =~ ^[0-9]+$ ]] || {
+    echo "Qwen gate could not count new macOS power events" >&2
+    return 1
+  }
+  # Preserve the established receipt schema while making its delta logical:
+  # final = baseline + genuinely new events, independent of history rollover.
+  QWEN36_POWER_EVENT_FINAL=$((
+    QWEN36_POWER_EVENT_BASELINE + QWEN36_POWER_EVENT_NEW_COUNT
+  ))
   qwen36_validate_power_event_counts \
-    "$QWEN36_POWER_EVENT_BASELINE" "$QWEN36_POWER_EVENT_FINAL"
+    "$QWEN36_POWER_EVENT_BASELINE" "$QWEN36_POWER_EVENT_FINAL" || {
+      sed -n '1,3p' "$QWEN36_POWER_EVENT_NEW_PATH" >&2
+      return 1
+    }
 }
 
 qwen36_stop_power_guard() {
