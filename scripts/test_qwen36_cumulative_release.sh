@@ -207,6 +207,7 @@ jq -n \
   >"$summary.tmp"
 jq -e '.status == "pass" and .server_pid > 0 and .max_slots == 4 and .warmup_max_tool_result_ms == 15000 and .measured_max_tool_result_ms == 10000 and .ready_http == 200 and .power_event_delta == 0 and .overlap.status == "pass" and .overlap.prompt_tokens == 87972 and .overlap.chunks == 44 and .overlap.full_chunks == 42 and all(.agent_waves[]; .status == "pass" and .family == "qwen36" and .concurrent_agents == 4 and .require_cold_first == 1 and all(.agents[]; .cold_cached_tokens == 0)) and .heap_bounds_valid == true and all(.heap[]; .command_buffer_objects == 0 and .command_buffer_impls == 0) and .heap_deltas.cfstring_baseline_to_overlap <= 512 and .heap_deltas.cfstring_overlap_to_warmup <= 512 and .heap_deltas.cfstring_baseline_to_warmup <= 1024 and .heap_deltas.cfstring_warmup_to_wave1 <= 256 and .heap_deltas.cfstring_wave1_to_wave2 <= 256 and .heap_deltas.cfstring_warmup_to_wave2 <= 512 and .heap_deltas.pool_baseline_to_overlap <= 8 and .heap_deltas.pool_overlap_to_warmup <= 8 and .heap_deltas.pool_baseline_to_warmup <= 16 and .heap_deltas.pool_warmup_to_wave1 <= 8 and .heap_deltas.pool_wave1_to_wave2 <= 8 and .heap_deltas.pool_warmup_to_wave2 <= 16' \
   "$summary.tmp" >/dev/null
+qwen36_assert_power_guard
 mv "$summary.tmp" "$summary"
 shasum -a 256 "$summary" >"$summary.sha256"
 shasum -c "$summary.sha256" >/dev/null

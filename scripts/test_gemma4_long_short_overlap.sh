@@ -80,7 +80,7 @@ wait_for_log() {
       printf '%s\n' "$row"
       return 0
     fi
-    qwen36_assert_power_guard
+    qwen36_assert_power_guard || return 1
     sleep 0.1
   done
   echo "timed out waiting for Gemma log: $pattern" >&2
@@ -297,6 +297,7 @@ jq -n \
   >"$OUT_DIR/summary.json.tmp"
 jq -e '.status == "pass" and .server_pid > 0 and .max_slots == 4 and .long_prompt_tokens > 80000 and .short_semantic_during_long_prefill == true and .short_semantic_events > 0 and .committed_tokens_when_short_progressed < .long_prompt_tokens and .cancel_prompt_tokens > 80000 and .cancellation_delta == 1 and .chunks_after_cancel == .chunks_after_stability and .rollback_restores >= 1 and .transaction_cap_tokens == 4096 and .ready_http == 200 and .power_event_delta == 0' \
   "$OUT_DIR/summary.json.tmp" >/dev/null
+qwen36_assert_power_guard
 mv "$OUT_DIR/summary.json.tmp" "$OUT_DIR/summary.json"
 shasum -a 256 "$OUT_DIR/summary.json" >"$OUT_DIR/summary.json.sha256"
 shasum -c "$OUT_DIR/summary.json.sha256" >/dev/null

@@ -47,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make the shared large-model sleep/thermal guard robust to macOS power-log
+  rollover. Exact-main run `31755150906` attempt 4 completed the full
+  DeepSeek and Gemma matrices, then Qwen accepted both its 552-token lane and
+  87,972-token overlap lane. macOS entered clamshell DarkWake while the lanes
+  were running; the old matcher ignored DarkWake and then false-failed
+  `402 -> 401` as older `pmset` rows expired. Cleanup ended the sleep
+  assertions before the later full-sleep row. The guard now captures DarkWake,
+  full sleep, and thermal events and compares baseline/final snapshots as
+  multisets: expired rows are harmless, every newly added event remains fatal,
+  and the established receipt delta stays monotonic and fail-closed. Each leaf
+  gate rechecks immediately before committing its receipt, and release replay
+  rehashes the exact snapshot inventory and recomputes every empty delta.
 - Keep long agentic continuations attached to their strongest retained prefix
   across all three SlotAware families. Admission now distinguishes an active
   prefix from an idle reusable prefix: a continuation waits for the active

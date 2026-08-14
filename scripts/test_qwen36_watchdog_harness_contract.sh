@@ -6,7 +6,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
-for command in jq awk sed wc tr mktemp seq shasum stat find; do
+for command in jq awk cmp diff sed wc tr mktemp seq shasum stat find grep; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -34,6 +34,203 @@ expect_fail qwen36_require_empty_receipt_dir "$test_dir/empty-receipt"
 qwen36_validate_power_event_counts 12 12
 expect_fail qwen36_validate_power_event_counts 12 13
 expect_fail qwen36_validate_power_event_counts not-a-number 12
+
+power_baseline="$test_dir/power-events.baseline"
+power_final="$test_dir/power-events.final"
+power_new="$test_dir/power-events.new"
+printf '%s\n' \
+  '2026-08-12 05:23:10 -0700 Sleep Entering Sleep state old-a' \
+  '2026-08-12 06:08:39 -0700 Sleep Entering Sleep state old-b' \
+  >"$power_baseline"
+# A rolling log may prune the oldest baseline row without recording a new
+# event. That is not an interruption and must not create a false positive.
+printf '%s\n' \
+  '2026-08-12 06:08:39 -0700 Sleep Entering Sleep state old-b' \
+  >"$power_final"
+qwen36_extract_new_power_events "$power_baseline" "$power_final" "$power_new"
+[[ ! -s "$power_new" ]]
+
+# A newly appended event remains visible even when another baseline row was
+# pruned, which is the exact counterexample from hardware run 31755150906.
+printf '%s\n' \
+  '2026-08-12 06:08:39 -0700 Sleep Entering Sleep state old-b' \
+  '2026-08-13 22:58:38 -0700 Sleep Entering Sleep state new-clamshell' \
+  >"$power_final"
+qwen36_extract_new_power_events "$power_baseline" "$power_final" "$power_new"
+[[ "$(wc -l <"$power_new" | tr -d ' ')" == 1 ]]
+grep -Fq 'new-clamshell' "$power_new"
+expect_fail qwen36_validate_power_event_counts 12 13
+
+# Preserve multiset semantics if two byte-identical rows ever appear.
+printf '%s\n' \
+  '2026-08-12 06:08:39 -0700 Sleep Entering Sleep state old-b' \
+  '2026-08-12 06:08:39 -0700 Sleep Entering Sleep state old-b' \
+  >"$power_final"
+qwen36_extract_new_power_events "$power_baseline" "$power_final" "$power_new"
+[[ "$(wc -l <"$power_new" | tr -d ' ')" == 1 ]]
+
+# An empty baseline must not cause awk's usual NR==FNR empty-file trap.
+: >"$power_baseline"
+printf '%s\n' \
+  '2026-08-13 22:58:38 -0700 Sleep Entering Sleep state first-event' \
+  >"$power_final"
+qwen36_extract_new_power_events "$power_baseline" "$power_final" "$power_new"
+[[ "$(wc -l <"$power_new" | tr -d ' ')" == 1 ]]
+expect_fail qwen36_extract_new_power_events \
+  "$test_dir/missing-power-events" "$power_final" "$power_new"
+
+pmset() {
+  [[ "${QWEN36_TEST_PMSET_FAIL:-0}" == 0 ]] || return 1
+  printf '%s\n' \
+    '2026-08-13 22:58:38 -0700 Sleep Entering Sleep state captured-event' \
+    "2026-08-13 22:58:33 -0700 Sleep Entering DarkWake state due to 'Clamshell Sleep':TCPKeepAlive=active Using AC (Charge:63%)" \
+    'irrelevant power-log row'
+}
+qwen36_capture_power_events "$test_dir/captured-power-events"
+[[ "$(wc -l <"$test_dir/captured-power-events" | tr -d ' ')" == 2 ]]
+grep -Fq 'captured-event' "$test_dir/captured-power-events"
+grep -Fq 'Entering DarkWake state' "$test_dir/captured-power-events"
+QWEN36_TEST_PMSET_FAIL=1 \
+  expect_fail qwen36_capture_power_events "$test_dir/failed-power-events"
+unset -f pmset
+
+# Bash 3.2 suppresses `errexit` when a function is evaluated by `if` or a
+# command substitution. A capture error must return explicitly instead of
+# reusing a pre-existing clean final snapshot and reporting a zero delta.
+printf 'old sleep row\n' >"$test_dir/stale-power-events.baseline"
+cp "$test_dir/stale-power-events.baseline" \
+  "$test_dir/stale-power-events.final"
+: >"$test_dir/stale-power-events.new"
+QWEN36_POWER_GUARD_TARGET_PID=$$
+QWEN36_POWER_GUARD_PID=$$
+QWEN36_POWER_EVENT_BASELINE=1
+QWEN36_POWER_EVENT_BASELINE_PATH="$test_dir/stale-power-events.baseline"
+QWEN36_POWER_EVENT_FINAL_PATH="$test_dir/stale-power-events.final"
+QWEN36_POWER_EVENT_NEW_PATH="$test_dir/stale-power-events.new"
+qwen36_bound_caffeinate_pid() { printf '%s\n' "$$"; }
+pmset() {
+  case "$*" in
+    '-g assertions') printf 'mock assertion\n' ;;
+    '-g batt') printf "Now drawing from 'AC Power'\n" ;;
+    '-g log') return 1 ;;
+    *) return 1 ;;
+  esac
+}
+expect_fail qwen36_assert_power_guard
+wait_like_command_substitution() {
+  qwen36_assert_power_guard || return 1
+  printf 'unreachable\n'
+}
+if stale_result=$(wait_like_command_substitution 2>/dev/null); then
+  echo "power capture failure was hidden by command substitution: $stale_result" >&2
+  exit 1
+fi
+unset -f pmset qwen36_bound_caffeinate_pid wait_like_command_substitution
+
+snapshot_root="$test_dir/power-snapshot-root"
+snapshot_manifest="$snapshot_root/power-event-snapshots.sha256"
+snapshot_prefixes=(family-a/caffeinate.log family-b/caffeinate.log)
+release_snapshot_prefixes=()
+while IFS= read -r prefix; do
+  release_snapshot_prefixes+=("$prefix")
+done < <(qwen36_release_power_snapshot_prefixes)
+[[ "${#release_snapshot_prefixes[@]}" == 5 ]]
+[[ "$(qwen36_power_snapshot_paths "${release_snapshot_prefixes[@]}" | wc -l | tr -d ' ')" == 15 ]]
+for prefix in "${snapshot_prefixes[@]}"; do
+  mkdir -p "$snapshot_root/$(dirname "$prefix")"
+  printf '%s\n' "old event for $prefix" \
+    >"$snapshot_root/${prefix}.power-events.baseline"
+  cp "$snapshot_root/${prefix}.power-events.baseline" \
+    "$snapshot_root/${prefix}.power-events.final"
+  : >"$snapshot_root/${prefix}.power-events.new"
+done
+qwen36_write_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+qwen36_verify_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+[[ "$(wc -l <"$snapshot_manifest" | tr -d ' ')" == 6 ]]
+
+# A producer that emits a complete-looking list and then fails must not be
+# accepted in Bash conditional contexts where `errexit` is suppressed.
+# shellcheck disable=SC2329
+find() {
+  command find "$@"
+  return 42
+}
+expect_fail qwen36_validate_power_snapshot_inventory \
+  "$snapshot_root" "${snapshot_prefixes[@]}"
+unset -f find
+# shellcheck disable=SC2329
+qwen36_power_snapshot_paths() {
+  local injected_prefix
+  for injected_prefix in "$@"; do
+    printf '%s\n' \
+      "${injected_prefix}.power-events.baseline" \
+      "${injected_prefix}.power-events.final" \
+      "${injected_prefix}.power-events.new"
+  done
+  return 43
+}
+expect_fail qwen36_validate_power_snapshot_inventory \
+  "$snapshot_root" "${snapshot_prefixes[@]}"
+# Restore the authoritative helper definitions for the remaining tests.
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
+source "$script_dir/qwen36_watchdog_validate.sh"
+
+# Download-side verification must reject changed bytes, an unrecorded delta,
+# missing/extra inventory, and a nonempty committed `.new` file.
+printf 'tamper\n' >>"$snapshot_root/family-a/caffeinate.log.power-events.final"
+expect_fail qwen36_verify_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+cp "$snapshot_root/family-a/caffeinate.log.power-events.baseline" \
+  "$snapshot_root/family-a/caffeinate.log.power-events.final"
+qwen36_write_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+printf 'new dark wake\n' >>"$snapshot_root/family-a/caffeinate.log.power-events.final"
+qwen36_write_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+expect_fail qwen36_verify_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+cp "$snapshot_root/family-a/caffeinate.log.power-events.baseline" \
+  "$snapshot_root/family-a/caffeinate.log.power-events.final"
+: >"$snapshot_root/family-a/caffeinate.log.power-events.new"
+qwen36_write_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+printf 'unbound\n' >"$snapshot_root/extra.power-events.baseline"
+expect_fail qwen36_verify_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+rm "$snapshot_root/extra.power-events.baseline"
+rm "$snapshot_root/family-b/caffeinate.log.power-events.final"
+expect_fail qwen36_verify_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+cp "$snapshot_root/family-b/caffeinate.log.power-events.baseline" \
+  "$snapshot_root/family-b/caffeinate.log.power-events.final"
+printf 'new event\n' >"$snapshot_root/family-b/caffeinate.log.power-events.new"
+expect_fail qwen36_write_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+
+# Every leaf powered receipt must take its terminal snapshot after validating
+# the temporary JSON and immediately before the atomic receipt commit.
+for powered_script in \
+  test_qwen36_cumulative_release.sh \
+  test_qwen36_prefill_watchdog.sh \
+  test_qwen36_prefill_cancellation.sh \
+  test_deepseek4_interactive_overlap.sh \
+  test_gemma4_long_short_overlap.sh; do
+  awk '
+    previous == "qwen36_assert_power_guard" && /^mv .*summary/ { found = 1 }
+    { previous = $0 }
+    END { exit(found ? 0 : 1) }
+  ' "$script_dir/$powered_script" || {
+    echo "powered receipt lacks a terminal assertion: $powered_script" >&2
+    exit 1
+  }
+done
+
+grep -Fq 'power_event_snapshots_sha256' \
+  "$script_dir/run_agentic_cache_release_gate.sh"
+grep -Fq 'qwen36_verify_power_snapshot_manifest' \
+  "$script_dir/../.github/workflows/release.yml"
 
 clean_log="$test_dir/clean.log"
 printf 'INFO bounded transaction complete\n' >"$clean_log"
