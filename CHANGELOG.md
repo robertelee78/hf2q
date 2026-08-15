@@ -47,6 +47,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Contain an intermittent Gemma N=8 tiny slot-prefill coherence fault without
+  changing the established long-prefill graph. Exact-main packed run
+  `31823149737` reached Gemma's release-profile parity test after the preceding
+  DeepSeek and Gemma gates passed, then exposed an all-non-finite logit row
+  after batched decode followed by a 2–5-token cold mounted prefill. Cold text
+  work below 32 tokens now uses the linear slot-aware path, 1–31-token retained
+  suffixes append through the existing one-token slot primitive, and initial,
+  installed, and stable cross-slot admission cannot bypass that boundary. A
+  production-worker discriminator then found a separate defect in the linear
+  fallback: pinned `mlx-native` 0.10.8 `flash_attn_vec` loads a complete 32-row
+  K/V tile before masking, while tiny requests previously allocated only their
+  logical 3–29-row extent. Linear physical KV capacity is now rounded through
+  the final 32-row tile; the pinned dependency's `MlxDevice::alloc_buffer`
+  zero-fills that allocation, so masked padding is finite. Linear and batched
+  prefill both reject the observed non-finite argmax poison, and a one-token
+  generation budget now terminates at the prefill seed instead of decoding an
+  extra token. The failed command-buffer/fence experiments are not shipped,
+  the original tiny batched-prefill cause remains open behind the containment
+  boundary. Focused
+  dirty-source evidence passed 25/25 fresh N=8 worker rounds at each of
+  `max_tokens=1`, `2`, and `24`, plus 64 cold/staggered and 16 retained-suffix
+  rounds in both Hybrid and full-TQ/HB regimes. A new exact-packed N=8 worker
+  and cross-family hardware run is still required; its worker receipt now
+  requires canonical cross-slot admission, 25 repeated normal 24-token and
+  one-token seed-budget parity rounds, and both Hybrid and full-TQ/HB direct
+  tiny-prefill discriminators.
 - Make the shared large-model sleep/thermal guard robust to macOS power-log
   rollover. Exact-main run `31755150906` attempt 4 completed the full
   DeepSeek and Gemma matrices, then Qwen accepted both its 552-token lane and

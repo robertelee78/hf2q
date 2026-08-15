@@ -5,20 +5,23 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HARNESS="$ROOT_DIR/scripts/test_gemma4_long_short_overlap.sh"
 RELEASE_GATE="$ROOT_DIR/scripts/run_agentic_cache_release_gate.sh"
 RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
+PARITY_VERIFIER="$ROOT_DIR/scripts/verify_gemma4_parity_receipt.sh"
 
-for command in awk bash grep; do
+for command in awk bash grep jq shasum; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
   }
 done
-bash -n "$HARNESS" "$RELEASE_GATE"
+bash -n "$HARNESS" "$RELEASE_GATE" "$PARITY_VERIFIER"
 bash -n "$ROOT_DIR/scripts/verify_gemma4_wave_thermal_receipt.sh"
 
 invalid_stderr=$(mktemp)
 exit_probe_script=$(mktemp)
+parity_contract_dir=$(mktemp -d)
 cleanup_contract() {
   rm -f "$invalid_stderr" "$exit_probe_script"
+  rm -rf "$parity_contract_dir"
 }
 trap cleanup_contract EXIT
 if SERVER_PID=1 SERVER_LOG=/dev/null BINARY_PATH=/bin/true \
@@ -233,6 +236,104 @@ grep -qF 'gemma_fresh_and_reused_4096_8193_bounded_outputs_match' "$RELEASE_GATE
   echo "Gemma release gate does not run the bounded fresh-versus-reused parity test" >&2
   exit 1
 }
+[[ "$(grep -cF 'HF2Q_CROSS_SLOT_ADMIT=1 HF2Q_ADMIT_COALESCE_US=25000' "$RELEASE_GATE")" == 2 ]] || {
+  echo "Gemma N=8 worker parity must use the canonical 25ms admission-coalescing window" >&2
+  exit 1
+}
+[[ "$(grep -cF 'HF2Q_GEMMA_N8_PARITY_ROUNDS=25' "$RELEASE_GATE")" == 2 ]] || {
+  echo "Gemma release gate must repeat both N=8 worker budgets 25 times" >&2
+  exit 1
+}
+[[ "$(grep -cF 'gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant' "$RELEASE_GATE")" == 2 ]] || {
+  echo "Gemma release gate must run the direct tiny-prefill discriminator in both cache regimes" >&2
+  exit 1
+}
+for regime in \
+  'HF2Q_HYBRID_KV=1 HF2Q_USE_DENSE=0 HF2Q_TQ_CODEBOOK_BITS=8' \
+  'HF2Q_HYBRID_KV=0 HF2Q_USE_DENSE=0 HF2Q_TQ_CODEBOOK_BITS=8' \
+  'HF2Q_GEMMA_N8_EXPECTED_KV_REGIME=hybrid' \
+  'HF2Q_GEMMA_N8_EXPECTED_KV_REGIME=full-tq'; do
+  grep -qF "$regime" "$RELEASE_GATE" || {
+    echo "Gemma direct discriminator does not pin its requested KV regime: $regime" >&2
+    exit 1
+  }
+done
+[[ "$(grep -cF 'verify_gemma4_parity_receipt.sh' "$RELEASE_GATE")" == 2 ]] || {
+  echo "Gemma producer must verify leaf parity logs after creation and before manifest seal" >&2
+  exit 1
+}
+grep -qF 'verify_gemma4_parity_receipt.sh' "$RELEASE_WORKFLOW" || {
+  echo "publication does not independently rehash Gemma parity leaf logs" >&2
+  exit 1
+}
+
+parity_files=(
+  n4.log
+  n8.log
+  n8-seed-budget.log
+  n8-tiny-hybrid.log
+  n8-tiny-full-tq.log
+  boundary-tail.log
+  long-resume.log
+)
+for file in "${parity_files[@]}"; do
+  printf 'fixture:%s\n' "$file" >"$parity_contract_dir/$file"
+done
+jq -n \
+  --arg n4 "$(shasum -a 256 "$parity_contract_dir/n4.log" | awk '{print $1}')" \
+  --arg n8 "$(shasum -a 256 "$parity_contract_dir/n8.log" | awk '{print $1}')" \
+  --arg seed "$(shasum -a 256 "$parity_contract_dir/n8-seed-budget.log" | awk '{print $1}')" \
+  --arg hybrid "$(shasum -a 256 "$parity_contract_dir/n8-tiny-hybrid.log" | awk '{print $1}')" \
+  --arg full_tq "$(shasum -a 256 "$parity_contract_dir/n8-tiny-full-tq.log" | awk '{print $1}')" \
+  --arg boundary "$(shasum -a 256 "$parity_contract_dir/boundary-tail.log" | awk '{print $1}')" \
+  --arg resume "$(shasum -a 256 "$parity_contract_dir/long-resume.log" | awk '{print $1}')" \
+  '{status:"pass",n4_log_sha256:$n4,n8_log_sha256:$n8,n8_seed_budget_log_sha256:$seed,n8_tiny_hybrid_log_sha256:$hybrid,n8_tiny_full_tq_log_sha256:$full_tq,boundary_tail_log_sha256:$boundary,long_resume_log_sha256:$resume}' \
+  >"$parity_contract_dir/summary.json"
+bash "$PARITY_VERIFIER" "$parity_contract_dir/summary.json" "$parity_contract_dir" \
+  >/dev/null
+printf 'unexpected\n' >"$parity_contract_dir/extra.log"
+if bash "$PARITY_VERIFIER" "$parity_contract_dir/summary.json" "$parity_contract_dir" \
+  >/dev/null 2>&1; then
+  echo "Gemma parity verifier accepted an extra unbound log" >&2
+  exit 1
+fi
+rm -f "$parity_contract_dir/extra.log"
+printf 'tamper\n' >>"$parity_contract_dir/n8.log"
+if bash "$PARITY_VERIFIER" "$parity_contract_dir/summary.json" "$parity_contract_dir" \
+  >/dev/null 2>&1; then
+  echo "Gemma parity verifier accepted a mutated bound log" >&2
+  exit 1
+fi
+[[ "$(grep -cF -- '--test-threads=1 --nocapture' "$RELEASE_GATE")" == 4 ]] || {
+  echo "Gemma N=8 release logs must retain their non-vacuity and KV-regime banners" >&2
+  exit 1
+}
+grep -qF 'HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=24' "$RELEASE_GATE" || {
+  echo "Gemma release gate does not bind the normal N=8 generation budget" >&2
+  exit 1
+}
+grep -qF 'HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=1' "$RELEASE_GATE" || {
+  echo "Gemma release gate does not bind the one-token N=8 seed budget" >&2
+  exit 1
+}
+# jq variables below are literal publication contracts.
+# shellcheck disable=SC2016
+for predicate in \
+  'and $g.parity.n8_cross_slot_admit == true' \
+  'and $g.parity.n8_max_tokens == 24' \
+  'and $g.parity.n8_rounds == 25' \
+  'and $g.parity.n8_seed_budget_exact_output_parity == true' \
+  'and $g.parity.n8_seed_budget_max_tokens == 1' \
+  'and $g.parity.n8_seed_budget_rounds == 25' \
+  'and $g.parity.n8_tiny_hybrid_exact_output_parity == true' \
+  'and $g.parity.n8_tiny_full_tq_exact_output_parity == true' \
+  'and $g.parity.n8_tiny_prefill_rounds == 64' \
+  'and $g.parity.n8_tiny_resume_rounds == 16'; do
+  grep -qF "$predicate" "$RELEASE_WORKFLOW" || {
+    echo "publication does not bind the N=8 production parity contract: $predicate" >&2
+    exit 1
+  }
+done
 grep -qF 'fresh_and_reused_4096_8193_bounded_output_parity:true' "$RELEASE_GATE" || {
   echo "Gemma parity receipt does not bind bounded fresh-versus-reused output" >&2
   exit 1

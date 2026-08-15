@@ -6559,6 +6559,14 @@ struct Gemma4DecodeState {
     decode_started: Instant,
 }
 
+fn gemma4_seed_finished(
+    finish_reason: &'static str,
+    generated_tokens: usize,
+    max_decode_tokens: usize,
+) -> bool {
+    finish_reason != "length" || generated_tokens >= max_decode_tokens
+}
+
 impl Gemma4DecodeState {
     fn prompt_tokens(&self) -> &[u32] {
         &self.prompt_tokens
@@ -7023,9 +7031,14 @@ impl Gemma4DecodeState {
     }
 
     /// Whether the slot already terminated during prefill-seed (first token
-    /// was EOS/stop), so the loop should skip decode ticks and finish now.
+    /// was EOS/stop or exhausted the generation budget), so the loop should
+    /// skip decode ticks and finish now.
     fn finished_at_seed(&self) -> bool {
-        self.finish_reason != "length"
+        gemma4_seed_finished(
+            self.finish_reason,
+            self.generated_tokens.len(),
+            self.max_decode_tokens,
+        )
     }
 
     /// The first semantic fragment was selected by prefill, before the first
@@ -12143,6 +12156,13 @@ fn advance_gemma4_prefill_quantum(
     let batch_supported = cross_slot_admit
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
+        && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+            primary
+                .prompt_tokens
+                .len()
+                .saturating_sub(primary.progress.cursor()),
+            false,
+        )
         && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
     if !batch_supported {
         return advance_gemma4_prefill(
@@ -12167,6 +12187,13 @@ fn advance_gemma4_prefill_quantum(
                 slots[slot_index].as_ref(),
                 Some((Gemma4SlotWork::Prefill(state), reply, _))
                     if (state.progress.cursor() == 0) == start_at_zero
+                        && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+                            state
+                                .prompt_tokens
+                                .len()
+                                .saturating_sub(state.progress.cursor()),
+                            false,
+                        )
                         && !reply.client_closed()
             )
         })
@@ -12443,6 +12470,9 @@ fn advance_gemma4_prefill_quantum(
 /// `ITER_GA_BATCHED_ADMIT_COUNT` counts forwards with N>=2 (E2E test signal).
 pub(crate) static ITER_GA_BATCHED_ADMIT_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[allow(clippy::too_many_arguments)]
 fn admit_gemma4_slots_batched(
@@ -12462,9 +12492,21 @@ fn admit_gemma4_slots_batched(
     // not independently to every lane. Direct/internal callers that hand us
     // a larger aggregate are routed through the bounded single-slot state
     // machine instead of constructing a 16K-32K multi-sequence forward.
-    if !gemma4_batch_rows_within_transaction_limit(
+    let transaction_too_large = !gemma4_batch_rows_within_transaction_limit(
         requests.iter().map(|(prompt, _, _)| prompt.len()),
-    ) {
+    );
+    let has_tiny_prefill = requests.iter().any(|(prompt, _, _)| {
+        !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+            prompt.len(),
+            false,
+        )
+    });
+    if transaction_too_large || has_tiny_prefill {
+        #[cfg(test)]
+        if has_tiny_prefill {
+            GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut requests = requests.into_iter();
         while let Some((prompt_tokens, params, reply)) = requests.next() {
             if let Some(mut fatal) = admit_gemma4_slot(
@@ -13007,7 +13049,23 @@ fn admit_gemma4_slots_stable_batched(
     // stable batch, execute the entire contiguous group through the proven
     // single-request path in original FIFO order. A later cold/incompatible
     // lane must never run before an earlier cached lane has reserved its slot.
-    if plan.len() != requests.len() || plan.len() < 2 {
+    let has_tiny_phase =
+        requests
+            .iter()
+            .zip(plan.iter())
+            .any(|((prompt, _, _), (preference, boundary, _))| {
+                let boundary_work = boundary.saturating_sub(preference.cached_tokens);
+                let cue_work = prompt.len().saturating_sub(*boundary);
+                (boundary_work > 0
+                    && !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+                        boundary_work,
+                        false,
+                    ))
+                    || !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+                        cue_work, false,
+                    )
+            });
+    if plan.len() != requests.len() || plan.len() < 2 || has_tiny_phase {
         return fallback_single(
             guard,
             scheduler,
@@ -13227,6 +13285,10 @@ fn admit_gemma4_slots_stable_batched(
 
     // Phase one advances only requests that have an appended conversation
     // suffix before their exact native generation cue.
+    let boundary_suffix_tokens: usize = admitted
+        .iter()
+        .map(|(_, _, _, _, preference, boundary)| boundary.saturating_sub(preference.cached_tokens))
+        .sum();
     let boundary_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
         .iter()
         .filter_map(|(handle, prompt, _, _, preference, boundary)| {
@@ -13321,7 +13383,7 @@ fn admit_gemma4_slots_stable_batched(
     GEMMA4_STABLE_RESUME_BATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
         requests = admitted.len(),
-        suffix_tokens = boundary_seqs.iter().map(|(s, _, _)| s.len()).sum::<usize>(),
+        suffix_tokens = boundary_suffix_tokens,
         elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
         "Gemma4 stable agent suffixes prefilled in one multi-slot body"
     );
@@ -27343,6 +27405,10 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "engine_gemma4_tiny_prefill_tests.rs"]
+mod gemma4_tiny_prefill_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::schema::{ChatMessage, ContentPart, ImageUrl, MessageContent};
     use super::*;
@@ -31537,6 +31603,28 @@ assistant:
         true
     }
 
+    fn positive_test_env_usize(name: &str, default: usize, maximum: usize) -> usize {
+        let value = match std::env::var(name) {
+            Ok(raw) => raw
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name} must be an integer: {error}")),
+            Err(std::env::VarError::NotPresent) => default,
+            Err(error) => panic!("{name} is not valid Unicode: {error}"),
+        };
+        assert!(
+            (1..=maximum).contains(&value),
+            "{name} must be in 1..={maximum}, got {value}"
+        );
+        value
+    }
+
+    #[test]
+    fn gemma_prefill_seed_honors_the_one_token_generation_budget() {
+        assert!(gemma4_seed_finished("length", 1, 1));
+        assert!(!gemma4_seed_finished("length", 1, 2));
+        assert!(gemma4_seed_finished("stop", 0, 64));
+    }
+
     #[test]
     fn engine_serial_fifo_byte_equivalent_to_pre_phase_c() {
         if byte_equiv_skip_unless_gated("engine_serial_fifo_byte_equivalent_to_pre_phase_c") {
@@ -33332,6 +33420,16 @@ assistant:
         if byte_equiv_skip_unless_gated("slot_aware_n8_per_slot_parity_vs_serial") {
             return;
         }
+        assert_eq!(
+            std::env::var("HF2Q_CROSS_SLOT_ADMIT").as_deref(),
+            Ok("1"),
+            "slot_aware_n8_per_slot_parity_vs_serial must exercise the canonical HF2Q_CROSS_SLOT_ADMIT=1 production route"
+        );
+        assert_eq!(
+            std::env::var("HF2Q_ADMIT_COALESCE_US").as_deref(),
+            Ok("25000"),
+            "slot_aware_n8_per_slot_parity_vs_serial must use the canonical 25ms admission-coalescing window"
+        );
         let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
             .map(PathBuf::from)
             .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
@@ -33355,9 +33453,10 @@ assistant:
             vec![21, 22, 23],
             vec![24, 25, 26, 27, 28],
         ];
+        let max_tokens = positive_test_env_usize("HF2Q_GEMMA_N8_PARITY_MAX_TOKENS", 24, 4_096);
         let params = SamplingParams {
             temperature: 0.0,
-            max_tokens: 24,
+            max_tokens,
             ..Default::default()
         };
 
@@ -33383,34 +33482,64 @@ assistant:
             "vacuous: prompts 6 and 7 produced identical serial output"
         );
 
-        // Concurrent SlotAware run at the SHIPPED default width (max_slots: 8).
-        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
-        let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
-                .expect("spawn SlotAware{max_slots:8}");
-        let slot_results: Vec<GenerationResult> = rt.block_on(async {
-            let mut handles = Vec::new();
-            for p in prompts.iter().cloned() {
-                let eng = engine_slot.clone();
-                let pr = params.clone();
-                handles.push(tokio::spawn(async move {
-                    eng.generate(p, pr).await.expect("slot generate")
-                }));
+        let rounds = positive_test_env_usize("HF2Q_GEMMA_N8_PARITY_ROUNDS", 1, 1_024);
+        GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        for round in 0..rounds {
+            let fallback_before =
+                GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            // Concurrent SlotAware run at the SHIPPED default width
+            // (max_slots: 8). Each diagnostic round gets a fresh model so no
+            // retained prefix or terminal result can hide a cold-admission
+            // failure; the default remains the historical one-round gate.
+            let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+            let engine_slot = Engine::spawn_with_mode(
+                loaded_slot,
+                8,
+                None,
+                EngineMode::SlotAware { max_slots: 8 },
+            )
+            .expect("spawn SlotAware{max_slots:8}");
+            let slot_results: Vec<GenerationResult> = rt.block_on(async {
+                let mut handles = Vec::new();
+                for p in prompts.iter().cloned() {
+                    let eng = engine_slot.clone();
+                    let pr = params.clone();
+                    handles.push(tokio::spawn(async move {
+                        eng.generate(p, pr).await.expect("slot generate")
+                    }));
+                }
+                let mut out = Vec::new();
+                for h in handles {
+                    out.push(h.await.expect("join"));
+                }
+                out
+            });
+            for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
+                assert_genresult_byte_equal(
+                    slot,
+                    serial,
+                    &format!(
+                        "ADR-040 iter-F-n8parity — round {round} SlotAware N=8 slot {i} vs its serial ref"
+                    ),
+                );
             }
-            let mut out = Vec::new();
-            for h in handles {
-                out.push(h.await.expect("join"));
-            }
-            out
-        });
-        for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
-            assert_genresult_byte_equal(
-                slot,
-                serial,
-                &format!("ADR-040 iter-F-n8parity — SlotAware N=8 slot {i} vs its serial ref"),
+            rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+            let fallback_after =
+                GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                fallback_after > fallback_before,
+                "canonical cross-slot admission did not exercise the tiny-prefill fallback in round {round}: before={fallback_before}, after={fallback_after}"
             );
         }
-        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+        let tiny_fallbacks =
+            GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            tiny_fallbacks >= rounds,
+            "canonical cross-slot admission produced fewer tiny-prefill fallbacks than rounds: fallbacks={tiny_fallbacks}, rounds={rounds}"
+        );
+        eprintln!(
+            "[gemma-n8-parity] cross_slot_admit=1 max_tokens={max_tokens} rounds={rounds} tiny_prefill_fallbacks={tiny_fallbacks}"
+        );
     }
 
     /// ADR-040 M-QWEN — qwen35moe serial slot-aware reference (mirror of
@@ -34075,9 +34204,13 @@ assistant:
             dwq_overlay_path: None,
             kv_persist_dir: None,
         };
+        // Every request is at or above the conservative tiny-prefill boundary,
+        // so this test continues to prove that the eligible multi-seq path
+        // fires. Tiny mixed batches are covered by the N=8 parity fallback
+        // counter and the dedicated direct discriminator.
         let prompts: Vec<Vec<u32>> = (0..8u32)
             .map(|i| {
-                (0..(20 + i * 3))
+                (0..(32 + i * 3))
                     .map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000))
                     .collect()
             })

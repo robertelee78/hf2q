@@ -32,6 +32,53 @@ use crate::debug::INVESTIGATION_ENV;
 /// sliding-layer storage; legacy ring-cache behavior is unchanged.
 pub(crate) const GEMMA_AGENTIC_LIVE_RESERVE_TOKENS: usize = 16 * 1024;
 
+/// Cold slot-mounted prefills below this size use the linear slot-aware path.
+///
+/// The batched slot-mount path reuses large persistent KV views and is the
+/// throughput path for ordinary prompts. Repeated decode -> cold-admission
+/// testing on Apple M5 Max exposed intermittent all-non-finite logits only for
+/// observed tiny batched prefills (2-5 tokens). Thirty-two tokens is a
+/// conservative power-of-two containment boundary; lengths 6-31 are covered
+/// by policy, not a claim that each length independently reproduced the fault.
+/// The linear path separately rounds its dense KV allocation through the final
+/// 32-row `flash_attn_vec` tile; without that padding the fallback itself can
+/// read beyond a partial tile in pinned `mlx-native` 0.10.8.
+pub(crate) const GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS: usize = 32;
+/// `flash_attn_vec` evaluates K/V in 32-row tiles. The current shader masks
+/// lanes after loading each tile, so dense cache rows must be padded through
+/// the final complete tile rather than merely through the logical extent.
+pub(crate) const GEMMA_FLASH_ATTN_VEC_KV_TILE: usize = 32;
+
+fn gemma_flash_attn_vec_capacity(logical_tokens: usize) -> usize {
+    logical_tokens.div_ceil(GEMMA_FLASH_ATTN_VEC_KV_TILE) * GEMMA_FLASH_ATTN_VEC_KV_TILE
+}
+
+pub(crate) fn gemma_slot_prefill_batched_work_eligible(
+    work_len: usize,
+    has_soft_tokens: bool,
+) -> bool {
+    !has_soft_tokens && work_len >= GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS
+}
+
+fn validate_linear_prefill_argmax(value: f32, token_index: usize) -> Result<()> {
+    anyhow::ensure!(
+        value.is_finite(),
+        "linear prefill produced a non-finite argmax value at token {token_index}: {value}"
+    );
+    Ok(())
+}
+
+fn gemma_use_batched_slot_prefill(
+    prompt_len: usize,
+    has_soft_tokens: bool,
+    cached_tokens: usize,
+) -> bool {
+    !has_soft_tokens
+        && (cached_tokens > 0
+            || gemma_slot_prefill_batched_work_eligible(prompt_len, has_soft_tokens))
+        && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() != Ok("0")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GemmaKvCapacityPlan {
     /// Minimum capacity needed to finish this request safely.
@@ -50,9 +97,11 @@ pub(crate) fn gemma_kv_capacity_plan(
     sliding_window: usize,
     long_resume: bool,
 ) -> GemmaKvCapacityPlan {
-    let required_linear = seq_len + max_decode_tokens;
+    let required_linear = gemma_flash_attn_vec_capacity(seq_len + max_decode_tokens);
     let allocation_linear = if long_resume {
-        seq_len + max_decode_tokens.max(GEMMA_AGENTIC_LIVE_RESERVE_TOKENS)
+        gemma_flash_attn_vec_capacity(
+            seq_len + max_decode_tokens.max(GEMMA_AGENTIC_LIVE_RESERVE_TOKENS),
+        )
     } else {
         required_linear
     };
@@ -533,7 +582,8 @@ impl MlxModelWeights {
     ///     full-equality + zero-overlap gates).
     ///   * `self.dense_kvs.is_some()` (caller installed cached state).
     ///   * Per-layer `dense_kvs[layer].capacity >= required_capacity`
-    ///     where required = `seq_len + max_decode_tokens` for global,
+    ///     where the global requirement rounds `seq_len + max_decode_tokens`
+    ///     through the final 32-row `flash_attn_vec` tile,
     ///     `sliding_window` for sliding (caller checks; this function
     ///     defensively bails on violation rather than silently
     ///     corrupting state).
@@ -725,8 +775,9 @@ impl MlxModelWeights {
         //   - LayerType::Sliding (ring): capacity = sliding_window.
         //     Writes wrap via `slot = tok_pos % capacity`; reads use
         //     `kv_seq_len = min(tok_i + 1, sliding_window)` (lines 963-967).
-        //   - LayerType::Global (linear): capacity = seq_len + max_decode_tokens.
-        //     Writes are monotonically increasing.
+        //   - LayerType::Global (linear): logical extent is
+        //     seq_len + max_decode_tokens; allocation rounds through the final
+        //     32-row flash_attn_vec tile. Writes are monotonically increasing.
         // The dense flash_attn_vec dispatch at lines 960-981 uses
         // `mask_type=1` (pure causal) for both layer types. Ring
         // correctness rests on attention being permutation-invariant
@@ -755,7 +806,8 @@ impl MlxModelWeights {
         //     Attention is permutation-invariant over cached K,V, so slot
         //     order doesn't affect correctness. Dense flash_attn_vec reads
         //     the populated slots with a pure causal mask.
-        //   - Global (linear): seq_len + max_decode_tokens. Writes are monotonic.
+        //   - Global (linear): seq_len + max_decode_tokens, rounded through
+        //     the final 32-row flash_attn_vec tile. Writes are monotonic.
         // Ring buffer for sliding drops ~5 GB of dense KV at 20k decode on
         // Gemma-4 26B (8×1024×256 per layer vs 8×20022×256).
         let sw = self.sliding_window;
@@ -764,8 +816,8 @@ impl MlxModelWeights {
         let required_linear_capacity = capacity_plan.required_linear;
         let linear_capacity = capacity_plan.allocation_linear;
         // ADR-017 Phase E.a iter-3.6 — when `HF2Q_KV_LCP_LONG_RESUME=1`,
-        // sliding layers use a LINEAR buffer (cap = max(sw, seq_len +
-        // max_decode_tokens)) instead of a ring (cap = sw). Per-token
+        // sliding layers use a LINEAR buffer (cap = max(sw, round32(seq_len +
+        // max_decode_tokens))) instead of a ring (cap = sw). Per-token
         // writes go to slot=tok_i (no `% sw` wrap). flash_attn_vec
         // dispatches use `mask_type=2 + sliding_window=sw` so the
         // kernel applies sliding-window masking based on slot index
@@ -2825,6 +2877,14 @@ impl MlxModelWeights {
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("prefill finish T{tok_i}: {e}"))?;
 
+                let argmax_value = {
+                    let value: &[f32] =
+                        self.activations.argmax_value.as_slice().map_err(|e| {
+                            anyhow::anyhow!("prefill argmax value read T{tok_i}: {e}")
+                        })?;
+                    value[0]
+                };
+                validate_linear_prefill_argmax(argmax_value, tok_i)?;
                 last_token = {
                     let idx: &[u32] = self
                         .activations
@@ -2904,7 +2964,7 @@ impl MlxModelWeights {
         //       overrun → panic at line ~1881.
         //
         // Fix:
-        //   * snap_cap = max(sw, seq_len + max_decode_tokens) so
+        //   * snap_cap = max(sw, round32(seq_len + max_decode_tokens)) so
         //     pure-dense long prompts fit AND multi-turn headroom
         //     stays at sw for short prompts.
         //   * `snapshot_safe` skips the entire snapshot path when any
@@ -2940,8 +3000,9 @@ impl MlxModelWeights {
         // bytes from shapes BEFORE allocating ~2×live-KV of snapshot
         // copies; skip when the entry cannot fit the registry budget
         // (97K-token dual-leg ≈ 64 GB → swap-storm, measured live).
-        let lcp_snap_cap_est =
-            sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
+        let lcp_snap_cap_est = sw.max(gemma_flash_attn_vec_capacity(
+            seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
+        ));
         let lcp_est_bytes: u64 = {
             let dense: u64 = self
                 .layers
@@ -2997,8 +3058,8 @@ impl MlxModelWeights {
                 // because !has_sliding_layer). For those, snap_cap
                 // must be ≥ seq_len or the per-head memcpy at
                 // `copy_len_per_head = seq_len*hd*elem` overruns dst.
-                // Take max with `seq_len + max_decode_tokens` to
-                // accommodate both cases.
+                // Take max with the final rounded flash-attention tile for
+                // `seq_len + max_decode_tokens` to accommodate both cases.
                 //
                 // Memory cost on Gemma 4 26B (sliding+global):
                 // sliding+short (seq_len ≤ sw) → snap_cap = sw →
@@ -3012,8 +3073,9 @@ impl MlxModelWeights {
                 // 2031). +4096 under long-resume keeps typical turn
                 // growth admissible; only the snapshot over-allocates,
                 // the per-request live buffers stay exact.
-                let snap_cap =
-                    sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
+                let snap_cap = sw.max(gemma_flash_attn_vec_capacity(
+                    seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
+                ));
                 for live_layer in dense_kvs_vec.iter() {
                     let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
                     let live_cap_dim = live_layer
@@ -3175,10 +3237,11 @@ impl MlxModelWeights {
                 Some(live_hybrid) => {
                     // Same capacity policy as the dense snapshot
                     // (mirrors line ~2229): sw headroom for short
-                    // prompts, seq_len + decode for long ones.
-                    let snap_cap = sw.max(
+                    // prompts, the final rounded seq_len + decode tile for
+                    // long ones.
+                    let snap_cap = sw.max(gemma_flash_attn_vec_capacity(
                         seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
-                    );
+                    ));
                     let mut hsnap: Vec<
                         std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
                     > = Vec::with_capacity(live_hybrid.len());
@@ -3398,7 +3461,8 @@ impl MlxModelWeights {
         // `leg_hb_encoded` re-allocation on `is_none()` — a latent quirk
         // that's harmless for chat (where the first allocation's capacity
         // covers later calls) but BREAKS embedding mode: embeds run with
-        // `max_decode_tokens=0` so `linear_capacity = prompt_len`, and the
+        // `max_decode_tokens=0` so `linear_capacity` is the prompt length
+        // rounded through the final 32-row attention tile, and the
         // first embedding's tiny cache poisons every subsequent call
         // (embed OR chat) with a capacity-too-small fault inside
         // `flash_attn_vec_tq_hb`. We force-clear before re-entering prefill
@@ -3617,9 +3681,9 @@ impl MlxModelWeights {
         gpu: &mut GpuContext,
         slot_id: SlotId,
         multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
-        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
-        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
-        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+        mut multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        mut multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        mut multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
         cached_tokens: usize,
     ) -> Result<u32> {
         anyhow::ensure!(
@@ -3631,6 +3695,25 @@ impl MlxModelWeights {
             soft_tokens.is_empty(),
             "Gemma slot resume does not reuse multimodal soft-token state"
         );
+        let suffix = &prompt_tokens[cached_tokens..];
+        if suffix.len() < GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS {
+            let mut next_token = None;
+            let mut profile = None;
+            for (offset, &input_token) in suffix.iter().enumerate() {
+                next_token = Some(self.forward_decode_slot_aware(
+                    input_token,
+                    cached_tokens + offset,
+                    gpu,
+                    &mut profile,
+                    slot_id,
+                    multi_seq_kv_hb,
+                    multi_seq_kv_hybrid.as_mut().map(|value| &mut **value),
+                    multi_seq_kv_dense.as_mut().map(|value| &mut **value),
+                    multi_seq_kv_mlx.as_mut().map(|value| &mut **value),
+                )?);
+            }
+            return next_token.ok_or_else(|| anyhow::anyhow!("Gemma slot resume suffix is empty"));
+        }
         self.forward_prefill_with_soft_tokens_slot_aware_impl(
             prompt_tokens,
             soft_tokens,
@@ -3763,7 +3846,6 @@ impl MlxModelWeights {
                 err,
             );
         }
-
         // ── Dispatch fork ─────────────────────────────────────────────
         //
         // Mirror the 4 production KV-regime branches at the existing
@@ -4817,15 +4899,19 @@ impl MlxModelWeights {
             // dense_sdpa_tmp}` (forward_prefill_batched's dense handoff) to preserve the
             // hybrid slot-aware contract. Soft-token (vision) prefills stay on per-token.
             // The N=8 SHORT-prompt lever still needs a purpose-built MULTI-SEQ prefill.
-            // iter-G(b) DEFAULT-ON (2026-06-25): validated byte-identical to
-            // production SerialFifo across short/long × single/8-concurrent, and
-            // deterministic, with the §0.19 FA fix in place. Gives ~18× long-prompt
-            // slot-aware prefill (batched-per-layer vs per-token). Opt out via
-            // HF2Q_PREFILL_SLOT_BATCHED=0. Soft-token (vision) prefills auto-fall-back
-            // to the per-token resume path (forward_prefill_batched has no soft-token
-            // surface) via the soft_tokens.is_empty() guard.
-            let use_batched_slot_prefill = soft_tokens.is_empty()
-                && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() != Ok("0");
+            // iter-G(b) DEFAULT-ON (2026-06-25): gives ~18× long-prompt
+            // slot-aware prefill (batched-per-layer vs per-token). A later repeated
+            // decode -> cold-admission staircase exposed intermittent non-finite
+            // argmax rows for 2-5-token cold mounted prefills. Cold text below the
+            // conservative 32-token boundary now uses the linear path. A tiny live
+            // suffix is appended through the proven per-token slot decode primitive;
+            // larger suffixes retain the suffix-aware batched path. Opt out via
+            // HF2Q_PREFILL_SLOT_BATCHED=0. Soft-token prefills stay linear.
+            let use_batched_slot_prefill = gemma_use_batched_slot_prefill(
+                prompt_tokens.len(),
+                !soft_tokens.is_empty(),
+                cached_tokens,
+            );
             let result = if cached_tokens > 0 {
                 anyhow::ensure!(
                     use_batched_slot_prefill,
@@ -5086,9 +5172,28 @@ impl MlxModelWeights {
         // is iter-2D scope (dense F32 LCP-eligible regime); iter-2A-cont
         // does NOT consume the LCP fast path for the HB-encoded branch
         // (orthogonal sub-deferral).
-        let use_batched_slot_prefill = soft_tokens.is_empty()
-            && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() != Ok("0");
-        let result = if use_batched_slot_prefill {
+        let use_batched_slot_prefill = gemma_use_batched_slot_prefill(
+            prompt_tokens.len(),
+            !soft_tokens.is_empty(),
+            cached_tokens,
+        );
+        let result = if cached_tokens > 0 {
+            anyhow::ensure!(
+                use_batched_slot_prefill,
+                "Gemma live HB slot resume requires text-only batched prefill"
+            );
+            let prior_dense_kvs = self.dense_kvs.take();
+            let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
+            let r = self.forward_prefill_batched_live_resume_slot_mounted(
+                &prompt_tokens[cached_tokens..],
+                max_decode_tokens,
+                cached_tokens,
+                gpu,
+            );
+            self.dense_kvs = prior_dense_kvs;
+            self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
+            r
+        } else if use_batched_slot_prefill {
             let prior_dense_kvs = self.dense_kvs.take();
             let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
             let r =
@@ -6323,23 +6428,55 @@ impl MlxModelWeights {
 
 #[cfg(test)]
 mod lcp_cursor_tests {
-    use super::{gemma_kv_capacity_plan, restored_kv_cursor, GEMMA_AGENTIC_LIVE_RESERVE_TOKENS};
+    use super::{
+        gemma_flash_attn_vec_capacity, gemma_kv_capacity_plan,
+        gemma_slot_prefill_batched_work_eligible, restored_kv_cursor,
+        validate_linear_prefill_argmax, GEMMA_FLASH_ATTN_VEC_KV_TILE,
+        GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS,
+    };
+
+    #[test]
+    fn tiny_cold_slot_prefill_uses_linear_route_at_the_conservative_boundary() {
+        assert!(!gemma_slot_prefill_batched_work_eligible(2, false));
+        assert!(!gemma_slot_prefill_batched_work_eligible(
+            GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS - 1,
+            false,
+        ));
+        assert!(gemma_slot_prefill_batched_work_eligible(
+            GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS,
+            false,
+        ));
+        assert!(!gemma_slot_prefill_batched_work_eligible(64, true));
+        assert_eq!(gemma_flash_attn_vec_capacity(1), 32);
+        assert_eq!(gemma_flash_attn_vec_capacity(31), 32);
+        assert_eq!(gemma_flash_attn_vec_capacity(32), 32);
+        assert_eq!(gemma_flash_attn_vec_capacity(33), 64);
+        assert_eq!(gemma_flash_attn_vec_capacity(63), 64);
+        assert_eq!(gemma_flash_attn_vec_capacity(64), 64);
+        assert_eq!(
+            gemma_kv_capacity_plan(3, 1, 1_024, false).required_linear,
+            32
+        );
+        assert_eq!(
+            gemma_kv_capacity_plan(32, 1, 1_024, false).required_linear,
+            64
+        );
+        assert_eq!(GEMMA_FLASH_ATTN_VEC_KV_TILE, 32);
+        assert!(validate_linear_prefill_argmax(17.0, 2).is_ok());
+        for poisoned in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_linear_prefill_argmax(poisoned, 2).is_err());
+        }
+    }
 
     #[test]
     fn live_capacity_headroom_does_not_raise_resume_admission_requirement() {
         let initial = gemma_kv_capacity_plan(10_909, 4_096, 1_024, true);
-        assert_eq!(initial.required_linear, 15_005);
-        assert_eq!(
-            initial.allocation_linear,
-            10_909 + GEMMA_AGENTIC_LIVE_RESERVE_TOKENS
-        );
+        assert_eq!(initial.required_linear, 15_008);
+        assert_eq!(initial.allocation_linear, 27_296);
 
         let next = gemma_kv_capacity_plan(10_992, 4_096, 1_024, true);
-        assert_eq!(next.required_linear, 15_088);
-        assert_eq!(
-            next.allocation_linear,
-            10_992 + GEMMA_AGENTIC_LIVE_RESERVE_TOKENS
-        );
+        assert_eq!(next.required_linear, 15_104);
+        assert_eq!(next.allocation_linear, 27_392);
         assert!(initial.allocation_linear >= next.required_linear);
         assert!(initial.allocation_linear < next.allocation_linear);
     }
@@ -6347,8 +6484,8 @@ mod lcp_cursor_tests {
     #[test]
     fn legacy_capacity_plan_has_no_extra_headroom() {
         let plan = gemma_kv_capacity_plan(10_909, 4_096, 1_024, false);
-        assert_eq!(plan.required_linear, 15_005);
-        assert_eq!(plan.allocation_linear, 15_005);
+        assert_eq!(plan.required_linear, 15_008);
+        assert_eq!(plan.allocation_linear, 15_008);
         assert_eq!(plan.required_sliding, 1_024);
         assert_eq!(plan.allocation_sliding, 1_024);
     }
