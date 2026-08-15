@@ -159,6 +159,8 @@ jobs:
           check_receipt gemma/transactions-four-slots.json '.receipt_sha256.gemma.transactions4'
           check_receipt gemma/transactions-eight-slots.json '.receipt_sha256.gemma.transactions8'
           check_receipt gemma/parity/summary.json '.receipt_sha256.gemma.parity'
+          bash scripts/verify_gemma4_parity_receipt.sh \
+            "$gate_dir/gemma/parity/summary.json" "$gate_dir/gemma/parity"
           check_receipt gemma/heap-summary.json '.receipt_sha256.gemma.heap'
           check_receipt qwen/lifecycle/summary.json '.receipt_sha256.qwen.lifecycle'
           check_receipt qwen/cumulative/cumulative-release-summary.json '.receipt_sha256.qwen.cumulative'
@@ -400,6 +402,16 @@ jobs:
                and $g.parity.profile == "release"
                and $g.parity.n4_exact_output_parity == true
                and $g.parity.n8_exact_output_parity == true
+               and $g.parity.n8_cross_slot_admit == true
+               and $g.parity.n8_max_tokens == 24
+               and $g.parity.n8_rounds == 25
+               and $g.parity.n8_seed_budget_exact_output_parity == true
+               and $g.parity.n8_seed_budget_max_tokens == 1
+               and $g.parity.n8_seed_budget_rounds == 25
+               and $g.parity.n8_tiny_hybrid_exact_output_parity == true
+               and $g.parity.n8_tiny_full_tq_exact_output_parity == true
+               and $g.parity.n8_tiny_prefill_rounds == 64
+               and $g.parity.n8_tiny_resume_rounds == 16
                and $g.parity.fresh_and_reused_4096_8193_bounded_output_parity == true
                and $g.parity.long_resume_exact_output_parity == true
                and $g.heap.status == "pass"
@@ -536,6 +548,7 @@ jobs:
               scripts/macos_thermal_guard.sh \
               scripts/verify_macos_thermal_receipt.sh \
               scripts/verify_gemma4_wave_thermal_receipt.sh \
+              scripts/verify_gemma4_parity_receipt.sh \
               scripts/test_macos_thermal_guard_contract.sh \
               scripts/test_gemma4_wave_thermal_contract.sh \
               scripts/test_gemma4_eight_slot_receipt_contract.sh \

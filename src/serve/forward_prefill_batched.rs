@@ -41,6 +41,14 @@ use crate::serve::forward_mlx_shared::{
 };
 use crate::serve::multi_seq_kv::SlotId;
 
+fn validate_batched_prefill_argmax(value: f32, head_row: usize) -> Result<()> {
+    anyhow::ensure!(
+        value.is_finite(),
+        "batched prefill produced a non-finite argmax value for row {head_row}: {value}"
+    );
+    Ok(())
+}
+
 /// Bound the live-prefix attention scratch while keeping every dispatch in a
 /// single hybrid-kernel scheduling bucket. The cache-length thresholds mirror
 /// mlx-native's current hybrid NWG/NSG policies.
@@ -6378,6 +6386,15 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
                 idx[0]
             };
+            let argmax_value = {
+                let value: &[f32] = self
+                    .activations
+                    .argmax_value
+                    .as_slice()
+                    .map_err(|e| anyhow::anyhow!("argmax value read: {e}"))?;
+                value[0]
+            };
+            validate_batched_prefill_argmax(argmax_value, head_row)?;
             // first_token (the fn's return) is seq 0's token — single-seq
             // callers read it; multi-seq callers read out_first_tokens.
             if ms_tokens.is_empty() {
@@ -7613,7 +7630,18 @@ mod route_viability_tests {
     use super::{
         batched_route_overhead_bytes as overhead, gemma_batched_mask_seq_len,
         gemma_lcp_resume_worthwhile, gemma_live_query_chunk_len, gemma_live_stage_history_len,
+        validate_batched_prefill_argmax,
     };
+
+    #[test]
+    fn batched_prefill_rejects_non_finite_argmax_poison() {
+        assert!(validate_batched_prefill_argmax(17.0, 0).is_ok());
+        for poisoned in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = validate_batched_prefill_argmax(poisoned, 3)
+                .expect_err("non-finite argmax poison must fail closed");
+            assert!(error.to_string().contains("row 3"));
+        }
+    }
 
     #[test]
     fn live_resume_does_not_allocate_suffix_squared_masks() {

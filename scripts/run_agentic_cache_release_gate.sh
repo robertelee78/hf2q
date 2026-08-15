@@ -858,8 +858,32 @@ run_gemma_release_gates() {
     cargo test --release --locked --bin hf2q slot_aware_n4_per_slot_parity_vs_serial -- \
       --test-threads=1 >"$OUT_ROOT/gemma/parity/n4.log" 2>&1
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    HF2Q_CROSS_SLOT_ADMIT=1 HF2Q_ADMIT_COALESCE_US=25000 \
+    HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=24 \
+    HF2Q_GEMMA_N8_PARITY_ROUNDS=25 \
     cargo test --release --locked --bin hf2q slot_aware_n8_per_slot_parity_vs_serial -- \
-      --test-threads=1 >"$OUT_ROOT/gemma/parity/n8.log" 2>&1
+      --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8.log" 2>&1
+  HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    HF2Q_CROSS_SLOT_ADMIT=1 HF2Q_ADMIT_COALESCE_US=25000 \
+    HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=1 \
+    HF2Q_GEMMA_N8_PARITY_ROUNDS=25 \
+    cargo test --release --locked --bin hf2q slot_aware_n8_per_slot_parity_vs_serial -- \
+      --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8-seed-budget.log" 2>&1
+  HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    HF2Q_HYBRID_KV=1 HF2Q_USE_DENSE=0 HF2Q_TQ_CODEBOOK_BITS=8 \
+    HF2Q_GEMMA_N8_EXPECTED_KV_REGIME=hybrid \
+    HF2Q_GEMMA_N8_PREFILL_REPEATS=64 HF2Q_GEMMA_N8_RESUME_REPEATS=16 \
+    cargo test --release --locked --bin hf2q \
+      gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant -- \
+      --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8-tiny-hybrid.log" 2>&1
+  HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
+    HF2Q_HYBRID_KV=0 HF2Q_USE_DENSE=0 HF2Q_TQ_CODEBOOK_BITS=8 \
+    HF2Q_GEMMA_N8_EXPECTED_KV_REGIME=full-tq \
+    HF2Q_GEMMA_N8_PREFILL_REPEATS=64 \
+    HF2Q_GEMMA_N8_RESUME_REPEATS=16 \
+    cargo test --release --locked --bin hf2q \
+      gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant -- \
+      --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8-tiny-full-tq.log" 2>&1
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
     cargo test --release --locked --bin hf2q \
       gemma_fresh_and_reused_4096_8193_bounded_outputs_match -- \
@@ -872,10 +896,15 @@ run_gemma_release_gates() {
   jq -n --arg status pass \
     --arg n4_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n4.log")" \
     --arg n8_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8.log")" \
+    --arg n8_seed_budget_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8-seed-budget.log")" \
+    --arg n8_tiny_hybrid_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8-tiny-hybrid.log")" \
+    --arg n8_tiny_full_tq_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8-tiny-full-tq.log")" \
     --arg boundary_tail_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/boundary-tail.log")" \
     --arg long_resume_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/long-resume.log")" \
-    '{status:$status,profile:"release",n4_exact_output_parity:true,n8_exact_output_parity:true,fresh_and_reused_4096_8193_bounded_output_parity:true,long_resume_exact_output_parity:true,n4_log_sha256:$n4_sha256,n8_log_sha256:$n8_sha256,boundary_tail_log_sha256:$boundary_tail_sha256,long_resume_log_sha256:$long_resume_sha256}' \
+    '{status:$status,profile:"release",n4_exact_output_parity:true,n8_exact_output_parity:true,n8_cross_slot_admit:true,n8_max_tokens:24,n8_rounds:25,n8_seed_budget_exact_output_parity:true,n8_seed_budget_max_tokens:1,n8_seed_budget_rounds:25,n8_tiny_hybrid_exact_output_parity:true,n8_tiny_full_tq_exact_output_parity:true,n8_tiny_prefill_rounds:64,n8_tiny_resume_rounds:16,fresh_and_reused_4096_8193_bounded_output_parity:true,long_resume_exact_output_parity:true,n4_log_sha256:$n4_sha256,n8_log_sha256:$n8_sha256,n8_seed_budget_log_sha256:$n8_seed_budget_sha256,n8_tiny_hybrid_log_sha256:$n8_tiny_hybrid_sha256,n8_tiny_full_tq_log_sha256:$n8_tiny_full_tq_sha256,boundary_tail_log_sha256:$boundary_tail_sha256,long_resume_log_sha256:$long_resume_sha256}' \
     >"$OUT_ROOT/gemma/parity/summary.json"
+  bash scripts/verify_gemma4_parity_receipt.sh \
+    "$OUT_ROOT/gemma/parity/summary.json" "$OUT_ROOT/gemma/parity"
 }
 
 # The 100 GiB DeepSeek artifact runs first. Every process fully exits before
@@ -902,6 +931,8 @@ gemma_bytes=$(stat -f '%z' "$GEMMA_MODEL")
 qwen_bytes=$(stat -f '%z' "$QWEN_MODEL")
 qwen36_validate_cancellation_transaction_counts \
   "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
+bash scripts/verify_gemma4_parity_receipt.sh \
+  "$OUT_ROOT/gemma/parity/summary.json" "$OUT_ROOT/gemma/parity"
 jq -n \
   --arg status pass \
   --arg source_sha "$EXPECTED_SHA" \

@@ -1,9 +1,10 @@
 # ADR-040 — Continuous batching: reopen the ADR-005 carve-out
 
 - **Status**: 🟢 **FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED (2026-08-08)** — every configured agent slot receives the complete logical model context; aggregate physical KV is governed by one shared high-water budget. Gemma 4, Qwen 3.6, and DeepSeek-V4 passed real four-agent OpenCode gates with native templates, tools, SSE, tool-result continuation, and retained prefix state. The historical 2026-07-01 8×32K result remains below as provenance for the fused batching work.
+>   - **Gemma N=8 tiny-prefill containment pending exact packed proof (2026-08-14, §6.1.65).** Exact-main run `31823149737` reached Gemma's release-profile N=8 parity test after every preceding DeepSeek and Gemma hardware gate had passed, then exposed an intermittent all-non-finite logit row after batched decode followed by a 2–5-token cold slot-mounted prefill. Cold text work below 32 tokens now uses the linear slot-aware path; tiny retained-prefix suffixes append through the one-token primitive; initial, installed, and stable cross-slot admission cannot bypass that boundary. The fallback also exposed a separate pinned-`mlx-native` dense-vector tail-read defect: physical linear KV capacity now rounds through each final 32-row tile, and a one-token budget terminates at the prefill seed. The original tiny batched-prefill cause is not claimed solved, and a new exact-packed run remains mandatory.
 >   - **Decode: campaign CLOSED at practical floor (2026-06-30).** 255 t/s aggregate N=8 short-ctx = **1.14× llama**; GPU-busy at parity; §21–§26 + iter-I/J/K/L/M levers landed; iter-O refuted the residual host gap.
 >   - **Long context: historical 32k/slot × 8 proof retained; full-context contract corrected in §0.0 (2026-08-08).** The O(seq²) `pf_kq` wall was closed and 32k×8 was proven coherent in 2026-07-01. The operator contract is now stronger: every slot has the full configured logical context, while one shared physical high-water budget governs aggregate residency. The three-family real-model gate below decides whether that stronger contract ships.
->   - **Coherence: MET.** Byte-identity to serial reference at N=8 (`n4`/`n8` parity gates), per-stream determinism + concurrency-invariance at 8k/12k/16k/32k. Standing rule (operator, 2026-07-01): **coherence > speed** — no lever ships without the ladder. (Known non-blocking residual: 2×-process GPU-contention decode non-determinism — not the deployment shape; tracked low-severity in the §0.19 history.)
+>   - **Historical coherence milestone met; current tiny-prefill proof pending.** Byte-identity to serial reference at N=8 (`n4`/`n8` parity gates), per-stream determinism, and concurrency-invariance at 8k/12k/16k/32k were established for the accepted graph. The 2026-08-14 2–5-token fault above reopens the exact packed N=8 parity proof for the containment candidate. Standing rule (operator, 2026-07-01): **coherence > speed** — no lever ships without the ladder. (Known non-blocking residual: 2×-process GPU-contention decode non-determinism — not the deployment shape; tracked low-severity in the §0.19 history.)
 >   - **qwen35moe: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12; TQ/full-context correction 2026-08-08, §0.0)** — the earlier proof found four real bugs. The 2026-08-08 correction removes the `HF2Q_TQ_KV=0` restriction: packed and norms allocations already had an outer sequence axis, and zero-copy slot views now route TQ encode, attention, and resume through the requested slot. Full logical context is no longer divided by slot count.
 >   - **OPEN (speed, tracked = M-SPEED-LC):** N=8 long-context decode remains a matched-reference gate. The full-context/TQ correction changes capacity and isolation, not the rule that coherence must pass before a throughput result is accepted.
 >
@@ -1653,6 +1654,97 @@ and Qwen `f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`
 (SHA-256 of each GGUF). Repository variables carry both the canonical local
 path and expected digest; changing either byte identity requires a new bound
 hardware receipt.
+
+### 6.1.65 Gemma N=8 tiny slot-prefill containment (2026-08-14)
+
+Exact-main packed run `31823149737` passed the complete DeepSeek matrix and
+the preceding Gemma hardware gates, then failed in Gemma's release-profile N=8
+per-slot parity test before Qwen began. After a production batched decode, a
+2–5-token cold slot-mounted batched prefill could intermittently return an
+all-non-finite 262,144-entry logit row; the argmax buffer consequently retained
+its negative-infinity initializer and selected token zero. A direct
+decode-to-cold-prefill staircase reproduced that shape. Decode chunk sizes,
+scalar decode, fused-head removal, fresh KV scaffolds, command-buffer owner
+retention, periodic waits, and prefill/decode/combined Metal event chains
+changed the failure rate or timing but did not eliminate the failure, so none
+of those experiments belongs in the landing diff. Disabling only the
+slot-mounted batched prefill passed the then-current direct staircase 64/64
+and identified the smallest boundary for further containment; the original
+tiny batched-prefill cause remains open behind that boundary.
+
+The first production-worker test of the linear fallback then selected token
+zero in three slots during prefill, before the first decode. Source inspection
+localized this separate failure to pinned registry `mlx-native` 0.10.8:
+`flash_attn_vec` processes K/V in 32-row tiles, masks the final partial tile,
+but loads all 32 K and V rows before applying that mask. Its host-side contract
+requires only `kv_capacity >= kv_seq_len`. The previous hf2q linear allocation
+was the exact logical `prompt_len + max_decode_tokens` extent (3–6 rows in the
+one-token discriminator and 26–29 under the normal 24-token budget), so the
+first tile could cross a KV-head or buffer boundary and propagate non-finite
+values. Pinned `mlx-native`'s `MlxDevice::alloc_buffer` path explicitly
+zero-fills the allocation; rounding hf2q's physical capacity and restored-
+cache requirement through the final complete tile therefore keeps those
+unconditional reads in bounds and makes masked padding finite. This explains
+the heap sensitivity and the all-non-finite row without attributing the
+original batched-prefill failure to a different attention kernel.
+
+The candidate therefore uses a conservative policy boundary rather than a
+false root-cause claim:
+
+- cold text work of 1–31 tokens uses the existing per-token slot-aware path;
+  32 or more tokens retains the established batched throughput path;
+- every global/linear dense KV allocation and restored-cache requirement is
+  rounded through the final 32-row `flash_attn_vec` tile; sliding rings remain
+  at their already tile-aligned 1,024-row capacity;
+- a retained-prefix text suffix of 1–31 tokens appends through the existing
+  slot-aware decode primitive, preserving the mounted cache instead of
+  recomputing the full prompt; larger suffixes keep the suffix-aware batched
+  live-resume graph;
+- initial, installed, and stable cross-slot admission all reject or peel back
+  a tiny phase to the single-request FIFO path, so the canonical
+  `HF2Q_CROSS_SLOT_ADMIT=1` launcher cannot bypass the boundary;
+- soft-token prefills retain their existing linear route, and
+  `HF2Q_PREFILL_SLOT_BATCHED=0` remains the explicit diagnostic opt-out; and
+- linear and batched prefill heads reject a non-finite argmax value after GPU
+  completion. This catches the observed all-NaN/negative-infinity poison; it
+  is not a claim that every individual logit is scanned for finiteness; and
+- a prefill seed that exhausts `max_tokens=1` now finishes immediately,
+  matching the serial reference instead of installing a decode state for a
+  second token.
+
+The direct staircase is a kernel discriminator, not worker, SSE, cache-
+lifecycle, or release authority. It covers Hybrid and full-TQ/HB cache
+regimes, cold 2–5-token admission, live 1/2/5-token suffixes after batched
+decode, the real-model 31/32 policy boundary, the coalesced eight-prefill then
+width-eight-decode shape, and the staggered width-one-through-eight shape
+against independent cold references. The actual N=8 worker parity test retains
+positive bounded repeat and output-token controls so zero-valued environment
+overrides cannot make the gate vacuous. The protected gate must set and the
+test itself requires canonical `HF2Q_CROSS_SLOT_ADMIT=1`; it separately runs
+25 fresh-model N=8 worker rounds at `max_tokens=24` and at the one-token seed
+budget. It also runs the direct tiny-prefill discriminator for 64 cold and 16
+retained-suffix rounds in both Hybrid and full-TQ/HB regimes, and binds every
+log and exact repeat/budget value into the parity receipt. Acceptance still
+requires those proofs, the complete Gemma agentic/cache matrix, and the cross-
+family lifecycle to pass from one newly sealed exact-main packed artifact.
+Run `31823149737` and all local diagnostics remain failure analysis, not
+release authority.
+
+Focused validation of the dirty candidate used release-test binary SHA-256
+`83bae9701ba2bb7a2a14b9aa46c5c14ddace338c8e03a7bcf0d7e75767a673bc`
+on AC power with no recorded thermal warning. Fresh-model production-worker
+parity passed 25/25 rounds at each of `max_tokens=1`, `2`, and `24`; the exact
+logs hash to
+`61eb3f16bb61c3c0eb25d92cfbf8351fdbc03411276bbbf7499071f1265fe8e2`,
+`e3acd106c7d45417e42204dd131070626033b15fb010382fc379181e8d0e35aa`,
+and `75d58a262f5ed245ad4bbeb77d2331c5354bc42e6fdf4d031dee38afbc7d82b2`.
+The direct discriminator passed 64 cold/coalesced/staggered rounds plus 16
+retained-suffix/31–32-boundary rounds in both the default Hybrid regime
+(`aca729eeb32d7469a12107ef2c93ea146a2f44a11d318e27428b6d827a7d4631`)
+and the full-TQ/HB opt-out
+(`c407b706356bc95b4d6f4a7a40c56ceeaeb3e55c5db5fcf37dd35232787ce28f`).
+These runs prove the candidate source shape on this host but are not an
+immutable packed-artifact receipt and cannot replace the protected gate.
 
 Qwen automatic-tool quality is prompt-sensitive at this quantization and must
 not be conflated with KV correctness. A 2026-08-12 discriminator used the same
