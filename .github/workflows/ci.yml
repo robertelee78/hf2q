@@ -125,6 +125,8 @@ jobs:
             scripts/test_gemma4_eight_slot_receipt_contract.sh \
             scripts/seal_release_binary.sh \
             scripts/test_release_binary_seal_contract.sh \
+            scripts/ensure_github_release_tag.sh \
+            scripts/test_release_tag_recovery_contract.sh \
             scripts/test_deepseek4_cached_suffix.sh \
             scripts/test_deepseek4_cached_suffix_contract.sh \
             scripts/test_deepseek4_interactive_overlap.sh \
@@ -140,6 +142,7 @@ jobs:
           bash scripts/test_gemma4_wave_thermal_contract.sh
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
+          bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
