@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Make GitHub release-tag creation distinguish an explicit missing-ref 404
+  from every other API failure. Release automation now validates existing and
+  newly created tag SHAs, re-reads a created ref before publishing assets, and
+  carries model-free regressions for missing, mismatched, and failed tag paths.
+
 ## [0.1.6] — 2026-08-13
 
 ### Changed

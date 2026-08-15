@@ -554,6 +554,8 @@ jobs:
               scripts/test_gemma4_eight_slot_receipt_contract.sh \
               scripts/seal_release_binary.sh \
               scripts/test_release_binary_seal_contract.sh \
+              scripts/ensure_github_release_tag.sh \
+              scripts/test_release_tag_recovery_contract.sh \
               scripts/test_deepseek4_cached_suffix.sh \
               scripts/test_deepseek4_cached_suffix_contract.sh \
               scripts/test_deepseek4_interactive_overlap.sh \
@@ -569,6 +571,7 @@ jobs:
             bash scripts/test_gemma4_wave_thermal_contract.sh
             bash scripts/test_gemma4_eight_slot_receipt_contract.sh
             bash scripts/test_release_binary_seal_contract.sh
+            bash scripts/test_release_tag_recovery_contract.sh
             bash scripts/test_gemma4_long_short_overlap_contract.sh
             cargo test --locked --bin hf2q --all-features deepseek4 -- \
               --skip attention_forward_tests \
@@ -651,14 +654,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="v${EXPECTED_VERSION}"
-          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null || true)
-          if [[ -n "$tag_sha" ]]; then
-            test "$tag_sha" = "$EXPECTED_SHA"
-          else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$tag" \
-              -f sha="$EXPECTED_SHA" >/dev/null
-          fi
+          bash scripts/ensure_github_release_tag.sh \
+            "$GITHUB_REPOSITORY" "$tag" "$EXPECTED_SHA"
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" \
               --target "$EXPECTED_SHA" \
