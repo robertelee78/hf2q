@@ -67,7 +67,8 @@ hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
    and a persistent block-prefix KV cache.
 
 Supported architectures today: **Gemma 4 (dense + MoE)**, **Qwen 3.5 /
-3.6 (dense + MoE + multi-token-prediction)**, **DeepSeek-V4-Flash-0731
+3.6 (dense + MoE + multi-token-prediction)**, **Qwen 3.8-27B text
+(dense + multi-token-prediction)**, **DeepSeek-V4-Flash-0731
 (compressed-attention MoE)**, **Qwen 3-VL (vision + text)**, and **BERT /
 Nomic-BERT** (embedding-only). Each lives under a single
 `src/inference/models/<arch>/` module — the arch-registry (`src/arch/`)
@@ -179,7 +180,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 ### Full-context agentic serving
 
-The native Gemma 4, Qwen 3.6, and DeepSeek-V4 workers are intended for
+The native Gemma 4, Qwen 3.6/3.8, and DeepSeek-V4 workers are intended for
 OpenAI-compatible coding clients such as OpenCode. Their canonical launchers
 default to four independent agent slots. Every slot receives the complete
 configured logical context; model weights are shared, while KV, recurrent
@@ -196,6 +197,9 @@ Start the launcher for the model family you want to serve:
 # Qwen 3.6 (default port 8081)
 ./scripts/serve_qwen36_opencode.sh
 
+# Qwen 3.8-27B text (default port 8081)
+./scripts/serve_qwen38_opencode.sh
+
 # DeepSeek-V4 (default port 8080)
 ./scripts/serve_deepseek4_opencode.sh
 
@@ -205,6 +209,19 @@ MODEL=./out/DeepSeek-V4-Flash-0731.gguf PORT=8090 \
 
 curl http://127.0.0.1:8080/v1/models
 ```
+
+Create the Qwen3.8 artifact natively from its immutable source revision before
+using that launcher:
+
+```bash
+hf2q convert --repo Qwen/Qwen3.8-27B \
+  --revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
+  --quant q4_k_m \
+  --output /opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf
+```
+
+This release accepts the text decoder. The bundled vision tower is excluded
+fail-closed until Qwen3.8 image projection and real-image parity are supported.
 
 Foreground launchers use the live operator dashboard automatically when
 stderr is an interactive terminal. Runtime work stays in place instead of
@@ -237,16 +254,18 @@ blocking other slots.
 A supervisor must recreate the process/device generation; an in-process slot
 reset is not safe recovery from a poisoned Metal queue.
 
-Qwen3.5/Qwen3.6 SlotAware text chat uses at most 2,048 prompt tokens per GPU
-prefill transaction. Active decoders run before the next cold transaction,
-multiple cold prompts rotate fairly, and cache/ledger state advances only
-after every full-attention and MTP cursor agrees. SlotAware embeddings are
+Qwen3.5/Qwen3.6/Qwen3.8 SlotAware text chat uses at most 2,048 prompt tokens
+per GPU prefill transaction. Active decoders run before the next cold
+transaction, multiple cold prompts rotate fairly, and cache/ledger state
+advances only after the verifier full-attention cursors agree. The optional
+MTP cursor is tracked independently until speculative decoding runs.
+SlotAware embeddings are
 limited to one <=2,048-token forward per admission quantum. Soft-token,
 deepstack, and 3D-position generation is rejected before Qwen SlotAware
 scheduler/SSE admission and before Qwen LM generation until its
 prefill and decode are scheduler-yielding; the separate SerialFifo primitive
 retains the historical multimodal path. Qwen3-VL remains a distinct model
-family rather than an approximate fallback through Qwen3.6 text serving.
+family rather than an approximate fallback through another Qwen text family.
 
 Long Gemma 4 text prefills use 4,096-token transactions and split at
 the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and

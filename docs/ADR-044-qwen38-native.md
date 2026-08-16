@@ -1,6 +1,6 @@
 # ADR-044: Qwen3.8 native conversion and inference
 
-- Status: Accepted for implementation; real-model acceptance pending
+- Status: Accepted for native text conversion and serving
 - Date: 2026-08-16
 - Owners: hf2q conversion, quantization, inference, and serving
 
@@ -85,8 +85,54 @@ must never silently advertise vision support before that gate is green.
 
 ## Consequences
 
-Qwen3.8 can reuse a mature native execution family without approximate
-architecture routing, while conversion and evidence remain explicit. The
-large source download is deferred until metadata and synthetic conversion
-are green, reducing iteration cost and making any later failure attributable
-to real weights or runtime behavior rather than basic dispatch.
+Qwen3.8 reuses the native dense Qwen execution family without approximate
+architecture routing, while conversion and evidence remain explicit. Vision
+and speculative MTP decode remain outside the accepted surface; the canonical
+launcher selects ordinary autoregressive text decode until those paths have
+separate real-artifact gates.
+
+## Acceptance evidence
+
+The text acceptance gate ran on an Apple M5 Max on AC power. The source was
+the exact revision named above; its configuration SHA-256 was
+`191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab` and
+its tensor-index SHA-256 was
+`77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df`.
+
+Native `q4_k_m` conversion produced 866 text tensors in a
+16,810,714,624-byte GGUF with SHA-256
+`bddc9ada92212253cceb77781cc3267cb63da10f6e000c32e775abdee9cf69ea`.
+An independently converted artifact had the same tensor count, dimensions,
+types, and deterministic smoke output. Quantized tensor payloads were not
+claimed byte-identical: 515 of 866 tensor payloads matched exactly and 351
+differed. Both artifacts generated the same requested Rust function through
+both runtimes used by the acceptance comparison.
+
+The native quantized artifact was also compared with the 54,657,734,016-byte
+BF16 source conversion in the independent runtime. Three deterministic prompts
+covering Rust code, integer arithmetic, and a concurrency explanation produced
+exactly identical complete text and the same first token ID in all three
+cases. This is a focused functional/quantization discriminator, not a broad
+language-quality benchmark.
+
+On the native hf2q artifact, deterministic single-shot generation measured a
+32-token prefill in 11.94 seconds and 32 decoded tokens in 2.37 seconds
+(13.5 tokens/second). The independent runtime measured 27.8 tokens/second on
+the same artifact, so decode performance remains a follow-up rather than an
+inflated parity claim. Initial GPU materialization exceeded the generic
+30-second request deadline; the accepted implementation gives only Qwen
+startup warmup a finite 240-second supervisor deadline and keeps ordinary
+request deadlines unchanged.
+
+The exact native server artifact passed `/readyz`, unary and SSE text,
+required-tool unary and SSE calls, schema-correct arguments, tool-result
+continuation with 320 cached tokens, automatic thinking without private client
+flags, cancellation with checkpoint recovery, and two simultaneous requests.
+An ordinary three-message follow-up returned the remembered value with 27 of
+54 prompt tokens reused. The first clean server load took 24.65 seconds and
+its measured startup warmup took 33.43 seconds. The gate also found and fixed
+an invalid cache invariant: verifier KV cursors must agree with one another,
+but the optional MTP cursor is independent until speculative decoding runs.
+
+These measurements establish functional native text support, not completion
+of the vision surface, speculative MTP acceptance, or performance parity.

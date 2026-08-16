@@ -23,6 +23,12 @@ categories = ["command-line-utilities", "science"]
 # parity, ADR-027 TQ-KV) stay in the published tarball so docs.rs / the
 # crates.io page can link them.
 exclude = [
+    # Local agent configuration and generated model/evidence artifacts are
+    # deliberately outside the crate, even when a developer has not added
+    # them to a personal gitignore yet.
+    ".agents/**",
+    "CLAUDE.md.pre-ruflo*",
+    "artifacts/**",
     # Test harnesses are excluded except the small source/fixture files that
     # crate-local unit tests read with include_str!. Keeping those makes the
     # exact registry archive testable after download.
@@ -33,6 +39,7 @@ exclude = [
     "!tests/lcp_registry_unit.rs",
     "!tests/fixtures/deepseek_v4_encoding/**",
     "!tests/fixtures/ggml_quants/**",
+    "!tests/fixtures/qwen38/**",
     # Reference paper PDF (TurboQuant arxiv 2504.19874).
     "docs/2306.14048.pdf",
     # Iter-log ADRs — internal investigation diaries, not user-facing

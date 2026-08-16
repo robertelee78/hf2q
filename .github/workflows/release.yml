@@ -529,6 +529,8 @@ jobs:
             cargo test --locked --test convert_integration --all-features
             cargo test --locked --test lcp_registry_unit --all-features
             cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
+            cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
+            cargo test --locked --bin hf2q --all-features qwen35_startup_warmup_primes_gpu_for_serial_and_slot_aware -- --test-threads=1
             cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
             cargo test --locked --bin hf2q --all-features prompt_cache_ -- --test-threads=1
             cargo test --locked --bin hf2q --all-features agentic_grammar_contract_ -- --test-threads=1
@@ -538,6 +540,7 @@ jobs:
             cargo test --locked --bin hf2q --all-features public_watchdog_fixture_bytes_are_stable_without_a_model -- --test-threads=1
             cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
             bash -n scripts/qwen36_watchdog_validate.sh \
+              scripts/serve_qwen38_opencode.sh \
               scripts/test_qwen36_prefill_watchdog.sh \
               scripts/test_qwen36_prefill_cancellation.sh \
               scripts/test_qwen36_cumulative_release.sh \
