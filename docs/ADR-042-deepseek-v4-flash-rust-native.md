@@ -1534,6 +1534,47 @@ release authority additionally requires the clean committed artifact,
 exact-SHA CI, packed-artifact validation, and the corresponding Qwen/Gemma
 lifecycle gates.
 
+### Client-order prompt serialization correction (2026-08-16 candidate)
+
+An exact 6,673-token required-tool request exposed a serving-only prompt
+divergence. The OpenAI request and the published DeepSeek encoder retain JSON
+object insertion order, but hf2q's typed request path passed the tool schema
+through a `serde_json::Map` configured to sort keys. The native encoder then
+received `description, name, parameters` and sorted parameter keys instead of
+the client's `name, description, parameters` and `type, properties, required,
+additionalProperties` order. The altered prompt was 6,674 tokens and produced
+the correct `read_file` operation only after 136 greedy tokens, exceeding the
+checked 128-token agentic budget.
+
+The source and quantized weights were not defective. The exact hf2q artifact
+(SHA-256 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
+107,431,343,168 bytes) produced the correct operation under an independent
+reference program, and hf2q's CLI produced it when given the exact published
+prompt. Embedded and source tokenizers also emitted identical token IDs for
+that prompt. Replaying hf2q's sorted prompt reproduced the 136-token path,
+isolating the difference before model execution.
+
+hf2q now enables `serde_json` insertion-order preservation for client-facing
+chat data. A model-free regression deserializes the OpenAI request and requires
+the rendered DeepSeek tool schema to retain the client's exact object order;
+its `deepseek4` name places it under the existing blocking hosted-safe and
+packed-artifact test filters. The supplied 22,976-byte published prompt
+(SHA-256 `5f4b1444b317a5f27c6a45a4ea0d91790c648e78a43ed3cb2a8cc1ae4944a81b`)
+also matches hf2q's render exactly, and the embedded/source tokenizer check
+passes on the official artifact.
+
+Release binary SHA-256
+`9a10a31798f9f97a4f5662d7408060b2b3c34d55b59ab61ede72ea4a398109db`
+(33,772,816 bytes) then passed the cold required call within 96 completion
+tokens: 10.387 seconds of prefill, 13.284 seconds total, and the exact
+`read_file` path. Automatic tool choice reused 6,665 tokens and completed in
+3.128 seconds. SSE reused the same boundary, emitted one structured call plus
+terminal `[DONE]`, and completed in 3.117 seconds. The tool-result continuation
+returned the exact sentinel in 16 tokens while reusing 6,665 tokens, completing
+in 6.108 seconds. This is local exact-artifact candidate evidence. Clean
+immutable source, exact-SHA CI, and the protected packed-artifact hardware gate
+remain the publication authority.
+
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
 This section records the rejected 89.65 GiB Q2_K_S artifact and the defects that

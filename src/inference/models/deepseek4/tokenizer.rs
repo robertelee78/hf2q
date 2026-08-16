@@ -212,9 +212,8 @@ mod tests {
     fn official_embedded_tokenizer_matches_source_json() {
         let gguf_path = std::env::var("HF2Q_DEEPSEEK4_GGUF")
             .expect("set HF2Q_DEEPSEEK4_GGUF to the official converted artifact");
-        let source_path = std::env::var("HF2Q_DEEPSEEK4_TOKENIZER_JSON").unwrap_or_else(|_| {
-            "/opt/hf2q/cache/deepseek-v4-flash-0731-source/tokenizer.json".into()
-        });
+        let source_path = std::env::var("HF2Q_DEEPSEEK4_TOKENIZER_JSON")
+            .expect("set HF2Q_DEEPSEEK4_TOKENIZER_JSON to the source tokenizer.json");
         let gguf = GgufFile::open(std::path::Path::new(&gguf_path)).expect("open official GGUF");
         let embedded = build_tokenizer_from_gguf(&gguf).expect("build embedded tokenizer");
         let source = Tokenizer::from_file(source_path).expect("load official tokenizer.json");
@@ -231,6 +230,65 @@ mod tests {
                 actual.get_ids(),
                 expected.get_ids(),
                 "token drift for {text:?}"
+            );
+        }
+        if let Ok(prompt_path) = std::env::var("HF2Q_DEEPSEEK4_RENDERED_PROMPT") {
+            let prompt = std::fs::read_to_string(&prompt_path)
+                .unwrap_or_else(|error| panic!("read rendered prompt {prompt_path:?}: {error}"));
+            if let Ok(request_path) = std::env::var("HF2Q_DEEPSEEK4_REQUEST_JSON") {
+                let request_bytes = std::fs::read(&request_path)
+                    .unwrap_or_else(|error| panic!("read request {request_path:?}: {error}"));
+                let request: crate::serve::api::schema::ChatCompletionRequest =
+                    serde_json::from_slice(&request_bytes)
+                        .unwrap_or_else(|error| panic!("parse request {request_path:?}: {error}"));
+                let template = crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731;
+                let rendered = crate::serve::api::engine::render_chat_prompt_with_tools(
+                    template,
+                    &request.messages,
+                    request.tools.as_deref(),
+                    crate::serve::template_supports_enable_thinking(template),
+                    request.chat_template_kwargs.as_ref(),
+                )
+                .expect("render request through the hf2q DeepSeek-V4 path");
+                if rendered != prompt {
+                    let first_mismatch = rendered
+                        .as_bytes()
+                        .iter()
+                        .zip(prompt.as_bytes())
+                        .position(|(actual, expected)| actual != expected);
+                    let offset = first_mismatch.unwrap_or(rendered.len().min(prompt.len()));
+                    let start = offset.saturating_sub(120);
+                    let end = offset.saturating_add(240);
+                    panic!(
+                        "hf2q native render drifted from supplied prompt: hf2q_len={} supplied_len={} first_mismatch={first_mismatch:?} hf2q_context={:?} supplied_context={:?}",
+                        rendered.len(),
+                        prompt.len(),
+                        String::from_utf8_lossy(
+                            &rendered.as_bytes()[start.min(rendered.len())..end.min(rendered.len())]
+                        ),
+                        String::from_utf8_lossy(
+                            &prompt.as_bytes()[start.min(prompt.len())..end.min(prompt.len())]
+                        ),
+                    );
+                }
+            }
+            let expected = source
+                .encode(prompt.as_str(), false)
+                .expect("source prompt encode");
+            let actual = embedded
+                .encode(prompt.as_str(), false)
+                .expect("embedded prompt encode");
+            let first_mismatch = actual
+                .get_ids()
+                .iter()
+                .zip(expected.get_ids())
+                .position(|(actual, expected)| actual != expected);
+            assert_eq!(
+                actual.get_ids(),
+                expected.get_ids(),
+                "rendered prompt token drift: embedded_len={} source_len={} first_mismatch={first_mismatch:?}",
+                actual.len(),
+                expected.len()
             );
         }
         let assistant = embedded

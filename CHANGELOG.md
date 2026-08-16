@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve client JSON-object insertion order while rendering native chat
+  templates. DeepSeek-V4's published encoder treats the serialized tool schema
+  as prompt bytes; sorting the function and parameter keys changed the greedy
+  trajectory and could push an otherwise correct required tool call beyond a
+  128-token completion budget. The corrected renderer matches the source
+  prompt, while conversion, quantization, and model weights remain unchanged.
 - Make GitHub release-tag creation distinguish an explicit missing-ref 404
   from every other API failure. Release automation now validates existing and
   newly created tag SHAs, re-reads a created ref before publishing assets, and

@@ -28907,6 +28907,41 @@ assistant:
     }
 
     #[test]
+    fn deepseek4_tool_schema_preserves_client_object_order() {
+        let request: super::super::schema::ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "model":"deepseek-v4",
+                "messages":[{"role":"user","content":"Read the manifest."}],
+                "tools":[{"type":"function","function":{
+                    "name":"read_file",
+                    "description":"Read a UTF-8 text file",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"path":{"type":"string","description":"Absolute file path"}},
+                        "required":["path"],
+                        "additionalProperties":false
+                    }
+                }}]
+            }"#,
+        )
+        .expect("parse ordered OpenAI request");
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731,
+            &request.messages,
+            request.tools.as_deref(),
+            false,
+            None,
+        )
+        .expect("render DeepSeek-V4 tool prompt");
+        assert!(
+            out.contains(
+                r#"{"name": "read_file", "description": "Read a UTF-8 text file", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute file path"}}, "required": ["path"], "additionalProperties": false}}"#
+            ),
+            "DeepSeek-V4 must retain the request's JSON-object insertion order: {out}"
+        );
+    }
+
+    #[test]
     fn render_chat_prompt_with_tools_threads_per_message_tool_calls_and_responses() {
         // Verify the per-message threading of `tool_calls` (assistant) and
         // synthesized `tool_responses` (from role:"tool" messages, looked up

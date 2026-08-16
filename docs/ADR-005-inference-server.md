@@ -9559,12 +9559,11 @@ object-form tool_call arguments intentionally change (that is fix F2).
    `serde_json::from_str(&tc.function.arguments)`; substitute ONLY when
    the parse yields a JSON **object**. Arrays, scalars, JSON strings,
    and parse failures keep the raw string verbatim (today's shape;
-   gate-1 #5). Key-order note (gate-3 #8): hf2q's serde_json build has
-   no `preserve_order` feature, so substituted-object key order is
-   serde_json's (sorted) — object argument key order in the rendered
-   prompt is INTENTIONALLY UNSPECIFIED. Both served templates are
-   order-insensitive anyway: Gemma 4 `dictsort`s its arguments and the
-   qwen template emits one `<parameter>` block per key.
+   gate-1 #5). Object insertion order is preserved from the client request.
+   This is required by native encoders whose serialized tool schema is part of
+   the prompt bytes; it also keeps substituted assistant arguments faithful to
+   the request instead of silently sorting their keys. Templates remain free
+   to apply an explicit ordering operation such as Gemma 4's `dictsort`.
 3. **Reasoning echo-back (F3).** Insert `reasoning_content` into the
    Jinja message object — assistant-role messages only, only when
    present (gate-1 #6). Non-assistant messages never gain the field
