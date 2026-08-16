@@ -1472,14 +1472,18 @@ impl HybridKvCache {
         crate::serve::multi_seq_kv::MultiSeqKvCache::seq_len(self, slot)
     }
 
-    /// Verify that every full-attention layer (and the optional MTP layer)
-    /// has committed the same request-local cursor before the serving driver
-    /// publishes a resumable prefill boundary.
+    /// Verify that every verifier full-attention layer has committed the same
+    /// request-local cursor before the serving driver publishes a resumable
+    /// prefill boundary.
     ///
     /// `sequence_len_for_slot` intentionally remains a cheap canonical read
     /// for metrics. Scheduler transaction boundaries need a release-mode
     /// check: a command-buffer or restore defect must not let layer 0 advance
-    /// the public token ledger while another layer remains behind.
+    /// the public token ledger while another verifier layer remains behind.
+    /// The optional MTP cache has an independent speculative cursor: ordinary
+    /// base prefill does not advance it, and speculative decoding advances it
+    /// relative to its own proposal window. It must therefore be snapshotted
+    /// and restored, but never compared to the verifier prompt cursor here.
     pub(crate) fn validate_sequence_len_for_slot(
         &self,
         slot: crate::serve::multi_seq_kv::SlotId,
@@ -1508,19 +1512,6 @@ impl HybridKvCache {
             anyhow::ensure!(
                 actual == expected,
                 "validate_sequence_len_for_slot: full_attn[{layer_idx}] cursor={actual} != expected={expected} for slot {}",
-                slot.0
-            );
-        }
-        if let Some(mtp) = self.mtp_slot.as_ref() {
-            let actual = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
-                anyhow!(
-                    "validate_sequence_len_for_slot: MTP cursor missing for slot {}",
-                    slot.0
-                )
-            })?;
-            anyhow::ensure!(
-                actual == expected,
-                "validate_sequence_len_for_slot: MTP cursor={actual} != expected={expected} for slot {}",
                 slot.0
             );
         }
@@ -1570,12 +1561,7 @@ impl HybridKvCache {
                         slot.0
                     )
                 })?;
-                anyhow::ensure!(
-                    cursor as usize == prompt_len,
-                    "snapshot_slot_anchor: MTP cursor={cursor} != prompt_len={prompt_len} for slot {}",
-                    slot.0
-                );
-                Ok(cursor)
+                Ok::<u32, anyhow::Error>(cursor)
             })
             .transpose()?;
 
@@ -9599,7 +9585,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_release_boundary_validation_rejects_later_layer_and_mtp_desync() {
+    fn qwen35_release_boundary_validation_keeps_mtp_cursor_independent() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
@@ -9621,16 +9607,13 @@ mod tests {
 
         let mtp = cache.mtp_slot.as_mut().expect("fixture has MTP slot");
         mtp.current_len[1] = 3;
-        let mtp_error = cache
+        cache
             .validate_sequence_len_for_slot(slot, 5)
-            .expect_err("MTP cursor desync must fail closed");
-        assert!(format!("{mtp_error:#}").contains("MTP cursor=3"));
-
-        let anchor_error = match cache.snapshot_slot_anchor(slot, 5) {
-            Ok(_) => panic!("prompt anchor must reject an MTP cursor desync independently"),
-            Err(error) => error,
-        };
-        assert!(format!("{anchor_error:#}").contains("MTP cursor=3"));
+            .expect("base verifier boundary must not require MTP lockstep");
+        let anchor = cache
+            .snapshot_slot_anchor(slot, 5)
+            .expect("prompt anchor captures the independent MTP cursor");
+        assert_eq!(anchor.mtp_current_len, Some(3));
     }
 
     /// Pin: drop resets ONLY the target slot's cursor (across all
