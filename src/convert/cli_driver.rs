@@ -1429,6 +1429,7 @@ fn build_metadata_for_arch(
     bert_pooling_override: Option<u32>,
     qwen3vl_n_deepstack: Option<u32>,
 ) -> Vec<(String, MetaValue)> {
+    let wrapper_config = config;
     // Multimodal-wrapper flatten: text-decoder hparams live in
     // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
     // Per-arch mappers don't each have to handle this; we resolve at the
@@ -1468,7 +1469,7 @@ fn build_metadata_for_arch(
             model_dir_basename,
         );
     }
-    let config = effective_config(config);
+    let config = effective_config(wrapper_config);
     match arch {
         ArchName::Llama3 => {
             llama3::build_metadata(config, ftype, model_card, sampling, model_dir_basename)
@@ -1488,7 +1489,7 @@ fn build_metadata_for_arch(
         ),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card, size_label),
         ArchName::Qwen35 => qwen35_dense::build_metadata(
-            config,
+            wrapper_config,
             ftype,
             model_card,
             sampling,
@@ -1496,10 +1497,10 @@ fn build_metadata_for_arch(
             size_label,
         ),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
-        ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {
+        ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(wrapper_config) {
             Some(ctx) => qwen35moe_full::build_metadata(
                 &ctx,
-                config,
+                wrapper_config,
                 ftype,
                 model_card,
                 sampling,
@@ -2864,6 +2865,30 @@ mod tests {
             conversion_model_basename(&args).as_deref(),
             Some("custom-qwen38")
         );
+    }
+
+    #[test]
+    fn qwen_conditional_metadata_dispatch_preserves_wrapper_vision_contract() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/qwen38/config.json"))
+                .expect("Qwen3.8 fixture");
+        let metadata = build_metadata_for_arch(
+            ArchName::Qwen35,
+            &config,
+            15,
+            None,
+            None,
+            None,
+            Some("Qwen3.8-27B"),
+            None,
+            None,
+        );
+        let map: std::collections::HashMap<_, _> = metadata.into_iter().collect();
+        assert_eq!(
+            map["hf2q.vision.projector_profile"],
+            MetaValue::String("qwen3vl_siglip".into())
+        );
+        assert_eq!(map["hf2q.vision.deepstack_output_count"], MetaValue::U32(0));
     }
 
     #[test]
