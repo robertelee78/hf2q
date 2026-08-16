@@ -4804,6 +4804,55 @@ mod tests {
     }
 
     #[test]
+    fn deepseek4_todowrite_nested_schema_rejects_null_content_and_accepts_repair() {
+        // Stock OpenCode's TodoWrite shape: the outer `todos` array and every
+        // item's content/status/priority fields are required strings.  This
+        // regression is deliberately tool-name agnostic at the compiler
+        // boundary; `todowrite` is the production witness that nested array
+        // item schemas remain authoritative for DSML values.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                            "priority": {"type": "string"}
+                        },
+                        "required": ["content", "status", "priority"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        }"#;
+        let malformed = "\n<｜DSML｜invoke name=\"todowrite\">\n<｜DSML｜parameter name=\"todos\" string=\"false\">[{\"content\":null,\"status\":\"in_progress\",\"priority\":\"high\"}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let repaired = "\n<｜DSML｜invoke name=\"todowrite\">\n<｜DSML｜parameter name=\"todos\" string=\"false\">[{\"content\":\"Inspect the environment\",\"status\":\"in_progress\",\"priority\":\"high\"}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+
+        let mut rejected = deepseek4_runtime(
+            "todowrite",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        assert!(
+            !rejected.accept_bytes(malformed.as_bytes()),
+            "a schema-required todo content string must not admit JSON null"
+        );
+
+        let mut accepted = deepseek4_runtime(
+            "todowrite",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        assert!(accepted.accept_bytes(repaired.as_bytes()));
+        assert!(accepted.is_accepted());
+    }
+
+    #[test]
     fn deepseek4_question_candidate_mask_matches_runtime_on_malformed_json() {
         let schema = serde_json::json!({
             "type": "object",
