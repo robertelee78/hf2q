@@ -130,6 +130,12 @@ pub fn try_serialize(cache: &PromptCache) -> Option<Vec<u8>> {
         // restore.
         return None;
     }
+    if cache.key.tool_argument_wire_kinds.is_some() {
+        // The request schema controls Qwen's ambiguous top-level wire types.
+        // This legacy disk format does not persist that contract; skip the
+        // response cache rather than restore a schema-blind replay key.
+        return None;
+    }
     let snap = PromptCacheSnapshot {
         format_version: PROMPT_CACHE_FORMAT_VERSION,
         tokens: cache.tokens.clone(),
@@ -195,6 +201,7 @@ pub fn try_deserialize(bytes: &[u8]) -> Option<PromptCache> {
             presence_penalty_bits: snap.key.presence_penalty_bits,
             min_p_bits: snap.key.min_p_bits,
             tool_call_policy: ToolCallPolicy::default(),
+            tool_argument_wire_kinds: None,
             logprobs: snap.key.logprobs,
             top_logprobs: snap.key.top_logprobs,
             parallel_tool_calls: snap.key.parallel_tool_calls,
@@ -226,6 +233,27 @@ mod tests {
     fn empty_cache_yields_none() {
         let c = PromptCache::new();
         assert!(try_serialize(&c).is_none());
+    }
+
+    #[test]
+    fn agentic_grammar_contract_schema_aware_cache_is_not_persisted_without_wire_kinds() {
+        let tools = vec![crate::serve::api::schema::Tool {
+            tool_type: "function".to_string(),
+            function: crate::serve::api::schema::ToolFunction {
+                name: "gateway".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"arguments_json": {"type": "string"}}
+                })),
+            },
+        }];
+        let mut cache = fresh_cache(vec![1, 2], "tool response");
+        cache.key.tool_argument_wire_kinds = Some(std::sync::Arc::new(
+            crate::serve::api::registry::qwen35_tool_argument_wire_kinds(&tools)
+                .expect("wire kinds"),
+        ));
+        assert!(try_serialize(&cache).is_none());
     }
 
     #[test]

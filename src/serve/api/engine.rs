@@ -333,8 +333,8 @@ pub struct SamplingParams {
     /// Pre-compiled GBNF grammar to constrain decode-time token selection.
     /// `None` ⇒ unconstrained (default sampling on raw logits).  When
     /// `Some(g)`, the decode loop builds a fresh `GrammarRuntime`
-    /// (`mask::mask_invalid_tokens` clones it per-token), calls the
-    /// mask BEFORE `sampler_pure::sample_token`, and feeds the chosen
+    /// and applies one candidate-set rejection walk over the live grammar
+    /// stacks BEFORE `sampler_pure::sample_token`, then feeds the chosen
     /// token's bytes through the runtime so the next step's mask is
     /// correctly narrowed.
     ///
@@ -372,6 +372,13 @@ pub struct SamplingParams {
     /// Defaults to `Auto` (content fallback) so the pre-wave-2.5
     /// behavior is preserved for all callers that don't set this field.
     pub tool_call_policy: ToolCallPolicy,
+
+    /// Qwen request-owned top-level parameter wire contract derived from the
+    /// OpenAI tool schemas.  Qwen renders declared strings as raw bytes and
+    /// non-strings as JSON, so identical wire text (for example `true` or
+    /// `{}`) is not self-describing.  Every unary, SSE, and cache-replay
+    /// parser must use this same map. `None` preserves legacy direct callers.
+    pub tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
 
     // --- ADR-005 iter-230 B — reasoning forced-open seed ---
     /// `true` when the rendered chat prompt ends inside an OPEN
@@ -420,6 +427,7 @@ impl Default for SamplingParams {
             token_bytes: None,
             grammar_kind: GrammarKind::default(),
             tool_call_policy: ToolCallPolicy::Auto,
+            tool_argument_wire_kinds: None,
             reasoning_forced_open: false,
             stable_prompt_prefix_tokens: None,
         }
@@ -452,22 +460,33 @@ pub fn effective_repetition_penalty(params: &SamplingParams) -> f64 {
     }
 }
 
-/// Configure an AUTO tool grammar to wake on the model family's native open
-/// marker.  The runtime itself scans accepted token bytes so a token carrying
-/// both the marker and the first body bytes cannot leave the grammar behind.
+/// Configure a tool grammar whose enforcement begins at a native boundary.
+/// AUTO wakes on the tool-open marker. A required call whose prompt already
+/// opened a reasoning span wakes on the reasoning-close marker, so reasoning
+/// remains unconstrained but the complete call that follows is still enforced.
+/// The runtime scans accepted token bytes itself, including markers split
+/// across tokens and marker-plus-body tokens.
 pub(super) fn arm_lazy_tool_grammar(
     runtime: &mut super::grammar::GrammarRuntime,
     kind: GrammarKind,
     registration: Option<&super::registry::ModelRegistration>,
+    reasoning_forced_open: bool,
 ) {
-    if !matches!(kind, GrammarKind::ToolCallBodyAuto) {
-        return;
-    }
-    if let Some(open) = registration.and_then(|registration| registration.tool_open) {
-        runtime.set_lazy_trigger(open.as_bytes());
+    let marker = match kind {
+        GrammarKind::ToolCallBodyAuto => {
+            registration.and_then(|registration| registration.tool_open)
+        }
+        GrammarKind::ToolCallBodyRequired if reasoning_forced_open => {
+            registration.and_then(|registration| registration.reasoning_close)
+        }
+        GrammarKind::ResponseFormat | GrammarKind::ToolCallBodyRequired => return,
+    };
+    if let Some(marker) = marker {
+        runtime.set_lazy_trigger(marker.as_bytes());
     } else {
-        // Defensive compatibility for synthetic/unregistered tests. Real
-        // tool grammars are compiled only for registered model families.
+        // A compiled tool grammar without its registered boundary must not
+        // begin accepting unrelated bytes. Keep it suspended so the request
+        // terminates through the constrained-call failure path.
         runtime.set_awaiting_trigger(true);
     }
 }
@@ -477,23 +496,35 @@ pub(super) fn grammar_runtime_for_request(
     registration: Option<&super::registry::ModelRegistration>,
 ) -> Result<Option<super::grammar::GrammarRuntime>> {
     let Some(grammar) = params.grammar.as_ref() else {
+        anyhow::ensure!(
+            params.token_bytes.is_none(),
+            "grammar token table present without a grammar"
+        );
         return Ok(None);
     };
     let root = grammar
         .rule_id("root")
         .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+    anyhow::ensure!(
+        params.token_bytes.is_some(),
+        "grammar is present without its authoritative token byte table"
+    );
     let mut runtime = super::grammar::GrammarRuntime::new(grammar.clone(), root)
         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-    arm_lazy_tool_grammar(&mut runtime, params.grammar_kind, registration);
+    arm_lazy_tool_grammar(
+        &mut runtime,
+        params.grammar_kind,
+        registration,
+        params.reasoning_forced_open,
+    );
     Ok(Some(runtime))
 }
 
 /// Sample from CPU logits while preserving grammar semantics.
 ///
-/// Temperature-zero grammar requests use a ranked validity probe instead of
-/// exhaustively cloning the grammar runtime for every vocabulary entry. The
-/// exhaustive mask remains the path for probabilistic sampling and logprobs,
-/// where the full constrained distribution is required.
+/// Temperature-zero grammar requests use a ranked validity probe. Probabilistic
+/// sampling and logprobs use the exact candidate-set mask over the full
+/// vocabulary so the constrained distribution remains complete.
 pub(super) fn sample_logits_with_grammar(
     logits: &mut [f32],
     sampler: &sampler_pure::SamplingParams,
@@ -501,10 +532,23 @@ pub(super) fn sample_logits_with_grammar(
     runtime: Option<&super::grammar::GrammarRuntime>,
     token_bytes: Option<&[Vec<u8>]>,
     want_logprobs: bool,
-) -> (u32, Option<f32>) {
+) -> Result<(u32, Option<f32>)> {
+    match (runtime, token_bytes) {
+        (Some(_), Some(table)) => anyhow::ensure!(
+            table.len() == logits.len(),
+            "grammar token table length {} != logits vocabulary {}",
+            table.len(),
+            logits.len()
+        ),
+        (Some(_), None) => {
+            anyhow::bail!("grammar runtime is present without its authoritative token byte table")
+        }
+        (None, Some(_)) => anyhow::bail!("grammar token table is present without a runtime"),
+        (None, None) => {}
+    }
     if !want_logprobs && sampler.temperature < sampler_pure::SAMPLING_EPS {
         if let (Some(runtime), Some(token_bytes)) = (runtime, token_bytes) {
-            return (
+            return Ok((
                 super::grammar::mask::sample_greedy_valid_token(
                     logits,
                     previous_tokens,
@@ -513,7 +557,7 @@ pub(super) fn sample_logits_with_grammar(
                     token_bytes,
                 ),
                 None,
-            );
+            ));
         }
     }
 
@@ -523,12 +567,12 @@ pub(super) fn sample_logits_with_grammar(
     if want_logprobs {
         let (token, logprob) =
             sampler_pure::sample_token_with_logprob(logits, sampler, previous_tokens);
-        (token, Some(logprob))
+        Ok((token, Some(logprob)))
     } else {
-        (
+        Ok((
             sampler_pure::sample_token(logits, sampler, previous_tokens),
             None,
-        )
+        ))
     }
 }
 
@@ -2482,6 +2526,9 @@ impl LoadedModel {
 /// - `tool_call_policy` — Auto vs Constrained changes error-promotion on
 ///   parse failure; a cached Auto replay served to a Constrained caller
 ///   would silently suppress error signalling
+/// - `tool_argument_wire_kinds` — changes how ambiguous Qwen wire bytes are
+///   serialized into OpenAI `function.arguments`; a cached response produced
+///   under a different schema is not response-equivalent
 /// - `logprobs` / `top_logprobs` — retained in the key as defense in depth and
 ///   for persisted-schema compatibility, although `logprobs=true` requests
 ///   currently bypass terminal response caching
@@ -2518,6 +2565,9 @@ pub struct PromptCacheKey {
     pub min_p_bits: u32,
     /// Auto vs Constrained — affects error-promotion on parse failure.
     pub tool_call_policy: ToolCallPolicy,
+    /// Request-owned Qwen schema wire contract. Structural equality of the
+    /// underlying map prevents replay under a type-incompatible tool schema.
+    pub tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
     /// `true` = include per-token logprob data in response. Changes response
     /// shape; different callers expect different response structures.
     pub logprobs: bool,
@@ -2550,6 +2600,7 @@ impl PromptCacheKey {
             presence_penalty_bits: params.presence_penalty.to_bits(),
             min_p_bits: params.min_p.to_bits(),
             tool_call_policy: params.tool_call_policy,
+            tool_argument_wire_kinds: params.tool_argument_wire_kinds.clone(),
             logprobs: params.logprobs,
             top_logprobs: params.top_logprobs,
             parallel_tool_calls: params.parallel_tool_calls,
@@ -2825,6 +2876,7 @@ impl PromptCache {
                 presence_penalty_bits: 0u32,
                 min_p_bits: 0u32,
                 tool_call_policy: ToolCallPolicy::Auto,
+                tool_argument_wire_kinds: None,
                 logprobs: false,
                 top_logprobs: 0,
                 parallel_tool_calls: true,
@@ -5707,6 +5759,7 @@ struct SlotStreamRouter {
     tool_emitter: Option<ToolCallStreamEmitter>,
     saw_tool_call: bool,
     policy: ToolCallPolicy,
+    tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
     accumulated_text_len: usize,
 }
 
@@ -5726,6 +5779,7 @@ impl SlotStreamRouter {
             tool_emitter: None,
             saw_tool_call: false,
             policy: params.tool_call_policy,
+            tool_argument_wire_kinds: params.tool_argument_wire_kinds.clone(),
             accumulated_text_len: 0,
         }
     }
@@ -5794,9 +5848,10 @@ impl SlotStreamRouter {
                 }
                 super::registry::ToolCallEvent::ToolCallOpen => {
                     self.tool_body.clear();
-                    self.tool_emitter = Some(ToolCallStreamEmitter::new(
+                    self.tool_emitter = Some(ToolCallStreamEmitter::new_with_wire_kinds(
                         registration.map(|registration| registration.family),
                         self.tool_index,
+                        self.tool_argument_wire_kinds.clone(),
                     ));
                 }
                 super::registry::ToolCallEvent::ToolCallText(text) => {
@@ -5808,9 +5863,10 @@ impl SlotStreamRouter {
                 super::registry::ToolCallEvent::ToolCallClose => {
                     let body = std::mem::take(&mut self.tool_body);
                     let mut emitter = self.tool_emitter.take().unwrap_or_else(|| {
-                        ToolCallStreamEmitter::new(
+                        ToolCallStreamEmitter::new_with_wire_kinds(
                             registration.map(|registration| registration.family),
                             self.tool_index,
+                            self.tool_argument_wire_kinds.clone(),
                         )
                     });
                     emitter.finalize(
@@ -6856,6 +6912,7 @@ impl Gemma4DecodeState {
             || params.repetition_penalty != 1.0
             || !params.logit_bias.is_empty()
             || params.grammar.is_some()
+            || params.token_bytes.is_some()
             || params.logprobs;
         let sampler_params = if sample_logits {
             Some(sampler_pure::SamplingParams {
@@ -6869,19 +6926,7 @@ impl Gemma4DecodeState {
         } else {
             None
         };
-        let mut grammar_runtime: Option<super::grammar::GrammarRuntime> =
-            match params.grammar.as_ref() {
-                Some(g) => {
-                    let start_rule_id = g
-                        .rule_id("root")
-                        .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
-                    let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
-                        .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
-                    Some(rt)
-                }
-                None => None,
-            };
+        let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
         let token_bytes: Option<Arc<Vec<Vec<u8>>>> = params.token_bytes.clone();
         let mut tc_splitter: Option<super::registry::ToolCallSplitter> =
             registration.and_then(super::registry::ToolCallSplitter::from_registration);
@@ -6924,7 +6969,7 @@ impl Gemma4DecodeState {
                 grammar_runtime.as_ref(),
                 token_bytes_ref,
                 want_logprobs,
-            );
+            )?;
             if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
@@ -7130,7 +7175,7 @@ impl Gemma4DecodeState {
                 self.grammar_runtime.as_ref(),
                 token_bytes_ref,
                 self.want_logprobs,
-            );
+            )?;
             if let (Some(acc), Some(lp_val)) = (self.logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
@@ -21186,6 +21231,7 @@ fn generate_once_with_soft_tokens(
         || params.repetition_penalty != 1.0
         || !params.logit_bias.is_empty()
         || params.grammar.is_some()
+        || params.token_bytes.is_some()
         || params.logprobs;
     let sampler_params = if sample_logits {
         Some(SamplerParams {
@@ -21200,43 +21246,7 @@ fn generate_once_with_soft_tokens(
         None
     };
 
-    // Build the per-request grammar runtime (Phase 2a Task #5 / iter-95).
-    // `Grammar` is `Clone` (cheap ~Vec<Vec<GretElement>>); the runtime
-    // owns the clone + a small Vec<Stack> of in-flight positions.  We
-    // mutate in place across decode steps (advance via accept_bytes
-    // after each sampled token).
-    //
-    // Wave 2.6 W-α5 Q2: when `params.grammar_kind == ToolCallBody`, the
-    // runtime starts SUSPENDED via `set_awaiting_trigger(true)`.  The
-    // mask + accept calls below are unconditional — the runtime
-    // self-gates internally (mirrors llama.cpp lazy-grammar pattern at
-    // /opt/llama.cpp/src/llama-grammar.cpp:1287-1344, citation in
-    // research-report.md Q2).  The trigger flips when the
-    // `ToolCallSplitter` sees the per-model open marker (handler
-    // below).  For `GrammarKind::ResponseFormat` the runtime starts
-    // EAGER — enforcement from token 0, byte-identical to pre-A1
-    // behavior.  This is the wave-2.5 audit divergence A1 fix.
-    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref()
-    {
-        Some(g) => {
-            let start_rule_id = g
-                .rule_id("root")
-                .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
-            let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
-                .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-            // Wave 2.7 W-η Q-A: only `ToolCallBodyAuto` arms the lazy
-            // (awaiting_trigger) gate.  `ToolCallBodyRequired` is EAGER
-            // from token 0 — the grammar root already wraps the body in
-            // open/close markers, so the mask must fire at byte 0 and
-            // reject any token whose decoded bytes don't prefix the
-            // open marker.  Mirrors llama.cpp `grammar_lazy = false` for
-            // `tool_choice == REQUIRED` at common/chat.cpp:898-913,
-            // 1177-1200, 1399-1416.
-            arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
-            Some(rt)
-        }
-        None => None,
-    };
+    let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
     let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
     // Wave-2.5 A1 / Wave 2.6 W-α5 Q2: ToolCallSplitter for the
@@ -21287,14 +21297,14 @@ fn generate_once_with_soft_tokens(
                 }
             }
         }
-        Ok(sample_logits_with_grammar(
+        sample_logits_with_grammar(
             &mut logits,
             sp,
             generated,
             runtime,
             token_bytes_ref,
             want_logprobs,
-        ))
+        )
     };
     // ADR-020 AC#7 — per-completion-token logprob accumulator.
     // Length tracks `completion_tokens` and is moved into
@@ -22182,7 +22192,12 @@ fn generate_gemma4_once_slot_aware(
                         .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
                     let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
+                    arm_lazy_tool_grammar(
+                        &mut rt,
+                        params.grammar_kind,
+                        registration,
+                        params.reasoning_forced_open,
+                    );
                     Some(rt)
                 }
                 None => None,
@@ -22841,7 +22856,12 @@ fn generate_stream_gemma4_once_slot_aware(
                                     return;
                                 }
                             };
-                        arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
+                        arm_lazy_tool_grammar(
+                            &mut rt,
+                            params.grammar_kind,
+                            registration,
+                            params.reasoning_forced_open,
+                        );
                         Some(rt)
                     }
                     None => None,
@@ -22875,6 +22895,7 @@ fn generate_stream_gemma4_once_slot_aware(
             let mut saw_tool_call: bool = false;
             let mut tool_call_emitter: Option<ToolCallStreamEmitter> = None;
             let tool_call_policy = params.tool_call_policy;
+            let tool_argument_wire_kinds = params.tool_argument_wire_kinds.clone();
 
             // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
             // EventSink wrapper for ToolCallStreamEmitter::{advance,
@@ -22968,9 +22989,10 @@ fn generate_stream_gemma4_once_slot_aware(
                                     body.clear();
                                     // Wave 3 W-B3 incremental:
                                     // fresh emitter for THIS call.
-                                    *emitter = Some(ToolCallStreamEmitter::new(
+                                    *emitter = Some(ToolCallStreamEmitter::new_with_wire_kinds(
                                         reg.map(|r| r.family),
                                         *tc_index,
+                                        tool_argument_wire_kinds.clone(),
                                     ));
                                     // Wave 2.6 W-α5 Q2: arm grammar trigger.
                                     if let Some(rt) = grammar_runtime.as_mut() {
@@ -22986,7 +23008,11 @@ fn generate_stream_gemma4_once_slot_aware(
                                 super::registry::ToolCallEvent::ToolCallClose => {
                                     let body_dump = std::mem::take(body);
                                     let mut em = emitter.take().unwrap_or_else(|| {
-                                        ToolCallStreamEmitter::new(reg.map(|r| r.family), *tc_index)
+                                        ToolCallStreamEmitter::new_with_wire_kinds(
+                                            reg.map(|r| r.family),
+                                            *tc_index,
+                                            tool_argument_wire_kinds.clone(),
+                                        )
                                     });
                                     em.finalize(
                                         body_dump,
@@ -23937,7 +23963,12 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                         .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
                     let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
+                    arm_lazy_tool_grammar(
+                        &mut rt,
+                        params.grammar_kind,
+                        registration,
+                        params.reasoning_forced_open,
+                    );
                     Some(rt)
                 }
                 None => None,
@@ -24457,6 +24488,15 @@ struct ToolCallStreamEmitter {
     /// `gemma4` / `qwen35` / unknown. Unknown families skip the streaming path
     /// (the close-time fallback handles them).
     family: Option<&'static str>,
+    /// Request-owned Qwen parameter wire contract. An Arc clone keeps the
+    /// exact schema interpretation stable for the lifetime of this call.
+    wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
+    /// Resolved function name, captured before any parameter block is emitted.
+    function_name: Option<String>,
+    /// A completed Qwen parameter could not be decoded under the authoritative
+    /// schema. Stop incremental emission and let finalize take the existing
+    /// policy-aware loud-error path; never guess a client-visible type.
+    conversion_failed: bool,
     /// `delta.tool_calls[N].index` — pre-incremented from the per-stream counter
     /// at construction. Stable across all chunks for THIS call.
     index: usize,
@@ -24486,6 +24526,14 @@ impl ToolCallStreamEmitter {
     /// fallback path so the close-buffered shape stays aligned when the
     /// streaming converter declines.
     fn new(family: Option<&'static str>, tc_index: usize) -> Self {
+        Self::new_with_wire_kinds(family, tc_index, None)
+    }
+
+    fn new_with_wire_kinds(
+        family: Option<&'static str>,
+        tc_index: usize,
+        wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
+    ) -> Self {
         let id = format!(
             "call_hf2q_{:016x}",
             std::time::SystemTime::now()
@@ -24496,6 +24544,9 @@ impl ToolCallStreamEmitter {
         );
         Self {
             family,
+            wire_kinds,
+            function_name: None,
+            conversion_failed: false,
             index: tc_index,
             id,
             name_emitted: false,
@@ -24522,6 +24573,7 @@ impl ToolCallStreamEmitter {
             let Some((name, header_end)) = name else {
                 return Ok(());
             };
+            self.function_name = Some(name.clone());
             // First chunk: index + id + type + name. arguments omitted —
             // clients see `function.name` complete on chunk 1 per spec.
             if events
@@ -24633,6 +24685,9 @@ impl ToolCallStreamEmitter {
     /// `</parameter>` after its opening tag. Emits one delta per closed block.
     fn scan_emit_qwen35_kvs(&mut self, body: &str, events: &EventSink<'_>) -> Result<(), ()> {
         use super::sse::GenerationEvent;
+        if self.conversion_failed {
+            return Ok(());
+        }
         loop {
             // Locate the next `<parameter=` in body[scan_cursor..].
             let rest = &body[self.scan_cursor..];
@@ -24659,9 +24714,18 @@ impl ToolCallStreamEmitter {
                 // policy.enforces_body_grammar(). Stop streaming this block.
                 break;
             }
-            let json_val: serde_json::Value = match serde_json::from_str(val_raw) {
-                Ok(v) => v,
-                Err(_) => serde_json::Value::String(val_raw.to_string()),
+            let Some(function_name) = self.function_name.as_deref() else {
+                self.conversion_failed = true;
+                break;
+            };
+            let Some(json_val) = super::registry::decode_qwen35_parameter_value(
+                function_name,
+                key,
+                val_raw,
+                self.wire_kinds.as_deref(),
+            ) else {
+                self.conversion_failed = true;
+                break;
             };
             let key_json = serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
             let val_json = serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string());
@@ -24731,7 +24795,13 @@ impl ToolCallStreamEmitter {
             // Fallback: streaming path never fired. Use the legacy close-
             // buffered emit so policy-enforced loud-error branches and the
             // single-chunk shape both stay intact.
-            let parsed = registration.and_then(|r| super::registry::parse_tool_call_body(r, &body));
+            let parsed = registration.and_then(|r| {
+                super::registry::parse_tool_call_body_with_wire_kinds(
+                    r,
+                    &body,
+                    self.wire_kinds.as_deref(),
+                )
+            });
             return emit_streaming_tool_call_close(parsed, body, policy, tc_index, saw_tc, events);
         }
 
@@ -24739,7 +24809,13 @@ impl ToolCallStreamEmitter {
         // the tail (last kv we couldn't stream because we couldn't
         // distinguish "final kv" from "next kv arriving later") + the
         // closing `}`.
-        let parsed = registration.and_then(|r| super::registry::parse_tool_call_body(r, &body));
+        let parsed = registration.and_then(|r| {
+            super::registry::parse_tool_call_body_with_wire_kinds(
+                r,
+                &body,
+                self.wire_kinds.as_deref(),
+            )
+        });
         let Some(pc) = parsed else {
             // Body failed parse despite streaming having extracted the name.
             // Under policy.enforces_body_grammar(), this means the grammar
@@ -25274,6 +25350,24 @@ fn replay_cached_streaming_response_with_fragments(
     events: &EventSink<'_>,
     cached_fragments: Option<&Vec<CachedFragment>>,
 ) -> Result<(), ()> {
+    replay_cached_streaming_response_with_fragments_and_wire_kinds(
+        cached,
+        registration,
+        tool_call_policy,
+        events,
+        cached_fragments,
+        None,
+    )
+}
+
+fn replay_cached_streaming_response_with_fragments_and_wire_kinds(
+    cached: &GenerationResult,
+    registration: Option<&super::registry::ModelRegistration>,
+    tool_call_policy: ToolCallPolicy,
+    events: &EventSink<'_>,
+    cached_fragments: Option<&Vec<CachedFragment>>,
+    wire_kinds: Option<&super::registry::ToolArgumentWireKinds>,
+) -> Result<(), ()> {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
     // ── 0. Fragments-replay branch (W-A2.3) ─────────────────────────────
@@ -25477,8 +25571,9 @@ fn replay_cached_streaming_response_with_fragments(
                     body.push_str(&t);
                 }
                 super::registry::ToolCallEvent::ToolCallClose => {
-                    let parsed =
-                        registration.and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    let parsed = registration.and_then(|r| {
+                        super::registry::parse_tool_call_body_with_wire_kinds(r, body, wire_kinds)
+                    });
                     let body_dump = std::mem::take(body);
                     emit_streaming_tool_call_close(
                         parsed,
@@ -25776,12 +25871,13 @@ fn generate_stream_once(
             cached.prompt_tokens,
             cached_frags.is_some(),
         );
-        if replay_cached_streaming_response_with_fragments(
+        if replay_cached_streaming_response_with_fragments_and_wire_kinds(
             &cached,
             registration,
             params.tool_call_policy,
             events,
             cached_frags,
+            params.tool_argument_wire_kinds.as_deref(),
         )
         .is_err()
         {
@@ -26093,6 +26189,7 @@ fn generate_stream_once(
     // Wave-2.5 A4: capture the policy so the route_content closure can branch
     // on Constrained vs Auto when a tool-call body fails to parse.
     let tool_call_policy = params.tool_call_policy;
+    let tool_argument_wire_kinds = params.tool_argument_wire_kinds.clone();
 
     // Wave 2.6 W-α5 Q2: the wave-2.5 `Arc<AtomicBool> grammar_active`
     // sibling-state pattern is REMOVED.  The trigger gate now lives
@@ -26175,7 +26272,11 @@ fn generate_stream_once(
                     // unregistered family yields an emitter that declines
                     // (its `advance` is a no-op and `finalize` falls back
                     // to `emit_streaming_tool_call_close`).
-                    *emitter = Some(ToolCallStreamEmitter::new(reg.map(|r| r.family), *tc_index));
+                    *emitter = Some(ToolCallStreamEmitter::new_with_wire_kinds(
+                        reg.map(|r| r.family),
+                        *tc_index,
+                        tool_argument_wire_kinds.clone(),
+                    ));
                     // Wave 2.6 W-α5 Q2: entering a tool-call body — flip
                     // the grammar runtime's trigger so subsequent decode
                     // steps enforce the body grammar.  No-op when the
@@ -26225,7 +26326,11 @@ fn generate_stream_once(
                         // but if a buggy splitter ever emits Close-without-
                         // Open we still want the legacy close-buffered
                         // semantics to fire.
-                        ToolCallStreamEmitter::new(reg.map(|r| r.family), *tc_index)
+                        ToolCallStreamEmitter::new_with_wire_kinds(
+                            reg.map(|r| r.family),
+                            *tc_index,
+                            tool_argument_wire_kinds.clone(),
+                        )
                     });
                     em.finalize(body_dump, reg, tool_call_policy, tc_index, saw_tc, events)?;
                 }
@@ -26311,7 +26416,8 @@ fn generate_stream_once(
         || params.top_p < 1.0
         || params.repetition_penalty != 1.0
         || !params.logit_bias.is_empty()
-        || params.grammar.is_some();
+        || params.grammar.is_some()
+        || params.token_bytes.is_some();
     let sampler_params = if sample_logits {
         Some(SamplerParams {
             temperature: params.temperature as f64,
@@ -26324,40 +26430,12 @@ fn generate_stream_once(
     } else {
         None
     };
-    // Wave 2.6 W-α5 Q2 + Wave 2.7 W-η Q-A: arm the trigger gate ONLY when
-    // the request carries an AUTO-mode tool-call body grammar
-    // (`GrammarKind::ToolCallBodyAuto`).  `ResponseFormat` and
-    // `ToolCallBodyRequired` runtimes leave the gate disarmed for eager
-    // enforcement from token 0 — fixes audit divergence A1 /
-    // response_format regression for ResponseFormat, and forces tool-call
-    // emission for Required/Function (mirrors llama.cpp grammar_lazy=false
-    // in common/chat.cpp:898-913, 1177-1200, 1399-1416).
-    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref()
-    {
-        Some(g) => {
-            let start_rule_id = match g.rule_id("root") {
-                Some(id) => id,
-                None => {
-                    send!(GenerationEvent::Error("grammar has no root rule".into()));
-                    return Ok(SerialStreamEnd::TerminalSent);
-                }
-            };
-            match super::grammar::GrammarRuntime::new(g.clone(), start_rule_id) {
-                Some(mut rt) => {
-                    // Wave 2.7 W-η Q-A: see non-streaming arming above —
-                    // `ToolCallBodyRequired` keeps the eager gate
-                    // (`awaiting_trigger=false`); only `ToolCallBodyAuto`
-                    // suspends until ToolCallSplitter sees the open marker.
-                    arm_lazy_tool_grammar(&mut rt, params.grammar_kind, registration);
-                    Some(rt)
-                }
-                None => {
-                    send!(GenerationEvent::Error("grammar runtime init failed".into()));
-                    return Ok(SerialStreamEnd::TerminalSent);
-                }
-            }
+    let mut grammar_runtime = match grammar_runtime_for_request(params, registration) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send!(GenerationEvent::Error(error.to_string()));
+            return Ok(SerialStreamEnd::TerminalSent);
         }
-        None => None,
     };
     let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
@@ -26471,7 +26549,7 @@ fn generate_stream_once(
             grammar_runtime.as_ref(),
             token_bytes_ref,
             false,
-        );
+        )?;
         if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
             let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
             if !bytes.is_empty() {
@@ -26587,7 +26665,7 @@ fn generate_stream_once(
                     grammar_runtime.as_ref(),
                     token_bytes_ref,
                     false,
-                );
+                )?;
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
                     let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
                     if !bytes.is_empty() {
@@ -27201,7 +27279,7 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
     // Context assembly (ADR-005 iter-229 Decision 4): renderer values
     // first, then `chat_template_kwargs` merged OVER them — kwargs win
     // every collision that survived the reserved-key validation above
-    // (i.e. only `enable_thinking`, the deliberate llama.cpp-parity
+    // (i.e. only `enable_thinking`, the deliberate reserved-key
     // exception, plus free keys like `preserve_thinking`). Values pass
     // to Jinja verbatim; templates own their type checks.
     //
@@ -27421,6 +27499,62 @@ mod tests {
         assert!(gemma_generation_stop_token(&eos, Some(0), 106));
         assert!(!gemma_generation_stop_token(&eos, Some(0), 48));
         assert!(!gemma_generation_stop_token(&eos, None, 0));
+    }
+
+    #[test]
+    fn agentic_grammar_contract_gemma_initialization_requires_exactly_one_authoritative_table() {
+        let mut table_only = SamplingParams::default();
+        table_only.token_bytes = Some(Arc::new(vec![b"a".to_vec()]));
+        assert!(grammar_runtime_for_request(&table_only, None)
+            .expect_err("Gemma table without grammar must fail before GPU sampling")
+            .to_string()
+            .contains("without a grammar"));
+
+        let mut grammar_only = SamplingParams::default();
+        grammar_only.grammar =
+            Some(crate::serve::api::grammar::parse("root ::= \"a\"\n").expect("literal grammar"));
+        assert!(grammar_runtime_for_request(&grammar_only, None)
+            .expect_err("Gemma grammar without table must fail before GPU sampling")
+            .to_string()
+            .contains("without its authoritative token byte table"));
+    }
+
+    #[test]
+    fn agentic_grammar_contract_required_qwen_call_waits_for_forced_reasoning_close() {
+        let registration = super::super::registry::find_for("qwen3.6").expect("Qwen registration");
+        let grammar_text = registration
+            .tool_call_gbnf(
+                "echo_probe",
+                &serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": false
+                }),
+                super::super::registry::GrammarShape::OneOrMoreCalls { parallel: false },
+            )
+            .expect("Qwen required-call grammar");
+        let grammar = super::super::grammar::parse(&grammar_text).expect("parse grammar");
+        let params = SamplingParams {
+            grammar: Some(grammar),
+            token_bytes: Some(Arc::new(vec![Vec::new()])),
+            grammar_kind: GrammarKind::ToolCallBodyRequired,
+            reasoning_forced_open: true,
+            ..SamplingParams::default()
+        };
+        let mut runtime = grammar_runtime_for_request(&params, Some(&registration))
+            .expect("runtime")
+            .expect("grammar runtime");
+
+        assert!(runtime.is_awaiting_trigger());
+        assert!(runtime.accept_bytes(b"reason about the argument"));
+        assert!(runtime.accept_bytes(b"</thi"));
+        assert!(runtime.accept_bytes(b"nk>\n\n"));
+        assert!(!runtime.is_awaiting_trigger());
+        assert!(runtime.accept_bytes(
+            b"<tool_call>\n<function=echo_probe>\n<parameter=value>\n42\n</parameter>\n</function>\n</tool_call>"
+        ));
+        assert!(runtime.is_accepted());
     }
 
     #[test]
@@ -30439,6 +30573,38 @@ assistant:
             cache.lookup(&tokens, &req).is_none(),
             "same prompt + different tool_call_policy must not hit cache \
              (Constrained promotes parse failures; Auto falls back to content)"
+        );
+    }
+
+    #[test]
+    fn agentic_grammar_contract_prompt_cache_misses_on_different_qwen_wire_schema() {
+        let make_kinds = |schema_type: &str| {
+            let tools = vec![super::super::schema::Tool {
+                tool_type: "function".to_string(),
+                function: super::super::schema::ToolFunction {
+                    name: "gateway".to_string(),
+                    description: None,
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": schema_type}}
+                    })),
+                },
+            }];
+            Arc::new(
+                super::super::registry::qwen35_tool_argument_wire_kinds(&tools)
+                    .expect("wire kinds"),
+            )
+        };
+        let tokens = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.tool_argument_wire_kinds = Some(make_kinds("string"));
+        let cache = make_cached(&tokens, &base, "cached tool response");
+
+        let mut request = SamplingParams::default();
+        request.tool_argument_wire_kinds = Some(make_kinds("object"));
+        assert!(
+            cache.lookup(&tokens, &request).is_none(),
+            "same prompt under RawString vs Json tool schema must miss"
         );
     }
 
@@ -38387,6 +38553,61 @@ mod tool_call_stream_emitter_tests {
             v, cv,
             "Qwen 3.5/3.6 streaming args MUST equal canonical parse"
         );
+    }
+
+    #[test]
+    fn agentic_grammar_contract_streaming_qwen_uses_schema_for_json_looking_strings() {
+        let tools = vec![super::super::schema::Tool {
+            tool_type: "function".to_string(),
+            function: super::super::schema::ToolFunction {
+                name: "ruflo_call".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"arguments_json": {"type": "string"}},
+                    "required": ["arguments_json"]
+                })),
+            },
+        }];
+        let kinds = Arc::new(
+            super::super::registry::qwen35_tool_argument_wire_kinds(&tools).expect("wire kinds"),
+        );
+        let body = concat!(
+            "<function=ruflo_call>",
+            "<parameter=arguments_json>{\"query\":\"cache\"}</parameter>",
+            "</function>"
+        );
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(16);
+        let mut emitter =
+            ToolCallStreamEmitter::new_with_wire_kinds(Some("qwen35"), 0, Some(kinds.clone()));
+        emitter
+            .advance(body, &EventSink::new(&tx))
+            .expect("incremental emit");
+        let mut tc_index = 0;
+        let mut saw_tc = false;
+        emitter
+            .finalize(
+                body.to_string(),
+                Some(&super::super::registry::QWEN35),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &EventSink::new(&tx),
+            )
+            .expect("finalize");
+        drop(tx);
+        let events = drain(&mut rx);
+        let (_, args) = rebuild_call(&events, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&args).expect("arguments JSON");
+        assert_eq!(parsed["arguments_json"], "{\"query\":\"cache\"}");
+
+        let canonical = super::super::registry::parse_tool_call_body_with_wire_kinds(
+            &super::super::registry::QWEN35,
+            body,
+            Some(&kinds),
+        )
+        .expect("canonical schema-aware parse");
+        assert_eq!(args, canonical.arguments_json);
     }
 
     /// Unknown family — `advance` is a no-op (no `name_emitted`), and
@@ -51404,8 +51625,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
 //   H196 (skip-mode): GenerateStream-arm typed-error literal for the
 //                     `stream_tool_call_engaged` short-circuit REMOVED
 //                     from the fn body.  Positive pin: the body now
-//                     constructs `ToolCallStreamEmitter::new(reg.map(
-//                     |r| r.family), *tc_index)` at ToolCallOpen, and
+//                     constructs `ToolCallStreamEmitter::new_with_wire_kinds(
+//                     reg.map(|r| r.family), *tc_index, ...)` at
+//                     ToolCallOpen, and
 //                     calls `em.advance(body, event_sink)` on
 //                     ToolCallText + `em.finalize(...)` on
 //                     ToolCallClose — verbatim mirror of the non-slot-
@@ -51472,7 +51694,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
     ///     CapabilityUnsupported` constructor that pre-iter-2-decode-
     ///     C-stream-tool-call branched on `stream_tool_call_engaged`
     ///     is GONE.
-    /// (b) Positive pin: `ToolCallStreamEmitter::new(` appears in the
+    /// (b) Positive pin: `ToolCallStreamEmitter::new_with_wire_kinds(` appears in the
     ///     slot-aware streaming fn body (per-call emitter
     ///     construction at ToolCallOpen).
     /// (c) Positive pin: `tool_call_policy = params.tool_call_policy`
@@ -51521,9 +51743,9 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // ToolCallStreamEmitter per call, mirror of the non-slot-aware
         // route_content at engine.rs:12257.
         assert!(
-            fn_window.contains("ToolCallStreamEmitter::new("),
+            fn_window.contains("ToolCallStreamEmitter::new_with_wire_kinds("),
             "H196 FALSIFIED: slot-aware streaming fn body does NOT \
-             construct `ToolCallStreamEmitter::new(...)` — Wave 3 \
+             construct `ToolCallStreamEmitter::new_with_wire_kinds(...)` — Wave 3 \
              W-B3 incremental tool-call streaming NOT wired."
         );
 

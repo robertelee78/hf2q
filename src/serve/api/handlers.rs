@@ -450,6 +450,7 @@ async fn chat_completions_with_prepared(
     let engine: &Engine = &loaded_engine.engine;
     // Wave-2.5 A4: save policy before params is moved into the engine call.
     let tool_call_policy = params.tool_call_policy;
+    let tool_argument_wire_kinds = params.tool_argument_wire_kinds.clone();
 
     // --- Generate (non-streaming) ---
     // Snapshot mlx-native process-global GPU counters pre-generation so we
@@ -591,7 +592,12 @@ async fn chat_completions_with_prepared(
     // logic.  A4 passes the tool_call_policy so Constrained parse failures
     // surface as 500 errors instead of silently falling back to Content.
     let registration = engine.registration();
-    let extracted = extract_tool_calls_from_text(&result.text, registration, tool_call_policy);
+    let extracted = extract_tool_calls_from_text_with_wire_kinds(
+        &result.text,
+        registration,
+        tool_call_policy,
+        tool_argument_wire_kinds.as_deref(),
+    );
 
     // A4: promote Constrained parse failure to 500.
     if let Some(failed_body) = extracted.constrained_parse_failure {
@@ -770,6 +776,15 @@ fn extract_tool_calls_from_text(
     registration: Option<&registry::ModelRegistration>,
     policy: engine::ToolCallPolicy,
 ) -> ExtractedToolCalls {
+    extract_tool_calls_from_text_with_wire_kinds(text, registration, policy, None)
+}
+
+fn extract_tool_calls_from_text_with_wire_kinds(
+    text: &str,
+    registration: Option<&registry::ModelRegistration>,
+    policy: engine::ToolCallPolicy,
+    wire_kinds: Option<&registry::ToolArgumentWireKinds>,
+) -> ExtractedToolCalls {
     // If there's no model registration or the registration has no tool markers,
     // there can't be any tool calls — return the text unchanged.
     let Some(reg) = registration else {
@@ -810,7 +825,7 @@ fn extract_tool_calls_from_text(
                 }
                 registry::ToolCallEvent::ToolCallClose => {
                     let body = std::mem::take(&mut tc_body);
-                    match registry::parse_tool_call_bodies(reg, &body) {
+                    match registry::parse_tool_call_bodies_with_wire_kinds(reg, &body, wire_kinds) {
                         Some(parsed_calls) if !parsed_calls.is_empty() => {
                             for parsed in parsed_calls {
                                 let id = format!(
@@ -1018,6 +1033,23 @@ struct PreparedChatContext {
     /// Gemma / non-Qwen3-VL paths (the worker arm synthesizes
     /// text-style positions when None).
     positions_flat: Option<Vec<i32>>,
+}
+
+fn resolve_api_enable_thinking(request_override: Option<bool>, template: &str) -> bool {
+    request_override.unwrap_or_else(|| crate::serve::template_supports_enable_thinking(template))
+}
+
+fn resolve_api_template_kwargs(
+    registration: Option<&registry::ModelRegistration>,
+    request_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut resolved = request_kwargs.cloned().unwrap_or_default();
+    if registration.is_some_and(|candidate| candidate.family == "qwen35") {
+        resolved
+            .entry("preserve_thinking")
+            .or_insert(serde_json::Value::Bool(true));
+    }
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 /// Run every validation + rendering + tokenization step common to the
@@ -1285,18 +1317,24 @@ where
     let tool_grammar_kind = tool_grammar_kind_for(&tool_choice);
     let (effective_grammar, effective_grammar_kind) =
         select_effective_grammar(tool_grammar, tool_grammar_kind, response_grammar);
-    // ADR-005 Phase 2a iter-133 Iter D (W67): per-request thinking mode
-    // override. Default off keeps every legacy / non-thinking-aware
-    // caller's rendered prompt byte-identical; Open WebUI's panel UX
-    // sets `hf2q_enable_thinking: true` when the user toggles thinking
-    // on. Reasoning-capable templates (Gemma 4, Qwen 3.5/3.6) consult
-    // the `enable_thinking` Jinja kwarg; non-reasoning templates ignore
-    // it.
-    let enable_thinking = req.hf2q_enable_thinking.unwrap_or(false);
+    // A stock OpenAI-compatible client cannot be expected to know an hf2q
+    // extension. An explicit request override still wins; when it is absent,
+    // derive the native default from the loaded chat template using the same
+    // render-and-diff capability probe as the CLI. Non-reasoning templates
+    // remain off, while thinking-capable templates keep their intended mode.
+    let enable_thinking =
+        resolve_api_enable_thinking(req.hf2q_enable_thinking, engine.chat_template());
     // ADR-005 iter-229 Decision 4: extra Jinja context vars (e.g.
     // preserve_thinking) ride the whole render path; reserved-key
     // validation happens inside the renderer and maps to 400.
-    let template_kwargs = req.chat_template_kwargs.as_ref();
+    // Qwen's template otherwise re-renders historical assistant turns when a
+    // later ordinary user message moves `last_query_index`. That invalidates
+    // the already-cached prompt before its stable anchor. Preserve wrappers
+    // from the first request so both plain and tool-bearing histories remain
+    // append-only. An explicit caller value still wins.
+    let resolved_template_kwargs =
+        resolve_api_template_kwargs(engine.registration(), req.chat_template_kwargs.as_ref());
+    let template_kwargs = resolved_template_kwargs.as_ref();
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
         match apply_overflow_policy(
             engine,
@@ -1451,6 +1489,19 @@ where
         }
         _ => engine::ToolCallPolicy::Auto,
     };
+    let tool_argument_wire_kinds = match (engine.registration(), req_tools) {
+        (Some(registration), Some(tools)) if registration.family == "qwen35" => {
+            match registry::qwen35_tool_argument_wire_kinds(tools) {
+                Ok(kinds) => Some(std::sync::Arc::new(kinds)),
+                Err(error) => {
+                    return Err(
+                        ApiError::invalid_request(error, Some("tools".into())).into_response()
+                    );
+                }
+            }
+        }
+        _ => None,
+    };
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
@@ -1470,6 +1521,7 @@ where
         token_bytes: grammar_token_bytes,
         grammar_kind: effective_grammar_kind,
         tool_call_policy: tc_policy,
+        tool_argument_wire_kinds,
         reasoning_forced_open,
         stable_prompt_prefix_tokens,
     };
@@ -9717,7 +9769,10 @@ mod iter215_qwen35_chat_501_tests {
 
 #[cfg(test)]
 mod test_a3_tool_call_extraction {
-    use super::{engine, extract_tool_calls_from_text, registry, tool_turn_message_content};
+    use super::{
+        engine, extract_tool_calls_from_text, extract_tool_calls_from_text_with_wire_kinds,
+        registry, tool_turn_message_content,
+    };
 
     #[test]
     fn pure_tool_turn_discards_whitespace_only_content() {
@@ -9780,6 +9835,40 @@ mod test_a3_tool_call_extraction {
             result.content.contains("Here is the weather:"),
             "pre-marker content must be preserved"
         );
+    }
+
+    #[test]
+    fn agentic_grammar_contract_unary_qwen_preserves_schema_string_that_looks_like_json() {
+        let reg = registry::find_for("qwen3.6").expect("Qwen registration");
+        let tools = vec![crate::serve::api::schema::Tool {
+            tool_type: "function".to_string(),
+            function: crate::serve::api::schema::ToolFunction {
+                name: "gateway".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"arguments_json": {"type": "string"}}
+                })),
+            },
+        }];
+        let kinds = registry::qwen35_tool_argument_wire_kinds(&tools).expect("wire kinds");
+        let (open, close) = (reg.tool_open.expect("open"), reg.tool_close.expect("close"));
+        let body = concat!(
+            "<function=gateway>",
+            "<parameter=arguments_json>{\"query\":\"cache\"}</parameter>",
+            "</function>"
+        );
+        let extracted = extract_tool_calls_from_text_with_wire_kinds(
+            &format!("{open}{body}{close}"),
+            Some(&reg),
+            engine::ToolCallPolicy::Constrained,
+            Some(&kinds),
+        );
+        assert!(extracted.constrained_parse_failure.is_none());
+        assert_eq!(extracted.tool_calls.len(), 1);
+        let arguments: serde_json::Value =
+            serde_json::from_str(&extracted.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(arguments["arguments_json"], "{\"query\":\"cache\"}");
     }
 
     #[test]
@@ -10987,5 +11076,153 @@ mod iter230_b_probe_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod api_thinking_default_tests {
+    use super::super::schema::{ChatMessage, MessageContent, ToolCall, ToolCallFunction};
+    use super::{engine, registry, resolve_api_enable_thinking, resolve_api_template_kwargs};
+
+    fn message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn stock_client_uses_thinking_capable_template_default() {
+        assert!(resolve_api_enable_thinking(
+            None,
+            crate::core::chat_templates::QWEN3_CHATML,
+        ));
+    }
+
+    #[test]
+    fn stock_client_keeps_non_reasoning_template_off() {
+        assert!(!resolve_api_enable_thinking(
+            None,
+            "{{ messages }}{% if add_generation_prompt %}assistant:{% endif %}",
+        ));
+    }
+
+    #[test]
+    fn explicit_request_override_wins_over_template_default() {
+        assert!(!resolve_api_enable_thinking(
+            Some(false),
+            crate::core::chat_templates::QWEN3_CHATML,
+        ));
+        assert!(resolve_api_enable_thinking(
+            Some(true),
+            "{{ messages }}{% if add_generation_prompt %}assistant:{% endif %}",
+        ));
+    }
+
+    #[test]
+    fn qwen_api_default_preserves_plain_history_as_an_exact_prefix() {
+        let registration = registry::find_for("qwen3.6").expect("Qwen registration");
+        let kwargs =
+            resolve_api_template_kwargs(Some(&registration), None).expect("Qwen default kwargs");
+        assert_eq!(
+            kwargs.get("preserve_thinking"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let before = vec![
+            message("system", "You are an agent."),
+            message("user", "Say hello."),
+            message("assistant", "Hello."),
+        ];
+        let mut after = before.clone();
+        after.push(message("user", "Now say goodbye."));
+        let stable = engine::render_chat_prompt_with_tools_generation_prompt(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &before,
+            None,
+            true,
+            Some(&kwargs),
+            false,
+        )
+        .unwrap();
+        let continued = engine::render_chat_prompt_with_tools_generation_prompt(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &after,
+            None,
+            true,
+            Some(&kwargs),
+            false,
+        )
+        .unwrap();
+        assert!(
+            continued.starts_with(&stable),
+            "stable prompt history was rewritten"
+        );
+    }
+
+    #[test]
+    fn qwen_api_default_preserves_tool_history_as_an_exact_prefix() {
+        let registration = registry::find_for("qwen3.6").expect("Qwen registration");
+        let kwargs =
+            resolve_api_template_kwargs(Some(&registration), None).expect("Qwen default kwargs");
+        let mut call = message("assistant", "I will look it up.");
+        call.reasoning_content = Some("Use the available tool.".into());
+        call.tool_calls = Some(vec![ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: ToolCallFunction {
+                name: "lookup".into(),
+                arguments: "{\"query\":\"gold\"}".into(),
+            },
+        }]);
+        let mut result = message("tool", "{\"price\":4377.41}");
+        result.tool_call_id = Some("call_1".into());
+        let before = vec![
+            message("system", "You are an agent."),
+            message("user", "Look up gold."),
+            call,
+            result,
+            message("assistant", "Gold is 4377.41."),
+        ];
+        let mut after = before.clone();
+        after.push(message("user", "What about silver?"));
+        let stable = engine::render_chat_prompt_with_tools_generation_prompt(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &before,
+            None,
+            true,
+            Some(&kwargs),
+            false,
+        )
+        .unwrap();
+        let continued = engine::render_chat_prompt_with_tools_generation_prompt(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &after,
+            None,
+            true,
+            Some(&kwargs),
+            false,
+        )
+        .unwrap();
+        assert!(continued.starts_with(&stable), "tool history was rewritten");
+    }
+
+    #[test]
+    fn qwen_explicit_preserve_false_and_other_families_are_unchanged() {
+        let registration = registry::find_for("qwen3.6").expect("Qwen registration");
+        let mut request = serde_json::Map::new();
+        request.insert("preserve_thinking".into(), serde_json::Value::Bool(false));
+        let resolved = resolve_api_template_kwargs(Some(&registration), Some(&request)).unwrap();
+        assert_eq!(
+            resolved.get("preserve_thinking"),
+            Some(&serde_json::Value::Bool(false))
+        );
+
+        let gemma = registry::find_for("gemma-4").expect("Gemma registration");
+        assert!(resolve_api_template_kwargs(Some(&gemma), None).is_none());
     }
 }

@@ -459,6 +459,11 @@ pub fn register(entry: ModelRegistration) {
 pub struct ReasoningSplitter {
     open_marker: &'static str,
     close_marker: &'static str,
+    /// Some native templates place a structural separator immediately after
+    /// the reasoning close marker. That separator belongs to the wire
+    /// protocol, not to OpenAI `content`.
+    post_close_separator: &'static str,
+    awaiting_post_close_separator: bool,
     in_reasoning: bool,
     /// Sliding tail of decoded text — long enough to see either marker span
     /// across token boundaries.
@@ -497,6 +502,8 @@ impl ReasoningSplitter {
         Some(Self {
             open_marker: open,
             close_marker: close,
+            post_close_separator: if close == "</think>" { "\n\n" } else { "" },
+            awaiting_post_close_separator: false,
             in_reasoning: forced_open,
             tail_buf: String::with_capacity(cap * 2),
             tail_cap: cap,
@@ -523,6 +530,20 @@ impl ReasoningSplitter {
         let mut out_cursor = 0usize;
 
         loop {
+            if self.awaiting_post_close_separator {
+                let remainder = &scan[scan_cursor..];
+                if remainder.len() < self.post_close_separator.len()
+                    && self.post_close_separator.starts_with(remainder)
+                {
+                    self.tail_buf = scan[out_cursor..].to_string();
+                    break;
+                }
+                if remainder.starts_with(self.post_close_separator) {
+                    scan_cursor += self.post_close_separator.len();
+                    out_cursor = scan_cursor;
+                }
+                self.awaiting_post_close_separator = false;
+            }
             let active_marker = if self.in_reasoning {
                 self.close_marker
             } else {
@@ -541,9 +562,12 @@ impl ReasoningSplitter {
                         out.push((slot, scan[out_cursor..marker_start].to_string()));
                     }
                     // Flip state + skip past marker.
+                    let closed_reasoning = self.in_reasoning;
                     self.in_reasoning = !self.in_reasoning;
                     scan_cursor = marker_start + active_marker.len();
                     out_cursor = scan_cursor;
+                    self.awaiting_post_close_separator =
+                        closed_reasoning && !self.post_close_separator.is_empty();
                 }
                 None => {
                     // No more markers in the remainder. Commit the tail
@@ -578,6 +602,12 @@ impl ReasoningSplitter {
     /// Drain any buffered tail into an output slot at generation end. Called
     /// by the engine when decode finishes, so tail-stashed text isn't lost.
     pub fn finish(&mut self) -> Option<(SplitSlot, String)> {
+        if self.awaiting_post_close_separator
+            && self.post_close_separator.starts_with(&self.tail_buf)
+        {
+            self.tail_buf.clear();
+            self.awaiting_post_close_separator = false;
+        }
         if self.tail_buf.is_empty() {
             return None;
         }
@@ -917,6 +947,172 @@ pub struct ParsedToolCall {
     pub arguments_json: String,
 }
 
+/// How Qwen's native top-level parameter wire should be interpreted.
+///
+/// Qwen emits declared strings as raw text but serializes non-strings as
+/// compact JSON.  Bytes such as `true`, `42`, `{}`, or `[]` are therefore
+/// ambiguous without the request schema; this request-owned map preserves the
+/// declared OpenAI tool type through both unary and incremental SSE parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolArgumentWireKind {
+    RawString,
+    Json,
+    /// Untyped or mixed string/non-string schema.  Preserve the historical
+    /// JSON-first/string-fallback interpretation because the native wire is
+    /// not injective for this shape.
+    Infer,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolArgumentWireKinds {
+    functions: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, ToolArgumentWireKind>,
+    >,
+}
+
+impl ToolArgumentWireKinds {
+    pub fn kind_for(&self, function: &str, parameter: &str) -> Option<ToolArgumentWireKind> {
+        self.functions
+            .get(function)
+            .and_then(|parameters| parameters.get(parameter))
+            .copied()
+    }
+
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+}
+
+fn combine_wire_kinds<I>(kinds: I) -> ToolArgumentWireKind
+where
+    I: IntoIterator<Item = ToolArgumentWireKind>,
+{
+    let mut kinds = kinds.into_iter();
+    let Some(first) = kinds.next() else {
+        return ToolArgumentWireKind::Infer;
+    };
+    if kinds.all(|kind| kind == first) {
+        first
+    } else {
+        ToolArgumentWireKind::Infer
+    }
+}
+
+/// Classify the top-level value surface produced by Qwen's chat template.
+/// Names never participate: only the JSON Schema controls interpretation.
+pub fn qwen35_top_level_wire_kind(schema: &serde_json::Value) -> ToolArgumentWireKind {
+    let Some(object) = schema.as_object() else {
+        return ToolArgumentWireKind::Infer;
+    };
+
+    let mut constraints = Vec::new();
+    if let Some(schema_type) = object.get("type") {
+        let type_kind = |name: &str| match name {
+            "string" => ToolArgumentWireKind::RawString,
+            "integer" | "number" | "boolean" | "null" | "object" | "array" => {
+                ToolArgumentWireKind::Json
+            }
+            _ => ToolArgumentWireKind::Infer,
+        };
+        match schema_type {
+            serde_json::Value::String(name) => constraints.push(type_kind(name)),
+            serde_json::Value::Array(names) => constraints.push(combine_wire_kinds(
+                names
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(type_kind),
+            )),
+            _ => constraints.push(ToolArgumentWireKind::Infer),
+        }
+    }
+    if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array) {
+        constraints.push(combine_wire_kinds(values.iter().map(|value| {
+            if value.is_string() {
+                ToolArgumentWireKind::RawString
+            } else {
+                ToolArgumentWireKind::Json
+            }
+        })));
+    }
+    if let Some(value) = object.get("const") {
+        constraints.push(if value.is_string() {
+            ToolArgumentWireKind::RawString
+        } else {
+            ToolArgumentWireKind::Json
+        });
+    }
+    for union in ["anyOf", "oneOf"] {
+        if let Some(branches) = object.get(union).and_then(serde_json::Value::as_array) {
+            constraints.push(combine_wire_kinds(
+                branches.iter().map(qwen35_top_level_wire_kind),
+            ));
+        }
+    }
+    combine_wire_kinds(constraints)
+}
+
+/// Build the authoritative Qwen parameter map for one OpenAI tools request.
+/// Duplicate function declarations are request errors. Even schemas that
+/// collapse to the same wire kind can carry different enum/object/array
+/// constraints, so accepting a duplicate would make executor identity
+/// ambiguous.
+pub fn qwen35_tool_argument_wire_kinds(
+    tools: &[super::schema::Tool],
+) -> Result<ToolArgumentWireKinds, String> {
+    let mut functions = std::collections::BTreeMap::new();
+    for tool in tools {
+        let mut parameters = std::collections::BTreeMap::new();
+        if let Some(properties) = tool
+            .function
+            .parameters
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|object| object.get("properties"))
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, schema) in properties {
+                parameters.insert(name.clone(), qwen35_top_level_wire_kind(schema));
+            }
+        }
+        match functions.entry(tool.function.name.clone()) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(format!(
+                    "duplicate tool '{}' is ambiguous",
+                    tool.function.name
+                ));
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(parameters);
+            }
+        }
+    }
+    Ok(ToolArgumentWireKinds { functions })
+}
+
+/// Decode one Qwen top-level parameter using the request's authoritative
+/// schema contract.  `None` keeps legacy direct callers compatible; `Some`
+/// fails closed for an unknown function/key instead of guessing a type.
+pub fn decode_qwen35_parameter_value(
+    function: &str,
+    parameter: &str,
+    raw: &str,
+    wire_kinds: Option<&ToolArgumentWireKinds>,
+) -> Option<serde_json::Value> {
+    let kind = match wire_kinds {
+        Some(kinds) => kinds.kind_for(function, parameter)?,
+        None => ToolArgumentWireKind::Infer,
+    };
+    match kind {
+        ToolArgumentWireKind::RawString => Some(serde_json::Value::String(raw.to_string())),
+        ToolArgumentWireKind::Json => serde_json::from_str(raw).ok(),
+        ToolArgumentWireKind::Infer => Some(
+            serde_json::from_str(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+        ),
+    }
+}
+
 /// Every registered in-call special-token marker across all supported
 /// families. Mirrors `BUILTIN_REGISTRATIONS` and the `LEAK_MARKERS` array
 /// in `tests/openwebui_multiturn.rs:115-138`. Used by the Auto-policy
@@ -1010,16 +1206,34 @@ pub fn is_valid_tool_name(name: &str) -> bool {
 /// the engine can degrade gracefully — emit a `Content(raw_body)` fragment
 /// rather than a malformed tool-call delta).
 pub fn parse_tool_call_body(reg: &ModelRegistration, body: &str) -> Option<ParsedToolCall> {
-    parse_tool_call_bodies(reg, body)?.into_iter().next()
+    parse_tool_call_body_with_wire_kinds(reg, body, None)
+}
+
+pub fn parse_tool_call_body_with_wire_kinds(
+    reg: &ModelRegistration,
+    body: &str,
+    wire_kinds: Option<&ToolArgumentWireKinds>,
+) -> Option<ParsedToolCall> {
+    parse_tool_call_bodies_with_wire_kinds(reg, body, wire_kinds)?
+        .into_iter()
+        .next()
 }
 
 /// Parse all function calls represented by one registered outer tool block.
 /// Gemma/Qwen marker pairs each contain one call; DeepSeek DSML deliberately
 /// permits multiple invokes inside a single pair.
 pub fn parse_tool_call_bodies(reg: &ModelRegistration, body: &str) -> Option<Vec<ParsedToolCall>> {
+    parse_tool_call_bodies_with_wire_kinds(reg, body, None)
+}
+
+pub fn parse_tool_call_bodies_with_wire_kinds(
+    reg: &ModelRegistration,
+    body: &str,
+    wire_kinds: Option<&ToolArgumentWireKinds>,
+) -> Option<Vec<ParsedToolCall>> {
     match reg.family {
         "gemma4" => parse_gemma4_tool_call(body).map(|call| vec![call]),
-        "qwen35" => parse_qwen35_tool_call(body).map(|call| vec![call]),
+        "qwen35" => parse_qwen35_tool_call_with_wire_kinds(body, wire_kinds).map(|call| vec![call]),
         "deepseek4" => crate::core::deepseek_v4_encoding::parse_tool_calls_body(body)
             .ok()
             .map(|calls| {
@@ -1224,6 +1438,13 @@ fn gemma4_value_to_json(v: &str) -> serde_json::Value {
 ///
 /// Whitespace-tolerant; `<parameter=key>...</parameter>` blocks become args.
 fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
+    parse_qwen35_tool_call_with_wire_kinds(body, None)
+}
+
+fn parse_qwen35_tool_call_with_wire_kinds(
+    body: &str,
+    wire_kinds: Option<&ToolArgumentWireKinds>,
+) -> Option<ParsedToolCall> {
     let body = body.trim();
     // Expect `<function=NAME>...</function>`.
     let after_func = body.strip_prefix("<function=")?;
@@ -1259,13 +1480,7 @@ fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
         };
         let val_end = val_start + rel_close;
         let val_raw = inner[val_start..val_end].trim();
-        // Try JSON-literal parse first (for numbers/booleans/objects);
-        // fall back to plain string. Qwen's template recommends `tojson` on
-        // the value, so well-formed JSON is the common case.
-        let json_val: serde_json::Value = match serde_json::from_str(val_raw) {
-            Ok(v) => v,
-            Err(_) => serde_json::Value::String(val_raw.to_string()),
-        };
+        let json_val = decode_qwen35_parameter_value(&name, &key, val_raw, wire_kinds)?;
         args.insert(key, json_val);
         cursor = val_end + "</parameter>".len();
     }
@@ -1428,6 +1643,39 @@ const MAX_NESTED_DEPTH: usize = 32;
 /// same shape).  Larger objects return
 /// `EmitterError::UnsupportedSchemaFeature`.
 const MAX_NESTED_PROPERTIES: usize = 32;
+
+/// JSON object keys are strings by construction.  OpenCode plugin tools built
+/// from a Zod `record(string, unknown)` nevertheless emit the redundant JSON
+/// Schema keyword `propertyNames: {"type":"string"}`.  Treat only the
+/// semantically-unconstrained forms as no-ops; a pattern/enum/length-constrained
+/// key schema still fails closed because the wildcard object-key grammar cannot
+/// enforce it.
+fn validate_unconstrained_property_names(
+    fn_name: &str,
+    path: &str,
+    schema: Option<&serde_json::Value>,
+) -> Result<(), EmitterError> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    let unconstrained = match schema {
+        serde_json::Value::Bool(true) => true,
+        serde_json::Value::Object(obj) if obj.is_empty() => true,
+        serde_json::Value::Object(obj) => {
+            obj.len() == 1
+                && matches!(obj.get("type"), Some(serde_json::Value::String(kind)) if kind == "string")
+        }
+        _ => false,
+    };
+    if unconstrained {
+        return Ok(());
+    }
+    Err(EmitterError::UnsupportedSchemaFeature {
+        fn_name: fn_name.to_string(),
+        param_path: path.to_string(),
+        feature: "constrained propertyNames".to_string(),
+    })
+}
 
 impl std::fmt::Display for EmitterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1635,6 +1883,8 @@ fn gemma4_nested_value_rule(
         None => return Ok("gemma4-json-val".to_string()),
     };
 
+    validate_unconstrained_property_names(fn_name, path, obj.get("propertyNames"))?;
+
     for feat in [
         "allOf",
         "$ref",
@@ -1645,7 +1895,6 @@ fn gemma4_nested_value_rule(
         "else",
         "dependentSchemas",
         "patternProperties",
-        "propertyNames",
         "contains",
     ] {
         if obj.contains_key(feat) {
@@ -1942,6 +2191,9 @@ fn gemma4_tool_call_gbnf(
     params_schema: &serde_json::Value,
     shape: GrammarShape,
 ) -> Result<String, EmitterError> {
+    if let Some(obj) = params_schema.as_object() {
+        validate_unconstrained_property_names(fn_name, "/", obj.get("propertyNames"))?;
+    }
     let mut rules: Vec<(String, String)> = Vec::new();
     let mut rule_counter: u32 = 0;
 
@@ -2321,6 +2573,9 @@ fn qwen35_tool_call_gbnf(
     params_schema: &serde_json::Value,
     shape: GrammarShape,
 ) -> Result<String, EmitterError> {
+    if let Some(obj) = params_schema.as_object() {
+        validate_unconstrained_property_names(fn_name, "/", obj.get("propertyNames"))?;
+    }
     let mut rules: Vec<(String, String)> = Vec::new();
 
     // Qwen 3.5/3.6 value primitives — values sit between XML tags, raw text
@@ -2554,6 +2809,7 @@ fn qwen35_tool_call_gbnf(
         GrammarShape::OneOrMoreCalls { parallel } => {
             let open_marker = gbnf_literal("<tool_call>");
             let close_marker = gbnf_literal("</tool_call>");
+            let separator_ws = "[ \\t\\r\\n]*";
             let qwen_call_rule = "qwen35-call".to_string();
             // Full call shape per chat_template:
             //   `<tool_call>\n<function=NAME>\n...\n</function>\n</tool_call>`
@@ -2570,9 +2826,12 @@ fn qwen35_tool_call_gbnf(
             if parallel {
                 // `call ("\n" call)*` — Qwen separates calls 2+ with literal `\n`
                 // (template's loop "else" branch — see citation above).
-                format!("{} ( {} {} )*", qwen_call_rule, newline_lit, qwen_call_rule)
+                format!(
+                    "{} {} ( {} {} )*",
+                    separator_ws, qwen_call_rule, newline_lit, qwen_call_rule
+                )
             } else {
-                qwen_call_rule
+                format!("{} {}", separator_ws, qwen_call_rule)
             }
         }
         GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
@@ -3066,6 +3325,8 @@ fn qwen35_nested_value_rule(
         None => return Ok("qwen35-json-val".to_string()),
     };
 
+    validate_unconstrained_property_names(fn_name, path, obj.get("propertyNames"))?;
+
     // Hard-reject features the grammar cannot enforce (honest 400, no
     // silent downgrade).
     for feat in [
@@ -3078,7 +3339,6 @@ fn qwen35_nested_value_rule(
         "else",
         "dependentSchemas",
         "patternProperties",
-        "propertyNames",
         "contains",
     ] {
         if obj.contains_key(feat) {
@@ -3528,6 +3788,37 @@ mod tests {
         }
         assert_eq!(reasoning, "I think therefore");
         assert_eq!(content, "I am");
+    }
+
+    /// A Qwen reasoning close is followed by two protocol newlines before
+    /// visible content. They may arrive in separate decoded fragments, but
+    /// must never leak into the OpenAI `content` field.
+    #[test]
+    fn agentic_grammar_contract_qwen_reasoning_separator_is_not_content() {
+        let mut sp = make_reasoning_splitter(&QWEN35, true).unwrap();
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for fragment in ["inspect the result</thi", "nk>\n", "\nEXACT"] {
+            for (slot, text) in sp.feed(fragment) {
+                match slot {
+                    SplitSlot::Reasoning => reasoning.push_str(&text),
+                    SplitSlot::Content => content.push_str(&text),
+                }
+            }
+        }
+        if let Some((slot, text)) = sp.finish() {
+            match slot {
+                SplitSlot::Reasoning => reasoning.push_str(&text),
+                SplitSlot::Content => content.push_str(&text),
+            }
+        }
+        assert_eq!(reasoning, "inspect the result");
+        assert_eq!(content, "EXACT");
+
+        let (content, reasoning) =
+            split_full_output_forced(&QWEN35, "reason</think> intentional", true);
+        assert_eq!(reasoning.as_deref(), Some("reason"));
+        assert_eq!(content, " intentional", "non-protocol whitespace is data");
     }
 
     /// Seeded-open with NO close marker: finish() drains the tail to
@@ -5266,6 +5557,103 @@ mod tests {
         );
     }
 
+    /// iter-231d: OpenCode plugin tools built from Zod records emit the
+    /// semantically-redundant `propertyNames:{type:"string"}` keyword. JSON
+    /// object keys are already strings, so both native tool surfaces must
+    /// compile the schema and preserve arbitrary nested argument values.
+    #[test]
+    fn agentic_grammar_contract_tautological_property_names_compiles_and_runs() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "arguments": {
+                    "type": "object",
+                    "propertyNames": {"type": "string"},
+                    "additionalProperties": {}
+                }
+            },
+            "required": ["arguments"]
+        }"#;
+
+        let mut qwen = qwen35_runtime("ruflo_call", schema);
+        let qwen_call = b"<function=ruflo_call>\n<parameter=arguments>\n{\"query\":\"cache\",\"limit\":5,\"nested\":{\"ok\":true}}\n</parameter>\n</function>";
+        assert!(
+            qwen.accept_bytes(qwen_call),
+            "Qwen rejected OpenCode Zod record"
+        );
+        assert!(qwen.is_accepted(), "Qwen record call incomplete");
+
+        let mut gemma = gemma4_runtime("ruflo_call", schema);
+        let gemma_call =
+            b"call:ruflo_call{arguments:{query:<|\"|>cache<|\"|>,limit:5,nested:{ok:true}}}";
+        assert!(
+            gemma.accept_bytes(gemma_call),
+            "Gemma rejected OpenCode Zod record"
+        );
+        assert!(gemma.is_accepted(), "Gemma record call incomplete");
+    }
+
+    /// `propertyNames` is ignored only when it adds no constraint beyond the
+    /// JSON object-key type. Key patterns/enums/length limits remain an honest
+    /// compilation error instead of silently widening the accepted language.
+    #[test]
+    fn agentic_grammar_contract_constrained_property_names_fails_closed() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "arguments": {
+                    "type": "object",
+                    "propertyNames": {"type": "string", "pattern": "^[a-z]+$"}
+                }
+            }
+        });
+        for registration in [&QWEN35, &GEMMA4] {
+            let error = registration
+                .tool_call_gbnf("ruflo_call", &schema, GrammarShape::SingleBody)
+                .expect_err("constrained propertyNames must fail closed");
+            assert!(
+                error.contains("constrained propertyNames"),
+                "error must name the unsupported constraint: {error}"
+            );
+            assert!(
+                error.contains("/arguments"),
+                "error must carry the path: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn agentic_grammar_contract_root_property_names_uses_fail_closed_boundary() {
+        for property_names in [
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!({"type": "string"}),
+        ] {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "propertyNames": property_names,
+            });
+            for registration in [&QWEN35, &GEMMA4] {
+                registration
+                    .tool_call_gbnf("ruflo_call", &schema, GrammarShape::SingleBody)
+                    .expect("unconstrained root propertyNames must compile");
+            }
+        }
+
+        let constrained = serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "propertyNames": {"type": "string", "minLength": 1},
+        });
+        for registration in [&QWEN35, &GEMMA4] {
+            let error = registration
+                .tool_call_gbnf("ruflo_call", &constrained, GrammarShape::SingleBody)
+                .expect_err("constrained root propertyNames must fail closed");
+            assert!(error.contains("constrained propertyNames"));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // iter-231b — full-fidelity nested-schema compilation
     //
@@ -5661,6 +6049,101 @@ mod tests {
             args,
             serde_json::json!({"config": {"model": "sonnet", "nested": {"ids": [1, 2]}}})
         );
+    }
+
+    #[test]
+    fn agentic_grammar_contract_qwen_wire_kinds_preserve_json_looking_strings() {
+        let tools = vec![crate::serve::api::schema::Tool {
+            tool_type: "function".to_string(),
+            function: crate::serve::api::schema::ToolFunction {
+                name: "gateway".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "arguments_json": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "count": {"type": "integer"},
+                        "payload": {"type": "object"}
+                    }
+                })),
+            },
+        }];
+        let kinds = qwen35_tool_argument_wire_kinds(&tools).expect("wire kinds");
+        assert_eq!(
+            kinds.kind_for("gateway", "arguments_json"),
+            Some(ToolArgumentWireKind::RawString)
+        );
+        assert_eq!(
+            kinds.kind_for("gateway", "enabled"),
+            Some(ToolArgumentWireKind::Json)
+        );
+
+        let body = concat!(
+            "<function=gateway>",
+            "<parameter=arguments_json>{\"query\":\"cache\"}</parameter>",
+            "<parameter=enabled>true</parameter>",
+            "<parameter=count>42</parameter>",
+            "<parameter=payload>{\"nested\":[1,2]}</parameter>",
+            "</function>"
+        );
+        let parsed =
+            parse_qwen35_tool_call_with_wire_kinds(body, Some(&kinds)).expect("schema-aware parse");
+        let args: serde_json::Value = serde_json::from_str(&parsed.arguments_json).unwrap();
+        assert_eq!(args["arguments_json"], "{\"query\":\"cache\"}");
+        assert_eq!(args["enabled"], true);
+        assert_eq!(args["count"], 42);
+        assert_eq!(args["payload"], serde_json::json!({"nested": [1, 2]}));
+
+        assert!(parse_qwen35_tool_call_with_wire_kinds(
+            "<function=gateway><parameter=unknown>x</parameter></function>",
+            Some(&kinds)
+        )
+        .is_none());
+        assert!(parse_qwen35_tool_call_with_wire_kinds(
+            "<function=gateway><parameter=count>not-json</parameter></function>",
+            Some(&kinds)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn agentic_grammar_contract_qwen_wire_classifier_handles_unions_and_duplicates() {
+        assert_eq!(
+            qwen35_top_level_wire_kind(&serde_json::json!({
+                "anyOf": [{"type": "string"}, {"enum": ["a", "b"]}]
+            })),
+            ToolArgumentWireKind::RawString
+        );
+        assert_eq!(
+            qwen35_top_level_wire_kind(&serde_json::json!({
+                "oneOf": [{"type": "string"}, {"type": "integer"}]
+            })),
+            ToolArgumentWireKind::Infer
+        );
+
+        let make_tool = |schema_type: &str| crate::serve::api::schema::Tool {
+            tool_type: "function".to_string(),
+            function: crate::serve::api::schema::ToolFunction {
+                name: "duplicate".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": schema_type}}
+                })),
+            },
+        };
+        let error = qwen35_tool_argument_wire_kinds(&[make_tool("string"), make_tool("integer")])
+            .expect_err("conflicting duplicate schema must fail");
+        assert!(error.contains("duplicate tool 'duplicate'"));
+
+        let error = qwen35_tool_argument_wire_kinds(&[make_tool("object"), make_tool("array")])
+            .expect_err("same-wire duplicate schema must also fail");
+        assert!(error.contains("duplicate tool 'duplicate'"));
+
+        let error = qwen35_tool_argument_wire_kinds(&[make_tool("string"), make_tool("string")])
+            .expect_err("identical duplicate declarations remain ambiguous");
+        assert!(error.contains("duplicate tool 'duplicate'"));
     }
 
     /// Both families: top-level UNTYPED parameters now accept structured

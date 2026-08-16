@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use mlx_native::MlxBuffer;
 
 use crate::serve::api::engine::{
-    arm_lazy_tool_grammar, effective_repetition_penalty, GenerationResult, SamplingParams,
+    effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
+    GenerationResult, SamplingParams,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
@@ -47,31 +48,23 @@ pub(super) fn grammar_runtime(
     params: &SamplingParams,
     registration: Option<&ModelRegistration>,
 ) -> Result<Option<GrammarRuntime>> {
-    let Some(grammar) = params.grammar.as_ref() else {
-        return Ok(None);
-    };
-    let root = grammar
-        .rule_id("root")
-        .context("grammar has no root rule")?;
-    let mut runtime = GrammarRuntime::new(grammar.clone(), root)
-        .context("grammar runtime initialization failed")?;
-    arm_lazy_tool_grammar(&mut runtime, params.grammar_kind, registration);
-    Ok(Some(runtime))
+    grammar_runtime_for_request(params, registration)
 }
 
-fn greedy_grammar_token(
+fn sample_cpu_logits(
     values: &mut [f32],
+    params: &SamplingParams,
+    sampler: &sampler_pure::SamplingParams,
     previous: &[u32],
-    repetition_penalty: f64,
-    runtime: &GrammarRuntime,
-    token_bytes: &[Vec<u8>],
-) -> u32 {
-    crate::serve::api::grammar::mask::sample_greedy_valid_token(
+    runtime: Option<&GrammarRuntime>,
+) -> Result<(u32, Option<f32>)> {
+    sample_logits_with_grammar(
         values,
+        sampler,
         previous,
-        repetition_penalty,
         runtime,
-        token_bytes,
+        params.token_bytes.as_deref().map(Vec::as_slice),
+        params.logprobs,
     )
 }
 
@@ -90,6 +83,7 @@ pub(super) fn sample(
         || params.repetition_penalty != 1.0
         || !params.logit_bias.is_empty()
         || runtime.is_some()
+        || params.token_bytes.is_some()
         || params.logprobs;
     if !needs_cpu {
         return supervisor
@@ -107,47 +101,8 @@ pub(super) fn sample(
             *logit += bias;
         }
     }
-    let greedy_grammar = params.temperature < sampler_pure::SAMPLING_EPS as f32
-        && !params.logprobs
-        && runtime.is_some()
-        && params.token_bytes.is_some();
-    let (token, logprob) = if greedy_grammar {
-        let token = greedy_grammar_token(
-            &mut values,
-            previous,
-            sampler.repetition_penalty,
-            runtime.as_ref().expect("checked above"),
-            params.token_bytes.as_deref().expect("checked above"),
-        );
-        (token, None)
-    } else if params.logprobs {
-        if let (Some(runtime), Some(token_bytes)) =
-            (runtime.as_ref(), params.token_bytes.as_deref())
-        {
-            crate::serve::api::grammar::mask::mask_invalid_tokens(
-                runtime,
-                token_bytes,
-                &mut values,
-            );
-        }
-        let (token, logprob) =
-            sampler_pure::sample_token_with_logprob(&mut values, sampler, previous);
-        (token, Some(logprob))
-    } else {
-        if let (Some(runtime), Some(token_bytes)) =
-            (runtime.as_ref(), params.token_bytes.as_deref())
-        {
-            crate::serve::api::grammar::mask::mask_invalid_tokens(
-                runtime,
-                token_bytes,
-                &mut values,
-            );
-        }
-        (
-            sampler_pure::sample_token(&mut values, sampler, previous),
-            None,
-        )
-    };
+    let (token, logprob) =
+        sample_cpu_logits(&mut values, params, sampler, previous, runtime.as_ref())?;
     if let (Some(runtime), Some(token_bytes)) = (runtime.as_mut(), params.token_bytes.as_deref()) {
         if let Some(bytes) = token_bytes.get(token as usize) {
             if !bytes.is_empty() {
@@ -282,21 +237,78 @@ pub(in crate::serve::api) fn generate_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_token_limit, greedy_grammar_token};
+    use std::sync::Arc;
+
+    use super::{decode_token_limit, grammar_runtime, sample_cpu_logits, sampler_config};
+    use crate::serve::api::engine::SamplingParams;
 
     #[test]
-    fn greedy_grammar_fast_path_selects_highest_valid_token() {
+    fn agentic_grammar_contract_deepseek_requires_exactly_one_authoritative_table() {
         let grammar =
             crate::serve::api::grammar::parse("root ::= \"b\"\n").expect("parse literal grammar");
-        let root = grammar.rule_id("root").expect("root rule");
-        let runtime = crate::serve::api::grammar::GrammarRuntime::new(grammar, root)
-            .expect("grammar runtime");
+        let missing = SamplingParams {
+            grammar: Some(grammar.clone()),
+            ..SamplingParams::default()
+        };
+        assert!(grammar_runtime(&missing, None)
+            .expect_err("grammar without table must fail")
+            .to_string()
+            .contains("authoritative token byte table"));
+
+        let stray = SamplingParams {
+            token_bytes: Some(Arc::new(vec![b"a".to_vec(), b"b".to_vec()])),
+            ..SamplingParams::default()
+        };
+        assert!(grammar_runtime(&stray, None)
+            .expect_err("table without grammar must fail")
+            .to_string()
+            .contains("without a grammar"));
+
+        let valid = SamplingParams {
+            grammar: Some(grammar),
+            token_bytes: Some(Arc::new(vec![b"a".to_vec(), b"b".to_vec()])),
+            ..SamplingParams::default()
+        };
+        assert!(grammar_runtime(&valid, None)
+            .expect("matching grammar/table presence")
+            .is_some());
+    }
+
+    #[test]
+    fn agentic_grammar_contract_deepseek_rejects_short_and_long_token_tables() {
+        let grammar =
+            crate::serve::api::grammar::parse("root ::= \"b\"\n").expect("parse literal grammar");
+        let make_params = |table: Vec<Vec<u8>>| SamplingParams {
+            grammar: Some(grammar.clone()),
+            token_bytes: Some(Arc::new(table)),
+            ..SamplingParams::default()
+        };
+
+        for table in [
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
+        ] {
+            let params = make_params(table);
+            let sampler = sampler_config(&params);
+            let runtime = grammar_runtime(&params, None).expect("runtime");
+            let mut logits = vec![10.0, 9.0, 8.0];
+            assert!(
+                sample_cpu_logits(&mut logits, &params, &sampler, &[], runtime.as_ref(),)
+                    .expect_err("table length mismatch must fail")
+                    .to_string()
+                    .contains("logits vocabulary")
+            );
+        }
+
+        let params = make_params(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        let sampler = sampler_config(&params);
+        let runtime = grammar_runtime(&params, None).expect("runtime");
         let mut logits = vec![10.0, 9.0, 8.0];
-        let bytes = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
-        assert_eq!(
-            greedy_grammar_token(&mut logits, &[], 1.0, &runtime, &bytes),
-            1
-        );
+        let (token, logprob) =
+            sample_cpu_logits(&mut logits, &params, &sampler, &[], runtime.as_ref())
+                .expect("exact table");
+        assert_eq!(token, 1);
+        assert_eq!(logprob, None);
     }
 
     #[test]

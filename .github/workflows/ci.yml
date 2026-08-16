@@ -102,6 +102,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
           cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features prompt_cache_ -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features agentic_grammar_contract_ -- --test-threads=1
           cargo test --locked --bin hf2q --all-features gemma4_bounded_prefill_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features slotaware_fail_stop_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1

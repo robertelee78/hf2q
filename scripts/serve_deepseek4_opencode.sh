@@ -59,7 +59,7 @@ set -euo pipefail
 # supported DeepSeek-V4 GGUF; serving is not restricted by producer identity.
 MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2-repro.gguf}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8081}"
 CONTEXT_LEN="${CONTEXT_LEN:-524288}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 CHECK_ONLY="${CHECK_ONLY:-0}"

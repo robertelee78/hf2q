@@ -10146,6 +10146,150 @@ conforming to `^[a-z][a-z0-9-]*$` under the active grammar.
 
 **Full sweep.** `cargo test --bin hf2q`: 3686 passed / 0 failed.
 
+### iter-231d (2026-08-15) — OpenCode/Zod free-form record compatibility
+
+**Problem.** A stock OpenCode plugin that declares a natural free-form object
+with `z.record(z.string(), z.unknown())` emits the nested JSON Schema shape
+`{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}}`.
+The iter-231b hard-feature gate rejected `propertyNames` unconditionally, so an
+otherwise standard stock-OpenCode tool failed grammar compilation before
+inference.
+
+**Decision.** Normalize only semantically unconstrained `propertyNames` forms:
+boolean `true`, `{}`, and exact `{"type":"string"}`. JSON object member names
+are strings by construction, so these forms add no constraint to either the Qwen
+compact-JSON surface or Gemma bare-key object surface. The same check applies at
+the tool-schema root and recursively at nested object values. Any real key-name
+constraint—`false`, pattern, enum, length, or another keyword—continues to return
+`UnsupportedSchemaFeature` with the exact parameter path. There is no permissive
+fallback.
+
+This compatibility edge belongs to hf2q because it is a standard free-form
+record schema. It does not make a patched client part of the product contract.
+Constrained key-name schemas remain explicitly unsupported and fail closed.
+
+**Tests.** `agentic_grammar_contract_tautological_property_names_compiles_and_runs`
+executes the exact generated nested record under both Qwen and Gemma runtimes;
+`agentic_grammar_contract_constrained_property_names_fails_closed` rejects a nested key
+pattern; `agentic_grammar_contract_root_property_names_uses_fail_closed_boundary`
+accepts the three tautological root forms and rejects `minLength`. The complete
+16-test `agentic_grammar_contract_` cohort is the blocking CI and packed-release
+regression boundary.
+
+### iter-231e (2026-08-15) — exact candidate-set grammar masking
+
+**Problem.** Stock OpenCode sends probabilistic Qwen tool requests at
+`temperature=0.55`. The old probabilistic path scanned the full ~248K-token
+vocabulary and deep-cloned/advanced the grammar runtime for every finite token.
+That made grammar work, rather than model inference or prompt caching, dominate
+each generated tool-call token. The older 5–15 ms estimate in the historical
+iter-95 entry below did not hold for this vocabulary and broad string state.
+
+**Decision.** Implement candidate-set rejection in the shared Rust grammar
+sampler. Decode all candidate token bytes into one code-point arena,
+walk the live grammar stacks collectively, and mask the rejected indices. Keep
+the former clone-per-token implementation test-only as a semantic oracle. The
+temperature-zero ranked probe remains an exact fast path; probabilistic sampling
+and logprobs use the complete candidate-set mask. Grammar/table mismatch is an
+error: a runtime without a table, or a table whose length differs from the live
+logits vocabulary, must fail before sampling rather than fall back to
+unconstrained output.
+
+**Focused evidence.** On a 248,070-entry tokenizer.json proxy table and a
+broad-string grammar, five release-mode repetitions produced an identical valid
+token bitmap. Median candidate-set time was 11.753 ms versus 305.553 ms for the
+clone oracle, a 25.96× focused speedup. This tokenizer-only measurement is not
+the loaded engine's padded 248,320-entry production table and is not final
+release authority. The acceptance gate remains a stock OpenAI-compatible
+multi-turn tool call and tool-result continuation using the packed binary.
+
+**Correctness boundary.** Oracle regressions cover literal, alternation,
+broad-string, escape, dead/accepting, and partial-UTF-8 states. Request validation
+rejects missing, short, or long token tables. Duplicate Qwen function names are
+always rejected because schemas with identical coarse wire kinds can still carry
+different executor constraints.
+
+### iter-231f (2026-08-15) — stock-client reasoning default
+
+**Problem.** The command-line path already derives thinking support from the
+loaded chat template, but the OpenAI-compatible API treated an omitted
+`hf2q_enable_thinking` extension as `false`. Stock clients do not know this
+private field, so a thinking-capable checkpoint could silently receive the
+no-thinking prompt even though the same model used its native mode from the
+CLI. That split degraded planning and evidence use in ordinary agentic turns.
+Separately, Qwen's moving `last_query_index` changed the wrappers around prior
+assistant turns after the next user message. Tool-loop continuations hit the
+cache, but the following ordinary turn rewrote history before the saved stable
+boundary and forced a full cold prefill.
+
+**Decision.** An explicit per-request boolean remains authoritative. When the
+field is absent, the API now runs the same render-and-diff template capability
+probe used by the CLI. A thinking-capable template defaults on; a template
+without a reasoning branch remains off. For Qwen API renders, effective
+template kwargs also default `preserve_thinking` to `true` from the first turn,
+so historical assistant bytes remain append-stable. An explicit
+`chat_template_kwargs.preserve_thinking=false` still wins. Other families and
+the internal overflow summarizer are unchanged. This does not require a
+patched OpenAI-compatible client.
+
+**Proof boundary.** Focused tests pin omitted-field behavior for a
+thinking-capable Qwen template and a non-reasoning template, plus explicit
+`true` and `false` precedence. Token-level tests prove both plain and
+tool-bearing completed histories are exact prefixes after the next user turn,
+and pin the explicit preserve override plus family isolation. Real-model stock
+client acceptance must still report a nonzero cached-token count on the first
+post-tool-final user turn; prompt stability alone does not prove answer quality.
+
+The first real-model required-tool probe exposed an interaction with that new
+default: the prompt had already opened Qwen reasoning, while the older eager
+required-call grammar expected a tool marker as the first generated byte. The
+grammar produced a syntactically valid call, but the response router correctly
+classified it as still-hidden reasoning because no reasoning-close marker had
+occurred. Required/function grammars now remain suspended only while a
+template-opened reasoning span is active, wake on the registered close marker,
+and then enforce the complete native call. Qwen permits only ASCII separator
+whitespace between that close and the call marker. A model-free regression
+splits the close marker across fragments, consumes the separator, and proves
+the full schema-conforming call reaches an accepted grammar state. The
+no-thinking required path remains eager from token zero.
+
+The same real-model gate then caught a response-boundary defect rather than
+weakening its byte-exact assertion: Qwen's native `</think>\n\n` separator was
+being exposed as two leading newlines in OpenAI `message.content`. The shared
+reasoning splitter now consumes exactly that registered protocol separator,
+including when it spans decoded fragments, while preserving any other leading
+content whitespace. The 16th load-bearing contract test pins both cases.
+
+**Focused real-model evidence.** On the M5 Max, release binary
+`20fd73cc182d26999ed9c33760b6e9a0e93ac466d961486743a9a64720862d1e`
+served the exact Qwen artifact already pinned below (`f2c70218...c25`). The
+checked-in `scripts/test_qwen36_agentic.sh` contract passed without a private
+thinking override: required and automatic calls, unary and SSE arguments,
+tool-result continuation, cached replay, and source-text preservation were all
+true. The 6,979-token cold turn had 0 cached tokens; exact replay reused 6,979,
+and both the automatic-call and continuation paths reused 6,974. Measured
+semantic response times were 3,989 ms cold, 8 ms exact replay, 611 ms automatic
+call, 466 ms cached SSE, and 2,271 ms for the tool-result answer.
+
+A separate two-server oracle used one byte-identical 586-token transcript with
+an assistant tool call, tool result, completed assistant answer, and a new user
+turn. The warm server reused 562 tokens; the restarted control reused 0. Their
+canonical choice/message, finish reason, completion count, and reasoning count
+were byte-identical (canonical SHA-256
+`58bfdfcd0196e00dbcca2d0eadf5b1a4bf177f06f6cbba35e728d2f9df300250`).
+This closes the numerical cache-parity question for that exact transcript; it
+does not replace the protected packed-artifact release gate.
+
+Finally, an isolated unmodified OpenCode 1.18.18 binary
+(`4f5979c2dadb06fbff1335335afaaea274e58f92e79aa43cf2ed98618d555422`)
+completed the compact OpenAI-compatible path against this server. It discovered
+the live memory operation, invoked it, consumed the empty result, and answered
+truthfully with no protocol-leading whitespace. Its four model steps reported
+cache reads 0, 8,819, 9,867, and 11,327 tokens; the complete JSONL event stream
+hashes to `5b23b30368cea321a677d513854df5301550522265a7f8b3cf61a45824b19764`.
+This focused integration run proves stock-client compatibility; the external
+plugin candidate remains independently owned and is not hf2q release authority.
+
 ## Agentic grammar hot-path revalidation (2026-08-06)
 
 OpenCode tool calls exposed two shared defects after the original phase

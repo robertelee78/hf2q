@@ -1,39 +1,37 @@
 //! Logit-masking for grammar-constrained decoding.
 //!
 //! Given a running `GrammarRuntime` and a per-vocab pre-decoded token text
-//! table, `mask_invalid_tokens` walks every candidate token, clones the
-//! grammar, feeds the token's bytes through it, and sets the corresponding
-//! logit to `-inf` if the grammar would die on that token. The sampler
-//! (sampler_pure) then picks from the remaining live tokens.
+//! table, `mask_invalid_tokens` decodes candidates into one flat code-point
+//! arena and rejects them as sets against the live grammar stacks: one shared
+//! traversal per candidate set rather than one deep runtime clone per token.
+//! Invalid candidates are set to `-inf`; the sampler (`sampler_pure`) then
+//! picks from the remaining live tokens.
 //!
-//! This is the CPU-side half of `response_format: {json_object}` /
-//! `{json_schema}` enforcement (ADR-005 Decision #6). The GPU-side half is
-//! the `forward_decode` refactor that exposes logits to the caller so this
-//! helper can be invoked per decode step — that refactor is deferred to an
-//! iter that has a live model for byte-identical validation.
+//! This is the CPU-side half of live `response_format: {json_object}` /
+//! `{json_schema}` and tool-call enforcement (ADR-005 Decision #6). Every
+//! production family exposes logits and invokes this helper before sampling.
 //!
 //! # Complexity
 //!
-//! `mask_invalid_tokens` is `O(vocab_size × avg_token_bytes × avg_stack_depth)`
-//! per decode step. For vocab=262k and a shallow JSON grammar this is
-//! ~1-5ms/token on modern CPU — acceptable for correctness-first. When
-//! performance matters, precompute a per-token byte table (`Vec<Vec<u8>>`)
-//! once at engine load, not per call.
+//! The candidate table is decoded once per mask and filtered collectively as
+//! grammar branches advance.  This avoids the former `vocab_size` deep clones
+//! and their repeated `Vec`/`HashSet` stack expansion.  Precompute the token
+//! byte table (`Vec<Vec<u8>>`) once at engine load; rebuilding it per step
+//! would still dominate this path.
 //!
 //! # Design notes
 //!
 //! - The caller owns the pre-decoded token text table. Rebuilding it every
 //!   call would dominate runtime; cache it on the engine.
-//! - We clone the `GrammarRuntime` per-token (cheap: `Grammar` is already
-//!   `Clone`, stacks are small `Vec`s). An alternative using an explicit
-//!   rollback API would avoid the clones but complicates the state machine
-//!   — the clone approach is simpler and sufficient.
+//! - The old clone-per-token implementation remains test-only as an exact
+//!   oracle.  Regression tests require identical masks across literals,
+//!   alternations, broad strings, UTF-8 partials, and dead/accepting states.
 //! - Token text may contain partial UTF-8 (tokenizer pieces like GPT-2's
 //!   `Ġ` prefix ARE full UTF-8 here after decoding; BPE byte-fallback
 //!   tokens are handled by `GrammarRuntime::accept_bytes`'s incremental
 //!   UTF-8 decoder).
 
-use super::sampler::GrammarRuntime;
+use super::sampler::{decode_candidate_utf8, reject_candidates, GrammarCandidate, GrammarRuntime};
 use std::cell::RefCell;
 
 /// Maximum number of descending-logit candidates checked directly before
@@ -49,9 +47,9 @@ thread_local! {
 
 /// Select the highest-logit grammar-valid token for temperature-zero decode.
 ///
-/// A full grammar mask clones and advances the runtime for every vocabulary
-/// entry. That is needlessly expensive for greedy agentic tool calls: the
-/// model's top candidate is normally already valid. Probe candidates in
+/// A full candidate-set grammar mask visits the whole vocabulary. That is
+/// needlessly expensive for greedy agentic tool calls when the model's top
+/// candidate is normally already valid. Probe candidates in
 /// descending logit order by repeatedly finding the current argmax, and fall
 /// back to the exhaustive mask after a bounded number of misses. The result is
 /// exactly the same highest-logit valid token as mask-then-argmax; only the
@@ -130,9 +128,9 @@ pub fn sample_greedy_valid_token(
 /// Mask tokens whose byte-text would drive the grammar dead.
 ///
 /// `token_bytes[i]` is the UTF-8 text emitted when token id `i` is
-/// sampled (typically `tokenizer.decode(&[i], false)` bytes). For every
-/// `i`, a clone of `grammar` consumes `token_bytes[i]`; if the clone
-/// dies (no surviving stacks), `logits[i]` is set to `f32::NEG_INFINITY`.
+/// sampled (typically `tokenizer.decode(&[i], false)` bytes). Candidates are
+/// decoded into one shared code-point arena and rejected against the live
+/// grammar stacks; rejected `logits[i]` are set to `f32::NEG_INFINITY`.
 ///
 /// Returns the number of tokens masked. `f32::NEG_INFINITY` is the
 /// standard logit-mask value: after softmax it becomes zero probability
@@ -157,13 +155,15 @@ pub fn mask_invalid_tokens(
     // tool-call open marker are unconstrained.  Skip the per-token
     // clone+accept loop entirely (it would also self-gate, but each
     // clone is non-trivial).  This is the apply-half of the dual-gate
-    // pattern from /opt/llama.cpp/src/llama-grammar.cpp:1339-1344
-    // (`if (grammar.awaiting_trigger) return;`).
+    // An awaiting-trigger grammar leaves preamble logits untouched.
     if grammar.is_awaiting_trigger() {
         return 0;
     }
-    let mut masked = 0usize;
     let n = token_bytes.len().min(logits.len());
+    let mut code_points = Vec::with_capacity(n.saturating_mul(2));
+    let mut candidates = Vec::with_capacity(n);
+    let mut masked = 0usize;
+
     for i in 0..n {
         let bytes = &token_bytes[i];
         if bytes.is_empty() {
@@ -174,9 +174,52 @@ pub fn mask_invalid_tokens(
             // Already masked (e.g. by logit_bias or a prior pass).
             continue;
         }
-        let mut rt = grammar.clone();
-        let alive = rt.accept_bytes(bytes);
-        if !alive {
+        let start = code_points.len();
+        let Some(partial_utf8) =
+            decode_candidate_utf8(bytes, grammar.partial_utf8, &mut code_points)
+        else {
+            logits[i] = f32::NEG_INFINITY;
+            masked += 1;
+            continue;
+        };
+        candidates.push(GrammarCandidate {
+            index: i,
+            cursor: start,
+            end: code_points.len(),
+            partial_utf8,
+        });
+    }
+
+    let rejects = reject_candidates(&grammar.grammar, &grammar.stacks, &candidates, &code_points);
+    for reject in rejects {
+        if logits[reject.index].is_finite() {
+            logits[reject.index] = f32::NEG_INFINITY;
+            masked += 1;
+        }
+    }
+    masked
+}
+
+/// Previous clone-per-token mask retained only as a semantic oracle.  The
+/// production path above must produce the exact same finite-token bitmap.
+#[cfg(test)]
+fn mask_invalid_tokens_clone_oracle(
+    grammar: &GrammarRuntime,
+    token_bytes: &[Vec<u8>],
+    logits: &mut [f32],
+) -> usize {
+    if grammar.is_awaiting_trigger() {
+        return 0;
+    }
+    let mut masked = 0usize;
+    let n = token_bytes.len().min(logits.len());
+    for i in 0..n {
+        let bytes = &token_bytes[i];
+        if bytes.is_empty() || !logits[i].is_finite() {
+            continue;
+        }
+        let mut runtime = grammar.clone();
+        if !runtime.accept_bytes(bytes) {
             logits[i] = f32::NEG_INFINITY;
             masked += 1;
         }
@@ -229,6 +272,183 @@ mod tests {
 
     fn vocab(strings: &[&str]) -> Vec<Vec<u8>> {
         strings.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    fn assert_candidate_set_matches_clone_oracle(
+        runtime: &GrammarRuntime,
+        token_bytes: &[Vec<u8>],
+        initial_logits: &[f32],
+    ) {
+        let mut actual = initial_logits.to_vec();
+        let mut oracle = initial_logits.to_vec();
+        let actual_masked = mask_invalid_tokens(runtime, token_bytes, &mut actual);
+        let oracle_masked = mask_invalid_tokens_clone_oracle(runtime, token_bytes, &mut oracle);
+        assert_eq!(actual_masked, oracle_masked, "new/oracle mask count");
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            oracle
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "new candidate-set mask must be bit-identical to clone oracle"
+        );
+    }
+
+    #[test]
+    fn agentic_grammar_contract_candidate_set_matches_clone_oracle_across_runtime_states() {
+        let names = vocab(&[
+            "ruflo_call",
+            "ruflo_search",
+            "aqe_call",
+            "aqe_search",
+            "task",
+            "read",
+            "write",
+            "bash",
+            "brain",
+            "skill",
+            "agent",
+            "memory",
+            "workflow",
+            "hooks",
+            "routing",
+            "swarm",
+            "wrong",
+            "",
+        ]);
+        let runtime = rt(
+            "root ::= \"ruflo_call\" | \"ruflo_search\" | \"aqe_call\" | \"aqe_search\" | \"task\" | \"read\" | \"write\" | \"bash\" | \"brain\" | \"skill\" | \"agent\" | \"memory\" | \"workflow\" | \"hooks\" | \"routing\" | \"swarm\"\n",
+            "root",
+        );
+        let mut logits = vec![1.0; names.len()];
+        logits[3] = f32::NEG_INFINITY;
+        assert_candidate_set_matches_clone_oracle(&runtime, &names, &logits);
+
+        // The current hf2q token table is decoded through Rust `String`s.
+        // Preserve its existing incomplete-tail behavior even when the
+        // partial code point cannot yet be proven to match the next literal;
+        // malformed continuation bytes still reject immediately.
+        let literal_runtime = rt("root ::= \"a\"\n", "root");
+        let byte_edge_tokens = vec![vec![0xCE], vec![0x80], b"a".to_vec(), b"x".to_vec()];
+        assert_candidate_set_matches_clone_oracle(
+            &literal_runtime,
+            &byte_edge_tokens,
+            &vec![1.0; byte_edge_tokens.len()],
+        );
+
+        // Broad-string state after the function name is selected.  Include
+        // escapes, multi-byte UTF-8, an incomplete tail, malformed UTF-8,
+        // an empty special token, and a pre-masked candidate.
+        let mut string_runtime = rt("root ::= \"ruflo_call:\\\"\" [^\\\"]* \"\\\"\"\n", "root");
+        assert!(string_runtime.accept_bytes(b"ruflo_call:\""));
+        let string_tokens = vec![
+            b"plain".to_vec(),
+            b"{}".to_vec(),
+            "α".as_bytes().to_vec(),
+            vec![0xCE],
+            vec![0x80],
+            b"\"".to_vec(),
+            Vec::new(),
+        ];
+        let mut string_logits = vec![1.0; string_tokens.len()];
+        string_logits[1] = f32::NEG_INFINITY;
+        assert_candidate_set_matches_clone_oracle(&string_runtime, &string_tokens, &string_logits);
+
+        // A UTF-8 code point split across sampled tokens exercises inherited
+        // `PartialUtf8` state and `match_partial_char`.
+        let mut partial_runtime = rt("root ::= \"α\"\n", "root");
+        assert!(partial_runtime.accept_bytes(&[0xCE]));
+        let partial_tokens = vec![vec![0xB1], vec![0xB2], b"a".to_vec(), Vec::new()];
+        assert_candidate_set_matches_clone_oracle(
+            &partial_runtime,
+            &partial_tokens,
+            &vec![1.0; partial_tokens.len()],
+        );
+
+        // Accepting and dead runtimes have intentionally different behavior:
+        // an accepting empty stack rejects further non-empty bytes; a dead
+        // runtime rejects every non-empty token.  Empty special tokens remain
+        // under the existing caller-owned EOS contract in both cases.
+        let mut accepted = rt("root ::= \"a\"\n", "root");
+        assert!(accepted.accept_bytes(b"a"));
+        assert!(accepted.is_accepted());
+        let terminal_tokens = vec![Vec::new(), b"a".to_vec(), b"x".to_vec(), vec![0xCE]];
+        assert_candidate_set_matches_clone_oracle(
+            &accepted,
+            &terminal_tokens,
+            &vec![1.0; terminal_tokens.len()],
+        );
+
+        let mut dead = rt("root ::= \"a\"\n", "root");
+        assert!(!dead.accept_bytes(b"x"));
+        assert!(dead.is_dead());
+        assert_candidate_set_matches_clone_oracle(
+            &dead,
+            &terminal_tokens,
+            &vec![1.0; terminal_tokens.len()],
+        );
+    }
+
+    /// Reproducible model-free performance probe for the tokenizer.json proxy
+    /// vocabulary.  It loads tokenizer metadata only (never weights or
+    /// Metal), compares the exact finite-token bitmap against the legacy
+    /// clone oracle, and prints both wall times.  Kept ignored because the
+    /// oracle intentionally performs one deep runtime clone per vocabulary
+    /// token.
+    #[test]
+    #[ignore = "diagnostic benchmark; set HF2Q_QWEN35_TOKENIZER to tokenizer.json"]
+    fn candidate_set_mask_qwen_vocab_benchmark() {
+        let Some(tokenizer_path) = std::env::var_os("HF2Q_QWEN35_TOKENIZER") else {
+            eprintln!("SKIP: set HF2Q_QWEN35_TOKENIZER to a tokenizer.json path");
+            return;
+        };
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to load {}: {error}",
+                tokenizer_path.to_string_lossy()
+            )
+        });
+        let vocab_size = tokenizer.get_vocab_size(true);
+        let token_bytes = (0..vocab_size as u32)
+            .map(|id| {
+                tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_default()
+                    .into_bytes()
+            })
+            .collect::<Vec<_>>();
+
+        let mut runtime = rt("root ::= \"\\\"\" [^\\\"]* \"\\\"\"\n", "root");
+        assert!(runtime.accept_bytes(b"\""));
+        let initial = vec![1.0_f32; vocab_size];
+        let mut actual = initial.clone();
+        let mut oracle = initial;
+
+        let started = std::time::Instant::now();
+        let actual_masked = mask_invalid_tokens(&runtime, &token_bytes, &mut actual);
+        let candidate_set_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let oracle_masked = mask_invalid_tokens_clone_oracle(&runtime, &token_bytes, &mut oracle);
+        let clone_oracle_elapsed = started.elapsed();
+
+        assert_eq!(actual_masked, oracle_masked);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            oracle
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "grammar mask benchmark: vocab={vocab_size} candidate_set={candidate_set_elapsed:?} clone_oracle={clone_oracle_elapsed:?} speedup={:.2}x",
+            clone_oracle_elapsed.as_secs_f64() / candidate_set_elapsed.as_secs_f64()
+        );
     }
 
     #[test]

@@ -831,14 +831,12 @@ pub struct ChatCompletionRequest {
     /// Iter D, W67). When `Some(true)`, the chat-template render passes
     /// `enable_thinking=true` so reasoning-capable models actually emit a
     /// thinking trace (e.g. Gemma 4 emits `<|channel>thought\n…<channel|>`,
-    /// Qwen 3.5/3.6 emits `<think>…</think>`). When `None` (default) or
-    /// `Some(false)`, reasoning mode is OFF — Gemma 4's template seeds an
-    /// empty channel block (`<|channel>thought\n<channel|>`) and the model
-    /// proceeds straight to answer; Qwen's template skips the
-    /// `<think>` enable hint. Open WebUI clients that target the panel UX
-    /// should set this to `true` when the user toggles thinking on; the
-    /// default-off keeps every legacy + non-thinking-aware caller's
-    /// rendered prompt byte-identical.
+    /// Qwen 3.5/3.6 emits `<think>…</think>`). `Some(false)` explicitly
+    /// disables reasoning. When omitted, hf2q derives the native default from
+    /// the loaded chat template so stock OpenAI-compatible clients do not
+    /// need a private extension to use a reasoning-capable checkpoint
+    /// correctly. Clients with a reasoning toggle may still send an explicit
+    /// value and override that automatic choice.
     #[serde(default)]
     pub hf2q_enable_thinking: Option<bool>,
 
@@ -850,8 +848,10 @@ pub struct ChatCompletionRequest {
     /// `eos_token`, `raise_exception`) are rejected 400 naming the key;
     /// `enable_thinking` is deliberately overridable. Values reach Jinja
     /// verbatim (no type coercion). Canonical use:
-    /// `{"preserve_thinking": true}` to make the Qwen 3.6 template
-    /// replay prior-turn reasoning on pre-last-query assistant turns.
+    /// `{"preserve_thinking": false}` explicitly opts out of the Qwen API
+    /// path's append-stable default. Keeping it enabled makes prior assistant
+    /// render bytes stable when a later user turn is appended, which allows
+    /// the saved KV prefix to remain reusable after tool-bearing turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }

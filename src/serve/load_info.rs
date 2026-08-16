@@ -696,7 +696,7 @@ fn fmt_tokenizer_source(source: &TokenizerSource) -> String {
         TokenizerSource::HfTokenizerJson { path } => {
             format!("hf-tokenizer-json ({})", path.display())
         }
-        TokenizerSource::GgufEmbedded => "gguf-embedded (<= mirrors llama-vocab.cpp)".to_string(),
+        TokenizerSource::GgufEmbedded => "gguf-embedded (validated ID bounds)".to_string(),
     }
 }
 
@@ -1635,7 +1635,7 @@ mod tests {
              hf2q load: features = sliding_window=none, full_attn_every=4, moe=128 experts/8 active\n\
              hf2q load: quant = Q4_K dominant, ~4.55 bpw, mlx-native resident 16.42 GiB\n\
              hf2q load: max_ctx_train = 262144, kv_budget = 4.00 GiB (~32768 tokens)\n\
-             hf2q load: tokenizer = gguf-embedded (<= mirrors llama-vocab.cpp)\n\
+             hf2q load: tokenizer = gguf-embedded (validated ID bounds)\n\
              hf2q load: chat_template = gguf-embedded\n\
              hf2q load: provenance = hf2q (producer hf2q 0.1.0, source_sha 7f3a…)\n\
              hf2q load: vision = n/a (text-only arch)\n\

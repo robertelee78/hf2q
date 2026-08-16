@@ -1,7 +1,4 @@
-//! GBNF runtime sampler — ported from llama.cpp `src/llama-grammar.cpp`
-//! functions `llama_grammar_advance_stack` / `llama_grammar_accept` /
-//! `llama_grammar_match_char` / `llama_grammar_match_partial_char` /
-//! `llama_grammar_reject_candidates_for_stack`.
+//! GBNF runtime sampler for hf2q constrained decoding.
 //!
 //! The runtime maintains a set of pushdown stacks over `(rule_id, elem_idx)`
 //! positions in the parsed grammar. After each decoded character the stacks
@@ -9,15 +6,13 @@
 //! remains valid after feeding all its characters, and **rejected** if every
 //! stack dead-ends.
 //!
-//! Key port differences vs. the C++ reference:
-//!   - llama.cpp uses `const llama_grammar_element *` pointers to identify a
-//!     position in the flat `rules[i].data()` buffer. Rust borrow semantics
-//!     would make that unwieldy; we use `Pos(rule_id, elem_idx)` instead —
+//! Implementation notes:
+//!   - `Pos(rule_id, elem_idx)` identifies a position in the flat rules —
 //!     O(1) lookup into `rules[rule_id][elem_idx]`, stable across clones.
 //!   - `accept_char` returns a fresh `Stacks` set (immutable-style) rather
 //!     than mutating in place. The caller assigns it back to the live state.
-//!   - `PartialUtf8` uses `Option<NonZeroU8>` for the byte count instead of
-//!     `int n_remain = -1` sentinel. Invalid state is explicitly `Err(...)`.
+//!   - `PartialUtf8` stores remaining bytes in an `i8`: zero is clean,
+//!     positive is incomplete, and negative is invalid.
 //!
 //! This file is **pure compute** — no axum / mlx-native dependencies. It
 //! runs entirely on CPU and can be exercised without a loaded model, which
@@ -30,8 +25,7 @@ use std::sync::Arc;
 // Position + Stack types
 // ---------------------------------------------------------------------------
 
-/// Stable position inside the flat `rules[rule_id][elem_idx]` buffer. Used
-/// in place of llama.cpp's raw `const llama_grammar_element *` pointers.
+/// Stable position inside the flat `rules[rule_id][elem_idx]` buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pos {
     pub rule_id: u32,
@@ -52,10 +46,23 @@ impl Pos {
     }
 }
 
-/// A grammar pushdown stack — a list of `Pos` entries. The TOP of the stack
-/// is `.last()` (matches llama.cpp's `stack.back()`).
+/// A grammar pushdown stack — a list of `Pos` entries. The top is `.last()`.
 pub type Stack = Vec<Pos>;
 pub type Stacks = Vec<Stack>;
+
+/// One decoded vocabulary candidate while applying a grammar mask.
+///
+/// Code points live in one flat arena owned by the caller.  `cursor` and
+/// `end` are offsets into that arena, which avoids one heap allocation per
+/// vocabulary token.  The rejection walk advances `cursor` temporarily and
+/// restores it while unwinding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GrammarCandidate {
+    pub index: usize,
+    pub cursor: usize,
+    pub end: usize,
+    pub partial_utf8: PartialUtf8,
+}
 
 // ---------------------------------------------------------------------------
 // Partial UTF-8 accumulator
@@ -69,9 +76,79 @@ pub type Stacks = Vec<Stack>;
 pub struct PartialUtf8 {
     pub value: u32,
     /// Bytes remaining to complete the code point. `0` = no partial state
-    /// (clean). Negative values are represented here as `n_remain = 0` +
-    /// the `invalid` flag (llama.cpp uses `-1`; we use a sentinel).
+    /// (clean). Negative values represent invalid state.
     pub n_remain: i8,
+}
+
+/// Decode one token's bytes into the shared code-point arena, continuing a
+/// partial UTF-8 sequence inherited from the live grammar runtime.
+///
+/// This deliberately matches [`GrammarRuntime::accept_bytes`]: malformed
+/// lead/continuation bytes reject the candidate, while an incomplete trailing
+/// code point is retained in `PartialUtf8` for the next sampled token.
+pub(super) fn decode_candidate_utf8(
+    bytes: &[u8],
+    partial_start: PartialUtf8,
+    code_points: &mut Vec<u32>,
+) -> Option<PartialUtf8> {
+    if partial_start.n_remain < 0 {
+        return None;
+    }
+
+    let mut i = 0usize;
+    let mut partial = partial_start;
+    if partial.n_remain > 0 {
+        while i < bytes.len() && partial.n_remain > 0 {
+            let byte = bytes[i];
+            if (byte & 0xC0) != 0x80 {
+                return None;
+            }
+            partial.value = (partial.value << 6) | (byte & 0x3F) as u32;
+            partial.n_remain -= 1;
+            i += 1;
+        }
+        if partial.n_remain > 0 {
+            return Some(partial);
+        }
+        code_points.push(partial.value);
+        partial = PartialUtf8::default();
+    }
+
+    while i < bytes.len() {
+        let first = bytes[i];
+        let (needed, mut value) = if first & 0x80 == 0 {
+            (0i8, first as u32)
+        } else if first & 0xE0 == 0xC0 {
+            (1, (first & 0x1F) as u32)
+        } else if first & 0xF0 == 0xE0 {
+            (2, (first & 0x0F) as u32)
+        } else if first & 0xF8 == 0xF0 {
+            (3, (first & 0x07) as u32)
+        } else {
+            return None;
+        };
+        i += 1;
+
+        let mut remain = needed;
+        while i < bytes.len() && remain > 0 {
+            let byte = bytes[i];
+            if (byte & 0xC0) != 0x80 {
+                return None;
+            }
+            value = (value << 6) | (byte & 0x3F) as u32;
+            i += 1;
+            remain -= 1;
+        }
+        if remain > 0 {
+            return Some(PartialUtf8 {
+                value,
+                n_remain: remain,
+            });
+        }
+        code_points.push(value);
+    }
+
+    Some(partial)
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +405,131 @@ pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
         accept_chr_into(grammar, stack, chr, &mut new_stacks);
     }
     new_stacks
+}
+
+// ---------------------------------------------------------------------------
+// Candidate-set rejection
+// ---------------------------------------------------------------------------
+
+/// Return the candidates rejected by every live grammar stack.
+///
+/// Candidates rejected by one alternate are passed to the next alternate,
+/// so a token is rejected only when no
+/// stack can consume it.  Unlike the legacy mask path, this advances each
+/// grammar branch once for a whole candidate set instead of cloning a complete
+/// `GrammarRuntime` for every vocabulary entry.
+pub(super) fn reject_candidates(
+    grammar: &Grammar,
+    stacks: &Stacks,
+    candidates: &[GrammarCandidate],
+    code_points: &[u32],
+) -> Vec<GrammarCandidate> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    if stacks.is_empty() {
+        return candidates.to_vec();
+    }
+
+    let mut rejects = reject_candidates_for_stack(grammar, &stacks[0], candidates, code_points);
+    for stack in &stacks[1..] {
+        if rejects.is_empty() {
+            break;
+        }
+        rejects = reject_candidates_for_stack(grammar, stack, &rejects, code_points);
+    }
+    rejects
+}
+
+/// Return candidates rejected by one grammar stack.  Recursive calls consume
+/// one code point from every matching candidate together, then advance the
+/// grammar stack once.  `cursor` is restored before a rejection is returned so
+/// callers can retry that same token against another alternate stack.
+fn reject_candidates_for_stack(
+    grammar: &Grammar,
+    stack: &Stack,
+    candidates: &[GrammarCandidate],
+    code_points: &[u32],
+) -> Vec<GrammarCandidate> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    if stack.is_empty() {
+        return candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.cursor < candidate.end)
+            .collect();
+    }
+
+    let top = *stack.last().expect("non-empty stack");
+    let Some(elem) = at(grammar, top) else {
+        return candidates.to_vec();
+    };
+    if !matches!(
+        elem.ty,
+        GretType::Char | GretType::CharNot | GretType::CharAny
+    ) {
+        // `advance_stack` guarantees terminal tops.  A corrupt runtime must
+        // fail closed rather than leaving candidates unmasked.
+        return candidates.to_vec();
+    }
+
+    let mut rejects = Vec::new();
+    let mut next_candidates = Vec::new();
+    rejects.reserve(candidates.len());
+    next_candidates.reserve(candidates.len());
+
+    for candidate in candidates.iter().copied() {
+        if candidate.cursor >= candidate.end {
+            // Preserve hf2q's existing token-table contract exactly: a
+            // syntactically valid but incomplete UTF-8 tail remains alive
+            // while the grammar stack is non-empty, and is resolved after the
+            // next sampled token. hf2q's current table is built from decoded
+            // Rust `String`s and cannot
+            // authoritatively classify byte-fallback fragments.  The clone
+            // oracle exercises this distinction.
+            continue;
+        }
+
+        let Some(&chr) = code_points.get(candidate.cursor) else {
+            rejects.push(candidate);
+            continue;
+        };
+        if match_char(grammar, top, chr).0 {
+            next_candidates.push(GrammarCandidate {
+                cursor: candidate.cursor + 1,
+                ..candidate
+            });
+        } else {
+            rejects.push(candidate);
+        }
+    }
+
+    if next_candidates.is_empty() {
+        return rejects;
+    }
+
+    // The position following a char range is independent of the character
+    // value.
+    let after = match_char(grammar, top, 0).1;
+    let mut stack_after = stack[..stack.len() - 1].to_vec();
+    if let Some(next) = at(grammar, after) {
+        if !is_end_of_sequence(next) {
+            stack_after.push(after);
+        }
+    }
+    let mut next_stacks = Vec::new();
+    advance_stack(grammar, stack_after, &mut next_stacks);
+
+    let mut deeper_rejects =
+        reject_candidates(grammar, &next_stacks, &next_candidates, code_points);
+    for candidate in &mut deeper_rejects {
+        candidate.cursor = candidate.cursor.saturating_sub(1);
+    }
+    rejects.extend(deeper_rejects);
+    rejects
 }
 
 // ---------------------------------------------------------------------------

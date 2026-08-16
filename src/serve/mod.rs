@@ -447,7 +447,7 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 /// > "Thinking is not determined by having thinking in the model name.
 /// >  Thinking is determined by the model class and what is available
 /// >  in the gguf file."
-fn template_supports_enable_thinking(template_str: &str) -> bool {
+pub(crate) fn template_supports_enable_thinking(template_str: &str) -> bool {
     let render_true = render_jinja_template(template_str, "x", Some(true));
     let render_false = render_jinja_template(template_str, "x", Some(false));
     match (render_true, render_false) {

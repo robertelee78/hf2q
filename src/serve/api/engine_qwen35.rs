@@ -34,6 +34,7 @@
 //!   live inference lands).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -966,17 +967,20 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
 /// only mode the cache stores, so the bypass-eligibility gate
 /// (`is_greedy_eligible`) handles every sampling-mode field; this key
 /// only needs the parameters that affect the cached *response shape*
-/// even under greedy decode (max_tokens early-stop, stop_strings).
+/// or interpretation even under greedy decode (max_tokens early-stop,
+/// stop_strings, and schema-derived tool argument wire kinds).
 ///
 /// Grammar, logit-bias, logprobs, and effective repetition-penalty
 /// requests bypass exact prompt replay through `is_greedy_eligible`, so
-/// they do not belong in this deliberately narrow key.  Tool-call policy
-/// affects response routing after KV restoration rather than the cached
-/// prompt state.
+/// they do not belong in this deliberately narrow key. Tool-call policy and
+/// wire kinds affect response routing after KV restoration rather than the
+/// cached prompt state; wire kinds are included because replayed argument
+/// bytes must retain their schema-authoritative JSON type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridPromptCacheKey {
     pub max_tokens: usize,
     pub stop_strings: Vec<String>,
+    pub tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
 }
 
 impl HybridPromptCacheKey {
@@ -984,6 +988,7 @@ impl HybridPromptCacheKey {
         Self {
             max_tokens: params.max_tokens,
             stop_strings: params.stop_strings.clone(),
+            tool_argument_wire_kinds: params.tool_argument_wire_kinds.clone(),
         }
     }
 }
@@ -1417,7 +1422,7 @@ fn sample_logits_qwen35_constrained(
     generated: &[u32],
     runtime: Option<&super::grammar::GrammarRuntime>,
     want_logprobs: bool,
-) -> (u32, Option<f32>) {
+) -> Result<(u32, Option<f32>)> {
     for (&token, &bias) in &params.logit_bias {
         if let Some(logit) = logits.get_mut(token as usize) {
             *logit += bias;
@@ -2455,7 +2460,7 @@ pub(super) fn generate_qwen35_once(
                 &[],
                 grammar_runtime.as_ref(),
                 want_logprobs,
-            );
+            )?;
             next_token = token;
             if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
                 values.push(logprob);
@@ -2603,7 +2608,7 @@ pub(super) fn generate_qwen35_once(
                     &generated_tokens,
                     grammar_runtime.as_ref(),
                     want_logprobs,
-                );
+                )?;
                 if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
                     values.push(logprob);
                 }
@@ -3560,7 +3565,7 @@ impl Qwen35DecodeState {
                 &[],
                 grammar_runtime.as_ref(),
                 want_logprobs,
-            );
+            )?;
             if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
                 values.push(logprob);
             }
@@ -3740,7 +3745,7 @@ impl Qwen35DecodeState {
                 &self.generated_tokens,
                 self.grammar_runtime.as_ref(),
                 self.want_logprobs,
-            );
+            )?;
             if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
                 values.push(logprob);
             }
@@ -4222,6 +4227,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         tc_index: &mut usize,
         saw_tc: &mut bool,
         registration: Option<&ModelRegistration>,
+        wire_kinds: Option<&super::registry::ToolArgumentWireKinds>,
         events: &tokio::sync::mpsc::Sender<GenerationEvent>,
         text: &str,
     ) -> bool {
@@ -4257,8 +4263,9 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                     body.push_str(&t);
                 }
                 ToolCallEvent::ToolCallClose => {
-                    let parsed =
-                        registration.and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    let parsed = registration.and_then(|r| {
+                        super::registry::parse_tool_call_body_with_wire_kinds(r, body, wire_kinds)
+                    });
                     let body_dump = std::mem::take(body);
                     let sink = super::engine::EventSink::new(events);
                     if super::engine::emit_streaming_tool_call_close(
@@ -4286,6 +4293,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         tc_index: &mut usize,
         saw_tc: &mut bool,
         registration: Option<&ModelRegistration>,
+        wire_kinds: Option<&super::registry::ToolArgumentWireKinds>,
         events: &tokio::sync::mpsc::Sender<GenerationEvent>,
         fragment: &str,
     ) -> bool {
@@ -4314,6 +4322,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                             tc_index,
                             saw_tc,
                             registration,
+                            wire_kinds,
                             events,
                             &text,
                         ) {
@@ -4330,6 +4339,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                 tc_index,
                 saw_tc,
                 registration,
+                wire_kinds,
                 events,
                 fragment,
             )
@@ -4357,6 +4367,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
             &mut tool_call_index,
             &mut saw_tool_call,
             registration,
+            params.tool_argument_wire_kinds.as_deref(),
             events,
             &first_text,
         ) {
@@ -4464,6 +4475,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                 &mut tool_call_index,
                 &mut saw_tool_call,
                 registration,
+                params.tool_argument_wire_kinds.as_deref(),
                 events,
                 &fragment,
             ) {
@@ -4515,6 +4527,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                         &mut tool_call_index,
                         &mut saw_tool_call,
                         registration,
+                        params.tool_argument_wire_kinds.as_deref(),
                         events,
                         &tail,
                     ) {
@@ -5851,7 +5864,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 &[],
                 grammar_runtime.as_ref(),
                 false,
-            )
+            )?
             .0;
         }
         advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
@@ -5934,6 +5947,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
         saw_tc: &mut bool,
         tool_call_policy: super::engine::ToolCallPolicy,
         registration: Option<&ModelRegistration>,
+        wire_kinds: Option<&super::registry::ToolArgumentWireKinds>,
         events: &tokio::sync::mpsc::Sender<GenerationEvent>,
         text: &str,
     ) -> bool {
@@ -5969,8 +5983,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
                     body.push_str(&t);
                 }
                 ToolCallEvent::ToolCallClose => {
-                    let parsed =
-                        registration.and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    let parsed = registration.and_then(|r| {
+                        super::registry::parse_tool_call_body_with_wire_kinds(r, body, wire_kinds)
+                    });
                     let body_dump = std::mem::take(body);
                     // Reuse the shared close-buffered emitter so the
                     // body-parse-failure semantics + ToolCallDelta shape
@@ -6014,6 +6029,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
         saw_tc: &mut bool,
         tool_call_policy: super::engine::ToolCallPolicy,
         registration: Option<&ModelRegistration>,
+        wire_kinds: Option<&super::registry::ToolArgumentWireKinds>,
         events: &tokio::sync::mpsc::Sender<GenerationEvent>,
         fragment: &str,
     ) -> bool {
@@ -6043,6 +6059,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                             saw_tc,
                             tool_call_policy,
                             registration,
+                            wire_kinds,
                             events,
                             &text,
                         ) {
@@ -6060,6 +6077,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 saw_tc,
                 tool_call_policy,
                 registration,
+                wire_kinds,
                 events,
                 fragment,
             )
@@ -6094,6 +6112,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             &mut saw_tool_call,
             params.tool_call_policy,
             registration,
+            params.tool_argument_wire_kinds.as_deref(),
             events,
             &first_text,
         ) {
@@ -6162,7 +6181,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                             &generated_tokens,
                             grammar_runtime.as_ref(),
                             false,
-                        )
+                        )?
                         .0;
                         Ok(token)
                     }
@@ -6200,6 +6219,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 &mut saw_tool_call,
                 params.tool_call_policy,
                 registration,
+                params.tool_argument_wire_kinds.as_deref(),
                 events,
                 &fragment,
             ) {
@@ -6249,6 +6269,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                         &mut saw_tool_call,
                         params.tool_call_policy,
                         registration,
+                        params.tool_argument_wire_kinds.as_deref(),
                         events,
                         &tail,
                     ) {
@@ -7310,21 +7331,9 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
 
 /// Default tool-call policy for the legacy slot-aware streaming arm.
 ///
-/// Wedge-3 ships `tool_choice=auto` semantics from the Qwen35 worker
-/// arm — the chat handler at `handlers.rs::prepare_chat_generation_core`
-/// ultimately decides the policy for the request and threads it through
-/// `SamplingParams.tool_call_policy`.  But the `params` arg to the worker
-/// thread is consumed BEFORE the streaming arm makes the
-/// `emit_streaming_tool_call_close` call (the arm holds `&params`
-/// throughout), so we re-derive Auto here for the body-parse-failure
-/// branch.  This is consistent with Gemma's pre-W-B3 behavior — the
-/// content-fallback path under Auto.
-///
-/// The canonical fifo-serial stream threads the request's actual policy
-/// through the grammar-aware sampler and tool-call router.  This helper
-/// remains only for the older slot-aware stream, whose decode loop is
-/// intentionally still unconstrained; callers must not treat that path as
-/// equivalent to the canonical agentic-serving path.
+/// This helper belongs to the retained legacy function above. Production
+/// SlotAware Qwen requests route through `run_slot_aware_qwen35` and its
+/// grammar-aware prefill/decode states instead.
 fn params_tool_call_policy_for_qwen35_stream() -> super::engine::ToolCallPolicy {
     super::engine::ToolCallPolicy::Auto
 }
@@ -7599,10 +7608,65 @@ mod tests {
         let mut logits = vec![100.0, 1.0];
 
         let (token, logprob) =
-            sample_logits_qwen35_constrained(&mut logits, &params, &[], Some(&runtime), false);
+            sample_logits_qwen35_constrained(&mut logits, &params, &[], Some(&runtime), false)
+                .expect("valid grammar/table invariant");
 
         assert_eq!(token, 1);
         assert_eq!(logprob, None);
+    }
+
+    #[test]
+    fn agentic_grammar_contract_sampler_rejects_missing_short_and_long_token_tables() {
+        let grammar = crate::serve::api::grammar::parse("root ::= \"a\"\n").expect("test grammar");
+        let mut params = greedy_params();
+        params.grammar = Some(grammar.clone());
+        let missing = grammar_runtime_for_request(&params, None)
+            .expect_err("grammar without token table must fail before sampling");
+        assert!(missing
+            .to_string()
+            .contains("without its authoritative token byte table"));
+
+        params.token_bytes = Some(std::sync::Arc::new(vec![b"a".to_vec()]));
+        let runtime = grammar_runtime_for_request(&params, None)
+            .expect("runtime build")
+            .expect("grammar runtime");
+        let sampler = SamplerPureParams {
+            temperature: 0.55,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 8,
+        };
+        let mut logits = vec![1.0, 0.0];
+        let short = sample_logits_with_grammar(
+            &mut logits,
+            &sampler,
+            &[],
+            Some(&runtime),
+            params.token_bytes.as_deref().map(Vec::as_slice),
+            false,
+        )
+        .expect_err("short token table must fail closed");
+        assert!(short
+            .to_string()
+            .contains("length 1 != logits vocabulary 2"));
+
+        params.token_bytes = Some(std::sync::Arc::new(vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+        ]));
+        let long = sample_logits_with_grammar(
+            &mut logits,
+            &sampler,
+            &[],
+            Some(&runtime),
+            params.token_bytes.as_deref().map(Vec::as_slice),
+            false,
+        )
+        .expect_err("long token table must fail closed");
+        assert!(long.to_string().contains("length 3 != logits vocabulary 2"));
     }
 
     #[test]
