@@ -133,27 +133,50 @@ exactly identical complete text and the same first token ID in all three
 cases. This is a focused functional/quantization discriminator, not a broad
 language-quality benchmark.
 
-On the native hf2q artifact, deterministic single-shot generation measured a
-32-token prefill in 11.94 seconds and 32 decoded tokens in 2.37 seconds
-(13.5 tokens/second). The independent runtime measured 27.8 tokens/second on
-the same artifact, so decode performance remains a follow-up rather than an
-inflated parity claim. Initial GPU materialization exceeded the generic
-30-second request deadline; the accepted implementation gives only Qwen
-startup warmup a finite 240-second supervisor deadline and keeps ordinary
-request deadlines unchanged.
+The first native hf2q performance spike expanded Q4_K feed-forward tensors to
+dense storage. It measured a 32-token prefill in 11.94 seconds and 32 decoded
+tokens in 2.37 seconds (13.5 tokens/second), versus 27.8 tokens/second in the
+comparison runtime. That result was a useful falsifier, not the accepted
+loader. The production loader now keeps Q4_K and Q6_K feed-forward tensors in
+their native quantized representation and fails loudly instead of silently
+expanding an unsupported quantization type. Initial GPU materialization fell
+from 24.65 seconds to about 10.7 seconds.
+
+On the exact 16,810,714,752-byte candidate above, an uninterrupted seven-run
+temperature-zero API sequence generated 512 tokens per run. hf2q end-to-end
+rates were 28.96, 30.10, 29.83, 29.49, 29.19, 28.74, and 27.99 tokens/second,
+for a 29.19 tokens/second median. The matched single-process comparison on the
+same artifact and user prompt produced a 24.87 tokens/second median across
+seven runs. The sustained median advantage was 17.4 percent. Both paths
+produced the same correct in-place Rust sort-and-deduplicate implementation
+and the same required `calculate_sum` call with integer arguments 17 and 25;
+the result continuation completed normally. This closes the original dense
+fallback performance defect without weakening the quality gate.
 
 The exact native server artifact passed `/readyz`, unary and SSE text,
 required-tool unary and SSE calls, schema-correct arguments, tool-result
-continuation with 320 cached tokens, automatic thinking without private client
-flags, cancellation with checkpoint recovery, and two simultaneous requests.
+continuation with 407 of 429 prompt tokens cached, automatic thinking without
+private client flags, cancellation with checkpoint recovery, and two
+simultaneous requests.
 An ordinary three-message follow-up returned the remembered value with 27 of
-54 prompt tokens reused. The first clean server load took 24.65 seconds and
-its measured startup warmup took 33.43 seconds. The gate also found and fixed
-an invalid cache invariant: verifier KV cursors must agree with one another,
-but the optional MTP cursor is independent until speculative decoding runs.
+54 prompt tokens reused. A separate coding follow-up reused the complete
+96-token stable prefix and returned a valid function plus unit test. The gate
+also found and fixed an invalid cache invariant: verifier KV cursors must agree
+with one another, but the optional MTP cursor is independent until speculative
+decoding runs.
 
-These measurements establish functional native text support, not completion
-of the vision surface, speculative MTP acceptance, or performance parity.
+These measurements establish functional native text support and sustained
+single-request performance superiority for the measured artifact and workload.
+They do not establish speculative MTP acceptance, cross-family vision
+completion, or multi-slot aggregate superiority. In a four-request cold-prefix
+run with 256 generated tokens per request, hf2q completed 1,024 tokens in
+30.003 seconds (34.13 aggregate tokens/second). The matched four-slot
+comparison completed in 19.103 seconds (53.60 aggregate tokens/second). Source
+inspection explains the gap: `decode_batch_qwen35` currently loops through
+four scalar forwards, while the faster runtime executes one width-four model
+step. A native, state-isolated width-N Qwen body/head is therefore a blocking
+performance follow-up; the single-request result must not be generalized to
+concurrent serving.
 
 ### Vision candidate evidence (2026-08-16)
 
