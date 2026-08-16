@@ -46,10 +46,13 @@ pub mod mmproj;
 pub mod mmproj_weights;
 pub mod pipeline;
 pub mod preprocess;
+mod resize_bicubic;
 pub mod vit;
 pub mod vit_dump;
 pub mod vit_gpu;
 pub mod vit_gpu_qwen3vl;
+
+const MAX_ENCODED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 #[allow(unused_imports)]
 pub use preprocess::{preprocess_rgb_chw, PreprocessConfig, GEMMA4_VISION_CONFIG};
@@ -183,9 +186,24 @@ pub fn load_image_bytes(input: &ImageInput) -> Result<Vec<u8>> {
     match input {
         ImageInput::DataUri { payload_base64, .. } => {
             use base64::Engine;
+            let encoded = payload_base64.trim();
+            let max_base64_len = MAX_ENCODED_IMAGE_BYTES.div_ceil(3) * 4;
+            if encoded.len() > max_base64_len {
+                return Err(anyhow!(
+                    "data URI exceeds {}-byte decoded image cap",
+                    MAX_ENCODED_IMAGE_BYTES
+                ));
+            }
             let payload = base64::engine::general_purpose::STANDARD
-                .decode(payload_base64.trim())
+                .decode(encoded)
                 .map_err(|e| anyhow!("base64 decode: {e}"))?;
+            if payload.len() > MAX_ENCODED_IMAGE_BYTES {
+                return Err(anyhow!(
+                    "data URI exceeds {}-byte decoded image cap (got {})",
+                    MAX_ENCODED_IMAGE_BYTES,
+                    payload.len()
+                ));
+            }
             Ok(payload)
         }
         ImageInput::FilePath(p) => read_file_bounded(p),
@@ -361,6 +379,16 @@ mod tests {
     fn parse_image_url_http_preserved_for_fetch() {
         let got = parse_image_url("https://example.com/img.jpg").unwrap();
         assert!(matches!(got, ImageInput::HttpUrl(_)));
+    }
+
+    #[test]
+    fn data_uri_is_rejected_before_decoding_when_payload_exceeds_cap() {
+        let input = ImageInput::DataUri {
+            mime_type: "image/png".into(),
+            payload_base64: "A".repeat(MAX_ENCODED_IMAGE_BYTES.div_ceil(3) * 4 + 1),
+        };
+        let error = load_image_bytes(&input).expect_err("oversize data URI must fail");
+        assert!(error.to_string().contains("decoded image cap"), "{error}");
     }
 
     #[test]

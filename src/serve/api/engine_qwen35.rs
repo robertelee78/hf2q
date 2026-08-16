@@ -55,8 +55,8 @@ use crate::serve::multi_seq_kv::SlotId;
 
 use super::engine::{
     effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
-    supervised_gpu_call, LoadOptions, SamplingParams, SerialStreamEnd, SerialStreamResult,
-    ToolCallPolicy,
+    supervised_gpu_call, DeepstackData, LoadOptions, SamplingParams, SerialStreamEnd,
+    SerialStreamResult, SoftTokenData, ToolCallPolicy,
 };
 use super::engine_supervisor::EngineSupervisor;
 
@@ -119,6 +119,12 @@ pub struct Qwen35LoadedModel {
     /// `LoadedModel::provenance()` surface; Qwen35 KV-spill remains
     /// descriptor-pending because the cache is hybrid.
     pub provenance: Provenance,
+    /// Exact projector profile emitted only for multimodal
+    /// ConditionalGeneration artifacts. Text-only artifacts keep this
+    /// unset and cannot consume a process projector.
+    pub vision_projector_profile: Option<String>,
+    /// Number of DeepStack feature streams expected by the text model.
+    pub vision_deepstack_output_count: u32,
     /// Single-slot prompt cache (Wedge-3 / iter-216 Phase C / D).  Stores
     /// the post-prefill `HybridKvCacheSnapshot` + the greedy first
     /// decoded token + a generation-affecting params key, so a subsequent
@@ -251,6 +257,12 @@ impl Qwen35LoadedModel {
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let provenance = provenance::detect(&gguf);
+        let vision_projector_profile = gguf
+            .metadata_string("hf2q.vision.projector_profile")
+            .map(str::to_owned);
+        let vision_deepstack_output_count = gguf
+            .metadata_u32("hf2q.vision.deepstack_output_count")
+            .unwrap_or(0);
 
         // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: model = ...")`
         // was deleted here. The same fact (`model_path`) is now emitted by
@@ -464,6 +476,8 @@ impl Qwen35LoadedModel {
             quant_type,
             load_duration,
             provenance,
+            vision_projector_profile,
+            vision_deepstack_output_count,
             prompt_cache: HybridPromptCache::new(),
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
             // Budget computed from sysinfo available_memory() × 5%
@@ -981,6 +995,7 @@ pub struct HybridPromptCacheKey {
     pub max_tokens: usize,
     pub stop_strings: Vec<String>,
     pub tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
+    pub vision_fingerprint: Option<[u8; 32]>,
 }
 
 impl HybridPromptCacheKey {
@@ -989,6 +1004,7 @@ impl HybridPromptCacheKey {
             max_tokens: params.max_tokens,
             stop_strings: params.stop_strings.clone(),
             tool_argument_wire_kinds: params.tool_argument_wire_kinds.clone(),
+            vision_fingerprint: params.vision_fingerprint,
         }
     }
 }
@@ -3138,6 +3154,197 @@ pub(crate) struct Qwen35StablePromptCheckpoint {
     pub prompt_tokens: Vec<u32>,
     pub kv: HybridKvSlotAnchor,
     pub prefill_logits: Vec<f32>,
+    pub vision_fingerprint: Option<[u8; 32]>,
+}
+
+/// Owned multimodal state carried by a bounded SlotAware prefill. Unlike the
+/// serial vision entry point, this survives scheduler yields and can project
+/// only the soft-token/deepstack rows intersecting the current prompt chunk.
+#[derive(Debug)]
+pub(crate) struct Qwen35VisionPrefillData {
+    soft_tokens: Vec<SoftTokenData>,
+    deepstack: Option<DeepstackData>,
+    positions_flat: Option<Vec<i32>>,
+}
+
+impl Qwen35VisionPrefillData {
+    pub(crate) fn new(
+        soft_tokens: Vec<SoftTokenData>,
+        deepstack: Option<DeepstackData>,
+        positions_flat: Option<Vec<i32>>,
+    ) -> Self {
+        Self {
+            soft_tokens,
+            deepstack,
+            positions_flat,
+        }
+    }
+
+    fn validate(&self, prompt_len: usize, hidden_size: usize) -> Result<()> {
+        anyhow::ensure!(
+            !self.soft_tokens.is_empty()
+                || self.deepstack.is_some()
+                || self.positions_flat.is_some(),
+            "Qwen35VisionPrefillData must carry at least one multimodal extension"
+        );
+        if let Some(positions) = self.positions_flat.as_ref() {
+            anyhow::ensure!(
+                positions.len() == 4 * prompt_len,
+                "Qwen35 vision positions len {} != 4 * prompt_len {}",
+                positions.len(),
+                4 * prompt_len
+            );
+        }
+        let row_bytes = hidden_size
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("Qwen35 vision hidden row byte overflow")?;
+        let mut previous_end = 0usize;
+        for (index, soft) in self.soft_tokens.iter().enumerate() {
+            anyhow::ensure!(
+                soft.range.start < soft.range.end && soft.range.end <= prompt_len,
+                "Qwen35 vision soft token [{index}] range {:?} outside prompt_len={prompt_len}",
+                soft.range
+            );
+            anyhow::ensure!(
+                index == 0 || soft.range.start >= previous_end,
+                "Qwen35 vision soft token ranges overlap or are unsorted at index {index}"
+            );
+            let needed = soft
+                .range
+                .len()
+                .checked_mul(row_bytes)
+                .context("Qwen35 vision soft-token byte-size overflow")?;
+            anyhow::ensure!(
+                soft.embeddings.byte_len() >= needed,
+                "Qwen35 vision soft token [{index}] has {} bytes, needs at least {needed}",
+                soft.embeddings.byte_len()
+            );
+            previous_end = soft.range.end;
+        }
+        if let Some(deepstack) = self.deepstack.as_ref() {
+            anyhow::ensure!(
+                deepstack
+                    .image_token_positions
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+                "Qwen35 vision deepstack positions must be strictly increasing"
+            );
+            anyhow::ensure!(
+                deepstack
+                    .image_token_positions
+                    .last()
+                    .is_none_or(|position| (*position as usize) < prompt_len),
+                "Qwen35 vision deepstack position outside prompt_len={prompt_len}"
+            );
+            let needed = deepstack
+                .image_token_positions
+                .len()
+                .checked_mul(row_bytes)
+                .context("Qwen35 vision deepstack byte-size overflow")?;
+            for (index, chunk) in deepstack.chunks.iter().enumerate() {
+                anyhow::ensure!(
+                    chunk.byte_len() >= needed,
+                    "Qwen35 vision deepstack chunk [{index}] has {} bytes, needs at least {needed}",
+                    chunk.byte_len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn chunk(&self, start: usize, end: usize, hidden_size: usize) -> Result<Qwen35VisionChunk> {
+        anyhow::ensure!(start < end, "Qwen35 vision chunk must be non-empty");
+        let row_bytes = hidden_size
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("Qwen35 vision chunk row byte overflow")?;
+        let mut soft_tokens = Vec::new();
+        for soft in &self.soft_tokens {
+            let intersection_start = soft.range.start.max(start);
+            let intersection_end = soft.range.end.min(end);
+            if intersection_start >= intersection_end {
+                continue;
+            }
+            let source_row = intersection_start - soft.range.start;
+            let rows = intersection_end - intersection_start;
+            let byte_offset = source_row
+                .checked_mul(row_bytes)
+                .context("Qwen35 vision soft-token view offset overflow")?;
+            let elements = rows
+                .checked_mul(hidden_size)
+                .context("Qwen35 vision soft-token view length overflow")?;
+            soft_tokens.push((
+                (intersection_start - start)..(intersection_end - start),
+                soft.embeddings.slice_view(byte_offset as u64, elements),
+            ));
+        }
+
+        let deepstack = self.deepstack.as_ref().and_then(|deepstack| {
+            let selected: Vec<(usize, u32)> = deepstack
+                .image_token_positions
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, position)| {
+                    let position = *position as usize;
+                    position >= start && position < end
+                })
+                .collect();
+            let (first, _) = selected.first().copied()?;
+            let rows = selected.len();
+            debug_assert!(selected
+                .iter()
+                .enumerate()
+                .all(|(offset, (index, _))| *index == first + offset));
+            let byte_offset = first.checked_mul(row_bytes)?;
+            let elements = rows.checked_mul(hidden_size)?;
+            let positions = selected
+                .into_iter()
+                .map(|(_, position)| position - start as u32)
+                .collect();
+            let chunks = deepstack
+                .chunks
+                .iter()
+                .map(|chunk| chunk.slice_view(byte_offset as u64, elements))
+                .collect();
+            Some((positions, chunks))
+        });
+
+        let positions_flat = self.positions_flat.as_ref().map(|positions| {
+            let full_len = positions.len() / 4;
+            let mut chunk_positions = Vec::with_capacity(4 * (end - start));
+            for axis in 0..4 {
+                chunk_positions
+                    .extend_from_slice(&positions[axis * full_len + start..axis * full_len + end]);
+            }
+            chunk_positions
+        });
+        Ok(Qwen35VisionChunk {
+            soft_tokens,
+            deepstack,
+            positions_flat,
+        })
+    }
+
+    fn decode_position_base(&self, prompt_len: usize) -> usize {
+        self.positions_flat
+            .as_ref()
+            .map(|positions| {
+                positions[..prompt_len]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .max(0) as usize
+            })
+            .unwrap_or(prompt_len)
+    }
+}
+
+struct Qwen35VisionChunk {
+    soft_tokens: Vec<(std::ops::Range<usize>, mlx_native::MlxBuffer)>,
+    deepstack: Option<(Vec<u32>, Vec<mlx_native::MlxBuffer>)>,
+    positions_flat: Option<Vec<i32>>,
 }
 
 pub(crate) struct Qwen35PrefillState {
@@ -3148,6 +3355,7 @@ pub(crate) struct Qwen35PrefillState {
     next_token_index: usize,
     cached_prefill_logits: Option<Vec<f32>>,
     stable_prompt_prefix_tokens: Option<usize>,
+    vision: Option<Qwen35VisionPrefillData>,
     prefill_started: Instant,
 }
 
@@ -3174,6 +3382,10 @@ impl Qwen35PrefillState {
         &self.prompt_tokens
     }
 
+    pub(crate) fn vision_fingerprint(&self) -> Option<[u8; 32]> {
+        self.params.vision_fingerprint
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         prompt_tokens: Vec<u32>,
@@ -3183,6 +3395,8 @@ impl Qwen35PrefillState {
         slot_id: SlotId,
         cached_tokens: usize,
         cached_prefill_logits: Option<Vec<f32>>,
+        vision: Option<Qwen35VisionPrefillData>,
+        hidden_size: usize,
     ) -> Result<Self> {
         anyhow::ensure!(
             !prompt_tokens.is_empty(),
@@ -3223,6 +3437,13 @@ impl Qwen35PrefillState {
         // Reject malformed grammar/tool state before the first bounded Metal
         // transaction, matching the legacy prefill path's fail-fast contract.
         let _ = grammar_runtime_for_request(&params, registration)?;
+        if let Some(vision) = vision.as_ref() {
+            vision.validate(prompt_len, hidden_size)?;
+            anyhow::ensure!(
+                params.vision_fingerprint.is_some(),
+                "Qwen35 SlotAware multimodal prefill requires an exact vision fingerprint"
+            );
+        }
 
         if cached_tokens == 0 {
             kv_cache
@@ -3245,6 +3466,7 @@ impl Qwen35PrefillState {
             next_token_index: cached_tokens,
             cached_prefill_logits,
             stable_prompt_prefix_tokens,
+            vision,
             prefill_started: Instant::now(),
         })
     }
@@ -3286,13 +3508,48 @@ impl Qwen35PrefillState {
                 );
                 let chunk_start = self.next_token_index;
                 let chunk = &self.prompt_tokens[self.next_token_index..end];
-                let positions = prefill_positions_from(self.next_token_index, chunk.len());
+                let vision_chunk = self
+                    .vision
+                    .as_ref()
+                    .map(|vision| vision.chunk(self.next_token_index, end, qwen.hidden_size))
+                    .transpose()?;
+                let positions = vision_chunk
+                    .as_ref()
+                    .and_then(|vision| vision.positions_flat.clone())
+                    .unwrap_or_else(|| prefill_positions_from(self.next_token_index, chunk.len()));
                 let chunk_started = Instant::now();
                 let lease =
                     supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
-                let forward =
+                let forward = if let Some(vision) = vision_chunk.as_ref() {
+                    let soft_tokens: Vec<_> = vision
+                        .soft_tokens
+                        .iter()
+                        .map(|(range, embeddings)| {
+                            crate::serve::forward_prefill::SoftTokenInjection {
+                                range: range.clone(),
+                                embeddings,
+                            }
+                        })
+                        .collect();
+                    let deepstack = vision.deepstack.as_ref().map(|(positions, chunks)| {
+                        crate::serve::forward_prefill::DeepstackInjection {
+                            image_token_positions: positions.clone(),
+                            chunks: chunks.iter().collect(),
+                        }
+                    });
                     qwen.model
-                        .forward_gpu_last_logits(chunk, &positions, kv_cache, self.slot_id);
+                        .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                            chunk,
+                            &positions,
+                            &soft_tokens,
+                            deepstack.as_ref(),
+                            kv_cache,
+                            self.slot_id,
+                        )
+                } else {
+                    qwen.model
+                        .forward_gpu_last_logits(chunk, &positions, kv_cache, self.slot_id)
+                };
                 lease.finish()?;
                 let logits = forward
                     .context("Qwen35Model::forward_gpu_last_logits (slot-aware bounded prefill)")?;
@@ -3317,6 +3574,7 @@ impl Qwen35PrefillState {
                             .snapshot_slot_anchor(self.slot_id, end)
                             .context("capture Qwen35 stable prompt boundary")?,
                         prefill_logits: logits.clone(),
+                        vision_fingerprint: self.params.vision_fingerprint,
                     })
                 } else {
                     None
@@ -3333,6 +3591,11 @@ impl Qwen35PrefillState {
         }
 
         let prefill_duration = self.prefill_started.elapsed();
+        let decode_position_base = self
+            .vision
+            .as_ref()
+            .map(|vision| vision.decode_position_base(self.prompt_tokens.len()))
+            .unwrap_or(self.prompt_tokens.len());
         let state = Qwen35DecodeState::from_prefill_logits(
             qwen,
             self.prompt_tokens,
@@ -3342,6 +3605,7 @@ impl Qwen35PrefillState {
             self.cached_tokens,
             &prefill_logits,
             prefill_duration,
+            decode_position_base,
         )?;
         Ok(Qwen35PrefillAdvance::Ready {
             state,
@@ -3373,6 +3637,10 @@ pub(crate) struct Qwen35DecodeState {
     slot_id: SlotId,
     prompt_tokens: Vec<u32>,
     prompt_len: usize,
+    /// Absolute text-axis position for the first post-prefill decode input.
+    /// Equals `prompt_len` for text, but Qwen multimodal mRoPE advances image
+    /// spans by their temporal grid extent rather than soft-token row count.
+    decode_position_base: usize,
     max_tokens: usize,
     is_greedy: bool,
     want_logprobs: bool,
@@ -3527,6 +3795,7 @@ impl Qwen35DecodeState {
             cached_tokens,
             &prefill_logits,
             prefill_duration,
+            prompt_len,
         )?;
         Ok((state, prefill_logits))
     }
@@ -3541,6 +3810,7 @@ impl Qwen35DecodeState {
         cached_tokens: usize,
         prefill_logits: &[f32],
         prefill_duration: Duration,
+        decode_position_base: usize,
     ) -> Result<Self> {
         anyhow::ensure!(
             prefill_logits.len() == qwen.vocab_size,
@@ -3607,6 +3877,7 @@ impl Qwen35DecodeState {
             slot_id,
             prompt_tokens,
             prompt_len,
+            decode_position_base,
             max_tokens,
             is_greedy,
             want_logprobs,
@@ -3701,7 +3972,7 @@ impl Qwen35DecodeState {
                 finished: true,
             });
         }
-        let pos = self.prompt_len + self.step - 1;
+        let pos = self.decode_position_base + self.step - 1;
         let pos_i32 = pos as i32;
         let positions: Vec<i32> = vec![pos_i32; 4];
         let last_input = &self.generated_tokens[self.generated_tokens.len() - 1..];
@@ -4903,8 +5174,6 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
         finish_reason,
         prefill_duration,
         decode_duration,
-        // No prompt-cache fast-path on the soft-tokens path; cached
-        // tokens count is always 0 for vision-augmented requests.
         cached_tokens: 0,
         logprobs: logprobs_vec,
     })
@@ -4964,69 +5233,95 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     };
 
     let device = MlxDevice::new()
-        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 wedge-4d generate): {e}"))?;
-    let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 vision generate): {e}"))?;
+    let (mut kv_cache, cache_reused) = take_serial_kv_cache(qwen, &device, prompt_len, max_tokens)?;
 
     // ADR-027 iter-6b.3: cold-start hydrate (wedge-4d deepstack path).
     qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
 
-    let prefill_start = Instant::now();
-    // Use supplied 3D positions if provided; otherwise fall back to
-    // text-style `[t,t,t,t]` positions.
-    let positions_owned: Vec<i32>;
-    let positions: &[i32] = match positions_flat {
-        Some(p) => {
-            anyhow::ensure!(
-                p.len() == 4 * prompt_len,
-                "generate_qwen35_once_with_soft_tokens_and_deepstack: \
-                 positions_flat.len() = {} != 4 * prompt_len = {}",
-                p.len(),
-                4 * prompt_len
-            );
-            p
-        }
-        None => {
-            positions_owned = prefill_positions_for(prompt_len);
-            &positions_owned
-        }
-    };
+    let prompt_cache_hit = params.vision_fingerprint.is_some()
+        && qwen.prompt_cache.try_match(prompt_tokens, params).is_some();
+    if cache_reused && !prompt_cache_hit {
+        kv_cache.reset();
+    }
 
-    let prefill_logits =
-        supervised_gpu_call(supervisor, "qwen35_serial_deepstack_prefill", || {
-            qwen.model
-                .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                    prompt_tokens,
-                    positions,
-                    soft_tokens,
-                    deepstack,
-                    &mut kv_cache,
-                    SlotId(0),
-                )
-                .context(
-                    "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
-                 (prefill)",
-                )
-        })?;
-    anyhow::ensure!(
-        prefill_logits.len() == qwen.vocab_size,
-        "qwen35 prefill (wedge-4d) logits len {} != vocab_size {}",
-        prefill_logits.len(),
-        qwen.vocab_size
-    );
-    let mut next_token: u32 = if want_logprobs {
-        // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-        let mut logits = prefill_logits.clone();
-        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
-        if let Some(v) = logprobs_vec.as_mut() {
-            v.push(lp);
-        }
-        tok
-    } else if is_greedy {
-        greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+    let prefill_start = Instant::now();
+    let mut next_token: u32;
+    if prompt_cache_hit {
+        let snap = qwen
+            .prompt_cache
+            .snapshot()
+            .expect("vision prompt-cache hit requires snapshot");
+        kv_cache
+            .restore_partial(snap, prompt_len)
+            .context("vision prompt-cache restore_partial")?;
+        next_token = qwen.prompt_cache.first_decoded_token();
     } else {
-        let mut logits = prefill_logits.clone();
-        sample_logits_qwen35(&mut logits, params, &[])
-    };
+        // Use supplied 3D positions if provided; otherwise fall back to
+        // text-style `[t,t,t,t]` positions.
+        let positions_owned: Vec<i32>;
+        let positions: &[i32] = match positions_flat {
+            Some(p) => {
+                anyhow::ensure!(
+                    p.len() == 4 * prompt_len,
+                    "generate_qwen35_once_with_soft_tokens_and_deepstack: \
+                     positions_flat.len() = {} != 4 * prompt_len = {}",
+                    p.len(),
+                    4 * prompt_len
+                );
+                p
+            }
+            None => {
+                positions_owned = prefill_positions_for(prompt_len);
+                &positions_owned
+            }
+        };
+
+        let prefill_logits =
+            supervised_gpu_call(supervisor, "qwen35_serial_deepstack_prefill", || {
+                qwen.model
+                    .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                        prompt_tokens,
+                        positions,
+                        soft_tokens,
+                        deepstack,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
+                    .context(
+                        "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
+                         (prefill)",
+                    )
+            })?;
+        anyhow::ensure!(
+            prefill_logits.len() == qwen.vocab_size,
+            "qwen35 vision prefill logits len {} != vocab_size {}",
+            prefill_logits.len(),
+            qwen.vocab_size
+        );
+        next_token = if want_logprobs {
+            let mut logits = prefill_logits.clone();
+            let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+            if let Some(v) = logprobs_vec.as_mut() {
+                v.push(lp);
+            }
+            tok
+        } else if is_greedy {
+            greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+        } else {
+            let mut logits = prefill_logits.clone();
+            sample_logits_qwen35(&mut logits, params, &[])
+        };
+        if is_greedy && params.vision_fingerprint.is_some() {
+            match kv_cache.snapshot_prefix(&device, prompt_len) {
+                Ok(snapshot) => {
+                    qwen.prompt_cache
+                        .update(prompt_tokens.to_vec(), snapshot, next_token, params)
+                }
+                Err(error) => tracing::warn!(%error, "Qwen vision prompt-cache snapshot failed"),
+            }
+        }
+    }
     let prefill_duration = prefill_start.elapsed();
 
     // Decode loop — for the post-prefill text steps, the global
@@ -5161,6 +5456,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         }
     }
     let decode_duration = decode_start.elapsed();
+    qwen.persistent_kv_cache = Some(kv_cache);
 
     let (content, reasoning_text) = match registration {
         Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
@@ -5203,7 +5499,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         finish_reason,
         prefill_duration,
         decode_duration,
-        cached_tokens: 0,
+        cached_tokens: if prompt_cache_hit { prompt_len } else { 0 },
         logprobs: logprobs_vec,
     })
 }
@@ -5403,15 +5699,13 @@ pub(super) fn generate_stream_qwen35_once_extended(
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
 
-    // Wedge-4e: prompt-cache fast-path is BYPASSED whenever any
-    // extension is present — the cache key is `prompt_tokens` only and
-    // would falsely hit on a vision-augmented request with the same
-    // placeholder ids but different image content. Mirrors the
-    // non-streaming `generate_qwen35_once_with_soft_tokens` rationale
-    // at engine_qwen35.rs:933 ("Prompt-cache is intentionally NOT
-    // consulted on the vision path").
+    // Vision requests may use the full-prompt fast path only when the HTTP
+    // preparation layer supplied an exact image-embedding fingerprint. The
+    // prompt-cache key includes that digest, so equal placeholder tokens with
+    // different pixels miss. Other extension callers remain fail-closed.
+    let prompt_cache_eligible = !has_extension || params.vision_fingerprint.is_some();
     let prompt_cache_hit =
-        !has_extension && qwen.prompt_cache.try_match(prompt_tokens, params).is_some();
+        prompt_cache_eligible && qwen.prompt_cache.try_match(prompt_tokens, params).is_some();
 
     // ADR-017 Phase E.a B.2c+B.3+B.5 — streaming-path LCP probe +
     // restore.  Mirrors the non-streaming probe in
@@ -5868,13 +6162,11 @@ pub(super) fn generate_stream_qwen35_once_extended(
             .0;
         }
         advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
-        // Prompt-cache snapshot is ONLY taken on the text-only path —
-        // the vision path's bypass-on-read above means there's no key
-        // collision risk, but it's also not productive to snapshot a
-        // soft-token-tainted KV cache that subsequent text-only
-        // requests must not restore. Skip the snapshot entirely on
-        // extension paths.
-        if is_greedy && !has_extension {
+        // The image fingerprint in `HybridPromptCacheKey` makes a
+        // vision-tainted snapshot safe and reusable only for the exact same
+        // image embeddings. Generic extension callers without that digest
+        // remain ineligible.
+        if is_greedy && prompt_cache_eligible {
             match kv_cache.snapshot_prefix(&device, prompt_len) {
                 Ok(snap) => {
                     qwen.prompt_cache
@@ -7349,7 +7641,7 @@ mod tests {
     use crate::inference::models::qwen35::{
         default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
     };
-    use mlx_native::MlxDevice;
+    use mlx_native::{MlxBuffer, MlxDevice};
     use std::cell::Cell;
 
     #[test]
@@ -7364,6 +7656,87 @@ mod tests {
             9_000
         );
         assert_eq!(qwen35_next_prefill_end(0, 9_000, 4_096, None), 4_096);
+    }
+
+    fn f32_buffer(device: &MlxDevice, rows: usize, hidden: usize, values: &[f32]) -> MlxBuffer {
+        assert_eq!(values.len(), rows * hidden);
+        let mut buffer = device
+            .alloc_buffer(
+                values.len() * std::mem::size_of::<f32>(),
+                mlx_native::DType::F32,
+                vec![rows, hidden],
+            )
+            .expect("allocate vision test buffer");
+        buffer
+            .as_mut_slice::<f32>()
+            .expect("vision test buffer f32 view")
+            .copy_from_slice(values);
+        buffer
+    }
+
+    #[test]
+    fn bounded_vision_chunk_rebases_soft_tokens_deepstack_and_mrope() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let hidden = 2;
+        let soft = f32_buffer(
+            &device,
+            6,
+            hidden,
+            &[
+                0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0,
+            ],
+        );
+        let deep = f32_buffer(
+            &device,
+            4,
+            hidden,
+            &[100.0, 101.0, 110.0, 111.0, 120.0, 121.0, 130.0, 131.0],
+        );
+        let prompt_len = 10;
+        let mut positions = Vec::with_capacity(4 * prompt_len);
+        for axis in 0..4_i32 {
+            positions.extend((0..prompt_len as i32).map(|position| axis * 100 + position));
+        }
+        let vision = Qwen35VisionPrefillData::new(
+            vec![SoftTokenData {
+                range: 2..8,
+                embeddings: soft,
+            }],
+            Some(DeepstackData {
+                image_token_positions: vec![3, 4, 5, 6],
+                chunks: vec![deep],
+            }),
+            Some(positions),
+        );
+        vision.validate(prompt_len, hidden).expect("valid vision");
+
+        let chunk = vision.chunk(4, 6, hidden).expect("middle chunk");
+        assert_eq!(chunk.soft_tokens.len(), 1);
+        assert_eq!(chunk.soft_tokens[0].0, 0..2);
+        assert_eq!(
+            chunk.soft_tokens[0].1.as_slice::<f32>().expect("soft view"),
+            &[20.0, 21.0, 30.0, 31.0]
+        );
+        let (deep_positions, deep_chunks) = chunk.deepstack.expect("deepstack chunk");
+        assert_eq!(deep_positions, vec![0, 1]);
+        assert_eq!(
+            deep_chunks[0].as_slice::<f32>().expect("deepstack view"),
+            &[110.0, 111.0, 120.0, 121.0]
+        );
+        assert_eq!(
+            chunk.positions_flat.expect("mRoPE chunk"),
+            vec![4, 5, 104, 105, 204, 205, 304, 305]
+        );
+    }
+
+    #[test]
+    fn bounded_vision_decode_base_uses_text_axis_not_expanded_prompt_length() {
+        let prompt_len = 8;
+        let mut positions = vec![0; 4 * prompt_len];
+        positions[..prompt_len].copy_from_slice(&[0, 1, 2, 3, 4, 4, 5, 6]);
+        let vision = Qwen35VisionPrefillData::new(Vec::new(), None, Some(positions));
+        assert_eq!(vision.decode_position_base(prompt_len), 7);
     }
 
     #[test]
@@ -7681,11 +8054,20 @@ mod tests {
                 .expect("syntactically valid grammar without root"),
         );
 
-        let error =
-            match Qwen35PrefillState::begin(vec![7], params, None, &mut kv, SlotId(0), 0, None) {
-                Ok(_) => panic!("missing-root grammar must fail before bounded prefill"),
-                Err(error) => error,
-            };
+        let error = match Qwen35PrefillState::begin(
+            vec![7],
+            params,
+            None,
+            &mut kv,
+            SlotId(0),
+            0,
+            None,
+            None,
+            cfg.hidden_size as usize,
+        ) {
+            Ok(_) => panic!("missing-root grammar must fail before bounded prefill"),
+            Err(error) => error,
+        };
         assert!(format!("{error:#}").contains("grammar has no root rule"));
         assert_eq!(
             kv.sequence_len_for_slot(SlotId(0)).expect("cursor"),
@@ -7781,6 +8163,26 @@ mod tests {
             cache.try_match(&longer, &greedy_params()).is_none(),
             "longer prompt should miss"
         );
+    }
+
+    #[test]
+    fn hybrid_prompt_cache_keys_vision_identity() {
+        let cfg = moe_cfg_40layer_for_cache_test();
+        let device = MlxDevice::new().expect("device");
+        let prompt = vec![10u32, 20, 30, 40];
+        let snapshot = initialized_prompt_cache_snapshot(&cfg, &device, prompt.len());
+        let mut cached_params = greedy_params();
+        cached_params.vision_fingerprint = Some([0x11; 32]);
+        let mut cache = HybridPromptCache::new();
+        cache.update(prompt.clone(), snapshot, 99, &cached_params);
+
+        assert_eq!(cache.try_match(&prompt, &cached_params), Some(prompt.len()));
+        let mut other_image = cached_params.clone();
+        other_image.vision_fingerprint = Some([0x22; 32]);
+        assert!(cache.try_match(&prompt, &other_image).is_none());
+        let mut text_only = cached_params;
+        text_only.vision_fingerprint = None;
+        assert!(cache.try_match(&prompt, &text_only).is_none());
     }
 
     /// Wedge-3 / iter-216 Phase C: gen-params mismatch misses even when
@@ -8328,6 +8730,8 @@ mod tests {
             quant_type: Some("Q4_K".to_string()),
             load_duration: std::time::Duration::from_millis(1),
             provenance: crate::core::provenance::Provenance::External,
+            vision_projector_profile: None,
+            vision_deepstack_output_count: 0,
             prompt_cache: HybridPromptCache::new(),
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,

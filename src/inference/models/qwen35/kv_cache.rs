@@ -2552,6 +2552,30 @@ impl HybridKvCache {
         Ok(())
     }
 
+    /// Re-select the pre-forward DeltaNet ping-pong buffers for one slot.
+    ///
+    /// A batched decode writes every linear-attention layer into its inactive
+    /// buffer and flips that slot exactly once after the forward completes.
+    /// When a speculative transaction is rejected in full, the previous
+    /// recurrent and convolution state is therefore still intact in the
+    /// opposite buffer. Flipping once restores it without a CPU copy; the
+    /// caller must then replay the valid target token normally.
+    pub fn rewind_la_ping_pong_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "rewind_la_ping_pong_for_slot: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        for linear in &mut self.linear_attn {
+            linear.swap_for_slot(slot);
+        }
+        Ok(())
+    }
+
     /// **ADR-040 iter-C2d-cont-kernel iter-1 (2026-05-29)** — per-slot
     /// reset for the persistent multi-seq `HybridKvCache` worker hot path.
     ///
@@ -4035,12 +4059,12 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // Per dossier §4 iter-2a step 2: full-attn cursors are
         // homogeneous across full_attn slots in production (every
         // full-attn layer advances together per token).  Reading from
-        // `full_attn[0]` is the canonical source.  MTP slot's cursor
-        // advances in lockstep but is read via the same forward path
-        // (it is not a separate logical sequence).  If `full_attn` is
-        // empty (degenerate config — Qwen35 production always has at
-        // least one full-attn layer), fall back to 0 to keep the
-        // trait total.
+        // `full_attn[0]` is the canonical source. The optional MTP cache has
+        // an independent speculative cursor: ordinary verifier prefill does
+        // not advance it, while proposal processing does. It must never be
+        // included in the public verifier-length invariant. If `full_attn`
+        // is empty (degenerate config — Qwen35 production always has at
+        // least one full-attn layer), fall back to 0 to keep the trait total.
         if self.full_attn.is_empty() {
             return Ok(0);
         }
@@ -4068,17 +4092,6 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
             slot.0,
             canonical
         );
-        if let Some(ref mtp) = self.mtp_slot {
-            debug_assert!(
-                mtp.current_len[slot.0 as usize] == canonical,
-                "HybridKvCache::seq_len({:?}): mtp.current_len[{}] = {} \
-                 disagrees with full_attn canonical {}",
-                slot,
-                slot.0,
-                mtp.current_len[slot.0 as usize],
-                canonical
-            );
-        }
         Ok(canonical)
     }
 
@@ -9607,6 +9620,11 @@ mod tests {
 
         let mtp = cache.mtp_slot.as_mut().expect("fixture has MTP slot");
         mtp.current_len[1] = 3;
+        assert_eq!(
+            cache.seq_len(slot).expect("public length follows verifier"),
+            5,
+            "an independent MTP proposal cursor must not poison verifier length"
+        );
         cache
             .validate_sequence_len_for_slot(slot, 5)
             .expect("base verifier boundary must not require MTP lockstep");
@@ -9614,6 +9632,36 @@ mod tests {
             .snapshot_slot_anchor(slot, 5)
             .expect("prompt anchor captures the independent MTP cursor");
         assert_eq!(anchor.mtp_current_len, Some(3));
+    }
+
+    #[test]
+    fn qwen38_spec_reject_rewinds_only_target_slot_ping_pong() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        let target = SlotId(2);
+
+        for linear in &mut cache.linear_attn {
+            linear.swap_for_slot(target);
+        }
+        assert!(
+            cache
+                .linear_attn
+                .iter()
+                .all(|linear| linear.pp_flipped[target.0 as usize]),
+            "fixture must model one completed target forward"
+        );
+
+        cache
+            .rewind_la_ping_pong_for_slot(target)
+            .expect("reject rewinds target slot");
+        for linear in &cache.linear_attn {
+            assert!(!linear.pp_flipped[target.0 as usize]);
+            for sibling in [0usize, 1, 3] {
+                assert!(!linear.pp_flipped[sibling], "sibling slot changed");
+            }
+        }
     }
 
     /// Pin: drop resets ONLY the target slot's cursor (across all

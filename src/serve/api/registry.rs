@@ -4714,6 +4714,128 @@ mod tests {
     }
 
     #[test]
+    fn deepseek4_question_grammar_rejects_observed_malformed_json() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"questions": {"type": "array"}},
+            "required": ["questions"]
+        }"#;
+        let mut runtime = deepseek4_runtime(
+            "question",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        let malformed = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":null,\"options\":{\"label\":\"Movies\",}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let alive = runtime.accept_bytes(malformed.as_bytes());
+        assert!(
+            !(alive && runtime.is_accepted()),
+            "malformed JSON must be impossible after the lazy tool boundary"
+        );
+    }
+
+    #[test]
+    fn deepseek4_question_candidate_mask_matches_runtime_on_malformed_json() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"questions": {"type": "array"}},
+            "required": ["questions"]
+        });
+        let grammar = DEEPSEEK4
+            .tool_call_gbnf(
+                "question",
+                &schema,
+                GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+            )
+            .expect("question grammar");
+        let parsed = crate::serve::api::grammar::parser::parse(&grammar).expect("parse grammar");
+        let root = parsed.rule_id("root").expect("root");
+        let mut runtime = crate::serve::api::grammar::sampler::GrammarRuntime::new(parsed, root)
+            .expect("runtime");
+        let malformed = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":null,\"options\":{\"label\":\"Movies\",}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let mut rejected_at = None;
+        for (offset, ch) in malformed.char_indices() {
+            let mut encoded = [0u8; 4];
+            let bytes = ch.encode_utf8(&mut encoded).as_bytes().to_vec();
+            let oracle_accepts = runtime.clone().accept_bytes(&bytes);
+            let mut logits = [0.0f32];
+            crate::serve::api::grammar::mask::mask_invalid_tokens(
+                &runtime,
+                &[bytes.clone()],
+                &mut logits,
+            );
+            assert_eq!(
+                logits[0].is_finite(),
+                oracle_accepts,
+                "candidate mask/runtime mismatch at byte {offset}, char {ch:?}"
+            );
+            if !oracle_accepts {
+                rejected_at = Some((offset, ch));
+                break;
+            }
+            assert!(runtime.accept_bytes(&bytes));
+        }
+        assert!(
+            rejected_at.is_some(),
+            "the observed malformed DSML sequence must be masked before completion"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires HF2Q_DEEPSEEK4_TOKENIZER pointing to the exact served tokenizer.json"]
+    fn deepseek4_question_candidate_mask_rejects_real_tokenizer_chunks() {
+        let tokenizer_path = std::env::var("HF2Q_DEEPSEEK4_TOKENIZER")
+            .expect("set HF2Q_DEEPSEEK4_TOKENIZER for this exact-artifact test");
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .unwrap_or_else(|error| panic!("load {tokenizer_path}: {error}"));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"questions": {"type": "array"}},
+            "required": ["questions"]
+        });
+        let grammar = DEEPSEEK4
+            .tool_call_gbnf(
+                "question",
+                &schema,
+                GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+            )
+            .expect("question grammar");
+        let parsed = crate::serve::api::grammar::parser::parse(&grammar).expect("parse grammar");
+        let root = parsed.rule_id("root").expect("root");
+        let mut runtime = crate::serve::api::grammar::sampler::GrammarRuntime::new(parsed, root)
+            .expect("runtime");
+        let malformed = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":null,\"options\":{\"label\":\"Movies\",}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let encoding = tokenizer.encode(malformed, false).expect("encode mutant");
+        let mut rejected_token = None;
+        for &token in encoding.get_ids() {
+            let bytes = tokenizer
+                .decode(&[token], false)
+                .expect("decode token")
+                .into_bytes();
+            assert!(!bytes.is_empty(), "mutant token {token} decoded empty");
+            let oracle_accepts = runtime.clone().accept_bytes(&bytes);
+            let mut logits = vec![f32::NEG_INFINITY; token as usize + 1];
+            logits[token as usize] = 0.0;
+            let mut table = vec![Vec::new(); token as usize + 1];
+            table[token as usize] = bytes.clone();
+            crate::serve::api::grammar::mask::mask_invalid_tokens(&runtime, &table, &mut logits);
+            assert_eq!(
+                logits[token as usize].is_finite(),
+                oracle_accepts,
+                "candidate mask/runtime mismatch for tokenizer token {token}"
+            );
+            if !oracle_accepts {
+                rejected_token = Some(token);
+                break;
+            }
+            assert!(runtime.accept_bytes(&bytes));
+        }
+        assert!(
+            rejected_token.is_some(),
+            "the malformed DSML mutant must be rejected on the real token boundaries"
+        );
+    }
+
+    #[test]
     fn deepseek4_string_parameter_accepts_source_code_with_angle_brackets() {
         let schema = r#"{
             "type": "object",

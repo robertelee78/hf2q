@@ -128,3 +128,10 @@ fn empty_tool_arguments_round_trip_with_official_blank_line() {
     let parsed = parse_completion(&prompt[start..], ThinkingMode::Chat).unwrap();
     assert_eq!(parsed.tool_calls[0].function.arguments, "{}");
 }
+
+#[test]
+fn malformed_non_string_parameter_fails_closed() {
+    let body = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":null,\"options\":{\"label\":\"Movies\",}</｜DSML｜parameter>\n</｜DSML｜invoke>\n";
+    let error = parse_tool_calls_body(body).expect_err("invalid JSON must not become tool args");
+    assert!(error.to_string().contains("is not valid JSON"), "{error}");
+}

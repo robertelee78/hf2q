@@ -149,6 +149,7 @@ impl MtpWeights {
         prev_hidden: &MlxBuffer,
         embed_t: &MlxBuffer,
         kv_cache: &mut HybridKvCache,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
         position_ids: &[i32],
         device: &MlxDevice,
         registry: &mut KernelRegistry,
@@ -158,6 +159,7 @@ impl MtpWeights {
             prev_hidden,
             embed_t,
             kv_cache,
+            slot_id,
             position_ids,
             device,
             registry,
@@ -179,6 +181,7 @@ impl MtpWeights {
         prev_hidden: &MlxBuffer,
         embed_t: &MlxBuffer,
         kv_cache: &mut HybridKvCache,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
         position_ids: &[i32],
         device: &MlxDevice,
         registry: &mut KernelRegistry,
@@ -222,8 +225,9 @@ impl MtpWeights {
         let t_proj = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
-        let attn_out =
-            self.forward_full_attention(&projected, &pos_buf, kv_cache, device, registry, cfg)?;
+        let attn_out = self.forward_full_attention(
+            &projected, &pos_buf, kv_cache, slot_id, device, registry, cfg,
+        )?;
         if mtp_substep_profile {
             let mut enc = device.command_encoder().context("MTP profile sync 2")?;
             enc.commit_and_wait().ok();
@@ -321,6 +325,7 @@ impl MtpWeights {
         x: &MlxBuffer,
         positions: &MlxBuffer,
         kv_cache: &mut HybridKvCache,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
         device: &MlxDevice,
         registry: &mut KernelRegistry,
         cfg: &Qwen35Config,
@@ -429,13 +434,7 @@ impl MtpWeights {
             cfg.head_dim,
             kv_cache.max_seq_len,
             None,
-            // ADR-040 Phase B4a-cont (2026-05-23): MTP draft slot
-            // (`HybridKvCache::mtp_slot`) is single-seq today (one MTP
-            // draft per host request).  Multi-slot MTP draft routing
-            // is deferred to Phase B4b alongside the other decode-side
-            // entry-point lifts.  Hard-coded `SlotId(0)` matches the
-            // single-seq contract; B4b removes the hard-coding.
-            crate::serve::multi_seq_kv::SlotId(0),
+            slot_id,
         )
         .context("MTP SDPA")?;
 

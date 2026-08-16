@@ -200,11 +200,12 @@ pub const ENTRY: ArchEntry = ArchEntry {
     hf_architectures: &["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"],
     tensor_catalog: &DENSE_CATALOG,
     has_mtp: true,
-    // The source family is multimodal, but the active unified converter does
-    // not yet expose the existing Qwen vision machinery through `--mmproj`.
-    // Keep this capability flag fail-closed until that separately gated path
-    // is wired and proven with a real image request.
-    has_vision: false,
+    // ConditionalGeneration checkpoints expose a separate Qwen vision tower.
+    // hf2q converts that tower to an mmproj and serves its embeddings through
+    // the same bounded SlotAware path as text prefill. CausalLM checkpoints
+    // remain usable without a projector; this flag advertises family
+    // capability, not a requirement that every checkpoint include vision.
+    has_vision: true,
     smoke_prompts: &["The quick brown fox"],
     ppl_corpus: EvalCorpus {
         id: "wikitext2",
@@ -264,11 +265,10 @@ mod tests {
     }
 
     #[test]
-    fn has_mtp_is_true_and_vision_stays_fail_closed() {
-        // Dense checkpoints carry one MTP layer. Multimodal source tensors
-        // are recognized, but capability advertisement stays off until the
-        // public projector route and image E2E are both load-bearing.
+    fn has_mtp_and_vision_capabilities_are_advertised() {
+        // Dense conditional-generation checkpoints carry both one MTP layer
+        // and a separately converted vision tower.
         assert!(ENTRY.has_mtp);
-        assert!(!ENTRY.has_vision);
+        assert!(ENTRY.has_vision);
     }
 }

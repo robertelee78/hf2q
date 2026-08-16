@@ -407,6 +407,12 @@ pub struct SamplingParams {
     /// This deliberately does not participate in `PromptCacheKey`: it
     /// describes prompt layout, not generation semantics.
     pub stable_prompt_prefix_tokens: Option<usize>,
+
+    /// Digest of the authoritative vision embeddings and image-grid layout
+    /// used to replace placeholder tokens in this request. `None` is the
+    /// text-only contract. Prompt/KV caches include this value so identical
+    /// placeholder token streams backed by different images cannot collide.
+    pub vision_fingerprint: Option<[u8; 32]>,
 }
 
 impl Default for SamplingParams {
@@ -436,6 +442,7 @@ impl Default for SamplingParams {
             tool_argument_wire_kinds: None,
             reasoning_forced_open: false,
             stable_prompt_prefix_tokens: None,
+            vision_fingerprint: None,
         }
     }
 }
@@ -703,6 +710,18 @@ pub enum LoadedArch {
     Qwen3VlText,
     /// DeepSeek-V4-Flash native compressed-attention runtime.
     Deepseek4,
+}
+
+/// Exact text-model contract for a separately loaded vision projector.
+/// Absence is authoritative: the loaded checkpoint is text-only or its
+/// multimodal consumer metadata is not strong enough to bind safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionConsumerContract {
+    pub profile: crate::inference::vision::mmproj::ArchProfile,
+    pub output_width: u32,
+    pub deepstack_output_count: u32,
+    pub source_sha256: Option<String>,
+    pub expected_projector_sha256: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1468,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
             chat_template: Arc::new(String::new()),
             registration: None,
+            vision_consumer_contract: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: Some(descriptor_for_engine),
             tq_packed_descriptor: None,
@@ -1506,6 +1526,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
             chat_template: Arc::new(String::new()),
             registration: None,
+            vision_consumer_contract: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
@@ -1580,6 +1601,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
             tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
             chat_template: Arc::new(String::new()),
             registration: None,
+            vision_consumer_contract: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
@@ -1644,6 +1666,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
             tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
             chat_template: Arc::new(String::new()),
             registration: None,
+            vision_consumer_contract: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
@@ -1733,6 +1756,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
             tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
             chat_template: Arc::new(String::new()),
             registration: None,
+            vision_consumer_contract: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
@@ -1799,6 +1823,7 @@ struct EngineInner {
     /// Per-model registration — reasoning-boundary + tool-call markers
     /// (Decision #21). `None` when no family matches this model's id.
     registration: Option<super::registry::ModelRegistration>,
+    vision_consumer_contract: Option<VisionConsumerContract>,
     /// Per-vocab decoded UTF-8 byte table — `token_bytes[id]` is the
     /// bytes the tokenizer emits when token `id` is sampled.  Built on
     /// first grammar request via `Engine::token_bytes_table()` and
@@ -2471,6 +2496,42 @@ impl LoadedModel {
             LoadedModel::Deepseek4(d) => d.load_duration,
         }
     }
+
+    fn vision_consumer_contract(&self) -> Option<VisionConsumerContract> {
+        use crate::inference::vision::mmproj::ArchProfile;
+
+        let (source_sha256, expected_projector_sha256) = match self.provenance() {
+            crate::core::provenance::Provenance::Hf2q {
+                source_sha256,
+                mmproj_sha256,
+                ..
+            } => (Some(source_sha256), mmproj_sha256),
+            crate::core::provenance::Provenance::External => (None, None),
+        };
+        match self {
+            LoadedModel::Gemma(g) => Some(VisionConsumerContract {
+                profile: ArchProfile::Gemma4Siglip,
+                output_width: g.weights.hidden_size as u32,
+                deepstack_output_count: 0,
+                source_sha256,
+                expected_projector_sha256,
+            }),
+            LoadedModel::Qwen35(q)
+                if q.vision_projector_profile.as_deref() == Some("qwen3vl_siglip") =>
+            {
+                Some(VisionConsumerContract {
+                    profile: ArchProfile::Qwen3VlSiglip,
+                    output_width: q.hidden_size as u32,
+                    deepstack_output_count: q.vision_deepstack_output_count,
+                    source_sha256,
+                    expected_projector_sha256,
+                })
+            }
+            LoadedModel::Qwen35(_) | LoadedModel::Qwen3VlText(_) | LoadedModel::Deepseek4(_) => {
+                None
+            }
+        }
+    }
     /// Prompt cache is Gemma-only in iter-215 MVP.  The Qwen35 worker
     /// arm returns 501 before any prompt-cache logic runs, so the
     /// `None` returned here is unreachable on the Qwen35 path.  Wedge-3
@@ -2585,6 +2646,9 @@ pub struct PromptCacheKey {
     /// Whether the reasoning splitter begins inside a reasoning span. This
     /// changes the public `text` / `reasoning_text` response shape.
     pub reasoning_forced_open: bool,
+    /// See [`SamplingParams::vision_fingerprint`]. This participates in
+    /// terminal-response replay keys for the same collision-safety reason.
+    pub vision_fingerprint: Option<[u8; 32]>,
 }
 
 impl PromptCacheKey {
@@ -2611,6 +2675,7 @@ impl PromptCacheKey {
             top_logprobs: params.top_logprobs,
             parallel_tool_calls: params.parallel_tool_calls,
             reasoning_forced_open: params.reasoning_forced_open,
+            vision_fingerprint: params.vision_fingerprint,
         }
     }
 }
@@ -2887,6 +2952,7 @@ impl PromptCache {
                 top_logprobs: 0,
                 parallel_tool_calls: true,
                 reasoning_forced_open: false,
+                vision_fingerprint: None,
             },
             text: String::new(),
             reasoning_text: None,
@@ -3934,6 +4000,7 @@ impl Engine {
             LoadedModel::Qwen3VlText(_) => LoadedArch::Qwen3VlText,
             LoadedModel::Deepseek4(_) => LoadedArch::Deepseek4,
         };
+        let vision_consumer_contract = loaded.vision_consumer_contract();
 
         // Phase B-dense.2 follow-up: snapshot the KV-spill shape
         // descriptor BEFORE moving `loaded` into the worker thread.
@@ -4141,6 +4208,7 @@ impl Engine {
                 tokenizer,
                 chat_template,
                 registration,
+                vision_consumer_contract,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor,
                 tq_packed_descriptor,
@@ -4538,6 +4606,7 @@ impl Engine {
             LoadedModel::Qwen3VlText(_) => LoadedArch::Qwen3VlText,
             LoadedModel::Deepseek4(_) => LoadedArch::Deepseek4,
         };
+        let vision_consumer_contract = loaded.vision_consumer_contract();
 
         // KV-spill descriptors: mirror Engine::spawn verbatim. The
         // SlotAware path inherits the same per-spill-family descriptor
@@ -4711,6 +4780,7 @@ impl Engine {
                 tokenizer,
                 chat_template,
                 registration,
+                vision_consumer_contract,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor,
                 tq_packed_descriptor,
@@ -4932,6 +5002,10 @@ impl Engine {
     /// Unified load snapshot for this engine.
     pub fn info(&self) -> &LoadInfo {
         &self.inner.info
+    }
+
+    pub fn vision_consumer_contract(&self) -> Option<VisionConsumerContract> {
+        self.inner.vision_consumer_contract.clone()
     }
 
     /// Lazily build + cache the per-vocab decoded UTF-8 byte table used
@@ -5737,7 +5811,7 @@ impl SlotReply {
 
     fn client_closed(&self) -> bool {
         match self {
-            Self::Unary(_) => false,
+            Self::Unary(reply) => reply.is_closed(),
             Self::Stream { events, .. } => events.is_closed(),
         }
     }
@@ -6060,8 +6134,9 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
 
 fn gemma4_request_runs_inline_gpu(request: &Request) -> bool {
     match request {
-        Request::Warmup { .. } | Request::Embed { .. } | Request::GenerateWithSoftTokens { .. } => {
-            true
+        Request::Warmup { .. } | Request::Embed { .. } => true,
+        Request::GenerateWithSoftTokens { prompt_tokens, .. } => {
+            prompt_tokens.len() <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
         }
         Request::Generate { prompt_tokens, .. } | Request::GenerateStream { prompt_tokens, .. } => {
             prompt_tokens.len() <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
@@ -6091,6 +6166,15 @@ fn gemma4_deferred_text_request(request: &Request) -> bool {
                 && params.max_tokens > 0
                 && u32::try_from(params.max_tokens).is_ok()
                 && soft_tokens.is_empty()
+        }
+        Request::GenerateWithSoftTokens {
+            prompt_tokens,
+            params,
+            ..
+        } => {
+            prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+                && params.max_tokens > 0
+                && u32::try_from(params.max_tokens).is_ok()
         }
         _ => false,
     }
@@ -6163,7 +6247,13 @@ fn gemma4_pending_disposition(
     let Some(prompt_tokens) = gemma4_request_prompt_tokens(request) else {
         return Gemma4PendingDisposition::ReadyControl;
     };
-    match active_gemma4_slot_affinity(retained_tokens, prompt_anchors, slots, prompt_tokens) {
+    match active_gemma4_slot_affinity(
+        retained_tokens,
+        prompt_anchors,
+        slots,
+        prompt_tokens,
+        gemma4_request_vision_fingerprint(request),
+    ) {
         Some(preference) => Gemma4PendingDisposition::WaitForActive(preference),
         None => Gemma4PendingDisposition::ReadyRequest,
     }
@@ -6325,6 +6415,7 @@ impl Gemma4PrefillProgress {
 struct Gemma4PrefillState {
     slot_id: SlotId,
     prompt_tokens: Vec<u32>,
+    soft_token_data: Vec<SoftTokenData>,
     params: SamplingParams,
     cached_tokens: usize,
     progress: Gemma4PrefillProgress,
@@ -6372,6 +6463,7 @@ impl Gemma4PrefillState {
     fn new(
         slot_id: SlotId,
         prompt_tokens: Vec<u32>,
+        soft_token_data: Vec<SoftTokenData>,
         params: SamplingParams,
         cached_tokens: usize,
         pending_anchor: Option<Gemma4PromptAnchor>,
@@ -6384,9 +6476,20 @@ impl Gemma4PrefillState {
         );
         let progress =
             Gemma4PrefillProgress::new(cached_tokens, prompt_tokens.len(), stable_boundary)?;
+        let soft_token_ranges: Vec<_> = soft_token_data
+            .iter()
+            .map(|soft| soft.range.clone())
+            .collect();
+        validate_gemma4_resumable_soft_token_ranges(
+            prompt_tokens.len(),
+            cached_tokens,
+            stable_boundary,
+            &soft_token_ranges,
+        )?;
         Ok(Self {
             slot_id,
             prompt_tokens,
+            soft_token_data,
             params,
             cached_tokens,
             progress,
@@ -6403,7 +6506,20 @@ impl Gemma4PrefillState {
         max_chunk_tokens: usize,
         supervisor: &EngineSupervisor,
     ) -> std::result::Result<Gemma4PrefillAdvance, Gemma4PrefillFailure> {
-        let plan = match self.progress.plan(max_chunk_tokens) {
+        let soft_token_ranges: Vec<_> = self
+            .soft_token_data
+            .iter()
+            .map(|soft| soft.range.clone())
+            .collect();
+        let plan = match self.progress.plan(max_chunk_tokens).and_then(|plan| {
+            gemma4_align_prefill_plan_to_soft_tokens(
+                plan,
+                max_chunk_tokens,
+                self.progress.prompt_len,
+                self.progress.stable_boundary,
+                &soft_token_ranges,
+            )
+        }) {
             Ok(plan) => plan,
             Err(error) => {
                 return Err(Gemma4PrefillFailure {
@@ -6420,6 +6536,15 @@ impl Gemma4PrefillState {
         }
         let started = Instant::now();
         let max_decode_tokens = self.params.max_tokens.max(1);
+        let soft_tokens: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> = self
+            .soft_token_data
+            .iter()
+            .filter(|soft| soft.range.start >= plan.start && soft.range.end <= plan.end)
+            .map(|soft| crate::serve::forward_prefill::SoftTokenInjection {
+                range: soft.range.clone(),
+                embeddings: &soft.embeddings,
+            })
+            .collect();
         let first_token =
             match supervised_gemma4_gpu_call(supervisor, "gemma4_bounded_prefill", || {
                 if plan.start == 0 {
@@ -6428,7 +6553,7 @@ impl Gemma4PrefillState {
                         .weights
                         .forward_prefill_with_soft_tokens_slot_aware(
                             &self.prompt_tokens[..plan.end],
-                            &[],
+                            &soft_tokens,
                             max_decode_tokens,
                             &mut guard.model.ctx,
                             self.slot_id,
@@ -6443,7 +6568,7 @@ impl Gemma4PrefillState {
                         .weights
                         .forward_prefill_with_soft_tokens_slot_aware_resume(
                             &self.prompt_tokens[..plan.end],
-                            &[],
+                            &soft_tokens,
                             max_decode_tokens,
                             &mut guard.model.ctx,
                             self.slot_id,
@@ -6512,6 +6637,7 @@ impl Gemma4PrefillState {
             rollback_anchor = Some(Gemma4PromptAnchor {
                 prompt_tokens: self.prompt_tokens[..plan.end].to_vec(),
                 kv,
+                vision_fingerprint: self.params.vision_fingerprint,
             });
         }
 
@@ -6533,6 +6659,36 @@ impl Gemma4PrefillState {
             return Ok(Gemma4PrefillAdvance::Pending {
                 state: self,
                 advanced_tokens,
+            });
+        }
+
+        if self.params.vision_fingerprint.is_some() && self.progress.stable_boundary.is_none() {
+            let Some(hybrid) = guard.hybrid.as_ref() else {
+                return Err(Gemma4PrefillFailure {
+                    rollback_anchor,
+                    error: anyhow::anyhow!(
+                        "Gemma vision prompt cache requires the production hybrid KV cache"
+                    ),
+                });
+            };
+            let kv =
+                match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid,
+                    self.slot_id,
+                    self.prompt_tokens.len(),
+                ) {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        return Err(Gemma4PrefillFailure {
+                            rollback_anchor,
+                            error: error.context("capture exact-image Gemma prompt boundary"),
+                        });
+                    }
+                };
+            rollback_anchor = Some(Gemma4PromptAnchor {
+                prompt_tokens: self.prompt_tokens.clone(),
+                kv,
+                vision_fingerprint: self.params.vision_fingerprint,
             });
         }
 
@@ -6580,6 +6736,7 @@ struct Gemma4DecodeState {
     /// Exact family-rendered prompt tokens whose KV entries are live in this
     /// physical slot.  This is the cache identity; raw chat messages are not.
     prompt_tokens: Vec<u32>,
+    vision_fingerprint: Option<[u8; 32]>,
     prompt_len: usize,
     /// Exact prefix reused at admission. Zero denotes a cold prefill.
     cached_tokens: usize,
@@ -6627,6 +6784,88 @@ fn gemma4_seed_finished(
     max_decode_tokens: usize,
 ) -> bool {
     finish_reason != "length" || generated_tokens >= max_decode_tokens
+}
+
+fn gemma4_cached_prefix_covers_soft_token_ranges<'a>(
+    cached_tokens: usize,
+    ranges: impl IntoIterator<Item = &'a std::ops::Range<usize>>,
+) -> bool {
+    ranges.into_iter().all(|range| range.end <= cached_tokens)
+}
+
+fn validate_gemma4_resumable_soft_token_ranges(
+    prompt_len: usize,
+    cursor: usize,
+    stable_boundary: Option<usize>,
+    soft_token_ranges: &[std::ops::Range<usize>],
+) -> Result<()> {
+    for (index, range) in soft_token_ranges.iter().enumerate() {
+        anyhow::ensure!(
+            range.start < range.end && range.end <= prompt_len,
+            "Gemma4 soft-token range {index} {:?} is outside prompt length {prompt_len}",
+            range
+        );
+        anyhow::ensure!(
+            range.len() <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize,
+            "Gemma4 soft-token range {index} has {} rows, exceeding the bounded prefill transaction limit {}",
+            range.len(),
+            GEMMA4_SLOT_PREFILL_CHUNK_TOKENS
+        );
+        anyhow::ensure!(
+            !(range.start < cursor && cursor < range.end),
+            "Gemma4 resumable prefill cursor {cursor} falls inside soft-token range {:?}",
+            range
+        );
+        if let Some(boundary) = stable_boundary {
+            anyhow::ensure!(
+                !(range.start < boundary && boundary < range.end),
+                "Gemma4 stable prompt boundary {boundary} falls inside soft-token range {:?}",
+                range
+            );
+        }
+        for (other_index, other) in soft_token_ranges.iter().enumerate().skip(index + 1) {
+            anyhow::ensure!(
+                range.end <= other.start || other.end <= range.start,
+                "Gemma4 soft-token ranges {index} {:?} and {other_index} {:?} overlap",
+                range,
+                other
+            );
+        }
+    }
+    Ok(())
+}
+
+fn gemma4_align_prefill_plan_to_soft_tokens(
+    mut plan: Gemma4PrefillPlan,
+    max_chunk_tokens: usize,
+    prompt_len: usize,
+    stable_boundary: Option<usize>,
+    soft_token_ranges: &[std::ops::Range<usize>],
+) -> Result<Gemma4PrefillPlan> {
+    for range in soft_token_ranges {
+        anyhow::ensure!(
+            !(range.start < plan.start && plan.start < range.end),
+            "Gemma4 prefill plan starts inside soft-token range {:?}",
+            range
+        );
+        if range.start < plan.end && plan.end < range.end {
+            plan.end = if range.start > plan.start {
+                range.start
+            } else {
+                range.end
+            };
+            break;
+        }
+    }
+    anyhow::ensure!(
+        plan.end > plan.start && plan.end - plan.start <= max_chunk_tokens,
+        "Gemma4 soft-token-aligned prefill transaction {}..{} exceeds budget {max_chunk_tokens}",
+        plan.start,
+        plan.end
+    );
+    plan.capture_anchor = stable_boundary == Some(plan.end);
+    plan.ready = plan.end == prompt_len;
+    Ok(plan)
 }
 
 impl Gemma4DecodeState {
@@ -6731,10 +6970,28 @@ impl Gemma4DecodeState {
             }
         }
 
+        // An exact-image continuation restores KV whose image rows were
+        // already injected. Only the post-image suffix is forwarded, so the
+        // override list must be empty for that resume. Refuse any checkpoint
+        // that ends inside an image span rather than silently mixing cached
+        // and newly injected rows.
+        let soft_tokens_for_prefill = if cached_tokens > 0 && !soft_tokens.is_empty() {
+            anyhow::ensure!(
+                gemma4_cached_prefix_covers_soft_token_ranges(
+                    cached_tokens,
+                    soft_tokens.iter().map(|soft| &soft.range),
+                ),
+                "Gemma 4 vision cache boundary {cached_tokens} falls inside a soft-token range"
+            );
+            &[][..]
+        } else {
+            soft_tokens
+        };
+
         let prefill_started = Instant::now();
         let stable_boundary = params
             .stable_prompt_prefix_tokens
-            .filter(|_| soft_tokens.is_empty() && multi_seq_kv_hybrid.is_some());
+            .filter(|_| multi_seq_kv_hybrid.is_some());
         if let Some(boundary) = stable_boundary {
             anyhow::ensure!(
                 boundary > 0 && boundary < prompt_tokens.len(),
@@ -6759,7 +7016,7 @@ impl Gemma4DecodeState {
                         || {
                             loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
                                 &prompt_tokens[..boundary],
-                                &[],
+                                soft_tokens_for_prefill,
                                 max_decode_tokens,
                                 &mut loaded.ctx,
                                 slot_id,
@@ -6825,7 +7082,7 @@ impl Gemma4DecodeState {
                 supervised_gemma4_gpu_call(supervisor, "gemma4_prefill", || {
                     loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
                         prompt_tokens,
-                        soft_tokens,
+                        soft_tokens_for_prefill,
                         max_decode_tokens,
                         &mut loaded.ctx,
                         slot_id,
@@ -6838,16 +7095,13 @@ impl Gemma4DecodeState {
                 None,
             )
         } else {
-            if !soft_tokens.is_empty() {
-                anyhow::bail!("Gemma 4 live-prefix resume does not accept soft-token prompts");
-            }
             (
                 supervised_gemma4_gpu_call(supervisor, "gemma4_prefill_resume", || {
                     loaded
                         .weights
                         .forward_prefill_with_soft_tokens_slot_aware_resume(
                             prompt_tokens,
-                            soft_tokens,
+                            soft_tokens_for_prefill,
                             max_decode_tokens,
                             &mut loaded.ctx,
                             slot_id,
@@ -7046,6 +7300,7 @@ impl Gemma4DecodeState {
         Ok(Gemma4DecodeState {
             slot_id,
             prompt_tokens: prompt_tokens.to_vec(),
+            vision_fingerprint: params.vision_fingerprint,
             prompt_len: prompt_tokens.len(),
             cached_tokens,
             valid_tokens: prompt_tokens.len(),
@@ -9618,6 +9873,13 @@ impl Gemma4SlotWork {
             Self::Decode(state) => state.prompt_tokens(),
         }
     }
+
+    fn vision_fingerprint(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Prefill(state) => state.params.vision_fingerprint,
+            Self::Decode(state) => state.vision_fingerprint,
+        }
+    }
 }
 
 /// Type alias for one installed Gemma 4 slot: bounded prefill or decode work,
@@ -10055,6 +10317,7 @@ fn fail_stop_deepseek4_worker(
 struct Gemma4PromptAnchor {
     prompt_tokens: Vec<u32>,
     kv: crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor,
+    vision_fingerprint: Option<[u8; 32]>,
 }
 
 /// ADR-040 Phase F M1 (F1) — Gemma 4 SlotAware admit-while-decoding loop.
@@ -10220,7 +10483,7 @@ fn run_slot_aware_gemma4(
                                 }
                             },
                         };
-                        let Some(req) = discard_closed_slotaware_stream("Gemma4", req) else {
+                        let Some(req) = discard_closed_slotaware_request("Gemma4", req) else {
                             continue;
                         };
                         reqs.push(req);
@@ -11342,21 +11605,7 @@ fn admit_gemma4_slot(
             return None;
         }
     }
-    if !soft_token_data.is_empty()
-        && prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
-    {
-        slot_fire_done(
-            reply,
-            Err(anyhow::anyhow!(
-                "capability_unsupported: Gemma4 SlotAware soft-token prefill is limited to one {}-token transaction until multimodal resume is implemented",
-                GEMMA4_SLOT_PREFILL_CHUNK_TOKENS
-            )),
-            false,
-        );
-        return None;
-    }
-    let bounded_text_prefill = soft_token_data.is_empty()
-        && prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
+    let bounded_prefill = prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
     // Build borrowed injection slices from the owned data — same shape as
     // the legacy SoftTokens arm (engine.rs:8212-8218). Empty ⇒ identity
     // over the text-only prefill (Generate path).
@@ -11367,11 +11616,13 @@ fn admit_gemma4_slot(
             embeddings: &d.embeddings,
         })
         .collect();
-    let preferred = if soft_tokens.is_empty() {
-        preferred_gemma4_slot(retained_tokens, prompt_anchors, slots, &prompt_tokens)
-    } else {
-        None
-    };
+    let preferred = preferred_gemma4_slot_for_request(
+        retained_tokens,
+        prompt_anchors,
+        slots,
+        &prompt_tokens,
+        params.vision_fingerprint,
+    );
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
@@ -11481,6 +11732,10 @@ fn admit_gemma4_slot(
                     &anchor.prompt_tokens,
                     &prompt_tokens
                 )),
+        vision_fingerprint = ?params.vision_fingerprint,
+        anchor_vision_fingerprint = ?prompt_anchors[handle.slot_id.0 as usize]
+            .as_ref()
+            .and_then(|anchor| anchor.vision_fingerprint),
         cached_tokens,
         cache = if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
             "prompt-anchor"
@@ -11583,7 +11838,7 @@ fn admit_gemma4_slot(
         return None;
     }
 
-    if bounded_text_prefill {
+    if bounded_prefill {
         let slot_idx = handle.slot_id.0 as usize;
         let pending_anchor = match take_gemma4_request_rollback_anchor(
             guard,
@@ -11591,6 +11846,7 @@ fn admit_gemma4_slot(
             cached_tokens,
             &prompt_tokens,
             &mut prompt_anchors[slot_idx],
+            params.vision_fingerprint,
         ) {
             Ok(anchor) => anchor,
             Err(error) => {
@@ -11617,6 +11873,7 @@ fn admit_gemma4_slot(
         let prefill = match Gemma4PrefillState::new(
             handle.slot_id,
             prompt_tokens,
+            soft_token_data,
             params,
             cached_tokens,
             pending_anchor,
@@ -11653,6 +11910,7 @@ fn admit_gemma4_slot(
         cached_tokens,
         &prompt_tokens,
         &mut prompt_anchors[slot_idx],
+        params.vision_fingerprint,
     ) {
         Ok(anchor) => anchor,
         Err(error) => {
@@ -11739,13 +11997,58 @@ fn admit_gemma4_slot(
         return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
 
-    let committed_anchor = stable_anchor.map(|kv| {
+    let committed_anchor = if let Some(kv) = stable_anchor {
         let boundary = kv.prompt_len();
-        Gemma4PromptAnchor {
+        Some(Gemma4PromptAnchor {
             prompt_tokens: prompt_tokens[..boundary].to_vec(),
             kv,
+            vision_fingerprint: params.vision_fingerprint,
+        })
+    } else if params.vision_fingerprint.is_some() {
+        let anchor = guard
+            .hybrid
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Gemma vision prompt cache requires hybrid KV"))
+            .and_then(|hybrid| {
+                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid,
+                    handle.slot_id,
+                    prompt_tokens.len(),
+                )
+            });
+        match anchor {
+            Ok(kv) => Some(Gemma4PromptAnchor {
+                prompt_tokens: prompt_tokens.clone(),
+                kv,
+                vision_fingerprint: params.vision_fingerprint,
+            }),
+            Err(error) => {
+                reply = match recover_gemma4_slot_after_cancellation_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    &mut retained_tokens[slot_idx],
+                    &mut prompt_anchors[slot_idx],
+                    request_rollback_anchor,
+                    false,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                scheduler.release(handle);
+                slot_fire_done(
+                    reply,
+                    Err(error.context("capture exact-image Gemma prompt boundary")),
+                    false,
+                );
+                return None;
+            }
         }
-    });
+    } else {
+        None
+    };
 
     if reply.client_closed() {
         reply.record_client_cancellation();
@@ -12212,6 +12515,7 @@ fn advance_gemma4_prefill_quantum(
     }
     let start_at_zero = primary.progress.cursor() == 0;
     let batch_supported = cross_slot_admit
+        && primary.soft_token_data.is_empty()
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
         && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
@@ -12245,6 +12549,7 @@ fn advance_gemma4_prefill_quantum(
                 slots[slot_index].as_ref(),
                 Some((Gemma4SlotWork::Prefill(state), reply, _))
                     if (state.progress.cursor() == 0) == start_at_zero
+                        && state.soft_token_data.is_empty()
                         && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
                             state
                                 .prompt_tokens
@@ -13387,6 +13692,7 @@ fn admit_gemma4_slots_stable_batched(
             prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
                 prompt_tokens: prompt[..*boundary].to_vec(),
                 kv: anchor,
+                vision_fingerprint: None,
             });
         }
 
@@ -15173,6 +15479,13 @@ impl Qwen35SlotWork {
             Self::Decode(state) => state.prompt_cache_identity().0,
         }
     }
+
+    fn vision_fingerprint(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Prefill(state) => state.vision_fingerprint(),
+            Self::Decode(state) => state.prompt_cache_identity().1.vision_fingerprint,
+        }
+    }
 }
 
 type Qwen35Slot = (Qwen35SlotWork, SlotReply, SlotHandle);
@@ -15219,24 +15532,6 @@ fn validate_qwen35_inline_prompt(surface: &str, prompt_tokens: usize) -> Result<
         "capability_unsupported: Qwen35 SlotAware {surface} prompt has {prompt_tokens} tokens; inline GPU routes are bounded to {QWEN35_SLOT_INLINE_PROMPT_LIMIT} until resumable prefill lands"
     );
     Ok(())
-}
-
-fn validate_qwen35_slot_stream_payload(
-    has_soft_tokens: bool,
-    has_deepstack: bool,
-    has_positions: bool,
-) -> Result<()> {
-    anyhow::ensure!(
-        !has_soft_tokens && !has_deepstack && !has_positions,
-        "capability_unsupported: Qwen35 SlotAware streaming with soft tokens, deepstack, or 3D-mRoPE positions is disabled until the multimodal prefill/decode state machine is scheduler-yielding"
-    );
-    Ok(())
-}
-
-fn qwen35_slot_soft_tokens_unsupported() -> anyhow::Error {
-    anyhow::anyhow!(
-        "capability_unsupported: Qwen35 SlotAware soft-token/deepstack generation is disabled until its prefill and decode are scheduler-yielding; use SerialFifo for this multimodal surface"
-    )
 }
 
 /// Inline GPU requests consume one admission quantum, then hand control back
@@ -15342,6 +15637,7 @@ struct Qwen35PromptAnchor {
     prompt_tokens: Vec<u32>,
     kv: crate::inference::models::qwen35::kv_cache::HybridKvSlotAnchor,
     prefill_logits: Vec<f32>,
+    vision_fingerprint: Option<[u8; 32]>,
 }
 
 fn install_qwen35_stable_prompt_checkpoint(
@@ -15359,6 +15655,7 @@ fn install_qwen35_stable_prompt_checkpoint(
         prompt_tokens: checkpoint.prompt_tokens,
         kv: checkpoint.kv,
         prefill_logits: checkpoint.prefill_logits,
+        vision_fingerprint: checkpoint.vision_fingerprint,
     });
 }
 
@@ -15489,9 +15786,18 @@ fn preferred_qwen35_slot<'a>(
 
 fn qwen35_request_prompt_tokens(request: &Request) -> Option<&[u32]> {
     match request {
-        Request::Generate { prompt_tokens, .. } | Request::GenerateStream { prompt_tokens, .. } => {
-            Some(prompt_tokens)
-        }
+        Request::Generate { prompt_tokens, .. }
+        | Request::GenerateStream { prompt_tokens, .. }
+        | Request::GenerateWithSoftTokens { prompt_tokens, .. } => Some(prompt_tokens),
+        _ => None,
+    }
+}
+
+fn qwen35_request_vision_fingerprint(request: &Request) -> Option<[u8; 32]> {
+    match request {
+        Request::Generate { params, .. }
+        | Request::GenerateStream { params, .. }
+        | Request::GenerateWithSoftTokens { params, .. } => params.vision_fingerprint,
         _ => None,
     }
 }
@@ -15506,13 +15812,13 @@ fn qwen35_request_has_response_cache_hit(request: &Request, prompt_caches: &[Pro
         Request::GenerateStream {
             prompt_tokens,
             params,
-            soft_tokens,
-            deepstack,
-            positions_flat,
             ..
-        } if soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none() => {
-            (prompt_tokens.as_slice(), params)
         }
+        | Request::GenerateWithSoftTokens {
+            prompt_tokens,
+            params,
+            ..
+        } => (prompt_tokens.as_slice(), params),
         _ => return false,
     };
     prompt_caches
@@ -15524,8 +15830,10 @@ fn qwen35_request_has_response_cache_hit(request: &Request, prompt_caches: &[Pro
 /// admission. It must not claim or reset a retained KV slot first. This rule
 /// is shared by every SlotAware family even though only Qwen currently owns a
 /// deterministic terminal-response cache.
-fn discard_closed_slotaware_stream(family: &'static str, request: Request) -> Option<Request> {
+fn discard_closed_slotaware_request(family: &'static str, request: Request) -> Option<Request> {
     match request {
+        Request::Generate { reply, .. } if reply.is_closed() => None,
+        Request::GenerateWithSoftTokens { reply, .. } if reply.is_closed() => None,
         Request::GenerateStream {
             events,
             cancellation_counter,
@@ -15568,15 +15876,12 @@ fn qwen35_pending_disposition(
         return Qwen35PendingDisposition::ReadyWithoutSlot;
     }
     let requires_slot = match request {
-        Request::Generate { .. } | Request::Embed { .. } | Request::Warmup { .. } => true,
-        Request::GenerateStream {
-            soft_tokens,
-            deepstack,
-            positions_flat,
-            ..
-        } => soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none(),
-        Request::GenerateWithSoftTokens { .. }
-        | Request::Shutdown
+        Request::Generate { .. }
+        | Request::GenerateStream { .. }
+        | Request::GenerateWithSoftTokens { .. }
+        | Request::Embed { .. }
+        | Request::Warmup { .. } => true,
+        Request::Shutdown
         | Request::KvSnapshot { .. }
         | Request::KvRestore { .. }
         | Request::TqPackedKvSnapshot { .. }
@@ -15632,7 +15937,7 @@ fn enqueue_slotaware_pending(
         }
         return;
     }
-    let Some(request) = discard_closed_slotaware_stream(family, request) else {
+    let Some(request) = discard_closed_slotaware_request(family, request) else {
         return;
     };
     let ordinary_pending = pending
@@ -15675,7 +15980,7 @@ fn enqueue_slotaware_pending(
 fn prune_closed_slotaware_pending(family: &'static str, pending: &mut VecDeque<Request>) {
     let mut live = VecDeque::with_capacity(pending.len());
     while let Some(request) = pending.pop_front() {
-        if let Some(request) = discard_closed_slotaware_stream(family, request) {
+        if let Some(request) = discard_closed_slotaware_request(family, request) {
             live.push_back(request);
         }
     }
@@ -15694,7 +15999,13 @@ fn qwen35_pending_request_is_ready(
         .then(|| qwen35_request_prompt_tokens(request))
         .flatten()
         .and_then(|prompt_tokens| {
-            active_qwen35_slot_affinity(retained_tokens, prompt_anchors, slots, prompt_tokens)
+            active_qwen35_slot_affinity(
+                retained_tokens,
+                prompt_anchors,
+                slots,
+                prompt_tokens,
+                qwen35_request_vision_fingerprint(request),
+            )
         });
     matches!(
         qwen35_pending_disposition(
@@ -15748,6 +16059,7 @@ fn active_qwen35_slot_affinity(
     prompt_anchors: &[Option<Qwen35PromptAnchor>],
     slots: &[Option<Qwen35Slot>],
     prompt_tokens: &[u32],
+    vision_fingerprint: Option<[u8; 32]>,
 ) -> Option<Qwen35SlotPreference> {
     match qwen35_slot_affinity(
         retained_tokens
@@ -15756,13 +16068,27 @@ fn active_qwen35_slot_affinity(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
+                let anchor_matches = anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let active_matches = active
+                    .as_ref()
+                    .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    retained.as_slice(),
+                    if anchor_matches {
+                        retained.as_slice()
+                    } else {
+                        &[]
+                    },
                     anchor
                         .as_ref()
+                        .filter(|_| anchor_matches)
                         .map(|anchor| anchor.prompt_tokens.as_slice()),
-                    active.as_ref().map(|(work, _, _)| work.prompt_tokens()),
+                    active
+                        .as_ref()
+                        .filter(|_| active_matches)
+                        .map(|(work, _, _)| work.prompt_tokens()),
                     active.is_some(),
                 )
             }),
@@ -15906,6 +16232,52 @@ fn preferred_gemma4_slot(
     )
 }
 
+fn preferred_gemma4_slot_for_request(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    active_slots: &[Option<Gemma4Slot>],
+    prompt_tokens: &[u32],
+    vision_fingerprint: Option<[u8; 32]>,
+) -> Option<Gemma4SlotPreference> {
+    match gemma4_slot_affinity(
+        retained_tokens
+            .iter()
+            .zip(prompt_anchors)
+            .zip(active_slots)
+            .enumerate()
+            .map(|(index, ((retained, anchor), active))| {
+                let identity_matches = anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let active_matches = active
+                    .as_ref()
+                    .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
+                (
+                    index,
+                    if identity_matches {
+                        retained.as_slice()
+                    } else {
+                        &[]
+                    },
+                    anchor
+                        .as_ref()
+                        .filter(|_| identity_matches)
+                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    active
+                        .as_ref()
+                        .filter(|_| active_matches)
+                        .map(|(work, _, _)| work.prompt_tokens()),
+                    active.is_some(),
+                    false,
+                )
+            }),
+        prompt_tokens,
+    ) {
+        Some(Gemma4SlotAffinity::Idle(preference)) => Some(preference),
+        Some(Gemma4SlotAffinity::Active(_)) | None => None,
+    }
+}
+
 fn preferred_gemma4_slot_excluding(
     retained_tokens: &[Vec<u32>],
     prompt_anchors: &[Option<Gemma4PromptAnchor>],
@@ -15927,12 +16299,18 @@ fn preferred_gemma4_slot_excluding(
 
 fn gemma4_request_prompt_tokens(request: &Request) -> Option<&[u32]> {
     match request {
-        Request::Generate { prompt_tokens, .. } => Some(prompt_tokens),
-        Request::GenerateStream {
-            prompt_tokens,
-            soft_tokens,
-            ..
-        } if soft_tokens.is_empty() => Some(prompt_tokens),
+        Request::Generate { prompt_tokens, .. }
+        | Request::GenerateStream { prompt_tokens, .. }
+        | Request::GenerateWithSoftTokens { prompt_tokens, .. } => Some(prompt_tokens),
+        _ => None,
+    }
+}
+
+fn gemma4_request_vision_fingerprint(request: &Request) -> Option<[u8; 32]> {
+    match request {
+        Request::Generate { params, .. }
+        | Request::GenerateStream { params, .. }
+        | Request::GenerateWithSoftTokens { params, .. } => params.vision_fingerprint,
         _ => None,
     }
 }
@@ -15942,13 +16320,41 @@ fn active_gemma4_slot_affinity(
     prompt_anchors: &[Option<Gemma4PromptAnchor>],
     slots: &[Option<Gemma4Slot>],
     prompt_tokens: &[u32],
+    vision_fingerprint: Option<[u8; 32]>,
 ) -> Option<Gemma4SlotPreference> {
-    match gemma4_slot_affinity_excluding(
-        retained_tokens,
-        prompt_anchors,
-        slots,
+    match gemma4_slot_affinity(
+        retained_tokens
+            .iter()
+            .zip(prompt_anchors)
+            .zip(slots)
+            .enumerate()
+            .map(|(index, ((retained, anchor), active))| {
+                let anchor_matches = anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let active_matches = active
+                    .as_ref()
+                    .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
+                (
+                    index,
+                    if anchor_matches {
+                        retained.as_slice()
+                    } else {
+                        &[]
+                    },
+                    anchor
+                        .as_ref()
+                        .filter(|_| anchor_matches)
+                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    active
+                        .as_ref()
+                        .filter(|_| active_matches)
+                        .map(|(work, _, _)| work.prompt_tokens()),
+                    active.is_some(),
+                    false,
+                )
+            }),
         prompt_tokens,
-        &vec![false; slots.len()],
     ) {
         Some(Gemma4SlotAffinity::Active(preference)) => Some(preference),
         Some(Gemma4SlotAffinity::Idle(_)) | None => None,
@@ -15977,6 +16383,7 @@ fn take_gemma4_request_rollback_anchor(
     cached_tokens: usize,
     prompt_tokens: &[u32],
     prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+    vision_fingerprint: Option<[u8; 32]>,
 ) -> Result<Option<Gemma4PromptAnchor>> {
     if cached_tokens == 0 {
         return Ok(None);
@@ -15984,6 +16391,7 @@ fn take_gemma4_request_rollback_anchor(
     let existing_is_sufficient = prompt_anchor.as_ref().is_some_and(|anchor| {
         prompt_tokens.starts_with(&anchor.prompt_tokens)
             && anchor.prompt_tokens.len() >= cached_tokens
+            && anchor.vision_fingerprint == vision_fingerprint
     });
     if existing_is_sufficient {
         return Ok(prompt_anchor.take());
@@ -15992,9 +16400,10 @@ fn take_gemma4_request_rollback_anchor(
         // Non-hybrid compatibility mode cannot materialize a rollback
         // checkpoint. Preserve an older compatible checkpoint when present;
         // otherwise cancellation will fail closed to a cold reset.
-        return Ok(prompt_anchor
-            .take()
-            .filter(|anchor| prompt_tokens.starts_with(&anchor.prompt_tokens)));
+        return Ok(prompt_anchor.take().filter(|anchor| {
+            prompt_tokens.starts_with(&anchor.prompt_tokens)
+                && anchor.vision_fingerprint == vision_fingerprint
+        }));
     };
     match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
         hybrid,
@@ -16006,6 +16415,7 @@ fn take_gemma4_request_rollback_anchor(
             Ok(Some(Gemma4PromptAnchor {
                 prompt_tokens: prompt_tokens[..cached_tokens].to_vec(),
                 kv,
+                vision_fingerprint,
             }))
         }
         Err(error) if prompt_anchor.is_some() => {
@@ -16015,9 +16425,10 @@ fn take_gemma4_request_rollback_anchor(
                 error = %error,
                 "Gemma4 live-prefix rollback snapshot failed; retaining older checkpoint"
             );
-            Ok(prompt_anchor
-                .take()
-                .filter(|anchor| prompt_tokens.starts_with(&anchor.prompt_tokens)))
+            Ok(prompt_anchor.take().filter(|anchor| {
+                prompt_tokens.starts_with(&anchor.prompt_tokens)
+                    && anchor.vision_fingerprint == vision_fingerprint
+            }))
         }
         Err(error) => Err(error.context("capture Gemma4 request-start rollback checkpoint")),
     }
@@ -16115,6 +16526,7 @@ fn run_slot_aware_qwen35(
                                 &prompt_anchors,
                                 &slots,
                                 prompt_tokens,
+                                qwen35_request_vision_fingerprint(request),
                             )
                         });
                     qwen35_pending_disposition(
@@ -16168,6 +16580,7 @@ fn run_slot_aware_qwen35(
                         &supervisor,
                         prompt_tokens,
                         params,
+                        None,
                         SlotReply::Unary(reply),
                     ) {
                         fail_qwen35_worker_after_gpu_fatal(
@@ -16193,14 +16606,16 @@ fn run_slot_aware_qwen35(
                     deepstack,
                     positions_flat,
                 } => {
-                    if let Err(error) = validate_qwen35_slot_stream_payload(
-                        !soft_tokens.is_empty(),
-                        deepstack.is_some(),
-                        positions_flat.is_some(),
-                    ) {
-                        reject_stream_before_sse(events, admission, error);
-                        continue;
-                    }
+                    let vision = (!soft_tokens.is_empty()
+                        || deepstack.is_some()
+                        || positions_flat.is_some())
+                    .then(|| {
+                        super::engine_qwen35::Qwen35VisionPrefillData::new(
+                            soft_tokens,
+                            deepstack,
+                            positions_flat,
+                        )
+                    });
                     let reply = SlotReply::family_stream(
                         events,
                         cancellation_counter,
@@ -16222,6 +16637,7 @@ fn run_slot_aware_qwen35(
                         &supervisor,
                         prompt_tokens,
                         params,
+                        vision,
                         reply,
                     ) {
                         fail_qwen35_worker_after_gpu_fatal(
@@ -16304,14 +16720,48 @@ fn run_slot_aware_qwen35(
                     }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
-                // The soft-token/deepstack path owns a different forward
-                // primitive and still performs its whole decode inline. It
-                // must not silently monopolize this multi-agent worker or
-                // discard multimodal state. SerialFifo retains the historical
-                // capability; SlotAware fails before GPU work until that path
-                // has its own scheduler-yielding state machine.
-                Request::GenerateWithSoftTokens { reply, .. } => {
-                    let _ = reply.send(Err(qwen35_slot_soft_tokens_unsupported()));
+                Request::GenerateWithSoftTokens {
+                    prompt_tokens,
+                    soft_tokens,
+                    params,
+                    deepstack,
+                    positions_flat,
+                    reply,
+                } => {
+                    let vision = super::engine_qwen35::Qwen35VisionPrefillData::new(
+                        soft_tokens,
+                        deepstack,
+                        positions_flat,
+                    );
+                    if let Some(fatal) = admit_qwen35_slot(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        &mut retained_tokens,
+                        &mut prompt_caches,
+                        &mut prompt_anchors,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        &supervisor,
+                        prompt_tokens,
+                        params,
+                        Some(vision),
+                        SlotReply::Unary(reply),
+                    ) {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
+                    publish(&scheduler, &scheduler_stats_snapshot);
                 }
                 Request::KvSnapshot { reply, .. } => {
                     let _ = reply.send(Ok(None));
@@ -16547,6 +16997,7 @@ fn admit_qwen35_slot(
     supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
+    vision: Option<super::engine_qwen35::Qwen35VisionPrefillData>,
     mut reply: SlotReply,
 ) -> Option<Qwen35FatalFailure> {
     let max_seq_len = guard
@@ -16573,6 +17024,7 @@ fn admit_qwen35_slot(
         replay_slot_prompt_cache(reply, result);
         return None;
     }
+    let request_vision_fingerprint = params.vision_fingerprint;
     let preferred = preferred_qwen35_slot(
         retained_tokens
             .iter()
@@ -16580,13 +17032,27 @@ fn admit_qwen35_slot(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
+                let anchor_matches = anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.vision_fingerprint == request_vision_fingerprint);
+                let active_matches = active.as_ref().is_some_and(|(work, _, _)| {
+                    work.vision_fingerprint() == request_vision_fingerprint
+                });
                 (
                     index,
-                    retained.as_slice(),
+                    if anchor_matches {
+                        retained.as_slice()
+                    } else {
+                        &[]
+                    },
                     anchor
                         .as_ref()
+                        .filter(|_| anchor_matches)
                         .map(|anchor| anchor.prompt_tokens.as_slice()),
-                    active.as_ref().map(|(work, _, _)| work.prompt_tokens()),
+                    active
+                        .as_ref()
+                        .filter(|_| active_matches)
+                        .map(|(work, _, _)| work.prompt_tokens()),
                     active.is_some(),
                 )
             }),
@@ -16735,6 +17201,8 @@ fn admit_qwen35_slot(
         handle.slot_id,
         cached_tokens,
         cached_prefill_logits,
+        vision,
+        guard.model.hidden_size,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -17066,9 +17534,10 @@ fn finish_qwen35_prefill(
     let desired_anchor_tokens = stable_boundary
         .map(|boundary| &prompt_tokens[..boundary])
         .unwrap_or(prompt_tokens.as_slice());
-    let already_anchored = prompt_anchors[slot_idx]
-        .as_ref()
-        .is_some_and(|anchor| anchor.prompt_tokens == desired_anchor_tokens);
+    let already_anchored = prompt_anchors[slot_idx].as_ref().is_some_and(|anchor| {
+        anchor.prompt_tokens == desired_anchor_tokens
+            && anchor.vision_fingerprint == params.vision_fingerprint
+    });
     if stable_boundary.is_some() && !already_anchored {
         // This is safe for generation—the full prompt has committed—but the
         // request must not publish an unusable post-cue checkpoint. The
@@ -17098,6 +17567,7 @@ fn finish_qwen35_prefill(
                     prompt_tokens: prompt_tokens.clone(),
                     kv,
                     prefill_logits,
+                    vision_fingerprint: params.vision_fingerprint,
                 });
             }
             Err(error) => {
@@ -29694,6 +30164,7 @@ assistant:
                 tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
                 chat_template: Arc::new(String::new()),
                 registration: None,
+                vision_consumer_contract: None,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: None,
                 tq_packed_descriptor: None,
@@ -31233,6 +31704,8 @@ assistant:
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
             provenance: crate::core::provenance::Provenance::External,
+            vision_projector_profile: None,
+            vision_deepstack_output_count: 0,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,
@@ -31556,6 +32029,7 @@ assistant:
                 tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
                 chat_template: Arc::new(String::new()),
                 registration: None,
+                vision_consumer_contract: None,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: descriptor,
                 tq_packed_descriptor: None,
@@ -39650,6 +40124,80 @@ mod gemma4_bounded_prefill_tests {
     }
 
     #[test]
+    fn gemma_vision_resume_requires_every_image_row_inside_cached_prefix() {
+        let ranges = [3..7, 11..15];
+        assert!(gemma4_cached_prefix_covers_soft_token_ranges(
+            15,
+            ranges.iter()
+        ));
+        assert!(!gemma4_cached_prefix_covers_soft_token_ranges(
+            14,
+            ranges.iter()
+        ));
+        assert!(!gemma4_cached_prefix_covers_soft_token_ranges(
+            6,
+            ranges.iter()
+        ));
+    }
+
+    #[test]
+    fn gemma_vision_prefill_transactions_stop_before_partial_image_spans() {
+        let ranges = vec![3_900..4_300, 8_100..8_356];
+        validate_gemma4_resumable_soft_token_ranges(9_000, 0, None, &ranges).unwrap();
+
+        let mut progress = Gemma4PrefillProgress::new(0, 9_000, None).unwrap();
+        let first = gemma4_align_prefill_plan_to_soft_tokens(
+            progress.plan(4_096).unwrap(),
+            4_096,
+            9_000,
+            None,
+            &ranges,
+        )
+        .unwrap();
+        assert_eq!((first.start, first.end), (0, 3_900));
+        progress.commit(first).unwrap();
+
+        let second = gemma4_align_prefill_plan_to_soft_tokens(
+            progress.plan(4_096).unwrap(),
+            4_096,
+            9_000,
+            None,
+            &ranges,
+        )
+        .unwrap();
+        assert_eq!((second.start, second.end), (3_900, 7_996));
+        assert!(ranges[0].start >= second.start && ranges[0].end <= second.end);
+        progress.commit(second).unwrap();
+
+        let third = gemma4_align_prefill_plan_to_soft_tokens(
+            progress.plan(4_096).unwrap(),
+            4_096,
+            9_000,
+            None,
+            &ranges,
+        )
+        .unwrap();
+        assert_eq!((third.start, third.end), (7_996, 9_000));
+        assert!(ranges[1].start >= third.start && ranges[1].end <= third.end);
+        assert!(third.ready);
+    }
+
+    #[test]
+    fn gemma_vision_prefill_rejects_unbounded_or_ambiguous_resume_ranges() {
+        assert!(validate_gemma4_resumable_soft_token_ranges(5_000, 0, None, &[0..4_097],).is_err());
+        assert!(
+            validate_gemma4_resumable_soft_token_ranges(5_000, 0, None, &[100..300, 250..400],)
+                .is_err()
+        );
+        assert!(
+            validate_gemma4_resumable_soft_token_ranges(5_000, 200, None, &[100..300],).is_err()
+        );
+        assert!(
+            validate_gemma4_resumable_soft_token_ranges(5_000, 0, Some(200), &[100..300],).is_err()
+        );
+    }
+
+    #[test]
     fn gemma_prefill_progress_commits_only_after_the_transaction_is_proven() {
         let mut progress = Gemma4PrefillProgress::new(0, 9_000, Some(3_000)).unwrap();
 
@@ -41468,28 +42016,26 @@ mod qwen35_bounded_prefill_watchdog_tests {
     }
 
     #[test]
-    fn qwen_slot_stream_rejects_every_unscheduled_multimodal_payload_shape() {
-        validate_qwen35_slot_stream_payload(false, false, false)
-            .expect("plain text streaming remains supported");
-        for shape in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-            (true, true, true),
-        ] {
-            let error = validate_qwen35_slot_stream_payload(shape.0, shape.1, shape.2)
-                .expect_err("multimodal streaming must fail before SSE admission");
-            assert!(format!("{error:#}").contains("capability_unsupported"));
-        }
-    }
-
-    #[test]
-    fn qwen_slot_soft_tokens_fail_closed_until_they_are_scheduler_yielding() {
-        let error = qwen35_slot_soft_tokens_unsupported();
-        let message = format!("{error:#}");
-        assert!(message.contains("capability_unsupported"));
-        assert!(message.contains("scheduler-yielding"));
-        assert!(message.contains("SerialFifo"));
+    fn qwen_slot_multimodal_stream_is_scheduler_admitted() {
+        let (events, _received_events) = mpsc::channel(2);
+        let request = Request::GenerateStream {
+            prompt_tokens: vec![7, 8],
+            params: SamplingParams {
+                vision_fingerprint: Some([9; 32]),
+                ..SamplingParams::default()
+            },
+            events,
+            cancellation_counter: None,
+            admission: None,
+            soft_tokens: Vec::new(),
+            deepstack: None,
+            positions_flat: Some(vec![0; 8]),
+        };
+        assert_eq!(
+            qwen35_pending_disposition(&request, false, true, None),
+            Qwen35PendingDisposition::ReadyWithSlot,
+            "multimodal stream must use the same bounded scheduler lane as text"
+        );
     }
 
     #[test]

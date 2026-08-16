@@ -986,6 +986,8 @@ mod tests {
             projector: super::super::mmproj::ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(2),
             projection_dim: Some(hidden),
             deepstack_indexes: Some(vec![]),

@@ -22,7 +22,9 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use super::handlers;
-use super::middleware::{bearer_auth, cors_layer, fallback, request_id_layer};
+use super::middleware::{
+    bearer_auth, cors_layer, fallback, request_cancellation_layer, request_id_layer,
+};
 use super::state::AppState;
 
 /// Build the complete axum router with all routes and middleware.
@@ -53,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         // so the last `.layer(X)` call becomes the outermost layer.
         // Order chosen: bearer_auth innermost, then request-id, then CORS.
         .layer(from_fn_with_state(state.clone(), bearer_auth))
+        .layer(axum::middleware::from_fn(request_cancellation_layer))
         .layer(axum::middleware::from_fn(request_id_layer))
         .layer(cors)
         .with_state(state)

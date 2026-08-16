@@ -20,6 +20,8 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::schema::ApiError;
@@ -27,6 +29,42 @@ use super::state::AppState;
 
 /// Header name used for request IDs (both on request and response).
 pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+#[derive(Debug, Clone)]
+pub struct RequestCancellation(pub Arc<AtomicBool>);
+
+struct RequestCancellationGuard {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Marks request-scoped pre-admission work cancelled when the HTTP service
+/// future is dropped. Streaming decode has a second channel-closure guard;
+/// this token covers image I/O, preprocessing, and the vision forward that
+/// happen before an engine request exists.
+pub async fn request_cancellation_layer(
+    mut req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    req.extensions_mut()
+        .insert(RequestCancellation(Arc::clone(&cancelled)));
+    let mut guard = RequestCancellationGuard {
+        cancelled,
+        armed: true,
+    };
+    let response = next.run(req).await;
+    guard.armed = false;
+    response
+}
 
 // ---------------------------------------------------------------------------
 // CORS

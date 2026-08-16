@@ -181,6 +181,11 @@ fn qwen38_metadata_matches_native_loader_contract() {
     assert_eq!(map["qwen35.context_length"], MetaValue::U32(262144));
     assert_eq!(map["qwen35.nextn_predict_layers"], MetaValue::U32(1));
     assert_eq!(
+        map["hf2q.vision.projector_profile"],
+        MetaValue::String("qwen3vl_siglip".into())
+    );
+    assert_eq!(map["hf2q.vision.deepstack_output_count"], MetaValue::U32(0));
+    assert_eq!(
         map["qwen35.nextn.use_dedicated_embeddings"],
         MetaValue::Bool(false)
     );
@@ -195,4 +200,12 @@ fn qwen38_metadata_matches_native_loader_contract() {
         explicit_map["qwen35.nextn.use_dedicated_embeddings"],
         MetaValue::Bool(true)
     );
+
+    let mut text_only = explicit;
+    text_only["architectures"] = serde_json::json!(["Qwen3_5ForCausalLM"]);
+    let text_only_map: std::collections::HashMap<_, _> =
+        build_metadata(&text_only, 15, None, None, Some("text-only"), None)
+            .into_iter()
+            .collect();
+    assert!(!text_only_map.contains_key("hf2q.vision.projector_profile"));
 }

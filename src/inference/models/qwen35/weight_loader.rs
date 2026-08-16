@@ -1143,17 +1143,73 @@ pub fn load_dense_ffn(
     Ok(DenseFfnWeights { gate, up, down })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseFfnStorage {
+    Float,
+    Quantized,
+}
+
+fn dense_ffn_storage(
+    layer_idx: u32,
+    gate: GgmlType,
+    up: GgmlType,
+    down: GgmlType,
+) -> Result<DenseFfnStorage> {
+    let is_float = |t: GgmlType| matches!(t, GgmlType::F16 | GgmlType::F32);
+    let is_supported_quant = |t: GgmlType| {
+        matches!(
+            t,
+            GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+        )
+    };
+
+    if is_float(gate) && is_float(up) && is_float(down) {
+        return Ok(DenseFfnStorage::Float);
+    }
+    if is_supported_quant(gate) && is_supported_quant(up) && is_supported_quant(down) {
+        anyhow::ensure!(
+            gate == up,
+            "layer {layer_idx}: dense gate/up quant types differ ({gate:?} vs {up:?}); \
+             both buffers share one dispatch type"
+        );
+        return Ok(DenseFfnStorage::Quantized);
+    }
+
+    Err(anyhow!(
+        "layer {layer_idx}: unsupported or mixed dense FFN storage: \
+         gate={gate:?}, up={up:?}, down={down:?}; refusing a silent F32 expansion"
+    ))
+}
+
+fn dense_ffn_tensor_types(
+    gguf: &GgufFile,
+    layer_idx: u32,
+) -> Result<(GgmlType, GgmlType, GgmlType)> {
+    let p = format!("blk.{layer_idx}");
+    let tensor_type = |role: &str| {
+        gguf.tensor_info(&format!("{p}.ffn_{role}.weight"))
+            .map(|info| info.ggml_type)
+            .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_{role}.weight not found in GGUF"))
+    };
+    Ok((
+        tensor_type("gate")?,
+        tensor_type("up")?,
+        tensor_type("down")?,
+    ))
+}
+
 /// Load a dense FFN layer's weights, keeping projections in their native GGML
-/// quantization (Q4_0/Q8_0/Q6_K) — the production path for 27B dense GGUFs.
+/// quantization (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K) — the production path for dense
+/// quantized GGUFs.
 ///
 /// Gate/up/down projection buffers are loaded via `GgufFile::load_tensor` (raw
 /// GGML blocks, DType::U8 on Metal) rather than `load_tensor_f32`.  This
 /// eliminates the Q4_0→F32 round-trip that expands a 27B model from ~14 GB
 /// on-disk to ~129 GB in RAM, causing an OOM hang on M5 Max 128 GB.
 ///
-/// Returns `Err` if any weight tensor has an unsupported quantization type
-/// (F32 and F16 are explicitly rejected; the caller's `load_layer` falls back
-/// to `load_dense_ffn` for synthetic/tiny models that use float weights).
+/// Returns `Err` if any weight tensor has an unsupported quantization type.
+/// Float storage is selected explicitly by [`load_layer`]; an error here must
+/// never trigger a silent full-model F32 expansion.
 pub fn load_dense_ffn_quantized(
     gguf: &GgufFile,
     layer_idx: u32,
@@ -1162,36 +1218,15 @@ pub fn load_dense_ffn_quantized(
 ) -> Result<DenseFfnWeightsQ> {
     let p = format!("blk.{}", layer_idx);
 
-    // Read quantization types from GGUF tensor metadata BEFORE loading buffers,
-    // so we can reject unsupported types cheaply without touching the tensor data.
-    let gate_info = gguf
-        .tensor_info(&format!("{p}.ffn_gate.weight"))
-        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate.weight not found in GGUF"))?;
-    let ggml_type_gate_up = gate_info.ggml_type;
-
-    let down_info = gguf
-        .tensor_info(&format!("{p}.ffn_down.weight"))
-        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down.weight not found in GGUF"))?;
-    let ggml_type_down = down_info.ggml_type;
-
-    // Reject float types — callers must use `load_dense_ffn` for those.
-    let supported = |t: GgmlType| matches!(t, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K);
-    if !supported(ggml_type_gate_up) {
-        return Err(anyhow!(
-            "layer {layer_idx}: gate/up dense weights have unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, or Q6_K for the quantized dense path; \
-             use load_dense_ffn for F32/F16 weights)",
-            ggml_type_gate_up
-        ));
-    }
-    if !supported(ggml_type_down) {
-        return Err(anyhow!(
-            "layer {layer_idx}: down dense weight has unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, or Q6_K for the quantized dense path; \
-             use load_dense_ffn for F32/F16 weights)",
-            ggml_type_down
-        ));
-    }
+    // Classify metadata before loading any buffers. Gate and up share one
+    // dispatch type, while down may intentionally use a different quant type.
+    let (ggml_type_gate_up, ggml_type_up, ggml_type_down) =
+        dense_ffn_tensor_types(gguf, layer_idx)?;
+    anyhow::ensure!(
+        dense_ffn_storage(layer_idx, ggml_type_gate_up, ggml_type_up, ggml_type_down)?
+            == DenseFfnStorage::Quantized,
+        "layer {layer_idx}: dense FFN is not quantized"
+    );
 
     // Load raw GGML blocks — DType::U8 on Metal, no F32 expansion.
     // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
@@ -1234,20 +1269,22 @@ pub fn load_layer(
         .copied()
         .ok_or_else(|| anyhow!("layer_idx {layer_idx} out of range"))?;
 
-    // Dense variant: prefer the quantized Q path (DenseQ) to avoid the
-    // Q4_0→F32 round-trip that causes the 129 GB OOM on 27B dense GGUFs.
-    // Fall back to F32 `load_dense_ffn` when the GGUF uses float weights
-    // (F32/F16), which covers synthetic test models and future architectures.
+    // Dense variant: select the storage class from all three projection
+    // tensors. Errors never fall back to F32: doing so can silently expand a
+    // quantized dense model by tens of GiB and replace its optimized kernels.
     //
     // MoE variant: always uses quantized MoeFfnWeightsQ (see comment in the
     // MoeQ branch below for rationale).
     let ffn = match cfg.variant {
         Qwen35Variant::Dense => {
-            // Try quantized path first; fall back to F32 for float-weight GGUFs
-            // (e.g. synthetic-weight unit tests that use F32 projections).
-            match load_dense_ffn_quantized(gguf, layer_idx, cfg, device) {
-                Ok(w) => Qwen35FfnWeights::DenseQ(w),
-                Err(_) => Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?),
+            let (gate, up, down) = dense_ffn_tensor_types(gguf, layer_idx)?;
+            match dense_ffn_storage(layer_idx, gate, up, down)? {
+                DenseFfnStorage::Quantized => Qwen35FfnWeights::DenseQ(load_dense_ffn_quantized(
+                    gguf, layer_idx, cfg, device,
+                )?),
+                DenseFfnStorage::Float => {
+                    Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?)
+                }
             }
         }
         Qwen35Variant::Moe => {
@@ -1279,6 +1316,35 @@ mod tests {
     use crate::inference::models::qwen35::model::Qwen35Model;
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
     use crate::ir::DType;
+
+    #[test]
+    fn qwen38_dense_q4k_q6k_storage_stays_quantized() {
+        assert_eq!(
+            dense_ffn_storage(0, GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K)
+                .expect("Q4_K gate/up with Q6_K down is a supported dense layout"),
+            DenseFfnStorage::Quantized
+        );
+    }
+
+    #[test]
+    fn dense_float_fixtures_use_explicit_float_storage() {
+        assert_eq!(
+            dense_ffn_storage(0, GgmlType::F32, GgmlType::F16, GgmlType::F32)
+                .expect("float fixtures remain supported"),
+            DenseFfnStorage::Float
+        );
+    }
+
+    #[test]
+    fn dense_storage_rejects_silent_float_expansion_and_gate_up_mismatch() {
+        let mixed = dense_ffn_storage(7, GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::F16)
+            .expect_err("mixed quantized/float storage must fail loud");
+        assert!(format!("{mixed:#}").contains("refusing a silent F32 expansion"));
+
+        let mismatched = dense_ffn_storage(8, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K)
+            .expect_err("gate/up share one dispatch type and must match");
+        assert!(format!("{mismatched:#}").contains("gate/up quant types differ"));
+    }
 
     fn f32_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
         values.flat_map(|v| v.to_le_bytes()).collect()

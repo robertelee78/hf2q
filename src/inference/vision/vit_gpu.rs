@@ -642,6 +642,161 @@ pub fn vit_attention_scores_gpu(
 /// # Errors
 ///
 /// Propagated from any sub-stage; primarily shape / dtype mismatches.
+const VIT_DECOMPOSED_ATTENTION_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn vit_decomposed_attention_workspace_bytes(batch: u32, num_heads: u32) -> Option<u64> {
+    u64::from(batch)
+        .checked_mul(u64::from(batch))?
+        .checked_mul(u64::from(num_heads))?
+        .checked_mul(4)?
+        .checked_mul(2)
+}
+
+/// Large-sequence bidirectional attention without a quadratic score tensor.
+/// The arithmetic stages Q/K/V through F16 and accumulates softmax/output in
+/// F32, matching the established vision attention precision contract.
+fn vit_attention_bounded_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    batch: u32,
+    num_heads: u32,
+    head_dim: u32,
+    scale: f32,
+) -> Result<MlxBuffer> {
+    anyhow::ensure!(
+        head_dim <= 256,
+        "vit_attention_bounded_gpu: head_dim {head_dim} exceeds the bounded kernel limit 256"
+    );
+    let elements = (batch as usize)
+        .checked_mul(num_heads as usize)
+        .and_then(|value| value.checked_mul(head_dim as usize))
+        .ok_or_else(|| anyhow!("vit_attention_bounded_gpu: element count overflow"))?;
+    let head_shape = vec![num_heads as usize, batch as usize, head_dim as usize];
+    let alloc_f32 = || {
+        device
+            .alloc_buffer(elements * 4, DType::F32, head_shape.clone())
+            .map_err(|error| anyhow!("vit_attention_bounded_gpu: alloc f32: {error}"))
+    };
+    let q_head = alloc_f32()?;
+    let k_head = alloc_f32()?;
+    let v_head = alloc_f32()?;
+    permute_021_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        q_seq_major,
+        &q_head,
+        batch as usize,
+        num_heads as usize,
+        head_dim as usize,
+    )?;
+    permute_021_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        k_seq_major,
+        &k_head,
+        batch as usize,
+        num_heads as usize,
+        head_dim as usize,
+    )?;
+    permute_021_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        v_seq_major,
+        &v_head,
+        batch as usize,
+        num_heads as usize,
+        head_dim as usize,
+    )?;
+    encoder.memory_barrier();
+
+    let alloc_f16 = || {
+        device
+            .alloc_buffer(elements * 2, DType::F16, head_shape.clone())
+            .map_err(|error| anyhow!("vit_attention_bounded_gpu: alloc f16: {error}"))
+    };
+    let q_f16 = alloc_f16()?;
+    let k_f16 = alloc_f16()?;
+    let v_f16 = alloc_f16()?;
+    cast(
+        encoder,
+        registry,
+        device.metal_device(),
+        &q_head,
+        &q_f16,
+        elements,
+        CastDirection::F32ToF16,
+    )?;
+    cast(
+        encoder,
+        registry,
+        device.metal_device(),
+        &k_head,
+        &k_f16,
+        elements,
+        CastDirection::F32ToF16,
+    )?;
+    cast(
+        encoder,
+        registry,
+        device.metal_device(),
+        &v_head,
+        &v_f16,
+        elements,
+        CastDirection::F32ToF16,
+    )?;
+    encoder.memory_barrier();
+
+    let output_head = alloc_f32()?;
+    let pipeline = registry
+        .get_pipeline("vit_bounded_attention_f16_f32", device.metal_device())
+        .map_err(|error| anyhow!("vit_attention_bounded_gpu: compile pipeline: {error}"))?;
+    let params = VitBoundedAttentionGpuParams {
+        seq_len: batch,
+        num_heads,
+        head_dim,
+        scale,
+    };
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(&q_f16)),
+            (1, KernelArg::Buffer(&k_f16)),
+            (2, KernelArg::Buffer(&v_f16)),
+            (3, KernelArg::Buffer(&output_head)),
+            (4, KernelArg::Bytes(pod_as_bytes(&params))),
+        ],
+        MTLSize::new(num_heads as u64, batch.div_ceil(32) as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
+    encoder.memory_barrier();
+
+    let output = device
+        .alloc_buffer(
+            elements * 4,
+            DType::F32,
+            vec![batch as usize, num_heads as usize, head_dim as usize],
+        )
+        .map_err(|error| anyhow!("vit_attention_bounded_gpu: alloc output: {error}"))?;
+    permute_021_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        &output_head,
+        &output,
+        num_heads as usize,
+        batch as usize,
+        head_dim as usize,
+    )?;
+    Ok(output)
+}
+
 pub fn vit_attention_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -666,6 +821,22 @@ pub fn vit_attention_gpu(
             batch,
             num_heads
         ));
+    }
+    let decomposed_workspace = vit_decomposed_attention_workspace_bytes(batch, num_heads)
+        .ok_or_else(|| anyhow!("vit_attention_gpu: quadratic workspace size overflow"))?;
+    if decomposed_workspace > VIT_DECOMPOSED_ATTENTION_WORKSPACE_BYTES {
+        return vit_attention_bounded_gpu(
+            encoder,
+            registry,
+            device,
+            q_seq_major,
+            k_seq_major,
+            v_seq_major,
+            batch,
+            num_heads,
+            head_dim,
+            scale,
+        );
     }
 
     let metal_dev = device.metal_device();
@@ -777,23 +948,48 @@ pub fn vit_attention_gpu(
             vec![num_heads as usize, batch as usize, head_dim as usize],
         )
         .map_err(|e| anyhow!("alloc attn_head_major: {e}"))?;
-    let params = DenseMmF16F32Params {
-        m: batch,    // batch_q
-        n: head_dim, // output last dim
-        k: batch,    // batch_k (contract)
-        src0_batch: num_heads,
-        src1_batch: num_heads,
-    };
-    dense_matmul_f16_f32_tensor(
-        encoder,
-        registry,
-        device,
-        &v_t_f16,
-        &softmaxed,
-        &mut attn_head_major,
-        &params,
-    )
-    .context("attention scores @ V matmul (f16)")?;
+    if batch < 32 {
+        let pipeline = registry
+            .get_pipeline("vit_scores_v_small_f32_f16", device.metal_device())
+            .map_err(|e| anyhow!("attention scores @ V short-sequence pipeline: {e}"))?;
+        let params = VitScoresVSmallGpuParams {
+            batch,
+            num_heads,
+            head_dim,
+            _pad: 0,
+        };
+        let bytes = pod_as_bytes(&params);
+        let total = n_attn as u64;
+        encoder.encode_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(&v_t_f16)),
+                (1, KernelArg::Buffer(&softmaxed)),
+                (2, KernelArg::Buffer(&attn_head_major)),
+                (3, KernelArg::Bytes(bytes)),
+            ],
+            MTLSize::new(total, 1, 1),
+            MTLSize::new(total.min(256), 1, 1),
+        );
+    } else {
+        let params = DenseMmF16F32Params {
+            m: batch,    // batch_q
+            n: head_dim, // output last dim
+            k: batch,    // batch_k (contract)
+            src0_batch: num_heads,
+            src1_batch: num_heads,
+        };
+        dense_matmul_f16_f32_tensor(
+            encoder,
+            registry,
+            device,
+            &v_t_f16,
+            &softmaxed,
+            &mut attn_head_major,
+            &params,
+        )
+        .context("attention scores @ V matmul (f16)")?;
+    }
     encoder.memory_barrier();
 
     // --- Stage 5: permute back to seq-major ---
@@ -1353,6 +1549,132 @@ kernel void vit_clip_inplace_f32(
     x = min(x, params.max_val);
     output[gid] = x;
 }
+
+// Erf-form GELU used by multimodal projector heads. The Metal profile
+// used by hf2q does not expose erf directly, so this evaluates it with
+// a bounded-error f32 approximation before applying
+// 0.5*x*(1+erf(x/sqrt(2))). Vision-transformer blocks can still select
+// their configured tanh approximation independently.
+inline float vit_erf_f32(float x) {
+    float z = abs(x);
+    float t = 1.0f / (1.0f + 0.5f * z);
+    float tau = t * exp(
+        -z * z - 1.26551223f + t * (
+            1.00002368f + t * (
+                0.37409196f + t * (
+                    0.09678418f + t * (
+                        -0.18628806f + t * (
+                            0.27886807f + t * (
+                                -1.13520398f + t * (
+                                    1.48851587f + t * (
+                                        -0.82215223f + t * 0.17087277f
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    );
+    float value = 1.0f - tau;
+    return x >= 0.0f ? value : -value;
+}
+
+kernel void vit_gelu_erf_f32(
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    output[gid] = 0.5f * input[gid]
+        * (1.0f + vit_erf_f32(input[gid] * 0.7071067811865475f));
+}
+
+struct VitScoresVSmallParams {
+    uint batch;
+    uint num_heads;
+    uint head_dim;
+    uint _pad;
+};
+
+// Exact scores@V fallback for short vision sequences. The tensor-core
+// dense matmul used for the normal path requires a K tile of at least 32,
+// while valid variable-resolution images can contain fewer than 32 patches.
+kernel void vit_scores_v_small_f32_f16(
+    device const half*  v_t    [[buffer(0)]],
+    device const float* scores [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant VitScoresVSmallParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.num_heads * params.batch * params.head_dim;
+    if (gid >= total) return;
+    uint n = gid % params.head_dim;
+    uint hm = gid / params.head_dim;
+    uint m = hm % params.batch;
+    uint h = hm / params.batch;
+    float acc = 0.0f;
+    uint scores_base = (h * params.batch + m) * params.batch;
+    uint v_base = (h * params.head_dim + n) * params.batch;
+    for (uint k = 0; k < params.batch; ++k) {
+        acc += scores[scores_base + k] * float(v_t[v_base + k]);
+    }
+    output[gid] = acc;
+}
+
+struct VitBoundedAttentionParams {
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+    float scale;
+};
+
+// Bidirectional attention with online softmax and O(sequence * hidden)
+// storage. Q/K/V are head-major F16; accumulation and output are F32.
+// Each thread owns one query row, so no quadratic score buffer exists.
+kernel void vit_bounded_attention_f16_f32(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant VitBoundedAttentionParams& params [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    constexpr uint TILE_Q = 32;
+    constexpr uint MAX_HEAD_DIM = 256;
+    uint head = tgid.x;
+    uint query = tgid.y * TILE_Q + tid;
+    if (head >= params.num_heads || query >= params.seq_len) return;
+
+    uint q_base = (head * params.seq_len + query) * params.head_dim;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc[MAX_HEAD_DIM];
+    for (uint d = 0; d < params.head_dim; ++d) acc[d] = 0.0f;
+
+    for (uint key = 0; key < params.seq_len; ++key) {
+        uint kv_base = (head * params.seq_len + key) * params.head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < params.head_dim; ++d) {
+            dot += float(q[q_base + d]) * float(k[kv_base + d]);
+        }
+        float score = dot * params.scale;
+        float next_max = max(running_max, score);
+        float correction = exp(running_max - next_max);
+        float weight = exp(score - next_max);
+        running_sum = running_sum * correction + weight;
+        for (uint d = 0; d < params.head_dim; ++d) {
+            acc[d] = acc[d] * correction + weight * float(v[kv_base + d]);
+        }
+        running_max = next_max;
+    }
+
+    float inv_sum = 1.0f / running_sum;
+    for (uint d = 0; d < params.head_dim; ++d) {
+        output[q_base + d] = acc[d] * inv_sum;
+    }
+}
 "#;
 
 #[repr(C)]
@@ -1387,6 +1709,24 @@ struct ClipInplaceGpuParams {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VitScoresVSmallGpuParams {
+    batch: u32,
+    num_heads: u32,
+    head_dim: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VitBoundedAttentionGpuParams {
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    scale: f32,
+}
+
 /// View any `Copy + repr(C)` POD as a byte slice. SAFE for `repr(C)`
 /// structs containing only primitive fields; the byte representation
 /// is stable and exactly `size_of::<T>()` bytes.
@@ -1405,6 +1745,39 @@ pub fn register_vit_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("vit_avg_pool_kxk_f32", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_std_bias_scale_f32", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_clip_inplace_f32", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("vit_gelu_erf_f32", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("vit_scores_v_small_f32_f16", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("vit_bounded_attention_f16_f32", VIT_CUSTOM_SHADERS_SOURCE);
+}
+
+/// Apply erf-form GELU to an f32 GPU buffer.
+pub fn vit_gelu_erf_f32_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+) -> Result<MlxBuffer> {
+    if input.dtype() != DType::F32 || input.element_count() == 0 {
+        return Err(anyhow!(
+            "vit_gelu_erf_f32_gpu: expected non-empty f32 input, got dtype={} elements={}",
+            input.dtype(),
+            input.element_count()
+        ));
+    }
+    let output = device
+        .alloc_buffer(input.byte_len(), DType::F32, input.shape().to_vec())
+        .map_err(|e| anyhow!("vit_gelu_erf_f32_gpu: alloc: {e}"))?;
+    let pipeline = registry
+        .get_pipeline("vit_gelu_erf_f32", device.metal_device())
+        .map_err(|e| anyhow!("vit_gelu_erf_f32_gpu: get_pipeline: {e}"))?;
+    let n = input.element_count() as u64;
+    encoder.encode(
+        pipeline,
+        &[(0, input), (1, &output)],
+        MTLSize::new(n, 1, 1),
+        MTLSize::new(n.min(256), 1, 1),
+    );
+    Ok(output)
 }
 
 /// GPU 2×2 spatial avg-pool on a `[N_side, N_side, hidden]` row-major
@@ -2007,12 +2380,10 @@ pub fn apply_vit_full_forward_gpu(
     Ok(final_out)
 }
 
-/// One-shot ViT GPU forward for server-startup self-test. Runs a single
-/// synthetic full forward through `apply_vit_full_forward_gpu` against
-/// the loaded mmproj weights, validating that every stage from
-/// patch_embed through the projector is wired correctly on the actual
-/// production weights at boot — surfaces missing-tensor / shape-mismatch
-/// bugs at startup instead of on the first user request.
+/// One-shot ViT GPU forward for server-startup self-test. Runs a synthetic
+/// image through the same architecture dispatcher used by real requests,
+/// validating preprocessing shape, the complete family-specific graph, and
+/// finite output against the loaded projector weights.
 ///
 /// **Does NOT amortize kernel-compile cost across user requests.** The
 /// `KernelRegistry` here is throwaway; user-request `compute_vision_
@@ -2026,55 +2397,111 @@ pub fn apply_vit_full_forward_gpu(
 /// including the CPU patch_embed) at boot. Catches wiring bugs that
 /// would otherwise hit the first multimodal user.
 ///
-/// Caller invokes once per `LoadedMmprojWeights`. Returns `Ok(())`
-/// on success (the embedding output is discarded; only the side
-/// effect of validating the wiring matters).
+/// Caller invokes once per `LoadedMmprojWeights`. Returns `Ok(())` only when
+/// the request graph returns a non-empty, entirely finite embedding.
 ///
 /// # Errors
 ///
-/// Propagated from any sub-stage. A failed warmup is non-fatal but
-/// surfaces real wiring bugs (missing tensors, shape mismatches)
-/// before they hit a user request.
+/// Propagated from any sub-stage. Serve startup treats failure as fatal so a
+/// server never advertises a projector whose production request graph failed.
 pub fn warmup_vit_gpu(
     weights: &super::mmproj_weights::LoadedMmprojWeights,
     cfg: &super::mmproj::MmprojConfig,
+    arch: super::mmproj::ArchProfile,
+    expected_text_hidden: usize,
 ) -> Result<()> {
-    use mlx_native::{GraphExecutor, MlxDevice};
-
-    let executor =
-        GraphExecutor::new(MlxDevice::new().map_err(|e| anyhow!("warmup_vit_gpu device: {e}"))?);
-    let mut session = executor
-        .begin()
-        .map_err(|e| anyhow!("warmup_vit_gpu begin: {e}"))?;
-    let mut registry = KernelRegistry::new();
-    mlx_native::ops::softmax::register(&mut registry);
-    mlx_native::ops::sigmoid_mul::register(&mut registry);
-    register_vit_custom_shaders(&mut registry);
-    let device_ref: *const MlxDevice = executor.device() as *const _;
-    let device: &MlxDevice = unsafe { &*device_ref };
-
-    // Synthetic [3, image_size, image_size] uniform input. Magnitudes
-    // tiny so attention isn't saturated; the goal is to exercise every
-    // kernel, not to validate output values.
-    let img = cfg.image_size as usize;
-    let pixels = vec![0.01f32; 3 * img * img];
-
-    let head_dim_f = (cfg.hidden_size / cfg.num_attention_heads) as f32;
-    let scale = 1.0f32 / head_dim_f.sqrt();
-
-    let _output = apply_vit_full_forward_gpu(
-        session.encoder_mut(),
-        &mut registry,
-        device,
+    anyhow::ensure!(
+        expected_text_hidden > 0,
+        "warmup_vit_gpu expected text hidden width must be positive"
+    );
+    let head_dim = cfg
+        .hidden_size
+        .checked_div(cfg.num_attention_heads)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("warmup_vit_gpu attention shape is invalid"))?;
+    let input = match arch {
+        super::mmproj::ArchProfile::Qwen3VlSiglip => {
+            let merge = cfg.spatial_merge_size.ok_or_else(|| {
+                anyhow!("warmup_vit_gpu Qwen vision config is missing spatial_merge_size")
+            })?;
+            let edge = cfg
+                .patch_size
+                .checked_mul(merge)
+                .filter(|v| *v > 0)
+                .ok_or_else(|| {
+                    anyhow!("warmup_vit_gpu Qwen vision patch/merge stride is invalid")
+                })?;
+            VisionInput::Siglip49(super::PreprocessedImage {
+                pixel_values: vec![0.01f32; 3 * edge as usize * edge as usize],
+                target_size: cfg.image_size,
+                pixel_w: Some(edge),
+                pixel_h: Some(edge),
+                source_label: "startup-warmup".to_owned(),
+            })
+        }
+        super::mmproj::ArchProfile::Gemma4Siglip => {
+            let patch_values = 3usize
+                .checked_mul(cfg.patch_size as usize)
+                .and_then(|value| value.checked_mul(cfg.patch_size as usize))
+                .ok_or_else(|| anyhow!("warmup_vit_gpu Gemma patch shape overflow"))?;
+            let mut pos_x = Vec::with_capacity(9);
+            let mut pos_y = Vec::with_capacity(9);
+            for y in 0..3u32 {
+                for x in 0..3u32 {
+                    pos_x.push(x);
+                    pos_y.push(y);
+                }
+            }
+            VisionInput::Gemma4v(Gemma4vPreprocessedImage {
+                patches: vec![0.01f32; 9 * patch_values],
+                pos_x,
+                pos_y,
+                n_x: 3,
+                n_y: 3,
+                source_label: "startup-warmup".to_owned(),
+            })
+        }
+        super::mmproj::ArchProfile::ClipClassic => {
+            let edge = cfg.image_size;
+            VisionInput::Siglip49(super::PreprocessedImage {
+                pixel_values: vec![0.01f32; 3 * edge as usize * edge as usize],
+                target_size: edge,
+                pixel_w: None,
+                pixel_h: None,
+                source_label: "startup-warmup".to_owned(),
+            })
+        }
+        super::mmproj::ArchProfile::Unknown => {
+            return Err(anyhow!(
+                "warmup_vit_gpu cannot run an unknown vision profile"
+            ));
+        }
+    };
+    let output = compute_vision_embeddings_gpu_dispatch(
+        &[input],
+        arch,
         weights,
         cfg,
-        &pixels,
-        scale,
+        1.0 / (head_dim as f32).sqrt(),
     )
-    .map_err(|e| anyhow!("warmup_vit_gpu forward: {e}"))?;
-    session
-        .finish()
-        .map_err(|e| anyhow!("warmup_vit_gpu finish: {e}"))?;
+    .map_err(|e| anyhow!("warmup_vit_gpu production vision forward: {e:#}"))?;
+    let first = output
+        .first()
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| {
+            anyhow!("warmup_vit_gpu production vision forward returned no embeddings")
+        })?;
+    if first.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow!(
+            "warmup_vit_gpu production vision forward returned non-finite embeddings"
+        ));
+    }
+    anyhow::ensure!(
+        first.len() % expected_text_hidden == 0,
+        "warmup_vit_gpu output length {} is not divisible by bound text hidden width {}",
+        first.len(),
+        expected_text_hidden
+    );
     Ok(())
 }
 
@@ -2491,17 +2918,23 @@ pub fn compute_vision_embeddings_gpu_dispatch(
             mmproj_cfg,
             num_position_embeddings,
         )?;
-        let r = super::vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl(
-            inputs,
-            mmproj_weights,
-            &cfg,
-            mmproj_cfg,
-        )?;
-        // 4c.4 landed the real arithmetic; indices are preserved by
-        // walking the returned-vec in input order (Wedge-4c.4 Phase-1
-        // accepts only single-image inputs, so r.len() == 1).
-        for (i, e) in r.into_iter().enumerate() {
-            out[i] = Some(e);
+        for (index, input) in inputs.iter().enumerate() {
+            let mut projected = super::vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl(
+                std::slice::from_ref(input),
+                mmproj_weights,
+                &cfg,
+                mmproj_cfg,
+            )?;
+            let embedding = projected.pop().ok_or_else(|| {
+                anyhow!(
+                    "compute_vision_embeddings_gpu_dispatch: Qwen image {index} produced no embedding"
+                )
+            })?;
+            anyhow::ensure!(
+                projected.is_empty(),
+                "compute_vision_embeddings_gpu_dispatch: Qwen image {index} produced more than one embedding"
+            );
+            out[index] = Some(embedding);
         }
         // Skip the gemma/siglip dispatch entirely — Qwen3VlSiglip arch
         // implies all inputs are Qwen3-VL Siglip49 (validated above).
@@ -5016,6 +5449,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vit_attention_gpu_short_sequence_matches_cpu() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let batch = 4usize;
+        let num_heads = 2usize;
+        let head_dim = 64usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let n = batch * num_heads * head_dim;
+        let q: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).sin() * 0.3).collect();
+        let k: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).cos() * 0.3).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * 0.11).sin() * ((i as f32) * 0.13).cos() * 0.5)
+            .collect();
+        let expected = attention_cpu(&q, &k, &v, batch, num_heads, head_dim).unwrap();
+
+        let executor = GraphExecutor::new(MlxDevice::new().expect("device"));
+        let q_buf = upload_f32(executor.device(), &q, vec![batch, num_heads, head_dim]);
+        let k_buf = upload_f32(executor.device(), &k, vec![batch, num_heads, head_dim]);
+        let v_buf = upload_f32(executor.device(), &v, vec![batch, num_heads, head_dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        register_vit_custom_shaders(&mut registry);
+        let device = executor.device();
+        let got_buf = vit_attention_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .expect("short attention");
+        session.finish().expect("finish");
+        let got = readback_f32(&got_buf, n);
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-2, "short attention max diff {max_diff}");
+    }
+
+    #[test]
+    fn vision_attention_workspace_routes_official_max_to_bounded_path() {
+        let bytes = vit_decomposed_attention_workspace_bytes(65_536, 16)
+            .expect("official maximum must fit u64 accounting");
+        assert_eq!(bytes, 549_755_813_888);
+        assert!(bytes > VIT_DECOMPOSED_ATTENTION_WORKSPACE_BYTES);
+        assert!(
+            vit_decomposed_attention_workspace_bytes(512, 16).unwrap()
+                <= VIT_DECOMPOSED_ATTENTION_WORKSPACE_BYTES
+        );
+    }
+
+    #[test]
+    fn vit_bounded_attention_qwen_head_shape_matches_cpu() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let batch = 17usize;
+        let num_heads = 2usize;
+        let head_dim = 72usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let n = batch * num_heads * head_dim;
+        let q: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.031).sin() * 0.3).collect();
+        let k: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.047).cos() * 0.3).collect();
+        let v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.061).sin() * 0.4).collect();
+        let expected = attention_cpu(&q, &k, &v, batch, num_heads, head_dim).unwrap();
+
+        let executor = GraphExecutor::new(MlxDevice::new().expect("device"));
+        let q_buf = upload_f32(executor.device(), &q, vec![batch, num_heads, head_dim]);
+        let k_buf = upload_f32(executor.device(), &k, vec![batch, num_heads, head_dim]);
+        let v_buf = upload_f32(executor.device(), &v, vec![batch, num_heads, head_dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let output = vit_attention_bounded_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            executor.device(),
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .expect("bounded attention");
+        session.finish().expect("finish");
+        let got = readback_f32(&output, n);
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-2, "bounded attention max diff {max_diff}");
+    }
+
     // -----------------------------------------------------------------------
     // vit_residual_add_gpu (iter 48)
     // -----------------------------------------------------------------------
@@ -6029,6 +6564,38 @@ mod tests {
         assert!(format!("{err}").contains("min_val") || format!("{err}").contains("> max_val"));
     }
 
+    #[test]
+    fn vit_gelu_erf_f32_gpu_matches_canonical_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let input_cpu = vec![-3.0f32, -1.0, 0.0, 0.5, 1.0, 3.0];
+        let expected_cpu = [
+            -0.004_049_694,
+            -0.158_655_26,
+            0.0,
+            0.345_731_23,
+            0.841_344_7,
+            2.995_950_2,
+        ];
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![input_cpu.len()]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out = vit_gelu_erf_f32_gpu(session.encoder_mut(), &mut registry, device, &in_buf)
+            .expect("exact gelu");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, input_cpu.len());
+        for ((actual, x), expected) in got.into_iter().zip(input_cpu).zip(expected_cpu) {
+            assert!(
+                (actual - expected).abs() < 2e-6,
+                "x={x}: {actual} != {expected}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // gemma4v_clippable_linear (CPU + GPU, iter 115)
     // -----------------------------------------------------------------------
@@ -6335,11 +6902,23 @@ mod tests {
         let weights =
             LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev")).expect("w");
         let t0 = std::time::Instant::now();
-        warmup_vit_gpu(&weights, &cfg).expect("warmup");
+        warmup_vit_gpu(
+            &weights,
+            &cfg,
+            super::super::mmproj::ArchProfile::Gemma4Siglip,
+            2816,
+        )
+        .expect("warmup");
         eprintln!("warmup_vit_gpu (cold): {:?}", t0.elapsed());
         // Run again — should be much faster (kernels cached).
         let t1 = std::time::Instant::now();
-        warmup_vit_gpu(&weights, &cfg).expect("warmup #2");
+        warmup_vit_gpu(
+            &weights,
+            &cfg,
+            super::super::mmproj::ArchProfile::Gemma4Siglip,
+            2816,
+        )
+        .expect("warmup #2");
         eprintln!("warmup_vit_gpu (warm): {:?}", t1.elapsed());
     }
 
@@ -7949,6 +8528,8 @@ mod tests {
             projector: crate::inference::vision::mmproj::ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
             // non-Qwen3-VL fixtures (this is a Gemma4v synthetic fixture).
             spatial_merge_size: None,

@@ -741,6 +741,11 @@ pub struct LoadedMmproj {
     pub arch: ArchProfile,
     pub weights: Arc<LoadedMmprojWeights>,
     pub model_id: String,
+    pub artifact_sha256: String,
+    pub source_sha256: Option<String>,
+    /// Bounded projector-local embedding cache and single-flight compute
+    /// gate. The payload is Arc-owned so hits do not duplicate large tensors.
+    pub vision_cache: Arc<crate::inference::vision::pipeline::VisionEmbeddingCache>,
 }
 
 impl AppState {
@@ -1091,6 +1096,8 @@ mod tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
             // non-Qwen3-VL fixtures.
             spatial_merge_size: None,
@@ -1104,6 +1111,13 @@ mod tests {
             arch: ArchProfile::Gemma4Siglip,
             weights: Arc::new(LoadedMmprojWeights::empty(device)),
             model_id: "synthetic-mmproj".into(),
+            artifact_sha256: "0".repeat(64),
+            source_sha256: None,
+            vision_cache: Arc::new(
+                crate::inference::vision::pipeline::VisionEmbeddingCache::new(
+                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
+                ),
+            ),
         };
         let state = AppState::new(ServerConfig::default()).with_mmproj(m);
         let attached = state.mmproj.as_ref().expect("mmproj should be Some");

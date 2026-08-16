@@ -64,6 +64,15 @@ fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> Result<MlxB
     Ok(hidden.slice_view(byte_offset, h))
 }
 
+fn trim_trailing_eos(tokens: &mut Vec<u32>, eos_token_ids: &[u32]) {
+    while tokens
+        .last()
+        .is_some_and(|token| eos_token_ids.contains(token))
+    {
+        tokens.pop();
+    }
+}
+
 /// Argmax over a vocab-length logits slice. Used by K=1 batched-verify
 /// to extract per-position predicted tokens from a multi-row logits
 /// buffer (caller slices `logits[row*vocab..(row+1)*vocab]`).
@@ -592,6 +601,7 @@ impl<'a> SpecDecode<'a> {
                                     prev_h,
                                     &embed,
                                     kv_cache_ref,
+                                    slot_id,
                                     &[mtp_pos; 4],
                                     device,
                                     registry,
@@ -958,6 +968,7 @@ impl<'a> SpecDecode<'a> {
                             hidden_ref,
                             &embed_next,
                             kv_cache_ref,
+                            slot_id,
                             &[next_pos; 4],
                             device,
                             registry,
@@ -998,12 +1009,10 @@ impl<'a> SpecDecode<'a> {
             // T_v(1)=34ms = +18% verifier cost for +78% accepted token
             // throughput → 1.37× greedy speedup at 78% accept.
             //
-            // Reject path: position next_pos+1's KV is stale (computed
-            // with the wrong draft_1 token). The next iter's verifier
-            // call writes pos next_pos+1 with the corrected token,
-            // OVERWRITING the stale K/V. No explicit GPU rollback —
-            // hidden_pos = next_pos (not next_pos+1) ensures only
-            // [0..=next_pos] is read in the meantime.
+            // Reject path: position next_pos+1 is stale. The cache appends by
+            // cursor rather than overwriting by RoPE position, so a reject
+            // restores the pre-batch target cursor/ping-pong selection and
+            // replays token_next through the ordinary one-token target path.
             //
             // ADR-034 iter 2026-05-21 (task #87): K=1 BATCHED is now the
             // default for DENSE MTP variant (empirically 1.08-1.13× on
@@ -1035,6 +1044,23 @@ impl<'a> SpecDecode<'a> {
             // with the corrected token.
             let two_calls =
                 k1_batched && std::env::var("HF2Q_SPEC_DECODE_K1_TWO_CALLS").as_deref() == Ok("1");
+            let prior_k1_target_len = if k1_batched && !two_calls {
+                let slot_idx = slot_id.0 as usize;
+                Some(
+                    self.kv_cache
+                        .full_attn
+                        .first()
+                        .and_then(|s| s.current_len.get(slot_idx).copied())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "SpecDecode K1: target full-attention cursor missing for slot {}",
+                                slot_id.0
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
 
             if two_calls {
                 // ADR-034 task #91 (2026-05-21) codex review #3 —
@@ -1150,9 +1176,6 @@ impl<'a> SpecDecode<'a> {
             }
 
             if k1_batched {
-                // hidden_row_0 / hidden_row_1: pre-extracted hidden rows.
-                let mut hidden_row_0: Option<MlxBuffer> = None;
-                let mut hidden_row_1: Option<MlxBuffer> = None;
                 let (verify_logits, verify_hidden) = {
                     let verify_positions_2 = positions_for_range(next_pos, 2);
                     self.verifier
@@ -1276,33 +1299,50 @@ impl<'a> SpecDecode<'a> {
                         break;
                     }
                     hidden_pos = next_pos + 1;
-                    hidden_t = if let Some(h1) = hidden_row_1.take() {
-                        h1
-                    } else {
-                        nth_hidden_row(&verify_hidden, hidden_size_u32, 1)
-                            .with_context(|| format!("K1 ACCEPT row=1 pos {next_pos}"))?
-                    };
+                    hidden_t = nth_hidden_row(&verify_hidden, hidden_size_u32, 1)
+                        .with_context(|| format!("K1 ACCEPT row=1 pos {next_pos}"))?;
                     logits_t = logits_row1.to_vec();
                 } else {
-                    // REJECT: emit the corrected token at N+1. KV at pos
-                    // N+1 is stale (draft_1's contribution); next iter
-                    // overwrites it via verifier.forward at pos N+1 with
-                    // verified_at_n1. hidden_pos = next_pos (not +1)
-                    // ensures attention-read range covers only [0..=N].
-                    generated.push(verified_at_n1);
+                    // REJECT: discard both rows of the speculative target
+                    // transaction, restore the pre-batch DeltaNet buffer
+                    // selection, then replay only the valid token_next. This
+                    // leaves target state exactly one ordinary step ahead;
+                    // the MTP cache already consumed that same valid step.
+                    let prior_target_len =
+                        prior_k1_target_len.expect("batched K1 records its target cursor");
+                    self.kv_cache
+                        .truncate_full_attn_to_for_slot(slot_id, prior_target_len)
+                        .context("SpecDecode K1 reject: rewind full-attention cursor")?;
+                    self.kv_cache
+                        .rewind_la_ping_pong_for_slot(slot_id)
+                        .context("SpecDecode K1 reject: rewind DeltaNet ping-pong")?;
+                    let (replay_logits, replay_hidden) = self
+                        .verifier
+                        .forward_gpu_with_hidden(
+                            &[token_next],
+                            &[next_pos; 4],
+                            &mut self.kv_cache,
+                            slot_id,
+                        )
+                        .with_context(|| {
+                            format!("SpecDecode K1 reject replay at pos {next_pos}")
+                        })?;
+                    let replay_last = last_logits(&replay_logits, vocab)?.to_vec();
+                    let corrected = if is_mh {
+                        verified_at_n1
+                    } else {
+                        greedy_argmax_slice(&replay_last)
+                    };
+                    generated.push(corrected);
                     preemitted_argmax = true;
                     self.stats.rejected += 1;
-                    if self.is_eos(verified_at_n1) {
+                    if self.is_eos(corrected) {
                         break;
                     }
                     hidden_pos = next_pos;
-                    hidden_t = if let Some(h0) = hidden_row_0.take() {
-                        h0
-                    } else {
-                        nth_hidden_row(&verify_hidden, hidden_size_u32, 0)
-                            .with_context(|| format!("K1 REJECT row=0 pos {next_pos}"))?
-                    };
-                    logits_t = logits_row0.to_vec();
+                    hidden_t = last_hidden_row(&replay_hidden, hidden_size_u32)
+                        .context("SpecDecode K1 reject replay hidden row")?;
+                    logits_t = replay_last;
                 }
 
                 if mtp_profile {
@@ -1442,6 +1482,7 @@ impl<'a> SpecDecode<'a> {
             }
         }
         self.stats.decode_elapsed = decode_start.elapsed();
+        trim_trailing_eos(&mut generated, &self.eos_token_ids);
 
         // ADR-028 iter-170: verifier(N) scaling bench (HF2Q_VERIFIER_NBENCH=1).
         //
@@ -1496,7 +1537,7 @@ impl<'a> SpecDecode<'a> {
     }
 }
 
-fn embed_token_on_device(
+pub(crate) fn embed_token_on_device(
     token_embd: &[f32],
     token: u32,
     hidden_size: u32,
@@ -1532,7 +1573,7 @@ fn last_logits(logits: &[f32], vocab_size: u32) -> Result<&[f32]> {
     Ok(&logits[logits.len() - v..])
 }
 
-fn argmax_logits_gpu(
+pub(crate) fn argmax_logits_gpu(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     logits: &MlxBuffer,
@@ -1571,6 +1612,13 @@ fn argmax_logits_gpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculative_output_does_not_expose_terminal_tokens() {
+        let mut tokens = vec![7, 8, 248_046, 248_046];
+        trim_trailing_eos(&mut tokens, &[248_046, 248_047]);
+        assert_eq!(tokens, vec![7, 8]);
+    }
     use crate::inference::models::qwen35::{Qwen35Config, Qwen35Variant};
 
     #[test]

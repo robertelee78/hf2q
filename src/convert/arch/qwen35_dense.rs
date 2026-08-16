@@ -334,6 +334,33 @@ pub fn build_metadata(
             MetaValue::U32((head_dim as f64 * partial_rotary) as u32),
         ),
     ]);
+    let is_multimodal = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .is_some_and(|architectures| {
+            architectures.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    Some("Qwen3_5ForConditionalGeneration")
+                        | Some("Qwen3_5MoeForConditionalGeneration")
+                )
+            })
+        });
+    if is_multimodal {
+        let deepstack_layers = config
+            .get("vision_config")
+            .and_then(|value| value.get("deepstack_visual_indexes"))
+            .and_then(|value| value.as_array())
+            .map_or(0, |values| values.len() as u32);
+        kv.push((
+            "hf2q.vision.projector_profile".into(),
+            MetaValue::String("qwen3vl_siglip".into()),
+        ));
+        kv.push((
+            "hf2q.vision.deepstack_output_count".into(),
+            MetaValue::U32(deepstack_layers),
+        ));
+    }
     if mtp_layers > 0 {
         kv.push((
             "qwen35.nextn_predict_layers".into(),

@@ -142,6 +142,8 @@ pub enum ConvertError {
     Integrity(crate::core::integrity::IntegrityError),
     /// Success-receipt construction or atomic persistence failed.
     Receipt(ReceiptError),
+    /// Native multimodal projector conversion failed.
+    Vision(crate::models::vit::VitConvertError),
     /// `config.json` did not name one of the 8 supported architectures.
     /// `arch_name` carries the offending raw string (from `model_type`
     /// or `architectures[0]`).
@@ -241,6 +243,7 @@ impl std::fmt::Display for ConvertError {
             ConvertError::Io(e) => write!(f, "convert/io: {e}"),
             ConvertError::Integrity(e) => write!(f, "convert/integrity: {e}"),
             ConvertError::Receipt(e) => write!(f, "convert/receipt: {e}"),
+            ConvertError::Vision(e) => write!(f, "convert/vision: {e}"),
             ConvertError::UnsupportedArch { arch_name } => {
                 write!(
                     f,
@@ -343,6 +346,7 @@ impl std::error::Error for ConvertError {
             ConvertError::Io(e) => Some(e),
             ConvertError::Integrity(e) => Some(e),
             ConvertError::Receipt(e) => Some(e),
+            ConvertError::Vision(e) => Some(e),
             ConvertError::Apex(e) => Some(e),
             ConvertError::Tokenizer(e) => Some(e),
             ConvertError::Imatrix(e) => Some(e),
@@ -384,6 +388,12 @@ impl From<crate::core::integrity::IntegrityError> for ConvertError {
 impl From<ReceiptError> for ConvertError {
     fn from(e: ReceiptError) -> Self {
         ConvertError::Receipt(e)
+    }
+}
+
+impl From<crate::models::vit::VitConvertError> for ConvertError {
+    fn from(e: crate::models::vit::VitConvertError) -> Self {
+        ConvertError::Vision(e)
     }
 }
 
@@ -441,6 +451,56 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
 
     // ----- 2. Detect arch ---------------------------------------------------
     let detected_arch = detect_arch(&src.config)?;
+    if args.mmproj
+        && matches!(
+            detected_arch,
+            ArchName::Qwen35 | ArchName::Qwen35MoeFull | ArchName::Qwen3VlText
+        )
+    {
+        if src.config.get("vision_config").is_none() {
+            return Err(ConvertError::UnsupportedArch {
+                arch_name: format!(
+                    "{detected_arch:?} (--mmproj requires a vision_config sub-object)"
+                ),
+            });
+        }
+        if args.dry_run {
+            return Err(ConvertError::UnsupportedArch {
+                arch_name: format!(
+                    "{detected_arch:?} (--mmproj dry-run is not yet available for this projector)"
+                ),
+            });
+        }
+
+        crate::models::vit::convert_vision_tower_to_path_with_source(
+            &args.hf_dir,
+            &args.output,
+            args.remote_source
+                .as_ref()
+                .map(|remote| remote.source_sha256.as_str()),
+        )?;
+
+        if let Some(remote) = args.remote_source.as_ref() {
+            let converter_git_commit = require_converter_git_commit()?;
+            let prepared = prepare_success_receipt(
+                &args.output,
+                &args.output,
+                remote,
+                &converter_git_commit,
+                "f16-mmproj",
+                excluded_dspark_count,
+                PeakChunkBoundReceipt {
+                    strategy: "lazy_source_index_projector_only".into(),
+                    scope: "multimodal_projector_tensors".into(),
+                    ..PeakChunkBoundReceipt::default()
+                },
+            )?;
+            promote_success_receipt(prepared)?;
+        } else {
+            clear_stale_receipt(&args.output)?;
+        }
+        return Ok(());
+    }
     // `--mmproj` overrides arch routing to the vision-projector sidecar
     // mapper. Mirrors canonical `convert_hf_to_gguf.py:223,229,233` —
     // when `--mmproj` is set, the script swaps `TEXT_MODEL_MAP` for

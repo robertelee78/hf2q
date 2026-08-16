@@ -97,20 +97,84 @@ pub fn convert_vision_tower(
         return Ok(None);
     }
 
-    // Load + validate the vision_config block.
-    let vision_config = VisionConfig::from_hf_config(&root)?;
-
     // Compute output slug and path.
     let slug = compute_slug(&root, hf_repo_dir);
     let output = output_dir.join(format!("mmproj-{}-F16.gguf", slug));
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| VitConvertError::GgufEmit(format!("mkdir output_dir: {}", e)))?;
-
-    // Build tensor map from safetensors + emit GGUF.
-    let tensors = convert::load_vision_tensors(hf_repo_dir, &vision_config)?;
-    gguf_emit::write_mmproj_gguf(&output, &vision_config, &tensors)?;
+    convert_vision_tower_to_path(hf_repo_dir, &output)?;
 
     Ok(Some(output))
+}
+
+/// Convert a multimodal projector to an exact caller-selected output path.
+/// The complete sidecar is written and synced in the destination directory,
+/// then atomically promoted so cancellation or conversion failure cannot
+/// replace a previously valid artifact with partial bytes.
+pub fn convert_vision_tower_to_path(
+    hf_repo_dir: &Path,
+    output: &Path,
+) -> Result<(), VitConvertError> {
+    convert_vision_tower_to_path_with_source(hf_repo_dir, output, None)
+}
+
+/// Convert a vision tower and optionally stamp the exact source-bundle
+/// identity shared with its text artifact.
+pub fn convert_vision_tower_to_path_with_source(
+    hf_repo_dir: &Path,
+    output: &Path,
+    source_sha256: Option<&str>,
+) -> Result<(), VitConvertError> {
+    let config_path = hf_repo_dir.join("config.json");
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| VitConvertError::Config(VisionConfigError::Io(e.to_string())))?;
+    let root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| VitConvertError::Config(VisionConfigError::BadJson(e.to_string())))?;
+    let mut vision_config = VisionConfig::from_hf_config(&root)?;
+    let processor_path = hf_repo_dir.join("preprocessor_config.json");
+    let requires_processor_config = vision_config.is_qwen3vl();
+    if processor_path.exists() {
+        let processor_raw = std::fs::read_to_string(&processor_path)?;
+        let processor: serde_json::Value = serde_json::from_str(&processor_raw)
+            .map_err(|e| VitConvertError::Config(VisionConfigError::BadJson(e.to_string())))?;
+        vision_config.apply_preprocessor_config(&processor)?;
+        if requires_processor_config
+            && (vision_config.image_min_pixels.is_none()
+                || vision_config.image_max_pixels.is_none())
+        {
+            return Err(VitConvertError::Config(VisionConfigError::InvalidField {
+                field: "processor.size",
+                value: "Qwen vision conversion requires positive shortest_edge and longest_edge pixel bounds"
+                    .to_string(),
+            }));
+        }
+    } else if requires_processor_config {
+        return Err(VitConvertError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Qwen vision conversion requires {}",
+                processor_path.display()
+            ),
+        )));
+    }
+
+    let output_dir = output.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| VitConvertError::GgufEmit(format!("mkdir output_dir: {e}")))?;
+
+    let tensors = convert::load_vision_tensors(hf_repo_dir, &vision_config)?;
+    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
+    let temporary_path = temporary.into_temp_path();
+    gguf_emit::write_mmproj_gguf_with_provenance(
+        &temporary_path,
+        &vision_config,
+        &tensors,
+        source_sha256,
+    )?;
+    std::fs::File::open(&temporary_path)?.sync_all()?;
+    temporary_path
+        .persist(output)
+        .map_err(|error| VitConvertError::Io(error.error))?;
+
+    Ok(())
 }
 
 /// Derive a filesystem-safe slug for the mmproj filename.
@@ -263,5 +327,38 @@ mod tests {
             result.is_none(),
             "MoE without vision_config must silent-skip"
         );
+    }
+
+    #[test]
+    fn qwen_vision_conversion_requires_processor_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("qwen-vision");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("config.json"),
+            include_str!("../../../tests/fixtures/qwen38/config.json"),
+        )
+        .unwrap();
+
+        let err = convert_vision_tower_to_path(&input, &tmp.path().join("out.gguf"))
+            .expect_err("missing processor config must fail before tensor loading");
+        assert!(format!("{err}").contains("preprocessor_config.json"));
+    }
+
+    #[test]
+    fn qwen_vision_conversion_rejects_processor_without_pixel_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("qwen-vision");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("config.json"),
+            include_str!("../../../tests/fixtures/qwen38/config.json"),
+        )
+        .unwrap();
+        fs::write(input.join("preprocessor_config.json"), r#"{"size":{}}"#).unwrap();
+
+        let err = convert_vision_tower_to_path(&input, &tmp.path().join("out.gguf"))
+            .expect_err("missing pixel bounds must fail before tensor loading");
+        assert!(format!("{err}").contains("processor.size"));
     }
 }

@@ -101,8 +101,8 @@ use crate::inference::models::bert::bert_gpu::{
 use super::mmproj::MmprojConfig;
 use super::mmproj_weights::LoadedMmprojWeights;
 use super::vit_gpu::{
-    register_vit_custom_shaders, vit_attention_gpu, vit_linear_gpu, vit_residual_add_gpu,
-    VisionInput,
+    register_vit_custom_shaders, vit_attention_gpu, vit_gelu_erf_f32_gpu, vit_linear_gpu,
+    vit_residual_add_gpu, VisionInput,
 };
 
 /// Static, immutable Qwen3-VL ViT shape configuration extracted at
@@ -2095,16 +2095,10 @@ fn apply_qwen3vl_deepstack_head_gpu(
     .context("apply_qwen3vl_deepstack_head_gpu: fc1 bias")?;
     encoder.memory_barrier();
 
-    // Stage 3: GELU (pytorch_tanh approx — qwen3vl.cpp:594-597 gate=nullptr
-    // branch of FFN_GELU). NOT GEGLU because there's no gate tensor.
-    let activated = vit_qwen3vl_gelu_gpu(
-        encoder,
-        registry,
-        device,
-        &fc1_out_buf,
-        n_image_tokens * fc1_out,
-    )
-    .context("apply_qwen3vl_deepstack_head_gpu: gelu")?;
+    // Projector heads use exact GELU; the configured tanh approximation
+    // applies only inside the vision-transformer blocks.
+    let activated = vit_gelu_erf_f32_gpu(encoder, registry, device, &fc1_out_buf)
+        .context("apply_qwen3vl_deepstack_head_gpu: gelu")?;
     encoder.memory_barrier();
 
     // Stage 4: fc2 = Linear(_, fc2.w) + fc2.b → `[n_image_tokens, lm_hidden]`.
@@ -2266,15 +2260,10 @@ fn apply_qwen3vl_main_projector_gpu(
     .context("apply_qwen3vl_main_projector_gpu: mm.0 bias")?;
     encoder.memory_barrier();
 
-    // Stage 2: GELU.
-    let activated = vit_qwen3vl_gelu_gpu(
-        encoder,
-        registry,
-        device,
-        &mm0_out_buf,
-        n_image_tokens * mm0_out,
-    )
-    .context("apply_qwen3vl_main_projector_gpu: gelu")?;
+    // Stage 2: exact GELU. Projector heads do not inherit the
+    // vision-block approximation mode.
+    let activated = vit_gelu_erf_f32_gpu(encoder, registry, device, &mm0_out_buf)
+        .context("apply_qwen3vl_main_projector_gpu: gelu")?;
     encoder.memory_barrier();
 
     // Stage 3: mm.2 + bias → `[n_image_tokens, lm_hidden]`.
@@ -2948,6 +2937,8 @@ mod tests {
             projector: ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size,
             projection_dim,
             deepstack_indexes,
@@ -2976,6 +2967,50 @@ mod tests {
         assert_eq!(vit.augmented_embed_dim(), 8192);
         // n_image_tokens at 768×768 / (16*2)² = (768/32)² = 24² = 576.
         assert_eq!(vit.n_image_tokens(768).unwrap(), 576);
+    }
+
+    #[test]
+    #[ignore = "requires HF2Q_QWEN_VISION_MMPROJ and Apple Metal"]
+    fn qwen38_real_mmproj_rectangular_forward_is_finite() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var("HF2Q_QWEN_VISION_MMPROJ")
+            .expect("set HF2Q_QWEN_VISION_MMPROJ to an hf2q-converted projector");
+        let gguf =
+            mlx_native::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open projector");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("parse projector config");
+        assert_eq!(cfg.projector, ProjectorType::Qwen3VlMerger);
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("Metal device"))
+                .expect("load projector weights");
+        let n_pos = weights
+            .position_embd_weight()
+            .expect("position embedding")
+            .shape()[0] as u32;
+        let vit = Qwen3VlViTConfig::from_mmproj(&cfg, n_pos).expect("Qwen vision config");
+
+        let (pixel_w, pixel_h) = (96u32, 64u32);
+        let pixels: Vec<f32> = (0..3 * pixel_w as usize * pixel_h as usize)
+            .map(|i| ((i as f32 * 0.0017).sin() * 0.5).clamp(-1.0, 1.0))
+            .collect();
+        let inputs = [VisionInput::Siglip49(
+            crate::inference::vision::PreprocessedImage {
+                pixel_values: pixels,
+                target_size: cfg.image_size,
+                pixel_w: Some(pixel_w),
+                pixel_h: Some(pixel_h),
+                source_label: "real-projector-regression".to_owned(),
+            },
+        )];
+        let output = compute_vision_embeddings_gpu_qwen3vl(&inputs, &weights, &vit, &cfg)
+            .expect("full rectangular Qwen vision forward");
+        let expected_tokens = (pixel_w / cfg.patch_size) as usize
+            * (pixel_h / cfg.patch_size) as usize
+            / (vit.spatial_merge_size as usize).pow(2);
+        let expected = expected_tokens * vit.augmented_embed_dim() as usize;
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].len(), expected);
+        assert!(output[0].iter().all(|v| v.is_finite()));
+        assert!(output[0].iter().any(|v| v.abs() > 1e-6));
     }
 
     #[test]
@@ -4100,6 +4135,8 @@ mod tests {
             projector: ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(2),
             projection_dim: Some(32),
             deepstack_indexes: Some(vec![]),
@@ -4640,6 +4677,8 @@ mod tests {
             projector: ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(2),
             projection_dim: Some(32),
             deepstack_indexes: Some(vec![]),
@@ -4945,6 +4984,8 @@ mod tests {
             projector: ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(merge_factor.isqrt()),
             projection_dim: Some(lm_hidden),
             deepstack_indexes: Some(vec![0]),
@@ -5241,6 +5282,8 @@ mod tests {
             projector: ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(merge_factor.isqrt()),
             projection_dim: Some(lm_hidden),
             deepstack_indexes: Some(vec![]),

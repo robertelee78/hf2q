@@ -322,6 +322,7 @@ fn mtp_forward_draft_returns_logits() {
             &prev,
             &embed,
             &mut kv,
+            crate::serve::multi_seq_kv::SlotId(0),
             &[0, 0, 0, 0],
             &device,
             &mut registry,

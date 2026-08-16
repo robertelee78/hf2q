@@ -67,6 +67,10 @@ pub struct VisionConfig {
     pub image_mean: [f32; 3],
     /// Image normalization std, `[R, G, B]`. Default `[0.5, 0.5, 0.5]`.
     pub image_std: [f32; 3],
+    /// Optional decoded-image area floor from the model's processor config.
+    pub image_min_pixels: Option<u32>,
+    /// Optional decoded-image area ceiling from the model's processor config.
+    pub image_max_pixels: Option<u32>,
     // ----- Qwen3-VL extensions (iter-224 Wedge-4f) ---------------------
     /// `clip.vision.spatial_merge_size` — Qwen3-VL spatial-merger
     /// degree (typically `2`, giving 2×2 patch fold + 4× token
@@ -134,6 +138,19 @@ impl VisionConfig {
                 .map(|x| x as f32)
                 .unwrap_or(default)
         };
+
+        let is_qwen_conditional = root
+            .get("architectures")
+            .and_then(Value::as_array)
+            .is_some_and(|architectures| {
+                architectures.iter().any(|architecture| {
+                    matches!(
+                        architecture.as_str(),
+                        Some("Qwen3_5ForConditionalGeneration")
+                            | Some("Qwen3_5MoeForConditionalGeneration")
+                    )
+                })
+            });
         let str_def = |k: &str, default: &str| -> String {
             vc.get(k)
                 .and_then(|v| v.as_str())
@@ -181,7 +198,11 @@ impl VisionConfig {
         let num_hidden_layers = u32_req_alt("num_hidden_layers", "depth")?;
         let num_attention_heads = u32_req_alt("num_attention_heads", "num_heads")?;
         let patch_size = u32_req("patch_size")?;
-        let intermediate_size = u32_req("intermediate_size")?;
+        let intermediate_size = match vc.get("intermediate_size").and_then(Value::as_u64) {
+            Some(value) => value as u32,
+            None if is_qwen_conditional => 4304,
+            None => u32_req("intermediate_size")?,
+        };
         // image_size: prefer explicit; otherwise derive from
         // num_position_embeddings = (image_size/patch_size)^2 for ViT.
         let image_size = if let Some(v) = vc.get("image_size").and_then(|v| v.as_u64()) {
@@ -189,6 +210,11 @@ impl VisionConfig {
         } else if let Some(npe) = vc.get("num_position_embeddings").and_then(|v| v.as_u64()) {
             let patches_per_side = (npe as f64).sqrt() as u32;
             patches_per_side * patch_size
+        } else if is_qwen_conditional {
+            // The conditional Qwen3.5-family vision contract fixes the
+            // learned position table at 48x48 patches while omitting the
+            // redundant count from vision_config.
+            48 * patch_size
         } else {
             return Err(VisionConfigError::MissingField {
                 field: "image_size",
@@ -220,7 +246,9 @@ impl VisionConfig {
         // `is_deepstack_layers` GGUF array that the loader rejects at
         // load time anyway, but failing here surfaces the producer bug
         // earlier with the offending index named.
-        let deepstack_visual_indexes: Option<Vec<u32>> = match vc.get("deepstack_visual_indexes") {
+        let mut deepstack_visual_indexes: Option<Vec<u32>> = match vc
+            .get("deepstack_visual_indexes")
+        {
             None => None,
             Some(v) => match v.as_array() {
                 None => {
@@ -304,11 +332,22 @@ impl VisionConfig {
             .map(|s| s == "qwen3_vl")
             .unwrap_or(false);
         let is_qwen3vl_via_deepstack = deepstack_visual_indexes.is_some();
-        let projector_type = if is_qwen3vl_via_model_type || is_qwen3vl_via_deepstack {
+        let is_qwen_vision =
+            is_qwen3vl_via_model_type || is_qwen3vl_via_deepstack || is_qwen_conditional;
+        let projector_type = if is_qwen_vision {
             "qwen3vl_merger".to_string()
         } else {
             raw_projector_type
         };
+
+        // Qwen3.8 uses the Qwen vision graph but intentionally has no
+        // DeepStack layers.  Preserve that as an explicit empty set so the
+        // writer emits a length-`num_hidden_layers` all-false metadata array.
+        // The runtime can then distinguish "this family has no DeepStack"
+        // from "the projector omitted required Qwen vision metadata".
+        if is_qwen_vision && deepstack_visual_indexes.is_none() {
+            deepstack_visual_indexes = Some(Vec::new());
+        }
 
         // projection_dim resolution order matches what llama.cpp's
         // MmprojModel.set_gguf_parameters does — read from the FIRST
@@ -351,10 +390,42 @@ impl VisionConfig {
             projection_dim,
             image_mean: read_triple("image_mean", [0.5, 0.5, 0.5]),
             image_std: read_triple("image_std", [0.5, 0.5, 0.5]),
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size,
             deepstack_visual_indexes,
             temporal_patch_size,
         })
+    }
+
+    /// Attach the processor's pixel-area bounds to the projector metadata.
+    /// The processor schema calls these values `shortest_edge` and
+    /// `longest_edge`, although they are areas rather than edge lengths.
+    pub fn apply_preprocessor_config(
+        &mut self,
+        processor: &Value,
+    ) -> Result<(), VisionConfigError> {
+        let Some(size) = processor.get("size").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        let min = size.get("shortest_edge").and_then(Value::as_u64);
+        let max = size.get("longest_edge").and_then(Value::as_u64);
+        match (min, max) {
+            (None, None) => Ok(()),
+            (Some(min), Some(max)) if min > 0 && min <= max && max <= u32::MAX as u64 => {
+                self.image_min_pixels = Some(min as u32);
+                self.image_max_pixels = Some(max as u32);
+                Ok(())
+            }
+            _ => Err(VisionConfigError::InvalidField {
+                field: "processor.size",
+                value: processor
+                    .get("size")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            }),
+        }
     }
 
     /// True when this `VisionConfig` describes a Qwen3-VL family vision
@@ -434,6 +505,59 @@ mod tests {
         assert_eq!(vc.projector_type, "mlp");
         assert_eq!(vc.num_patches_side(), 8);
         assert_eq!(vc.num_patches(), 64);
+    }
+
+    #[test]
+    fn qwen38_official_vision_defaults_are_explicit() {
+        let root: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        let cfg = VisionConfig::from_hf_config(&root).expect("vision config");
+
+        assert_eq!(cfg.hidden_size, 1152);
+        assert_eq!(cfg.num_hidden_layers, 27);
+        assert_eq!(cfg.num_attention_heads, 16);
+        assert_eq!(cfg.intermediate_size, 4304);
+        assert_eq!(cfg.patch_size, 16);
+        assert_eq!(cfg.image_size, 768);
+        assert_eq!(cfg.num_patches_side(), 48);
+        assert_eq!(cfg.spatial_merge_size, Some(2));
+        assert_eq!(cfg.temporal_patch_size, Some(2));
+        assert_eq!(cfg.projection_dim, Some(5120));
+        assert_eq!(cfg.projector_type, "qwen3vl_merger");
+        assert_eq!(cfg.deepstack_visual_indexes, Some(Vec::new()));
+        assert_eq!(
+            cfg.build_is_deepstack_layers(),
+            Some(vec![false; cfg.num_hidden_layers as usize])
+        );
+    }
+
+    #[test]
+    fn qwen_conditional_dense_and_moe_share_explicit_vision_contract() {
+        let dense: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        let mut moe = dense.clone();
+        moe["architectures"] = serde_json::json!(["Qwen3_5MoeForConditionalGeneration"]);
+
+        let dense_cfg = VisionConfig::from_hf_config(&dense).expect("dense vision config");
+        let moe_cfg = VisionConfig::from_hf_config(&moe).expect("MoE vision config");
+        assert_eq!(moe_cfg.projector_type, "qwen3vl_merger");
+        assert_eq!(moe_cfg.deepstack_visual_indexes, Some(Vec::new()));
+        assert_eq!(
+            moe_cfg.build_is_deepstack_layers(),
+            dense_cfg.build_is_deepstack_layers()
+        );
+    }
+
+    #[test]
+    fn native_qwen_vision_without_deepstack_emits_explicit_empty_set() {
+        let mut root = valid_config();
+        root["vision_config"]["model_type"] = serde_json::json!("qwen3_vl");
+        let cfg = VisionConfig::from_hf_config(&root).expect("native Qwen vision config");
+        assert_eq!(cfg.projector_type, "qwen3vl_merger");
+        assert_eq!(cfg.deepstack_visual_indexes, Some(Vec::new()));
+        assert_eq!(cfg.build_is_deepstack_layers(), Some(vec![false; 4]));
     }
 
     #[test]
@@ -646,6 +770,8 @@ mod tests {
             projection_dim: None,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(2),
             deepstack_visual_indexes: Some(vec![5, 11, 17]),
             temporal_patch_size: Some(2),
@@ -674,6 +800,8 @@ mod tests {
             projection_dim: None,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: None,
             deepstack_visual_indexes: None,
             temporal_patch_size: None,

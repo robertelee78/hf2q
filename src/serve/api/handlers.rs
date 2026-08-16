@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Extension, Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -347,6 +347,7 @@ fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
 /// pointing to the iter-4 placeholder until streaming lands.
 pub async fn chat_completions(
     State(state): State<AppState>,
+    cancellation: Option<Extension<super::middleware::RequestCancellation>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     use std::sync::atomic::Ordering;
@@ -362,16 +363,19 @@ pub async fn chat_completions(
     // Shared prelude: engine gate, model-id match, chat-template render,
     // tokenize, sampling-params build. Returns either a prepared context or
     // an error response to return directly.
-    let prepared = match prepare_chat_generation(&state, &req).await {
-        Ok(p) => p,
-        Err(resp) => {
-            state
-                .metrics
-                .requests_rejected_total
-                .fetch_add(1, Ordering::Relaxed);
-            return resp;
-        }
-    };
+    let prepared =
+        match prepare_chat_generation(&state, &req, cancellation.map(|Extension(token)| token.0))
+            .await
+        {
+            Ok(p) => p,
+            Err(resp) => {
+                state
+                    .metrics
+                    .requests_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return resp;
+            }
+        };
     state
         .metrics
         .chat_completions_started
@@ -1064,8 +1068,9 @@ fn resolve_api_template_kwargs(
 async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::result::Result<PreparedChatContext, Response> {
-    prepare_chat_generation_core(state, req, |s, m| {
+    prepare_chat_generation_core(state, req, cancellation, |s, m| {
         Box::pin(async move { resolve_engine_for_request(s, &m).await })
     })
     .await
@@ -1088,6 +1093,7 @@ async fn prepare_chat_generation(
 async fn prepare_chat_generation_core<'s, F>(
     state: &'s AppState,
     req: &ChatCompletionRequest,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     resolver: F,
 ) -> std::result::Result<PreparedChatContext, Response>
 where
@@ -1155,68 +1161,16 @@ where
     // → N image tokens + MlxBuffer alloc + range computation) runs
     // after the standard render/tokenize/overflow pipeline so its
     // inputs are exactly the prompt tokens the engine sees.
-    let preprocessed_inputs = match process_multimodal_content(&req.messages, state.mmproj.as_ref())
-    {
-        Ok(imgs) => imgs,
-        Err(resp) => return Err(resp),
-    };
     let (
         messages_for_render,
         vision_embeddings,
+        vision_fingerprint,
         vit_forward_ms_v,
         vit_images_v,
         vision_family,
         per_row_floats,
         qwen3vl_image_grids,
-    ) = if preprocessed_inputs.is_empty() {
-        (
-            req.messages.clone(),
-            Vec::new(),
-            None,
-            None,
-            crate::inference::vision::mmproj::VisionFamily::Gemma,
-            engine.hidden_size(),
-            Vec::<(u32, u32)>::new(),
-        )
-    } else {
-        let mmproj = state
-            .mmproj
-            .as_ref()
-            .expect("mmproj checked in process_multimodal_content");
-        // ADR-005 Phase 2c iter-116a: arch-profile dispatch routes
-        // through `compute_vision_embeddings_gpu_dispatch` (W25). The
-        // body of (a) ViT forward, (b) per-row-floats derivation, (c)
-        // Qwen3-VL grid extraction, (d) embedding-stride validation
-        // lives in `inference::vision::pipeline::run_vit_forward`
-        // (extracted iter-2 of mmproj-on-generate so SERVE + CLI share
-        // one path); request-shape-specific concerns (chat-message
-        // rewriting) stay here at the call site.
-        let pipeline_out = match crate::inference::vision::pipeline::run_vit_forward(
-            &preprocessed_inputs,
-            mmproj,
-            engine.hidden_size(),
-        ) {
-            Ok(out) => out,
-            Err(e) => {
-                return Err(
-                    ApiError::generation_error(format!("ViT forward failed: {e:#}"))
-                        .into_response(),
-                );
-            }
-        };
-        let n_images = pipeline_out.embeddings.len();
-        let rewritten =
-            rewrite_messages_for_vision_placeholders_family(&req.messages, pipeline_out.family);
-        (
-            rewritten,
-            pipeline_out.embeddings,
-            Some(pipeline_out.forward_ms),
-            Some(n_images),
-            pipeline_out.family,
-            pipeline_out.per_row_floats,
-            pipeline_out.qwen3vl_image_grids,
-        )
-    };
+    ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
 
     // Compile the response_format grammar (Decision #6).  Iter-95 wires
     // the parsed grammar into `SamplingParams.grammar` so the decode loop
@@ -1359,8 +1313,7 @@ where
     let stable_prompt_prefix_tokens = if matches!(
         engine.info().arch_family,
         crate::serve::load_info::ArchFamily::Gemma4 | crate::serve::load_info::ArchFamily::Qwen35
-    ) && vision_embeddings.is_empty()
-    {
+    ) {
         let stable = render_chat_prompt_or_400_with_generation_prompt(
             engine.chat_template(),
             &messages_for_render,
@@ -1502,7 +1455,7 @@ where
         }
         _ => None,
     };
-    let params = SamplingParams {
+    let mut params = SamplingParams {
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.map(|v| v as usize).unwrap_or(0),
@@ -1524,6 +1477,7 @@ where
         tool_argument_wire_kinds,
         reasoning_forced_open,
         stable_prompt_prefix_tokens,
+        vision_fingerprint,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
     // the multimodal preflight produced ViT embeddings, locate the
@@ -1536,6 +1490,7 @@ where
     //
     // Empty `vision_embeddings` ⇒ pure-text path: skip everything,
     // return `Vec::new()` for `soft_tokens`.
+    let prompt_tokens_len_before_vision_expansion = prompt_tokens.len();
     let (final_prompt_tokens, soft_tokens, image_token_positions_per_image): (
         Vec<u32>,
         Vec<engine::SoftTokenData>,
@@ -1579,6 +1534,12 @@ where
     } else {
         Some(soft_tokens.iter().map(|s| s.range.len()).sum())
     };
+    params.stable_prompt_prefix_tokens = expand_stable_prompt_boundary(
+        params.stable_prompt_prefix_tokens,
+        prompt_tokens_len_before_vision_expansion,
+        final_prompt_tokens.len(),
+        soft_tokens.iter().map(|soft| soft.range.clone()),
+    );
 
     // Wedge-4d engine seam (Qwen3-VL only):
     //   1. Split each image's augmented `[n_image_tokens, hidden * (1 +
@@ -1733,12 +1694,8 @@ fn dispatch_qwen3vl_seam_split(
     }
 
     let total_n_image_tokens: usize = per_image_n_image_tokens.iter().sum();
-    if total_n_image_tokens == 0 || n_deepstack == 0 {
-        // No deepstack chunks to split. Still return an empty
-        // DeepstackData and a positions_flat (text-only positions for
-        // the expanded prompt — image regions get the standard
-        // `[t,t,t,t]` text broadcast since no Wedge-4d hooks consume
-        // them at decode time anyway).
+    if total_n_image_tokens == 0 {
+        // No image positions exist, so a normal text broadcast is correct.
         let flat = build_qwen3vl_positions(final_prompt_tokens.len(), &[]).map_err(|e| {
             ApiError::generation_error(format!("build_qwen3vl_positions (no images): {e}"))
                 .into_response()
@@ -1836,23 +1793,15 @@ fn dispatch_qwen3vl_seam_split(
         let n_tokens = per_image_n_image_tokens[i] as u32;
         let (n_x, n_y) = if !qwen3vl_image_grids.is_empty() {
             let (gx, gy) = qwen3vl_image_grids[i];
-            // Both axes > 0, both ≤ canonical canvas grid, and the
-            // product matches the observed n_image_tokens — these
-            // pin the producer/consumer agreement.
+            // Both axes must be positive and their product must match
+            // the observed image-token count. Variable-resolution inputs
+            // may exceed the learned position grid on one axis; the vision
+            // tower interpolates its learned table to that exact grid.
             if gx == 0 || gy == 0 {
                 return Err(ApiError::generation_error(format!(
                     "dispatch_qwen3vl_seam_split: image[{i}] grid \
                      ({gx},{gy}) has zero axis (preprocessor must report \
                      positive (n_x, n_y))"
-                ))
-                .into_response());
-            }
-            if gx > canonical_per_side || gy > canonical_per_side {
-                return Err(ApiError::generation_error(format!(
-                    "dispatch_qwen3vl_seam_split: image[{i}] grid \
-                     ({gx},{gy}) exceeds canonical canvas grid \
-                     ({canonical_per_side},{canonical_per_side}) — \
-                     preprocessor canvas clamp violated"
                 ))
                 .into_response());
             }
@@ -1897,7 +1846,11 @@ fn dispatch_qwen3vl_seam_split(
 
     Ok((
         engine::DeepstackData {
-            image_token_positions: all_positions,
+            image_token_positions: if n_deepstack == 0 {
+                Vec::new()
+            } else {
+                all_positions
+            },
             chunks,
         },
         positions_flat,
@@ -2991,6 +2944,131 @@ mod truncate_tests {
 /// Per mantra ("no stubs"): we refuse to silently strip images from a
 /// request that supplied them. The preprocessing stage runs the full
 /// load→decode→normalize→CHW pipeline before the ViT forward.
+fn chat_messages_have_images(messages: &[super::schema::ChatMessage]) -> bool {
+    use super::schema::{ContentPart, MessageContent};
+
+    messages.iter().any(|message| {
+        matches!(
+            message.content.as_ref(),
+            Some(MessageContent::Parts(parts))
+                if parts.iter().any(|part| matches!(part, ContentPart::ImageUrl { .. }))
+        )
+    })
+}
+
+type PreparedVisionContext = (
+    Vec<super::schema::ChatMessage>,
+    Arc<Vec<Vec<f32>>>,
+    Option<[u8; 32]>,
+    Option<u64>,
+    Option<usize>,
+    crate::inference::vision::mmproj::VisionFamily,
+    usize,
+    Vec<(u32, u32)>,
+);
+
+async fn prepare_vision_context(
+    messages: &[super::schema::ChatMessage],
+    mmproj: Option<&super::state::LoadedMmproj>,
+    engine: &Engine,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> std::result::Result<PreparedVisionContext, Response> {
+    use std::sync::atomic::Ordering;
+
+    if !chat_messages_have_images(messages) {
+        return Ok((
+            messages.to_vec(),
+            Arc::new(Vec::new()),
+            None,
+            None,
+            None,
+            crate::inference::vision::mmproj::VisionFamily::Gemma,
+            engine.hidden_size(),
+            Vec::new(),
+        ));
+    }
+    let mmproj = mmproj
+        .cloned()
+        .ok_or_else(|| ApiError::no_mmproj_loaded().into_response())?;
+    if let Err(error) = super::super::validate_mmproj_text_binding(
+        engine.vision_consumer_contract(),
+        mmproj.arch,
+        mmproj.config.projection_dim,
+        mmproj.config.deepstack_indexes.as_ref().map_or(0, Vec::len),
+        mmproj.source_sha256.as_deref(),
+        Some(mmproj.artifact_sha256.as_str()),
+    ) {
+        return Err(ApiError::invalid_request(
+            format!("vision projector is not bound to the requested model: {error:#}"),
+            Some("model".into()),
+        )
+        .into_response());
+    }
+    if cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(ApiError::generation_error(
+            "request_cancelled: vision preparation was abandoned",
+        )
+        .into_response());
+    }
+
+    let messages = messages.to_vec();
+    let worker_messages = messages.clone();
+    let hidden_size = engine.hidden_size();
+    let worker_cancellation = cancellation.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        if worker_cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(ApiError::generation_error(
+                "request_cancelled: vision preparation was abandoned",
+            )
+            .into_response());
+        }
+        let inputs = process_multimodal_content(&worker_messages, Some(&mmproj))?;
+        let output = crate::inference::vision::pipeline::run_vit_forward_cancellable(
+            &inputs,
+            &mmproj,
+            hidden_size,
+            worker_cancellation.as_deref(),
+        )
+        .map_err(|error| {
+            ApiError::generation_error(format!("ViT forward failed: {error:#}")).into_response()
+        })?;
+        if worker_cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(ApiError::generation_error(
+                "request_cancelled: vision preparation was abandoned",
+            )
+            .into_response());
+        }
+        Ok(output)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::generation_error(format!("vision preparation worker failed: {error}"))
+            .into_response()
+    })??;
+
+    let n_images = prepared.embeddings.len();
+    let rewritten = rewrite_messages_for_vision_placeholders_family(&messages, prepared.family);
+    Ok((
+        rewritten,
+        prepared.embeddings,
+        Some(prepared.input_fingerprint),
+        Some(prepared.forward_ms),
+        Some(n_images),
+        prepared.family,
+        prepared.per_row_floats,
+        prepared.qwen3vl_image_grids,
+    ))
+}
+
 fn process_multimodal_content(
     messages: &[super::schema::ChatMessage],
     mmproj: Option<&super::state::LoadedMmproj>,
@@ -3203,6 +3281,56 @@ fn process_multimodal_content(
         }
     }
     Ok(out)
+}
+
+/// Translate a no-generation-cue boundary from the tokenizer's one-marker
+/// representation into the expanded soft-token prompt. Every expanded range
+/// replaces exactly one original image marker. A range at or beyond the
+/// stable boundary would make the checkpoint interpretation ambiguous, so
+/// that request safely falls back to ordinary prefix matching.
+fn expand_stable_prompt_boundary(
+    stable: Option<usize>,
+    unexpanded_len: usize,
+    expanded_len: usize,
+    soft_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+) -> Option<usize> {
+    let stable = stable?;
+    if stable == 0 || stable >= unexpanded_len || expanded_len < unexpanded_len {
+        return None;
+    }
+    let mut extra_before_boundary = 0usize;
+    let mut prior_expanded_end = 0usize;
+    for range in soft_ranges {
+        if range.is_empty() || range.start < prior_expanded_end || range.end > expanded_len {
+            return None;
+        }
+        let original_marker = range.start.checked_sub(extra_before_boundary)?;
+        if original_marker >= stable {
+            return None;
+        }
+        extra_before_boundary = extra_before_boundary.checked_add(range.len().checked_sub(1)?)?;
+        prior_expanded_end = range.end;
+    }
+    let expanded = stable.checked_add(extra_before_boundary)?;
+    (expanded > 0 && expanded < expanded_len).then_some(expanded)
+}
+
+#[cfg(test)]
+mod vision_stable_boundary_tests {
+    use super::expand_stable_prompt_boundary;
+
+    #[test]
+    fn expands_boundary_across_every_image_marker() {
+        assert_eq!(
+            expand_stable_prompt_boundary(Some(8), 10, 15, [2..5, 7..11]),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn refuses_image_range_outside_the_stable_message_prefix() {
+        assert_eq!(expand_stable_prompt_boundary(Some(4), 10, 12, [6..9]), None);
+    }
 }
 
 /// Iter 52: 501 emitted AFTER the GPU ViT forward succeeded. Reports
@@ -8381,6 +8509,8 @@ mod multimodal_tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
             // non-Qwen3-VL synthetic fixtures.
             spatial_merge_size: None,
@@ -8395,6 +8525,13 @@ mod multimodal_tests {
             arch: crate::inference::vision::mmproj::ArchProfile::ClipClassic,
             weights: Arc::new(weights),
             model_id: "synthetic-mmproj".into(),
+            artifact_sha256: "0".repeat(64),
+            source_sha256: None,
+            vision_cache: Arc::new(
+                crate::inference::vision::pipeline::VisionEmbeddingCache::new(
+                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
+                ),
+            ),
         }
     }
 
@@ -8526,6 +8663,8 @@ mod multimodal_tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
             // non-Qwen3-VL synthetic fixtures (this is a Gemma4v fixture).
             spatial_merge_size: None,
@@ -8540,6 +8679,13 @@ mod multimodal_tests {
             arch: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
             weights: Arc::new(weights),
             model_id: "synthetic-mmproj-gemma4v".into(),
+            artifact_sha256: "0".repeat(64),
+            source_sha256: None,
+            vision_cache: Arc::new(
+                crate::inference::vision::pipeline::VisionEmbeddingCache::new(
+                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
+                ),
+            ),
         }
     }
 
@@ -9367,7 +9513,7 @@ mod readiness_guard_tests {
             )
         };
 
-        let resp = match prepare_chat_generation_core(&state, &req, resolver).await {
+        let resp = match prepare_chat_generation_core(&state, &req, None, resolver).await {
             Err(r) => r,
             Ok(_) => panic!("not-ready state must return Err(503 response), got Ok"),
         };
@@ -9419,13 +9565,17 @@ mod readiness_guard_tests {
             let resolver = |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
                 unreachable!("global readiness must reject before resolving a dead pooled engine")
             };
-            let response =
-                match prepare_chat_generation_core(&state, &minimal_chat_request(model), resolver)
-                    .await
-                {
-                    Err(response) => response,
-                    Ok(_) => panic!("dead pooled engine must reject generation for {arch:?}"),
-                };
+            let response = match prepare_chat_generation_core(
+                &state,
+                &minimal_chat_request(model),
+                None,
+                resolver,
+            )
+            .await
+            {
+                Err(response) => response,
+                Ok(_) => panic!("dead pooled engine must reject generation for {arch:?}"),
+            };
             assert_eq!(
                 response.status(),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -9454,6 +9604,7 @@ mod readiness_guard_tests {
         let response = match prepare_chat_generation_core(
             &state,
             &minimal_chat_request("raced-dead-qwen"),
+            None,
             resolver,
         )
         .await
@@ -9604,7 +9755,7 @@ mod pool_error_tests {
             Box::pin(async move { Err(response) })
         };
 
-        let resp = match prepare_chat_generation_core(&state, &req, resolver).await {
+        let resp = match prepare_chat_generation_core(&state, &req, None, resolver).await {
             Err(r) => r,
             Ok(_) => panic!("PoolRefused resolver must yield Err(503 response), got Ok"),
         };
@@ -9726,7 +9877,7 @@ mod iter215_qwen35_chat_501_tests {
         // To prove the contract end-to-end, drive
         // `prepare_chat_generation_core` and assert the engine on the
         // returned PreparedChatContext reports LoadedArch::Qwen35.
-        let prepared = match prepare_chat_generation_core(&state, &req, resolver).await {
+        let prepared = match prepare_chat_generation_core(&state, &req, None, resolver).await {
             Ok(p) => p,
             Err(_resp) => panic!("prepare must succeed before the 501 short-circuit fires"),
         };

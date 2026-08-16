@@ -109,7 +109,13 @@ pub fn parse_tool_calls_body(mut body: &str) -> Result<Vec<ParsedToolCall>, Pars
             let encoded = if is_string == "true" {
                 serde_json::to_string(value).expect("string JSON")
             } else {
-                value.to_string()
+                serde_json::from_str::<serde_json::Value>(value)
+                    .map_err(|error| {
+                        ParseError::Invalid(format!(
+                            "DSML non-string parameter {key:?} is not valid JSON: {error}"
+                        ))
+                    })?
+                    .to_string()
             };
             args.push((key.to_string(), encoded));
             body = tail.strip_prefix('\n').ok_or_else(|| {

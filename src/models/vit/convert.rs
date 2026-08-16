@@ -385,7 +385,7 @@ pub fn load_vision_tensors(
     vision_config: &VisionConfig,
 ) -> Result<HashMap<String, VitTensor>, VitConvertError> {
     let progress = ProgressReporter::new();
-    let tensor_map = safetensors::read_tensors(hf_repo_dir, &progress)
+    let mut tensor_map = safetensors::read_tensors_lazy(hf_repo_dir, &progress)
         .map_err(|e| VitConvertError::Safetensors(e.to_string()))?;
 
     // Wedge-4f: cache the deepstack absolute indexes for the per-tensor
@@ -397,7 +397,35 @@ pub fn load_vision_tensors(
         .unwrap_or_default();
 
     let mut out: HashMap<String, VitTensor> = HashMap::new();
-    for (name, tensor) in tensor_map.iter() {
+    // Materialize only the vision tensors. The source checkpoint also carries
+    // the full text decoder; eagerly loading every tensor here would multiply
+    // conversion RSS by tens of GiB for no useful work.
+    let source_names: Vec<String> = tensor_map.iter().map(|(name, _)| name.clone()).collect();
+    for name in source_names {
+        let Some(lazy) = tensor_map.remove(&name) else {
+            return Err(VitConvertError::Safetensors(format!(
+                "vision tensor disappeared from lazy source index: {name}"
+            )));
+        };
+
+        let is_deepstack = hf_qwen3vl_deepstack_to_gguf(&name, &deepstack_indexes).is_some();
+        let is_qwen3vl_patch_5d = (name == "model.visual.patch_embed.proj.weight"
+            || name == "visual.patch_embed.proj.weight")
+            && lazy.shape().len() == 5;
+        let is_mapped = hf_vit_name_to_gguf(&name).is_some()
+            || name
+                .strip_prefix("model.")
+                .and_then(hf_vit_name_to_gguf)
+                .is_some()
+            || hf_vit_name_to_gguf(&format!("model.{name}")).is_some();
+        if !is_deepstack && !is_qwen3vl_patch_5d && !is_mapped {
+            continue;
+        }
+
+        let tensor = lazy
+            .materialize()
+            .map_err(|e| VitConvertError::Safetensors(e.to_string()))?;
+
         // Wedge-4f: Qwen3-VL DeepStack head tensors —
         // `visual.deepstack_merger_list.{rel_idx}.*`. Remap the
         // relative index to absolute via the model's
@@ -405,13 +433,13 @@ pub fn load_vision_tensors(
         // map (which doesn't pattern-match this prefix) and BEFORE
         // the per-block ViT encoder match (which strips
         // `model.vision_tower.encoder.layer.` — different prefix).
-        if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(name, &deepstack_indexes) {
+        if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(&name, &deepstack_indexes) {
             // ADR-021 iter-11b: route F32 (norms + biases) through the
             // F32 path; weights stay F16. Peer convention.
             let (data, dtype) = if vit_emission_is_f32(&gguf_name) {
-                (ensure_f32_bytes(tensor)?, DType::F32)
+                (ensure_f32_bytes(&tensor)?, DType::F32)
             } else {
-                (ensure_f16_bytes(tensor)?, DType::F16)
+                (ensure_f16_bytes(&tensor)?, DType::F16)
             };
             out.insert(
                 gguf_name.clone(),
@@ -439,11 +467,8 @@ pub fn load_vision_tensors(
         // `hf_vit_name_to_gguf::QWEN36_GLOBAL_MAP` keeps the
         // `model.visual.*` form for backward-compat with synthetic
         // fixtures that embed the prefix.
-        let is_qwen3vl_patch_5d = (name == "model.visual.patch_embed.proj.weight"
-            || name == "visual.patch_embed.proj.weight")
-            && tensor.shape.len() == 5;
         if is_qwen3vl_patch_5d {
-            let (slice0, slice1) = split_qwen3vl_patch_embed_temporal(tensor)?;
+            let (slice0, slice1) = split_qwen3vl_patch_embed_temporal(&tensor)?;
             out.insert(
                 "v.patch_embd.weight".to_string(),
                 VitTensor {
@@ -469,7 +494,7 @@ pub fn load_vision_tensors(
         // (`visual.*`) forms — real Qwen3-VL HF strips the `model.`
         // prefix from the visual tower (mirrors line-4908-4909 in
         // convert_hf_to_gguf.py); synthetic fixtures keep it.
-        let mapped = hf_vit_name_to_gguf(name).or_else(|| {
+        let mapped = hf_vit_name_to_gguf(&name).or_else(|| {
             if let Some(stripped) = name.strip_prefix("model.") {
                 // Re-add the `model.` prefix when calling into
                 // `hf_vit_name_to_gguf` so we don't accidentally
@@ -479,7 +504,7 @@ pub fn load_vision_tensors(
                 // map by re-adding `model.`.
                 hf_vit_name_to_gguf(stripped)
             } else {
-                hf_vit_name_to_gguf(&format!("model.{}", name))
+                hf_vit_name_to_gguf(&format!("model.{name}"))
             }
         });
 
@@ -487,9 +512,9 @@ pub fn load_vision_tensors(
             // ADR-021 iter-11b: route F32 (norms + biases) through the
             // F32 path; weights stay F16. Peer convention.
             let (data, dtype) = if vit_emission_is_f32(&gguf_name) {
-                (ensure_f32_bytes(tensor)?, DType::F32)
+                (ensure_f32_bytes(&tensor)?, DType::F32)
             } else {
-                (ensure_f16_bytes(tensor)?, DType::F16)
+                (ensure_f16_bytes(&tensor)?, DType::F16)
             };
             out.insert(
                 gguf_name.clone(),
@@ -610,6 +635,63 @@ fn f32_bytes_to_f16(input: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn qwen38_official_vision_inventory_maps_without_gaps() {
+        let mut names = Vec::new();
+        let block_suffixes = [
+            "attn.proj.weight",
+            "attn.proj.bias",
+            "attn.qkv.weight",
+            "attn.qkv.bias",
+            "mlp.linear_fc1.weight",
+            "mlp.linear_fc1.bias",
+            "mlp.linear_fc2.weight",
+            "mlp.linear_fc2.bias",
+            "norm1.weight",
+            "norm1.bias",
+            "norm2.weight",
+            "norm2.bias",
+        ];
+        for layer in 0..27 {
+            for suffix in block_suffixes {
+                names.push(format!("model.visual.blocks.{layer}.{suffix}"));
+            }
+        }
+        names.extend(
+            [
+                "model.visual.merger.linear_fc1.weight",
+                "model.visual.merger.linear_fc1.bias",
+                "model.visual.merger.linear_fc2.weight",
+                "model.visual.merger.linear_fc2.bias",
+                "model.visual.merger.norm.weight",
+                "model.visual.merger.norm.bias",
+                "model.visual.patch_embed.proj.weight",
+                "model.visual.patch_embed.proj.bias",
+                "model.visual.pos_embed.weight",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+
+        assert_eq!(names.len(), 333, "official projector tensor count");
+        let mut mapped = HashSet::new();
+        for name in names {
+            let gguf_name = hf_vit_name_to_gguf(&name)
+                .unwrap_or_else(|| panic!("unmapped official vision tensor: {name}"));
+            assert!(
+                mapped.insert(gguf_name.clone()),
+                "duplicate projector target name: {gguf_name}"
+            );
+        }
+        assert_eq!(mapped.len(), 333);
+        assert!(mapped.contains("v.patch_embd.weight"));
+        assert!(
+            !mapped.contains("v.patch_embd.weight.1"),
+            "the temporal split is emitted by load_vision_tensors"
+        );
+    }
 
     #[test]
     fn static_mappings_match_spec() {

@@ -1052,6 +1052,21 @@ pub fn build_metadata(
     // Qwen 3.5 set_gguf_parameters intentionally omits it from GGUF
     // (it's baked into the tensor topology — attn_output is gated via
     // the existence of `blk.<N>.attn_output_gate.weight` tensor).
+    if ctx.multimodal_wrapping {
+        let deepstack_layers = config
+            .get("vision_config")
+            .and_then(|value| value.get("deepstack_visual_indexes"))
+            .and_then(|value| value.as_array())
+            .map_or(0, |values| values.len() as u32);
+        kvs.push((
+            "hf2q.vision.projector_profile".into(),
+            MetaValue::String("qwen3vl_siglip".into()),
+        ));
+        kvs.push((
+            "hf2q.vision.deepstack_output_count".into(),
+            MetaValue::U32(deepstack_layers),
+        ));
+    }
     kvs.extend(emit_general_postlude(file_type));
     let _ = ctx; // future per-arch metadata may need ctx fields
     kvs

@@ -337,6 +337,7 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         | ConvertError::Io(_)
         | ConvertError::Integrity(_)
         | ConvertError::Receipt(_)
+        | ConvertError::Vision(_)
         | ConvertError::HfDownload { .. } => AppError::Conversion(anyhow::anyhow!("{e}")),
     })
 }

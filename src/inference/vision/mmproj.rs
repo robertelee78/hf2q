@@ -219,6 +219,10 @@ pub struct MmprojConfig {
     pub image_mean: [f32; 3],
     /// Per-channel std `[R, G, B]`.
     pub image_std: [f32; 3],
+    /// Optional decoded-image area floor carried by the projector artifact.
+    pub image_min_pixels: Option<u32>,
+    /// Optional decoded-image area ceiling carried by the projector artifact.
+    pub image_max_pixels: Option<u32>,
     // ---- Qwen3-VL extensions (iter-224 Wedge-4b) -----------------------
     /// `clip.vision.spatial_merge_size` — Qwen3-VL spatial-merger
     /// degree (typically `2`, giving 2×2 patch fold + 4× token
@@ -368,6 +372,8 @@ impl MmprojConfig {
         };
         let image_mean = read_triple("clip.vision.image_mean", [0.5, 0.5, 0.5]);
         let image_std = read_triple("clip.vision.image_std", [0.5, 0.5, 0.5]);
+        let image_min_pixels = gguf.metadata_u32("clip.vision.image_min_pixels");
+        let image_max_pixels = gguf.metadata_u32("clip.vision.image_max_pixels");
 
         // ----- Qwen3-VL extensions (iter-224 Wedge-4b) -----
         // All three fields are Optional — non-Qwen3-VL mmproj GGUFs
@@ -394,6 +400,8 @@ impl MmprojConfig {
             projector,
             image_mean,
             image_std,
+            image_min_pixels,
+            image_max_pixels,
             spatial_merge_size,
             projection_dim,
             deepstack_indexes,
@@ -1053,6 +1061,8 @@ mod tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // iter-224 Wedge-4b: Qwen3-VL extension fields default to
             // None for non-Qwen3-VL profiles.
             spatial_merge_size: None,
@@ -1079,6 +1089,8 @@ mod tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: None,
             projection_dim: None,
             deepstack_indexes: None,
@@ -1104,6 +1116,8 @@ mod tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // iter-224 Wedge-4b: Qwen3-VL extensions default to None
             // (Mlp profile has no DeepStack / spatial-merger metadata).
             spatial_merge_size: None,
@@ -1484,6 +1498,8 @@ mod tests {
             projector: ProjectorType::Qwen3VlMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             spatial_merge_size: Some(2),
             projection_dim: Some(2048),
             deepstack_indexes: Some(deepstack_indexes),

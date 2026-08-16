@@ -1672,6 +1672,36 @@ impl Qwen35Model {
         )
     }
 
+    /// Final-token logits plus the unnormalized residual stream. This is the
+    /// production prefill seam for the optional MTP decoder: it avoids the
+    /// `[seq_len, vocab]` host materialization of `forward_gpu_with_hidden`
+    /// while retaining the verifier state needed to draft the next token.
+    pub fn forward_gpu_last_logits_with_hidden(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+    ) -> Result<(Vec<f32>, MlxBuffer)> {
+        let mut hidden_out = None;
+        let logits = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            Some(&mut hidden_out),
+            OutputHeadMode::Last,
+            &[],
+            None,
+            None,
+            slot_id,
+        )?;
+        let hidden = hidden_out.ok_or_else(|| {
+            anyhow!("forward_gpu_last_logits_with_hidden: hidden buffer was not captured")
+        })?;
+        Ok((logits, hidden))
+    }
+
     /// Top-K variant of [`Self::forward_gpu_last_logits`].
     ///
     /// ADR-005 iter-25 — GPU top-K sampling. Same forward pass as

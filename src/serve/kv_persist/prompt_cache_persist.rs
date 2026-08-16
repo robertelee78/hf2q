@@ -136,6 +136,11 @@ pub fn try_serialize(cache: &PromptCache) -> Option<Vec<u8>> {
         // response cache rather than restore a schema-blind replay key.
         return None;
     }
+    if cache.key.vision_fingerprint.is_some() {
+        // The disk response-cache subset does not persist image identity.
+        // Never restore an image-conditioned answer under a text-only key.
+        return None;
+    }
     let snap = PromptCacheSnapshot {
         format_version: PROMPT_CACHE_FORMAT_VERSION,
         tokens: cache.tokens.clone(),
@@ -206,6 +211,7 @@ pub fn try_deserialize(bytes: &[u8]) -> Option<PromptCache> {
             top_logprobs: snap.key.top_logprobs,
             parallel_tool_calls: snap.key.parallel_tool_calls,
             reasoning_forced_open: snap.key.reasoning_forced_open,
+            vision_fingerprint: None,
         },
         text: snap.text,
         reasoning_text: snap.reasoning_text,

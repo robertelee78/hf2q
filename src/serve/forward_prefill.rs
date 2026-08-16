@@ -590,9 +590,9 @@ impl MlxModelWeights {
     ///   * Per-layer `Arc::strong_count(&dense_kvs[layer]) == 1`
     ///     (caller's `take_prefix` semantics ensure this; defensive
     ///     bail on violation).
-    ///   * `soft_tokens.is_empty()` (multimodal LCP support is
-    ///     deferred to Phase E.a v2 per dossier §10.5; the engine's
-    ///     `probe_lcp_opportunity` enforces this upstream).
+    ///   * Every soft-token range is wholly in the appended suffix. Cached
+    ///     image rows are represented by the restored KV and are not
+    ///     injected again.
     ///
     /// # Errors
     ///
@@ -602,7 +602,8 @@ impl MlxModelWeights {
     ///   * `restored_lcp = Some(k)` with `k == 0` or `k >= seq_len`.
     ///   * Per-layer `Arc` not exclusive (`Arc::try_unwrap` failed).
     ///   * Per-layer cached capacity < required.
-    ///   * `restored_lcp = Some(k)` with non-empty `soft_tokens`.
+    ///   * `restored_lcp = Some(k)` with a soft-token range starting before
+    ///     `k`.
     pub fn forward_prefill_with_soft_tokens_resume(
         &mut self,
         prompt_tokens: &[u32],
@@ -636,13 +637,10 @@ impl MlxModelWeights {
                     seq_len
                 );
             }
-            if !soft_tokens.is_empty() {
-                anyhow::bail!(
-                    "forward_prefill: restored_lcp=Some(_) with non-empty soft_tokens \
-                     ({} ranges) — multimodal LCP is Phase E.a v2 scope",
-                    soft_tokens.len()
-                );
-            }
+            anyhow::ensure!(
+                soft_tokens.iter().all(|soft| soft.range.start >= k),
+                "forward_prefill: restored_lcp=Some({k}) requires every soft-token range to lie wholly in the suffix"
+            );
             if self.dense_kvs.is_none() {
                 anyhow::bail!(
                     "forward_prefill: restored_lcp=Some({}) but self.dense_kvs is None — \
@@ -3671,7 +3669,8 @@ impl MlxModelWeights {
 
     /// Append a prompt suffix to an exact live Gemma slot prefix.
     /// `cached_tokens` is verified by the worker against both its rendered
-    /// token ledger and the slot cursor before this call.
+    /// token ledger and the slot cursor before this call. Soft-token ranges
+    /// are accepted only when they lie wholly in the appended suffix.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_prefill_with_soft_tokens_slot_aware_resume(
         &mut self,
@@ -3692,11 +3691,13 @@ impl MlxModelWeights {
             prompt_tokens.len(),
         );
         anyhow::ensure!(
-            soft_tokens.is_empty(),
-            "Gemma slot resume does not reuse multimodal soft-token state"
+            soft_tokens
+                .iter()
+                .all(|soft| soft.range.start >= cached_tokens),
+            "Gemma slot resume soft-token ranges must start at or after cached_tokens={cached_tokens}"
         );
         let suffix = &prompt_tokens[cached_tokens..];
-        if suffix.len() < GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS {
+        if soft_tokens.is_empty() && suffix.len() < GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS {
             let mut next_token = None;
             let mut profile = None;
             for (offset, &input_token) in suffix.iter().enumerate() {
@@ -4109,7 +4110,7 @@ impl MlxModelWeights {
                 soft_tokens,
                 max_decode_tokens,
                 gpu,
-                None,
+                (cached_tokens > 0).then_some(cached_tokens),
                 true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
             );
 
@@ -4373,7 +4374,7 @@ impl MlxModelWeights {
                 soft_tokens,
                 max_decode_tokens,
                 gpu,
-                None,
+                (cached_tokens > 0).then_some(cached_tokens),
                 true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
             );
 
@@ -4912,11 +4913,7 @@ impl MlxModelWeights {
                 !soft_tokens.is_empty(),
                 cached_tokens,
             );
-            let result = if cached_tokens > 0 {
-                anyhow::ensure!(
-                    use_batched_slot_prefill,
-                    "Gemma live slot resume requires text-only batched prefill"
-                );
+            let result = if cached_tokens > 0 && use_batched_slot_prefill {
                 let prior_dense_kvs = self.dense_kvs.take();
                 let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
                 let r = self.forward_prefill_batched_live_resume_slot_mounted(
@@ -4946,7 +4943,7 @@ impl MlxModelWeights {
                     soft_tokens,
                     max_decode_tokens,
                     gpu,
-                    None,
+                    (cached_tokens > 0).then_some(cached_tokens),
                     true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
                 )
             };
@@ -5177,11 +5174,7 @@ impl MlxModelWeights {
             !soft_tokens.is_empty(),
             cached_tokens,
         );
-        let result = if cached_tokens > 0 {
-            anyhow::ensure!(
-                use_batched_slot_prefill,
-                "Gemma live HB slot resume requires text-only batched prefill"
-            );
+        let result = if cached_tokens > 0 && use_batched_slot_prefill {
             let prior_dense_kvs = self.dense_kvs.take();
             let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
             let r = self.forward_prefill_batched_live_resume_slot_mounted(
@@ -5207,7 +5200,7 @@ impl MlxModelWeights {
                 soft_tokens,
                 max_decode_tokens,
                 gpu,
-                None,
+                (cached_tokens > 0).then_some(cached_tokens),
                 true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
             )
         };

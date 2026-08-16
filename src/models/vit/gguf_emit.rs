@@ -26,6 +26,7 @@ use std::path::Path;
 use super::config::VisionConfig;
 use super::convert::VitTensor;
 use super::VitConvertError;
+use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 
 const GGUF_MAGIC: [u8; 4] = [0x47, 0x47, 0x55, 0x46]; // "GGUF"
 const GGUF_VERSION: u32 = 3;
@@ -66,6 +67,17 @@ pub fn write_mmproj_gguf(
     vision_config: &VisionConfig,
     tensors: &HashMap<String, VitTensor>,
 ) -> Result<(), VitConvertError> {
+    write_mmproj_gguf_with_provenance(output, vision_config, tensors, None)
+}
+
+/// Write a projector GGUF and, when supplied, bind it to the exact source
+/// bundle used for the paired text artifact.
+pub fn write_mmproj_gguf_with_provenance(
+    output: &Path,
+    vision_config: &VisionConfig,
+    tensors: &HashMap<String, VitTensor>,
+    source_sha256: Option<&str>,
+) -> Result<(), VitConvertError> {
     let file = File::create(output)
         .map_err(|e| VitConvertError::GgufEmit(format!("create {:?}: {}", output, e)))?;
     let mut w = BufWriter::new(file);
@@ -76,7 +88,17 @@ pub fn write_mmproj_gguf(
     let tensor_count = names.len() as u64;
 
     // Metadata per clip-model.h conventions.
-    let metadata = build_metadata(vision_config);
+    let mut metadata = build_metadata(vision_config);
+    if let Some(source_sha256) = source_sha256 {
+        metadata.push((
+            KEY_PRODUCER_VERSION.to_owned(),
+            MetaValue::String(format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+        ));
+        metadata.push((
+            KEY_SOURCE_SHA256.to_owned(),
+            MetaValue::String(source_sha256.to_owned()),
+        ));
+    }
     let kv_count = metadata.len() as u64;
 
     // --- Header ---
@@ -324,6 +346,19 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
         ),
     ];
 
+    if let Some(min_pixels) = cfg.image_min_pixels {
+        kvs.push((
+            "clip.vision.image_min_pixels".into(),
+            MetaValue::Uint32(min_pixels),
+        ));
+    }
+    if let Some(max_pixels) = cfg.image_max_pixels {
+        kvs.push((
+            "clip.vision.image_max_pixels".into(),
+            MetaValue::Uint32(max_pixels),
+        ));
+    }
+
     // Optional `projection_dim`: emit only when present in
     // VisionConfig (HF source had `vision_config.projection_dim` OR
     // caller filled it from text_config.hidden_size). The mmproj
@@ -404,6 +439,8 @@ mod tests {
             projection_dim: None,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: None,
+            image_max_pixels: None,
             // Wedge-4f: Qwen3-VL extension fields default to None for
             // non-Qwen3-VL profiles (CLIP-classic / Gemma 4).
             spatial_merge_size: None,
@@ -543,6 +580,8 @@ mod tests {
             projection_dim: Some(2048),
             image_mean: [0.48145466, 0.4578275, 0.40821073],
             image_std: [0.26862954, 0.26130258, 0.27577711],
+            image_min_pixels: Some(65_536),
+            image_max_pixels: Some(16_777_216),
             spatial_merge_size: Some(2),
             deepstack_visual_indexes: Some(vec![0, 1]),
             temporal_patch_size: Some(2),
@@ -608,6 +647,65 @@ mod tests {
             Some(MetaValue::Bool(true)) => {}
             other => panic!("use_gelu must be Bool(true); got {:?}", other),
         }
+    }
+
+    #[test]
+    fn qwen38_metadata_emits_explicit_all_false_deepstack_mask() {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        let cfg = VisionConfig::from_hf_config(&root).expect("vision config");
+        let md = build_metadata(&cfg);
+        let mask = md
+            .iter()
+            .find(|(key, _)| key == "clip.vision.is_deepstack_layers")
+            .map(|(_, value)| value)
+            .expect("Qwen3.8 projector must carry an explicit DeepStack mask");
+
+        match mask {
+            MetaValue::ArrayBool(values) => {
+                assert_eq!(values.len(), cfg.num_hidden_layers as usize);
+                assert!(values.iter().all(|enabled| !enabled));
+            }
+            other => panic!("DeepStack mask must be Bool[]; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen38_all_false_deepstack_round_trips_as_explicit_empty_indexes() {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("Qwen3.8 config fixture");
+        let cfg = VisionConfig::from_hf_config(&root).expect("vision config");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("qwen38-all-false.mmproj.gguf");
+        write_mmproj_gguf(&path, &cfg, &tiny_tensors()).expect("write projector");
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open projector");
+        let parsed = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
+            .expect("parse projector metadata");
+        assert_eq!(parsed.deepstack_indexes, Some(Vec::new()));
+    }
+
+    #[test]
+    fn projector_source_provenance_round_trips_through_the_shared_reader() {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("Qwen3.8 config fixture");
+        let cfg = VisionConfig::from_hf_config(&root).expect("vision config");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("projector-provenance.gguf");
+        let source = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        write_mmproj_gguf_with_provenance(&path, &cfg, &tiny_tensors(), Some(source))
+            .expect("write projector");
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open projector");
+        assert_eq!(
+            crate::core::provenance::detect(&gguf),
+            crate::core::provenance::Provenance::Hf2q {
+                producer_version: format!("hf2q {}", env!("CARGO_PKG_VERSION")),
+                source_sha256: source.to_string(),
+                mmproj_sha256: None,
+            }
+        );
     }
 
     /// Wedge-4f regression gate: a CLIP-classic config (no Qwen3-VL

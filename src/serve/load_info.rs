@@ -174,10 +174,11 @@ impl ArchFamily {
     /// `true` iff this architecture supports a separate mmproj GGUF for
     /// vision (so the banner should distinguish "mmproj-required (none
     /// loaded)" from "n/a (text-only arch)").  Gemma4 ships as
-    /// text+mmproj pairs; Qwen3-VL text LM has a companion ViT.  Pure
-    /// text architectures (Qwen35) never carry vision.
+    /// text+mmproj pairs; Qwen3-VL text LM has a companion ViT. Qwen35 is a
+    /// mixed registry family, so its serve banner is upgraded from the loaded
+    /// projector rather than inferring a requirement for every checkpoint.
     pub fn supports_mmproj(&self) -> bool {
-        matches!(self, ArchFamily::Gemma4 | ArchFamily::Qwen3VlText)
+        matches!(self, ArchFamily::Gemma4)
     }
 }
 
@@ -1745,6 +1746,8 @@ mod tests {
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
             tq_kv_active: false,
+            vision_projector_profile: None,
+            vision_deepstack_output_count: 0,
             // ADR-040 Phase C iter-2a (C2b) — scaffold field on
             // `Qwen35LoadedModel`; test fixtures must populate it (here
             // as `None`) to keep struct-literal construction

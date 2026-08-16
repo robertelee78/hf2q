@@ -66,6 +66,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
+MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.6/mmproj-qwen36-F16.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
@@ -113,6 +114,13 @@ for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
     fi
 done
 
+MMPROJ_ARGS=()
+if [[ -f "$MMPROJ" ]]; then
+    MMPROJ_ARGS=(--mmproj "$MMPROJ")
+else
+    echo "vision projector not found at $MMPROJ; starting text-only (set MMPROJ to the converted projector path)" >&2
+fi
+
 exec env \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
     HF2Q_TQ_KV=1 \
@@ -120,6 +128,7 @@ exec env \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \
     "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
+        "${MMPROJ_ARGS[@]}" \
         --host "$HOST" \
         --port "$PORT" \
         --overflow-policy reject \
