@@ -4853,6 +4853,97 @@ mod tests {
     }
 
     #[test]
+    fn agentic_grammar_contract_cross_family_question_rejects_null_header() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "header": {"type": "string"},
+                            "question": {"type": "string"},
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string"}
+                                    },
+                                    "required": ["label", "description"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["header", "question", "options"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        }"#;
+
+        let qwen_bad = b"<function=question>\n<parameter=questions>\n[{\"header\":null,\"question\":\"What kind of video?\",\"options\":[{\"label\":\"Movies\",\"description\":\"Narrative film\"}]}]\n</parameter>\n</function>";
+        let qwen_good = b"<function=question>\n<parameter=questions>\n[{\"header\":\"Video type\",\"question\":\"What kind of video?\",\"options\":[{\"label\":\"Movies\",\"description\":\"Narrative film\"}]}]\n</parameter>\n</function>";
+        let mut qwen_rejected = qwen35_runtime("question", schema);
+        assert!(!qwen_rejected.accept_bytes(qwen_bad));
+        let mut qwen_accepted = qwen35_runtime("question", schema);
+        assert!(qwen_accepted.accept_bytes(qwen_good));
+        assert!(qwen_accepted.is_accepted());
+
+        let gemma_bad = b"call:question{questions:[{header:null,question:<|\"|>What kind of video?<|\"|>,options:[{label:<|\"|>Movies<|\"|>,description:<|\"|>Narrative film<|\"|>}]}]}";
+        let gemma_good = b"call:question{questions:[{header:<|\"|>Video type<|\"|>,question:<|\"|>What kind of video?<|\"|>,options:[{label:<|\"|>Movies<|\"|>,description:<|\"|>Narrative film<|\"|>}]}]}";
+        let mut gemma_rejected = gemma4_runtime("question", schema);
+        assert!(!gemma_rejected.accept_bytes(gemma_bad));
+        let mut gemma_accepted = gemma4_runtime("question", schema);
+        assert!(gemma_accepted.accept_bytes(gemma_good));
+        assert!(gemma_accepted.is_accepted());
+    }
+
+    #[test]
+    fn agentic_grammar_contract_cross_family_todowrite_rejects_null_content() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                            "priority": {"type": "string"}
+                        },
+                        "required": ["content", "status", "priority"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        }"#;
+
+        let qwen_bad = b"<function=todowrite>\n<parameter=todos>\n[{\"content\":null,\"status\":\"in_progress\",\"priority\":\"high\"}]\n</parameter>\n</function>";
+        let qwen_good = b"<function=todowrite>\n<parameter=todos>\n[{\"content\":\"Inspect the environment\",\"status\":\"in_progress\",\"priority\":\"high\"}]\n</parameter>\n</function>";
+        let mut qwen_rejected = qwen35_runtime("todowrite", schema);
+        assert!(!qwen_rejected.accept_bytes(qwen_bad));
+        let mut qwen_accepted = qwen35_runtime("todowrite", schema);
+        assert!(qwen_accepted.accept_bytes(qwen_good));
+        assert!(qwen_accepted.is_accepted());
+
+        let gemma_bad = b"call:todowrite{todos:[{content:null,status:<|\"|>in_progress<|\"|>,priority:<|\"|>high<|\"|>}]}";
+        let gemma_good = b"call:todowrite{todos:[{content:<|\"|>Inspect the environment<|\"|>,status:<|\"|>in_progress<|\"|>,priority:<|\"|>high<|\"|>}]}";
+        let mut gemma_rejected = gemma4_runtime("todowrite", schema);
+        assert!(!gemma_rejected.accept_bytes(gemma_bad));
+        let mut gemma_accepted = gemma4_runtime("todowrite", schema);
+        assert!(gemma_accepted.accept_bytes(gemma_good));
+        assert!(gemma_accepted.is_accepted());
+    }
+
+    #[test]
     fn deepseek4_question_candidate_mask_matches_runtime_on_malformed_json() {
         let schema = serde_json::json!({
             "type": "object",
