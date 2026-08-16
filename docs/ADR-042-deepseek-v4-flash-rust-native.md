@@ -410,6 +410,14 @@ brackets. An earlier `[^<\\]` grammar rule forced calls containing Rust generic
 or lifetime syntax such as `fmt::Formatter<'_>` to close immediately before
 the `<`, yielding valid but semantically truncated tool arguments.
 
+Non-string DSML parameters are constrained by their full recursive JSON
+schema, not merely by generic JSON syntax. Nested required fields, scalar
+types, arrays, objects, enums, and closed-object boundaries therefore apply
+before a token can be emitted. This is required for client tools whose sole
+top-level parameter is an array of structured objects: syntactically valid
+JSON such as a required string field set to `null` must be rejected by the
+grammar rather than discovered after generation by the client.
+
 ## Acceptance gates
 
 ### Converter gate
@@ -1574,6 +1582,31 @@ returned the exact sentinel in 16 tokens while reusing 6,665 tokens, completing
 in 6.108 seconds. This is local exact-artifact candidate evidence. Clean
 immutable source, exact-SHA CI, and the protected packed-artifact hardware gate
 remain the publication authority.
+
+### Nested DSML schema repair (2026-08-16 candidate)
+
+A stock client `question` call exposed a distinct nested-schema failure: the
+model emitted a syntactically damaged questions array whose required `header`
+was `null`, then repeated an ineffective repair intention. The close-time DSML
+parser correctly rejected the damaged body, but generation had constrained a
+non-string top-level parameter only to generic JSON. It therefore could not
+prevent well-formed JSON with a schema-invalid nested value.
+
+The DSML compiler now applies the same recursive schema rules used for nested
+objects and arrays throughout the agentic grammar. Focused tests reject the
+observed trailing-corrupt body, reject a well-formed questions array with
+`header:null`, accept the same body with a string header, and reject invalid
+token candidates using the exact 129,280-entry DeepSeek tokenizer.
+
+The release binary then ran the exact 100.05 GiB Q2 artifact on an Apple M5
+Max. A forced `question` request emitted one OpenAI tool call with the string
+header `Video Type`, a string question, and three complete label/description
+option objects. Its repeat reused 459 of 467 prompt tokens. The tool-result
+continuation reused the same boundary, acknowledged the selected video type,
+and stopped without another question. The SSE variant emitted 53 JSON chunks,
+one `tool_calls` finish, one terminal `[DONE]`, and no null header or parser
+error. This proves the repaired production failure path; clean immutable
+source and the protected exact-artifact gate remain release authority.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

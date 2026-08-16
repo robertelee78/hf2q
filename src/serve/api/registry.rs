@@ -2896,28 +2896,34 @@ fn deepseek4_tool_call_gbnf(
 ) -> Result<String, EmitterError> {
     let mut rules: Vec<(String, String)> = vec![
         (
-            "dsml-json-char".into(),
+            "qwen35-json-char".into(),
             r#"[^"\\\x00-\x1F] | [\\] (["\\/bfnrt] | "u" [0-9a-fA-F]{4})"#.into(),
         ),
         (
-            "dsml-json-str".into(),
-            r#""\"" dsml-json-char* "\"""#.into(),
+            "qwen35-json-str".into(),
+            r#""\"" qwen35-json-char* "\"""#.into(),
         ),
         (
-            "dsml-json-num".into(),
+            "qwen35-int-val".into(),
+            r#""-"? ([0] | [1-9] [0-9]{0,15})"#.into(),
+        ),
+        (
+            "qwen35-num-val".into(),
             r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#.into(),
         ),
+        ("qwen35-bool-val".into(), r#""true" | "false""#.into()),
+        ("qwen35-null-val".into(), r#""null""#.into()),
         (
-            "dsml-json-obj".into(),
-            r#""{" ("}" | dsml-json-str ":" dsml-json-val ("," dsml-json-str ":" dsml-json-val)* "}")"#.into(),
+            "qwen35-json-obj".into(),
+            r#""{" ("}" | qwen35-json-str ":" qwen35-json-val ("," qwen35-json-str ":" qwen35-json-val)* "}")"#.into(),
         ),
         (
-            "dsml-json-arr".into(),
-            r#""[" ("]" | dsml-json-val ("," dsml-json-val)* "]")"#.into(),
+            "qwen35-json-arr".into(),
+            r#""[" ("]" | qwen35-json-val ("," qwen35-json-val)* "]")"#.into(),
         ),
         (
-            "dsml-json-val".into(),
-            r#"dsml-json-str | dsml-json-num | "true" | "false" | "null" | dsml-json-obj | dsml-json-arr"#.into(),
+            "qwen35-json-val".into(),
+            r#"qwen35-json-str | qwen35-num-val | qwen35-bool-val | qwen35-null-val | qwen35-json-obj | qwen35-json-arr"#.into(),
         ),
         (
             "dsml-string-char".into(),
@@ -2955,6 +2961,7 @@ fn deepseek4_tool_call_gbnf(
 
     let mut required_parameter_rules = Vec::new();
     let mut optional_parameter_rules = Vec::new();
+    let mut rule_counter = 0_u32;
     if let Some(properties) = params_schema
         .as_object()
         .and_then(|object| object.get("properties"))
@@ -2969,9 +2976,16 @@ fn deepseek4_tool_call_gbnf(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|kind| kind == "string");
             let value_rule = if is_string {
-                "dsml-string-val"
+                "dsml-string-val".to_string()
             } else {
-                "dsml-json-val"
+                qwen35_nested_value_rule(
+                    fn_name,
+                    &format!("/{key}"),
+                    schema,
+                    &mut rules,
+                    &mut rule_counter,
+                    1,
+                )?
             };
             let open = gbnf_literal(&format!(
                 "<｜DSML｜parameter name=\"{}\" string=\"{}\">",
@@ -4731,6 +4745,62 @@ mod tests {
             !(alive && runtime.is_accepted()),
             "malformed JSON must be impossible after the lazy tool boundary"
         );
+    }
+
+    #[test]
+    fn deepseek4_question_nested_schema_rejects_null_header_and_accepts_repair() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "header": {"type": "string"},
+                            "question": {"type": "string"},
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string"}
+                                    },
+                                    "required": ["label", "description"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "multiple": {"type": "boolean"}
+                        },
+                        "required": ["header", "question", "options"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        }"#;
+        let malformed = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":null,\"question\":\"What kind of video?\",\"options\":[{\"label\":\"Movies\",\"description\":\"Narrative film\"}]}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let repaired = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":\"Video type\",\"question\":\"What kind of video?\",\"options\":[{\"label\":\"Movies\",\"description\":\"Narrative film\"}]}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+
+        let mut rejected = deepseek4_runtime(
+            "question",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        assert!(
+            !rejected.accept_bytes(malformed.as_bytes()),
+            "a schema-required string header must not admit JSON null"
+        );
+
+        let mut accepted = deepseek4_runtime(
+            "question",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        assert!(accepted.accept_bytes(repaired.as_bytes()));
+        assert!(accepted.is_accepted());
     }
 
     #[test]
