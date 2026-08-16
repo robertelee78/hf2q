@@ -65,6 +65,9 @@ pub enum ArchName {
     /// handler `/opt/llama.cpp/conversion/gemma.py:769-840
     /// Gemma4VisionAudioModel`.
     Gemma4VisionMmproj,
+    /// Dense Qwen3.5-family hybrid decoder (`qwen35` GGUF), including
+    /// Qwen3.8-27B. This is distinct from both Qwen MoE variants.
+    Qwen35,
     /// Qwen 3.5/3.6 MoE-A3B family — older dense-MoE variant (gguf
     /// upstream label `qwen3moe`, no linear-attention, no MTP heads,
     /// no shared experts). Used for HF arches like `Qwen3MoeForCausalLM`.
@@ -107,6 +110,7 @@ impl ArchName {
             ArchName::Gemma4 => "gemma4",
             ArchName::Gemma4Mmproj => "gemma4_mmproj",
             ArchName::Gemma4VisionMmproj => "gemma4_vision_mmproj",
+            ArchName::Qwen35 => "qwen35",
             ArchName::Qwen35Moe => "qwen3moe",
             ArchName::Qwen35MoeFull => "qwen35moe",
             ArchName::Qwen3VlText => "qwen3vl",
@@ -133,6 +137,7 @@ impl ArchName {
             "gemma4" => Some(ArchName::Gemma4),
             "gemma4_mmproj" => Some(ArchName::Gemma4Mmproj),
             "gemma4_vision_mmproj" => Some(ArchName::Gemma4VisionMmproj),
+            "qwen35" => Some(ArchName::Qwen35),
             // Two explicit labels for the same arch:
             //   - "qwen3moe" — upstream GGUF metadata convention
             //     (`general.architecture` value).
@@ -190,6 +195,7 @@ mod tests {
     fn arch_names_lowercase() {
         for arch in [
             ArchName::Gemma4,
+            ArchName::Qwen35,
             ArchName::Qwen35Moe,
             ArchName::Bert,
             ArchName::Llama3,

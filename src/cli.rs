@@ -263,16 +263,10 @@ pub struct ConvertCliArgs {
     /// APEX variants (`apex-i-quality`, `apex-i-balanced`, `apex-i-compact`)
     /// per ADR-033 §Pi. Mutually exclusive with `--imatrix-corpus`.
     ///
-    /// Two ways to produce an imatrix:
-    ///   1. **In-tree** (recommended for supported arches): use
-    ///      `--imatrix-corpus cdv3` instead. Drives hf2q's own
-    ///      forward-pass-based generator (ADR-033 §Pi Phase B,
-    ///      Stage 3.0 supports Gemma 4 only).
-    ///   2. **External** (works for any arch, useful when the
-    ///      target arch isn't yet wired for in-tree generation):
-    ///      run `llama-imatrix -m <gguf> -f
-    ///      data/calibration/cdv3.txt -o <out>.imatrix.gguf` from
-    ///      stock llama.cpp and pass `<out>.imatrix.gguf` here.
+    /// For supported architectures, `--imatrix-corpus cdv3` is the
+    /// recommended alternative. It drives hf2q's own forward-pass-based
+    /// generator (ADR-033 §Pi Phase B). A pre-computed file remains useful
+    /// for architectures that are not yet wired for in-tree generation.
     #[arg(long, conflicts_with = "imatrix_corpus")]
     pub imatrix: Option<PathBuf>,
 
@@ -282,15 +276,12 @@ pub struct ConvertCliArgs {
     /// the source `<hf_dir>` to a temporary F16 GGUF, loads it via the
     /// per-arch inference path, tokenizes the corpus, and runs
     /// `forward_prefill` over `--imatrix-n-ctx`-sized chunks (default
-    /// 512, matching stock `llama-imatrix -c 512`) while intercepting
-    /// per-tensor activations.
+    /// 512 while intercepting per-tensor activations.
     ///
-    /// **Supported arches: Gemma 4 (Stage 3.0) + Qwen 3.5/3.6 MoE
-    /// (Stage 3b.4 SHIPPED 2026-05-22).** Other arches (MiniMax-M2,
-    /// dense Qwen, BERT, etc.) surface
+    /// **Supported arches: Gemma 4 plus dense and MoE Qwen3.5-family
+    /// decoders.** Other arches (MiniMax-M2, BERT, etc.) surface
     /// `ImatrixError::UnsupportedArchForDriver`. For those, use the
-    /// `--imatrix <file>` flag with a pre-computed
-    /// `.imatrix.gguf` from stock `llama-imatrix`.
+    /// `--imatrix <file>` flag with a pre-computed `.imatrix.gguf`.
     ///
     /// Accepted values: `cdv3` (bartowski's default, baked at compile
     /// time), `mudler` (selector parses but the corpus itself is

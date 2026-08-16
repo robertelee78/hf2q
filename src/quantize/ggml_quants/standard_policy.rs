@@ -936,7 +936,9 @@ mod tests {
         let arches = [
             ArchName::Gemma4,
             ArchName::Gemma4Mmproj,
+            ArchName::Qwen35,
             ArchName::Qwen35Moe,
+            ArchName::Qwen35MoeFull,
             ArchName::Qwen3VlText,
             ArchName::Bert,
             ArchName::NomicBert,

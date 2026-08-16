@@ -1,7 +1,7 @@
 //! qwen35moe (Qwen3.5-MoE / Qwen3.6-35B-A3B) registry entry.
 //!
-//! Tensor catalog hand-transcribed from `/opt/llama.cpp/src/llama-arch.cpp`
-//! and the P4-shipped mapping in `src/models/qwen35/moe.rs`.
+//! The active mapping is `src/convert/arch/qwen35moe_full.rs`; the native
+//! consumer is `src/inference/models/qwen35`.
 
 use crate::arch::catalog::{LayerScope, TensorCatalog, TensorCatalogEntry, TensorDtype};
 use crate::arch::registry::{ArchEntry, EvalCorpus, QualityThresholds};
@@ -15,200 +15,200 @@ const MOE_CATALOG: TensorCatalog = TensorCatalog {
             name_template: "token_embd.weight",
             scope: LayerScope::Global,
             dtype: TensorDtype::F16,
-            citation: "src/models/qwen35/moe.rs:49",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "output_norm.weight",
             scope: LayerScope::Global,
             dtype: TensorDtype::F32,
-            citation: "src/models/qwen35/moe.rs:53",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "output.weight",
             scope: LayerScope::Global,
             dtype: TensorDtype::F16,
-            citation: "src/models/qwen35/moe.rs:57",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // Per-block norms.
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_norm.weight",
             scope: LayerScope::AllLayers,
             dtype: TensorDtype::F32,
-            citation: "src/models/qwen35/moe.rs:218",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.post_attention_norm.weight",
             scope: LayerScope::AllLayers,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:406; src/models/qwen35/moe.rs:221",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // Full-attention.
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_q.weight",
             scope: LayerScope::FullAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:149",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_k.weight",
             scope: LayerScope::FullAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:150",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_v.weight",
             scope: LayerScope::FullAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:151",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_output.weight",
             scope: LayerScope::FullAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:152",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_q_norm.weight",
             scope: LayerScope::FullAttentionLayersOnly,
             dtype: TensorDtype::F32,
-            citation: "src/models/qwen35/moe.rs:153",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_k_norm.weight",
             scope: LayerScope::FullAttentionLayersOnly,
             dtype: TensorDtype::F32,
-            citation: "src/models/qwen35/moe.rs:154",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // Linear-attention (shared with dense).
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_qkv.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "llama-arch.cpp:421; src/models/qwen35/moe.rs:179",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.attn_gate.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "llama-arch.cpp:409; src/models/qwen35/moe.rs:181",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_alpha.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "llama-arch.cpp:438; src/models/qwen35/moe.rs:183",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_beta.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "llama-arch.cpp:455; src/models/qwen35/moe.rs:185",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_out.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::Quantized,
-            citation: "llama-arch.cpp:441; src/models/qwen35/moe.rs:187",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_a",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:434; src/models/qwen35/moe.rs:189",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_dt.bias",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:436 LLM_TENSOR_SSM_DT + gguf-py/gguf/constants.py:1175",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_conv1d.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:435",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ssm_norm.weight",
             scope: LayerScope::LinearAttentionLayersOnly,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:440",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // MoE router (one per MoE block; every block has the router in qwen35moe).
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_gate_inp.weight",
             scope: LayerScope::MoeRouterPerLayer,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:394 LLM_TENSOR_FFN_GATE_INP; src/models/qwen35/moe.rs:83",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // Merged per-expert tensors (N experts merged into one 3-D stack per projection).
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_gate_exps.weight",
             scope: LayerScope::AllLayers, // Once per block after merge — not once per expert.
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:126 (merged stack of 256 experts)",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_up_exps.weight",
             scope: LayerScope::AllLayers,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:127",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_down_exps.weight",
             scope: LayerScope::AllLayers,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:128",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // Shared-expert tensors (per-block, one copy).
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_gate_shexp.weight",
             scope: LayerScope::MoeSharedExpertPerLayer,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:138",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_up_shexp.weight",
             scope: LayerScope::MoeSharedExpertPerLayer,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:139",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_down_shexp.weight",
             scope: LayerScope::MoeSharedExpertPerLayer,
             dtype: TensorDtype::Quantized,
-            citation: "src/models/qwen35/moe.rs:140",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.ffn_gate_inp_shexp.weight",
             scope: LayerScope::MoeSharedExpertPerLayer,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:433; src/models/qwen35/moe.rs:90",
+            citation: "src/convert/arch/qwen35moe_full.rs",
         },
         // MTP tensors.
         TensorCatalogEntry {
             name_template: "blk.{L}.nextn.enorm.weight",
             scope: LayerScope::MtpLayers,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:507",
+            citation: "src/convert/arch/qwen35moe_full.rs; src/inference/models/qwen35/mtp_weights_load.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.nextn.hnorm.weight",
             scope: LayerScope::MtpLayers,
             dtype: TensorDtype::F32,
-            citation: "llama-arch.cpp:508",
+            citation: "src/convert/arch/qwen35moe_full.rs; src/inference/models/qwen35/mtp_weights_load.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.nextn.embed_tokens.weight",
             scope: LayerScope::MtpLayers,
             dtype: TensorDtype::F16,
-            citation: "llama-arch.cpp:506",
+            citation: "src/convert/arch/qwen35moe_full.rs; src/inference/models/qwen35/mtp_weights_load.rs",
         },
         TensorCatalogEntry {
             name_template: "blk.{L}.nextn.eh_proj.weight",
             scope: LayerScope::MtpLayers,
             dtype: TensorDtype::Quantized,
-            citation: "llama-arch.cpp:505",
+            citation: "src/convert/arch/qwen35moe_full.rs; src/inference/models/qwen35/mtp_weights_load.rs",
         },
     ],
 };

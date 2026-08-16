@@ -47,8 +47,12 @@ pub enum LayerScope {
     Global,
     /// Emitted once per block index `[0, num_hidden_layers)`.
     AllLayers,
+    /// Emitted once per verifier block and once per appended MTP block.
+    AllLayersIncludingMtp,
     /// Emitted only for layers whose `Qwen35LayerKind` is `FullAttention`.
     FullAttentionLayersOnly,
+    /// Emitted for full-attention verifier layers and appended MTP blocks.
+    FullAttentionAndMtpLayers,
     /// Emitted only for layers whose `Qwen35LayerKind` is `LinearAttention`.
     LinearAttentionLayersOnly,
     /// Emitted once per MTP block (`mtp_num_hidden_layers` in HF config).
@@ -96,7 +100,13 @@ impl TensorCatalog {
             let count = match e.scope {
                 LayerScope::Global => 1,
                 LayerScope::AllLayers => exp.num_hidden_layers as u64,
+                LayerScope::AllLayersIncludingMtp => {
+                    (exp.num_hidden_layers + exp.mtp_num_hidden_layers) as u64
+                }
                 LayerScope::FullAttentionLayersOnly => exp.num_full_attention_layers as u64,
+                LayerScope::FullAttentionAndMtpLayers => {
+                    (exp.num_full_attention_layers + exp.mtp_num_hidden_layers) as u64
+                }
                 LayerScope::LinearAttentionLayersOnly => exp.num_linear_attention_layers as u64,
                 LayerScope::MtpLayers => exp.mtp_num_hidden_layers as u64,
                 LayerScope::MoeExpertsPerLayer => {
@@ -128,11 +138,28 @@ impl TensorCatalog {
                         names.push(e.name_template.replace("{L}", &l.to_string()));
                     }
                 }
+                LayerScope::AllLayersIncludingMtp => {
+                    for l in 0..(exp.num_hidden_layers + exp.mtp_num_hidden_layers) {
+                        names.push(e.name_template.replace("{L}", &l.to_string()));
+                    }
+                }
                 LayerScope::FullAttentionLayersOnly | LayerScope::LinearAttentionLayersOnly => {
                     // Caller must filter by known layer kinds; expansion inserts indices
                     // for every block and downstream matchers filter by kind.
                     for l in 0..exp.num_hidden_layers {
                         names.push(e.name_template.replace("{L}", &l.to_string()));
+                    }
+                }
+                LayerScope::FullAttentionAndMtpLayers => {
+                    // The catalog does not carry concrete verifier layer kinds;
+                    // callers apply that filter. MTP blocks are appended after
+                    // the verifier range and always use full attention.
+                    for l in 0..exp.num_hidden_layers {
+                        names.push(e.name_template.replace("{L}", &l.to_string()));
+                    }
+                    for l in 0..exp.mtp_num_hidden_layers {
+                        let block = exp.num_hidden_layers + l;
+                        names.push(e.name_template.replace("{L}", &block.to_string()));
                     }
                 }
                 LayerScope::MtpLayers => {
@@ -230,6 +257,38 @@ mod tests {
         assert!(names.contains(&"blk.3.attn_q.weight".to_string()));
         // MTP layer is at block N == num_hidden_layers
         assert!(names.contains(&"blk.4.nextn.embed.weight".to_string()));
+    }
+
+    #[test]
+    fn qwen_dense_mtp_scopes_count_appended_block_without_duplicate_templates() {
+        const CAT: TensorCatalog = TensorCatalog {
+            entries: &[
+                TensorCatalogEntry {
+                    name_template: "blk.{L}.attn_norm.weight",
+                    scope: LayerScope::AllLayersIncludingMtp,
+                    dtype: TensorDtype::F32,
+                    citation: "test",
+                },
+                TensorCatalogEntry {
+                    name_template: "blk.{L}.attn_q.weight",
+                    scope: LayerScope::FullAttentionAndMtpLayers,
+                    dtype: TensorDtype::Quantized,
+                    citation: "test",
+                },
+            ],
+        };
+        let exp = CatalogExpansion {
+            num_hidden_layers: 64,
+            num_full_attention_layers: 16,
+            num_linear_attention_layers: 48,
+            num_experts: 0,
+            has_shared_expert: false,
+            mtp_num_hidden_layers: 1,
+        };
+        assert_eq!(CAT.expected_tensor_count(exp), 65 + 17);
+        let names = CAT.expand_names(exp);
+        assert!(names.contains(&"blk.64.attn_norm.weight".to_string()));
+        assert!(names.contains(&"blk.64.attn_q.weight".to_string()));
     }
 
     #[test]

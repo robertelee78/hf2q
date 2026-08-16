@@ -293,6 +293,264 @@ fn convert_llama3_tiny_round_trip() {
     }
 }
 
+/// Build a complete four-layer dense Qwen3.5-family fixture with the same
+/// 3-linear/1-full schedule and one dense MTP block used by Qwen3.8. The
+/// dimensions are deliberately small but preserve every tensor kind and the
+/// 1:2 linear K/V-head reorder ratio.
+fn synthesize_tiny_qwen38(dir: &Path) {
+    // K-quant rows must be divisible by the 256-value super-block. Keeping
+    // every matrix axis production-valid makes the Q4_K_M half of the
+    // round-trip exercise the same formats accepted by the native loader.
+    const H: usize = 256;
+    const FF: usize = 512;
+    const VOCAB: usize = 256;
+    const LAYERS: usize = 4;
+    const HEAD_DIM: usize = 128;
+
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+    let bytes = |numel: usize, seed: u32| -> Vec<u8> {
+        (0..numel)
+            .flat_map(|i| {
+                let bits = (i as u32).wrapping_mul(747_796_405).wrapping_add(seed);
+                ((bits as i32) as f32 / i32::MAX as f32).to_le_bytes()
+            })
+            .collect()
+    };
+    let mut push = |name: String, shape: Vec<usize>, seed: u32| {
+        let numel = shape.iter().product();
+        tensors.push((name, shape, bytes(numel, seed)));
+    };
+
+    push(
+        "model.language_model.embed_tokens.weight".into(),
+        vec![VOCAB, H],
+        1,
+    );
+    push("model.language_model.norm.weight".into(), vec![H], 2);
+    push("lm_head.weight".into(), vec![VOCAB, H], 3);
+
+    for layer in 0..LAYERS {
+        let p = format!("model.language_model.layers.{layer}");
+        let seed = 1000 + layer as u32 * 100;
+        push(format!("{p}.input_layernorm.weight"), vec![H], seed + 1);
+        push(
+            format!("{p}.post_attention_layernorm.weight"),
+            vec![H],
+            seed + 2,
+        );
+        push(format!("{p}.mlp.gate_proj.weight"), vec![FF, H], seed + 3);
+        push(format!("{p}.mlp.up_proj.weight"), vec![FF, H], seed + 4);
+        push(format!("{p}.mlp.down_proj.weight"), vec![H, FF], seed + 5);
+        if (layer + 1) % 4 == 0 {
+            push(
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![4 * HEAD_DIM, H],
+                seed + 10,
+            );
+            for (offset, projection) in [(11, "k"), (12, "v")] {
+                push(
+                    format!("{p}.self_attn.{projection}_proj.weight"),
+                    vec![HEAD_DIM, H],
+                    seed + offset,
+                );
+            }
+            push(
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![H, 2 * HEAD_DIM],
+                seed + 13,
+            );
+            push(
+                format!("{p}.self_attn.q_norm.weight"),
+                vec![HEAD_DIM],
+                seed + 14,
+            );
+            push(
+                format!("{p}.self_attn.k_norm.weight"),
+                vec![HEAD_DIM],
+                seed + 15,
+            );
+        } else {
+            push(format!("{p}.linear_attn.A_log"), vec![2], seed + 20);
+            push(
+                format!("{p}.linear_attn.conv1d.weight"),
+                vec![4 * HEAD_DIM, 1, 4],
+                seed + 21,
+            );
+            push(format!("{p}.linear_attn.dt_bias"), vec![2], seed + 22);
+            for (offset, projection) in [(23, "a"), (24, "b")] {
+                push(
+                    format!("{p}.linear_attn.in_proj_{projection}.weight"),
+                    vec![2, H],
+                    seed + offset,
+                );
+            }
+            push(
+                format!("{p}.linear_attn.in_proj_qkv.weight"),
+                vec![4 * HEAD_DIM, H],
+                seed + 25,
+            );
+            push(
+                format!("{p}.linear_attn.in_proj_z.weight"),
+                vec![2 * HEAD_DIM, H],
+                seed + 26,
+            );
+            push(
+                format!("{p}.linear_attn.norm.weight"),
+                vec![HEAD_DIM],
+                seed + 27,
+            );
+            push(
+                format!("{p}.linear_attn.out_proj.weight"),
+                vec![H, 2 * HEAD_DIM],
+                seed + 28,
+            );
+        }
+    }
+
+    let mtp = "mtp.layers.0";
+    push("mtp.fc.weight".into(), vec![H, 2 * H], 5001);
+    push(format!("{mtp}.input_layernorm.weight"), vec![H], 5002);
+    push(format!("{mtp}.mlp.down_proj.weight"), vec![H, FF], 5003);
+    push(format!("{mtp}.mlp.gate_proj.weight"), vec![FF, H], 5004);
+    push(format!("{mtp}.mlp.up_proj.weight"), vec![FF, H], 5005);
+    push(
+        format!("{mtp}.post_attention_layernorm.weight"),
+        vec![H],
+        5006,
+    );
+    push(
+        format!("{mtp}.self_attn.k_norm.weight"),
+        vec![HEAD_DIM],
+        5007,
+    );
+    push(
+        format!("{mtp}.self_attn.k_proj.weight"),
+        vec![HEAD_DIM, H],
+        5008,
+    );
+    push(
+        format!("{mtp}.self_attn.o_proj.weight"),
+        vec![H, 2 * HEAD_DIM],
+        5009,
+    );
+    push(
+        format!("{mtp}.self_attn.q_norm.weight"),
+        vec![HEAD_DIM],
+        5010,
+    );
+    push(
+        format!("{mtp}.self_attn.q_proj.weight"),
+        vec![4 * HEAD_DIM, H],
+        5011,
+    );
+    push(
+        format!("{mtp}.self_attn.v_proj.weight"),
+        vec![HEAD_DIM, H],
+        5012,
+    );
+    push("mtp.norm.weight".into(), vec![H], 5013);
+    push("mtp.pre_fc_norm_embedding.weight".into(), vec![H], 5014);
+    push("mtp.pre_fc_norm_hidden.weight".into(), vec![H], 5015);
+
+    // Known vision-side tensor: must be omitted from the text GGUF.
+    push("model.visual.pos_embed.weight".into(), vec![32, H], 6001);
+
+    let views: Vec<(String, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(name, shape, data)| {
+            (
+                name.clone(),
+                TensorView::new(Dtype::F32, shape.clone(), data).expect("tensor view"),
+            )
+        })
+        .collect();
+    let refs: Vec<(String, &TensorView<'_>)> = views
+        .iter()
+        .map(|(name, view)| (name.clone(), view))
+        .collect();
+    fs::write(
+        dir.join("model.safetensors"),
+        safetensors::tensor::serialize(refs, None).expect("serialize Qwen3.8 fixture"),
+    )
+    .unwrap();
+
+    let config = serde_json::json!({
+        "_name_or_path": "synthetic/Qwen3.8-Tiny",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": H,
+            "intermediate_size": FF,
+            "num_hidden_layers": LAYERS,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": HEAD_DIM,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1.0e-6,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": HEAD_DIM,
+            "linear_value_head_dim": HEAD_DIM,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 2,
+            "full_attention_interval": 4,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [1, 1, 2],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000
+            },
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
+            "vocab_size": VOCAB
+        },
+        "vision_config": {"depth": 1, "hidden_size": H}
+    });
+    fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    write_minimal_tokenizer_fixture(dir, VOCAB);
+}
+
+#[test]
+fn convert_qwen38_dense_tiny_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen38(model_dir.path());
+
+    for quant in ["q8_0", "q4_k_m"] {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        Command::cargo_bin("hf2q")
+            .unwrap()
+            .arg("convert")
+            .arg(model_dir.path())
+            .arg("--quant")
+            .arg(quant)
+            .arg("-o")
+            .arg(output.path())
+            .assert()
+            .success();
+
+        let gguf = mlx_native::gguf::GgufFile::open(output.path())
+            .unwrap_or_else(|error| panic!("open Qwen3.8 {quant} GGUF: {error}"));
+        assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen35"));
+        assert_eq!(gguf.metadata_u32("qwen35.block_count"), Some(5));
+        assert_eq!(gguf.metadata_u32("qwen35.nextn_predict_layers"), Some(1));
+        assert!(matches!(
+            gguf.metadata("qwen35.nextn.use_dedicated_embeddings"),
+            Some(mlx_native::gguf::MetadataValue::Bool(false))
+        ));
+        assert_eq!(gguf.tensor_count(), 71);
+        assert!(gguf.tensor_info("blk.0.ssm_conv1d.weight").is_some());
+        assert!(gguf.tensor_info("blk.3.attn_q.weight").is_some());
+        assert!(gguf.tensor_info("blk.4.nextn.eh_proj.weight").is_some());
+        assert!(gguf.tensor_info("blk.4.ffn_gate.weight").is_some());
+        assert!(gguf.tensor_info("model.visual.pos_embed.weight").is_none());
+    }
+}
+
 /// Sibling test — feeding an unsupported `model_type` surfaces typed
 /// `ConvertError::UnsupportedArch`, which the CLI dispatcher maps to
 /// `AppError::Input` → exit code 3 + diagnostic mentioning the

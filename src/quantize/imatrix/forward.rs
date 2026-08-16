@@ -411,9 +411,9 @@ pub struct ComputeImatrixParams {
 ///
 /// Pipeline (per ADR-033 §Pi):
 ///   1. Convert `hf_dir` to a temporary F16 GGUF via `run_convert`.
-///   2. Load the F16 GGUF via `LoadedModel::load`. Supported arches:
-///      Gemma 4 (Stage 3.0) and Qwen 3.5/3.6 MoE (Stage 3b.4); other
-///      arches surface [`ImatrixError::UnsupportedArchForDriver`].
+///   2. Load the inner GGUF via `LoadedModel::load`. Supported arches:
+///      Gemma 4 plus dense and MoE Qwen3.5-family decoders; other arches
+///      surface [`ImatrixError::UnsupportedArchForDriver`].
 ///   3. Tokenize `params.corpus` via the model's tokenizer.
 ///   4. Chunk tokens into `params.n_ctx`-sized windows via
 ///      [`super::corpus::chunk_tokens`]; partial trailing chunks
@@ -424,7 +424,8 @@ pub struct ComputeImatrixParams {
 ///      (Gemma: `forward_prefill(chunk, 1, &mut ctx)`; Qwen35Moe:
 ///      `Qwen35Model::forward_gpu_last_logits(chunk, positions,
 ///      &mut kv_cache)`); collector is automatically dropped on
-///      scope exit.
+///      scope exit. Dense Qwen uses the same forward path with a
+///      single-matrix collector rather than routed-expert accumulation.
 ///   6. Pack the accumulated registry into [`super::ImatrixData`]
 ///      with [`super::ImatrixProvenance::Computed`] provenance.
 ///
@@ -454,16 +455,16 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
             ),
         });
     }
-    // Stage 3.0 (Gemma 4) + Stage 3b.4 (Qwen 3.5/3.6 MoE) are wired
+    // Gemma 4 plus dense and MoE Qwen3.5-family graphs are wired
     // for the driver. Other arches surface a typed error pointing at
     // the supported set.
     if !matches!(
         params.arch,
-        Arch::Gemma4 | Arch::Qwen35Moe | Arch::Qwen35MoeFull,
+        Arch::Gemma4 | Arch::Qwen35 | Arch::Qwen35Moe | Arch::Qwen35MoeFull,
     ) {
         return Err(ImatrixError::UnsupportedArchForDriver {
             arch: params.arch.name().to_string(),
-            supported: &["gemma4", "qwen35moe"],
+            supported: &["gemma4", "qwen35", "qwen35moe"],
         });
     }
     let tmp = tempfile::tempdir().map_err(ImatrixError::Io)?;
@@ -632,7 +633,7 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
     // ---- 7. Drive forward pass over each chunk ------------------------
     //
     // Arch-specific prefill: Gemma 4 uses `forward_prefill(chunk, 1,
-    // &mut ctx)` (Stage 3.0); Qwen 3.5/3.6 MoE uses
+    // &mut ctx)`; dense and MoE Qwen3.5-family models use
     // `Qwen35Model::forward_gpu_last_logits(chunk, positions, &mut
     // kv_cache)` with a fresh HybridKvCache per chunk + 4-axis
     // mRoPE positions (Stage 3b.4). Both call the same intercept
@@ -647,17 +648,11 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
             .moe
             .as_ref()
             .map(|m| m.num_experts as usize)
-            .ok_or_else(|| ImatrixError::UnsupportedArchForDriver {
-                arch: format!(
-                    "{} (dense — imatrix driver is MoE-only)",
-                    params.arch.name()
-                ),
-                supported: &["gemma4", "qwen35moe"],
-            })?,
+            .unwrap_or(1),
         _ => {
             return Err(ImatrixError::UnsupportedArchForDriver {
                 arch: format!("{:?}", params.arch),
-                supported: &["gemma4", "qwen35moe"],
+                supported: &["gemma4", "qwen35", "qwen35moe"],
             })
         }
     };
@@ -747,7 +742,7 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
         _ => {
             return Err(ImatrixError::UnsupportedArchForDriver {
                 arch: format!("{:?}", params.arch),
-                supported: &["gemma4", "qwen35moe"],
+                supported: &["gemma4", "qwen35", "qwen35moe"],
             })
         }
     }
@@ -1033,8 +1028,7 @@ mod tests {
         }
     }
 
-    /// Stage 3 driver: arches outside the Stage 3.0 + Stage 3b.4
-    /// supported set (Gemma 4 + Qwen 3.5/3.6 MoE) surface
+    /// Arches outside the Gemma 4 + dense/MoE Qwen3.5-family set surface
     /// `UnsupportedArchForDriver` BEFORE touching the filesystem
     /// (cheap upfront validation per the "fail fast at boundaries"
     /// rule). MiniMax-M2 is the canonical out-of-scope MoE used for
@@ -1054,7 +1048,7 @@ mod tests {
         match err {
             ImatrixError::UnsupportedArchForDriver { arch, supported } => {
                 assert_eq!(arch, "minimax-m2");
-                assert_eq!(supported, &["gemma4", "qwen35moe"]);
+                assert_eq!(supported, &["gemma4", "qwen35", "qwen35moe"]);
             }
             other => panic!("expected UnsupportedArchForDriver, got {other:?}"),
         }
@@ -1117,6 +1111,22 @@ mod tests {
             ),
             other => panic!("expected ConvertFailed past arch gate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compute_imatrix_dense_qwen35_passes_arch_gate() {
+        let corpus = CorpusBytes::load(&CorpusSource::Cdv3).unwrap();
+        let params = ComputeImatrixParams {
+            hf_dir: PathBuf::from("/tmp/non-existent-fixture-qwen35-dense-driver"),
+            corpus,
+            n_ctx: 512,
+            arch: ArchName::Qwen35,
+        };
+        let err = compute_imatrix(&params).unwrap_err();
+        assert!(
+            matches!(err, ImatrixError::ConvertFailed { .. }),
+            "dense qwen35 must pass the arch gate, got {err:?}"
+        );
     }
 
     /// Used as a test-only collector that records via shared state. We

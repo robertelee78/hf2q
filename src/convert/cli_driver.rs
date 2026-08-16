@@ -33,11 +33,12 @@ use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
 use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
+use crate::convert::arch::qwen35_dense::Qwen35DenseCtx;
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
-use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
+use crate::convert::arch::qwen35moe_full::{Qwen35LinearAttentionCtx, Qwen35MoeFullCtx};
 use crate::convert::arch::{
     bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
-    nomic_bert, qwen35moe, qwen35moe_full, qwen3vl_text,
+    nomic_bert, qwen35_dense, qwen35moe, qwen35moe_full, qwen3vl_text,
 };
 use crate::convert::orchestrator::PlanEntry;
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
@@ -244,7 +245,7 @@ impl std::fmt::Display for ConvertError {
                 write!(
                     f,
                     "convert: unsupported architecture `{arch_name}` \
-                     (supported: llama, gemma3, bert, nomic_bert, qwen3_moe, qwen3_5_moe, \
+                     (supported: llama, gemma3, bert, nomic_bert, qwen3_moe, qwen3_5, qwen3_5_moe, \
                      qwen3_vl, minimax_m2)"
                 )
             }
@@ -633,11 +634,12 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // consume the model card ignore the parameter.
     let model_card = crate::convert::model_card::parse_readme_frontmatter(&args.hf_dir);
     let sampling = crate::convert::model_card::parse_generation_config(&args.hf_dir);
-    let dir_basename: Option<String> = args
-        .hf_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(String::from);
+    // A remote conversion lives in a content-addressed cache directory whose
+    // basename is the exact revision SHA.  That is storage identity, not model
+    // identity, and must never leak into `general.name`.  Prefer the final
+    // component of the verified repository ID for remote sources; retain the
+    // local-directory behavior for explicit `--hf-dir` conversions.
+    let dir_basename: Option<String> = conversion_model_basename(&args);
     // Pre-compute `general.size_label` for MoE arches by walking the
     // source tensors. Mirrors canonical's
     // `gguf_writer.get_total_parameter_count()` + `gguf.size_label()`
@@ -911,6 +913,19 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     Ok(())
 }
 
+fn conversion_model_basename(args: &ConvertArgs) -> Option<String> {
+    args.remote_source
+        .as_ref()
+        .and_then(|source| source.repo.rsplit('/').find(|part| !part.is_empty()))
+        .map(String::from)
+        .or_else(|| {
+            args.hf_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+        })
+}
+
 fn create_temporary_output(output: &Path) -> Result<tempfile::NamedTempFile, ConvertError> {
     let parent = output
         .parent()
@@ -1091,10 +1106,10 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B has this at config.json:6).
             // The `_text` variant is the nested text_config.model_type
             // that text-only `Qwen3_5MoeForCausalLM` checkpoints expose.
-            // Note: "Qwen 3.6" is a model VERSION name; all locally-
-            // available qwen3.6-* models use Qwen3_5* arch strings
-            // (canonical does NOT define a Qwen3_6Moe* arch — verified
-            // via grep on /opt/llama.cpp/conversion).
+            // Note: "Qwen 3.6" and "Qwen 3.8" are model version names;
+            // their official configurations continue to use Qwen3_5*
+            // architecture strings.
+            "qwen3_5" | "qwen3_5_text" => return Ok(ArchName::Qwen35),
             "qwen3_5_moe" | "qwen3_5_moe_text" => return Ok(ArchName::Qwen35MoeFull),
             "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
             "minimax_m2" => return Ok(ArchName::MiniMaxM2),
@@ -1138,6 +1153,9 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             // registers Qwen3_5MoeFor* (no Qwen3_6Moe* arch exists).
             "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => {
                 return Ok(ArchName::Qwen35MoeFull);
+            }
+            "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration" => {
+                return Ok(ArchName::Qwen35);
             }
             "Qwen3VLForConditionalGeneration"
             | "Qwen3VLMoeForConditionalGeneration"
@@ -1409,6 +1427,14 @@ fn build_metadata_for_arch(
             bert_pooling_override,
         ),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card, size_label),
+        ArchName::Qwen35 => qwen35_dense::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+            size_label,
+        ),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
         ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {
             Some(ctx) => qwen35moe_full::build_metadata(
@@ -1598,6 +1624,7 @@ fn map_tensor(
     arch: ArchName,
     hf_name: &str,
     hf_shape: &[usize],
+    qwen35_dense_ctx: Option<&Qwen35DenseCtx>,
     qwen35moe_full_ctx: Option<&Qwen35MoeFullCtx>,
     llama3_ctx: Option<&Llama3Ctx>,
     nomic_bert_ctx: &nomic_bert::NomicBertCtx,
@@ -1705,6 +1732,12 @@ fn map_tensor(
             }
         },
         ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
+        ArchName::Qwen35 => match qwen35_dense_ctx {
+            Some(ctx) => {
+                lift_qwen35moe_full_mapped(qwen35_dense::map_tensor_name(hf_name, hf_shape, ctx))
+            }
+            None => MapOutcome::Unmapped,
+        },
         ArchName::Qwen35MoeFull => match qwen35moe_full_ctx {
             Some(ctx) => {
                 lift_qwen35moe_full_mapped(qwen35moe_full::map_tensor_name(hf_name, hf_shape, ctx))
@@ -1893,6 +1926,62 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         linear_value_head_dim,
         multimodal_wrapping,
         drop_mtp,
+    })
+}
+
+fn build_qwen35_dense_ctx(config: &serde_json::Value) -> Option<Qwen35DenseCtx> {
+    let text = effective_config(config);
+    let num_hidden_layers = text.get("num_hidden_layers")?.as_u64()? as usize;
+    let full_attention_interval = text
+        .get("full_attention_interval")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(4) as usize;
+    let linear_num_key_heads = text.get("linear_num_key_heads")?.as_u64()? as usize;
+    let linear_num_value_heads = text.get("linear_num_value_heads")?.as_u64()? as usize;
+    let linear_key_head_dim = text.get("linear_key_head_dim")?.as_u64()? as usize;
+    let linear_value_head_dim = text.get("linear_value_head_dim")?.as_u64()? as usize;
+    if num_hidden_layers == 0
+        || full_attention_interval == 0
+        || linear_num_key_heads == 0
+        || linear_num_value_heads == 0
+        || linear_key_head_dim == 0
+        || linear_value_head_dim == 0
+        || linear_num_value_heads % linear_num_key_heads != 0
+    {
+        return None;
+    }
+    if let Some(layer_types) = text.get("layer_types").and_then(|value| value.as_array()) {
+        if layer_types.len() != num_hidden_layers
+            || layer_types.iter().enumerate().any(|(layer, value)| {
+                let expected = if (layer + 1) % full_attention_interval == 0 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                };
+                value.as_str() != Some(expected)
+            })
+        {
+            return None;
+        }
+    }
+    let multimodal_wrapping = config
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .any(|name| name.ends_with("ForConditionalGeneration"))
+        })
+        .unwrap_or(false);
+    Some(Qwen35DenseCtx {
+        num_hidden_layers,
+        linear: Qwen35LinearAttentionCtx {
+            linear_num_key_heads,
+            linear_num_value_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+        },
+        multimodal_wrapping,
     })
 }
 
@@ -2187,6 +2276,10 @@ fn build_convert_plan(
     // one but the config is missing required fields it's also None
     // and every tensor surfaces as UnmappedTensor — per the
     // no-fallback rule.
+    let qwen35_dense_ctx: Option<Qwen35DenseCtx> = match arch {
+        ArchName::Qwen35 => build_qwen35_dense_ctx(&src.config),
+        _ => None,
+    };
     let qwen35moe_full_ctx: Option<Qwen35MoeFullCtx> = match arch {
         ArchName::Qwen35MoeFull => build_qwen35moe_full_ctx(&src.config),
         _ => None,
@@ -2208,6 +2301,7 @@ fn build_convert_plan(
             arch,
             &meta.name,
             &meta.shape,
+            qwen35_dense_ctx.as_ref(),
             qwen35moe_full_ctx.as_ref(),
             llama3_ctx.as_ref(),
             &nomic_bert_ctx,
@@ -2446,6 +2540,7 @@ fn build_convert_plan(
             arch,
             &t.name,
             &t.shape,
+            qwen35_dense_ctx.as_ref(),
             qwen35moe_full_ctx.as_ref(),
             llama3_ctx.as_ref(),
             &nomic_bert_ctx,
@@ -2670,6 +2765,47 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
 
+    fn basename_test_args(hf_dir: &str, repo: Option<&str>) -> ConvertArgs {
+        ConvertArgs {
+            hf_dir: PathBuf::from(hf_dir),
+            selector: QuantSelector::Standard(LlamaFtype::MostlyQ8_0),
+            output: PathBuf::from("out.gguf"),
+            dry_run: true,
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mmproj: false,
+            remote_source: repo.map(|repo| RemoteConversionSource {
+                repo: repo.into(),
+                revision: "a".repeat(40),
+                source_sha256: "b".repeat(64),
+                files: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn remote_model_name_uses_repository_not_content_addressed_cache_directory() {
+        let args = basename_test_args(
+            "/cache/Qwen__Qwen3.8-27B/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            Some("Qwen/Qwen3.8-27B"),
+        );
+        assert_eq!(
+            conversion_model_basename(&args).as_deref(),
+            Some("Qwen3.8-27B")
+        );
+    }
+
+    #[test]
+    fn local_model_name_remains_directory_basename() {
+        let args = basename_test_args("/models/custom-qwen38", None);
+        assert_eq!(
+            conversion_model_basename(&args).as_deref(),
+            Some("custom-qwen38")
+        );
+    }
+
     #[test]
     fn temporary_conversion_output_is_fail_safe_and_promotes_atomically() {
         let dir = tempfile::tempdir().unwrap();
@@ -2792,6 +2928,42 @@ mod tests {
             detect_arch(&json!({ "architectures": ["Qwen3MoeForCausalLM"] })).unwrap(),
             ArchName::Qwen35Moe
         );
+    }
+
+    #[test]
+    fn qwen38_official_config_detects_dense_qwen35() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        assert_eq!(detect_arch(&config).expect("detect"), ArchName::Qwen35);
+
+        let text_only = serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "architectures": ["Qwen3_5ForCausalLM"]
+        });
+        assert_eq!(
+            detect_arch(&text_only).expect("detect text-only"),
+            ArchName::Qwen35
+        );
+    }
+
+    #[test]
+    fn qwen38_dense_context_rejects_zero_linear_dimensions() {
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        config["text_config"]["linear_key_head_dim"] = serde_json::json!(0);
+        assert!(build_qwen35_dense_ctx(&config).is_none());
+    }
+
+    #[test]
+    fn qwen38_dense_context_rejects_an_irregular_layer_schedule() {
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        config["text_config"]["layer_types"] =
+            serde_json::Value::Array(vec![serde_json::json!("full_attention"); 64]);
+        assert!(build_qwen35_dense_ctx(&config).is_none());
     }
 
     /// All three qwen3_vl flavors land on Qwen3VlText.
@@ -3110,8 +3282,8 @@ mod tests {
 
     /// **Stage 3c.2 — `--imatrix-corpus` on an unsupported arch
     /// surfaces `UnsupportedArchForDriver`** BEFORE attempting any
-    /// convert/load. Stage 3.0 (Gemma 4) + Stage 3b.4 (Qwen 3.5/3.6
-    /// MoE) are the supported driver arches; MiniMax-M2 is the
+    /// convert/load. Gemma 4 plus dense and MoE Qwen3.5-family models
+    /// are the supported driver arches; MiniMax-M2 is the
     /// canonical out-of-scope MoE used here.
     #[test]
     fn imatrix_corpus_unsupported_arch_errors_typed() {
@@ -3134,7 +3306,7 @@ mod tests {
                 },
             ) => {
                 assert_eq!(arch, "minimax-m2");
-                assert_eq!(supported, &["gemma4", "qwen35moe"]);
+                assert_eq!(supported, &["gemma4", "qwen35", "qwen35moe"]);
             }
             other => panic!("expected UnsupportedArchForDriver, got {other:?}"),
         }

@@ -133,12 +133,39 @@ pub struct Qwen35MoeFullCtx {
     pub drop_mtp: bool,
 }
 
+/// Architecture-neutral dimensions needed by the shared Qwen3.5/3.8
+/// linear-attention tensor transforms. Dense and MoE checkpoints use the
+/// same grouped-to-tiled V-head layout, so keeping this contract separate
+/// prevents the dense converter from manufacturing dummy expert metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35LinearAttentionCtx {
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+}
+
+impl Qwen35LinearAttentionCtx {
+    fn num_v_per_k(self) -> usize {
+        self.linear_num_value_heads / self.linear_num_key_heads
+    }
+}
+
 impl Qwen35MoeFullCtx {
     /// `num_v_per_k = linear_num_value_heads / linear_num_key_heads`.
     /// Number of V heads grouped under each K head in the HF
     /// safetensors layout.
     pub fn num_v_per_k(&self) -> usize {
         self.linear_num_value_heads / self.linear_num_key_heads
+    }
+
+    fn linear_attention_ctx(&self) -> Qwen35LinearAttentionCtx {
+        Qwen35LinearAttentionCtx {
+            linear_num_key_heads: self.linear_num_key_heads,
+            linear_num_value_heads: self.linear_num_value_heads,
+            linear_key_head_dim: self.linear_key_head_dim,
+            linear_value_head_dim: self.linear_value_head_dim,
+        }
     }
 }
 
@@ -322,7 +349,7 @@ fn map_per_block(
 
     // ---- Linear-attention SSM family ----------------------------------
     if let Some(la_rest) = rest.strip_prefix("linear_attn.") {
-        return map_linear_attn(layer, la_rest, hf_shape, ctx);
+        return map_linear_attn(layer, la_rest, hf_shape, &ctx.linear_attention_ctx());
     }
 
     // ---- MoE router + per-expert + shared experts ---------------------
@@ -338,11 +365,11 @@ fn map_per_block(
 /// The norm.weight here is NOT baked +1 — it's the one explicit
 /// exception in canonical `qwen.py:303` (`.endswith("norm.weight") and
 /// not name.endswith("linear_attn.norm.weight")`).
-fn map_linear_attn(
+pub(crate) fn map_linear_attn(
     layer: usize,
     la_rest: &str,
     hf_shape: &[usize],
-    ctx: &Qwen35MoeFullCtx,
+    ctx: &Qwen35LinearAttentionCtx,
 ) -> Option<MappedTensor> {
     let blk = |suffix: &str| format!("blk.{layer}.{suffix}");
 

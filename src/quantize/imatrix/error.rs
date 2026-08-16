@@ -285,7 +285,7 @@ mod p7_ac3_hint_tests {
         // this hint test.
         let msg = ImatrixError::UnsupportedArchForDriver {
             arch: "minimax-m2".to_string(),
-            supported: &["gemma4", "qwen35moe"],
+            supported: &["gemma4", "qwen35", "qwen35moe"],
         }
         .to_string();
         assert!(
@@ -295,6 +295,10 @@ mod p7_ac3_hint_tests {
         assert!(
             msg.contains("gemma4"),
             "msg should list supported arches: {msg}"
+        );
+        assert!(
+            msg.contains("qwen35"),
+            "msg should list dense qwen35: {msg}"
         );
         assert!(
             msg.contains("qwen35moe"),

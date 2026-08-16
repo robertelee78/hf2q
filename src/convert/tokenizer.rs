@@ -643,7 +643,7 @@ pub fn build_tokenizer_metadata(
         }
     } else if matches!(
         arch,
-        ArchName::Qwen3VlText | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull
+        ArchName::Qwen3VlText | ArchName::Qwen35 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull
     ) {
         // Qwen3-VL Text decoder emit order — canonical
         // `Qwen2Model.set_vocab` calls `_set_vocab_gpt2` (base.py:1603-1611):
@@ -1244,7 +1244,7 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // llama-vocab.cpp:2042 — Qwen3.5 / Qwen3.6 family.
         // Both the older qwen3moe variant AND the new qwen35moe
         // (linear-attn + MTP) use the same pre-tokenizer rules.
-        ArchName::Qwen35Moe | ArchName::Qwen35MoeFull => "qwen35".into(),
+        ArchName::Qwen35 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull => "qwen35".into(),
         // llama-vocab.cpp:2035 — Qwen2-family pre-tokenizer also used
         // by Qwen3-VL text-side decoders.
         ArchName::Qwen3VlText => "qwen2".into(),

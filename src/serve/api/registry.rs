@@ -372,12 +372,15 @@ pub const GEMMA4: ModelRegistration = ModelRegistration {
     tool_preamble: None,
 };
 
-/// Qwen 3.5 / 3.6 family. Uses `<think>` / `</think>` — the Qwen convention
+/// Qwen 3.5-family models, including Qwen3.6 and Qwen3.8 releases. Uses
+/// `<think>` / `</think>` — the Qwen convention
 /// (no pipe in the closer; distinct from Gemma's). Tool calling also uses
 /// `<tool_call>` / `</tool_call>` (Qwen standard).
 pub const QWEN35: ModelRegistration = ModelRegistration {
     family: "qwen35",
-    id_substrings: &["qwen3.5", "qwen3.6", "qwen35", "qwen36"],
+    id_substrings: &[
+        "qwen3.5", "qwen3.6", "qwen3.8", "qwen35", "qwen36", "qwen38",
+    ],
     reasoning_open: Some("<think>"),
     reasoning_close: Some("</think>"),
     tool_open: Some("<tool_call>"),
@@ -3892,6 +3895,8 @@ mod tests {
     fn qwen35_matches_family_ids() {
         assert!(QWEN35.matches("qwen3.5-27b"));
         assert!(QWEN35.matches("qwen3.6-35b-a3b-abliterix"));
+        assert!(QWEN35.matches("Qwen/Qwen3.8-27B"));
+        assert!(QWEN35.matches("qwen38-27b-q4_k_m"));
         assert!(QWEN35.matches("Qwen35-14B-chat"));
     }
 

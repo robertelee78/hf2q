@@ -343,7 +343,9 @@ mod tests {
                         );
                     }
                     LayerScope::AllLayers
+                    | LayerScope::AllLayersIncludingMtp
                     | LayerScope::FullAttentionLayersOnly
+                    | LayerScope::FullAttentionAndMtpLayers
                     | LayerScope::LinearAttentionLayersOnly
                     | LayerScope::MtpLayers
                     | LayerScope::MoeSharedExpertPerLayer
