@@ -49,6 +49,12 @@ const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 // more headroom than Qwen's measured 30-second watchdog while still turning a
 // non-returning Metal call into a finite readiness failure.
 const GEMMA4_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+// Qwen's startup warmup materializes every layer's GPU weights and pipelines
+// in one transaction. The 64-layer dense family takes roughly 130-150 seconds
+// on the release M5 Max host, while ordinary prefill/decode transactions stay
+// within the 30-second slot-aware bound. Give this one-time, family-specific
+// operation bounded headroom without weakening request-time supervision.
+const QWEN35_GPU_WARMUP_TIMEOUT: Duration = Duration::from_secs(240);
 const ENGINE_SYNC_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
 use crate::inference::models::gemma4::{
@@ -9819,6 +9825,13 @@ fn supervised_gemma4_gpu_call<T>(
     call: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     supervisor.run(kind, GEMMA4_GPU_TRANSACTION_TIMEOUT, call)
+}
+
+fn supervised_qwen35_warmup<T>(
+    supervisor: &EngineSupervisor,
+    call: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    supervisor.run("qwen35_warmup", QWEN35_GPU_WARMUP_TIMEOUT, call)
 }
 
 fn is_worker_fatal(supervisor: &EngineSupervisor, error: &anyhow::Error) -> bool {
@@ -20467,7 +20480,7 @@ fn warmup_qwen35_once(
     supervisor: &EngineSupervisor,
 ) -> Result<()> {
     let started = Instant::now();
-    supervised_gpu_call(supervisor, "qwen35_warmup", || {
+    supervised_qwen35_warmup(supervisor, || {
         loaded
             .model
             .ensure_gpu_cache_primed()
@@ -53764,8 +53777,13 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             "Qwen35 startup warmup must eagerly prime GPU weights and pipelines"
         );
         assert!(
-            helper.contains("supervised_gpu_call(supervisor"),
-            "Qwen35 warmup must arm the worker transaction supervisor"
+            helper.contains("supervised_qwen35_warmup(supervisor"),
+            "Qwen35 warmup must use its bounded family-specific supervisor deadline"
+        );
+        assert_eq!(
+            QWEN35_GPU_WARMUP_TIMEOUT,
+            Duration::from_secs(240),
+            "Qwen35's 64-layer startup materialization needs measured headroom"
         );
         assert!(
             serial_worker.contains("LoadedModel::Qwen35(q) => warmup_qwen35_once(q, &supervisor)"),
