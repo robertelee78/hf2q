@@ -33,6 +33,7 @@ use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32};
 use mlx_native::ops::encode_helpers::KernelArg;
+use mlx_native::ops::flash_attn_prefill::{AttnParamsGpu, FLASH_ATTN_PREFILL_SHADER_SOURCE};
 use mlx_native::ops::gather::dispatch_gather_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
@@ -40,6 +41,22 @@ use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_f16};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use std::sync::LazyLock;
+
+const VIT_FLASH_ATTN_F16_D72: &str = "hf2q_vit_flash_attn_f16_d72";
+
+/// The published compute backend contains the generic tiled prefill-attention
+/// implementation but does not export a 72-wide entry point. Vision towers in
+/// the supported Qwen and SigLIP profiles use exactly that head width. Compile
+/// one additional specialization from the backend-owned source and retain it
+/// for the process lifetime, matching `KernelRegistry`'s static-source contract.
+static VIT_FLASH_ATTN_D72_SOURCE: LazyLock<&'static str> = LazyLock::new(|| {
+    let source = format!(
+        "{FLASH_ATTN_PREFILL_SHADER_SOURCE}\n\n\
+         instantiate_flash_attn_prefill(\"{VIT_FLASH_ATTN_F16_D72}\", \
+         half, 32, 16, 72, 4, 1, half)\n"
+    );
+    Box::leak(source.into_boxed_str())
+});
 
 /// ADR-005 Phase 2c iter-120 (W49), repurposed at iter-129 — F32-attention
 /// development override.
@@ -652,6 +669,181 @@ fn vit_decomposed_attention_workspace_bytes(batch: u32, num_heads: u32) -> Optio
         .checked_mul(2)
 }
 
+/// Tiled bidirectional attention for the 72-wide heads used by the supported
+/// vision towers. Q/K/V enter and leave in sequence-major F32 layout; only the
+/// attention tile traffic is narrowed to F16, while score, softmax, and output
+/// accumulation remain F32 inside the kernel.
+#[allow(clippy::too_many_arguments)]
+fn vit_attention_flash_d72_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    batch: u32,
+    num_heads: u32,
+    scale: f32,
+) -> Result<MlxBuffer> {
+    const HEAD_DIM: u32 = 72;
+    const BQ: u32 = 32;
+    const BK: u32 = 16;
+    const WM: u32 = 4;
+
+    let elements = (batch as usize)
+        .checked_mul(num_heads as usize)
+        .and_then(|value| value.checked_mul(HEAD_DIM as usize))
+        .ok_or_else(|| anyhow!("vit_attention_flash_d72_gpu: element count overflow"))?;
+    let head_shape = vec![num_heads as usize, batch as usize, HEAD_DIM as usize];
+
+    let alloc_f32 = || {
+        device
+            .alloc_buffer(elements * 4, DType::F32, head_shape.clone())
+            .map_err(|error| anyhow!("vit_attention_flash_d72_gpu: alloc F32: {error}"))
+    };
+    let q_head = alloc_f32()?;
+    let k_head = alloc_f32()?;
+    let v_head = alloc_f32()?;
+    for (source, destination, name) in [
+        (q_seq_major, &q_head, "Q"),
+        (k_seq_major, &k_head, "K"),
+        (v_seq_major, &v_head, "V"),
+    ] {
+        permute_021_f32(
+            encoder,
+            registry,
+            device.metal_device(),
+            source,
+            destination,
+            batch as usize,
+            num_heads as usize,
+            HEAD_DIM as usize,
+        )
+        .with_context(|| format!("vit_attention_flash_d72_gpu: permute {name}"))?;
+    }
+    encoder.memory_barrier();
+
+    let alloc_f16 = || {
+        device
+            .alloc_buffer(elements * 2, DType::F16, head_shape.clone())
+            .map_err(|error| anyhow!("vit_attention_flash_d72_gpu: alloc F16: {error}"))
+    };
+    let q_f16 = alloc_f16()?;
+    let k_f16 = alloc_f16()?;
+    let v_f16 = alloc_f16()?;
+    for (source, destination, name) in [
+        (&q_head, &q_f16, "Q"),
+        (&k_head, &k_f16, "K"),
+        (&v_head, &v_f16, "V"),
+    ] {
+        cast(
+            encoder,
+            registry,
+            device.metal_device(),
+            source,
+            destination,
+            elements,
+            CastDirection::F32ToF16,
+        )
+        .with_context(|| format!("vit_attention_flash_d72_gpu: cast {name}"))?;
+    }
+    encoder.memory_barrier();
+
+    let out_f16 = alloc_f16()?;
+    let nq = batch.div_ceil(BQ);
+    let nk = batch.div_ceil(BK);
+    let ql_rem = batch % BQ;
+    let kl_rem = batch % BK;
+    let pipeline = registry
+        .get_pipeline_with_bool_constants(
+            VIT_FLASH_ATTN_F16_D72,
+            device.metal_device(),
+            &[
+                (200, ql_rem == 0),
+                (201, kl_rem == 0),
+                (300, false),
+                (301, false),
+                (303, false),
+            ],
+        )
+        .map_err(|error| anyhow!("vit_attention_flash_d72_gpu: compile pipeline: {error}"))?;
+
+    let seq_stride = i64::from(HEAD_DIM);
+    let head_stride = i64::from(batch) * seq_stride;
+    let batch_stride = i64::from(num_heads) * head_stride;
+    let params = AttnParamsGpu {
+        b: 1,
+        h: num_heads as i32,
+        d: HEAD_DIM as i32,
+        ql: batch as i32,
+        kl: batch as i32,
+        gqa_factor: 1,
+        scale,
+        softcapping: 1.0,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: (batch / BQ) as i32,
+        nk_aligned: (batch / BK) as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: 0,
+        _pad: 0,
+        q_strides: [batch_stride, head_stride, seq_stride],
+        k_strides: [batch_stride, head_stride, seq_stride],
+        v_strides: [batch_stride, head_stride, seq_stride],
+        o_strides: [batch_stride, head_stride, seq_stride],
+    };
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(&q_f16)),
+            (1, KernelArg::Buffer(&k_f16)),
+            (2, KernelArg::Buffer(&v_f16)),
+            (3, KernelArg::Buffer(&out_f16)),
+            (
+                4,
+                KernelArg::Bytes(mlx_native::ops::encode_helpers::as_bytes(&params)),
+            ),
+        ],
+        MTLSize::new(nq as u64, num_heads as u64, 1),
+        MTLSize::new(32, WM as u64, 1),
+    );
+    encoder.memory_barrier();
+
+    let out_head_f32 = alloc_f32()?;
+    cast(
+        encoder,
+        registry,
+        device.metal_device(),
+        &out_f16,
+        &out_head_f32,
+        elements,
+        CastDirection::F16ToF32,
+    )
+    .context("vit_attention_flash_d72_gpu: cast output")?;
+    encoder.memory_barrier();
+
+    let output = device
+        .alloc_buffer(
+            elements * 4,
+            DType::F32,
+            vec![batch as usize, num_heads as usize, HEAD_DIM as usize],
+        )
+        .map_err(|error| anyhow!("vit_attention_flash_d72_gpu: alloc output: {error}"))?;
+    permute_021_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        &out_head_f32,
+        &output,
+        num_heads as usize,
+        batch as usize,
+        HEAD_DIM as usize,
+    )
+    .context("vit_attention_flash_d72_gpu: permute output")?;
+    Ok(output)
+}
+
 /// Large-sequence bidirectional attention without a quadratic score tensor.
 /// The arithmetic stages Q/K/V through F16 and accumulates softmax/output in
 /// F32, matching the established vision attention precision contract.
@@ -825,6 +1017,19 @@ pub fn vit_attention_gpu(
     let decomposed_workspace = vit_decomposed_attention_workspace_bytes(batch, num_heads)
         .ok_or_else(|| anyhow!("vit_attention_gpu: quadratic workspace size overflow"))?;
     if decomposed_workspace > VIT_DECOMPOSED_ATTENTION_WORKSPACE_BYTES {
+        if head_dim == 72 {
+            return vit_attention_flash_d72_gpu(
+                encoder,
+                registry,
+                device,
+                q_seq_major,
+                k_seq_major,
+                v_seq_major,
+                batch,
+                num_heads,
+                scale,
+            );
+        }
         return vit_attention_bounded_gpu(
             encoder,
             registry,
@@ -1748,6 +1953,7 @@ pub fn register_vit_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("vit_gelu_erf_f32", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_scores_v_small_f32_f16", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_bounded_attention_f16_f32", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source(VIT_FLASH_ATTN_F16_D72, *VIT_FLASH_ATTN_D72_SOURCE);
 }
 
 /// Apply erf-form GELU to an f32 GPU buffer.
@@ -5509,7 +5715,7 @@ mod tests {
     }
 
     #[test]
-    fn vit_bounded_attention_qwen_head_shape_matches_cpu() {
+    fn vit_flash_attention_qwen_head_shape_matches_cpu() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let batch = 17usize;
         let num_heads = 2usize;
@@ -5528,7 +5734,7 @@ mod tests {
         let mut session = executor.begin().expect("begin");
         let mut registry = KernelRegistry::new();
         register_vit_custom_shaders(&mut registry);
-        let output = vit_attention_bounded_gpu(
+        let output = vit_attention_flash_d72_gpu(
             session.encoder_mut(),
             &mut registry,
             executor.device(),
@@ -5537,10 +5743,9 @@ mod tests {
             &v_buf,
             batch as u32,
             num_heads as u32,
-            head_dim as u32,
             scale,
         )
-        .expect("bounded attention");
+        .expect("flash attention");
         session.finish().expect("finish");
         let got = readback_f32(&output, n);
         let max_diff = got
@@ -5548,7 +5753,7 @@ mod tests {
             .zip(expected.iter())
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-2, "bounded attention max diff {max_diff}");
+        assert!(max_diff < 1e-2, "flash attention max diff {max_diff}");
     }
 
     // -----------------------------------------------------------------------

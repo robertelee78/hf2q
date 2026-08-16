@@ -1,6 +1,7 @@
 # ADR-044: Qwen3.8 native conversion and inference
 
-- Status: Accepted for native text conversion and serving
+- Status: Accepted for native text conversion and serving; vision candidate
+  is under exact-artifact acceptance
 - Date: 2026-08-16
 - Owners: hf2q conversion, quantization, inference, and serving
 
@@ -44,8 +45,10 @@ so the official Qwen3.8 checkpoint correctly failed closed as unsupported.
    `nextn.use_dedicated_embeddings=false`. The native loader subtracts the
    NextN count to recover the 64 verifier layers.
 4. Text conversion drops only the known `model.visual.*` namespace. Vision
-   support is a separate projector artifact and is not claimed until its
-   converter, loader, image-token plumbing, and real-image parity gate pass.
+   uses a separate projector artifact produced by hf2q. The server may
+   advertise it only after exact text/projector binding, production-graph
+   warmup, image preprocessing, image-token plumbing, and cache isolation pass
+   fail closed.
 5. hf2q remains the implementation owner. No external converter,
    quantizer, or inference runtime becomes a product dependency. An external
    implementation may be used only as a developer-side reference oracle.
@@ -79,17 +82,32 @@ so the official Qwen3.8 checkpoint correctly failed closed as unsupported.
 
 ### Vision
 
-Vision remains unavailable for Qwen3.8 until a separately reviewable gate
-proves the projector bytes and at least one real image request. Text support
-must never silently advertise vision support before that gate is green.
+- Conversion requires and records the official processor configuration and
+  emits an explicit all-false 27-layer DeepStack mask for the dense Qwen3.8
+  projector.
+- Startup and every image-bearing request validate the exact text/projector
+  architecture and hidden-width contract before image I/O or GPU execution.
+- The production graph must pass a real-projector warmup and reject non-finite
+  or wrong-width output.
+- Official bicubic preprocessing, the 200:1 aspect-ratio ceiling, the exact
+  65,536 through 16,777,216 pixel range, multi-image order, and decoded-input
+  bounds are part of the accepted wire contract.
+- Projected embeddings use an immutable byte-budgeted cache with exact image
+  identity, single-flight execution, and request cancellation before language
+  admission. A changed image must not reuse image or language-model state.
+- Unary and SSE image requests, an image-driven tool call, its tool-result
+  continuation, exact prompt-prefix reuse, concurrent same-image requests, a
+  disconnected client, and the official maximum image size must pass on the
+  exact artifact.
 
 ## Consequences
 
 Qwen3.8 reuses the native dense Qwen execution family without approximate
-architecture routing, while conversion and evidence remain explicit. Vision
-and speculative MTP decode remain outside the accepted surface; the canonical
-launcher selects ordinary autoregressive text decode until those paths have
-separate real-artifact gates.
+architecture routing, while conversion and evidence remain explicit.
+Speculative MTP decode remains outside the accepted surface; the canonical
+launcher selects ordinary autoregressive decode until its separate
+transactional state and parity gates pass. Vision is a separately measured
+candidate surface and does not inherit text-only performance authority.
 
 ## Acceptance evidence
 
@@ -136,3 +154,34 @@ but the optional MTP cursor is independent until speculative decoding runs.
 
 These measurements establish functional native text support, not completion
 of the vision surface, speculative MTP acceptance, or performance parity.
+
+### Vision candidate evidence (2026-08-16)
+
+The exact source revision above produced a 927,606,848-byte F16 projector with
+SHA-256
+`6fa039b75244c0a28a013da30b92b1d221c61029acc19f9efa882b75a495b0d0`.
+The paired Q4_K_M text candidate was 16,810,714,752 bytes with SHA-256
+`0fa8acc661d0edc60276c43705619fd848682dbf768ced9fe46cd8a572b8043d`.
+
+On an Apple M5 Max, the production server correctly described an 8.65 MP
+screenshot, a separately resized image, and a two-image request. A required
+image-driven `record_observation` call emitted schema-valid arguments with the
+grounded two-panel count; its tool-result continuation reused 1,514 of 1,550
+prompt tokens and completed normally. The matching SSE request emitted 224
+valid JSON chunks, one `tool_calls` finish, and one terminal `[DONE]`.
+
+Two simultaneous cold requests for the same previously unseen image executed
+one 838 ms vision forward; the follower reused the immutable embedding and
+both returned the same grounded answer. A client disconnected after 203 ms;
+thirty seconds later no vision result, language request, or cache state had
+been published. The next identical request was therefore cold and performed
+one 18.429 second vision forward.
+
+The official 4,096 by 4,096 processor maximum completed without materializing
+an unbounded attention matrix: 16,384 visual tokens and 83,886,080 projected
+F32 values, with a 55.097 second vision forward and 93 second cold end-to-end
+time. Its exact repeat hit the vision cache and reused 16,444 of 16,449 prompt
+tokens, then returned the correct two-panel answer in 20 seconds. This closes
+the former out-of-memory correctness boundary. It does not yet establish the
+desired comparative latency, so vision performance remains an optimization
+gate rather than an inflated release claim.

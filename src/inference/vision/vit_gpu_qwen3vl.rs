@@ -2583,14 +2583,12 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .context("compute_vision_embeddings_gpu_qwen3vl: pos_embd → f32 widen")?;
 
     // -----------------------------------------------------------------
-    // GPU session — Stage A + Stage B + Stage C share ONE encoder.
-    // ADR-021 iter-6 collapses what used to be:
-    //   - Stage A: own session + Vec<f32> readback
-    //   - Stage B: own session + per-chunk Vec<f32> readback
-    //   - Stage C: CPU concat
-    // into a single `executor.begin()` … `session.finish()` window
-    // with one `as_slice::<f32>()` readback at the very end. The §2
-    // end-state.
+    // Use one executor/registry but bounded command-buffer transactions.
+    // A single encoder spanning the full tower retains every intermediate
+    // allocation until the final commit and can exhaust unified memory on a
+    // valid high-resolution image. Stage A, each transformer block, and the
+    // final projector therefore commit independently. The surviving output
+    // buffer is the only activation carried across a transaction boundary.
     // -----------------------------------------------------------------
     use mlx_native::GraphExecutor;
 
@@ -2598,7 +2596,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         MlxDevice::new()
             .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: device: {e}"))?,
     );
-    let mut session = executor
+    let mut prelude_session = executor
         .begin()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: begin: {e}"))?;
     let mut registry = KernelRegistry::new();
@@ -2621,7 +2619,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     // Stage A — one shared encoder; returns merged MlxBuffer directly
     // (no Vec<f32> seam, no upload_f32_to_gpu round-trip).
     let input_gpu = qwen3vl_stage_a_dispatch(
-        session.encoder_mut(),
+        prelude_session.encoder_mut(),
         &mut registry,
         device,
         pixel_values,
@@ -2668,7 +2666,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         mmproj_weights.get("v.pre_ln.bias"),
     ) {
         hidden_states = bert_layer_norm_gpu(
-            session.encoder_mut(),
+            prelude_session.encoder_mut(),
             &mut registry,
             device,
             &hidden_states,
@@ -2679,8 +2677,11 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
             cfg.n_embd,
         )
         .context("compute_vision_embeddings_gpu_qwen3vl: pre-LN")?;
-        session.encoder_mut().memory_barrier();
+        prelude_session.encoder_mut().memory_barrier();
     }
+    prelude_session
+        .finish()
+        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: prelude finish: {e}"))?;
 
     // DeepStack head outputs collected across the per-block loop, in
     // ascending block-index order (matches `cfg.deepstack_indexes`
@@ -2695,8 +2696,11 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         cfg.deepstack_indexes.iter().copied().collect();
 
     for block_idx in 0..(cfg.n_layer as usize) {
+        let mut block_session = executor.begin().map_err(|e| {
+            anyhow!("compute_vision_embeddings_gpu_qwen3vl: block {block_idx} begin: {e}")
+        })?;
         let block_out = apply_qwen3vl_block_forward_gpu(
-            session.encoder_mut(),
+            block_session.encoder_mut(),
             &mut registry,
             device,
             mmproj_weights,
@@ -2709,7 +2713,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
             freq_base,
         )
         .with_context(|| format!("compute_vision_embeddings_gpu_qwen3vl: block {block_idx}"))?;
-        session.encoder_mut().memory_barrier();
+        block_session.encoder_mut().memory_barrier();
 
         // DeepStack head tap (qwen3vl.cpp:150-165). The head is applied
         // BEFORE `inpL = cur` propagates the buffer to the next block,
@@ -2720,7 +2724,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         // for the next-block chain.
         if deepstack_set.contains(&(block_idx as u32)) {
             let head_out = apply_qwen3vl_deepstack_head_gpu(
-                session.encoder_mut(),
+                block_session.encoder_mut(),
                 &mut registry,
                 device,
                 mmproj_weights,
@@ -2734,9 +2738,13 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
                     "compute_vision_embeddings_gpu_qwen3vl: deepstack head at block {block_idx}"
                 )
             })?;
-            session.encoder_mut().memory_barrier();
+            block_session.encoder_mut().memory_barrier();
             deepstack_outputs.push(head_out);
         }
+
+        block_session.finish().map_err(|e| {
+            anyhow!("compute_vision_embeddings_gpu_qwen3vl: block {block_idx} finish: {e}")
+        })?;
 
         hidden_states = block_out;
     }
@@ -2759,6 +2767,9 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     //     because every Qwen3-VL mmproj observed to date ships it
     //     and a missing post-LN would produce wrong-magnitude logits
     //     downstream.
+    let mut final_session = executor
+        .begin()
+        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: projector begin: {e}"))?;
     let post_ln_w = mmproj_weights
         .post_ln_weight()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: post_ln.weight: {e}"))?;
@@ -2773,7 +2784,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
             )
         })?;
     let final_out = bert_layer_norm_gpu(
-        session.encoder_mut(),
+        final_session.encoder_mut(),
         &mut registry,
         device,
         &hidden_states,
@@ -2784,13 +2795,13 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         cfg.n_embd,
     )
     .context("compute_vision_embeddings_gpu_qwen3vl: post-LN")?;
-    session.encoder_mut().memory_barrier();
+    final_session.encoder_mut().memory_barrier();
 
     // B5. Main `mm.0/mm.2` 2-layer GELU projector (qwen3vl.cpp:175-184)
     //     consumed the post-LN output via implicit 2x2-merger reshape
     //     `[n_pos, n_embd]` → `[n_image_tokens, n_embd*4]`.
     let main_out = apply_qwen3vl_main_projector_gpu(
-        session.encoder_mut(),
+        final_session.encoder_mut(),
         &mut registry,
         device,
         mmproj_weights,
@@ -2805,7 +2816,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     // `bert_bias_add_gpu` finishes writing, producing all-zero output
     // for the chunk-0 slice of the augmented buffer (deterministic
     // race on Apple Metal unified memory).
-    session.encoder_mut().memory_barrier();
+    final_session.encoder_mut().memory_barrier();
 
     // -----------------------------------------------------------------
     // Stage C — GPU feature-axis concat (ADR-021 iter-4b).
@@ -2845,7 +2856,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
 
     // Chunk 0 — main projector output at column offset 0.
     dispatch_feature_concat_f32(
-        session.encoder_mut(),
+        final_session.encoder_mut(),
         &mut registry,
         device.metal_device(),
         &main_out,
@@ -2861,13 +2872,13 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
              n_image_tokens={n_image_tokens} lm_hidden={lm_hidden} augmented_dim={augmented_dim}"
         )
     })?;
-    session.encoder_mut().memory_barrier();
+    final_session.encoder_mut().memory_barrier();
 
     // Chunks 1..N — DeepStack heads, each at column offset (i+1)*lm_hidden.
     for (i, head_out) in deepstack_outputs.iter().enumerate() {
         let dst_offset = ((i + 1) * lm_hidden) as u32;
         dispatch_feature_concat_f32(
-            session.encoder_mut(),
+            final_session.encoder_mut(),
             &mut registry,
             device.metal_device(),
             head_out,
@@ -2883,10 +2894,10 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
                  dst_offset={dst_offset}"
             )
         })?;
-        session.encoder_mut().memory_barrier();
+        final_session.encoder_mut().memory_barrier();
     }
 
-    session
+    final_session
         .finish()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: finish: {e}"))?;
 
