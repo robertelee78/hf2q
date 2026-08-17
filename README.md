@@ -147,6 +147,13 @@ that loads in stock `llama.cpp` and in `hf2q serve`. The source can
 be a path that already exists on disk OR a `--repo <hf_repo>` that
 the driver auto-downloads via `huggingface-cli`.
 
+At serve time, Qwen3.5/Qwen3.6 reads its tokenizer and chat template from
+the GGUF metadata; a sibling `tokenizer.json` is not required. Vision uses a
+separate projector GGUF. Compatible externally produced text/projector pairs
+are accepted from standard architecture, multimodal-token, profile, width,
+tensor, and forward-warmup checks. When exact source or artifact hashes are
+present, hf2q additionally requires those identities to match.
+
 ```bash
 # 1. Pre-download the HF source explicitly:
 huggingface-cli download google/gemma-4-26b-a4b-it \

@@ -1585,6 +1585,19 @@ Per `feedback_evidence_first_no_blind_kernel_rewrites`: do NOT touch tile geomet
 
 **End-gate.** `./target/release/hf2q generate --model …dwq48.gguf --prompt "How to make bread?" --max-tokens 200` produces fully coherent English: opens with a `<think>` reasoning block, then a structured Basic White Bread Recipe with proper ingredient list. Prefill 31 tok in 3.5s (9 t/s); decode 200 tok in 1.90s (105 t/s); peak 21.1 GB. **Coherence depended on the parallel `70b31d3` tokenizer fix (`fix(adr-013 coherence): API engine_qwen35 — GGUF-driven tokenizer`)** — without that fix the dwq48 model produced a degenerate `"How to make bread?"` echo loop because the HF-fallback tokenizer was emitting OOB-special-tokens. Q4_K kernels alone weren't sufficient; Q4_K kernels + GGUF-driven tokenizer compose to give correct end-to-end inference.
 
+**2026-08-16 portability correction.** The serving constructor still called
+the legacy sidecar resolver before constructing the GGUF-driven tokenizer,
+then discarded the returned path without reading it. A portable external GGUF
+therefore failed unless an unused `tokenizer.json` happened to be colocated.
+The dead precondition is removed: Qwen serving now has a path-free tokenizer
+constructor whose only input is the opened GGUF, with a synthetic
+sidecar-free regression. Vision binding is likewise producer-neutral. The
+baseline contract comes from the Qwen architecture, all three embedded vision
+markers, projector profile/output width, complete tensor inventory, and a real
+forward warmup; optional source/artifact identities remain mandatory when
+present. This keeps exact hf2q provenance stronger without making it a vendor
+lock-in requirement.
+
 **H4 falsification artifact (`tests/test_q4_k_h4_real_block_parity.rs` on `cfa/adr013-q4k-h4-diagnose`).** While diagnosing the gibberish, wrote a parity test embedding a real 144-byte Q4_K block from `blk.0.ffn_gate_exps.weight` expert 0 of the dwq48 GGUF, decoded it via BOTH the test-file's `cpu_dequant_q4k_block` (Claude's oracle for the 12 unit tests) AND the canonical `dequantize_q4_k` from `src/gguf/mod.rs:582`. Result: 0 indices differ, max_err = 0.0 — the synthetic encoder/decoder pair is bit-exactly canonical-compatible, the unit tests were not decorative. This pre-empted a deep kernel-bug rabbit-hole and surfaced the tokenizer as the actual cause.
 
 **Bench vs llama.cpp (same M5 Max, same dwq48 GGUF, prompt "How to make bread?", temp=0.0, seed=42, 200 tokens).**

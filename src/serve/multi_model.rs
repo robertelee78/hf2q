@@ -110,8 +110,9 @@ use crate::core::hardware::HardwareProfile;
 /// next-to-the-GGUF lookup performed inside `LoadedModel::load`.
 #[derive(Clone, Default)]
 pub struct EngineConfig {
-    /// Optional explicit `tokenizer.json` path.  `None` ⇒ auto-resolve
-    /// via `find_tokenizer` in `engine.rs` (sidecar lookup).
+    /// Optional explicit `tokenizer.json` path for families that consume a
+    /// sidecar. Qwen3.5/Qwen3.6 deliberately ignore it and build from the
+    /// GGUF-embedded tokenizer metadata.
     pub tokenizer_path: Option<PathBuf>,
     /// Optional explicit `config.json` path.  `None` ⇒ auto-resolve via
     /// `find_config`.

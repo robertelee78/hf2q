@@ -712,14 +712,20 @@ pub enum LoadedArch {
     Deepseek4,
 }
 
-/// Exact text-model contract for a separately loaded vision projector.
-/// Absence is authoritative: the loaded checkpoint is text-only or its
-/// multimodal consumer metadata is not strong enough to bind safely.
+/// Text-model contract for a separately loaded vision projector.
+///
+/// Standard GGUF architecture/tokenizer facts provide the producer-neutral
+/// baseline. Optional hf2q provenance fields strengthen that baseline with
+/// exact DeepStack/source/artifact identity when available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisionConsumerContract {
     pub profile: crate::inference::vision::mmproj::ArchProfile,
     pub output_width: u32,
-    pub deepstack_output_count: u32,
+    /// Exact expected DeepStack stream count when the text GGUF records it.
+    /// External GGUFs may omit hf2q's extension metadata; `None` keeps the
+    /// standard architecture/width/token contract loadable while the
+    /// projector tensor validator and real forward warmup remain mandatory.
+    pub deepstack_output_count: Option<u32>,
     pub source_sha256: Option<String>,
     pub expected_projector_sha256: Option<String>,
 }
@@ -2512,12 +2518,16 @@ impl LoadedModel {
             LoadedModel::Gemma(g) => Some(VisionConsumerContract {
                 profile: ArchProfile::Gemma4Siglip,
                 output_width: g.weights.hidden_size as u32,
-                deepstack_output_count: 0,
+                deepstack_output_count: Some(0),
                 source_sha256,
                 expected_projector_sha256,
             }),
+            // Producer-neutral Qwen binding. Fresh hf2q artifacts carry the
+            // explicit profile metadata; compatible external GGUFs are
+            // identified by the standard embedded multimodal marker tokens.
             LoadedModel::Qwen35(q)
-                if q.vision_projector_profile.as_deref() == Some("qwen3vl_siglip") =>
+                if q.vision_projector_profile.as_deref() == Some("qwen3vl_siglip")
+                    || q.vision_special_tokens_present =>
             {
                 Some(VisionConsumerContract {
                     profile: ArchProfile::Qwen3VlSiglip,
@@ -31697,7 +31707,8 @@ assistant:
             load_duration: Duration::from_millis(7),
             provenance: crate::core::provenance::Provenance::External,
             vision_projector_profile: None,
-            vision_deepstack_output_count: 0,
+            vision_deepstack_output_count: None,
+            vision_special_tokens_present: false,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,

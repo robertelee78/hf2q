@@ -1747,7 +1747,8 @@ mod tests {
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
             tq_kv_active: false,
             vision_projector_profile: None,
-            vision_deepstack_output_count: 0,
+            vision_deepstack_output_count: None,
+            vision_special_tokens_present: false,
             // ADR-040 Phase C iter-2a (C2b) — scaffold field on
             // `Qwen35LoadedModel`; test fixtures must populate it (here
             // as `None`) to keep struct-literal construction

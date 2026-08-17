@@ -74,6 +74,26 @@ const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// `fn`-local inside `load`, which is structurally untestable from a
 /// `mod tests` block (fn-local consts aren't `super::*`-visible).
 pub const QWEN35_EOS_STOP_NAMES: &[&str] = &["<|im_end|>", "<|endoftext|>"];
+const QWEN35_VISION_MARKERS: &[&str] = &["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"];
+
+/// Construct the serving tokenizer exclusively from the opened GGUF.
+///
+/// This function intentionally has no filesystem-path parameter. A Qwen GGUF
+/// carrying `tokenizer.ggml.*` is self-contained; requiring a sibling
+/// `tokenizer.json` would be a dead precondition and would make externally
+/// produced artifacts needlessly non-portable.
+fn build_qwen35_serving_tokenizer(gguf: &mlx_native::gguf::GgufFile) -> Result<(Tokenizer, bool)> {
+    let mut tokenizer =
+        crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(gguf)
+            .map_err(|e| anyhow::anyhow!("GGUF-driven tokenizer build failed: {e}"))?;
+    tokenizer
+        .with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
+    let vision_special_tokens_present = QWEN35_VISION_MARKERS
+        .iter()
+        .all(|token| tokenizer.token_to_id(token).is_some());
+    Ok((tokenizer, vision_special_tokens_present))
+}
 
 /// All artifacts the SERVE worker needs to handle requests against a
 /// Qwen3.5 or Qwen3.6 GGUF.
@@ -123,8 +143,15 @@ pub struct Qwen35LoadedModel {
     /// ConditionalGeneration artifacts. Text-only artifacts keep this
     /// unset and cannot consume a process projector.
     pub vision_projector_profile: Option<String>,
-    /// Number of DeepStack feature streams expected by the text model.
-    pub vision_deepstack_output_count: u32,
+    /// Number of DeepStack feature streams expected by the text model when
+    /// the producer recorded hf2q's exact extension metadata. External GGUFs
+    /// may omit the extension even when their standard multimodal contract is
+    /// otherwise complete.
+    pub vision_deepstack_output_count: Option<u32>,
+    /// Standard Qwen multimodal marker tokens are present in the embedded
+    /// vocabulary. This is the producer-neutral consumer signal used for
+    /// external GGUFs that predate or do not emit hf2q extension metadata.
+    pub vision_special_tokens_present: bool,
     /// Single-slot prompt cache (Wedge-3 / iter-216 Phase C / D).  Stores
     /// the post-prefill `HybridKvCacheSnapshot` + the greedy first
     /// decoded token + a generation-affecting params key, so a subsequent
@@ -260,27 +287,12 @@ impl Qwen35LoadedModel {
         let vision_projector_profile = gguf
             .metadata_string("hf2q.vision.projector_profile")
             .map(str::to_owned);
-        let vision_deepstack_output_count = gguf
-            .metadata_u32("hf2q.vision.deepstack_output_count")
-            .unwrap_or(0);
+        let vision_deepstack_output_count = gguf.metadata_u32("hf2q.vision.deepstack_output_count");
 
         // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: model = ...")`
         // was deleted here. The same fact (`model_path`) is now emitted by
         // `emit_tracing(&info)` at every CLI/SERVE entry that constructs a
         // `LoadInfo`. Conditions/warnings stay; load FACTS are unified.
-
-        // ---- Resolve tokenizer path ----
-        // Reuse the shared `find_tokenizer` helper from serve/mod.rs so
-        // the SERVE path resolves the tokenizer the same way
-        // `cmd_generate_qwen35` does.  Caller may override via
-        // `--tokenizer` (threaded through `LoadOptions::tokenizer_path`).
-        let tokenizer_path =
-            crate::serve::find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
-        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: tokenizer = ...")`
-        // was deleted here. `emit_tracing(&info)` surfaces the active
-        // tokenizer source; for Qwen3.5/3.6 that's `TokenizerSource::GgufEmbedded`
-        // (the on-disk path is a load-time diagnostic only — see the
-        // `tokenizer_path` shadow below).
 
         // ---- Load weights (full mlx-native pipeline) ----
         // ADR-018 C3: TTY-aware progress reporter mirroring cmd_generate
@@ -397,15 +409,7 @@ impl Qwen35LoadedModel {
         // residual stream and producing deterministic prompt-repetition
         // gibberish on chat-templated requests.
         //
-        // `tokenizer_path` is kept in scope only as a load-time
-        // diagnostic (logged above); its bytes are NOT consumed.
-        let _tokenizer_path = tokenizer_path;
-        let mut tokenizer =
-            crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
-                .map_err(|e| anyhow::anyhow!("GGUF-driven tokenizer build failed: {e}"))?;
-        tokenizer
-            .with_truncation(None)
-            .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
+        let (tokenizer, vision_special_tokens_present) = build_qwen35_serving_tokenizer(&gguf)?;
 
         // ---- Chat template ----
         // Qwen's ChatML tool protocol is not interchangeable with Gemma's
@@ -478,6 +482,7 @@ impl Qwen35LoadedModel {
             provenance,
             vision_projector_profile,
             vision_deepstack_output_count,
+            vision_special_tokens_present,
             prompt_cache: HybridPromptCache::new(),
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
             // Budget computed from sysinfo available_memory() × 5%
@@ -8368,6 +8373,55 @@ mod tests {
         );
     }
 
+    /// Regression for the laptop portability failure: Qwen serving must not
+    /// require a sibling `tokenizer.json` when the GGUF carries the standard
+    /// tokenizer metadata. This fixture lives in a fresh directory containing
+    /// only one GGUF and exercises the exact helper used by `load`.
+    #[test]
+    fn qwen35_serving_tokenizer_is_sidecar_free_and_detects_vision_markers() {
+        use crate::backends::gguf::types::MetaValue;
+        use crate::backends::gguf::writer::GgufWriter;
+
+        let dir = tempfile::tempdir().expect("temporary sidecar-free directory");
+        let path = dir.path().join("qwen35-tokenizer.gguf");
+        let file = std::fs::File::create(&path).expect("create tokenizer GGUF fixture");
+        let metadata = [
+            ("tokenizer.ggml.pre", MetaValue::String("qwen35".into())),
+            (
+                "tokenizer.ggml.tokens",
+                MetaValue::ArrayString(vec![
+                    "<|vision_start|>".into(),
+                    "<|image_pad|>".into(),
+                    "<|vision_end|>".into(),
+                    "a".into(),
+                ]),
+            ),
+            ("tokenizer.ggml.merges", MetaValue::ArrayString(Vec::new())),
+            (
+                "tokenizer.ggml.token_type",
+                MetaValue::ArrayI32(vec![4, 4, 4, 1]),
+            ),
+        ];
+        let mut writer = GgufWriter::new(file);
+        writer
+            .write_header(0, metadata.len() as u64)
+            .expect("write fixture header");
+        for (key, value) in &metadata {
+            writer
+                .write_metadata_kv(key, value)
+                .expect("write tokenizer metadata");
+        }
+        writer.pad_to_alignment().expect("align fixture");
+        writer.finalize().expect("finalize fixture");
+
+        assert!(!dir.path().join("tokenizer.json").exists());
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open tokenizer fixture");
+        let (tokenizer, has_vision_markers) =
+            build_qwen35_serving_tokenizer(&gguf).expect("build embedded tokenizer");
+        assert!(has_vision_markers);
+        assert_eq!(tokenizer.token_to_id("<|image_pad|>"), Some(1));
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Wedge-4e (iter-224 row 5) — streaming + soft-tokens + deepstack +
     // 3D positions invariance tests.
@@ -8737,7 +8791,8 @@ mod tests {
             load_duration: std::time::Duration::from_millis(1),
             provenance: crate::core::provenance::Provenance::External,
             vision_projector_profile: None,
-            vision_deepstack_output_count: 0,
+            vision_deepstack_output_count: None,
+            vision_special_tokens_present: false,
             prompt_cache: HybridPromptCache::new(),
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,

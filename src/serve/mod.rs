@@ -140,12 +140,10 @@ fn build_warmed_embedding_registry(
     Ok(registry)
 }
 
-/// Resolve the tokenizer path: explicit flag, or look next to GGUF / in parent dirs.
-///
-/// Iter-215 Wedge-2: visibility raised to `pub(crate)` so the new
-/// `serve::api::engine_qwen35::Qwen35LoadedModel::load` constructor
-/// can reuse the same tokenizer-resolution logic `cmd_generate_qwen35`
-/// uses (parity with the working CLI chat path).
+/// Resolve a tokenizer sidecar for legacy paths that still consume one.
+/// Qwen3.5/Qwen3.6 serving is deliberately absent from this contract: its
+/// tokenizer is built exclusively from the GGUF's `tokenizer.ggml.*`
+/// metadata and must remain portable without a sibling `tokenizer.json`.
 pub(crate) fn find_tokenizer(
     model_path: &Path,
     explicit: Option<&Path>,
@@ -4111,10 +4109,11 @@ pub(crate) fn parse_scheduler_config(
 pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4;
 
 /// Bind a loaded projector to the text architecture before allocating its
-/// GPU weights. A projector is process-global today, so accepting an
-/// unbound or approximately compatible pair would make every later image
-/// request unsafe. Family and output-width agreement are structural facts;
-/// no model-name heuristic participates.
+/// GPU weights. Standard architecture, tokenizer, projector profile, output
+/// width, tensor inventory, and real-forward warmup make externally produced
+/// GGUF pairs loadable without hf2q-private metadata. When exact source or
+/// artifact identities are present, those stronger checks remain mandatory.
+/// No filename or model-name heuristic participates.
 pub(crate) fn validate_mmproj_text_binding(
     contract: Option<api::engine::VisionConsumerContract>,
     projector_profile: crate::inference::vision::mmproj::ArchProfile,
@@ -4140,12 +4139,14 @@ pub(crate) fn validate_mmproj_text_binding(
         projector_output_size,
         contract.output_width
     );
-    anyhow::ensure!(
-        projector_deepstack_output_count == contract.deepstack_output_count as usize,
-        "mmproj/text-model mismatch: projector exposes {} DeepStack outputs but text requires {}",
-        projector_deepstack_output_count,
-        contract.deepstack_output_count
-    );
+    if let Some(expected_deepstack) = contract.deepstack_output_count {
+        anyhow::ensure!(
+            projector_deepstack_output_count == expected_deepstack as usize,
+            "mmproj/text-model mismatch: projector exposes {} DeepStack outputs but text requires {}",
+            projector_deepstack_output_count,
+            expected_deepstack
+        );
+    }
     if let Some(expected_source) = contract.source_sha256.as_deref() {
         anyhow::ensure!(
             projector_source_sha256 == Some(expected_source),
@@ -8251,7 +8252,7 @@ mod tests {
             Some(VisionConsumerContract {
                 profile: ArchProfile::Gemma4Siglip,
                 output_width: 2816,
-                deepstack_output_count: 0,
+                deepstack_output_count: Some(0),
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
@@ -8266,7 +8267,7 @@ mod tests {
             Some(VisionConsumerContract {
                 profile: ArchProfile::Qwen3VlSiglip,
                 output_width: 5120,
-                deepstack_output_count: 0,
+                deepstack_output_count: Some(0),
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
@@ -8288,7 +8289,7 @@ mod tests {
             Some(VisionConsumerContract {
                 profile: ArchProfile::Gemma4Siglip,
                 output_width: 2816,
-                deepstack_output_count: 0,
+                deepstack_output_count: Some(0),
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
@@ -8303,7 +8304,7 @@ mod tests {
             Some(VisionConsumerContract {
                 profile: ArchProfile::Qwen3VlSiglip,
                 output_width: 5120,
-                deepstack_output_count: 0,
+                deepstack_output_count: Some(0),
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
@@ -8316,6 +8317,28 @@ mod tests {
         .expect_err("Qwen width mismatch must fail");
         assert!(error.to_string().contains("2048"), "{error}");
         assert!(error.to_string().contains("5120"), "{error}");
+    }
+
+    #[test]
+    fn vision_projector_binding_accepts_external_qwen_without_private_metadata() {
+        use crate::inference::vision::mmproj::ArchProfile;
+        use crate::serve::api::engine::VisionConsumerContract;
+
+        validate_mmproj_text_binding(
+            Some(VisionConsumerContract {
+                profile: ArchProfile::Qwen3VlSiglip,
+                output_width: 2048,
+                deepstack_output_count: None,
+                source_sha256: None,
+                expected_projector_sha256: None,
+            }),
+            ArchProfile::Qwen3VlSiglip,
+            Some(2048),
+            0,
+            None,
+            None,
+        )
+        .expect("standard GGUF facts bind an external Qwen pair");
     }
 
     #[test]
@@ -8345,7 +8368,7 @@ mod tests {
         let contract = VisionConsumerContract {
             profile: ArchProfile::Qwen3VlSiglip,
             output_width: 5120,
-            deepstack_output_count: 0,
+            deepstack_output_count: Some(0),
             source_sha256: Some("source-a".into()),
             expected_projector_sha256: Some("projector-a".into()),
         };
