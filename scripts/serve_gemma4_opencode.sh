@@ -139,14 +139,12 @@ fi
 # One-model-at-a-time guard (feedback_oom_prevention): a 26B-class model
 # holds ~25-35 GB of unified memory; concurrent inference processes on
 # one box OOM it (measured 2026-08-03).
-for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
-    if RUNTIME_PIDS="$(pgrep -x "$RUNTIME_NAME" 2>/dev/null)"; then
-        echo "another inference runtime is already running — refusing before model load" >&2
-        echo "process: $RUNTIME_NAME (pid(s): ${RUNTIME_PIDS//$'\n'/, })" >&2
-        echo "stop that runtime before starting Gemma" >&2
-        exit 1
-    fi
-done
+if RUNTIME_PIDS="$(pgrep -x hf2q 2>/dev/null)"; then
+    echo "another hf2q server is already running — refusing before model load" >&2
+    echo "pid(s): ${RUNTIME_PIDS//$'\n'/, }" >&2
+    echo "stop that server before starting Gemma" >&2
+    exit 1
+fi
 
 # BATCHED unset = engine auto-routes per request (recommended; see
 # header). BATCHED=0 forces the linear route; BATCHED=1 forces batched

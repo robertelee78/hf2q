@@ -67,6 +67,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.6/mmproj-qwen36-F16.gguf}"
+VISION_MODE="${VISION_MODE:-auto}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
@@ -87,6 +88,13 @@ if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 
     echo "KV_CACHE_BUDGET_BYTES must be a positive integer (got: $KV_CACHE_BUDGET_BYTES)" >&2
     exit 3
 fi
+case "$VISION_MODE" in
+    auto|required|off) ;;
+    *)
+        echo "VISION_MODE must be auto, required, or off (got: $VISION_MODE)" >&2
+        exit 3
+        ;;
+esac
 # Refuse before loading the model when another service already owns the port.
 if command -v lsof >/dev/null 2>&1; then
     PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
@@ -105,33 +113,53 @@ fi
 # One-model-at-a-time guard (feedback_oom_prevention): a 35B-class model
 # holds ~30 GB of unified memory; a second concurrent inference process
 # on the same box risks OOM.
-for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
-    if RUNTIME_PIDS="$(pgrep -x "$RUNTIME_NAME" 2>/dev/null)"; then
-        echo "another inference runtime is already running — refusing before model load" >&2
-        echo "process: $RUNTIME_NAME (pid(s): ${RUNTIME_PIDS//$'\n'/, })" >&2
-        echo "stop that runtime before starting Qwen" >&2
-        exit 1
-    fi
-done
+if RUNTIME_PIDS="$(pgrep -x hf2q 2>/dev/null)"; then
+    echo "another hf2q server is already running — refusing before model load" >&2
+    echo "pid(s): ${RUNTIME_PIDS//$'\n'/, }" >&2
+    echo "stop that server before starting Qwen" >&2
+    exit 1
+fi
 
 MMPROJ_ARGS=()
-if [[ -f "$MMPROJ" ]]; then
-    MMPROJ_ARGS=(--mmproj "$MMPROJ")
-else
-    echo "vision projector not found at $MMPROJ; starting text-only (set MMPROJ to the converted projector path)" >&2
+case "$VISION_MODE" in
+    off)
+        echo "vision disabled explicitly; starting text-only" >&2
+        ;;
+    required)
+        [[ -f "$MMPROJ" ]] || {
+            echo "vision projector required but not found: $MMPROJ" >&2
+            exit 3
+        }
+        MMPROJ_ARGS=(--mmproj "$MMPROJ")
+        ;;
+    auto)
+        if [[ -f "$MMPROJ" ]]; then
+            MMPROJ_ARGS=(--mmproj "$MMPROJ")
+        else
+            echo "vision projector not found at $MMPROJ; starting text-only (set MMPROJ to the converted projector path)" >&2
+        fi
+        ;;
+esac
+
+HF2Q_SERVE_ARGS=(
+    -v serve
+    --model "$MODEL"
+)
+if (( ${#MMPROJ_ARGS[@]} > 0 )); then
+    HF2Q_SERVE_ARGS+=("${MMPROJ_ARGS[@]}")
 fi
+HF2Q_SERVE_ARGS+=(
+    --host "$HOST"
+    --port "$PORT"
+    --overflow-policy reject
+    --scheduler inflight-batched
+    --max-slots "$MAX_SLOTS"
+    --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
+)
 
 exec env \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
     HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \
-    "$HF2Q_BIN" -v serve \
-        --model "$MODEL" \
-        "${MMPROJ_ARGS[@]}" \
-        --host "$HOST" \
-        --port "$PORT" \
-        --overflow-policy reject \
-        --scheduler inflight-batched \
-        --max-slots "$MAX_SLOTS" \
-        --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
+    "$HF2Q_BIN" "${HF2Q_SERVE_ARGS[@]}"

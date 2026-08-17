@@ -59,7 +59,7 @@ set -euo pipefail
 # The default is the schema-v2, source-bound reproduction used by the strict
 # coherence/performance gate. Operators may still set MODEL to any explicitly
 # supported DeepSeek-V4 GGUF; serving is not restricted by producer identity.
-MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
+MODEL="${MODEL:-/opt/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
 CONTEXT_LEN="${CONTEXT_LEN:-524288}"
@@ -135,14 +135,12 @@ fi
 
 # One-model-at-a-time guard: the agentic artifact is ~100 GiB and a second
 # inference process on a 128 GiB unified-memory host will exhaust headroom.
-for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
-    if RUNTIME_PIDS="$(pgrep -x "$RUNTIME_NAME" 2>/dev/null)"; then
-        echo "another inference runtime is already running — refusing before model load" >&2
-        echo "process: $RUNTIME_NAME (pid(s): ${RUNTIME_PIDS//$'\n'/, })" >&2
-        echo "stop that runtime before starting DeepSeek-V4" >&2
-        exit 1
-    fi
-done
+if RUNTIME_PIDS="$(pgrep -x hf2q 2>/dev/null)"; then
+    echo "another hf2q server is already running — refusing before model load" >&2
+    echo "pid(s): ${RUNTIME_PIDS//$'\n'/, }" >&2
+    echo "stop that server before starting DeepSeek-V4" >&2
+    exit 1
+fi
 
 MODEL_BYTES=$(stat -f '%z' "$MODEL" 2>/dev/null || stat -c '%s' "$MODEL")
 if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
