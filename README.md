@@ -200,14 +200,14 @@ Start the launcher for the model family you want to serve:
 # Qwen 3.8-27B text (default port 8081)
 ./scripts/serve_qwen38_opencode.sh
 
-# DeepSeek-V4 (default port 8080)
+# DeepSeek-V4 (default port 8081; run one large family at a time)
 ./scripts/serve_deepseek4_opencode.sh
 
 # A different explicitly supported GGUF can be served without hf2q provenance:
 MODEL=./out/DeepSeek-V4-Flash-0731.gguf PORT=8090 \
   ./scripts/serve_deepseek4_opencode.sh
 
-curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:8081/v1/models
 ```
 
 Create the Qwen3.8 artifact natively from its immutable source revision before
@@ -220,8 +220,17 @@ hf2q convert --repo Qwen/Qwen3.8-27B \
   --output /opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf
 ```
 
-This release accepts the text decoder. The bundled vision tower is excluded
-fail-closed until Qwen3.8 image projection and real-image parity are supported.
+Native text conversion and serving are accepted. Vision is a separate
+candidate surface: hf2q converts the 333-tensor tower into a paired projector,
+binds it to the text architecture and width, and runs the production image
+graph before language-model admission. The exact candidate has passed unary
+and SSE image chat, two-image ordering, an image-driven tool call and
+tool-result continuation, same-image single-flight/cache reuse, disconnect
+isolation, and the official 4,096 by 4,096 processor maximum. Vision is not yet
+performance-accepted—the official-maximum cold path remains materially slower
+than desired—so those results are candidate evidence, not a release-wide speed
+claim. Speculative MTP decode remains disabled and outside the accepted server
+surface.
 
 Foreground launchers use the live operator dashboard automatically when
 stderr is an interactive terminal. Runtime work stays in place instead of
@@ -254,18 +263,18 @@ blocking other slots.
 A supervisor must recreate the process/device generation; an in-process slot
 reset is not safe recovery from a poisoned Metal queue.
 
-Qwen3.5/Qwen3.6/Qwen3.8 SlotAware text chat uses at most 2,048 prompt tokens
-per GPU prefill transaction. Active decoders run before the next cold
-transaction, multiple cold prompts rotate fairly, and cache/ledger state
-advances only after the verifier full-attention cursors agree. The optional
-MTP cursor is tracked independently until speculative decoding runs.
-SlotAware embeddings are
-limited to one <=2,048-token forward per admission quantum. Soft-token,
-deepstack, and 3D-position generation is rejected before Qwen SlotAware
-scheduler/SSE admission and before Qwen LM generation until its
-prefill and decode are scheduler-yielding; the separate SerialFifo primitive
-retains the historical multimodal path. Qwen3-VL remains a distinct model
-family rather than an approximate fallback through another Qwen text family.
+Qwen3.5/Qwen3.6/Qwen3.8 SlotAware chat uses at most 2,048 prompt tokens per GPU
+prefill transaction. Active decoders run before the next cold transaction,
+multiple cold prompts rotate fairly, and cache/ledger state advances only
+after the verifier full-attention cursors agree. The optional MTP cursor is
+tracked independently until speculative decoding runs. For a bound Qwen3.8
+projector, image requests carry soft-token embeddings, the explicit DeepStack
+layout, and 3D positions through the same scheduler-yielding prefill state;
+the payload is validated before its first GPU transaction. Image identity is
+part of slot affinity, response caching, and retained-prefix reuse, so a text
+turn or different image cannot inherit vision state. Qwen3-VL remains a
+distinct model family rather than an approximate fallback through another
+Qwen text family.
 
 Long Gemma 4 text prefills use 4,096-token transactions and split at
 the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and
@@ -299,6 +308,37 @@ slot-aware and uses bounded admission/decode waves so several agents make
 progress without duplicating model weights. Embeddings and multimodal messages
 remain unsupported for DeepSeek and fail explicitly rather than selecting
 another family or runtime.
+
+DeepSeek production prefill now uses the exact gathered-attention path for
+every nonempty prompt and retained-prefix suffix. The older dense kernel is a
+diagnostic oracle only: it produced a different, incoherent first-token
+ordering on stock-client structured-tool prompts and did not provide a speed
+advantage. Native template rendering emits the model's canonical JSON spacing,
+and the DSML grammar accepts both that spaced form and compact JSON while still
+rejecting `null` for required strings. This covers nested `question` and
+`todowrite` payloads in required and automatic tool-choice modes, including
+recovery after prior invalid calls, SSE, and tool-result continuation.
+
+The canonical launcher does not inject a repetition penalty when the client
+omits one (`HF2Q_DEFAULT_REPETITION_PENALTY=1.0`). The former hidden `1.05`
+default distorted constrained strings and did not stop client-side action
+loops. Set `REP_PENALTY` only for a measured workload; an explicit request
+value still wins.
+
+With an already-running DeepSeek server, run the focused real-model gate:
+
+```bash
+BASE_URL=http://127.0.0.1:8081 \
+  ./scripts/test_deepseek4_structured_tools.sh
+```
+
+The gate defaults to three temperature-0.55 repetitions per required and
+automatic `question`/`todowrite` case, validates meaningful non-null nested
+strings, exercises two-prior-failure recovery, checks SSE and continuation,
+and requires retained-prefix cache use. An isolated stock OpenCode 1.18.18
+coding gate additionally completed a Rust edit and same-session continuation
+without a repeated tool loop. These are candidate-source and local-artifact
+proofs; publication still requires the protected exact-package hardware gate.
 
 DeepSeek cold and meaningful retained-prefix suffix work advances at native
 atomic verifier boundaries. At most two cold prefills own the single scratch
@@ -446,8 +486,8 @@ curl --fail http://127.0.0.1:8082/readyz
 BASE_URL=http://127.0.0.1:8082 FAMILY=gemma4 AGENTS=4 \
   ./scripts/test_full_context_agent_slots.sh
 
-curl --fail http://127.0.0.1:8080/readyz
-BASE_URL=http://127.0.0.1:8080 FAMILY=deepseek4 AGENTS=4 \
+curl --fail http://127.0.0.1:8081/readyz
+BASE_URL=http://127.0.0.1:8081 FAMILY=deepseek4 AGENTS=4 \
   ./scripts/test_full_context_agent_slots.sh
 ```
 
