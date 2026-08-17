@@ -116,6 +116,7 @@ jobs:
             scripts/test_qwen36_prefill_cancellation.sh \
             scripts/test_qwen36_cumulative_release.sh \
             scripts/test_deepseek4_agentic.sh \
+            scripts/test_deepseek4_structured_tools.sh \
             scripts/test_deepseek4_agentic_fixture_contract.sh \
             scripts/test_deepseek4_peer_cold_wave.sh \
             scripts/test_deepseek4_peer_cold_wave_contract.sh \
