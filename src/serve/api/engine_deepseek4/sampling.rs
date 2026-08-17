@@ -26,6 +26,7 @@ pub(super) fn sampler_config(params: &SamplingParams) -> sampler_pure::SamplingP
         min_p: params.min_p as f64,
         repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
+        seed: params.seed,
     }
 }
 

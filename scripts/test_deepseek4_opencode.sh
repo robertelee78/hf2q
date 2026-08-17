@@ -13,6 +13,9 @@ OPENCODE=${OPENCODE:-/Users/robert.lee/.opencode/bin/opencode}
 KEEP_WORK_DIR=${KEEP_WORK_DIR:-0}
 TURN_TIMEOUT_SECONDS=${TURN_TIMEOUT_SECONDS:-600}
 TOOL_TIMEOUT_SECONDS=${TOOL_TIMEOUT_SECONDS:-180}
+AGENT_TEMPERATURE=${AGENT_TEMPERATURE:-0.55}
+AGENT_TOP_P=${AGENT_TOP_P:-0.95}
+REASONING_EFFORT=${REASONING_EFFORT:-max}
 SANDBOX_EXEC=${SANDBOX_EXEC:-/usr/bin/sandbox-exec}
 TIMEOUT_BIN=${TIMEOUT_BIN:-}
 
@@ -62,6 +65,15 @@ if (( TOOL_TIMEOUT_SECONDS >= TURN_TIMEOUT_SECONDS )); then
   echo "TOOL_TIMEOUT_SECONDS must be less than TURN_TIMEOUT_SECONDS" >&2
   exit 2
 fi
+if ! [[ "$AGENT_TEMPERATURE" =~ ^[0-9]+([.][0-9]+)?$ && "$AGENT_TOP_P" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+   ! jq -en --argjson top_p "$AGENT_TOP_P" '$top_p > 0 and $top_p <= 1' >/dev/null; then
+  echo "AGENT_TEMPERATURE must be nonnegative and AGENT_TOP_P must be in (0, 1]" >&2
+  exit 2
+fi
+case "$REASONING_EFFORT" in
+  low|high|max) ;;
+  *) echo "REASONING_EFFORT must be low, high, or max" >&2; exit 2 ;;
+esac
 if [[ ! "$BASE_URL" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})/v1$ ]]; then
   echo "BASE_URL must be a loopback endpoint of the form http://127.0.0.1:PORT/v1" >&2
   exit 2
@@ -416,9 +428,16 @@ selected_model="$PROVIDER_ID/$MODEL_ID"
 opencode_config=$(jq -cn \
   --arg provider "$PROVIDER_ID" --arg model "$MODEL_ID" \
   --arg selected "$selected_model" --arg base_url "$BASE_URL" \
+  --argjson agent_temperature "$AGENT_TEMPERATURE" \
+  --argjson agent_top_p "$AGENT_TOP_P" \
+  --arg reasoning_effort "$REASONING_EFFORT" \
   --arg shell "$sandbox_shell" '{
     model: $selected,
     small_model: $selected,
+    agent: {
+      build: {temperature: $agent_temperature, top_p: $agent_top_p, variant: "max"},
+      plan: {temperature: $agent_temperature, top_p: $agent_top_p, variant: "max"}
+    },
     shell: $shell,
     share: "disabled",
     permission: {
@@ -453,7 +472,10 @@ opencode_config=$(jq -cn \
           ($model): {
             name: "DeepSeek V4 Flash via hf2q",
             tool_call: true,
+            reasoning: true,
+            interleaved: "reasoning_content",
             temperature: true,
+            variants: {max: {reasoningEffort: $reasoning_effort}},
             limit: {context: 131072, output: 8192}
           }
         }
@@ -861,12 +883,20 @@ fi
 run_succeeded=1
 jq -n --arg status pass --arg opencode_version "$opencode_version" \
   --arg session_id "$session_id" --arg model "$selected_model" \
+  --argjson agent_temperature "$AGENT_TEMPERATURE" \
+  --argjson agent_top_p "$AGENT_TOP_P" \
+  --arg reasoning_effort "$REASONING_EFFORT" \
   --argjson session_deleted "$session_deleted" \
   --argjson first_turn_completed_tools "$first_tools" \
   --argjson second_turn_completed_tools "$second_tools" '{
     status: $status,
     opencode_version: $opencode_version,
     model: $model,
+    sampling_profile: {
+      temperature: $agent_temperature,
+      top_p: $agent_top_p,
+      reasoning_effort: $reasoning_effort
+    },
     session_id: $session_id,
     first_turn_completed_tools: $first_turn_completed_tools,
     second_turn_completed_tools: $second_turn_completed_tools,

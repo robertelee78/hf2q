@@ -78,6 +78,7 @@
 //! shape" contract for clients at N=1.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
@@ -87,6 +88,7 @@ use super::schema::{
     ChatCompletionChunk, ChoiceLogprobs, ChunkChoice, ChunkDelta, CompletionTokensDetails,
     PromptTokensDetails, UsageStats,
 };
+use super::state::ServerMetrics;
 
 /// Which delta slot a token fragment belongs to (per Decision #21).
 ///
@@ -192,11 +194,22 @@ pub struct SseStreamOptions {
 /// The public entrypoint `generation_events_to_sse` wraps this with
 /// `Sse::new(...).keep_alive(...)`.
 pub fn generation_events_stream(
+    rx: mpsc::Receiver<GenerationEvent>,
+    request_id: String,
+    model_name: String,
+    created: i64,
+    opts: SseStreamOptions,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    generation_events_stream_with_metrics(rx, request_id, model_name, created, opts, None)
+}
+
+fn generation_events_stream_with_metrics(
     mut rx: mpsc::Receiver<GenerationEvent>,
     request_id: String,
     model_name: String,
     created: i64,
     opts: SseStreamOptions,
+    metrics: Option<Arc<ServerMetrics>>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let sfp = opts.system_fingerprint.clone();
@@ -308,6 +321,9 @@ pub fn generation_events_stream(
                     completion_tokens,
                     stats,
                 } => {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_chat_completion_success(prompt_tokens, completion_tokens);
+                    }
                     let usage = if include_usage {
                         Some(UsageStats {
                             prompt_tokens,
@@ -506,6 +522,33 @@ pub fn generation_events_to_sse(
     generation_events_to_sse_with_slot(rx, request_id, model_name, created, opts, None)
 }
 
+/// Build an SSE response whose successful terminal event contributes to the
+/// process-wide chat-completion and token counters. The legacy public encoder
+/// remains metrics-neutral for callers and focused wire-format tests that do
+/// not own server state.
+pub(crate) fn generation_events_to_sse_with_metrics(
+    rx: mpsc::Receiver<GenerationEvent>,
+    request_id: String,
+    model_name: String,
+    created: i64,
+    opts: SseStreamOptions,
+    metrics: Arc<ServerMetrics>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(generation_events_stream_with_metrics(
+        rx,
+        request_id,
+        model_name,
+        created,
+        opts,
+        Some(metrics),
+    ))
+    .keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(SSE_KEEPALIVE_INTERVAL_SECS))
+            .text(SSE_KEEPALIVE_TEXT),
+    )
+}
+
 /// **ADR-040 §6 Phase C C3** — slot-aware variant of
 /// [`generation_events_to_sse`]. Accepts an optional `slot_id: Option<u32>`
 /// carrying the scheduler-allocated `SlotId.0` for this stream.
@@ -593,6 +636,8 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::response::IntoResponse;
+    use futures::StreamExt;
+    use std::sync::atomic::Ordering;
     use tokio::sync::mpsc::Sender;
 
     /// Drain the Sse response body into a vector of SSE data-payload strings
@@ -640,6 +685,156 @@ mod tests {
             1700000000,
             opts,
         )
+    }
+
+    fn assert_success_metrics(
+        metrics: &ServerMetrics,
+        completed: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        assert_eq!(
+            metrics.chat_completions_completed.load(Ordering::Relaxed),
+            completed
+        );
+        assert_eq!(
+            metrics.prompt_tokens_total.load(Ordering::Relaxed),
+            prompt_tokens
+        );
+        assert_eq!(
+            metrics.decode_tokens_total.load(Ordering::Relaxed),
+            completion_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_done_records_stream_metrics_once() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(GenerationEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 17,
+            completion_tokens: 5,
+            stats: StreamStats::default(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let sse = generation_events_to_sse_with_metrics(
+            rx,
+            "req-metrics".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Arc::clone(&metrics),
+        );
+        let payloads = drain_sse(sse).await;
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+        assert_success_metrics(&metrics, 1, 17, 5);
+    }
+
+    #[tokio::test]
+    async fn duplicate_done_records_only_first_terminal_event() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(GenerationEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 11,
+            completion_tokens: 3,
+            stats: StreamStats::default(),
+        })
+        .unwrap();
+        tx.try_send(GenerationEvent::Done {
+            finish_reason: "length",
+            prompt_tokens: 999,
+            completion_tokens: 999,
+            stats: StreamStats::default(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let sse = generation_events_to_sse_with_metrics(
+            rx,
+            "req-duplicate-done".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Arc::clone(&metrics),
+        );
+        let _ = drain_sse(sse).await;
+        assert_success_metrics(&metrics, 1, 11, 3);
+    }
+
+    #[tokio::test]
+    async fn stream_error_does_not_record_success_metrics() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(GenerationEvent::Error("synthetic failure".into()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let sse = generation_events_to_sse_with_metrics(
+            rx,
+            "req-error".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Arc::clone(&metrics),
+        );
+        let _ = drain_sse(sse).await;
+        assert_success_metrics(&metrics, 0, 0, 0);
+    }
+
+    #[tokio::test]
+    async fn sender_close_without_terminal_does_not_record_success_metrics() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        let sse = generation_events_to_sse_with_metrics(
+            rx,
+            "req-close".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Arc::clone(&metrics),
+        );
+        let _ = drain_sse(sse).await;
+        assert_success_metrics(&metrics, 0, 0, 0);
+    }
+
+    #[tokio::test]
+    async fn consumer_drop_before_done_does_not_record_success_metrics() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(GenerationEvent::Delta {
+            kind: DeltaKind::Content,
+            text: "partial".into(),
+        })
+        .unwrap();
+        tx.try_send(GenerationEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 13,
+            completion_tokens: 2,
+            stats: StreamStats::default(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut stream = Box::pin(generation_events_stream_with_metrics(
+            rx,
+            "req-drop".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Some(Arc::clone(&metrics)),
+        ));
+        assert!(stream.as_mut().next().await.is_some(), "role event");
+        assert!(stream.as_mut().next().await.is_some(), "content event");
+        drop(stream);
+        assert_success_metrics(&metrics, 0, 0, 0);
     }
 
     #[tokio::test]

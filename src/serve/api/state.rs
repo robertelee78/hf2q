@@ -169,6 +169,21 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
+    /// Record one successfully completed chat generation and its token usage.
+    ///
+    /// Unary and SSE handlers share this seam so the Prometheus counters have
+    /// identical semantics. Callers must invoke it only after the generation
+    /// has reached its successful terminal state; errors and cancellations do
+    /// not count as completions.
+    pub fn record_chat_completion_success(&self, prompt_tokens: usize, completion_tokens: usize) {
+        self.chat_completions_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.prompt_tokens_total
+            .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+        self.decode_tokens_total
+            .fetch_add(completion_tokens as u64, Ordering::Relaxed);
+    }
+
     /// Clone the shared `sse_cancellations` Arc so the engine worker thread
     /// can bump it from outside the handler.
     pub fn sse_cancellations_counter_arc(&self) -> Arc<AtomicU64> {

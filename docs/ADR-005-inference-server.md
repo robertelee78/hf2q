@@ -10351,3 +10351,60 @@ the tool-result continuation. Qwen passed at 6,692 prompt tokens with 6,688
 tokens reused. Both returned the exact requested call and accepted
 `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result`; no source
 truncation or approximately reconstructed argument is accepted by the gate.
+
+## Streaming metrics and request-seed hardening (2026-08-17 candidate)
+
+Two serving defects were isolated above the model graph. First, successful
+unary chat completions incremented the completed, prompt-token, and
+decode-token counters, while successful SSE completions did not. Both paths
+now call one `ServerMetrics::record_chat_completion_success` seam. The SSE
+encoder records exactly once when it consumes `GenerationEvent::Done`; an
+error, sender closure, client drop, or queued duplicate terminal does not count
+as a successful completion. This preserves the metric's generation-success
+meaning rather than conflating it with delivery of the final `[DONE]` bytes.
+
+Second, the OpenAI `seed` field reached the engine request but was dropped by
+every low-level pure-sampler configuration. The field is now threaded through
+Gemma, Qwen, Qwen-VL, and DeepSeek sampling. Seeded draws use a counter-based
+SplitMix64 mapping of `(seed, decode_step)`, making identical request state
+independent of worker-thread assignment; requests without a seed keep the
+existing process-local entropy stream. Qwen's slot-aware streaming loop now
+retains the complete generated-token history, which both advances the seeded
+draw and preserves repetition-penalty semantics. The pre-extracted top-K API
+has an explicit step-indexed entry point before any production caller adopts
+that path.
+
+Focused receipts on the candidate tree:
+
+- `serve::sampler_pure`: 20 passed, including same-seed replay,
+  cross-thread equality, different-seed divergence, seed zero, and logprob
+  selection parity.
+- `serve::api::sse::tests`: 16 passed, including exact success totals,
+  duplicate terminal, error, sender close, and consumer-drop falsifiers.
+- `serve::api::engine_supervisor::tests`: 8 passed; the guarded receiver and
+  poison/late-terminal cancellation contracts remain intact.
+- The slot-aware closed-stream cancellation and Prometheus-format router
+  regressions each passed.
+
+Completion receipts on the candidate tree:
+
+- `cargo check --locked --all-targets --all-features`,
+  `cargo build --release --locked`, and
+  `cargo test --locked -- --test-threads=1` passed. The default parallel test
+  run exposed one pre-existing process-environment race in
+  `test_resolve_auth_token_from_env`; that test passed alone, and the serial
+  whole-tree run closed with zero failures.
+- On the rebuilt DeepSeek-V4 release server, two unary calls and one SSE call
+  with seed `424242` reconstructed the same canonical choice, while seed `7`
+  diverged. The same four requests advanced the successful-completion counter
+  by 4 and advanced prompt/decode totals by the exact summed usage values 488
+  and 384. The canonical same-seed choice SHA-256 is
+  `49f33e6b0a4cf5273d7e3958b53ef06a1c156110fd148969d795b3153caa1073`.
+- The real-model structured-tool matrix passed at both the local OpenCode
+  profile (`temperature=0.55`, `top_p=0.95`) and the official comparison
+  profile (`temperature=1.0`, `top_p=0.95`), with top-level reasoning effort
+  `max`. An invalid top-level effort failed at the API boundary with HTTP 400.
+
+These receipts close the local source and exact-artifact candidate. Clean
+immutable source, exact-SHA CI, and protected publication gates remain separate
+release authority.

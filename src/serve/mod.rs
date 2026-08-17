@@ -1307,6 +1307,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         min_p: args.min_p,
         repetition_penalty: args.repetition_penalty,
         max_tokens: args.max_tokens,
+        seed: None,
     };
 
     // --- mlx-native forward pass ---
@@ -2438,6 +2439,7 @@ fn sample_qwen35_logits_for_generate(
         min_p: args.min_p,
         repetition_penalty: args.repetition_penalty,
         max_tokens: args.max_tokens,
+        seed: None,
     };
     crate::serve::sampler_pure::sample_token(logits, &params, previous_tokens)
 }

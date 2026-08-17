@@ -1413,6 +1413,7 @@ fn sample_logits_qwen35(logits: &mut [f32], params: &SamplingParams, generated: 
         min_p: 0.0,
         repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
+        seed: params.seed,
     };
     sampler_pure::sample_token(logits, &sp, generated)
 }
@@ -1433,6 +1434,7 @@ fn sample_logits_qwen35_with_logprob(
         min_p: 0.0,
         repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
+        seed: params.seed,
     };
     sampler_pure::sample_token_with_logprob(logits, &sp, generated)
 }
@@ -1456,6 +1458,7 @@ fn sample_logits_qwen35_constrained(
         min_p: params.min_p as f64,
         repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
+        seed: params.seed,
     };
     sample_logits_with_grammar(
         logits,
@@ -4625,6 +4628,8 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
     // ── Decode loop ────────────────────────────────────────────────
     let decode_start = Instant::now();
     let mut completion_tokens = 0usize;
+    let mut generated_tokens = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
     let mut accumulated_text = String::new();
     let mut reasoning_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
@@ -4717,7 +4722,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                             ))
                         } else {
                             let mut tmp = logits;
-                            Ok(sample_logits_qwen35(&mut tmp, params, &[next_token]))
+                            Ok(sample_logits_qwen35(&mut tmp, params, &generated_tokens))
                         }
                     }
                     Err(e) => Err(e),
@@ -4738,6 +4743,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                 finish_reason = "stop";
                 break;
             }
+            generated_tokens.push(next_token);
             completion_tokens += 1;
             let fragment = qwen
                 .tokenizer
@@ -8015,6 +8021,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 8,
+            seed: None,
         };
         let mut logits = vec![1.0, 0.0];
         let short = sample_logits_with_grammar(

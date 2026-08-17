@@ -35,6 +35,10 @@ pub struct SamplingParams {
     pub min_p: f64,
     pub repetition_penalty: f64,
     pub max_tokens: usize,
+    /// Optional request seed. A supplied value yields the same random draw at
+    /// each decode step for identical request state; `None` retains the
+    /// process-local entropy stream.
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingParams {
@@ -46,6 +50,7 @@ impl Default for SamplingParams {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 2048,
+            seed: None,
         }
     }
 }
@@ -125,7 +130,7 @@ pub fn sample_token(logits: &mut [f32], params: &SamplingParams, previous_tokens
         if indexed.is_empty() {
             return Some(sample_greedy(logits));
         }
-        sample_token_indexed(&mut indexed, params)
+        sample_token_indexed(&mut indexed, params, previous_tokens.len())
     });
     if let Some(out) = result {
         return out;
@@ -222,6 +227,19 @@ pub fn sample_token_from_topk(
     top_values: &[f32],
     params: &SamplingParams,
 ) -> u32 {
+    sample_token_from_topk_at_step(top_indices, top_values, params, 0)
+}
+
+/// Step-indexed variant of [`sample_token_from_topk`]. Seeded generation
+/// loops must pass the current decode step so each token consumes a distinct
+/// deterministic draw. The compatibility wrapper above represents a single
+/// standalone draw at step zero.
+pub fn sample_token_from_topk_at_step(
+    top_indices: &[u32],
+    top_values: &[f32],
+    params: &SamplingParams,
+    sample_index: usize,
+) -> u32 {
     debug_assert_eq!(
         top_indices.len(),
         top_values.len(),
@@ -289,7 +307,7 @@ pub fn sample_token_from_topk(
         .map(|(&i, &l)| (i as usize, l))
         .collect();
 
-    match sample_token_indexed(&mut indexed, params) {
+    match sample_token_indexed(&mut indexed, params, sample_index) {
         Some(tok) => tok,
         None => {
             // Fallback to top-1 of the GPU subset (the indexed Vec may
@@ -308,7 +326,11 @@ pub fn sample_token_from_topk(
     }
 }
 
-fn sample_token_indexed(indexed: &mut Vec<(usize, f32)>, params: &SamplingParams) -> Option<u32> {
+fn sample_token_indexed(
+    indexed: &mut Vec<(usize, f32)>,
+    params: &SamplingParams,
+    sample_index: usize,
+) -> Option<u32> {
     // ------------------------------------------------------------------
     // Top-k truncation on raw logits (llama-sampler.cpp:317).
     //
@@ -393,7 +415,7 @@ fn sample_token_indexed(indexed: &mut Vec<(usize, f32)>, params: &SamplingParams
         return Some(indexed.first().map(|&(idx, _)| idx as u32).unwrap_or(0));
     }
 
-    let mut rng_val = rand_f32();
+    let mut rng_val = rand_f32(params.seed, sample_index);
     for (i, &p) in probs.iter().enumerate() {
         let normalized = p / sum;
         if rng_val < normalized {
@@ -498,8 +520,24 @@ fn softmax_pairs_in_place(indexed: &mut [(usize, f32)]) {
 // PRNG — xorshift64* (verbatim copy from sampler.rs)
 // ---------------------------------------------------------------------------
 
-/// Thread-local xorshift64* PRNG.
-fn rand_f32() -> f32 {
+/// Draw one value from the request seed or the thread-local entropy stream.
+///
+/// Seeded requests use SplitMix64 as a counter-based generator: the draw is a
+/// pure function of `(seed, decode_step)`, so request scheduling and worker
+/// thread assignment cannot perturb reproducibility. Unseeded requests keep
+/// the existing xorshift64* stream.
+fn rand_f32(seed: Option<u64>, sample_index: usize) -> f32 {
+    if let Some(seed) = seed {
+        let mut z = seed.wrapping_add(
+            0x9e3779b97f4a7c15u64.wrapping_mul((sample_index as u64).wrapping_add(1)),
+        );
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        let upper = (z >> 32) as u32;
+        return upper as f32 / (u32::MAX as f32 + 1.0);
+    }
+
     use std::time::SystemTime;
 
     thread_local! {
@@ -573,6 +611,74 @@ mod tests {
         counts.iter().map(|&c| c as f64 / n as f64).collect()
     }
 
+    fn seeded_sequence(seed: u64, steps: usize) -> Vec<u32> {
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: steps,
+            seed: Some(seed),
+        };
+        let base_logits = vec![0.0_f32; 257];
+        let mut previous = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let mut logits = base_logits.clone();
+            let token = sample_token(&mut logits, &params, &previous);
+            previous.push(token);
+        }
+        previous
+    }
+
+    #[test]
+    fn same_seed_replays_identical_sequence() {
+        assert_eq!(seeded_sequence(0x5eed, 32), seeded_sequence(0x5eed, 32));
+    }
+
+    #[test]
+    fn same_seed_is_independent_of_worker_thread() {
+        let expected = seeded_sequence(0xdecafbad, 32);
+        let actual = std::thread::spawn(|| seeded_sequence(0xdecafbad, 32))
+            .join()
+            .expect("seeded sampler worker must not panic");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn different_seeds_produce_different_sequences() {
+        assert_ne!(seeded_sequence(1, 32), seeded_sequence(2, 32));
+    }
+
+    #[test]
+    fn zero_seed_is_valid_and_deterministic() {
+        let first = seeded_sequence(0, 32);
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, seeded_sequence(0, 32));
+    }
+
+    #[test]
+    fn seeded_logprob_entry_point_selects_same_token() {
+        let params = SamplingParams {
+            temperature: 0.83,
+            top_p: 0.94,
+            top_k: 7,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+            seed: Some(8675309),
+        };
+        let previous = [3, 1, 4, 1, 5];
+        let base_logits = [0.2_f32, -0.1, 0.7, 1.1, 0.0, 0.5, -0.4, 0.9];
+        let mut plain_logits = base_logits;
+        let mut logprob_logits = base_logits;
+        let plain = sample_token(&mut plain_logits, &params, &previous);
+        let (with_logprob, logprob) =
+            sample_token_with_logprob(&mut logprob_logits, &params, &previous);
+        assert_eq!(with_logprob, plain);
+        assert!(logprob.is_finite());
+    }
+
     #[test]
     fn sampler_all_pass_matches_raw_softmax() {
         // With temp=1, no truncation, the empirical distribution must match
@@ -586,6 +692,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let freq = sample_frequencies(&logits, &params, 20_000);
         for i in 0..logits.len() {
@@ -614,6 +721,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let hot = SamplingParams {
             temperature: 2.0,
@@ -652,6 +760,7 @@ mod tests {
             min_p: 0.05,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let freq = sample_frequencies(&logits, &params, 5_000);
         // Only index 7 passes the min-p logit threshold; sampler must always
@@ -675,6 +784,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let freq = sample_frequencies(&logits, &params, 5_000);
         // idx 2 (logit=3.0) and idx 1 (logit=2.0) are the top 2.
@@ -698,6 +808,7 @@ mod tests {
             min_p: 0.05,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let freq = sample_frequencies(&logits, &params, 5_000);
         assert!(
@@ -718,6 +829,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         assert_eq!(sample_token(&mut logits, &params, &[]), 1);
     }
@@ -739,6 +851,7 @@ mod tests {
                     min_p: 0.0,
                     repetition_penalty: 1.0,
                     max_tokens: 1,
+                    seed: None,
                 };
                 assert_eq!(
                     sample_token_from_topk(&top_indices, &top_values, &params),
@@ -769,6 +882,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         // Max value 5.0 is at index 1 in the top_values array → top_indices[1] = 200.
         assert_eq!(
@@ -800,6 +914,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
 
         let n = 4_000usize;
@@ -872,6 +987,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let a = sample_token_from_topk(&top_indices_a, &top_values_a, &params);
         let b = sample_token_from_topk(&top_indices_b, &top_values_b, &params);
@@ -895,6 +1011,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let (_token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
         let expected = -(n as f32).ln();
@@ -918,6 +1035,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let (token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
         assert_eq!(token, 42);
@@ -940,6 +1058,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let (token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
         assert_eq!(token, 1, "greedy should pick the larger logit");
@@ -961,6 +1080,7 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
+            seed: None,
         };
         let (_token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
         assert!(logprob.is_infinite() && logprob < 0.0);

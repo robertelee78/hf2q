@@ -24,6 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::engine::{self, Engine, SamplingParams};
@@ -350,7 +351,6 @@ pub async fn chat_completions(
     cancellation: Option<Extension<super::middleware::RequestCancellation>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    use std::sync::atomic::Ordering;
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         model = %req.model,
@@ -437,7 +437,6 @@ async fn chat_completions_with_prepared(
     req: ChatCompletionRequest,
     prepared: PreparedChatContext,
 ) -> Response {
-    use std::sync::atomic::Ordering;
     let PreparedChatContext {
         loaded_engine,
         prompt_tokens,
@@ -541,16 +540,7 @@ async fn chat_completions_with_prepared(
     let total_time = gen_started.elapsed();
     state
         .metrics
-        .chat_completions_completed
-        .fetch_add(1, Ordering::Relaxed);
-    state
-        .metrics
-        .prompt_tokens_total
-        .fetch_add(result.prompt_tokens as u64, Ordering::Relaxed);
-    state
-        .metrics
-        .decode_tokens_total
-        .fetch_add(result.completion_tokens as u64, Ordering::Relaxed);
+        .record_chat_completion_success(result.prompt_tokens, result.completion_tokens);
 
     // --- Wrap in OpenAI response envelope ---
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -1046,12 +1036,20 @@ fn resolve_api_enable_thinking(request_override: Option<bool>, template: &str) -
 fn resolve_api_template_kwargs(
     registration: Option<&registry::ModelRegistration>,
     request_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    reasoning_effort: Option<&str>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut resolved = request_kwargs.cloned().unwrap_or_default();
     if registration.is_some_and(|candidate| candidate.family == "qwen35") {
         resolved
             .entry("preserve_thinking")
             .or_insert(serde_json::Value::Bool(true));
+    }
+    if registration.is_some_and(|candidate| candidate.family == "deepseek4") {
+        if let Some(effort) = reasoning_effort {
+            resolved
+                .entry("reasoning_effort")
+                .or_insert_with(|| serde_json::Value::String(effort.to_owned()));
+        }
     }
     (!resolved.is_empty()).then_some(resolved)
 }
@@ -1286,8 +1284,11 @@ where
     // the already-cached prompt before its stable anchor. Preserve wrappers
     // from the first request so both plain and tool-bearing histories remain
     // append-only. An explicit caller value still wins.
-    let resolved_template_kwargs =
-        resolve_api_template_kwargs(engine.registration(), req.chat_template_kwargs.as_ref());
+    let resolved_template_kwargs = resolve_api_template_kwargs(
+        engine.registration(),
+        req.chat_template_kwargs.as_ref(),
+        req.reasoning_effort.as_deref(),
+    );
     let template_kwargs = resolved_template_kwargs.as_ref();
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
         match apply_overflow_policy(
@@ -1866,7 +1867,7 @@ async fn chat_completions_stream(
     req: ChatCompletionRequest,
     prepared: PreparedChatContext,
 ) -> Response {
-    use super::sse::{generation_events_to_sse, SseStreamOptions};
+    use super::sse::{generation_events_to_sse_with_metrics, SseStreamOptions};
 
     // Iter-209: stream path uses the resolved engine from
     // `prepared.loaded_engine` — the pool resolution already ran in
@@ -2001,7 +2002,14 @@ async fn chat_completions_stream(
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono_seconds();
     let events_rx = engine.supervise_stream_events(events_rx);
-    let sse = generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts);
+    let sse = generation_events_to_sse_with_metrics(
+        events_rx,
+        request_id,
+        req.model.clone(),
+        created,
+        opts,
+        Arc::clone(&state.metrics),
+    );
     let mut response = sse.into_response();
     apply_transparency_headers(
         &state,
@@ -2973,8 +2981,6 @@ async fn prepare_vision_context(
     engine: &Engine,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::result::Result<PreparedVisionContext, Response> {
-    use std::sync::atomic::Ordering;
-
     if !chat_messages_have_images(messages) {
         return Ok((
             messages.to_vec(),
@@ -4186,6 +4192,7 @@ mod compile_tool_grammar_precondition_tests {
             response_format: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9430,6 +9437,7 @@ mod readiness_guard_tests {
             response_format: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9541,6 +9549,7 @@ mod readiness_guard_tests {
             response_format: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9783,6 +9792,7 @@ mod pool_error_tests {
             response_format: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9868,6 +9878,7 @@ mod iter215_qwen35_chat_501_tests {
             response_format: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -10802,6 +10813,7 @@ mod a5d_handler_429_tests {
             response_format: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -11332,8 +11344,8 @@ mod api_thinking_default_tests {
     #[test]
     fn qwen_api_default_preserves_plain_history_as_an_exact_prefix() {
         let registration = registry::find_for("qwen3.6").expect("Qwen registration");
-        let kwargs =
-            resolve_api_template_kwargs(Some(&registration), None).expect("Qwen default kwargs");
+        let kwargs = resolve_api_template_kwargs(Some(&registration), None, None)
+            .expect("Qwen default kwargs");
         assert_eq!(
             kwargs.get("preserve_thinking"),
             Some(&serde_json::Value::Bool(true))
@@ -11373,8 +11385,8 @@ mod api_thinking_default_tests {
     #[test]
     fn qwen_api_default_preserves_tool_history_as_an_exact_prefix() {
         let registration = registry::find_for("qwen3.6").expect("Qwen registration");
-        let kwargs =
-            resolve_api_template_kwargs(Some(&registration), None).expect("Qwen default kwargs");
+        let kwargs = resolve_api_template_kwargs(Some(&registration), None, None)
+            .expect("Qwen default kwargs");
         let mut call = message("assistant", "I will look it up.");
         call.reasoning_content = Some("Use the available tool.".into());
         call.tool_calls = Some(vec![ToolCall {
@@ -11422,13 +11434,46 @@ mod api_thinking_default_tests {
         let registration = registry::find_for("qwen3.6").expect("Qwen registration");
         let mut request = serde_json::Map::new();
         request.insert("preserve_thinking".into(), serde_json::Value::Bool(false));
-        let resolved = resolve_api_template_kwargs(Some(&registration), Some(&request)).unwrap();
+        let resolved =
+            resolve_api_template_kwargs(Some(&registration), Some(&request), None).unwrap();
         assert_eq!(
             resolved.get("preserve_thinking"),
             Some(&serde_json::Value::Bool(false))
         );
 
         let gemma = registry::find_for("gemma-4").expect("Gemma registration");
-        assert!(resolve_api_template_kwargs(Some(&gemma), None).is_none());
+        assert!(resolve_api_template_kwargs(Some(&gemma), None, None).is_none());
+    }
+
+    #[test]
+    fn deepseek_accepts_top_level_reasoning_effort() {
+        let registration = registry::find_for("deepseek-v4-flash")
+            .or_else(|| registry::find_for("deepseek4"))
+            .expect("DeepSeek-V4 registration");
+        let resolved = resolve_api_template_kwargs(Some(&registration), None, Some("max"))
+            .expect("top-level reasoning effort must produce template kwargs");
+        assert_eq!(
+            resolved.get("reasoning_effort"),
+            Some(&serde_json::Value::String("max".into()))
+        );
+    }
+
+    #[test]
+    fn explicit_template_reasoning_effort_keeps_compatibility_precedence() {
+        let registration = registry::find_for("deepseek-v4-flash")
+            .or_else(|| registry::find_for("deepseek4"))
+            .expect("DeepSeek-V4 registration");
+        let mut request = serde_json::Map::new();
+        request.insert(
+            "reasoning_effort".into(),
+            serde_json::Value::String("high".into()),
+        );
+        let resolved =
+            resolve_api_template_kwargs(Some(&registration), Some(&request), Some("max"))
+                .expect("explicit compatibility kwarg must be retained");
+        assert_eq!(
+            resolved.get("reasoning_effort"),
+            Some(&serde_json::Value::String("high".into()))
+        );
     }
 }

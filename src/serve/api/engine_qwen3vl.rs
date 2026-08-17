@@ -551,6 +551,7 @@ fn sample_logits_qwen3vl(logits: &mut [f32], params: &SamplingParams, generated:
         min_p: params.min_p as f64,
         repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
+        seed: params.seed,
     };
     sampler_pure::sample_token(logits, &sp, generated)
 }

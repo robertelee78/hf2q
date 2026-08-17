@@ -811,6 +811,11 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// DeepSeek-V4 reasoning budget. Accepted at the OpenAI-compatible
+    /// top level so clients need not know hf2q's `chat_template_kwargs`
+    /// extension. Valid values are `low`, `high`, and `max`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]

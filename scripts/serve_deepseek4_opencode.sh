@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # serve_deepseek4_opencode.sh — canonical hf2q serve launcher for the
 # DeepSeek-V4-Flash-0731 agentic Q2/Q3/Q8 GGUF, tuned for OpenCode coding.
+# Pair this server with explicit OpenCode build/plan settings
+# `temperature=0.55`, `top_p=0.95`, and a `max` model variant whose
+# `reasoningEffort` is `max`; see README.md and the checked-in OpenCode gate.
 #
 # The DeepSeek cache is native and in-memory:
 #

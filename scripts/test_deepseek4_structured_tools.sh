@@ -9,6 +9,8 @@ MODEL="${MODEL:-}"
 MAX_TOKENS="${MAX_TOKENS:-768}"
 REPEATS="${REPEATS:-3}"
 TEMPERATURE="${TEMPERATURE:-0.55}"
+TOP_P="${TOP_P:-0.95}"
+REASONING_EFFORT="${REASONING_EFFORT:-max}"
 KEEP_WORK_DIR="${KEEP_WORK_DIR:-0}"
 
 if ! [[ "$BASE_URL" =~ ^http://(127\.0\.0\.1|localhost):[0-9]+$ ]]; then
@@ -19,10 +21,18 @@ if ! [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ && "$REPEATS" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_TOKENS and REPEATS must be positive integers" >&2
     exit 2
 fi
-if ! [[ "$TEMPERATURE" =~ ^[0-9]+([.][0-9]+)?$ && "$KEEP_WORK_DIR" =~ ^[01]$ ]]; then
-    echo "TEMPERATURE must be nonnegative and KEEP_WORK_DIR must be 0 or 1" >&2
+if ! [[ "$TEMPERATURE" =~ ^[0-9]+([.][0-9]+)?$ && "$TOP_P" =~ ^[0-9]+([.][0-9]+)?$ && "$KEEP_WORK_DIR" =~ ^[01]$ ]]; then
+    echo "TEMPERATURE/TOP_P must be nonnegative numbers and KEEP_WORK_DIR must be 0 or 1" >&2
     exit 2
 fi
+if ! jq -en --argjson top_p "$TOP_P" '$top_p > 0 and $top_p <= 1' >/dev/null; then
+    echo "TOP_P must be greater than 0 and at most 1" >&2
+    exit 2
+fi
+case "$REASONING_EFFORT" in
+    low|high|max) ;;
+    *) echo "REASONING_EFFORT must be low, high, or max" >&2; exit 2 ;;
+esac
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-deepseek-structured.XXXXXX")
 cleanup() {
@@ -164,9 +174,11 @@ build_request() {
       --arg prompt "$prompt" \
       --arg bad_arguments "$bad_arguments" \
       --arg tool_choice "$tool_choice" \
+      --arg reasoning_effort "$REASONING_EFFORT" \
       --argjson tool "$tool_json" \
       --argjson recovery "$recovery" \
       --argjson temperature "$TEMPERATURE" \
+      --argjson top_p "$TOP_P" \
       --argjson max_tokens "$MAX_TOKENS" '
       {
         model: $model,
@@ -180,7 +192,8 @@ build_request() {
         tools: [$tool],
         tool_choice: $tool_choice,
         temperature: $temperature,
-        top_p: 1,
+        top_p: $top_p,
+        reasoning_effort: $reasoning_effort,
         max_tokens: $max_tokens,
         stream: false
       }
@@ -368,6 +381,9 @@ fi
 jq -n \
   --arg model "$MODEL" \
   --argjson repeats "$REPEATS" \
+  --argjson temperature "$TEMPERATURE" \
+  --argjson top_p "$TOP_P" \
+  --arg reasoning_effort "$REASONING_EFFORT" \
   --argjson question_cached_tokens "$question_cached" \
   --argjson todo_cached_tokens "$todo_cached" \
   --argjson question_auto_cached_tokens "$question_auto_cached" \
@@ -377,6 +393,11 @@ jq -n \
     status: "pass",
     model: $model,
     repeats: $repeats,
+    sampling_profile: {
+      temperature: $temperature,
+      top_p: $top_p,
+      reasoning_effort: $reasoning_effort
+    },
     question_arguments_valid: true,
     todo_arguments_valid: true,
     auto_question_arguments_valid: true,

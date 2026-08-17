@@ -2,13 +2,15 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-16 — production prefill now uses the exact gathered
+- **Updated:** 2026-08-17 — production prefill uses the exact gathered
   attention path for every nonempty prompt and suffix; native JSON rendering
   and DSML grammar accept the model's canonical separator spacing; and the
-  canonical launcher no longer injects a hidden repetition penalty. Real-model
-  structured-tool and isolated stock-client coding gates pass with prefix
-  reuse. Earlier four-agent scheduling and thermal evidence remains as recorded
-  below.
+  canonical launcher no longer injects a hidden repetition penalty. The
+  candidate request surface also accepts top-level `reasoning_effort`, and the
+  OpenCode gates pin explicit sampling/reasoning profiles. Earlier real-model
+  structured-tool, prefix-reuse, four-agent scheduling, and thermal evidence
+  remains as recorded below; the 2026-08-17 candidate additions require their
+  own hardware receipts before publication.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1662,6 +1664,91 @@ behavior oracle, executed the named regression, passed tests after both turns,
 and deleted the isolated session. This is local exact-artifact candidate
 evidence; clean immutable source, exact-SHA CI, and protected packed-artifact
 hardware replay remain publication authority.
+
+### OpenCode loop, sampling, and recovery hardening (2026-08-17 candidate)
+
+The observed repeated-call incident had two independent layers. OpenCode
+1.18.18's native doom-loop detector reads only tool parts belonging to the
+current assistant message. A tool result starts another assistant message, so
+three identical calls spread across normal agent continuations are invisible;
+interleaved reasoning or text also masks its same-message tail check. The open
+upstream patch that counts matching calls anywhere in compacted history is too
+broad for hf2q operations because legitimate nonconsecutive inspections would
+become false positives.
+
+The immediate machine mitigation therefore lives in Agentic Kit's managed
+OpenCode lifecycle-plugin template rather than this Rust server. It tracks only
+the trailing completed call within one user turn, canonicalizes recursively
+reordered argument keys, and requires the tool name, arguments, and output to
+repeat three times before aborting a fourth identical attempt. A changed call,
+changed output, new user message, or different session resets or isolates the
+streak; compaction and assistant continuations preserve it. Six focused plugin
+tests cover the helper and deployed-hook abort path. This prevents the known
+loop without claiming to replace an eventual tested upstream core repair.
+
+On the hf2q boundary, DeepSeek already understood
+`chat_template_kwargs.reasoning_effort`; generic OpenAI-compatible clients sent
+the same setting at the request top level, where it was ignored. The request
+schema now accepts `reasoning_effort` directly and merges it into the native
+template context for DeepSeek only. Valid values remain `low`, `high`, and
+`max`; an explicitly supplied compatibility kwarg retains its documented
+precedence. Eight focused API/template tests pass, including top-level `max`
+and compatibility precedence.
+
+The canonical OpenCode profile and isolated coding gate now declare
+`temperature=0.55`, `top_p=0.95`, interleaved `reasoning_content`, and a `max`
+variant mapped to `reasoningEffort=max`. The structured-tool harness accepts
+these parameters explicitly and records them in its result. The official model
+card's code-agent comparison profile (`temperature=1`, `top_p=0.95`) remains a
+required matched comparison rather than being silently substituted for the
+locally proven lower-temperature starting point.
+
+`scripts/test_deepseek4_reasoning_recovery.sh` adds an opt-in sanitized
+incident-class replay. It calibrates an assistant-`reasoning_content` history
+to 168K--178K actual server tokens, requires a cold structured tool call, then
+checks a tool-result continuation and a following recovery turn for near-total
+prefix reuse and valid reasoning/tool semantics. The script hashes its fixture,
+request, and normalized recovery result and labels itself explicitly as a
+reconstruction, not a byte-exact replay of private historical content. The
+recovery turn has its own 512-token default because the incident-shaped history
+causes the model to reconcile the archived "never repeat" rule before obeying
+the explicit new recovery request. The first 128-token attempt failed closed;
+an observational automatic-choice replay showed the correct DSML call beginning
+at the 256-token boundary, and the 512-token required-choice replay completed
+the call in 290 tokens. This is a fixture-budget correction, not a relaxation
+of the fail-closed parser.
+
+The rebuilt release binary produced the following local hardware receipts on
+the M5 Max and exact 100.05 GiB agentic Q2 artifact:
+
+- Identical seed `424242` produced byte-identical unary/unary and unary/SSE
+  choices (SHA-256
+  `49f33e6b0a4cf5273d7e3958b53ef06a1c156110fd148969d795b3153caa1073`),
+  while seed `7` diverged
+  (`f096b3353d1f7f2099a23fd3783a67e79d6e48a44b38c02f3eb5bfcf978a8ec5`).
+  Four successful requests advanced the completed, prompt, and decode counters
+  by exactly 4, 488, and 384. Top-level `reasoning_effort=max` was consumed;
+  `bogus` failed with HTTP 400.
+- Both matched structured-tool profiles passed every required/automatic,
+  repeated-null recovery, SSE, continuation, and prefix-reuse assertion:
+  local OpenCode `temperature=0.55, top_p=0.95` and the model-card comparison
+  `temperature=1.0, top_p=0.95`, both with reasoning effort `max`.
+- Stock OpenCode 1.18.18 passed the isolated coding gate in one continued
+  session: five tools on the repair turn, two on the continuation, exact source
+  mutation, immutable behavior oracle, named regression, and tests after both
+  turns. The isolated session was deleted.
+- The sanitized recovery fixture calibrated to 169,864 cold prompt tokens and
+  completed in 537.558 s with zero cached tokens. Its tool-result continuation
+  reused 169,856 of 169,962 prompt tokens in 4.034 s. The corrected recovery
+  turn reused 170,045 of 170,053 prompt tokens and emitted the exact
+  `inspect_file` call in 13.493 s. Fixture, cold request, and normalized final
+  response SHA-256 values are respectively
+  `71ce1f1c4a8dd83bd8a5e04f8dc8b28532703890512d537407bc4c2c1e8e12ef`,
+  `469186318228ed79e4d31c25b6320b27c1de5dbfdcb427806d146e3bd5f2529a`,
+  and `a495f462660d9970086dec328e1b2d80312b66a7dd23d15541110f37c3ac510f`.
+
+These receipts close the local hardening candidate. They do not replace clean
+immutable source, exact-SHA CI, or packed-artifact publication authority.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

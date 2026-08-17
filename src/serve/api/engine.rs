@@ -117,8 +117,11 @@ use crate::serve::multi_seq_kv::MultiSeqError;
 /// retained on the struct, but not consumed by the current sampler):
 /// - `frequency_penalty`, `presence_penalty` — Tier 2 OpenAI extras.
 /// - `min_p` — Tier 3 llama.cpp extension.
-/// - `seed` — RNG seeding (sampler_pure uses a thread-local RNG today).
 /// - `logprobs`, `top_logprobs` — Tier 4 response shape; surface only.
+///
+/// `seed` is honored by `sampler_pure`: seeded requests use a counter-based
+/// draw keyed by seed and decode step, while unseeded requests retain the
+/// process-local entropy stream.
 /// Tool-call enforcement policy derived from the request's `tool_choice`.
 ///
 /// Wave-2.5 A4: the streaming worker's `route_content` fallback silently
@@ -7192,6 +7195,7 @@ impl Gemma4DecodeState {
                 min_p: 0.0,
                 repetition_penalty: effective_repetition_penalty(params),
                 max_tokens: params.max_tokens,
+                seed: params.seed,
             })
         } else {
             None
@@ -21734,6 +21738,7 @@ fn generate_once_with_soft_tokens(
             min_p: 0.0,
             repetition_penalty: effective_repetition_penalty(params),
             max_tokens: params.max_tokens,
+            seed: params.seed,
         })
     } else {
         None
@@ -22670,6 +22675,7 @@ fn generate_gemma4_once_slot_aware(
                 min_p: 0.0,
                 repetition_penalty: effective_repetition_penalty(params),
                 max_tokens: params.max_tokens,
+                seed: params.seed,
             })
         } else {
             None
@@ -23322,6 +23328,7 @@ fn generate_stream_gemma4_once_slot_aware(
                     min_p: 0.0,
                     repetition_penalty: effective_repetition_penalty(params),
                     max_tokens: params.max_tokens,
+                    seed: params.seed,
                 })
             } else {
                 None
@@ -24443,6 +24450,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 min_p: 0.0,
                 repetition_penalty: effective_repetition_penalty(params),
                 max_tokens: params.max_tokens,
+                seed: params.seed,
             })
         } else {
             None
@@ -26911,6 +26919,7 @@ fn generate_stream_once(
             min_p: 0.0,
             repetition_penalty: effective_repetition_penalty(params),
             max_tokens: params.max_tokens,
+            seed: params.seed,
         })
     } else {
         None
