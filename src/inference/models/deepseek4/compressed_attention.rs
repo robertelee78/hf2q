@@ -30,26 +30,16 @@ use super::compressed_attention_main::{encode_main_compressor, MainCompressorAre
 use super::compressed_attention_weights::CompressedAttentionWeightsRef;
 use super::forward_support::{alloc, alloc_host_input};
 use super::prefill_flash_attention::{
-    encode_deepseek_flash_prefill, encode_deepseek_sparse_flash_prefill, DeepseekPrefillFlashArena,
-    DeepseekSparsePrefillFlashArena,
+    encode_deepseek_flash_prefill, encode_deepseek_sparse_flash_prefill, requires_gathered_prefill,
+    DeepseekPrefillFlashArena, DeepseekSparsePrefillFlashArena,
 };
 use super::rope::yarn_frequencies;
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
 
 const SPARSE_FLASH_MIN_TOP_K: usize = 384;
-/// The dense-mask flash kernel wins while the compressed history is short;
-/// gathered sparse flash becomes faster once ratio-four history reaches this
-/// measured crossover. Heads-as-rows packing moved the crossover from 6,144
-/// compressed entries to 1,024 (roughly 4K raw tokens): at 2K raw entries the
-/// two paths are effectively tied, while at 4K dense attention measured 0.98 s
-/// per transaction versus about 0.69 s for packed sparse attention. Keeping
-/// the decision on the compressed count makes it independent of prompt chunk
-/// size.
-const SPARSE_PREFILL_MIN_COMPRESSED: usize = 1_024;
-
-fn use_gathered_sparse_prefill(ratio: u32, valid_compressed: usize) -> bool {
-    ratio == 4 && valid_compressed >= SPARSE_PREFILL_MIN_COMPRESSED
+fn use_gathered_sparse_prefill(valid_compressed: usize, rows: usize) -> bool {
+    requires_gathered_prefill(rows) && valid_compressed > 0
 }
 
 fn sparse_attention_scratch_shape(rows: usize, attention_width: usize) -> Vec<usize> {
@@ -418,7 +408,7 @@ impl Deepseek4Model {
                 .with_shape(vec![1, rows, attention_width])?
         };
         let use_sparse_prefill_flash =
-            use_matrix_prefill && use_gathered_sparse_prefill(ratio, valid_compressed);
+            use_matrix_prefill && use_gathered_sparse_prefill(valid_compressed, rows);
         let prefill_flash = (use_matrix_prefill && !use_sparse_prefill_flash)
             .then(|| {
                 DeepseekPrefillFlashArena::new(&device, rows, head_dim, compact_prefill_kv_len)
@@ -818,15 +808,11 @@ mod tests {
     }
 
     #[test]
-    fn gathered_sparse_prefill_activates_only_after_measured_ratio_four_crossover() {
-        assert!(!use_gathered_sparse_prefill(
-            4,
-            SPARSE_PREFILL_MIN_COMPRESSED - 1
-        ));
-        assert!(use_gathered_sparse_prefill(
-            4,
-            SPARSE_PREFILL_MIN_COMPRESSED
-        ));
-        assert!(!use_gathered_sparse_prefill(128, usize::MAX));
+    fn gathered_sparse_prefill_covers_every_nonempty_request_and_cache() {
+        assert!(!use_gathered_sparse_prefill(0, 512));
+        assert!(!use_gathered_sparse_prefill(512, 0));
+        assert!(use_gathered_sparse_prefill(1, 1));
+        assert!(use_gathered_sparse_prefill(1, 512));
+        assert!(use_gathered_sparse_prefill(1, 2_048));
     }
 }

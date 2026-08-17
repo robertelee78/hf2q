@@ -6,7 +6,10 @@ use super::forward_support::{
     alloc, alloc_host_input, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
     BatchedGroupedOutputArena,
 };
-use super::prefill_flash_attention::{encode_deepseek_flash_prefill, DeepseekPrefillFlashArena};
+use super::prefill_flash_attention::{
+    encode_deepseek_flash_prefill, encode_deepseek_sparse_flash_prefill, requires_gathered_prefill,
+    DeepseekPrefillFlashArena, DeepseekSparsePrefillFlashArena,
+};
 use super::rope::yarn_frequencies;
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
@@ -289,7 +292,8 @@ impl Deepseek4Model {
                 )
             })
             .transpose()?;
-        let prefill_flash = use_matrix_prefill
+        let use_gathered_prefill = use_matrix_prefill && requires_gathered_prefill(rows);
+        let prefill_flash = (use_matrix_prefill && !use_gathered_prefill)
             .then(|| DeepseekPrefillFlashArena::new(&device, rows, head_dim, compact_raw_kv_len))
             .transpose()?;
 
@@ -333,6 +337,18 @@ impl Deepseek4Model {
             .first()
             .context("DeepSeek-V4 window index row missing")?
             .len();
+        let gathered_prefill = use_gathered_prefill
+            .then(|| {
+                DeepseekSparsePrefillFlashArena::new(
+                    &device,
+                    rows,
+                    heads,
+                    head_dim,
+                    compact_raw_kv_len,
+                    index_width,
+                )
+            })
+            .transpose()?;
         let mut indices = alloc_host_input(
             &device,
             DType::I32,
@@ -591,7 +607,29 @@ impl Deepseek4Model {
                 window_capacity as u32,
                 true,
             )?;
-            if let Some(prefill_flash) = prefill_flash.as_ref() {
+            if let Some(gathered_prefill) = gathered_prefill.as_ref() {
+                encode_deepseek_sparse_flash_prefill(
+                    session,
+                    registry,
+                    &device,
+                    &q_rope,
+                    raw_prefix.as_ref(),
+                    &kv_rope,
+                    &kv_rope,
+                    sinks,
+                    &indices,
+                    &attention,
+                    gathered_prefill,
+                    rows,
+                    raw_prefix_len,
+                    compact_raw_kv_len,
+                    compact_raw_kv_len,
+                    index_width,
+                    heads,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                )?;
+            } else if let Some(prefill_flash) = prefill_flash.as_ref() {
                 encode_deepseek_flash_prefill(
                     session,
                     registry,

@@ -25108,11 +25108,13 @@ impl ToolCallStreamEmitter {
     /// before `}` may not yet be in the body, so we can't speculate).
     fn scan_emit_gemma4_kvs(&mut self, body: &str, events: &EventSink<'_>) -> Result<(), ()> {
         use super::sse::GenerationEvent;
-        // Walk from scan_cursor, tracking `<|"|>` string state. On a top-level
-        // `,` after `scan_cursor`, parse the kv span [scan_cursor..comma] and
-        // emit. Advance scan_cursor past the comma.
+        // Walk from scan_cursor, tracking `<|"|>` string state and nested
+        // object/array depth. Only a comma at depth zero terminates a
+        // top-level argument; commas inside an OpenCode-style nested schema
+        // value must remain part of that value.
         let bytes = body.as_bytes();
         let mut in_str = false;
+        let mut depth = 0usize;
         let mut i = self.scan_cursor;
         let kv_start = self.scan_cursor;
         let mut last_kv_start = kv_start;
@@ -25127,7 +25129,17 @@ impl ToolCallStreamEmitter {
                 i += 5;
                 continue;
             }
-            if !in_str && bytes[i] == b',' {
+            if !in_str && matches!(bytes[i], b'{' | b'[') {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if !in_str && matches!(bytes[i], b'}' | b']') && depth > 0 {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if !in_str && depth == 0 && bytes[i] == b',' {
                 let kv = &body[last_kv_start..i];
                 if let Some(json) = gemma4_kv_to_json(kv) {
                     let prefix = if self.kvs_emitted == 0 { "" } else { "," };
@@ -25155,7 +25167,7 @@ impl ToolCallStreamEmitter {
             // finalize will emit the trailing kv (if any) + `}`. Don't
             // speculatively emit on `}` because the body may still gain bytes
             // (sticky tool_close marker streamed separately).
-            if !in_str && bytes[i] == b'}' {
+            if !in_str && depth == 0 && bytes[i] == b'}' {
                 break;
             }
             i += 1;
@@ -25491,38 +25503,18 @@ fn extract_qwen35_name_prefix(body: &str) -> Option<(String, usize)> {
     Some((name, absolute_gt + 1))
 }
 
-/// Convert one Gemma 4 kv span `key:<jsonval>` into a JSON `"key":<json>`
-/// fragment. Mirrors the value-coercion logic in `parse_gemma4_tool_call`
-/// at registry.rs:737-768. Returns `None` on malformed kv (caller leaves
-/// scan_cursor untouched so finalize falls into the close-buffered path).
+/// Convert one complete Gemma 4 kv span into the same recursive JSON fragment
+/// as the authoritative close-time parser. Wrapping the span as a one-field
+/// call deliberately avoids a second, shallower value parser here: nested
+/// arrays/objects must be byte-for-byte equivalent in unary and SSE responses.
 fn gemma4_kv_to_json(kv: &str) -> Option<String> {
-    let (k, v) = kv.split_once(':')?;
-    let key = k.trim();
-    if key.is_empty() {
-        return None;
-    }
-    let v = v.trim();
-    let json_val = if let Some(stripped) = v
-        .strip_prefix("<|\"|>")
-        .and_then(|s| s.strip_suffix("<|\"|>"))
-    {
-        serde_json::Value::String(stripped.to_string())
-    } else if let Ok(num) = v.parse::<i64>() {
-        serde_json::Value::from(num)
-    } else if let Ok(num) = v.parse::<f64>() {
-        serde_json::Value::from(num)
-    } else if v == "true" {
-        serde_json::Value::Bool(true)
-    } else if v == "false" {
-        serde_json::Value::Bool(false)
-    } else if v == "null" {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(v.to_string())
-    };
-    let key_json = serde_json::to_string(key).ok()?;
-    let val_json = serde_json::to_string(&json_val).ok()?;
-    Some(format!("{key_json}:{val_json}"))
+    let synthetic = format!("call:hf2q_stream{{{kv}}}");
+    let parsed = super::registry::parse_tool_call_body(&super::registry::GEMMA4, &synthetic)?;
+    parsed
+        .arguments_json
+        .strip_prefix('{')?
+        .strip_suffix('}')
+        .map(str::to_owned)
 }
 
 /// Dispatch the close-time tool-call body after `ToolCallClose` fires in the
@@ -29813,7 +29805,7 @@ assistant:
         .unwrap();
         assert_eq!(
             out,
-            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\":{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are an agent.<|im_end|>\n<|im_start|>user\nFix the bug in foo.rs<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nfoo.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nfn main() { panic!() }\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Read a file\", \"name\": \"read_file\", \"parameters\": {\"properties\": {\"path\": {\"type\": \"string\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are an agent.<|im_end|>\n<|im_start|>user\nFix the bug in foo.rs<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nfoo.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nfn main() { panic!() }\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
         );
     }
 
@@ -38756,6 +38748,71 @@ mod tool_call_stream_emitter_tests {
         assert_eq!(
             parsed, canonical_json,
             "concatenated streaming args MUST equal canonical parse"
+        );
+    }
+
+    /// Nested Gemma arguments must not be split at commas inside an array or
+    /// object. OpenCode's TodoWrite schema exercises both levels at once.
+    #[test]
+    fn agentic_grammar_contract_streaming_gemma_nested_todo_matches_unary() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(64);
+        let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
+        let body = concat!(
+            "call:todowrite{todos:[{",
+            "content:<|\"|>Inspect the environment<|\"|>,",
+            "priority:<|\"|>high<|\"|>,",
+            "status:<|\"|>in_progress<|\"|>",
+            "}]}"
+        )
+        .to_string();
+
+        for end in [
+            "call:todowrite{todos:[{content:<|\"|>Inspect",
+            "call:todowrite{todos:[{content:<|\"|>Inspect the environment<|\"|>,priority:<|\"|>high",
+            body.as_str(),
+        ] {
+            emitter
+                .advance(end, &EventSink::new(&tx))
+                .expect("advance nested todo");
+        }
+
+        let mut tc_index = 0;
+        let mut saw_tc = false;
+        emitter
+            .finalize(
+                body.clone(),
+                Some(&super::super::registry::GEMMA4),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &EventSink::new(&tx),
+            )
+            .expect("finalize nested todo");
+        drop(tx);
+
+        let events = drain(&mut rx);
+        let (name, args) = rebuild_call(&events, 0);
+        assert_eq!(name.as_deref(), Some("todowrite"));
+        let streamed: serde_json::Value =
+            serde_json::from_str(&args).expect("streamed nested arguments JSON");
+        let canonical =
+            super::super::registry::parse_tool_call_body(&super::super::registry::GEMMA4, &body)
+                .expect("canonical nested parse");
+        let unary: serde_json::Value =
+            serde_json::from_str(&canonical.arguments_json).expect("unary arguments JSON");
+        assert_eq!(
+            streamed, unary,
+            "SSE and unary arguments must match exactly"
+        );
+        assert_eq!(
+            streamed,
+            serde_json::json!({
+                "todos": [{
+                    "content": "Inspect the environment",
+                    "priority": "high",
+                    "status": "in_progress"
+                }]
+            })
         );
     }
 

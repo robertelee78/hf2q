@@ -2121,8 +2121,16 @@ fn gemma4_nested_object(
         Some(r#"gemma4-json-key ":" gemma4-json-val"#.to_string())
     };
 
-    build_nested_obj_body("g4n", req_kv, opt_kv, extra_kv, rules, rule_counter)
-        .map(|inner| format!(r#""{{" {} "}}""#, inner))
+    build_nested_obj_body(
+        "g4n",
+        req_kv,
+        opt_kv,
+        extra_kv,
+        r#"",""#,
+        rules,
+        rule_counter,
+    )
+    .map(|inner| format!(r#""{{" {} "}}""#, inner))
 }
 
 /// iter-231b — nested `array` compiler (Gemma kv surface).
@@ -2617,9 +2625,10 @@ fn qwen35_tool_call_gbnf(
     // iter-231a (B3 supersession): permissive recursive JSON rules for
     // `object` / `array` parameters.  The chat template renders every
     // non-string argument via the `tojson` filter
-    // (`serde_json::to_string` — compact, NO whitespace, `<` NOT escaped;
-    // src/serve/mod.rs `build_chat_template_env`), so the value grammar is
-    // compact-JSON-shaped:
+    // (`tojson` — native compact JSON uses one space after commas and
+    // colons). Accept both that canonical surface and its whitespace-free
+    // equivalent so constrained decoding does not force the model away from
+    // the syntax shown in its own prompt:
     //
     //   * `qwen35-json-char` follows JSON's normal string-character rule.
     //     A literal `<` is valid JSON and `\<` is not a valid JSON escape;
@@ -2645,13 +2654,15 @@ fn qwen35_tool_call_gbnf(
         "qwen35-json-str".to_string(),
         r#""\"" qwen35-json-char* "\"""#.to_string(),
     ));
+    rules.push(("qwen35-json-colon".to_string(), r#"":" " "?"#.to_string()));
+    rules.push(("qwen35-json-comma".to_string(), r#""," " "?"#.to_string()));
     rules.push((
         "qwen35-json-obj".to_string(),
-        r#""{" ("}" | qwen35-json-str ":" qwen35-json-val ("," qwen35-json-str ":" qwen35-json-val)* "}")"#.to_string(),
+        r#""{" ("}" | qwen35-json-str qwen35-json-colon qwen35-json-val (qwen35-json-comma qwen35-json-str qwen35-json-colon qwen35-json-val)* "}")"#.to_string(),
     ));
     rules.push((
         "qwen35-json-arr".to_string(),
-        r#""[" ("]" | qwen35-json-val ("," qwen35-json-val)* "]")"#.to_string(),
+        r#""[" ("]" | qwen35-json-val (qwen35-json-comma qwen35-json-val)* "]")"#.to_string(),
     ));
     rules.push((
         "qwen35-json-val".to_string(),
@@ -2903,6 +2914,13 @@ fn deepseek4_tool_call_gbnf(
             "qwen35-json-str".into(),
             r#""\"" qwen35-json-char* "\"""#.into(),
         ),
+        // The recursive structured-value compiler is shared with Qwen. DSML
+        // examples commonly render one ASCII space after JSON separators,
+        // while compact JSON is equally valid. Accept both surfaces so the
+        // grammar does not mask the model's preferred `: "value"` token and
+        // force a low-probability compact-JSON continuation.
+        ("qwen35-json-colon".into(), r#"":" " "?"#.into()),
+        ("qwen35-json-comma".into(), r#""," " "?"#.into()),
         (
             "qwen35-int-val".into(),
             r#""-"? ([0] | [1-9] [0-9]{0,15})"#.into(),
@@ -2915,11 +2933,11 @@ fn deepseek4_tool_call_gbnf(
         ("qwen35-null-val".into(), r#""null""#.into()),
         (
             "qwen35-json-obj".into(),
-            r#""{" ("}" | qwen35-json-str ":" qwen35-json-val ("," qwen35-json-str ":" qwen35-json-val)* "}")"#.into(),
+            r#""{" ("}" | qwen35-json-str qwen35-json-colon qwen35-json-val (qwen35-json-comma qwen35-json-str qwen35-json-colon qwen35-json-val)* "}")"#.into(),
         ),
         (
             "qwen35-json-arr".into(),
-            r#""[" ("]" | qwen35-json-val ("," qwen35-json-val)* "]")"#.into(),
+            r#""[" ("]" | qwen35-json-val (qwen35-json-comma qwen35-json-val)* "]")"#.into(),
         ),
         (
             "qwen35-json-val".into(),
@@ -3280,7 +3298,7 @@ fn compile_pattern(
 }
 
 /// iter-231b — recursive nested-schema compiler for Qwen 3.5/3.6 tool
-/// parameters (`tojson` = compact JSON surface, `serde_json::to_string`).
+/// parameters (`tojson` JSON surface).
 ///
 /// Constrains everything the schema DECLARES and stays open only where
 /// the schema itself is open:
@@ -3564,7 +3582,7 @@ fn qwen35_nested_object(
             .unwrap_or_else(|_| format!("\"{}\"", key.replace('"', "\\\"")));
         rules.push((
             kv_name.clone(),
-            format!("{} \":\" {}", gbnf_literal(&key_json), val_body),
+            format!("{} qwen35-json-colon {}", gbnf_literal(&key_json), val_body),
         ));
         if required_set.contains(key.as_str()) {
             req_kv.push(kv_name);
@@ -3578,11 +3596,19 @@ fn qwen35_nested_object(
     let extra_kv: Option<String> = if additional_closed {
         None
     } else {
-        Some(r#"qwen35-json-str ":" qwen35-json-val"#.to_string())
+        Some(r#"qwen35-json-str qwen35-json-colon qwen35-json-val"#.to_string())
     };
 
-    build_nested_obj_body("q35n", req_kv, opt_kv, extra_kv, rules, rule_counter)
-        .map(|inner| format!(r#""{{" {} "}}""#, inner))
+    build_nested_obj_body(
+        "q35n",
+        req_kv,
+        opt_kv,
+        extra_kv,
+        "qwen35-json-comma",
+        rules,
+        rule_counter,
+    )
+    .map(|inner| format!(r#""{{" {} "}}""#, inner))
 }
 
 /// iter-231b — nested `array` compiler (Qwen compact-JSON surface).
@@ -3605,7 +3631,10 @@ fn qwen35_nested_array(
                 rule_counter,
                 depth + 1,
             )?;
-            Ok(format!(r#""[" ( {0} ("," {0})* )? "]""#, item_rule))
+            Ok(format!(
+                r#""[" ( {0} (qwen35-json-comma {0})* )? "]""#,
+                item_rule
+            ))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
             fn_name: fn_name.to_string(),
@@ -3633,13 +3662,10 @@ fn build_nested_obj_body(
     req_kv: Vec<String>,
     opt_kv: Vec<String>,
     extra_kv: Option<String>,
+    comma: &str,
     rules: &mut Vec<(String, String)>,
     rule_counter: &mut u32,
 ) -> Result<String, EmitterError> {
-    // GBNF literal for the inter-kv comma (compact surfaces — Qwen
-    // `tojson` and Gemma `format_argument` — emit NO whitespace).
-    // NOTE: the 3-byte form `","` — `r#"","#` would be just `,`.
-    let comma = r#"",""#;
     let mut opt_items: Vec<String> = opt_kv;
     if let Some(eb) = &extra_kv {
         opt_items.push(format!("( {} )", eb));
@@ -4783,6 +4809,7 @@ mod tests {
         }"#;
         let malformed = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":null,\"question\":\"What kind of video?\",\"options\":[{\"label\":\"Movies\",\"description\":\"Narrative film\"}]}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
         let repaired = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":\"Video type\",\"question\":\"What kind of video?\",\"options\":[{\"label\":\"Movies\",\"description\":\"Narrative film\"}]}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let repaired_spaced = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\": \"Video type\", \"question\": \"What kind of video?\", \"options\": [{\"label\": \"Movies\", \"description\": \"Narrative film\"}]}]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
 
         let mut rejected = deepseek4_runtime(
             "question",
@@ -4801,6 +4828,29 @@ mod tests {
         );
         assert!(accepted.accept_bytes(repaired.as_bytes()));
         assert!(accepted.is_accepted());
+
+        let mut accepted_spaced = deepseek4_runtime(
+            "question",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        assert!(
+            accepted_spaced.accept_bytes(repaired_spaced.as_bytes()),
+            "DSML nested JSON must accept the model's canonical spaced separators"
+        );
+        assert!(accepted_spaced.is_accepted());
+
+        let mut boundary = deepseek4_runtime(
+            "question",
+            schema,
+            GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+        );
+        let through_header_colon = "\n<｜DSML｜invoke name=\"question\">\n<｜DSML｜parameter name=\"questions\" string=\"false\">[{\"header\":";
+        assert!(boundary.accept_bytes(through_header_colon.as_bytes()));
+        assert!(
+            boundary.accept_bytes(b" \""),
+            "a token carrying space plus the opening string quote must survive"
+        );
     }
 
     #[test]
@@ -4934,6 +4984,15 @@ mod tests {
         assert!(qwen_accepted.accept_bytes(qwen_good));
         assert!(qwen_accepted.is_accepted());
 
+        // The native `tojson` filter places one space after commas and
+        // colons. Constrained decoding must admit that exact trained surface;
+        // forcing compact JSON here changes the model trajectory and can turn
+        // a requested content string into punctuation.
+        let qwen_native = b"<function=todowrite>\n<parameter=todos>\n[{\"content\": \"Inspect the environment\", \"status\": \"in_progress\", \"priority\": \"high\"}]\n</parameter>\n</function>";
+        let mut qwen_native_accepted = qwen35_runtime("todowrite", schema);
+        assert!(qwen_native_accepted.accept_bytes(qwen_native));
+        assert!(qwen_native_accepted.is_accepted());
+
         let gemma_bad = b"call:todowrite{todos:[{content:null,status:<|\"|>in_progress<|\"|>,priority:<|\"|>high<|\"|>}]}";
         let gemma_good = b"call:todowrite{todos:[{content:<|\"|>Inspect the environment<|\"|>,status:<|\"|>in_progress<|\"|>,priority:<|\"|>high<|\"|>}]}";
         let mut gemma_rejected = gemma4_runtime("todowrite", schema);
@@ -5042,6 +5101,139 @@ mod tests {
         assert!(
             rejected_token.is_some(),
             "the malformed DSML mutant must be rejected on the real token boundaries"
+        );
+    }
+
+    #[test]
+    fn deepseek4_todowrite_candidate_mask_keeps_meaningful_string_chunks() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                            "priority": {"type": "string"}
+                        },
+                        "required": ["content", "status", "priority"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        });
+        let grammar = DEEPSEEK4
+            .tool_call_gbnf(
+                "todowrite",
+                &schema,
+                GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+            )
+            .expect("todowrite grammar");
+        let parsed = crate::serve::api::grammar::parser::parse(&grammar).expect("parse grammar");
+        let root = parsed.rule_id("root").expect("root");
+        let mut runtime = crate::serve::api::grammar::sampler::GrammarRuntime::new(parsed, root)
+            .expect("runtime");
+        let prefix = "\n<｜DSML｜invoke name=\"todowrite\">\n<｜DSML｜parameter name=\"todos\" string=\"false\">[{\"content\":\"";
+        assert!(runtime.accept_bytes(prefix.as_bytes()), "content prefix");
+
+        let table = ["Inspect", " the", " environment", ",", "\"", "null"]
+            .map(|value| value.as_bytes().to_vec());
+        let mut logits = vec![1.0_f32; table.len()];
+        crate::serve::api::grammar::mask::mask_invalid_tokens(&runtime, &table, &mut logits);
+        for (index, value) in table.iter().enumerate() {
+            let oracle_accepts = runtime.clone().accept_bytes(value);
+            assert_eq!(
+                logits[index].is_finite(),
+                oracle_accepts,
+                "candidate mask/runtime mismatch for {:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        assert!(logits[0].is_finite(), "word token must remain sampleable");
+        assert!(
+            logits[1].is_finite(),
+            "space-prefixed word must remain sampleable"
+        );
+        assert!(
+            logits[2].is_finite(),
+            "long word chunk must remain sampleable"
+        );
+        assert!(
+            logits[3].is_finite(),
+            "punctuation is also valid string content"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires HF2Q_DEEPSEEK4_TOKENIZER pointing to the exact served tokenizer.json"]
+    fn deepseek4_todowrite_candidate_mask_matches_clone_oracle_for_real_vocabulary() {
+        let tokenizer_path = std::env::var("HF2Q_DEEPSEEK4_TOKENIZER")
+            .expect("set HF2Q_DEEPSEEK4_TOKENIZER for this exact-artifact test");
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .unwrap_or_else(|error| panic!("load {tokenizer_path}: {error}"));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                            "priority": {"type": "string"}
+                        },
+                        "required": ["content", "status", "priority"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        });
+        let grammar = DEEPSEEK4
+            .tool_call_gbnf(
+                "todowrite",
+                &schema,
+                GrammarShape::OneOrMoreCallsBodyOnly { parallel: false },
+            )
+            .expect("todowrite grammar");
+        let parsed = crate::serve::api::grammar::parser::parse(&grammar).expect("parse grammar");
+        let root = parsed.rule_id("root").expect("root");
+        let mut runtime = crate::serve::api::grammar::sampler::GrammarRuntime::new(parsed, root)
+            .expect("runtime");
+        let prefix = "\n<｜DSML｜invoke name=\"todowrite\">\n<｜DSML｜parameter name=\"todos\" string=\"false\">[{\"content\":\"";
+        assert!(runtime.accept_bytes(prefix.as_bytes()), "content prefix");
+
+        let vocab_size = tokenizer.get_vocab_size(true);
+        let table = (0..vocab_size as u32)
+            .map(|token| {
+                tokenizer
+                    .decode(&[token], false)
+                    .unwrap_or_default()
+                    .into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let mut logits = vec![1.0_f32; table.len()];
+        crate::serve::api::grammar::mask::mask_invalid_tokens(&runtime, &table, &mut logits);
+
+        let mut mismatches = Vec::new();
+        for (token, bytes) in table.iter().enumerate() {
+            let oracle_accepts = bytes.is_empty() || runtime.clone().accept_bytes(bytes);
+            if logits[token].is_finite() != oracle_accepts {
+                mismatches.push((token, String::from_utf8_lossy(bytes).into_owned()));
+                if mismatches.len() == 16 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "candidate-set mask diverged from clone oracle: {mismatches:?}"
         );
     }
 

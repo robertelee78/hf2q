@@ -12,10 +12,12 @@
 #                           Growing transcripts prefill only their
 #                           suffix; reasoning canonicalization restores the
 #                           checkpoint and replays the rewritten tail.
-#   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
-#                           Gentle loop mitigation when a sampling client omits
-#                           repetition_penalty. Explicit request values win;
-#                           temperature-zero greedy decoding is unchanged.
+#   HF2Q_DEFAULT_REPETITION_PENALTY=1.0
+#                           No hidden repetition penalty. The previous 1.05
+#                           default distorted constrained tool strings and did
+#                           not prevent client-side action loops. Operators may
+#                           set REP_PENALTY only for a measured workload;
+#                           non-default request values still win.
 #   HF2Q_DEEPSEEK_PREFILL_WINDOWS=adaptive
 #                           Uses the measured 2,048-token transaction while
 #                           the live cache is 131K, balances a cold prompt that
@@ -57,7 +59,7 @@ set -euo pipefail
 # The default is the schema-v2, source-bound reproduction used by the strict
 # coherence/performance gate. Operators may still set MODEL to any explicitly
 # supported DeepSeek-V4 GGUF; serving is not restricted by producer identity.
-MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2-repro.gguf}"
+MODEL="${MODEL:-/opt/hf2q/artifacts/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
 CONTEXT_LEN="${CONTEXT_LEN:-524288}"
@@ -142,7 +144,7 @@ for RUNTIME_NAME in hf2q llama-server llama-cli llama-bench; do
     fi
 done
 
-MODEL_BYTES=$(stat -f '%z' "$MODEL")
+MODEL_BYTES=$(stat -f '%z' "$MODEL" 2>/dev/null || stat -c '%s' "$MODEL")
 if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
     PAGE_BYTES=$(vm_stat | awk -F'of ' '/page size of/ {
         gsub(/[^0-9]/, "", $2); print $2; exit
@@ -232,7 +234,7 @@ fi
 
 exec env \
     HF2Q_DEEPSEEK_MAX_SEQ_LEN="$CONTEXT_LEN" \
-    HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
+    HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.0}" \
     "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \

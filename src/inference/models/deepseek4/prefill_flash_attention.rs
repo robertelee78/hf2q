@@ -21,6 +21,16 @@ use super::forward_support::{alloc, alloc_host_input};
 /// width (640 selected rows, D=512), 256 queries require 160 MiB of BF16 KV.
 const SPARSE_PREFILL_QUERY_TILE: usize = 256;
 
+/// The dense prefix-attention kernel is retained only as a diagnostic oracle.
+/// Exact 458-token and 6K-token agentic prompts showed materially wrong first
+/// logits on that path, while the gathered kernel matched the scalar attention
+/// contract and produced coherent continuations. Every production prefill row
+/// therefore uses the gathered implementation, including short prompts and
+/// cached suffixes.
+pub(super) fn requires_gathered_prefill(rows: usize) -> bool {
+    rows > 0
+}
+
 pub(super) struct DeepseekPrefillFlashArena {
     kv: MlxBuffer,
     mask: MlxBuffer,
@@ -382,4 +392,18 @@ pub(super) fn encode_deepseek_flash_prefill(
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_prefill_uses_the_exact_gathered_path() {
+        assert!(!requires_gathered_prefill(0));
+        assert!(requires_gathered_prefill(1));
+        assert!(requires_gathered_prefill(512));
+        assert!(requires_gathered_prefill(513));
+        assert!(requires_gathered_prefill(2_048));
+    }
 }

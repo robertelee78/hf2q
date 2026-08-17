@@ -636,6 +636,55 @@ pub(crate) enum RaisePolicy {
     Strict,
 }
 
+/// Compact JSON formatting used by the native chat-template runtime.
+///
+/// The model-family templates were trained with a space after every array /
+/// object comma and after every object colon. `serde_json`'s default compact
+/// formatter omits those spaces, which changes the tokenized tool catalogue
+/// even though the JSON value is semantically identical.
+struct ChatTemplateJsonFormatter;
+
+impl serde_json::ser::Formatter for ChatTemplateJsonFormatter {
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
+}
+
+fn serialize_chat_template_json(value: &minijinja::Value) -> String {
+    let mut bytes = Vec::new();
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut bytes, ChatTemplateJsonFormatter);
+    if serde::Serialize::serialize(value, &mut serializer).is_err() {
+        return "null".to_string();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| "null".to_string())
+}
+
 /// Shared Jinja environment for chat-template rendering (ADR-005
 /// iter-229 Decision 1). BOTH renderers — the one-shot
 /// `render_jinja_template_with_specials` below and the API path's
@@ -655,7 +704,7 @@ pub(crate) fn build_chat_template_env<'s>(raise_policy: RaisePolicy) -> minijinj
     let mut env = minijinja::Environment::new();
 
     env.add_filter("tojson", |v: minijinja::Value| {
-        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string())
+        serialize_chat_template_json(&v)
     });
 
     match raise_policy {
@@ -7300,6 +7349,28 @@ mod tests {
             .render(minijinja::context! { x => f64::NAN })
             .unwrap();
         assert_eq!(out, "null");
+    }
+
+    #[test]
+    fn agentic_grammar_contract_tojson_preserves_native_tool_spacing() {
+        let mut env = build_chat_template_env(RaisePolicy::Lenient);
+        env.add_template("t", "{{ x | tojson }}").unwrap();
+        let out = env
+            .get_template("t")
+            .unwrap()
+            .render(minijinja::context! {
+                x => serde_json::json!({
+                    "name": "todowrite",
+                    "arguments": {"todos": [
+                        {"content": "Inspect the environment", "status": "in_progress"}
+                    ]}
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            out,
+            r#"{"arguments": {"todos": [{"content": "Inspect the environment", "status": "in_progress"}]}, "name": "todowrite"}"#
+        );
     }
 
     #[test]

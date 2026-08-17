@@ -2,16 +2,13 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-11 — cross-family lifecycle review added active-prefix
-  affinity, request-local rollback, and the DeepSeek Busy-only admission
-  no-spin correction. The four-agent performance workload is now an immutable,
-  SHA-bound 6,685-token fixture after mutable README growth invalidated one
-  release run. One exact-packed wave exposed and corrected a thermal-order
-  defect in that release gate; the next thermally valid wave isolated a
-  saturated-cold scheduling regression. The bounded mixed-work replacement,
-  saturated-cold barrier, paired-prefill schedule, and cold-cohort thermal
-  evidence boundary remain release candidates pending immutable
-  packed-artifact hardware proof.
+- **Updated:** 2026-08-16 — production prefill now uses the exact gathered
+  attention path for every nonempty prompt and suffix; native JSON rendering
+  and DSML grammar accept the model's canonical separator spacing; and the
+  canonical launcher no longer injects a hidden repetition penalty. Real-model
+  structured-tool and isolated stock-client coding gates pass with prefix
+  reuse. Earlier four-agent scheduling and thermal evidence remains as recorded
+  below.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1607,6 +1604,64 @@ and stopped without another question. The SSE variant emitted 53 JSON chunks,
 one `tool_calls` finish, one terminal `[DONE]`, and no null header or parser
 error. This proves the repaired production failure path; clean immutable
 source and the protected exact-artifact gate remain release authority.
+
+### Prefill and structured-JSON surface correction (2026-08-16 candidate)
+
+The nested-schema compiler was necessary but did not close the operator
+failure. An exact 458-token stock-client-shaped `question` request still
+produced a meaningless string at temperature zero. This was two independent
+inference defects rather than a client, conversion, quantization, or transport
+failure.
+
+First, the dense prefix-attention kernel produced materially different first
+logits from the scalar attention contract. On the exact request its three
+highest token IDs were `271`, EOS, and `6328`; the gathered implementation
+ranked `671` (`The`), `43` (`I`), and `128822` (`</think>`), matching the
+coherent trajectory from the same artifact in a matched external runtime. The
+dense path also failed a separate approximately 6K-token agentic prompt. It is
+therefore retained only as a diagnostic oracle: every nonempty production
+prefill and cached suffix now uses gathered attention. The 458-token gathered
+run measured approximately 368--375 prompt tokens/s versus approximately 360
+on the incorrect dense path, so the correctness repair did not trade away
+prompt throughput.
+
+Second, the recursive JSON grammar accepted only whitespace-free separators,
+while the trained template surface places one ASCII space after commas and
+colons. At the first nested `header` value, raw logits ranked token `582` (space
+plus opening quote) at `37.73235`; the compact-only grammar masked it and forced
+token `3305` (`\".`) at `12.709398`. The model was being compelled away from a
+high-confidence coherent string. Native `tojson` rendering now preserves the
+canonical spaced surface, and recursive grammars accept both canonical spacing
+and compact JSON. A boundary regression proves the space-prefixed opening quote
+remains sampleable, while null required strings and malformed nested bodies
+remain rejected.
+
+The canonical launcher also defaults `HF2Q_DEFAULT_REPETITION_PENALTY` to
+`1.0`. Its former hidden `1.05` value distorted constrained strings and did not
+prevent client-side action loops. Operators may still opt into a measured
+non-default value; hf2q does not silently change a stock client's sampling
+request.
+
+The exact 107,431,343,168-byte artifact (SHA-256
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`) then
+passed `scripts/test_deepseek4_structured_tools.sh` at temperature `0.55`:
+three required and three automatic `question` calls, three required and three
+automatic `todowrite` calls, two-prior-null recovery for both tools, SSE, and a
+tool-result continuation all emitted meaningful schema-valid strings. Repeated
+requests reused 395--450 prompt tokens. The existing full agentic gate also
+passed required/automatic tools, unary/SSE, tool-result continuation, exact
+source arguments, and 6,666-token prefix reuse.
+
+Finally, unmodified OpenCode 1.18.18 ran in an isolated configuration against
+the candidate server. Its direct compatibility turn executed a valid two-item
+`todowrite`, executed the requested shell command, and stopped; subsequent
+steps reused 7,438 and 7,660 prompt tokens. The stronger checked-in coding gate
+completed five tools on its first Rust repair turn and two on its continuation,
+preserved one session, changed the source correctly, passed the immutable
+behavior oracle, executed the named regression, passed tests after both turns,
+and deleted the isolated session. This is local exact-artifact candidate
+evidence; clean immutable source, exact-SHA CI, and protected packed-artifact
+hardware replay remain publication authority.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
