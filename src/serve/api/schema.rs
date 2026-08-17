@@ -517,6 +517,20 @@ pub struct ModelObject {
     /// Mirrors `LoadInfo::quant_bpw`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quant_bpw: Option<f32>,
+    /// Input modalities accepted by this live inference model. Unloaded
+    /// cache entries omit the field because hf2q has not validated their
+    /// runtime attachments. A loaded model with a bound projector advertises
+    /// `["text", "image"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<&'static str>>,
+    /// Output modalities produced by this inference model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<&'static str>>,
+    /// Projector attached to this chat model after exact runtime binding.
+    /// Projectors are implementation components, not independently selectable
+    /// language models, so they are linked here instead of listed separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_projector: Option<String>,
 }
 
 /// Response for `GET /v1/models`.
@@ -1282,7 +1296,7 @@ mod tests {
     fn test_model_list_response_serialization() {
         // ADR-018 C5: every new `LoadInfo`-sourced field is `None` here so
         // the serialized shape mirrors the pre-C5 cache-scanned entry shape
-        // exactly (the eight new keys are skipped via
+        // exactly (the optional extension keys are skipped via
         // `#[serde(skip_serializing_if = "Option::is_none")]`).
         let resp = ModelListResponse {
             object: "list",
@@ -1303,6 +1317,9 @@ mod tests {
                 sliding_window: None,
                 kv_spill_active: None,
                 quant_bpw: None,
+                input_modalities: None,
+                output_modalities: None,
+                vision_projector: None,
             }],
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1348,6 +1365,9 @@ mod tests {
             entry.get("quant_bpw").is_none(),
             "quant_bpw must be skipped"
         );
+        assert!(entry.get("input_modalities").is_none());
+        assert!(entry.get("output_modalities").is_none());
+        assert!(entry.get("vision_projector").is_none());
     }
 
     #[test]
@@ -1371,6 +1391,9 @@ mod tests {
             sliding_window: None,
             kv_spill_active: Some(false),
             quant_bpw: Some(4.55),
+            input_modalities: Some(vec!["text"]),
+            output_modalities: Some(vec!["text"]),
+            vision_projector: None,
         };
         let json = serde_json::to_value(&obj).unwrap();
         assert_eq!(json["arch"], "qwen35moe");
@@ -1389,6 +1412,9 @@ mod tests {
             (bpw - 4.55_f64).abs() < 1e-3,
             "quant_bpw expected ≈4.55, got {bpw}"
         );
+        assert_eq!(json["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(json["output_modalities"], serde_json::json!(["text"]));
+        assert!(json.get("vision_projector").is_none());
     }
 
     #[test]

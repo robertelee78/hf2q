@@ -7747,14 +7747,20 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
     for le in pool_snapshot.iter() {
         let loaded_id = le.engine.model_id().to_string();
         let info = le.engine.info();
-        match models.iter_mut().find(|m| m.id == loaded_id) {
+        let bound_projector = bound_projector_for_engine(&state, &le.engine);
+        let model = match models.iter_mut().find(|m| m.id == loaded_id) {
             Some(m) => {
                 m.loaded = true;
                 enrich_model_object_from_load_info(m, info);
+                m
             }
             None => {
                 models.insert(0, model_object_from_load_info(loaded_id, info, true));
+                &mut models[0]
             }
+        };
+        if let Some(projector) = bound_projector {
+            advertise_bound_vision(model, &projector.model_id);
         }
     }
     // Prepend the embedding model if one was supplied via --embedding-model.
@@ -7790,40 +7796,9 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                     sliding_window: None,
                     kv_spill_active: None,
                     quant_bpw: None,
-                },
-            );
-        }
-    }
-    // Prepend the mmproj if one was supplied via --mmproj. Context length
-    // doesn't apply to a vision-tower projector, so it's left `None`;
-    // clients that care can inspect the id (file stem) to correlate with
-    // their chat model. Listed with `loaded: true` — header+config are
-    // resident in memory, weight loading happens on first multimodal
-    // request in a later iter.
-    //
-    // ADR-018 C5: the mmproj is not engine-backed either; new optional
-    // fields stay `None`.
-    if let Some(m) = state.mmproj.as_ref() {
-        if !models.iter().any(|existing| existing.id == m.model_id) {
-            models.insert(
-                0,
-                ModelObject {
-                    id: m.model_id.clone(),
-                    object: "model",
-                    created: chrono_seconds(),
-                    owned_by: "hf2q",
-                    context_length: None,
-                    quant_type: None,
-                    backend: Some("mlx-native"),
-                    loaded: true,
-                    arch: None,
-                    max_context_length: None,
-                    provenance: None,
-                    moe_experts: None,
-                    moe_experts_per_tok: None,
-                    sliding_window: None,
-                    kv_spill_active: None,
-                    quant_bpw: None,
+                    input_modalities: None,
+                    output_modalities: None,
+                    vision_projector: None,
                 },
             );
         }
@@ -7848,8 +7823,27 @@ pub async fn get_model(
         Ok(Ok(m)) => m,
         Ok(Err(_)) | Err(_) => return ApiError::internal_error().into_response(),
     };
-    match all.into_iter().find(|m| m.id == model_id) {
-        Some(m) => (StatusCode::OK, Json(m)).into_response(),
+    let loaded = state.pool.read().ok().and_then(|pool| {
+        pool.snapshot_engines()
+            .into_iter()
+            .find(|entry| entry.engine.model_id() == model_id)
+    });
+    if let Some(entry) = loaded {
+        let mut model = all
+            .into_iter()
+            .find(|model| model.id == model_id)
+            .unwrap_or_else(|| {
+                model_object_from_load_info(model_id.clone(), entry.engine.info(), true)
+            });
+        model.loaded = true;
+        enrich_model_object_from_load_info(&mut model, entry.engine.info());
+        if let Some(projector) = bound_projector_for_engine(&state, &entry.engine) {
+            advertise_bound_vision(&mut model, &projector.model_id);
+        }
+        return (StatusCode::OK, Json(model)).into_response();
+    }
+    match all.into_iter().find(|model| model.id == model_id) {
+        Some(model) => (StatusCode::OK, Json(model)).into_response(),
         None => ApiError::model_not_found(&model_id).into_response(),
     }
 }
@@ -7959,6 +7953,9 @@ fn inspect_gguf(path: &Path) -> Option<ModelObject> {
         sliding_window: None,
         kv_spill_active: None,
         quant_bpw: None,
+        input_modalities: None,
+        output_modalities: None,
+        vision_projector: None,
     })
 }
 
@@ -8007,7 +8004,39 @@ fn model_object_from_load_info(
         sliding_window: info.sliding_window,
         kv_spill_active: Some(info.kv_spill_active),
         quant_bpw: info.quant_bpw,
+        input_modalities: Some(vec!["text"]),
+        output_modalities: Some(vec!["text"]),
+        vision_projector: None,
     }
+}
+
+/// Advertise image input only after the process projector has passed the
+/// same text/projector binding contract enforced by request handling.
+fn advertise_bound_vision(model: &mut ModelObject, projector_id: &str) {
+    model.input_modalities = Some(vec!["text", "image"]);
+    model.output_modalities = Some(vec!["text"]);
+    model.vision_projector = Some(projector_id.to_owned());
+}
+
+fn bound_projector_for_engine<'a>(
+    state: &'a AppState,
+    engine: &super::engine::Engine,
+) -> Option<&'a super::state::LoadedMmproj> {
+    state.mmproj.as_ref().filter(|projector| {
+        crate::serve::validate_mmproj_text_binding(
+            engine.vision_consumer_contract(),
+            projector.arch,
+            projector.config.projection_dim,
+            projector
+                .config
+                .deepstack_indexes
+                .as_ref()
+                .map_or(0, Vec::len),
+            projector.source_sha256.as_deref(),
+            Some(projector.artifact_sha256.as_str()),
+        )
+        .is_ok()
+    })
 }
 
 /// Enrich an existing (cache-scanned) `ModelObject` in place with every
@@ -8033,6 +8062,9 @@ fn enrich_model_object_from_load_info(
     m.sliding_window = info.sliding_window;
     m.kv_spill_active = Some(info.kv_spill_active);
     m.quant_bpw = info.quant_bpw;
+    m.input_modalities = Some(vec!["text"]);
+    m.output_modalities = Some(vec!["text"]);
+    m.vision_projector = None;
     // Fold in the LoadInfo's quant label too, only if the cache scan didn't
     // already pick one up. Live `LoadInfo::quant_label` is sourced from the
     // same histogram algorithm as the cache scan's `infer_quant_type`, so
@@ -8378,6 +8410,9 @@ mod tests {
             sliding_window: None,
             kv_spill_active: None,
             quant_bpw: None,
+            input_modalities: None,
+            output_modalities: None,
+            vision_projector: None,
         };
         let info = populated_qwen35_load_info();
         enrich_model_object_from_load_info(&mut m, &info);
@@ -8421,6 +8456,9 @@ mod tests {
             sliding_window: None,
             kv_spill_active: None,
             quant_bpw: None,
+            input_modalities: None,
+            output_modalities: None,
+            vision_projector: None,
         };
         let info = populated_qwen35_load_info();
         enrich_model_object_from_load_info(&mut m, &info);
@@ -8453,6 +8491,23 @@ mod tests {
         assert_eq!(v["kv_spill_active"], true);
         let bpw = v["quant_bpw"].as_f64().expect("quant_bpw f64");
         assert!((bpw - 4.83_f64).abs() < 1e-3);
+        assert_eq!(v["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(v["output_modalities"], serde_json::json!(["text"]));
+        assert!(v.get("vision_projector").is_none());
+    }
+
+    #[test]
+    fn model_advertisement_contract_bound_vision_is_on_chat_model() {
+        let info = populated_qwen35_load_info();
+        let mut model = model_object_from_load_info("qwen-vision".into(), &info, true);
+        advertise_bound_vision(&mut model, "mmproj-qwen");
+        let wire = serde_json::to_value(model).expect("serialize advertised vision model");
+        assert_eq!(
+            wire["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(wire["output_modalities"], serde_json::json!(["text"]));
+        assert_eq!(wire["vision_projector"], "mmproj-qwen");
     }
 }
 

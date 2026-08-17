@@ -1598,6 +1598,14 @@ forward warmup; optional source/artifact identities remain mandatory when
 present. This keeps exact hf2q provenance stronger without making it a vendor
 lock-in requirement.
 
+The serving catalogue follows the same binding authority. A successfully
+bound projector upgrades the chat-model row to advertise text+image input and
+records the projector identifier there; it is no longer prepended as an
+independent selectable model. Text-only and mismatched hot-loaded engines stay
+text-only. This extension improves discovery without weakening the stock
+OpenCode requirement for an explicit local `modalities` declaration on a
+custom OpenAI-compatible provider.
+
 **H4 falsification artifact (`tests/test_q4_k_h4_real_block_parity.rs` on `cfa/adr013-q4k-h4-diagnose`).** While diagnosing the gibberish, wrote a parity test embedding a real 144-byte Q4_K block from `blk.0.ffn_gate_exps.weight` expert 0 of the dwq48 GGUF, decoded it via BOTH the test-file's `cpu_dequant_q4k_block` (Claude's oracle for the 12 unit tests) AND the canonical `dequantize_q4_k` from `src/gguf/mod.rs:582`. Result: 0 indices differ, max_err = 0.0 — the synthetic encoder/decoder pair is bit-exactly canonical-compatible, the unit tests were not decorative. This pre-empted a deep kernel-bug rabbit-hole and surfaced the tokenizer as the actual cause.
 
 **Bench vs llama.cpp (same M5 Max, same dwq48 GGUF, prompt "How to make bread?", temp=0.0, seed=42, 200 tokens).**

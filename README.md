@@ -154,6 +154,14 @@ are accepted from standard architecture, multimodal-token, profile, width,
 tensor, and forward-warmup checks. When exact source or artifact hashes are
 present, hf2q additionally requires those identities to match.
 
+When `serve --mmproj` successfully binds that projector to the loaded chat
+model, `/v1/models` advertises `input_modalities: ["text", "image"]` and the
+attached `vision_projector` on the chat-model row. The projector is not a
+separate selectable language model. Stock OpenCode custom-provider entries
+still need the equivalent local `modalities.input: ["text", "image"]`
+declaration because its generic OpenAI-compatible provider does not infer
+custom model capabilities from `/v1/models`.
+
 ```bash
 # 1. Pre-download the HF source explicitly:
 huggingface-cli download google/gemma-4-26b-a4b-it \

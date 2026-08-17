@@ -103,6 +103,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen35_serving_tokenizer_is_sidecar_free_and_detects_vision_markers -- --test-threads=1
           cargo test --locked --bin hf2q --all-features vision_projector_binding -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features model_advertisement_contract_ -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen35_startup_warmup_primes_gpu_for_serial_and_slot_aware -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen35_bounded_prefill_watchdog_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features prompt_cache_ -- --test-threads=1
