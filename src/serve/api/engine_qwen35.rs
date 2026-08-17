@@ -8661,20 +8661,26 @@ mod tests {
         );
     }
 
-    /// SerialFifo retains the historical Qwen3-VL extended stream primitive,
-    /// while SlotAware fails closed until those extra GPU inputs are carried
-    /// by the scheduler-yielding state machine. It must never silently drop
-    /// them and run the plain-text path.
+    /// Both schedulers must retain the complete multimodal stream payload.
+    /// SlotAware owns the extensions across bounded prefill yields, validates
+    /// them before the first Metal transaction, and routes each chunk through
+    /// the multimodal forward graph rather than silently using text-only
+    /// prefill.
     #[test]
     fn wedge4e_multimodal_streaming_is_explicit_per_scheduler_mode() {
         let src = include_str!("engine.rs");
+        let qwen = include_str!("engine_qwen35.rs");
         assert!(
-            src.contains("validate_qwen35_slot_stream_payload("),
-            "SlotAware Qwen must validate every multimodal stream field before admission"
+            src.contains("Qwen35VisionPrefillData::new("),
+            "SlotAware Qwen must retain every multimodal stream field at admission"
         );
         assert!(
-            src.contains("reject_stream_before_sse(events, admission, error)"),
-            "unsupported SlotAware multimodal streams must fail before SSE"
+            qwen.contains("vision.validate(prompt_len, hidden_size)?"),
+            "SlotAware Qwen must validate multimodal state before GPU prefill"
+        );
+        assert!(
+            qwen.contains("forward_gpu_last_logits_with_soft_tokens_and_deepstack("),
+            "SlotAware Qwen must route multimodal chunks through the vision-aware graph"
         );
         assert!(
             src.contains("generate_stream_qwen35_once_extended"),

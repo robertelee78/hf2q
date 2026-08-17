@@ -1319,6 +1319,7 @@ mod tests {
 
     #[test]
     fn qwen38_dense_q4k_q6k_storage_stays_quantized() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(
             dense_ffn_storage(0, GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K)
                 .expect("Q4_K gate/up with Q6_K down is a supported dense layout"),
@@ -1328,6 +1329,7 @@ mod tests {
 
     #[test]
     fn dense_float_fixtures_use_explicit_float_storage() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(
             dense_ffn_storage(0, GgmlType::F32, GgmlType::F16, GgmlType::F32)
                 .expect("float fixtures remain supported"),
@@ -1337,6 +1339,7 @@ mod tests {
 
     #[test]
     fn dense_storage_rejects_silent_float_expansion_and_gate_up_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mixed = dense_ffn_storage(7, GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::F16)
             .expect_err("mixed quantized/float storage must fail loud");
         assert!(format!("{mixed:#}").contains("refusing a silent F32 expansion"));

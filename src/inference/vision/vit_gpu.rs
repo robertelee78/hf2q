@@ -5704,6 +5704,7 @@ mod tests {
 
     #[test]
     fn vision_attention_workspace_routes_official_max_to_bounded_path() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let bytes = vit_decomposed_attention_workspace_bytes(65_536, 16)
             .expect("official maximum must fit u64 accounting");
         assert_eq!(bytes, 549_755_813_888);
