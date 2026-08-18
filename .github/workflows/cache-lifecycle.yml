@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   exact-artifact-cache-lifecycle:
-    name: exact packed artifact · DeepSeek + Gemma + Qwen
+    name: exact packed artifact · DeepSeek + Gemma + Qwen + Qwen3.8
     runs-on: [self-hosted, macOS, ARM64, hf2q-gates]
     timeout-minutes: 300
     env:
@@ -38,9 +38,11 @@ jobs:
           DEEPSEEK_MODEL_PATH: ${{ vars.DEEPSEEK4_MODEL_PATH }}
           GEMMA_MODEL_PATH: ${{ vars.GEMMA4_MODEL_PATH }}
           QWEN_MODEL_PATH: ${{ vars.QWEN36_MODEL_PATH }}
+          QWEN38_MODEL_PATH: ${{ vars.QWEN38_MODEL_PATH }}
           DEEPSEEK_MODEL_SHA256: ${{ vars.DEEPSEEK4_MODEL_SHA256 }}
           GEMMA_MODEL_SHA256: ${{ vars.GEMMA4_MODEL_SHA256 }}
           QWEN_MODEL_SHA256: ${{ vars.QWEN36_MODEL_SHA256 }}
+          QWEN38_MODEL_SHA256: ${{ vars.QWEN38_MODEL_SHA256 }}
         run: |
           set -euo pipefail
           actual_sha=$(git rev-parse HEAD)
@@ -49,20 +51,24 @@ jobs:
           test "$actual_sha" = "$(git rev-parse origin/main)"
           git diff --exit-code
 
-          for model in "$DEEPSEEK_MODEL_PATH" "$GEMMA_MODEL_PATH" "$QWEN_MODEL_PATH"; do
+          for model in "$DEEPSEEK_MODEL_PATH" "$GEMMA_MODEL_PATH" \
+            "$QWEN_MODEL_PATH" "$QWEN38_MODEL_PATH"; do
             [[ "$model" != *$'\n'* && "$model" != *$'\r'* ]]
             test -f "$model"
           done
-          for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" "$QWEN_MODEL_SHA256"; do
+          for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" \
+            "$QWEN_MODEL_SHA256" "$QWEN38_MODEL_SHA256"; do
             [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           done
           {
             printf 'DEEPSEEK_MODEL=%s\n' "$DEEPSEEK_MODEL_PATH"
             printf 'GEMMA_MODEL=%s\n' "$GEMMA_MODEL_PATH"
             printf 'QWEN_MODEL=%s\n' "$QWEN_MODEL_PATH"
+            printf 'QWEN38_MODEL=%s\n' "$QWEN38_MODEL_PATH"
             printf 'DEEPSEEK_MODEL_SHA256=%s\n' "$DEEPSEEK_MODEL_SHA256"
             printf 'GEMMA_MODEL_SHA256=%s\n' "$GEMMA_MODEL_SHA256"
             printf 'QWEN_MODEL_SHA256=%s\n' "$QWEN_MODEL_SHA256"
+            printf 'QWEN38_MODEL_SHA256=%s\n' "$QWEN38_MODEL_SHA256"
           } >> "$GITHUB_ENV"
 
       - name: Toolchain
@@ -113,9 +119,11 @@ jobs:
           DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
           GEMMA_MODEL="$GEMMA_MODEL" \
           QWEN_MODEL="$QWEN_MODEL" \
+          QWEN38_MODEL="$QWEN38_MODEL" \
           DEEPSEEK_MODEL_SHA256="$DEEPSEEK_MODEL_SHA256" \
           GEMMA_MODEL_SHA256="$GEMMA_MODEL_SHA256" \
           QWEN_MODEL_SHA256="$QWEN_MODEL_SHA256" \
+          QWEN38_MODEL_SHA256="$QWEN38_MODEL_SHA256" \
           OUT_ROOT="$OUT_ROOT" \
             scripts/run_agentic_cache_release_gate.sh
 
