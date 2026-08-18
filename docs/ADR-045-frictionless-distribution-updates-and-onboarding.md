@@ -470,10 +470,10 @@ hf2q update --rollback
 The default channel is stable. Update metadata uses a TUF-style trust model:
 the binary embeds a multi-key threshold root, metadata has signed roles and
 expiry, versions are monotonic, and the target binds the exact archive and
-release-manifest hashes. The v1 wire format supports root rotation through a
-threshold-signed rollover chain; reinstalling through a newly verified
-installer is the documented recovery of last resort. This must resist
-rollback, freeze, mix-and-match, and replayed-metadata attacks. The exact Rust
+release-manifest hashes. The eventual v1 wire contract must support root
+rotation through a threshold-signed rollover chain; reinstalling through a
+newly verified installer is the documented recovery of last resort. This must
+resist rollback, freeze, mix-and-match, and replayed-metadata attacks. The exact Rust
 client/library is selected only after a Rust 1.88-compatible implementation
 spike and hostile-metadata tests; plain unsigned `latest` JSON is not an
 acceptable updater authority.
@@ -486,18 +486,95 @@ targets metadata is a hard failure. V1 uses top-level targets only and does not
 use delegations. The manifest never contains the archive digest because an
 identical embedded manifest would make that relationship self-referential.
 
-The first Rust 1.88 comparison found no production-ready library selection.
-[`tough` 0.24.0](https://docs.rs/tough/0.24.0/tough/) compiles at the project
-MSRV, but its stock persistent metadata store does not yet prove the
-crash-durable, cross-role transaction required by this ADR.
-[`sigstore-tuf` 0.11.0](https://docs.rs/sigstore-tuf/0.11.0/sigstore_tuf/) has a
-promising I/O-independent verifier and conformance coverage, but the published
-crate predates its delegated-path
-[wildcard fix](https://github.com/sigstore/sigstore-rust/pull/174) and its stock
-file store is not cross-role atomic. Both remain
-spike candidates; no dependency lands and no signed wire schema freezes until
-the same rollback, freeze, replay, rotation, crash, and concurrency corpus
-passes with durable version-floor state.
+The 2026-08-17 Rust 1.88 comparison found no production-ready library
+selection. It used the exact crates.io archives for `sigstore-tuf` 0.11.0
+(SHA-256
+`eedac50883a917b7b434db22e2e6e853ace8c00f4a9c27f53e1e9c87e6d89fe4`,
+upstream commit `ef17cacdbd357befea4c1c768ef02ed9bf52672c`) and `tough`
+0.24.0 (SHA-256
+`35b378d98765c2ae9cdc3e9963ea7e670da8cdd9ee39611b8d722083c7f1ac11`,
+upstream commit `98d8eb8b2ce63515d9b4981c938ef6453c5b5771`). Both compile with
+Rust 1.88; no unpublished revision is an acceptable landing dependency.
+
+[`sigstore-tuf` 0.11.0](https://docs.rs/sigstore-tuf/0.11.0/sigstore_tuf/)
+declares Rust 1.70, exposes a promising I/O-independent
+`TrustedMetadataSet`, and its release tree runs the official TUF conformance
+suite pinned at v2.4.0 with an empty expected-failure list. That run predates
+the conformance suite's later
+[multi-star path cases](https://github.com/theupdateframework/tuf-conformance/pull/388),
+so it does not prove the post-release delegation behavior. Its stock restart
+behavior fails hf2q's persistent rollback-floor contract, however. A temporary
+external regression used a generated P-256 key and a fixed initial time of
+`2026-06-01T00:00:00Z`, seeded the metadata store with correctly signed
+timestamp version 2 expiring `2026-06-15T00:00:00Z`, then restarted at
+`2026-07-01T00:00:00Z` from the same pinned root while the repository offered
+a correctly signed version 1 expiring in 2999. The refresh succeeded and
+trusted version 1. The test patch remained outside the hf2q landing diff; the
+exact command against the published source plus that regression was:
+
+```text
+cargo +1.88.0 test --locked -p sigstore-tuf --test end_to_end \
+  expired_cached_timestamp_still_blocks_restart_rollback -- --exact --nocapture
+```
+
+This is an expected-failing regression: it exited 101 because `refresh`
+returned `Ok(())` instead of the required rollback error.
+
+The root cause is `Updater::seed_lower_from_store(now)`: expired cached lower
+roles are silently skipped before the network refresh, so their versions stop
+being floors. `FileStore` also provides neither a cross-role transaction nor
+the file and parent-directory sync barriers required here. This rejects the
+published stock `Updater` plus `FileStore` as update authority; it does not yet
+reject using only the transport-free verifier behind hf2q-owned durable state.
+The published crate already used `literal_separator(true)` for delegated
+patterns; the later
+[`sigstore-tuf` wildcard hardening](https://github.com/sigstore/sigstore-rust/pull/174)
+fixes additional multi-star and segment semantics and is not present in 0.11.0.
+Another unpublished change re-verifies cached delegated roles. V1 therefore
+rejects any delegations before target resolution rather than depending on
+either unpublished fix.
+
+[`tough` 0.24.0](https://docs.rs/tough/0.24.0/tough/) retains an expired prior
+timestamp or snapshot as a rollback floor, but its private datastore rewrites
+each JSON file independently with `tokio::fs::write`; root replacement removes
+then recreates `root.json`, and no file sync, parent-directory sync, or
+cross-role commit exists. Its public `Transport` can capture the exact bytes
+of each response keyed by the requested metadata URL. After a successful
+top-level-only load, an adapter may associate captured response bytes with the
+successful verification only after parsing them and requiring equality with
+the corresponding public `Repository` role getter; each captured root must
+additionally form the exact gapless N+1 chain. This makes `tough` the mature
+comparator only with an isolated per-attempt scratch datastore. Because
+`load_root` currently treats any error opening the next root as the end of the
+chain, the adapter must record that probe result and reject a successful load
+unless termination was an actual not-found response. Because
+`RepositoryLoader::load` eagerly fetches delegated metadata, the attempt
+transport must reject every metadata request after the one expected top-level
+targets response, and the returned top-level role must have no `delegations`
+block.
+
+The next comparative spike must keep both stock stores out of the authority
+path. It feeds the last committed raw root and metadata generation into an
+isolated verifier attempt, captures exact fetched bytes, and—when using
+`tough`—correlates them by requested name and parsed-role equality with the
+successful library result. Application code never substitutes its own serde
+reserialization for the fetched metadata bytes. The attempt rejects
+delegations and compares every returned role version plus an hf2q-owned sampled
+update-start time against a locked durable generation journal. `sigstore-tuf`
+accepts that time explicitly; the `tough` wrapper must instead preflight the
+durable clock floor and bind its separately sampled internal expiry checks to
+the same attempt. Those floors never decrease during ordinary root or role
+rotation; recovery that intentionally replaces them is the separately
+authenticated fresh-installer path. Only after
+the same rollback, expiry/freeze, replay, sequential-root rotation,
+mix-and-match, duplicate/oversized metadata, crash-at-every-write, and
+cross-process concurrency corpus passes may the winning verifier dependency,
+the authenticated adapter, and its application target records land. Large
+archives are streamed and checked against the verified target descriptor by
+hf2q rather than buffered through either client's convenience target API. The
+corpus retains normalization-sensitive fixtures that prove each verifier's
+canonicalization behavior without confusing canonical signed content with
+byte-for-byte target or metadata identity.
 
 The initial stable metadata repository is served from GitHub Pages under the
 hf2q repository (for example,
