@@ -634,11 +634,14 @@ bounded distribution context.
 
 The main crate now contains that dormant transport-free adapter under
 `src/distribution/update_auth/`. The exact normal dependency is
-`sigstore-tuf = 0.11.0` with default features disabled; no stock updater,
-fetcher, TLS client, URL policy, or metadata store is compiled into this
-authority path. One-use request tokens derive the only accepted next role and
-wire name. Responses are bounded before parsing, reject duplicate/trailing or
-over-depth JSON, and preserve the exact authenticated bytes. The v1 profile
+`sigstore-tuf = 0.11.0` with default features disabled. `TrustedMetadataSet`
+is the only library verification state machine that hf2q imports or uses; the
+stock `Updater`, `FileStore`, and `Repository` APIs are not imported or used,
+and the dependency's fetch/HTTP/TLS features are disabled. No URL policy,
+transport, or metadata store participates in this authority path. One-use
+request tokens derive the only accepted next role and wire name. Responses are
+bounded before parsing, reject duplicate/trailing or over-depth JSON, and
+preserve the exact authenticated bytes. The v1 profile
 requires positive versions, canonical expiry strings, exact lowercase SHA-256
 and length parent pins, timestamp/snapshot singleton metadata, no delegations,
 and a maximum of 256 lifetime root rotations. Root-chain termination advances

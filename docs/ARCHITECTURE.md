@@ -544,8 +544,10 @@ harness leans on three patterns:
    production dependency graph or published crate. Its wire types grant no
    production authority.
 5. **Production signed-metadata boundary.** `distribution/update_auth/` uses
-   only `sigstore-tuf::TrustedMetadataSet` behind hf2q's strict bounded profile;
-   the stock fetcher, updater, and store are absent. A retained Python-TUF
+   `sigstore-tuf::TrustedMetadataSet` as its only library verification state
+   machine behind hf2q's strict bounded profile. The stock `Updater`,
+   `FileStore`, and `Repository` APIs are not imported or used, and the
+   dependency's fetch/HTTP/TLS features are disabled. A retained Python-TUF
    corpus, generated with canonical key IDs and a fully hashed dependency lock,
    proves cross-implementation root rotation and lower-role authentication.
    The production module owns no URL, HTTP, target lookup, archive, activation,
