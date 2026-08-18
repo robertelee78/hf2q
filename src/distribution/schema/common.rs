@@ -153,7 +153,7 @@ impl UpdateChannel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct MacOsVersion(String);
 
@@ -173,11 +173,12 @@ impl MacOsVersion {
                     || (part.len() > 1 && part.starts_with('0'))
                     || part.parse::<u16>().is_err()
             })
+            || (parts.len() == 3 && parts[2] == "0")
             || parts[0] == "0"
         {
             return Err(SchemaValueError::new(
                 field,
-                "must be canonical major.minor or major.minor.patch decimal components",
+                "must be canonical major.minor or nonzero-patch major.minor.patch decimal components",
             ));
         }
         Ok(Self(value))
@@ -185,6 +186,26 @@ impl MacOsVersion {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn numeric_components(&self) -> impl Iterator<Item = u16> + '_ {
+        self.0
+            .split('.')
+            .map(|part| part.parse::<u16>().expect("validated macOS version"))
+            .chain(std::iter::repeat(0))
+            .take(3)
+    }
+}
+
+impl PartialOrd for MacOsVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MacOsVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.numeric_components().cmp(other.numeric_components())
     }
 }
 

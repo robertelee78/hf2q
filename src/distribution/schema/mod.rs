@@ -18,6 +18,6 @@ pub use install_receipt::{
 };
 pub use release_manifest::{
     BundleFileV1, CodeSigningIdentityV1, CompatibilityV1, DynamicDependencyV1,
-    ReleaseManifestError, ReleaseManifestV1, RELEASE_MANIFEST_KIND,
+    ReleaseManifestError, ReleaseManifestV1, MAX_RELEASE_MANIFEST_BYTES, RELEASE_MANIFEST_KIND,
     RELEASE_MANIFEST_SCHEMA_VERSION,
 };

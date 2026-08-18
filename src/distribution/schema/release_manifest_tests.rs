@@ -118,6 +118,23 @@ fn rejects_noncanonical_or_unstable_versions() {
 }
 
 #[test]
+fn macos_versions_order_by_numeric_components() {
+    let old = MacOsVersion::parse("minimum_macos", "9.0".into()).expect("macOS 9");
+    let current = MacOsVersion::parse("minimum_macos", "14.0".into()).expect("macOS 14");
+    let patch = MacOsVersion::parse("minimum_macos", "14.0.1".into()).expect("macOS 14 patch");
+
+    assert!(old < current);
+    assert!(current < patch);
+    assert!(
+        MacOsVersion::parse("minimum_macos", "14.0.0".into()).is_err(),
+        "redundant zero patch would violate Eq/Ord consistency"
+    );
+    let nine = MacOsVersion::parse("minimum_macos", "14.9".into()).expect("macOS 14.9");
+    let ten = MacOsVersion::parse("minimum_macos", "14.10".into()).expect("macOS 14.10");
+    assert!(nine < ten);
+}
+
+#[test]
 fn rejects_unsupported_target_channel_and_compatibility() {
     let mut target = valid_value();
     target["target"] = serde_json::json!("x86_64-apple-darwin");

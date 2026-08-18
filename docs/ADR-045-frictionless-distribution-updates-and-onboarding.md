@@ -239,6 +239,9 @@ hf2q-owned state below one root, except for the user PATH entry point:
 ├── cache/sessions/
 ├── receipts/
 ├── update/
+│   ├── install.lock
+│   ├── .noreplace-source
+│   └── .noreplace-target
 └── config.toml
 ~/.local/bin/hf2q
 ```
@@ -269,6 +272,76 @@ sequence one. The receipt schema additionally requires install, update, and
 confirmed-migration sequences to equal the newly installed version sequence,
 and rollback sequences to exceed every active or retained installation
 sequence. A parsed receipt alone cannot establish this live monotonic floor.
+
+The v1 standalone filesystem contract uses mode `0700` for the state root,
+`versions`, `activations`, `update`, version roots, activation roots, and
+private transaction staging directories; manifest-derived payload directories
+use `0755`. The immutable activation receipt and installed-version marker use
+`0600`, the manifest envelope uses `0644`, and payload modes come from the
+manifest. `update/install.lock` is a regular `0600`, single-link, current-user
+file opened without following links, locked exclusively without blocking, and
+never unlinked. The two empty private no-replace markers are fixed owned state,
+not temporary cruft; attempting to rename source over target must fail with
+`EEXIST` before any activation is published. Every descendant must remain on
+the root device. An explicit
+custom root is traversed component-by-component from `/` without following
+symlinks; only normal UTF-8 components are accepted. Existing ancestors need
+not be private or user-owned, but they must already exist: explicit authority
+to create one root never authorizes creation of missing ancestors. The final
+root may be created and must be current-user owned mode `0700`.
+
+The first filesystem implementation is deliberately narrower than ownership
+or update. Given explicit root authorization and an already authenticated,
+fully prepared version, it may create only an `install` transition at
+standalone sequence one; confirmed migration remains gated on a separate
+one-time consent capability and live source evidence. Its
+lock-bound, descriptor-backed prepared capability is non-cloneable and grants
+no update, overwrite, entry-point, manager, pruning, or deletion authority.
+If a crash publishes the complete version or activation before `current`, a
+retry may adopt it only after re-verifying the currently authenticated exact
+manifest, marker, receipt, inventory, and raw link bytes. Partial or conflicting
+state fails closed; it is never blindly deleted or adopted. A temporary entry
+is resumed only when every existing byte/type/mode is the exact expected
+prefix, so a successful retry leaves no transaction cruft. Receipt publication
+uses the one fixed `.install-receipt.json.partial` name: an absent file is
+created privately, a bounded byte-for-byte prefix is resumed, conflicting
+bytes fail closed, and only the complete synced file is renamed no-replace to
+`install-receipt.json`.
+
+Root and `update/` creation are a minimal race-safe lock bootstrap. `update/`
+is opened and the nonblocking lock acquired before `activations/` or any other
+transition state is created; an already prepared `versions/` must exist. A
+fresh-root race adopts an exact private root/update directory and then yields
+one lock holder plus `Busy`, never an `EEXIST` transition failure. Preparation,
+the immediate precommit check, and postcommit recovery reopen the root-relative
+`update`, `versions`, exact version, and `activations` names, bind their inode
+identities, and reverify the resolved content rather than trusting stale file
+descriptors or link strings. Every version file is full-synced and every
+derived directory plus `versions/` is synced bottom-up before selection.
+
+`current` is committed with a no-replace descriptor-relative rename. Before
+that rename, every error means no activation was selected. After that rename,
+an error from directory sync or macOS `F_FULLFSYNC` is reported distinctly as
+`CommittedDurabilityUnknown { sequence }`: the caller must treat sequence one
+as potentially active and re-open/verify instead of retrying as though nothing
+changed. Unsupported no-replace or full-sync behavior fails in preflight. The
+v1 binary deployment target and public release floor are macOS 14.0. The
+future binary-bundle release job must set `MACOSX_DEPLOYMENT_TARGET=14.0` and
+reject the packed executable unless `vtool`/`otool` proves that exact minimum;
+source-crate workflows do not pretend to prove a binary deployment target.
+The activation verifier reads the actual host version without a subprocess,
+compares versions numerically rather than lexically, and rejects both a host
+below the release requirement and a release below the v1 floor. Public README
+requirements change only when that packed binary gate passes.
+
+If postcommit durability is unknown, reopening a matching activation repeats
+version-file, version-directory, activation-directory, root-directory, and
+receipt full-sync barriers before returning durable `AlreadyCommitted`.
+The advisory lock and repeated namespace checks reject observable accidental
+or non-cooperating swaps, but no name-based POSIX protocol can defeat an
+actively malicious same-EUID process in the final check-to-rename instruction
+window. That case is part of the already excluded fully compromised local
+account threat, not an ownership guarantee claimed by this capability.
 
 Install-receipt v1 has independent receipt, state-layout, and
 installation-layout schema integers. It records a local-only random

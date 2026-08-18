@@ -58,6 +58,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/progress.rs      indicatif-based progress reporting
 ├── src/report.rs        machine-readable convert-result report
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
+├── src/distribution/   ADR-045 release/install bounded context
+│   ├── schema/         strict bounded manifest, receipt, marker schemas
+│   └── install_state/  descriptor-relative sequence-one activation;
+│                        internal until signed-update authentication exists
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes

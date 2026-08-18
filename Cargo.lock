@@ -1434,6 +1434,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "rustix",
  "ruvector-core",
  "safetensors",
  "semver",
