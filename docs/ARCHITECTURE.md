@@ -70,10 +70,13 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       commit guard, and durable metadata-baseline proof;
 │                       all internal until the real root and public update
 │                       authority exist
-│   └── update_transport/ closed Pages-pointer/GitHub-asset routes and manual
+│   ├── update_transport/ closed Pages-pointer/GitHub-asset routes and manual
 │                       one-hop release redirect, exact bounded bodies, and anonymous
 │                       same-FD streamed archive staging; no extraction,
 │                       prepared-version, installer, or CLI authority
+│   └── prepared_release/ bounded classic-ZIP structural/profile validation,
+│                       canonical embedded-manifest and exact payload binding;
+│                       no extraction, codesign, prepared-version, or CLI authority
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -572,7 +575,16 @@ harness leans on three patterns:
    fetch capability replays the ordinary selected journal under the shared
    installation lock before and after archive I/O and rejects generation or
    clock drift. The result remains inert: it grants no ZIP extraction,
-   codesign/notary, prepared-version, activation, installer, or CLI authority.
+   codesign, prepared-version, activation, installer, or CLI authority. The
+   private `distribution/prepared_release/` boundary consumes that inert bundle,
+   revalidates the same anonymous archive descriptor, and uses a bounded custom
+   classic-ZIP parser before pinned `flate2` 1.1.9/`zlib-rs` proves exact raw
+   Deflate consumption and an actual `StreamEnd`; pinned `zip` 7.2.0 then
+   supplies an independent Stored/Deflate decode, CRC, and payload-digest view.
+   It requires canonical central/local layout, exact raw inventory/order/modes,
+   a byte-identical deterministic embedded manifest, and every streamed payload
+   digest. Its non-cloneable result is still inert and grants no filesystem,
+   codesign, prepared-version, activation, installer, or CLI authority.
    Verifier-request metadata HTTP remains a pending production-root slice.
    Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected

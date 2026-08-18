@@ -23,6 +23,7 @@ pub use install_receipt::{
     INSTALLED_VERSION_MARKER_SCHEMA_VERSION, INSTALL_RECEIPT_KIND, INSTALL_RECEIPT_SCHEMA_VERSION,
     MAX_INSTALLED_VERSION_MARKER_BYTES, MAX_INSTALL_RECEIPT_BYTES, STATE_LAYOUT_SCHEMA_V1,
 };
+pub(crate) use release_manifest::MAX_BUNDLE_FILES;
 pub use release_manifest::{
     BundleFileV1, CodeSigningIdentityV1, CompatibilityV1, DynamicDependencyV1,
     ReleaseManifestError, ReleaseManifestV1, MAX_RELEASE_MANIFEST_BYTES, RELEASE_MANIFEST_KIND,

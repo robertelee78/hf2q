@@ -53,7 +53,7 @@ pub(in crate::distribution) enum UpdateTransportError {
 ///
 /// This is deliberately not prepared-version or installation authority. A
 /// later lock-held coordinator must reauthenticate the selected generation,
-/// validate the embedded manifest and ZIP inventory, verify codesign/notary,
+/// validate the embedded manifest and ZIP inventory, verify code signing,
 /// and durably publish a version before activation is possible.
 pub(in crate::distribution) struct VerifiedReleaseBundle {
     authorization: FinalArtifactAuthorization,
@@ -67,5 +67,13 @@ impl std::fmt::Debug for VerifiedReleaseBundle {
         formatter
             .debug_struct("VerifiedReleaseBundle")
             .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedReleaseBundle {
+    pub(super) fn preparation_parts_mut(
+        &mut self,
+    ) -> (&[u8], &ReleaseManifestV1, &mut VerifiedArchiveFile) {
+        (&self.manifest_bytes, &self.manifest, &mut self.archive)
     }
 }

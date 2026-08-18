@@ -7,9 +7,9 @@
   restart-discard, root-authorized online-role recovery, and dormant
   channel-pointer/selected-target binding, origin-locked artifact transport,
   lock-reauthenticated fetch capability, and same-descriptor streamed archive
-  staging are reconciled; the real release trust root, verifier-request
-  metadata transport, embedded-manifest/ZIP inventory and codesign/notary
-  verification, public
+  staging, and dormant exact embedded-manifest/classic-ZIP validation are
+  reconciled; the real release trust root, verifier-request metadata
+  transport, descriptor-relative extraction and codesign verification, public
   update/install/onboarding implementation, and exact-artifact proof remain
   pending
 - Date: 2026-08-17
@@ -200,6 +200,31 @@ external manifest bytes, and the embedded copy must be byte-for-byte identical
 to that separately verified external target. Neither the manifest nor its
 embedded copy attempts the impossible operation of hashing itself or its
 containing archive.
+
+The v1 archive profile is deliberately narrower than general ZIP. It is a
+classic single-disk archive whose EOCD occupies exactly the final 22 bytes, with
+no prefix, trailing bytes, archive comment, ZIP64 record, split disk, extra
+field, per-entry comment, encryption, data descriptor, or discretionary flag.
+Entry zero is `release-manifest.json`; the remaining entries follow the
+manifest's already sorted file order. Every raw name is the exact safe ASCII
+manifest path. Local records are contiguous from offset zero, the central
+directory begins at the exact end of compressed data, and every local header
+must equal its central record for name, method, flags, timestamp, CRC, and
+sizes. Only Stored and Deflate are accepted. Creator metadata must identify
+Unix and each external mode must be an exact regular-file `0644` or `0755`.
+Stored requires extraction version 1.0 and Deflate requires 2.0; both local and
+central timestamps use the canonical DOS epoch. Stored compressed size must
+equal uncompressed size. Every file is smaller than the classic-ZIP
+`0xffffffff` sentinel. After the bounded hf2q structural pass, pinned
+`flate2` 1.1.9 with the Rust `zlib-rs` backend must observe a real raw-Deflate
+`StreamEnd`, consume the exact declared compressed range without ignored suffix
+bytes, and emit the exact declared uncompressed length. Pinned `zip` 7.2.0 then
+supplies the independent Stored/Deflate decode, CRC, and payload-digest view;
+hf2q never calls its generic extractor. The embedded manifest must also equal
+the deterministic external manifest encoding. The archive is reverified on its
+original unlinked descriptor before and after this pass. This validation
+remains inert and creates no filesystem-write, prepared-version, activation, or
+install authority.
 
 The binary is Developer ID signed with Hardened Runtime and a secure timestamp.
 The final ZIP is submitted with `notarytool`; release promotion requires an
@@ -840,7 +865,7 @@ replays the current selected journal from the compiled anchor at current time,
 and requires the same installation/state identity, selected sequence and
 receipt digest, pointer/manifest/archive descriptors, and fresh role expiries.
 Any change discards the inert staged bytes and restarts planning. The fetched
-result still grants no extraction, codesign/notary, prepared-version,
+result still grants no extraction, codesign verification, prepared-version,
 installed-release-floor, activation, or update authority.
 
 TUF metadata versions do not prevent newly signed metadata from moving the
@@ -852,9 +877,11 @@ downgrade or rollback requires a separate one-use intent capability.
 
 Large archives are streamed and checked against the sealed descriptor by hf2q
 rather than buffered through either client's convenience target API. The
-origin-locked external-byte layer is implemented but remains deliberately
-dormant; embedded-manifest, extraction, codesign/notary, and prepared-version
-authority remain pending. The implemented metadata layer
+origin-locked external-byte layer and exact classic-ZIP/embedded-manifest
+validator are implemented but remain deliberately dormant; descriptor-relative
+extraction, codesign verification, and prepared-version authority remain
+pending. Notarization is publisher promotion evidence for the exact archive,
+not runtime preparation authority. The implemented metadata layer
 already preserves the distinction between ordinary read authority and
 lock-held recovery: any partial or published-but-unselected
 successor is ambiguous and fails closed for an ordinary reader. A same-process
@@ -1016,10 +1043,14 @@ The journal, verifier, dormant application layer, and sibling transport now
 compose a fresh, generation-bound selection of the stable pointer, fetch its
 exact external manifest/archive bytes from closed origins, and reauthenticate
 the same selected generation under the shared lock before and after archive
-I/O. They still do not produce update authority. The next slice must embed the
-real stable trust root and cross-bind the embedded manifest, codesign/notary
-evidence, and exact ZIP/payload inventory before it can construct an
-authenticated prepared version.
+I/O. The private preparation boundary additionally proves the exact classic-ZIP
+layout, canonical embedded manifest, complete payload inventory, modes, sizes,
+CRCs, and SHA-256 values on the same archive descriptor. These boundaries still
+do not produce update authority. The next slice must embed the real stable
+trust root, retain lock-held freshness authority through preparation, extract
+descriptor-relatively, verify the fixed Developer ID policy, and durably
+publish and reopen the version before it can construct an authenticated
+prepared version.
 Neither a receipt, parsed role, provisional candidate, durable baseline, nor
 selected target plan can download bytes or mutate an installation by itself.
 
@@ -1454,7 +1485,7 @@ support.
 | Compromised mirror/CDN asset | A uniquely staged binary must pass exact Developer ID/team validation before it authenticates threshold-signed bootstrap metadata; only that metadata supplies the archive/manifest digests. Any mismatch fails closed, and the high-assurance flow additionally verifies GitHub attestation. |
 | Replayed old metadata or release | Version/expiry/role checks reject rollback and freeze; no downgrade occurs without explicit selection of a previously verified retained version. |
 | Published asset replacement | Immutable draft-to-publish flow forbids overwrite; clients bind exact hashes rather than trusting a mutable tag alone. |
-| Malicious archive path/link | A listing-only allowlist/path/type pass precedes any extraction; only the signed binary is extracted first, all remaining files stay in private staging until their signed inventory/digests verify, and no write escapes staging or the new version directory. |
+| Malicious archive path/link | A bounded custom classic-ZIP pass preserves every raw record and rejects duplicates, noncanonical order, flags, links/types, ZIP64, comments/extras, local/central disagreement, gaps, overlaps, prefixes, and trailing bytes before the decoder or any extraction runs. The exact embedded manifest and every streamed payload digest must then match the signed inventory. |
 | Interrupted install/update | Before activation, old `current` selects the complete old activation. After the sole commit, new `current` selects one complete immutable receipt, relative version link, version, and marker. Partial staging is never executable. |
 | Concurrent updater | Installation lock admits one transition and leaves no ambiguous active version. |
 | Package-manager collision | Receipt plus manager-database ownership evidence prevents self-overwrite; Cargo route history is never guessed, and `hf2q update` delegates through the recorded/selected route and verifies the result. |
@@ -1485,10 +1516,12 @@ before public self-update ships.
    reset, independent Python-TUF corpus, canonical channel-pointer schema,
    current-time authenticated target inventory, sealed pointer cross-binding,
    origin-locked transport, lock-reauthenticated fetch capability, and exact
-   external manifest/same-FD streamed archive binding have landed as dormant
+   external manifest/same-FD streamed archive binding plus exact
+   embedded-manifest/classic-ZIP inventory verification have landed as dormant
    bounded contexts. Next, embed the real stable root and implement
-   embedded-manifest/ZIP inventory,
-   codesign/notary, live installed-release downgrade floor, canonical Hugging
+   descriptor-relative extraction, codesign verification, crash-durable
+   prepared-version publication, live installed-release downgrade floor,
+   canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration
    receipt, and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
@@ -1512,7 +1545,8 @@ before public self-update ships.
 6. Lift ADR-017/ADR-027 persistence into bounded setup-controlled multi-slot
    Qwen3.8 vision sessions, with isolation, crash, quota, and semantic replay
    gates.
-7. Build the candidate bundle; add signing, notarization, GitHub attestation,
+7. Build the candidate bundle; add signing, notarization promotion evidence,
+   GitHub attestation,
    immutable-release enforcement, draft publication, and installed-artifact
    hardware gates.
 8. Implement and adversarially test the standalone installer, atomic switch,

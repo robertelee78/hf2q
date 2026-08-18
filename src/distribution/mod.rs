@@ -9,6 +9,8 @@
 // trust root, prepared-version pipeline, and public update authority exist.
 #[allow(dead_code)]
 pub(crate) mod install_state;
+#[allow(dead_code)]
+mod prepared_release;
 pub mod schema;
 #[allow(dead_code)]
 mod update_auth;
