@@ -207,7 +207,7 @@ jobs:
                and $d.interactive_overlap.server.binary_sha256 == $root.binary_sha256
                and $d.interactive_overlap.server.model_sha256 == $deepseek_sha
                and $d.interactive_overlap.server.max_slots == 4
-               and $d.interactive_overlap.fixture_sha256 == "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d"
+               and $d.interactive_overlap.fixture_sha256 == "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e"
                and $d.interactive_overlap.long_prompt_tokens > 80000
                and $d.interactive_overlap.first_mixed_prefill_chunk_tokens > 0
                and $d.interactive_overlap.first_mixed_prefill_chunk_tokens <= 256

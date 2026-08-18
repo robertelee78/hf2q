@@ -346,7 +346,7 @@ HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-short.json"
     public_347_tool_fixture_renders_to_exact_87972_tokens -- \
     --ignored --test-threads=1 >"$OUT_ROOT/fixtures/generator.log" 2>&1
 test "$(sha256_file "$OUT_ROOT/fixtures/public-347.json")" = \
-  "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d"
+  "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e"
 test "$(sha256_file "$OUT_ROOT/fixtures/public-short.json")" = \
   "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004"
 
