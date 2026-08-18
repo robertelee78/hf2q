@@ -1283,6 +1283,26 @@ mod qwen_thinking_budget_tests {
     }
 
     #[test]
+    fn tool_continuation_default_composes_with_small_completion_answer_reserve() {
+        let messages = vec![
+            message("user", None),
+            tool_call_message(&["call-1"]),
+            tool_result_message("call-1"),
+        ];
+        let chain = qwen_tool_chain_state(&messages);
+        let adaptive = adaptive_qwen_default_thinking_budget(Some(2_048), None, chain);
+        assert_eq!(adaptive, Some(512));
+        assert_eq!(
+            effective_qwen_thinking_budget(adaptive, false, 256, 8).unwrap(),
+            Some(192)
+        );
+        assert_eq!(
+            effective_qwen_thinking_budget(adaptive, false, 128, 8).unwrap(),
+            Some(96)
+        );
+    }
+
+    #[test]
     fn parallel_tool_results_count_as_one_continuation_cycle() {
         let mut messages = vec![
             message("user", None),
@@ -1762,7 +1782,7 @@ where
     if qwen_thinking_mode {
         if let Some((tool, repeats)) = repeated_tool_result_signature(&messages_for_render, 3) {
             tracing::warn!(
-                tool,
+                tool = ?tool,
                 repeats,
                 "identical Qwen tool call and result repeated across assistant turns"
             );
@@ -4411,6 +4431,7 @@ fn defensive_no_call_under_constrained(
 /// `grammar_lazy = false` for Required at common/chat.cpp:898-913,
 /// 1177-1200, 1399-1416, 1626-1628 and `grammar_triggers` registration
 /// for the per-model open marker.
+#[cfg(test)]
 fn compile_tool_grammar(
     req: &super::schema::ChatCompletionRequest,
     tool_choice: &super::schema::ToolChoiceValue,

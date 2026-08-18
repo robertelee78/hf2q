@@ -348,14 +348,16 @@ then measured 1.603x, 1.610x, and 1.615x; the 1,000-step thermal ratio was
 release authority; publication, immutable dependency pinning, and the
 protected exact-artifact receipt remain mandatory. Q3 was slower because
 larger per-workgroup state reduced occupancy and was removed from the landing
-code. Short contexts below 8,192 retain the legacy dispatch, and the protected
-gate must re-verify no more than 2% regression rather than assuming the old
-crossover transfers.
+code. The protected gate now runs a 512-token short request on every fresh
+OFF/AUTO server before the 105K request, requires byte-identical output and no
+more than 2% short regression, and snapshots the log to prove AUTO did not
+select Q2 below 8,192 before the long request proves Q2 selection.
 
 That release gate binds its throughput calculation to one exactly-once
 `Qwen35 decode complete` event from the request's real SlotAware completion
 path. The event reports the same generated-token count and decode clock used
-by the response timing fields and is suppressed for client cancellation. The
+by the response timing fields and is suppressed for detected client
+cancellation. The
 first end-to-end gate attempt correctly rejected an otherwise valid
 105,097-prompt-token response because SlotAware lacked this SerialFifo-parity
 telemetry; the missing path is now pinned by a model-free regression test, and

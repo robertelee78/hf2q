@@ -343,11 +343,14 @@ above that threshold. `HF2Q_QWEN_GQA_Q2=off` is the supported escape hatch;
 `on` still cannot bypass hard geometry checks, and invalid values fail safe to
 off. This default is accepted for merge only when the same packed hf2q binary
 passes the shipping contract's OFF/AUTO/AUTO/OFF release receipt: identical
-greedy output, at least 15% mean end-to-end decode gain near 105K, no arm above
-5% spread, lower independently measured curl wall time, exactly-once
-SlotAware completion telemetry derived from the finalized result, and a
-continuous fair-or-better thermal envelope. Isolated mlx-native numbers are
-dependency evidence, not hf2q release authority.
+greedy output at both a sub-8,192 short prompt and near 105K, no more than 2%
+short-context regression, at least 15% mean long-context decode gain, no arm
+above 5% spread, lower independently measured long-request curl wall time,
+one exactly-once SlotAware completion event per request derived from the
+finalized result, and a continuous fair-or-better thermal envelope. The short
+log snapshot must prove `auto` retained the scalar route before the long AUTO
+request proves Q2 selection. Isolated mlx-native numbers are dependency
+evidence, not hf2q release authority.
 
 The next exact-output optimization sequence is a two-dimensional H2xP2
 query-head/query-position verifier, then native Qwen3.8 MTP and a dynamic

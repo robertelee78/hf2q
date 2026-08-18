@@ -33,11 +33,15 @@ build_fixture() {
   local include_seed=${2:-0}
   local slow_auto=${3:-0}
   local noisy_off=${4:-0}
+  local slow_short_auto=${5:-0}
   local benchmark_dir="$destination/benchmark"
   local trial_index mode decode_tps decode_seconds elapsed_ms prewarm
   local response_total_seconds wall_total_seconds
-  local trial_start request_start request_end trial_end
+  local short_decode_tps short_decode_seconds short_elapsed_ms
+  local short_response_total_seconds short_wall_total_seconds
+  local trial_start short_request_start short_request_end request_start request_end trial_end
   local trial_dir artifacts_json prompt_sha prompt_bytes request_sha semantic_sha
+  local short_prompt_sha short_prompt_bytes short_request_sha short_semantic_sha
   mkdir -p "$benchmark_dir" "$destination/thermal"
   printf 'synthetic canonical prompt\n' >"$benchmark_dir/prompt.txt"
   jq -n --rawfile prompt "$benchmark_dir/prompt.txt" '
@@ -46,6 +50,13 @@ build_fixture() {
       temperature:0,max_tokens:512,stream:false,hf2q_enable_thinking:false,
       repetition_penalty:1.0}
   ' >"$benchmark_dir/request.json"
+  printf 'synthetic short canonical prompt\n' >"$benchmark_dir/short-prompt.txt"
+  jq -n --rawfile prompt "$benchmark_dir/short-prompt.txt" '
+    {model:"Qwen3.8 27B",messages:[
+      {role:"system",content:"synthetic"},{role:"user",content:$prompt}],
+      temperature:0,max_tokens:512,stream:false,hf2q_enable_thinking:false,
+      repetition_penalty:1.0}
+  ' >"$benchmark_dir/short-request.json"
   if [[ "$include_seed" == 1 ]]; then
     jq '.seed = 1234' "$benchmark_dir/request.json" \
       >"$benchmark_dir/request.seed.json"
@@ -54,6 +65,9 @@ build_fixture() {
   prompt_sha=$(sha256_file "$benchmark_dir/prompt.txt")
   prompt_bytes=$(wc -c <"$benchmark_dir/prompt.txt" | tr -d ' ')
   request_sha=$(sha256_file "$benchmark_dir/request.json")
+  short_prompt_sha=$(sha256_file "$benchmark_dir/short-prompt.txt")
+  short_prompt_bytes=$(wc -c <"$benchmark_dir/short-prompt.txt" | tr -d ' ')
+  short_request_sha=$(sha256_file "$benchmark_dir/short-request.json")
   : >"$benchmark_dir/phase.log"
 
   trial_index=0
@@ -83,25 +97,50 @@ build_fixture() {
         ;;
       4) decode_tps=10.2; decode_seconds=50.1960784314; wall_total_seconds=51.3 ;;
     esac
+    case "$trial_index" in
+      1) short_decode_tps=30.0; short_decode_seconds=17.0666666667; short_wall_total_seconds=18.2 ;;
+      2)
+        if [[ "$slow_short_auto" == 1 ]]; then
+          short_decode_tps=29.0; short_decode_seconds=17.6551724138; short_wall_total_seconds=18.8
+        else
+          short_decode_tps=30.2; short_decode_seconds=16.9536423841; short_wall_total_seconds=18.1
+        fi
+        ;;
+      3)
+        if [[ "$slow_short_auto" == 1 ]]; then
+          short_decode_tps=29.1; short_decode_seconds=17.5945017182; short_wall_total_seconds=18.7
+        else
+          short_decode_tps=30.1; short_decode_seconds=17.0099667774; short_wall_total_seconds=18.1
+        fi
+        ;;
+      4) short_decode_tps=29.9; short_decode_seconds=17.1237458194; short_wall_total_seconds=18.3 ;;
+    esac
     response_total_seconds=$(awk -v seconds="$decode_seconds" \
       'BEGIN { printf "%.10f", seconds + 1 }')
+    short_response_total_seconds=$(awk -v seconds="$short_decode_seconds" \
+      'BEGIN { printf "%.10f", seconds + 1 }')
     case "$trial_index" in
-      1) trial_start=2000; request_start=2001; request_end=2053; trial_end=2054 ;;
-      2) trial_start=2055; request_start=2056; request_end=2100; trial_end=2101 ;;
-      3) trial_start=2102; request_start=2103; request_end=2146; trial_end=2147 ;;
-      4) trial_start=2148; request_start=2149; request_end=2200; trial_end=2201 ;;
+      1) trial_start=2000; short_request_start=2001; short_request_end=2019; request_start=2020; request_end=2072; trial_end=2073 ;;
+      2) trial_start=2074; short_request_start=2075; short_request_end=2093; request_start=2094; request_end=2138; trial_end=2139 ;;
+      3) trial_start=2140; short_request_start=2141; short_request_end=2159; request_start=2160; request_end=2203; trial_end=2204 ;;
+      4) trial_start=2205; short_request_start=2206; short_request_end=2224; request_start=2225; request_end=2276; trial_end=2277 ;;
     esac
     {
       printf '%s\t%s\t%s\ttrial-start\n' "$trial_start" "$trial_index" "$mode"
+      printf '%s\t%s\t%s\tshort-request-start\n' "$short_request_start" "$trial_index" "$mode"
+      printf '%s\t%s\t%s\tshort-request-end\n' "$short_request_end" "$trial_index" "$mode"
       printf '%s\t%s\t%s\trequest-start\n' "$request_start" "$trial_index" "$mode"
       printf '%s\t%s\t%s\trequest-end\n' "$request_end" "$trial_index" "$mode"
       printf '%s\t%s\t%s\ttrial-end\n' "$trial_end" "$trial_index" "$mode"
     } >>"$benchmark_dir/phase.log"
     elapsed_ms=$(awk -v seconds="$decode_seconds" 'BEGIN { printf "%.6f", seconds * 1000 }')
+    short_elapsed_ms=$(awk -v seconds="$short_decode_seconds" \
+      'BEGIN { printf "%.6f", seconds * 1000 }')
     if [[ "$mode" == auto ]]; then prewarm=true; else prewarm=false; fi
     trial_dir="$benchmark_dir/trial-${trial_index}-${mode}"
     mkdir -p "$trial_dir"
     cp "$benchmark_dir/request.json" "$trial_dir/request.json"
+    cp "$benchmark_dir/short-request.json" "$trial_dir/short-request.json"
     jq -n --argjson decode_seconds "$decode_seconds" --argjson decode_tps "$decode_tps" \
       --argjson response_total_seconds "$response_total_seconds" '
       {id:"synthetic",object:"chat.completion",created:1,
@@ -114,10 +153,27 @@ build_fixture() {
          prefill_tokens_per_sec:105100,decode_tokens_per_sec:$decode_tps,
          gpu_sync_count:512,gpu_dispatch_count:1024}}
     ' >"$trial_dir/response.json"
+    jq -n --argjson decode_seconds "$short_decode_seconds" \
+      --argjson decode_tps "$short_decode_tps" \
+      --argjson response_total_seconds "$short_response_total_seconds" '
+      {id:"synthetic-short",object:"chat.completion",created:1,
+       model:"Qwen3.8 27B",choices:[{index:0,
+         message:{role:"assistant",content:"same exact short output"},
+         finish_reason:"length"}],
+       usage:{prompt_tokens:4100,completion_tokens:512,total_tokens:4612},
+       x_hf2q_timing:{prefill_time_secs:1,decode_time_secs:$decode_seconds,
+         total_time_secs:$response_total_seconds,time_to_first_token_ms:1000,
+         prefill_tokens_per_sec:4100,decode_tokens_per_sec:$decode_tps,
+         gpu_sync_count:512,gpu_dispatch_count:1024}}
+    ' >"$trial_dir/short-response.json"
     jq -S '{model,choices,usage}' "$trial_dir/response.json" \
       >"$trial_dir/semantic.json"
+    jq -S '{model,choices,usage}' "$trial_dir/short-response.json" \
+      >"$trial_dir/short-semantic.json"
     printf 'http_code=200\ntotal_seconds=%s\n' "$wall_total_seconds" \
       >"$trial_dir/curl.metrics"
+    printf 'http_code=200\ntotal_seconds=%s\n' "$short_wall_total_seconds" \
+      >"$trial_dir/short-curl.metrics"
     printf '{"ready":true,"detail":"ready"}\n' >"$trial_dir/readyz.json"
     printf '{"object":"list","data":[{"id":"Qwen3.8 27B","loaded":true}]}\n' \
       >"$trial_dir/models.json"
@@ -129,6 +185,11 @@ build_fixture() {
       "$mode" >"$trial_dir/environment.txt"
     {
       printf '[prewarm] warmed 1 / 1 no-const kernels + 1 / 1 fa-prefill variants + gqa_q2=%s in 1.00ms\n' "$prewarm"
+      printf 'INFO mode=unary generated_tokens=512 elapsed_ms=%s tokens_per_second=%s Qwen35 decode complete\n' \
+        "$short_elapsed_ms" "$short_decode_tps"
+    } >"$trial_dir/short-server.log"
+    {
+      cat "$trial_dir/short-server.log"
       if [[ "$mode" == auto ]]; then
         printf 'INFO kv_seq_len=105100 num_heads=32 num_kv_heads=8 Qwen TQ-HB decode selected GQA-cooperative Q2 attention\n'
       fi
@@ -136,8 +197,11 @@ build_fixture() {
         "$elapsed_ms" "$decode_tps"
     } >"$trial_dir/server.log"
     semantic_sha=$(sha256_file "$trial_dir/semantic.json")
+    short_semantic_sha=$(sha256_file "$trial_dir/short-semantic.json")
     artifacts_json=$(
-      for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
+      for name in request.json response.json semantic.json curl.metrics server.log \
+        short-request.json short-response.json short-semantic.json short-curl.metrics \
+        short-server.log readyz.json models.json environment.txt settle.log; do
         jq -n --arg name "$name" --arg sha256 "$(sha256_file "$trial_dir/$name")" \
           '{name:$name,sha256:$sha256}'
       done | jq -s .
@@ -145,9 +209,15 @@ build_fixture() {
     jq -n --argjson index "$trial_index" --arg mode "$mode" \
       --arg binary_sha256 "$binary_sha" --arg model_sha256 "$model_sha" \
       --arg request_sha256 "$request_sha" --arg semantic_sha256 "$semantic_sha" \
+      --arg short_request_sha256 "$short_request_sha" \
+      --arg short_semantic_sha256 "$short_semantic_sha" \
       --argjson decode_seconds "$decode_seconds" --argjson decode_tps "$decode_tps" \
       --argjson response_total_seconds "$response_total_seconds" \
       --argjson wall_total_seconds "$wall_total_seconds" \
+      --argjson short_decode_seconds "$short_decode_seconds" \
+      --argjson short_decode_tps "$short_decode_tps" \
+      --argjson short_response_total_seconds "$short_response_total_seconds" \
+      --argjson short_wall_total_seconds "$short_wall_total_seconds" \
       --argjson artifacts "$artifacts_json" '
       {index:$index,mode:$mode,status:"pass",binary_sha256:$binary_sha256,
        binary_file_identity:"1:2",model_sha256:$model_sha256,
@@ -156,7 +226,15 @@ build_fixture() {
        completion_tokens:512,finish_reason:"length",decode_seconds:$decode_seconds,
        decode_tokens_per_second:$decode_tps,
        response_total_seconds:$response_total_seconds,
-       wall_total_seconds:$wall_total_seconds,artifacts:$artifacts}
+       wall_total_seconds:$wall_total_seconds,
+       short:{request_sha256:$short_request_sha256,
+         semantic_sha256:$short_semantic_sha256,prompt_tokens:4100,
+         completion_tokens:512,finish_reason:"length",
+         decode_seconds:$short_decode_seconds,
+         decode_tokens_per_second:$short_decode_tps,
+         response_total_seconds:$short_response_total_seconds,
+         wall_total_seconds:$short_wall_total_seconds},
+       artifacts:$artifacts}
     ' >"$trial_dir/trial.json"
   done
 
@@ -180,14 +258,31 @@ build_fixture() {
   fi
   improvement_percent=$(awk -v baseline="$off_mean" -v candidate="$auto_mean" \
     'BEGIN { printf "%.6f", ((candidate / baseline) - 1) * 100 }')
+  short_off_mean=29.95
+  if [[ "$slow_short_auto" == 1 ]]; then
+    short_auto_mean=29.05
+    short_auto_spread_percent=0.344234
+  else
+    short_auto_mean=30.15
+    short_auto_spread_percent=0.331675
+  fi
+  short_off_spread_percent=0.333890
+  short_regression_percent=$(awk -v baseline="$short_off_mean" \
+    -v candidate="$short_auto_mean" \
+    'BEGIN { printf "%.6f", (1 - (candidate / baseline)) * 100 }')
   semantic_sha=$(sha256_file "$benchmark_dir/trial-1-off/semantic.json")
+  short_semantic_sha=$(sha256_file "$benchmark_dir/trial-1-off/short-semantic.json")
   phase_sha=$(sha256_file "$benchmark_dir/phase.log")
   phase_bytes=$(wc -c <"$benchmark_dir/phase.log" | tr -d ' ')
   jq -n --arg source_sha "$source_sha" --arg crate_sha256 "$crate_sha" \
     --arg binary_sha256 "$binary_sha" --arg model_sha256 "$model_sha" \
     --arg prompt_sha256 "$prompt_sha" --argjson prompt_bytes "$prompt_bytes" \
+    --arg short_prompt_sha256 "$short_prompt_sha" \
+    --argjson short_prompt_bytes "$short_prompt_bytes" \
     --arg phase_sha256 "$phase_sha" --argjson phase_bytes "$phase_bytes" \
     --arg request_sha256 "$request_sha" --arg semantic_sha256 "$semantic_sha" \
+    --arg short_request_sha256 "$short_request_sha" \
+    --arg short_semantic_sha256 "$short_semantic_sha" \
     --arg thermal_probe_sha256 "$thermal_probe_sha" \
     --argjson off_mean "$off_mean" --argjson auto_mean "$auto_mean" \
     --argjson off_spread_percent "$off_spread_percent" \
@@ -195,6 +290,11 @@ build_fixture() {
     --argjson off_wall_mean "$off_wall_mean" \
     --argjson auto_wall_mean "$auto_wall_mean" \
     --argjson improvement_percent "$improvement_percent" \
+    --argjson short_off_mean "$short_off_mean" \
+    --argjson short_auto_mean "$short_auto_mean" \
+    --argjson short_off_spread_percent "$short_off_spread_percent" \
+    --argjson short_auto_spread_percent "$short_auto_spread_percent" \
+    --argjson short_regression_percent "$short_regression_percent" \
     --slurpfile trial1 "$benchmark_dir/trial-1-off/trial.json" \
     --slurpfile trial2 "$benchmark_dir/trial-2-auto/trial.json" \
     --slurpfile trial3 "$benchmark_dir/trial-3-auto/trial.json" \
@@ -206,13 +306,18 @@ build_fixture() {
          sha256:$model_sha256,file_identity:"3:4",bytes:123456},
        prompt:{path:"prompt.txt",sha256:$prompt_sha256,bytes:$prompt_bytes,
          padding_tokens:105000},
+       short_prompt:{path:"short-prompt.txt",sha256:$short_prompt_sha256,
+         bytes:$short_prompt_bytes,padding_tokens:4000},
        phase_log:{path:"phase.log",sha256:$phase_sha256,bytes:$phase_bytes},
        request:{path:"request.json",sha256:$request_sha256},
+       short_request:{path:"short-request.json",sha256:$short_request_sha256},
        hardware:{model:"Mac16,1",chip:"Apple M5 Max",arch:"arm64",
          memory_bytes:137438953472,os_version:"26.0",
          thermal_probe:{path:"/usr/bin/swift",sha256:$thermal_probe_sha256}}},
-     settings:{temperature:0,max_tokens:512,stream:false,thinking:false,
+     settings:{temperature:0,max_tokens:512,short_max_tokens:512,
+       stream:false,thinking:false,
        repetition_penalty:1.0,min_prompt_tokens:100000,max_prompt_tokens:120000,
+       min_short_prompt_tokens:3000,max_short_prompt_tokens:6000,
        trial_settle_seconds:30,maximum_within_arm_spread_percent:5,
        maximum_wall_timing_delta_seconds:2},
      trial_order:["off","auto","auto","off"],
@@ -224,7 +329,14 @@ build_fixture() {
        off_mean_wall_seconds:$off_wall_mean,
        auto_mean_wall_seconds:$auto_wall_mean,
        improvement_percent:$improvement_percent,minimum_improvement_percent:15,
-       exact_output_sha256:$semantic_sha256}}
+       exact_output_sha256:$semantic_sha256,
+       short_off_mean_decode_tokens_per_second:$short_off_mean,
+       short_auto_mean_decode_tokens_per_second:$short_auto_mean,
+       short_off_within_arm_spread_percent:$short_off_spread_percent,
+       short_auto_within_arm_spread_percent:$short_auto_spread_percent,
+       short_regression_percent:$short_regression_percent,
+       maximum_short_regression_percent:2,
+       short_exact_output_sha256:$short_semantic_sha256}}
   ' >"$benchmark_dir/summary.json"
   printf '%s  summary.json\n' "$(sha256_file "$benchmark_dir/summary.json")" \
     >"$benchmark_dir/summary.json.sha256"
@@ -232,10 +344,10 @@ build_fixture() {
   for offset in 0 5 10 15 20 25 30 35 40 45 50 55 60; do
     printf '%d\tnominal\tqwen38-long-decode-settle\n' "$((1000 + offset))"
   done >"$destination/thermal/settle.log"
-  for epoch in $(seq 1998 2 2204); do
+  for epoch in $(seq 1998 2 2280); do
     if [[ "$epoch" == 1998 ]]; then
       printf '%s\tnominal\tqwen38-long-decode-measurement-start\n' "$epoch"
-    elif [[ "$epoch" == 2204 ]]; then
+    elif [[ "$epoch" == 2280 ]]; then
       printf '%s\tfair\tqwen38-long-decode-measurement-end\n' "$epoch"
     else
       printf '%s\tfair\tqwen38-long-decode-measurement\n' "$epoch"
@@ -248,11 +360,11 @@ build_fixture() {
      maximum_measurement_state:"fair",
      runtime_preflight:"pass",measurement_scope:"full-abba-benchmark",
      benchmark_summary_sha256:$benchmark_summary_sha256,settle_seconds:60,
-     settle_duration_seconds:60,settle_samples:13,measurement_samples:104,
-     measurement_duration_seconds:206,sample_interval_seconds:2,
+     settle_duration_seconds:60,settle_samples:13,measurement_samples:142,
+     measurement_duration_seconds:282,sample_interval_seconds:2,
      maximum_sample_gap_seconds:5,settle_sample_interval_seconds:5,
-     maximum_settle_sample_gap_seconds:8,non_nominal_measurement_samples:103,
-     fair_measurement_samples:103,over_limit_measurement_samples:0,
+     maximum_settle_sample_gap_seconds:8,non_nominal_measurement_samples:141,
+     fair_measurement_samples:141,over_limit_measurement_samples:0,
      settle_telemetry_gaps:0,telemetry_gaps:0,
      settle_log_sha256:$settle_log_sha256,
      measurement_log_sha256:$measurement_log_sha256}
@@ -290,7 +402,9 @@ rehash_trial_into_summary() {
   local trial_json="$trial_dir/trial.json"
   local summary="$fixture/benchmark/summary.json"
   local artifact
-  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
+  for artifact in request.json response.json semantic.json curl.metrics server.log \
+    short-request.json short-response.json short-semantic.json short-curl.metrics \
+    short-server.log readyz.json models.json environment.txt settle.log; do
     jq --arg name "$artifact" --arg sha "$(sha256_file "$trial_dir/$artifact")" '
       .artifacts |= map(if .name == $name then .sha256 = $sha else . end)
     ' "$trial_json" >"$trial_json.tmp"
@@ -355,6 +469,18 @@ noisy="$tmp/noisy"
 build_fixture "$noisy" 0 0 1
 expect_benchmark_rejected "$noisy" excessive-within-arm-spread
 
+short_regression="$tmp/short-regression"
+build_fixture "$short_regression" 0 0 0 1
+expect_benchmark_rejected "$short_regression" excessive-short-context-regression
+
+premature_q2="$tmp/premature-q2"
+cp -R "$valid" "$premature_q2"
+printf 'INFO kv_seq_len=4100 Qwen TQ-HB decode selected GQA-cooperative Q2 attention\n' \
+  >>"$premature_q2/benchmark/trial-2-auto/short-server.log"
+rehash_trial_into_summary "$premature_q2" 1 \
+  "$premature_q2/benchmark/trial-2-auto"
+expect_benchmark_rejected "$premature_q2" premature-short-context-q2-selection
+
 wall_inconsistent="$tmp/wall-inconsistent"
 cp -R "$valid" "$wall_inconsistent"
 printf 'http_code=200\ntotal_seconds=60\n' \
@@ -393,9 +519,11 @@ expect_benchmark_rejected "$missing_decode" missing-decode-telemetry
 duplicate_decode="$tmp/duplicate-decode"
 cp -R "$valid" "$duplicate_decode"
 decode_line=$(grep 'Qwen35 decode complete' \
-  "$duplicate_decode/benchmark/trial-2-auto/server.log")
+  "$duplicate_decode/benchmark/trial-2-auto/server.log" | tail -n 1)
 printf '%s\n' "$decode_line" \
   >>"$duplicate_decode/benchmark/trial-2-auto/server.log"
+[[ "$(grep -c 'Qwen35 decode complete' \
+  "$duplicate_decode/benchmark/trial-2-auto/server.log")" == 3 ]]
 rehash_trial_into_summary "$duplicate_decode" 1 \
   "$duplicate_decode/benchmark/trial-2-auto"
 expect_benchmark_rejected "$duplicate_decode" duplicate-decode-telemetry
@@ -452,6 +580,26 @@ mv "$wrong_semantic/benchmark/trial-2-auto/trial.tmp" \
 rehash_trial_into_summary "$wrong_semantic" 1 \
   "$wrong_semantic/benchmark/trial-2-auto"
 expect_benchmark_rejected "$wrong_semantic" cross-arm-semantic-mismatch
+
+wrong_short_semantic="$tmp/wrong-short-semantic"
+cp -R "$valid" "$wrong_short_semantic"
+jq '.choices[0].message.content = "different short output"' \
+  "$wrong_short_semantic/benchmark/trial-2-auto/short-response.json" \
+  >"$wrong_short_semantic/benchmark/trial-2-auto/short-response.tmp"
+mv "$wrong_short_semantic/benchmark/trial-2-auto/short-response.tmp" \
+  "$wrong_short_semantic/benchmark/trial-2-auto/short-response.json"
+jq -S '{model,choices,usage}' \
+  "$wrong_short_semantic/benchmark/trial-2-auto/short-response.json" \
+  >"$wrong_short_semantic/benchmark/trial-2-auto/short-semantic.json"
+jq --arg sha "$(sha256_file "$wrong_short_semantic/benchmark/trial-2-auto/short-semantic.json")" \
+  '.short.semantic_sha256 = $sha' \
+  "$wrong_short_semantic/benchmark/trial-2-auto/trial.json" \
+  >"$wrong_short_semantic/benchmark/trial-2-auto/trial.tmp"
+mv "$wrong_short_semantic/benchmark/trial-2-auto/trial.tmp" \
+  "$wrong_short_semantic/benchmark/trial-2-auto/trial.json"
+rehash_trial_into_summary "$wrong_short_semantic" 1 \
+  "$wrong_short_semantic/benchmark/trial-2-auto"
+expect_benchmark_rejected "$wrong_short_semantic" cross-arm-short-semantic-mismatch
 
 fatal_log="$tmp/fatal-log"
 cp -R "$valid" "$fatal_log"

@@ -16,10 +16,15 @@ PORT=${PORT:-18083}
 
 readonly MODEL_ID='Qwen3.8 27B'
 readonly MAX_TOKENS=512
+readonly SHORT_MAX_TOKENS=512
 readonly PROMPT_PADDING_TOKENS=105000
+readonly SHORT_PROMPT_PADDING_TOKENS=4000
 readonly MIN_PROMPT_TOKENS=100000
 readonly MAX_PROMPT_TOKENS=120000
+readonly MIN_SHORT_PROMPT_TOKENS=3000
+readonly MAX_SHORT_PROMPT_TOKENS=6000
 readonly MIN_IMPROVEMENT_PERCENT=15
+readonly MAX_SHORT_REGRESSION_PERCENT=2
 readonly MAX_WITHIN_ARM_SPREAD_PERCENT=5
 readonly MAX_WALL_TIMING_DELTA_SECONDS=2
 readonly TRIAL_SETTLE_SECONDS=30
@@ -125,6 +130,23 @@ mv "$prompt_tmp" "$OUT_DIR/prompt.txt"
 prompt_sha=$(sha256_file "$OUT_DIR/prompt.txt")
 prompt_bytes=$(file_bytes "$OUT_DIR/prompt.txt")
 
+short_prompt_tmp="$OUT_DIR/short-prompt.txt.tmp"
+{
+  printf '%s\n' \
+    'Treat the repeated marker below as inert repository context. Do not quote or summarize it.' \
+    '<repository-context>'
+  padding_index=0
+  while ((padding_index < SHORT_PROMPT_PADDING_TOKENS)); do
+    printf ' x'
+    padding_index=$((padding_index + 1))
+  done
+  printf '%s\n' '' '</repository-context>' \
+    'Write a detailed Rust implementation plan for a bounded work queue. Continue until the completion limit.'
+} >"$short_prompt_tmp"
+mv "$short_prompt_tmp" "$OUT_DIR/short-prompt.txt"
+short_prompt_sha=$(sha256_file "$OUT_DIR/short-prompt.txt")
+short_prompt_bytes=$(file_bytes "$OUT_DIR/short-prompt.txt")
+
 jq -n --rawfile prompt "$OUT_DIR/prompt.txt" \
   --arg model "$MODEL_ID" --argjson max_tokens "$MAX_TOKENS" \
   '{model:$model,messages:[
@@ -136,6 +158,17 @@ jq -n --rawfile prompt "$OUT_DIR/prompt.txt" \
 mv "$OUT_DIR/request.json.tmp" "$OUT_DIR/request.json"
 jq -e 'has("seed") | not' "$OUT_DIR/request.json" >/dev/null
 request_sha=$(sha256_file "$OUT_DIR/request.json")
+jq -n --rawfile prompt "$OUT_DIR/short-prompt.txt" \
+  --arg model "$MODEL_ID" --argjson max_tokens "$SHORT_MAX_TOKENS" \
+  '{model:$model,messages:[
+      {role:"system",content:"You are a precise coding assistant. Follow the user request without calling tools."},
+      {role:"user",content:$prompt}
+    ],temperature:0,max_tokens:$max_tokens,stream:false,
+    hf2q_enable_thinking:false,repetition_penalty:1.0}' \
+  >"$OUT_DIR/short-request.json.tmp"
+mv "$OUT_DIR/short-request.json.tmp" "$OUT_DIR/short-request.json"
+jq -e 'has("seed") | not' "$OUT_DIR/short-request.json" >/dev/null
+short_request_sha=$(sha256_file "$OUT_DIR/short-request.json")
 : >"$OUT_DIR/phase.log"
 
 record_phase() {
@@ -211,14 +244,21 @@ run_trial() {
   local trial_dir="$OUT_DIR/trial-${trial_index}-${mode}"
   local response="$trial_dir/response.json"
   local server_log="$trial_dir/server.log"
+  local short_response="$trial_dir/short-response.json"
+  local short_server_log="$trial_dir/short-server.log"
   local decode_line log_generated log_elapsed_ms log_tps
   local prompt_tokens completion_tokens decode_seconds decode_tps finish_reason
   local response_total_seconds wall_total_seconds
+  local short_decode_line short_log_generated short_log_elapsed_ms short_log_tps
+  local short_prompt_tokens short_completion_tokens short_decode_seconds short_decode_tps
+  local short_finish_reason short_response_total_seconds short_wall_total_seconds
+  local short_semantic_sha
   local semantic_sha ready_code
   local artifacts_json
 
   mkdir -p "$trial_dir"
   cp "$OUT_DIR/request.json" "$trial_dir/request.json"
+  cp "$OUT_DIR/short-request.json" "$trial_dir/short-request.json"
   printf 'HF2Q_QWEN_GQA_Q2=%s\nHF2Q_PIPELINE_PREWARM_LOG=1\nQWEN38_VISION=off\n' \
     "$mode" >"$trial_dir/environment.txt"
   thermal_wait_for_nominal "$trial_dir/settle.log" \
@@ -251,6 +291,74 @@ run_trial() {
     echo "Qwen3.8 trial server did not expose exactly the sealed loaded model: $MODEL_ID" >&2
     return 1
   }
+
+  record_phase "$trial_index" "$mode" short-request-start
+  curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 900 \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$trial_dir/short-request.json" \
+    -o "$short_response" \
+    -w 'http_code=%{http_code}\ntotal_seconds=%{time_total}\n' \
+    "http://127.0.0.1:$PORT/v1/chat/completions" \
+    >"$trial_dir/short-curl.metrics" &
+  request_pid=$!
+  wait "$request_pid"
+  request_pid=''
+  record_phase "$trial_index" "$mode" short-request-end
+  grep -qx 'http_code=200' "$trial_dir/short-curl.metrics"
+  short_wall_total_seconds=$(sed -n 's/^total_seconds=//p' "$trial_dir/short-curl.metrics")
+  [[ "$short_wall_total_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]
+  jq -e --arg model "$MODEL_ID" --argjson max_tokens "$SHORT_MAX_TOKENS" \
+    --argjson min_prompt "$MIN_SHORT_PROMPT_TOKENS" \
+    --argjson max_prompt "$MAX_SHORT_PROMPT_TOKENS" '
+      .model == $model
+      and (.choices | type) == "array" and (.choices | length) == 1
+      and .choices[0].finish_reason == "length"
+      and .choices[0].message.role == "assistant"
+      and (.choices[0].message.content | type) == "string"
+      and (.choices[0].message.content | length) > 0
+      and (.usage.prompt_tokens >= $min_prompt)
+      and (.usage.prompt_tokens <= $max_prompt)
+      and .usage.completion_tokens == $max_tokens
+      and .usage.total_tokens == (.usage.prompt_tokens + .usage.completion_tokens)
+      and (.x_hf2q_timing.decode_time_secs | type) == "number"
+      and .x_hf2q_timing.decode_time_secs > 0
+      and (.x_hf2q_timing.decode_tokens_per_sec | type) == "number"
+      and .x_hf2q_timing.decode_tokens_per_sec > 0
+      and (.x_hf2q_timing.total_time_secs | type) == "number"
+      and .x_hf2q_timing.total_time_secs > 0
+    ' "$short_response" >/dev/null
+  jq -S '{model,choices,usage}' "$short_response" >"$trial_dir/short-semantic.json"
+  short_prompt_tokens=$(jq -er '.usage.prompt_tokens' "$short_response")
+  short_completion_tokens=$(jq -er '.usage.completion_tokens' "$short_response")
+  short_decode_seconds=$(jq -er '.x_hf2q_timing.decode_time_secs' "$short_response")
+  short_decode_tps=$(jq -er '.x_hf2q_timing.decode_tokens_per_sec' "$short_response")
+  short_response_total_seconds=$(jq -er '.x_hf2q_timing.total_time_secs' "$short_response")
+  short_finish_reason=$(jq -er '.choices[0].finish_reason' "$short_response")
+  short_semantic_sha=$(sha256_file "$trial_dir/short-semantic.json")
+  awk -v wall="$short_wall_total_seconds" -v response="$short_response_total_seconds" \
+    -v tolerance="$MAX_WALL_TIMING_DELTA_SECONDS" '
+      BEGIN {
+        delta = wall - response
+        if (delta < 0) delta = -delta
+        exit !(wall > 0 && response > 0 && delta <= tolerance)
+      }
+    '
+  cp "$server_log" "$short_server_log"
+  [[ "$(rg -c 'Qwen35 decode complete' "$short_server_log")" == 1 ]]
+  short_decode_line=$(rg 'Qwen35 decode complete' "$short_server_log")
+  short_log_generated=$(sed -n 's/.*generated_tokens=\([^ ]*\).*/\1/p' <<<"$short_decode_line")
+  short_log_elapsed_ms=$(sed -n 's/.*elapsed_ms=\([^ ]*\).*/\1/p' <<<"$short_decode_line")
+  short_log_tps=$(sed -n 's/.*tokens_per_second=\([^ ]*\).*/\1/p' <<<"$short_decode_line")
+  [[ "$short_log_generated" == "$short_completion_tokens" ]]
+  [[ "$short_log_elapsed_ms" =~ ^[0-9]+([.][0-9]+)?$ ]]
+  [[ "$short_log_tps" =~ ^[0-9]+([.][0-9]+)?$ ]]
+  awk -v observed="$short_decode_tps" -v logged="$short_log_tps" \
+    'BEGIN { delta=observed-logged; if (delta<0) delta=-delta; exit !(delta <= 0.2) }'
+  if rg -Fq 'Qwen TQ-HB decode selected GQA-cooperative Q2 attention' \
+    "$short_server_log"; then
+    echo "Qwen3.8 short trial crossed into the GQA Q2 candidate" >&2
+    return 1
+  fi
 
   record_phase "$trial_index" "$mode" request-start
   curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 1800 \
@@ -312,8 +420,8 @@ run_trial() {
       }
     '
 
-  [[ "$(rg -c 'Qwen35 decode complete' "$server_log")" == 1 ]]
-  decode_line=$(rg 'Qwen35 decode complete' "$server_log")
+  [[ "$(rg -c 'Qwen35 decode complete' "$server_log")" == 2 ]]
+  decode_line=$(rg 'Qwen35 decode complete' "$server_log" | tail -n 1)
   log_generated=$(sed -n 's/.*generated_tokens=\([^ ]*\).*/\1/p' <<<"$decode_line")
   log_elapsed_ms=$(sed -n 's/.*elapsed_ms=\([^ ]*\).*/\1/p' <<<"$decode_line")
   log_tps=$(sed -n 's/.*tokens_per_second=\([^ ]*\).*/\1/p' <<<"$decode_line")
@@ -340,7 +448,9 @@ run_trial() {
   fi
 
   artifacts_json=$(
-    for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
+    for name in request.json response.json semantic.json curl.metrics server.log \
+      short-request.json short-response.json short-semantic.json short-curl.metrics \
+      short-server.log readyz.json models.json environment.txt settle.log; do
       jq -n --arg name "$name" --arg sha256 "$(sha256_file "$trial_dir/$name")" \
         '{name:$name,sha256:$sha256}'
     done | jq -s .
@@ -350,11 +460,20 @@ run_trial() {
     --arg binary_file_identity "$binary_identity" \
     --arg model_sha256 "$MODEL_SHA256" --arg model_file_identity "$model_identity" \
     --arg request_sha256 "$request_sha" --arg semantic_sha256 "$semantic_sha" \
+    --arg short_request_sha256 "$short_request_sha" \
+    --arg short_semantic_sha256 "$short_semantic_sha" \
     --arg finish_reason "$finish_reason" --argjson prompt_tokens "$prompt_tokens" \
     --argjson completion_tokens "$completion_tokens" \
     --argjson decode_seconds "$decode_seconds" --argjson decode_tps "$decode_tps" \
     --argjson response_total_seconds "$response_total_seconds" \
     --argjson wall_total_seconds "$wall_total_seconds" \
+    --arg short_finish_reason "$short_finish_reason" \
+    --argjson short_prompt_tokens "$short_prompt_tokens" \
+    --argjson short_completion_tokens "$short_completion_tokens" \
+    --argjson short_decode_seconds "$short_decode_seconds" \
+    --argjson short_decode_tps "$short_decode_tps" \
+    --argjson short_response_total_seconds "$short_response_total_seconds" \
+    --argjson short_wall_total_seconds "$short_wall_total_seconds" \
     --argjson artifacts "$artifacts_json" \
     '{index:$index,mode:$mode,status:$status,binary_sha256:$binary_sha256,
       binary_file_identity:$binary_file_identity,model_sha256:$model_sha256,
@@ -364,6 +483,13 @@ run_trial() {
       decode_seconds:$decode_seconds,decode_tokens_per_second:$decode_tps,
       response_total_seconds:$response_total_seconds,
       wall_total_seconds:$wall_total_seconds,
+      short:{request_sha256:$short_request_sha256,
+        semantic_sha256:$short_semantic_sha256,prompt_tokens:$short_prompt_tokens,
+        completion_tokens:$short_completion_tokens,finish_reason:$short_finish_reason,
+        decode_seconds:$short_decode_seconds,
+        decode_tokens_per_second:$short_decode_tps,
+        response_total_seconds:$short_response_total_seconds,
+        wall_total_seconds:$short_wall_total_seconds},
       artifacts:$artifacts}' >"$trial_dir/trial.json.tmp"
   mv "$trial_dir/trial.json.tmp" "$trial_dir/trial.json"
 }
@@ -382,15 +508,28 @@ off_a=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-1-off/trial.json")
 off_b=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-4-off/trial.json")
 auto_a=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-2-auto/trial.json")
 auto_b=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-3-auto/trial.json")
+short_off_a=$(jq -er .short.decode_tokens_per_second "$OUT_DIR/trial-1-off/trial.json")
+short_off_b=$(jq -er .short.decode_tokens_per_second "$OUT_DIR/trial-4-off/trial.json")
+short_auto_a=$(jq -er .short.decode_tokens_per_second "$OUT_DIR/trial-2-auto/trial.json")
+short_auto_b=$(jq -er .short.decode_tokens_per_second "$OUT_DIR/trial-3-auto/trial.json")
 off_mean=$(awk -v a="$off_a" -v b="$off_b" \
   'BEGIN { printf "%.6f", (a+b)/2 }')
 auto_mean=$(awk -v a="$auto_a" -v b="$auto_b" \
+  'BEGIN { printf "%.6f", (a+b)/2 }')
+short_off_mean=$(awk -v a="$short_off_a" -v b="$short_off_b" \
+  'BEGIN { printf "%.6f", (a+b)/2 }')
+short_auto_mean=$(awk -v a="$short_auto_a" -v b="$short_auto_b" \
   'BEGIN { printf "%.6f", (a+b)/2 }')
 off_spread_percent=$(awk -v a="$off_a" -v b="$off_b" -v mean="$off_mean" '
   BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
 auto_spread_percent=$(awk -v a="$auto_a" -v b="$auto_b" -v mean="$auto_mean" '
   BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
-for spread in "$off_spread_percent" "$auto_spread_percent"; do
+short_off_spread_percent=$(awk -v a="$short_off_a" -v b="$short_off_b" -v mean="$short_off_mean" '
+  BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
+short_auto_spread_percent=$(awk -v a="$short_auto_a" -v b="$short_auto_b" -v mean="$short_auto_mean" '
+  BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
+for spread in "$off_spread_percent" "$auto_spread_percent" \
+  "$short_off_spread_percent" "$short_auto_spread_percent"; do
   awk -v observed="$spread" -v maximum="$MAX_WITHIN_ARM_SPREAD_PERCENT" \
     'BEGIN { exit !(observed <= maximum) }' || {
       echo "Qwen3.8 within-arm decode spread ${spread}% exceeds ${MAX_WITHIN_ARM_SPREAD_PERCENT}%" >&2
@@ -399,9 +538,16 @@ for spread in "$off_spread_percent" "$auto_spread_percent"; do
 done
 improvement_percent=$(awk -v baseline="$off_mean" -v candidate="$auto_mean" \
   'BEGIN { if (baseline <= 0) exit 1; printf "%.6f", ((candidate / baseline) - 1) * 100 }')
+short_regression_percent=$(awk -v baseline="$short_off_mean" -v candidate="$short_auto_mean" \
+  'BEGIN { if (baseline <= 0) exit 1; printf "%.6f", (1 - (candidate / baseline)) * 100 }')
 awk -v observed="$improvement_percent" -v required="$MIN_IMPROVEMENT_PERCENT" \
   'BEGIN { exit !(observed >= required) }' || {
     echo "Qwen3.8 GQA Q2 improvement ${improvement_percent}% is below ${MIN_IMPROVEMENT_PERCENT}%" >&2
+    exit 1
+  }
+awk -v observed="$short_regression_percent" -v maximum="$MAX_SHORT_REGRESSION_PERCENT" \
+  'BEGIN { exit !(observed <= maximum) }' || {
+    echo "Qwen3.8 short-context regression ${short_regression_percent}% exceeds ${MAX_SHORT_REGRESSION_PERCENT}%" >&2
     exit 1
   }
 
@@ -420,11 +566,13 @@ awk -v baseline="$off_wall_mean" -v candidate="$auto_wall_mean" \
   }
 
 semantic_sha=$(jq -er .semantic_sha256 "$OUT_DIR/trial-1-off/trial.json")
+short_semantic_sha=$(jq -er .short.semantic_sha256 "$OUT_DIR/trial-1-off/trial.json")
 for trial in \
   "$OUT_DIR/trial-2-auto/trial.json" \
   "$OUT_DIR/trial-3-auto/trial.json" \
   "$OUT_DIR/trial-4-off/trial.json"; do
   test "$(jq -er .semantic_sha256 "$trial")" = "$semantic_sha"
+  test "$(jq -er .short.semantic_sha256 "$trial")" = "$short_semantic_sha"
 done
 
 "$script_dir/seal_release_binary.sh" --verify "$BINARY_PATH" "$BINARY_SHA256" \
@@ -442,18 +590,26 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --arg model_path "$MODEL_PATH" --arg model_sha256 "$MODEL_SHA256" \
   --arg model_file_identity "$model_identity" --argjson model_bytes "$model_bytes" \
   --arg prompt_sha256 "$prompt_sha" --argjson prompt_bytes "$prompt_bytes" \
+  --arg short_prompt_sha256 "$short_prompt_sha" \
+  --argjson short_prompt_bytes "$short_prompt_bytes" \
   --arg phase_sha256 "$phase_sha" --argjson phase_bytes "$phase_bytes" \
   --arg request_sha256 "$request_sha" --arg hardware_model "$hardware_model" \
+  --arg short_request_sha256 "$short_request_sha" \
   --arg hardware_chip "$hardware_chip" --arg hardware_arch "$hardware_arch" \
   --arg hardware_os "$hardware_os" --argjson hardware_memory_bytes "$hardware_memory_bytes" \
   --arg thermal_probe_path "$HF2Q_THERMAL_SWIFT_BIN" \
   --arg thermal_probe_sha256 "$thermal_probe_sha" \
   --argjson max_tokens "$MAX_TOKENS" \
+  --argjson short_max_tokens "$SHORT_MAX_TOKENS" \
   --argjson prompt_padding_tokens "$PROMPT_PADDING_TOKENS" \
+  --argjson short_prompt_padding_tokens "$SHORT_PROMPT_PADDING_TOKENS" \
   --argjson min_prompt_tokens "$MIN_PROMPT_TOKENS" \
   --argjson max_prompt_tokens "$MAX_PROMPT_TOKENS" \
+  --argjson min_short_prompt_tokens "$MIN_SHORT_PROMPT_TOKENS" \
+  --argjson max_short_prompt_tokens "$MAX_SHORT_PROMPT_TOKENS" \
   --argjson trial_settle_seconds "$TRIAL_SETTLE_SECONDS" \
   --argjson minimum_improvement_percent "$MIN_IMPROVEMENT_PERCENT" \
+  --argjson maximum_short_regression_percent "$MAX_SHORT_REGRESSION_PERCENT" \
   --argjson maximum_within_arm_spread_percent "$MAX_WITHIN_ARM_SPREAD_PERCENT" \
   --argjson maximum_wall_timing_delta_seconds "$MAX_WALL_TIMING_DELTA_SECONDS" \
   --argjson off_mean "$off_mean" --argjson auto_mean "$auto_mean" \
@@ -462,7 +618,13 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --argjson off_wall_mean "$off_wall_mean" \
   --argjson auto_wall_mean "$auto_wall_mean" \
   --argjson improvement_percent "$improvement_percent" \
+  --argjson short_off_mean "$short_off_mean" \
+  --argjson short_auto_mean "$short_auto_mean" \
+  --argjson short_off_spread_percent "$short_off_spread_percent" \
+  --argjson short_auto_spread_percent "$short_auto_spread_percent" \
+  --argjson short_regression_percent "$short_regression_percent" \
   --arg semantic_sha256 "$semantic_sha" \
+  --arg short_semantic_sha256 "$short_semantic_sha" \
   --slurpfile trial1 "$OUT_DIR/trial-1-off/trial.json" \
   --slurpfile trial2 "$OUT_DIR/trial-2-auto/trial.json" \
   --slurpfile trial3 "$OUT_DIR/trial-3-auto/trial.json" \
@@ -474,14 +636,21 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
         file_identity:$model_file_identity,bytes:$model_bytes},
       prompt:{path:"prompt.txt",sha256:$prompt_sha256,bytes:$prompt_bytes,
         padding_tokens:$prompt_padding_tokens},
+      short_prompt:{path:"short-prompt.txt",sha256:$short_prompt_sha256,
+        bytes:$short_prompt_bytes,padding_tokens:$short_prompt_padding_tokens},
       phase_log:{path:"phase.log",sha256:$phase_sha256,bytes:$phase_bytes},
       request:{path:"request.json",sha256:$request_sha256},
+      short_request:{path:"short-request.json",sha256:$short_request_sha256},
       hardware:{model:$hardware_model,chip:$hardware_chip,arch:$hardware_arch,
         memory_bytes:$hardware_memory_bytes,os_version:$hardware_os,
         thermal_probe:{path:$thermal_probe_path,sha256:$thermal_probe_sha256}}},
-    settings:{temperature:0,max_tokens:$max_tokens,stream:false,
+    settings:{temperature:0,max_tokens:$max_tokens,short_max_tokens:$short_max_tokens,
+      stream:false,
       thinking:false,repetition_penalty:1.0,min_prompt_tokens:$min_prompt_tokens,
-      max_prompt_tokens:$max_prompt_tokens,trial_settle_seconds:$trial_settle_seconds,
+      max_prompt_tokens:$max_prompt_tokens,
+      min_short_prompt_tokens:$min_short_prompt_tokens,
+      max_short_prompt_tokens:$max_short_prompt_tokens,
+      trial_settle_seconds:$trial_settle_seconds,
       maximum_within_arm_spread_percent:$maximum_within_arm_spread_percent,
       maximum_wall_timing_delta_seconds:$maximum_wall_timing_delta_seconds},
     trial_order:["off","auto","auto","off"],
@@ -494,7 +663,14 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
       auto_mean_wall_seconds:$auto_wall_mean,
       improvement_percent:$improvement_percent,
       minimum_improvement_percent:$minimum_improvement_percent,
-      exact_output_sha256:$semantic_sha256}}' >"$OUT_DIR/summary.json.tmp"
+      exact_output_sha256:$semantic_sha256,
+      short_off_mean_decode_tokens_per_second:$short_off_mean,
+      short_auto_mean_decode_tokens_per_second:$short_auto_mean,
+      short_off_within_arm_spread_percent:$short_off_spread_percent,
+      short_auto_within_arm_spread_percent:$short_auto_spread_percent,
+      short_regression_percent:$short_regression_percent,
+      maximum_short_regression_percent:$maximum_short_regression_percent,
+      short_exact_output_sha256:$short_semantic_sha256}}' >"$OUT_DIR/summary.json.tmp"
 mv "$OUT_DIR/summary.json.tmp" "$OUT_DIR/summary.json"
 printf '%s  summary.json\n' "$(sha256_file "$OUT_DIR/summary.json")" \
   >"$OUT_DIR/summary.json.sha256"

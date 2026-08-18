@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Emit authoritative, exactly-once Qwen SlotAware decode-complete telemetry so
   the long-context receipt cannot accept response timing detached from the
-  engine path that generated it; cancelled requests never publish success.
+  engine path that generated it; requests with a detected client cancellation
+  never publish success.
 - Update `h2` to 0.4.16 to resolve RUSTSEC-2026-0258 and keep the exact-source
   security rebuild inside the release gate.
 - Upgrade the direct `indicatif` dependency to 0.18.4, removing the

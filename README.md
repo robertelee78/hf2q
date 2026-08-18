@@ -486,7 +486,7 @@ gates from a clean hf2q package resolving published `mlx-native 0.10.9`:
   family artifacts on a 128 GiB host.
 - `scripts/run_agentic_cache_release_gate.sh` is the release wrapper used by
   the manual `Cache lifecycle` workflow. It packages the exact main commit,
-  runs DeepSeek, Gemma, Qwen, and the Qwen3.8 long-decode discriminator
+  runs DeepSeek, Gemma, Qwen, and the Qwen3.8 short/long decode discriminator
   sequentially under continuous AC and
   `caffeinate` guards, verifies each GGUF against a protected SHA-256, and
   emits a source/crate/binary/model-bound manifest that the publication
