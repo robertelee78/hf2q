@@ -80,8 +80,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       prepared-version, installer, or CLI authority
 │   └── prepared_release/ bounded classic-ZIP structural/profile validation,
 │                       canonical embedded-manifest and exact payload binding,
-│                       plus shared-lock inert extraction; no codesign,
-│                       prepared-version, publication, or CLI authority
+│                       shared-lock inert extraction, and a filesystem-free
+│                       strict thin-arm64 Mach-O profile parser; no native
+│                       codesign, prepared-version, publication, or CLI authority
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -598,6 +599,12 @@ harness leans on three patterns:
    anonymous archive descriptor is revalidated on both sides. The sealed result
    remains inert and grants no path/FD, codesign, mode normalization,
    prepared-version publication, activation, installer, or CLI authority.
+   The same private boundary contains a dormant filesystem-free bounded read-at
+   validator for the exact thin arm64-ALL `MH_EXECUTE`/modern-dyld profile. It
+   proves segment, section, link-edit, entry-point, deployment, and terminal
+   code-signature structure but grants no native-signature or prepared-version
+   authority. Descriptor-relative acquisition and native Security.framework
+   validation remain in the next retained-lock transaction.
    The schema boundary now defines installed-version marker v2 and a narrow
    first-standalone record builder. Marker v2 carries the exact metadata-role
    versions needed to regenerate the same install-receipt-v1 transition after
