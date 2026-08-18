@@ -656,22 +656,38 @@ fn read_token_file(path: &std::path::Path) -> Option<String> {
 /// 3. `XDG_CACHE_HOME` env var + `/huggingface/hub`
 /// 4. `~/.cache/huggingface/hub`
 fn resolve_hf_cache_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("HF_HUB_CACHE") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    let hf_hub_cache = std::env::var("HF_HUB_CACHE").ok();
+    let hf_home = std::env::var("HF_HOME").ok();
+    let xdg_cache_home = std::env::var("XDG_CACHE_HOME").ok();
+    let home = home_dir();
+    resolve_hf_cache_dir_from_inputs(
+        hf_hub_cache.as_deref(),
+        hf_home.as_deref(),
+        xdg_cache_home.as_deref(),
+        home.as_deref(),
+    )
+}
+
+/// Pure cache-path resolver used by the production environment wrapper and
+/// deterministic tests. Keeping process-global environment access outside
+/// this function prevents parallel unit tests from changing one another's
+/// inputs.
+fn resolve_hf_cache_dir_from_inputs(
+    hf_hub_cache: Option<&str>,
+    hf_home: Option<&str>,
+    xdg_cache_home: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(value) = hf_hub_cache.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
     }
-    if let Ok(v) = std::env::var("HF_HOME") {
-        if !v.is_empty() {
-            return PathBuf::from(v).join("hub");
-        }
+    if let Some(value) = hf_home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value).join("hub");
     }
-    if let Ok(v) = std::env::var("XDG_CACHE_HOME") {
-        if !v.is_empty() {
-            return PathBuf::from(v).join("huggingface").join("hub");
-        }
+    if let Some(value) = xdg_cache_home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value).join("huggingface").join("hub");
     }
-    home_dir()
+    home.map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
         .join(".cache")
         .join("huggingface")
@@ -916,26 +932,47 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_hf_cache_dir_uses_env_override() {
-        let original = std::env::var("HF_HUB_CACHE").ok();
-        std::env::set_var("HF_HUB_CACHE", "/custom/cache");
-        let dir = resolve_hf_cache_dir();
-        assert_eq!(dir, std::path::PathBuf::from("/custom/cache"));
-        match original {
-            Some(v) => std::env::set_var("HF_HUB_CACHE", v),
-            None => std::env::remove_var("HF_HUB_CACHE"),
-        }
+    fn test_resolve_hf_cache_dir_input_precedence() {
+        let home = std::path::Path::new("/home/tester");
+        assert_eq!(
+            resolve_hf_cache_dir_from_inputs(
+                Some("/hub-cache"),
+                Some("/hf-home"),
+                Some("/xdg-cache"),
+                Some(home),
+            ),
+            std::path::PathBuf::from("/hub-cache")
+        );
+        assert_eq!(
+            resolve_hf_cache_dir_from_inputs(
+                Some(""),
+                Some("/hf-home"),
+                Some("/xdg-cache"),
+                Some(home),
+            ),
+            std::path::PathBuf::from("/hf-home/hub")
+        );
+        assert_eq!(
+            resolve_hf_cache_dir_from_inputs(None, None, Some("/xdg-cache"), Some(home)),
+            std::path::PathBuf::from("/xdg-cache/huggingface/hub")
+        );
     }
 
     #[test]
-    fn test_resolve_hf_cache_dir_returns_path() {
-        // With no special env vars, should return something rooted under home.
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
-        let dir = resolve_hf_cache_dir();
-        assert!(dir.to_str().is_some());
-        assert!(dir.ends_with("hub") || dir.to_str().unwrap().contains("huggingface"));
+    fn test_resolve_hf_cache_dir_fallbacks_are_deterministic() {
+        assert_eq!(
+            resolve_hf_cache_dir_from_inputs(
+                None,
+                Some(""),
+                Some(""),
+                Some(std::path::Path::new("/home/tester")),
+            ),
+            std::path::PathBuf::from("/home/tester/.cache/huggingface/hub")
+        );
+        assert_eq!(
+            resolve_hf_cache_dir_from_inputs(None, None, None, None),
+            std::path::PathBuf::from("/.cache/huggingface/hub")
+        );
     }
 
     #[test]

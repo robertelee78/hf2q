@@ -200,6 +200,27 @@ tool-result wall-clock threshold by 732 ms while satisfying the semantic
 assertions; the recorded passing rerun used a 15-second threshold. This is a
 remaining latency measurement, not a cache or tool-correctness failure.
 
+Canonical launcher-default OpenCode receipt (2026-08-17, Apple M5 Max):
+
+- release binary SHA-256:
+  `b8853d6b13f80e6657965ac817cffe4c9de9d2b6b55ea708b690cb21436d2ae1`;
+- the live process started after that artifact was built and carried
+  `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET=2048`;
+- stock OpenCode 1.18.18 requested an 8,192-token completion without its own
+  explicit thinking-budget field;
+- the decisive cached tool turn recorded 17,802 cached plus 1,547 input
+  tokens, 2,055 reasoning tokens (the 2,048-token allowance plus the forced
+  transition), 59 output tokens, and `finish=tool-calls`;
+- the immediate continuation recorded 19,344 cached plus 3,643 input tokens,
+  25 reasoning tokens, 61 output tokens, and `finish=tool-calls`;
+- server counters advanced from six of seven to eight of eight completed
+  requests with zero SSE cancellations.
+
+This closes the exact launcher-default path that the earlier 64-token explicit
+budget gate did not cover. The operator UI's `generated N / 8192 budget` is the
+total completion allowance, not the effective reasoning allowance; a separate
+reasoning-cap field remains a useful UI follow-up.
+
 `cargo test --locked` passed the complete hosted-safe suite. The first umbrella
 run exposed that two `cache_clear` tests require the release binary at their
 documented fallback path; after `cargo build --release --locked`, the exact
