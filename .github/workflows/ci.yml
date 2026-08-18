@@ -147,6 +147,9 @@ jobs:
             scripts/verify_macos_thermal_receipt.sh \
             scripts/verify_gemma4_wave_thermal_receipt.sh \
             scripts/verify_gemma4_parity_receipt.sh \
+            scripts/qwen38_long_decode_ab.sh \
+            scripts/verify_qwen38_long_decode_receipt.sh \
+            scripts/test_qwen38_long_decode_receipt_contract.sh \
             scripts/test_macos_thermal_guard_contract.sh \
             scripts/test_gemma4_wave_thermal_contract.sh \
             scripts/test_gemma4_eight_slot_receipt_contract.sh \
@@ -168,6 +171,7 @@ jobs:
           bash scripts/test_macos_thermal_guard_contract.sh
           bash scripts/test_gemma4_wave_thermal_contract.sh
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
+          bash scripts/test_qwen38_long_decode_receipt_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh

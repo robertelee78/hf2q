@@ -35,6 +35,7 @@ jobs:
       EXPECTED_DEEPSEEK_MODEL_SHA256: ${{ vars.DEEPSEEK4_MODEL_SHA256 }}
       EXPECTED_GEMMA_MODEL_SHA256: ${{ vars.GEMMA4_MODEL_SHA256 }}
       EXPECTED_QWEN_MODEL_SHA256: ${{ vars.QWEN36_MODEL_SHA256 }}
+      EXPECTED_QWEN38_MODEL_SHA256: ${{ vars.QWEN38_MODEL_SHA256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -167,10 +168,17 @@ jobs:
           check_receipt qwen/cancellation/cancellation-summary.json '.receipt_sha256.qwen.cancellation'
           qwen36_validate_cancellation_transaction_counts \
             "$gate_dir/qwen/cancellation/cancellation-summary.json"
+          check_receipt qwen38/long-decode/receipt.json '.receipt_sha256.qwen38.long_decode'
+          bash scripts/verify_qwen38_long_decode_receipt.sh release \
+            "$gate_dir/qwen38/long-decode" "$EXPECTED_SHA" \
+            "$(jq -er .crate_sha256 "$manifest")" \
+            "$(jq -er .binary_sha256 "$manifest")" \
+            "$EXPECTED_QWEN38_MODEL_SHA256"
           for digest in \
             "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
             "$EXPECTED_GEMMA_MODEL_SHA256" \
-            "$EXPECTED_QWEN_MODEL_SHA256"; do
+            "$EXPECTED_QWEN_MODEL_SHA256" \
+            "$EXPECTED_QWEN38_MODEL_SHA256"; do
             [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           done
           jq -e \
@@ -178,6 +186,7 @@ jobs:
             --arg deepseek_sha "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
             --arg gemma_sha "$EXPECTED_GEMMA_MODEL_SHA256" \
             --arg qwen_sha "$EXPECTED_QWEN_MODEL_SHA256" \
+            --arg qwen38_sha "$EXPECTED_QWEN38_MODEL_SHA256" \
             '. as $root
              | .status == "pass"
              and .source_sha == $source_sha
@@ -187,6 +196,7 @@ jobs:
              and .models.deepseek.sha256 == $deepseek_sha
              and .models.gemma.sha256 == $gemma_sha
              and .models.qwen.sha256 == $qwen_sha
+             and .models.qwen38.sha256 == $qwen38_sha
              and (.families.deepseek as $d
                | $d.status == "pass"
                and $d.lifecycle.status == "pass"
@@ -488,7 +498,23 @@ jobs:
                and $q.cancellation.chunks_after_cancel == $q.cancellation.chunks_after_stability
                and $q.cancellation.pre_tiny_ready_http == 200
                and $q.cancellation.ready_http == 200
-               and $q.cancellation.power_event_delta == 0)' \
+               and $q.cancellation.power_event_delta == 0)
+             and (.families.qwen38 as $q38
+               | $q38.status == "pass"
+               and $q38.long_decode.schema_version == 1
+               and $q38.long_decode.status == "pass"
+               and $q38.long_decode.benchmark.status == "pass"
+               and $q38.long_decode.benchmark.identity.source_sha == $source_sha
+               and $q38.long_decode.benchmark.identity.crate_sha256 == $root.crate_sha256
+               and $q38.long_decode.benchmark.identity.binary.sha256 == $root.binary_sha256
+               and $q38.long_decode.benchmark.identity.model.sha256 == $qwen38_sha
+               and $q38.long_decode.benchmark.trial_order == ["off","auto","auto","off"]
+               and $q38.long_decode.benchmark.settings.temperature == 0
+               and ($q38.long_decode.benchmark.settings | has("seed") | not)
+               and $q38.long_decode.benchmark.aggregate.improvement_percent >= 15
+               and $q38.long_decode.thermal.status == "pass"
+               and $q38.long_decode.thermal.required_state == "nominal"
+               and $q38.long_decode.thermal.measurement_scope == "full-abba-benchmark")' \
             "$manifest" >/dev/null
           expected_crate_sha=$(jq -er '.crate_sha256' "$manifest")
           [[ "$expected_crate_sha" =~ ^[0-9a-f]{64}$ ]]
@@ -559,6 +585,9 @@ jobs:
               scripts/verify_macos_thermal_receipt.sh \
               scripts/verify_gemma4_wave_thermal_receipt.sh \
               scripts/verify_gemma4_parity_receipt.sh \
+              scripts/qwen38_long_decode_ab.sh \
+              scripts/verify_qwen38_long_decode_receipt.sh \
+              scripts/test_qwen38_long_decode_receipt_contract.sh \
               scripts/test_macos_thermal_guard_contract.sh \
               scripts/test_gemma4_wave_thermal_contract.sh \
               scripts/test_gemma4_eight_slot_receipt_contract.sh \
@@ -580,6 +609,7 @@ jobs:
             bash scripts/test_macos_thermal_guard_contract.sh
             bash scripts/test_gemma4_wave_thermal_contract.sh
             bash scripts/test_gemma4_eight_slot_receipt_contract.sh
+            bash scripts/test_qwen38_long_decode_receipt_contract.sh
             bash scripts/test_release_binary_seal_contract.sh
             bash scripts/test_release_tag_recovery_contract.sh
             bash scripts/test_gemma4_long_short_overlap_contract.sh
