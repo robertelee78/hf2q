@@ -60,11 +60,15 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
 ├── src/distribution/   ADR-045 release/install bounded context
 │   ├── schema/         strict bounded manifest, receipt, marker schemas
-│   └── install_state/  shared descriptor-relative installation lock,
+│   ├── install_state/  shared descriptor-relative installation lock,
 │       ├── metadata/   canonical crash-durable update-metadata journal;
 │       │                stored bytes are not cryptographic authority
-│       └── …           sequence-one activation; all internal until the
-│                       production signed-update verifier exists
+│       └── …           sequence-one activation and bounded restart cleanup
+│   └── update_auth/    transport-free strict TUF profile, one-use request
+│                       tokens, historical replay floors, sealed advancing
+│                       commit guard, and durable metadata-baseline proof;
+│                       all internal until the real root, transport, and
+│                       application release binding exist
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -539,6 +543,15 @@ harness leans on three patterns:
    and crash-durable journal hypotheses without adding either candidate to the
    production dependency graph or published crate. Its wire types grant no
    production authority.
+5. **Production signed-metadata boundary.** `distribution/update_auth/` uses
+   only `sigstore-tuf::TrustedMetadataSet` behind hf2q's strict bounded profile;
+   the stock fetcher, updater, and store are absent. A retained Python-TUF
+   corpus, generated with canonical key IDs and a fully hashed dependency lock,
+   proves cross-implementation root rotation and lower-role authentication.
+   The production module owns no URL, HTTP, target lookup, archive, activation,
+   installer, or CLI authority. Fresh-process recovery repairs the selected
+   rollback floor, crash-durably discards only the derived exact unselected
+   write prefix, and requires a wholly fresh transcript.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.

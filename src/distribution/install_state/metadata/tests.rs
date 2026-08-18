@@ -10,6 +10,7 @@ use crate::distribution::install_state::locked::LockedInstallation;
 use crate::distribution::install_state::metadata::journal::{
     cleanup_selected_with_hook_for_test, commit_candidate_for_test,
     commit_candidate_with_hook_for_test, commit_candidate_with_precommit_hook_for_test,
+    discard_unselected_for_test, discard_unselected_with_hook_for_test,
     hold_metadata_lock_for_test, read_selected, Barrier, FaultPlan,
 };
 use crate::distribution::install_state::ExplicitRootAuthorization;
@@ -19,11 +20,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn role(name: &str, version: u64, marker: &str) -> ExactMetadataRole {
-    ExactMetadataRole {
-        request_name: name.to_owned(),
+    ExactMetadataRole::for_test(
+        name,
         version,
-        bytes: format!("{{\"signed\":\"{marker}\"}}").into_bytes().into(),
-    }
+        format!("{{\"signed\":\"{marker}\"}}").into_bytes(),
+    )
 }
 
 fn candidate(
@@ -40,32 +41,30 @@ fn candidate(
             &format!("root-{version}"),
         ));
     }
-    VerifiedMetadataCandidate {
-        installation_id: "7c907c7a-3125-4a40-a8b3-1c125080e46a".to_owned(),
-        state_root: "/Users/example/.hf2q".to_owned(),
-        repository_id: "hf2q".to_owned(),
-        channel: "stable".to_owned(),
-        verification_started_at: started.parse().expect("valid start"),
-        verification_completed_at: completed.parse().expect("valid completion"),
-        anchor_root: role("1.root.json", 1, "root-1"),
-        trusted_root: role(
+    VerifiedMetadataCandidate::for_test(
+        "7c907c7a-3125-4a40-a8b3-1c125080e46a".to_owned(),
+        "/Users/example/.hf2q".to_owned(),
+        started.parse().expect("valid start"),
+        completed.parse().expect("valid completion"),
+        role("1.root.json", 1, "root-1"),
+        root_chain,
+        role(
             &format!("{root_version}.root.json"),
             root_version,
             &format!("root-{root_version}"),
         ),
-        root_chain,
-        timestamp: role("timestamp.json", timestamp_version, "timestamp"),
-        snapshot: role(
+        role("timestamp.json", timestamp_version, "timestamp"),
+        role(
             &format!("{timestamp_version}.snapshot.json"),
             timestamp_version,
             "snapshot",
         ),
-        targets: role(
+        role(
             &format!("{timestamp_version}.targets.json"),
             timestamp_version,
             "targets",
         ),
-    }
+    )
 }
 
 fn candidate_at(
@@ -76,7 +75,7 @@ fn candidate_at(
     timestamp_version: u64,
 ) -> VerifiedMetadataCandidate {
     let mut candidate = candidate(started, completed, root_version, timestamp_version);
-    candidate.state_root = root.to_str().expect("UTF-8 root").to_owned();
+    candidate.set_state_root_for_test(root.to_str().expect("UTF-8 root"));
     candidate
 }
 
@@ -129,6 +128,24 @@ fn prune_entry_barriers(root_history_entries: usize) -> impl Iterator<Item = Bar
     (1..=root_history_entries + 7).map(Barrier::PredecessorPruneEntryRemoval)
 }
 
+fn successor_discard_barriers(root_history_entries: usize) -> Vec<Barrier> {
+    let mut barriers = vec![
+        Barrier::SuccessorDiscardSelector,
+        Barrier::SuccessorDiscardRename,
+    ];
+    // Reverse removal visits six fixed files, each root-history file, and the
+    // root-chain directory before removing the pending generation itself.
+    barriers.extend((1..=root_history_entries + 7).map(Barrier::SuccessorDiscardEntryRemoval));
+    barriers.push(Barrier::SuccessorDiscardDirectory);
+    barriers.push(Barrier::SuccessorDiscardGenerationsSync);
+    barriers.push(Barrier::SuccessorDiscardMetadataSync);
+    barriers.push(Barrier::SuccessorDiscardUpdateSync);
+    barriers.push(Barrier::SuccessorDiscardRootSync);
+    barriers.push(Barrier::SuccessorDiscardFullSync);
+    barriers
+}
+
 mod journal_cases;
 mod process_cases;
+mod recovery_cases;
 mod schema_cases;

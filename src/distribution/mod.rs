@@ -5,8 +5,10 @@
 //! not authenticate bytes, establish package ownership, or authorize a
 //! filesystem mutation.
 
-// This is intentionally unreachable from production dispatch until the
-// signed-update adapter can construct its authenticated input capability.
+// This is intentionally unreachable from production dispatch until the real
+// trust root, bounded transport, and application release binding exist.
 #[allow(dead_code)]
 pub(crate) mod install_state;
 pub mod schema;
+#[allow(dead_code)]
+mod update_auth;

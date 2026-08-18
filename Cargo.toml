@@ -195,6 +195,12 @@ hex = "0.4"
 # instant, including subsecond precision, as a monotonic restart clock floor.
 jiff = { version = "0.2", features = ["serde"] }
 
+# ADR-045: only the transport-free trusted-metadata state machine is used.
+# hf2q deliberately does not enable sigstore-tuf's fetch/HTTP/store features;
+# request sequencing, exact-byte capture, rollback floors, and persistence are
+# owned by the distribution bounded context.
+sigstore-tuf = { version = "=0.11.0", default-features = false }
+
 # ADR-005 Phase 2c T1.4: HTTPS image URL fetch in vision/mod.rs.
 # Promoted from dev-dep (where it served only E2E streaming tests) to runtime
 # dep to support `fetch_https_image`. The `blocking` feature pulls reqwest's
@@ -204,6 +210,11 @@ jiff = { version = "0.2", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [dev-dependencies]
+# Deterministic Ed25519 fixture signing for the production TUF verifier's
+# hostile/root-rotation corpus. This exact crate is already a transitive
+# verifier dependency; tests promote it only to build independently signed
+# metadata rather than relying on sigstore-tuf's own test helpers.
+aws-lc-rs = "=1.18.0"
 assert_cmd = "2"
 predicates = "3"
 criterion = "0.5"

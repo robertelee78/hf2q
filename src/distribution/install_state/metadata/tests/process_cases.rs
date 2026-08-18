@@ -116,6 +116,81 @@ fn process_abort_at_every_multi_root_cleanup_prefix_is_recoverable() {
 }
 
 #[test]
+fn process_abort_at_every_successor_discard_barrier_is_recoverable() {
+    for barrier in successor_discard_barriers(1) {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = test_root(&parent);
+        assert!(commit_candidate_for_test(
+            authorization(&root),
+            candidate_at(&root, "2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 2, 3,),
+            FaultPlan {
+                barrier: Some(Barrier::MetadataPrecommitSync),
+            },
+        )
+        .is_err());
+
+        let mut child = spawn_discard_crash_worker(&root, 1, barrier);
+        let status = child.wait().expect("wait for discard crash worker");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGABRT),
+            "discard barrier {barrier:?} must abort with SIGABRT"
+        );
+        discard_unselected_for_test(authorization(&root), FaultPlan::default())
+            .unwrap_or_else(|error| panic!("restart after discard {barrier:?}: {error}"));
+        assert!(read_selected(&authorization(&root))
+            .expect("ordinary reader recovers after discard crash")
+            .is_none());
+    }
+}
+
+#[test]
+fn process_abort_discarding_a_successor_preserves_the_selected_floor() {
+    for barrier in successor_discard_barriers(2) {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = test_root(&parent);
+        commit_candidate_for_test(
+            authorization(&root),
+            candidate_at(&root, "2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 2, 3),
+            FaultPlan::default(),
+        )
+        .expect("commit discard predecessor");
+        let selected_selector =
+            std::fs::read(root.join("update/metadata/current.json")).expect("selected selector");
+        assert!(commit_candidate_for_test(
+            authorization(&root),
+            candidate_at(&root, "2026-08-17T20:00:01Z", "2026-08-17T20:00:02Z", 3, 4,),
+            FaultPlan {
+                barrier: Some(Barrier::MetadataPrecommitSync),
+            },
+        )
+        .is_err());
+
+        let mut child = spawn_discard_crash_worker(&root, 2, barrier);
+        let status = child.wait().expect("wait for successor discard worker");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGABRT),
+            "successor discard barrier {barrier:?} must abort"
+        );
+        discard_unselected_for_test(authorization(&root), FaultPlan::default())
+            .unwrap_or_else(|error| panic!("restart successor discard after {barrier:?}: {error}"));
+        assert_eq!(
+            std::fs::read(root.join("update/metadata/current.json"))
+                .expect("selected floor survives"),
+            selected_selector,
+        );
+        assert_eq!(
+            read_selected(&authorization(&root))
+                .expect("selected floor reads")
+                .expect("selected floor exists")
+                .sequence,
+            1
+        );
+    }
+}
+
+#[test]
 fn metadata_crash_worker_process() {
     let Some(root) = std::env::var_os("HF2Q_METADATA_CRASH_ROOT") else {
         return;
@@ -128,6 +203,15 @@ fn metadata_crash_worker_process() {
         Barrier::parse(&std::env::var("HF2Q_METADATA_CRASH_BARRIER").expect("crash barrier"))
             .expect("known crash barrier");
     let root = Path::new(&root);
+    if std::env::var_os("HF2Q_METADATA_DISCARD_MODE").is_some() {
+        let _ = discard_unselected_for_test(
+            authorization(root),
+            FaultPlan {
+                barrier: Some(barrier),
+            },
+        );
+        return;
+    }
     let (started, completed, default_root_version, default_timestamp_version) = if sequence == 1 {
         ("2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 2, 3)
     } else {
@@ -148,6 +232,22 @@ fn metadata_crash_worker_process() {
             barrier: Some(barrier),
         },
     );
+}
+
+fn spawn_discard_crash_worker(root: &Path, sequence: u64, barrier: Barrier) -> std::process::Child {
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .arg("--exact")
+        .arg("distribution::install_state::metadata::tests::process_cases::metadata_crash_worker_process")
+        .arg("--nocapture")
+        .env("HF2Q_METADATA_CRASH_ROOT", root)
+        .env("HF2Q_METADATA_CRASH_SEQUENCE", sequence.to_string())
+        .env("HF2Q_METADATA_CRASH_BARRIER", barrier.name())
+        .env("HF2Q_METADATA_DISCARD_MODE", "1")
+        .env("HF2Q_METADATA_ABORT_ON_FAULT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().expect("spawn discard crash worker")
 }
 
 #[test]

@@ -14,7 +14,7 @@ use crate::distribution::install_state::file;
 use crate::distribution::install_state::unix::{self, Directory};
 use crate::distribution::install_state::InstallStateError;
 
-pub(in crate::distribution::install_state::metadata) fn read_selected(
+pub(in crate::distribution) fn read_selected(
     authorization: &MetadataStateAuthorization,
 ) -> Result<Option<StoredMetadataGeneration>, MetadataJournalError> {
     let root = match unix::open_existing_root(&authorization.root.path) {
@@ -68,18 +68,18 @@ pub(super) fn write_generation(
     receipt: &[u8],
 ) -> Result<(), MetadataJournalError> {
     let root_chain = unix::ensure_private_directory(directory, "root-chain")?;
-    for root in &candidate.root_chain {
-        let name = format!("{:020}.root.json", root.version);
-        let file = file::write_or_resume_private_file(&root_chain, &name, &root.bytes)?;
+    for root in candidate.root_chain() {
+        let name = format!("{:020}.root.json", root.version());
+        let file = file::write_or_resume_private_file(&root_chain, &name, root.bytes())?;
         unix::full_sync_file(&file)?;
     }
     unix::sync_directory(&root_chain)?;
     for (name, bytes) in [
-        ("anchor-root.json", candidate.anchor_root.bytes.as_ref()),
-        ("trusted-root.json", candidate.trusted_root.bytes.as_ref()),
-        ("timestamp.json", candidate.timestamp.bytes.as_ref()),
-        ("snapshot.json", candidate.snapshot.bytes.as_ref()),
-        ("targets.json", candidate.targets.bytes.as_ref()),
+        ("anchor-root.json", candidate.anchor_root().bytes()),
+        ("trusted-root.json", candidate.trusted_root().bytes()),
+        ("timestamp.json", candidate.timestamp().bytes()),
+        ("snapshot.json", candidate.snapshot().bytes()),
+        ("targets.json", candidate.targets().bytes()),
         ("generation.json", receipt),
     ] {
         let file = file::write_or_resume_private_file(directory, name, bytes)?;
@@ -180,7 +180,7 @@ pub(super) fn read_selector_with_mode(
     Ok(selector)
 }
 
-fn read_selected_with_mode(
+pub(super) fn read_selected_with_mode(
     metadata: &Directory,
     generations: &Directory,
     mode: HistoryMode,
@@ -286,9 +286,6 @@ fn verify_history(
             true,
         )?)?;
     }
-    if has_pending_selector {
-        let _ = file::read_regular_file(metadata, &pending_selector, 0o600, MAX_SELECTOR_BYTES)?;
-    }
     if let Some(selector) = selector {
         let receipt = read_receipt(generations, selector)?;
         let selected = unix::open_directory_at(
@@ -312,6 +309,18 @@ fn verify_history(
         if let Some(selected) = selector {
             let prior = read_receipt(generations, selected)?;
             successor_receipt.validate_successor(&prior, selected.generation_sha256())?;
+        }
+        if has_pending_selector {
+            let (_, bytes, _) =
+                file::read_regular_file(metadata, &pending_selector, 0o600, MAX_SELECTOR_BYTES)?;
+            let staged = MetadataSelectorV1::parse(&bytes)?;
+            if staged.sequence() != next
+                || staged.generation_sha256() != successor_receipt.digest()?
+            {
+                return Err(MetadataJournalError::Invalid(
+                    "pending metadata selector does not bind its successor",
+                ));
+            }
         }
     }
     Ok(())

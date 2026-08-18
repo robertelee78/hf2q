@@ -2,7 +2,7 @@ use super::super::MetadataJournalError;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::distribution::install_state::metadata) enum Barrier {
+pub(in crate::distribution) enum Barrier {
     PendingDirectory,
     GenerationFiles,
     GenerationPublish,
@@ -19,11 +19,20 @@ pub(in crate::distribution::install_state::metadata) enum Barrier {
     PredecessorPruneEntryRemoval(usize),
     PredecessorPruneRemoval,
     PredecessorPruneFullSync,
+    SuccessorDiscardSelector,
+    SuccessorDiscardRename,
+    SuccessorDiscardEntryRemoval(usize),
+    SuccessorDiscardDirectory,
+    SuccessorDiscardGenerationsSync,
+    SuccessorDiscardMetadataSync,
+    SuccessorDiscardUpdateSync,
+    SuccessorDiscardRootSync,
+    SuccessorDiscardFullSync,
 }
 
 #[cfg(test)]
 impl Barrier {
-    pub(in crate::distribution::install_state::metadata) fn name(self) -> String {
+    pub(in crate::distribution) fn name(self) -> String {
         match self {
             Self::PendingDirectory => "pending-directory".to_owned(),
             Self::GenerationFiles => "generation-files".to_owned(),
@@ -43,10 +52,23 @@ impl Barrier {
             }
             Self::PredecessorPruneRemoval => "predecessor-prune-removal".to_owned(),
             Self::PredecessorPruneFullSync => "predecessor-prune-full-sync".to_owned(),
+            Self::SuccessorDiscardSelector => "successor-discard-selector".to_owned(),
+            Self::SuccessorDiscardRename => "successor-discard-rename".to_owned(),
+            Self::SuccessorDiscardEntryRemoval(step) => {
+                format!("successor-discard-entry-{step}")
+            }
+            Self::SuccessorDiscardDirectory => "successor-discard-directory".to_owned(),
+            Self::SuccessorDiscardGenerationsSync => {
+                "successor-discard-generations-sync".to_owned()
+            }
+            Self::SuccessorDiscardMetadataSync => "successor-discard-metadata-sync".to_owned(),
+            Self::SuccessorDiscardUpdateSync => "successor-discard-update-sync".to_owned(),
+            Self::SuccessorDiscardRootSync => "successor-discard-root-sync".to_owned(),
+            Self::SuccessorDiscardFullSync => "successor-discard-full-sync".to_owned(),
         }
     }
 
-    pub(in crate::distribution::install_state::metadata) fn parse(value: &str) -> Option<Self> {
+    pub(in crate::distribution) fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "pending-directory" => Self::PendingDirectory,
             "generation-files" => Self::GenerationFiles,
@@ -63,20 +85,33 @@ impl Barrier {
             "predecessor-prune-rename" => Self::PredecessorPruneRename,
             "predecessor-prune-removal" => Self::PredecessorPruneRemoval,
             "predecessor-prune-full-sync" => Self::PredecessorPruneFullSync,
+            "successor-discard-selector" => Self::SuccessorDiscardSelector,
+            "successor-discard-rename" => Self::SuccessorDiscardRename,
+            "successor-discard-directory" => Self::SuccessorDiscardDirectory,
+            "successor-discard-generations-sync" => Self::SuccessorDiscardGenerationsSync,
+            "successor-discard-metadata-sync" => Self::SuccessorDiscardMetadataSync,
+            "successor-discard-update-sync" => Self::SuccessorDiscardUpdateSync,
+            "successor-discard-root-sync" => Self::SuccessorDiscardRootSync,
+            "successor-discard-full-sync" => Self::SuccessorDiscardFullSync,
             _ => {
-                let step = value
-                    .strip_prefix("predecessor-prune-entry-")?
-                    .parse()
-                    .ok()?;
-                Self::PredecessorPruneEntryRemoval(step)
+                if let Some(step) = value.strip_prefix("predecessor-prune-entry-") {
+                    Self::PredecessorPruneEntryRemoval(step.parse().ok()?)
+                } else {
+                    Self::SuccessorDiscardEntryRemoval(
+                        value
+                            .strip_prefix("successor-discard-entry-")?
+                            .parse()
+                            .ok()?,
+                    )
+                }
             }
         })
     }
 }
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
-pub(in crate::distribution::install_state::metadata) struct FaultPlan {
-    pub(in crate::distribution::install_state::metadata) barrier: Option<Barrier>,
+pub(in crate::distribution) struct FaultPlan {
+    pub(in crate::distribution) barrier: Option<Barrier>,
 }
 
 #[cfg(not(test))]
@@ -124,6 +159,15 @@ pub(super) enum TestBarrier {
     PredecessorPruneEntryRemoval(usize),
     PredecessorPruneRemoval,
     PredecessorPruneFullSync,
+    SuccessorDiscardSelector,
+    SuccessorDiscardRename,
+    SuccessorDiscardEntryRemoval(usize),
+    SuccessorDiscardDirectory,
+    SuccessorDiscardGenerationsSync,
+    SuccessorDiscardMetadataSync,
+    SuccessorDiscardUpdateSync,
+    SuccessorDiscardRootSync,
+    SuccessorDiscardFullSync,
 }
 
 #[cfg(not(test))]
@@ -145,6 +189,15 @@ pub(super) enum TestBarrier {
     PredecessorPruneEntryRemoval(usize),
     PredecessorPruneRemoval,
     PredecessorPruneFullSync,
+    SuccessorDiscardSelector,
+    SuccessorDiscardRename,
+    SuccessorDiscardEntryRemoval(usize),
+    SuccessorDiscardDirectory,
+    SuccessorDiscardGenerationsSync,
+    SuccessorDiscardMetadataSync,
+    SuccessorDiscardUpdateSync,
+    SuccessorDiscardRootSync,
+    SuccessorDiscardFullSync,
 }
 
 pub(super) fn trip(faults: FaultPlan, barrier: TestBarrier) -> Result<(), MetadataJournalError> {
@@ -169,6 +222,19 @@ pub(super) fn trip(faults: FaultPlan, barrier: TestBarrier) -> Result<(), Metada
             }
             TestBarrier::PredecessorPruneRemoval => Barrier::PredecessorPruneRemoval,
             TestBarrier::PredecessorPruneFullSync => Barrier::PredecessorPruneFullSync,
+            TestBarrier::SuccessorDiscardSelector => Barrier::SuccessorDiscardSelector,
+            TestBarrier::SuccessorDiscardRename => Barrier::SuccessorDiscardRename,
+            TestBarrier::SuccessorDiscardEntryRemoval(step) => {
+                Barrier::SuccessorDiscardEntryRemoval(step)
+            }
+            TestBarrier::SuccessorDiscardDirectory => Barrier::SuccessorDiscardDirectory,
+            TestBarrier::SuccessorDiscardGenerationsSync => {
+                Barrier::SuccessorDiscardGenerationsSync
+            }
+            TestBarrier::SuccessorDiscardMetadataSync => Barrier::SuccessorDiscardMetadataSync,
+            TestBarrier::SuccessorDiscardUpdateSync => Barrier::SuccessorDiscardUpdateSync,
+            TestBarrier::SuccessorDiscardRootSync => Barrier::SuccessorDiscardRootSync,
+            TestBarrier::SuccessorDiscardFullSync => Barrier::SuccessorDiscardFullSync,
         };
         return faults.trip(selected);
     }
@@ -177,6 +243,21 @@ pub(super) fn trip(faults: FaultPlan, barrier: TestBarrier) -> Result<(), Metada
         let _ = (faults, barrier);
         Ok(())
     }
+}
+
+pub(super) fn trip_discard_entry(
+    faults: FaultPlan,
+    removal_step: &mut usize,
+) -> Result<(), MetadataJournalError> {
+    *removal_step = removal_step
+        .checked_add(1)
+        .ok_or(MetadataJournalError::Invalid(
+            "metadata discard step overflowed",
+        ))?;
+    trip(
+        faults,
+        TestBarrier::SuccessorDiscardEntryRemoval(*removal_step),
+    )
 }
 
 pub(super) fn trip_prune_entry(

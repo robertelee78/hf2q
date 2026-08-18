@@ -7,7 +7,7 @@
 mod file;
 mod host;
 mod locked;
-mod metadata;
+pub(in crate::distribution) mod metadata;
 mod unix;
 mod verify;
 
