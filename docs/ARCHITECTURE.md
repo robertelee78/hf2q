@@ -64,12 +64,16 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │       ├── metadata/   canonical crash-durable update-metadata journal;
 │       │                stored bytes are not cryptographic authority
 │       └── …           sequence-one activation and bounded restart cleanup
-│   └── update_auth/    transport-free strict TUF profile, one-use request
+│   ├── update_auth/    transport-free strict TUF profile, one-use request
 │                       tokens, historical replay floors, root-authorized
 │                       timestamp/snapshot recovery, sealed advancing
 │                       commit guard, and durable metadata-baseline proof;
-│                       all internal until the real root, transport, and
-│                       application release binding exist
+│                       all internal until the real root and public update
+│                       authority exist
+│   └── update_transport/ closed Pages-pointer/GitHub-asset routes and manual
+│                       one-hop release redirect, exact bounded bodies, and anonymous
+│                       same-FD streamed archive staging; no extraction,
+│                       prepared-version, installer, or CLI authority
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -561,7 +565,16 @@ harness leans on three patterns:
    move and new complete pairs may be appended, but old descriptors cannot be
    rewritten or removed. The production module
    still owns no URL, HTTP, download, archive extraction, activation, installer,
-   or CLI authority. Fresh-process recovery repairs the selected
+   or CLI authority. The private sibling `distribution/update_transport/`
+   maps only those sealed typed artifact descriptors to fixed Pages/GitHub origins,
+   accepts at most one exact GitHub asset-CDN redirect, and verifies bounded
+   pointer/manifest bytes plus an unlinked same-FD streamed archive. A one-use
+   fetch capability replays the ordinary selected journal under the shared
+   installation lock before and after archive I/O and rejects generation or
+   clock drift. The result remains inert: it grants no ZIP extraction,
+   codesign/notary, prepared-version, activation, installer, or CLI authority.
+   Verifier-request metadata HTTP remains a pending production-root slice.
+   Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected
    write prefix, and requires a wholly fresh transcript. An authenticated root
    transition that changes the effective timestamp or snapshot authorization

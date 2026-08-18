@@ -18,7 +18,7 @@ use crate::distribution::schema::{
     MAX_RELEASE_ARCHIVE_BYTES, MAX_RELEASE_MANIFEST_BYTES,
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct SelectedMetadataIdentity {
     installation_id: String,
     state_root: String,
@@ -26,7 +26,7 @@ struct SelectedMetadataIdentity {
     generation_sha256: [u8; 32],
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct MetadataVersions {
     root: u64,
     timestamp: u64,
@@ -34,8 +34,8 @@ struct MetadataVersions {
     targets: u64,
 }
 
-#[derive(Debug)]
-pub(super) struct AuthenticatedTargetDescriptor {
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::distribution) struct AuthenticatedTargetDescriptor {
     logical_name: LogicalTargetName,
     physical_name: ConsistentSnapshotTargetName,
     length: u64,
@@ -43,25 +43,38 @@ pub(super) struct AuthenticatedTargetDescriptor {
 }
 
 impl AuthenticatedTargetDescriptor {
-    pub(super) fn logical_name(&self) -> &str {
+    pub(in crate::distribution) fn logical_name(&self) -> &str {
         self.logical_name.as_str()
     }
 
-    pub(super) fn physical_name(&self) -> &ConsistentSnapshotTargetName {
+    pub(in crate::distribution) fn physical_name(&self) -> &ConsistentSnapshotTargetName {
         &self.physical_name
     }
 
-    pub(super) fn length(&self) -> u64 {
+    pub(in crate::distribution) fn length(&self) -> u64 {
         self.length
     }
 
-    pub(super) fn sha256(&self) -> &Sha256Digest {
+    pub(in crate::distribution) fn sha256(&self) -> &Sha256Digest {
         &self.sha256
     }
 
     fn matches_bytes(&self, bytes: &[u8]) -> bool {
         self.length == bytes.len() as u64
             && self.sha256.as_str() == hex::encode(Sha256::digest(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(logical_name: LogicalTargetName, bytes: &[u8]) -> Self {
+        let sha256 = Sha256Digest::parse("sha256", hex::encode(Sha256::digest(bytes)))
+            .expect("test target digest");
+        let physical_name = logical_name.consistent_snapshot_name(&sha256);
+        Self {
+            logical_name,
+            physical_name,
+            length: bytes.len() as u64,
+            sha256,
+        }
     }
 }
 
@@ -77,7 +90,7 @@ struct AuthenticatedReleasePair {
 /// This exposes no generic target lookup. Older release pairs are retained as
 /// inert authenticated history only so the stable pointer can select one pair.
 #[derive(Debug)]
-pub(super) struct AuthenticatedTargetSet {
+pub(in crate::distribution) struct AuthenticatedTargetSet {
     selected: SelectedMetadataIdentity,
     versions: MetadataVersions,
     authenticated_at: Timestamp,
@@ -92,7 +105,7 @@ pub(super) struct AuthenticatedTargetSet {
 /// authority. A later transition must reacquire the installation lock and
 /// prove the same selected metadata identity before mutating state.
 #[derive(Debug)]
-pub(super) struct AuthenticatedReleaseTargets {
+pub(in crate::distribution) struct AuthenticatedReleaseTargets {
     selected: SelectedMetadataIdentity,
     versions: MetadataVersions,
     authenticated_at: Timestamp,
@@ -102,46 +115,47 @@ pub(super) struct AuthenticatedReleaseTargets {
     pointer: AuthenticatedTargetDescriptor,
     manifest: AuthenticatedTargetDescriptor,
     archive: AuthenticatedTargetDescriptor,
+    exact_pointer_bytes: Box<[u8]>,
 }
 
 impl AuthenticatedReleaseTargets {
-    pub(super) fn selected_sequence(&self) -> u64 {
+    pub(in crate::distribution) fn selected_sequence(&self) -> u64 {
         self.selected.sequence
     }
 
-    pub(super) fn selected_generation_sha256(&self) -> [u8; 32] {
+    pub(in crate::distribution) fn selected_generation_sha256(&self) -> [u8; 32] {
         self.selected.generation_sha256
     }
 
-    pub(super) fn version(&self) -> &ReleaseVersion {
+    pub(in crate::distribution) fn version(&self) -> &ReleaseVersion {
         &self.version
     }
 
-    pub(super) fn target(&self) -> TargetTriple {
+    pub(in crate::distribution) fn target(&self) -> TargetTriple {
         self.target
     }
 
-    pub(super) fn pointer(&self) -> &AuthenticatedTargetDescriptor {
+    pub(in crate::distribution) fn pointer(&self) -> &AuthenticatedTargetDescriptor {
         &self.pointer
     }
 
-    pub(super) fn manifest(&self) -> &AuthenticatedTargetDescriptor {
+    pub(in crate::distribution) fn manifest(&self) -> &AuthenticatedTargetDescriptor {
         &self.manifest
     }
 
-    pub(super) fn archive(&self) -> &AuthenticatedTargetDescriptor {
+    pub(in crate::distribution) fn archive(&self) -> &AuthenticatedTargetDescriptor {
         &self.archive
     }
 
-    pub(super) fn authenticated_at(&self) -> Timestamp {
+    pub(in crate::distribution) fn authenticated_at(&self) -> Timestamp {
         self.authenticated_at
     }
 
-    pub(super) fn earliest_expiry(&self) -> Timestamp {
+    pub(in crate::distribution) fn earliest_expiry(&self) -> Timestamp {
         self.earliest_expiry
     }
 
-    pub(super) fn metadata_versions(&self) -> [u64; 4] {
+    pub(in crate::distribution) fn metadata_versions(&self) -> [u64; 4] {
         [
             self.versions.root,
             self.versions.timestamp,
@@ -150,17 +164,41 @@ impl AuthenticatedReleaseTargets {
         ]
     }
 
-    pub(super) fn installation_id(&self) -> &str {
+    pub(in crate::distribution) fn installation_id(&self) -> &str {
         &self.selected.installation_id
     }
 
-    pub(super) fn state_root(&self) -> &str {
+    pub(in crate::distribution) fn state_root(&self) -> &str {
         &self.selected.state_root
+    }
+
+    pub(in crate::distribution) fn exact_pointer_bytes(&self) -> &[u8] {
+        &self.exact_pointer_bytes
+    }
+
+    pub(super) fn exactly_matches_bound_release(&self, other: &Self) -> bool {
+        self.selected == other.selected
+            && self.versions == other.versions
+            && self.earliest_expiry == other.earliest_expiry
+            && self.version == other.version
+            && self.target == other.target
+            && self.pointer == other.pointer
+            && self.manifest == other.manifest
+            && self.archive == other.archive
+            && self.exact_pointer_bytes == other.exact_pointer_bytes
     }
 }
 
 impl AuthenticatedTargetSet {
-    pub(super) fn bind_channel_pointer(
+    pub(in crate::distribution) fn pointer(&self) -> &AuthenticatedTargetDescriptor {
+        &self.pointer
+    }
+
+    pub(super) fn authenticated_at(&self) -> Timestamp {
+        self.authenticated_at
+    }
+
+    pub(in crate::distribution) fn bind_channel_pointer(
         self,
         exact_pointer_bytes: &[u8],
     ) -> Result<AuthenticatedReleaseTargets, TufVerifierError> {
@@ -197,6 +235,7 @@ impl AuthenticatedTargetSet {
             pointer: self.pointer,
             manifest: pair.manifest,
             archive: pair.archive,
+            exact_pointer_bytes: exact_pointer_bytes.into(),
         })
     }
 }
@@ -222,7 +261,7 @@ fn authenticate_selected_targets_with_clock(
     authenticate_stored_targets(authorization, anchor, stored, &mut clock)
 }
 
-fn authenticate_stored_targets(
+pub(super) fn authenticate_stored_targets(
     authorization: &MetadataStateAuthorization,
     anchor: &EmbeddedTrustRoot,
     stored: StoredMetadataGeneration,

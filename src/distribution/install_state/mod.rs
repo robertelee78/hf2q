@@ -4,6 +4,7 @@
 //! an already authenticated, fully prepared standalone release. It does not
 //! establish update authority, executable ownership, or deletion authority.
 
+mod artifact;
 mod file;
 mod host;
 mod locked;
@@ -28,6 +29,12 @@ use self::locked::LockedInstallation;
 use self::unix::Directory;
 use self::verify::VerifiedPreparedVersion;
 use super::schema;
+
+#[cfg(test)]
+pub(in crate::distribution) use artifact::create_ephemeral_artifact_stage;
+pub(in crate::distribution) use artifact::{
+    ArtifactStageError, EphemeralArtifactStage, VerifiedArchiveFile,
+};
 
 const FIRST_SEQUENCE: u64 = 1;
 const FIRST_GENERATION: &str = "00000000000000000001";

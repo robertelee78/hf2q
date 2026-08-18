@@ -154,8 +154,18 @@ jobs:
             src/distribution/schema/channel_pointer.rs \
             src/distribution/schema/testdata/channel_pointer_v1.json \
             src/distribution/schema/target_name.rs \
+            src/distribution/install_state/artifact.rs \
+            src/distribution/install_state/artifact/tests.rs \
+            src/distribution/install_state/unix.rs \
+            src/distribution/update_auth/artifact_authorization.rs \
             src/distribution/update_auth/commit.rs \
             src/distribution/update_auth/target_set.rs \
+            src/distribution/update_auth/target_set_tests.rs \
+            src/distribution/update_transport/mod.rs \
+            src/distribution/update_transport/fetch.rs \
+            src/distribution/update_transport/http.rs \
+            src/distribution/update_transport/origin.rs \
+            src/distribution/update_transport/tests.rs \
             src/distribution/update_auth/testdata/python-tuf-v1/1.root.json \
             src/distribution/update_auth/testdata/python-tuf-v1/2.root.json \
             src/distribution/update_auth/testdata/python-tuf-v1/timestamp.json \
@@ -164,7 +174,9 @@ jobs:
             src/distribution/update_auth/testdata/python-tuf-v1/PROVENANCE.json \
             src/distribution/update_auth/testdata/python-tuf-v1/SHA256SUMS \
             src/distribution/update_auth/testdata/python-tuf-v1/generate.py \
-            src/distribution/update_auth/testdata/python-tuf-v1/requirements.lock
+            src/distribution/update_auth/testdata/python-tuf-v1/requirements.lock \
+            docs/ADR-045-frictionless-distribution-updates-and-onboarding.md \
+            docs/ARCHITECTURE.md
           do
             grep -Fqx -- "$required" <<<"$package_list"
           done
@@ -184,6 +196,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::schema::
           cargo test --locked --bin hf2q --all-features distribution::install_state:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::update_auth:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features distribution::update_transport:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen35_serving_tokenizer_is_sidecar_free_and_detects_vision_markers -- --test-threads=1
           cargo test --locked --bin hf2q --all-features vision_projector_binding -- --test-threads=1

@@ -6,9 +6,11 @@
 //! filesystem mutation.
 
 // This is intentionally unreachable from production dispatch until the real
-// trust root, bounded transport, and application release binding exist.
+// trust root, prepared-version pipeline, and public update authority exist.
 #[allow(dead_code)]
 pub(crate) mod install_state;
 pub mod schema;
 #[allow(dead_code)]
 mod update_auth;
+#[allow(dead_code)]
+mod update_transport;
