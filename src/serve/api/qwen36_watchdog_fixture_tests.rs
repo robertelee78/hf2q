@@ -25,9 +25,14 @@ const TOOL_COUNT: usize = 347;
 const TARGET_PROMPT_TOKENS: usize = 87_972;
 const STABLE_PROMPT_TOKENS: usize = 87_965;
 const SHORT_PROMPT_TOKENS: usize = 552;
-const LONG_PADDING_REPETITIONS: usize = 56_122;
+// Calibrated after client JSON-object order became part of the chat-template
+// wire contract. Preserving each three-property tool schema adds exactly 28
+// tokens per tool versus the historical key-sorted rendering, so the public
+// payload needs 9,716 fewer one-token padding repetitions (28 * 347) while
+// retaining the same 87,972-token target and stable generation boundary.
+const LONG_PADDING_REPETITIONS: usize = 46_406;
 const SHORT_PADDING_REPETITIONS: usize = 496;
-const REQUEST_SHA256: &str = "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d";
+const REQUEST_SHA256: &str = "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e";
 const TOOLS_SHA256: &str = "586e09658c8d4d69b1ad451c8218199e405eeb72de4e550741730e83ed653766";
 const SHORT_REQUEST_SHA256: &str =
     "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004";
