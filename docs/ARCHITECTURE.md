@@ -61,7 +61,7 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/distribution/   ADR-045 release/install bounded context
 │   ├── schema/         strict bounded manifest, receipt, marker schemas
 │   └── install_state/  descriptor-relative sequence-one activation;
-│                        internal until signed-update authentication exists
+│                        internal until production signed-update auth exists
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -531,6 +531,11 @@ harness leans on three patterns:
 3. **End-gate smoke prompts.** `hf2q smoke` runs the arch's canonical
    prompts and asserts the model emits the expected first / stop
    tokens. Failure modes get distinct exit codes (see §7).
+4. **Isolated security spikes.** `tests/adr045_tuf_spike/` is an unpublished,
+   separately locked Rust 1.88 workspace. It compares signed-update verifiers
+   and crash-durable journal hypotheses without adding either candidate to the
+   production dependency graph or published crate. Its wire types grant no
+   production authority.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.

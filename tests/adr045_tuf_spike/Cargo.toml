@@ -1,0 +1,34 @@
+[package]
+name = "hf2q-adr045-tuf-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+publish = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+
+[dev-dependencies]
+async-trait = "0.1"
+aws-lc-rs = "1"
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+jiff = { version = "0.2", features = ["serde"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sigstore-tuf = { version = "=0.11.0", default-features = false }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tough = { version = "=0.24.0", default-features = false }
+url = "2"
+zip = { version = "=7.2.0", default-features = false }

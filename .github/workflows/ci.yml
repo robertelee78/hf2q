@@ -63,7 +63,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'tests/adr045_tuf_spike/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
       # --- fmt: informational (baseline drift, see header) ---
@@ -87,6 +87,23 @@ jobs:
         run: |
           cargo install cargo-audit --locked --version 0.22.2 --no-default-features
           cargo audit
+
+      - name: ADR-045 signed-update verifier spike (blocking)
+        env:
+          CARGO_TARGET_DIR: target/adr045-tuf-spike
+        run: |
+          set -euo pipefail
+          spike=tests/adr045_tuf_spike/Cargo.toml
+          cargo +1.88.0 fmt --manifest-path "$spike" -- --check
+          cargo +1.88.0 check --locked --all-targets --manifest-path "$spike"
+          cargo +1.88.0 clippy --locked --all-targets --manifest-path "$spike" -- -D warnings
+          cargo +1.88.0 test --locked --lib --manifest-path "$spike" -- --test-threads=1
+          cargo audit --file tests/adr045_tuf_spike/Cargo.lock
+          package_list="$(cargo package --locked --list)"
+          if grep -q '^tests/adr045_tuf_spike/' <<<"$package_list"; then
+            echo 'ADR-045 spike leaked into the published hf2q crate' >&2
+            exit 1
+          fi
 
       # GitHub's hosted macOS VM returns nil from Metal residency-set
       # creation. Keep the hosted gate blocking and deterministic by running
