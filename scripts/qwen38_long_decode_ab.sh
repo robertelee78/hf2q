@@ -123,23 +123,40 @@ jq -e 'has("seed") | not' "$OUT_DIR/request.json" >/dev/null
 request_sha=$(sha256_file "$OUT_DIR/request.json")
 
 server_pid=''
+request_pid=''
 stop_server() {
   local waited=0
   [[ -n "$server_pid" ]] || return 0
   if kill -0 "$server_pid" 2>/dev/null; then
     kill -INT "$server_pid" 2>/dev/null || true
-    while kill -0 "$server_pid" 2>/dev/null && ((waited < 90)); do
+    while kill -0 "$server_pid" 2>/dev/null && ((waited < 30)); do
       sleep 1
       waited=$((waited + 1))
     done
     if kill -0 "$server_pid" 2>/dev/null; then
       kill -TERM "$server_pid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$server_pid" 2>/dev/null && ((waited < 10)); do
+        sleep 1
+        waited=$((waited + 1))
+      done
+    fi
+    if kill -0 "$server_pid" 2>/dev/null; then
+      echo "Qwen3.8 trial server ignored bounded shutdown; killing exact child PID $server_pid" >&2
+      kill -KILL "$server_pid" 2>/dev/null || true
     fi
   fi
   wait "$server_pid" 2>/dev/null || true
   server_pid=''
 }
-cleanup() { stop_server; }
+cleanup() {
+  if [[ -n "$request_pid" ]] && kill -0 "$request_pid" 2>/dev/null; then
+    kill -TERM "$request_pid" 2>/dev/null || true
+    wait "$request_pid" 2>/dev/null || true
+  fi
+  request_pid=''
+  stop_server
+}
 trap cleanup EXIT
 trap 'exit 1' INT TERM
 
@@ -212,7 +229,10 @@ run_trial() {
     -o "$response" \
     -w 'http_code=%{http_code}\ntotal_seconds=%{time_total}\n' \
     "http://127.0.0.1:$PORT/v1/chat/completions" \
-    >"$trial_dir/curl.metrics"
+    >"$trial_dir/curl.metrics" &
+  request_pid=$!
+  wait "$request_pid"
+  request_pid=''
   grep -qx 'http_code=200' "$trial_dir/curl.metrics"
   ready_code=$(curl --silent --show-error --max-time 3 \
     -o "$trial_dir/readyz.json" -w '%{http_code}' \
