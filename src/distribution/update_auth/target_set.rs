@@ -59,7 +59,7 @@ impl AuthenticatedTargetDescriptor {
         &self.sha256
     }
 
-    fn matches_bytes(&self, bytes: &[u8]) -> bool {
+    pub(super) fn matches_bytes(&self, bytes: &[u8]) -> bool {
         self.length == bytes.len() as u64
             && self.sha256.as_str() == hex::encode(Sha256::digest(bytes))
     }

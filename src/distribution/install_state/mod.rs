@@ -1,10 +1,12 @@
 //! Descriptor-relative standalone installation state.
 //!
-//! This bounded context intentionally implements only the first activation of
-//! an already authenticated, fully prepared standalone release. It does not
-//! establish update authority, executable ownership, or deletion authority.
+//! This bounded context implements private descriptor-relative extraction and
+//! the first activation of an already authenticated, fully prepared standalone
+//! release. Extraction remains inert and cannot publish an executable version;
+//! neither path establishes update authority or deletion authority.
 
 mod artifact;
+mod extraction;
 mod file;
 mod host;
 mod locked;
@@ -34,6 +36,9 @@ use super::schema;
 pub(in crate::distribution) use artifact::create_ephemeral_artifact_stage;
 pub(in crate::distribution) use artifact::{
     ArtifactStageError, EphemeralArtifactStage, VerifiedArchiveFile,
+};
+pub(in crate::distribution) use extraction::{
+    ExtractedReleaseTree, ExtractionError, ReleaseExtractionStage,
 };
 
 const FIRST_SEQUENCE: u64 = 1;

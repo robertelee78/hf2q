@@ -299,6 +299,61 @@ pub(super) fn regular_file_identity(
     Ok(identity(&stat))
 }
 
+pub(super) fn open_private_regular_file(
+    parent: &Directory,
+    name: &str,
+) -> Result<(File, EntryIdentity), InstallStateError> {
+    validate_component(name)?;
+    let named = fs::statat(parent.fd(), name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| InstallStateError::io("inspect private regular file", error))?;
+    require_regular_policy(&named, 0o600, parent.device())?;
+    let fd = fs::openat(
+        parent.fd(),
+        name,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| InstallStateError::io("open private regular file", error))?;
+    let file = File::from(fd);
+    let opened = fs::fstat(&file)
+        .map_err(|error| InstallStateError::io("inspect opened private regular file", error))?;
+    require_same_identity(
+        &named,
+        &opened,
+        "private regular file changed while opening",
+    )?;
+    require_regular_policy(&opened, 0o600, parent.device())?;
+    Ok((file, identity(&opened)))
+}
+
+pub(super) fn create_private_regular_file(
+    parent: &Directory,
+    name: &str,
+) -> Result<(File, EntryIdentity), InstallStateError> {
+    validate_component(name)?;
+    let fd = fs::openat(
+        parent.fd(),
+        name,
+        OFlags::RDWR
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| InstallStateError::io("create private regular file", error))?;
+    let file = File::from(fd);
+    let opened = fs::fstat(&file)
+        .map_err(|error| InstallStateError::io("inspect created private regular file", error))?;
+    require_regular_policy(&opened, 0o600, parent.device())?;
+    let identity = identity(&opened);
+    verify_named_identity(parent, name, identity)?;
+    sync_directory(parent)?;
+    verify_named_identity(parent, name, identity)?;
+    Ok((file, identity))
+}
+
 pub(super) fn remove_named_regular_file(
     parent: &Directory,
     name: &str,

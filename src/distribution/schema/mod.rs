@@ -33,10 +33,10 @@ pub use installed_version_marker::{
     INSTALLED_VERSION_MARKER_KIND, INSTALLED_VERSION_MARKER_SCHEMA_VERSION,
     MAX_INSTALLED_VERSION_MARKER_BYTES,
 };
-pub(crate) use release_manifest::MAX_BUNDLE_FILES;
 pub use release_manifest::{
     BundleFileV1, CodeSigningIdentityV1, CompatibilityV1, DynamicDependencyV1,
     ReleaseManifestError, ReleaseManifestV1, MAX_RELEASE_MANIFEST_BYTES, RELEASE_MANIFEST_KIND,
     RELEASE_MANIFEST_SCHEMA_VERSION,
 };
+pub(crate) use release_manifest::{MAX_BUNDLE_DIRECTORIES, MAX_BUNDLE_FILES};
 pub(crate) use target_name::{ConsistentSnapshotTargetName, LogicalTargetKind, LogicalTargetName};

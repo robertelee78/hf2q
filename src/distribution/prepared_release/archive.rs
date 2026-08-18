@@ -36,22 +36,59 @@ pub(super) struct ClassicEntry {
     name: String,
     version_needed: u16,
     flags: u16,
-    pub(super) method: u16,
+    method: u16,
     modified_time: u16,
     modified_date: u16,
     crc32: u32,
-    pub(super) compressed_size: u32,
-    pub(super) uncompressed_size: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
     local_header_start: u32,
-    pub(super) data_start: u64,
+    data_start: u64,
     central_header_start: u64,
+}
+
+/// Exact classic-ZIP entry layout retained by the sealed release wrapper.
+///
+/// This is structural evidence only. Extraction must still decode every
+/// entry from the same revalidated archive descriptor and enforce its signed
+/// size, digest, mode, and end-of-stream.
+pub(super) struct VerifiedArchiveProfile {
+    entries: Vec<ClassicEntry>,
+}
+
+impl ClassicEntry {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn method(&self) -> u16 {
+        self.method
+    }
+
+    pub(super) fn compressed_size(&self) -> u32 {
+        self.compressed_size
+    }
+
+    pub(super) fn uncompressed_size(&self) -> u32 {
+        self.uncompressed_size
+    }
+
+    pub(super) fn data_start(&self) -> u64 {
+        self.data_start
+    }
+}
+
+impl VerifiedArchiveProfile {
+    pub(super) fn entries(&self) -> &[ClassicEntry] {
+        &self.entries
+    }
 }
 
 pub(super) fn verify_archive<R: Read + Seek>(
     reader: &mut R,
     exact_manifest: &[u8],
     manifest: &ReleaseManifestV1,
-) -> Result<(), PreparedReleaseError> {
+) -> Result<VerifiedArchiveProfile, PreparedReleaseError> {
     if exact_manifest.is_empty()
         || exact_manifest.len() > MAX_RELEASE_MANIFEST_BYTES
         || manifest
@@ -69,7 +106,7 @@ pub(super) fn verify_archive<R: Read + Seek>(
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|_| PreparedReleaseError::ArchiveRead)?;
-    Ok(())
+    Ok(VerifiedArchiveProfile { entries: classic })
 }
 
 fn expected_entries<'a>(

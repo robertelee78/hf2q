@@ -13,6 +13,12 @@ use crate::distribution::install_state::metadata::{
 use crate::distribution::install_state::{ArtifactStageError, EphemeralArtifactStage};
 use crate::distribution::schema::{ReleaseVersion, TargetTriple};
 
+mod extraction;
+
+pub(in crate::distribution) use extraction::{
+    ExtractionStageAuthorization, PostLocalIoReleaseAuthorization,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub(in crate::distribution) enum ArtifactFetchAuthorizationError {
     #[error(transparent)]
@@ -60,10 +66,19 @@ pub(in crate::distribution) struct BoundArtifactFetchAuthorization<'a> {
 }
 
 /// Final current-time proof retained by the inert downloaded bundle.
-#[derive(Debug)]
-pub(in crate::distribution) struct FinalArtifactAuthorization {
+pub(in crate::distribution) struct FinalArtifactAuthorization<'a> {
+    authorization: &'a MetadataStateAuthorization,
+    anchor: &'a EmbeddedTrustRoot,
     targets: AuthenticatedReleaseTargets,
     authenticated_at: Timestamp,
+}
+
+impl std::fmt::Debug for FinalArtifactAuthorization<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FinalArtifactAuthorization")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Deliberately dormant until a real stable root is compiled into hf2q.
@@ -100,7 +115,7 @@ impl<'a> ArtifactFetchAuthorization<'a> {
     }
 }
 
-impl BoundArtifactFetchAuthorization<'_> {
+impl<'a> BoundArtifactFetchAuthorization<'a> {
     pub(in crate::distribution) fn version(&self) -> &ReleaseVersion {
         self.targets.version()
     }
@@ -152,14 +167,14 @@ impl BoundArtifactFetchAuthorization<'_> {
     /// its target descriptors happen to be identical.
     pub(in crate::distribution) fn finalize(
         self,
-    ) -> Result<FinalArtifactAuthorization, ArtifactFetchAuthorizationError> {
+    ) -> Result<FinalArtifactAuthorization<'a>, ArtifactFetchAuthorizationError> {
         self.finalize_with_clock(ClockSource::System)
     }
 
     fn finalize_with_clock(
         mut self,
         clock: ClockSource,
-    ) -> Result<FinalArtifactAuthorization, ArtifactFetchAuthorizationError> {
+    ) -> Result<FinalArtifactAuthorization<'a>, ArtifactFetchAuthorizationError> {
         if !self.archive_stage_created {
             return Err(ArtifactFetchAuthorizationError::ArchiveStageMissing);
         }
@@ -167,6 +182,8 @@ impl BoundArtifactFetchAuthorization<'_> {
         let current = self.reauthenticate_locked(&locked, clock)?;
         self.last_sample = current.authenticated_at();
         Ok(FinalArtifactAuthorization {
+            authorization: self.authorization,
+            anchor: self.anchor,
             authenticated_at: self.last_sample,
             targets: current,
         })
@@ -175,20 +192,16 @@ impl BoundArtifactFetchAuthorization<'_> {
     fn reauthenticate_locked(
         &self,
         locked: &crate::distribution::install_state::metadata::LockedMetadataState,
-        mut clock: ClockSource,
+        clock: ClockSource,
     ) -> Result<AuthenticatedReleaseTargets, ArtifactFetchAuthorizationError> {
-        let stored = locked
-            .read_selected_for_authority()?
-            .ok_or(TufVerifierError::NoSelectedMetadata)?;
-        let set = authenticate_stored_targets(self.authorization, self.anchor, stored, &mut clock)?;
-        let current = set.bind_channel_pointer(self.targets.exact_pointer_bytes())?;
-        if current.authenticated_at() < self.last_sample {
-            return Err(TufVerifierError::ClockRollback.into());
-        }
-        if !self.targets.exactly_matches_bound_release(&current) {
-            return Err(TufVerifierError::DurableCommitMismatch.into());
-        }
-        Ok(current)
+        reauthenticate_release(
+            self.authorization,
+            self.anchor,
+            locked,
+            &self.targets,
+            self.last_sample,
+            clock,
+        )
     }
 }
 
@@ -198,7 +211,7 @@ impl ArchiveStageAuthorization {
     }
 }
 
-impl FinalArtifactAuthorization {
+impl<'a> FinalArtifactAuthorization<'a> {
     pub(in crate::distribution) fn targets(&self) -> &AuthenticatedReleaseTargets {
         &self.targets
     }
@@ -206,6 +219,28 @@ impl FinalArtifactAuthorization {
     pub(in crate::distribution) fn authenticated_at(&self) -> Timestamp {
         self.authenticated_at
     }
+}
+
+pub(super) fn reauthenticate_release(
+    authorization: &MetadataStateAuthorization,
+    anchor: &EmbeddedTrustRoot,
+    locked: &crate::distribution::install_state::metadata::LockedMetadataState,
+    expected: &AuthenticatedReleaseTargets,
+    last_sample: Timestamp,
+    mut clock: ClockSource,
+) -> Result<AuthenticatedReleaseTargets, ArtifactFetchAuthorizationError> {
+    let stored = locked
+        .read_selected_for_authority()?
+        .ok_or(TufVerifierError::NoSelectedMetadata)?;
+    let set = authenticate_stored_targets(authorization, anchor, stored, &mut clock)?;
+    let current = set.bind_channel_pointer(expected.exact_pointer_bytes())?;
+    if current.authenticated_at() < last_sample {
+        return Err(TufVerifierError::ClockRollback.into());
+    }
+    if !expected.exactly_matches_bound_release(&current) {
+        return Err(TufVerifierError::DurableCommitMismatch.into());
+    }
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -224,7 +259,7 @@ pub(super) fn begin_artifact_fetch_for_test<'a>(
 }
 
 #[cfg(test)]
-impl BoundArtifactFetchAuthorization<'_> {
+impl<'a> BoundArtifactFetchAuthorization<'a> {
     pub(super) fn create_archive_stage_for_test(
         &mut self,
         samples: impl IntoIterator<Item = Timestamp>,
@@ -235,7 +270,7 @@ impl BoundArtifactFetchAuthorization<'_> {
     pub(super) fn finalize_for_test(
         self,
         samples: impl IntoIterator<Item = Timestamp>,
-    ) -> Result<FinalArtifactAuthorization, ArtifactFetchAuthorizationError> {
+    ) -> Result<FinalArtifactAuthorization<'a>, ArtifactFetchAuthorizationError> {
         self.finalize_with_clock(ClockSource::scripted(samples))
     }
 }

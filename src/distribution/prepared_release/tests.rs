@@ -31,6 +31,36 @@ struct CountingArchive {
     fail_on: Option<usize>,
 }
 
+#[derive(Default)]
+struct RecordingExtraction {
+    entries: Vec<(String, Vec<u8>)>,
+}
+
+impl super::extract::ExtractionSink for RecordingExtraction {
+    fn resume_manifest(&mut self, source: &mut dyn Read) -> Result<(), PreparedReleaseError> {
+        let mut bytes = Vec::new();
+        source
+            .read_to_end(&mut bytes)
+            .map_err(|_| PreparedReleaseError::ArchiveRead)?;
+        self.entries
+            .push(("release-manifest.json".to_owned(), bytes));
+        Ok(())
+    }
+
+    fn resume_payload(
+        &mut self,
+        file: &crate::distribution::schema::BundleFileV1,
+        source: &mut dyn Read,
+    ) -> Result<(), PreparedReleaseError> {
+        let mut bytes = Vec::new();
+        source
+            .read_to_end(&mut bytes)
+            .map_err(|_| PreparedReleaseError::ArchiveRead)?;
+        self.entries.push((file.path().as_str().to_owned(), bytes));
+        Ok(())
+    }
+}
+
 impl Read for CountingArchive {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.bytes.read(buffer)
@@ -66,6 +96,34 @@ fn stored_and_deflated_archives_bind_exact_manifest_and_inventory() {
 }
 
 #[test]
+fn retained_profile_drives_exact_decoder_order() {
+    let (manifest, manifest_bytes) = manifest();
+    for compression in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let bytes = archive(&manifest_bytes, &PAYLOADS, compression, None);
+        let profile = verify_archive(&mut Cursor::new(&bytes), &manifest_bytes, &manifest)
+            .expect("valid exact archive profile");
+        let mut sink = RecordingExtraction::default();
+        super::extract::extract_entries(
+            &mut Cursor::new(&bytes),
+            &manifest_bytes,
+            &manifest,
+            &profile,
+            &mut sink,
+        )
+        .expect("profile-bound entries decode in exact order");
+        let expected: Vec<_> =
+            std::iter::once(("release-manifest.json".to_owned(), manifest_bytes.clone()))
+                .chain(
+                    PAYLOADS
+                        .iter()
+                        .map(|(path, bytes, _)| ((*path).to_owned(), bytes.to_vec())),
+                )
+                .collect();
+        assert_eq!(sink.entries, expected);
+    }
+}
+
+#[test]
 fn binding_composes_pre_and_post_archive_revalidation() {
     let (manifest, manifest_bytes) = manifest();
     let bytes = archive(&manifest_bytes, &PAYLOADS, CompressionMethod::Stored, None);
@@ -74,9 +132,16 @@ fn binding_composes_pre_and_post_archive_revalidation() {
         revalidations: 0,
         fail_on: None,
     };
-    super::validate_archive_reader(&mut checked, &manifest_bytes, &manifest)
+    let profile = super::validate_archive_reader(&mut checked, &manifest_bytes, &manifest)
         .expect("archive is revalidated around profile binding");
     assert_eq!(checked.revalidations, 2);
+    assert_eq!(profile.entries().len(), manifest.files().len() + 1);
+    assert_eq!(profile.entries()[0].name(), "release-manifest.json");
+    assert!(profile
+        .entries()
+        .windows(2)
+        .all(|entries| entries[0].data_start() < entries[1].data_start()));
+    assert!(profile.entries().iter().all(|entry| entry.method() == 0));
 
     let mut changed_after_profile = CountingArchive {
         bytes: Cursor::new(bytes),

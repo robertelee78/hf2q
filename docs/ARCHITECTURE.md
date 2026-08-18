@@ -65,6 +65,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── install_state/  shared descriptor-relative installation lock,
 │       ├── metadata/   canonical crash-durable update-metadata journal;
 │       │                stored bytes are not cryptographic authority
+│       ├── extraction/ private exact-replay extraction tree, bounded retained
+│       │                stages, and descriptor-relative crash recovery
 │       └── …           sequence-one activation and bounded restart cleanup
 │   ├── update_auth/    transport-free strict TUF profile, one-use request
 │                       tokens, historical replay floors, root-authorized
@@ -77,8 +79,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       same-FD streamed archive staging; no extraction,
 │                       prepared-version, installer, or CLI authority
 │   └── prepared_release/ bounded classic-ZIP structural/profile validation,
-│                       canonical embedded-manifest and exact payload binding;
-│                       no extraction, codesign, prepared-version, or CLI authority
+│                       canonical embedded-manifest and exact payload binding,
+│                       plus shared-lock inert extraction; no codesign,
+│                       prepared-version, publication, or CLI authority
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -576,7 +579,7 @@ harness leans on three patterns:
    pointer/manifest bytes plus an unlinked same-FD streamed archive. A one-use
    fetch capability replays the ordinary selected journal under the shared
    installation lock before and after archive I/O and rejects generation or
-   clock drift. The result remains inert: it grants no ZIP extraction,
+   clock drift. The result remains inert transport data: it grants no ZIP extraction,
    codesign, prepared-version, activation, installer, or CLI authority. The
    private `distribution/prepared_release/` boundary consumes that inert bundle,
    revalidates the same anonymous archive descriptor, and uses a bounded custom
@@ -585,8 +588,16 @@ harness leans on three patterns:
    supplies an independent Stored/Deflate decode, CRC, and payload-digest view.
    It requires canonical central/local layout, exact raw inventory/order/modes,
    a byte-identical deterministic embedded manifest, and every streamed payload
-   digest. Its non-cloneable result is still inert and grants no filesystem,
-   codesign, prepared-version, activation, installer, or CLI authority.
+   digest. It then extracts only through directory descriptors into the
+   deterministic private `update/extractions/.extract-vVERSION-SHA256` stage.
+   At most eight retained stages are accepted; files remain `0600` and all
+   directories remain `0700`. Exact authenticated replay can reconstruct torn
+   scratch in the same inode, while unexpected names/types/modes/links fail
+   closed without deletion. The same shared installation lock brackets a
+   current-time selected-metadata replay before and after local I/O, and the
+   anonymous archive descriptor is revalidated on both sides. The sealed result
+   remains inert and grants no path/FD, codesign, mode normalization,
+   prepared-version publication, activation, installer, or CLI authority.
    The schema boundary now defines installed-version marker v2 and a narrow
    first-standalone record builder. Marker v2 carries the exact metadata-role
    versions needed to regenerate the same install-receipt-v1 transition after
