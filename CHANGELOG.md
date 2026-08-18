@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trajectory and could push an otherwise correct required tool call beyond a
   128-token completion budget. The corrected renderer matches the source
   prompt, while conversion, quantization, and model weights remain unchanged.
+- Recalibrate the public Qwen3.6 347-tool/87,972-token release fixture for that
+  insertion-order contract. The production renderer adds 28 tokens per tool
+  relative to the historical key-sorted fixture, so its deterministic padding
+  drops by 9,716 tokens and its canonical request digest is rebound without
+  changing the long-overlap workload or stable prompt boundary.
 - Make GitHub release-tag creation distinguish an explicit missing-ref 404
   from every other API failure. Release automation now validates existing and
   newly created tag SHAs, re-reads a created ref before publishing assets, and
