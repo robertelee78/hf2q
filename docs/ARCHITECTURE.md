@@ -551,8 +551,17 @@ harness leans on three patterns:
    dependency's fetch/HTTP/TLS features are disabled. A retained Python-TUF
    corpus, generated with canonical key IDs and a fully hashed dependency lock,
    proves cross-implementation root rotation and lower-role authentication.
-   The production module owns no URL, HTTP, target lookup, archive, activation,
-   installer, or CLI authority. Fresh-process recovery repairs the selected
+   The same bounded context now owns the structural `ChannelPointerV1`, typed
+   logical/consistent-snapshot target names, and a sealed current-time replay
+   that accepts one stable pointer plus complete retained release pairs. Pointer
+   binding exposes only the selected pointer/manifest/archive descriptors; it
+   is not generic target lookup or downgrade authority. Lock-held successor
+   authentication makes versioned pairs append-only by comparing the exact
+   selected predecessor and candidate before selector commit; the pointer may
+   move and new complete pairs may be appended, but old descriptors cannot be
+   rewritten or removed. The production module
+   still owns no URL, HTTP, download, archive extraction, activation, installer,
+   or CLI authority. Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected
    write prefix, and requires a wholly fresh transcript. An authenticated root
    transition that changes the effective timestamp or snapshot authorization
