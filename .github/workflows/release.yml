@@ -512,6 +512,8 @@ jobs:
                and $q38.long_decode.benchmark.settings.temperature == 0
                and ($q38.long_decode.benchmark.settings | has("seed") | not)
                and $q38.long_decode.benchmark.aggregate.improvement_percent >= 15
+               and ($q38.long_decode.benchmark.aggregate.short_regression_percent
+                 | type) == "number"
                and $q38.long_decode.benchmark.aggregate.short_regression_percent <= 2
                and ($q38.long_decode.benchmark.aggregate.short_exact_output_sha256
                  | test("^[0-9a-f]{64}$"))

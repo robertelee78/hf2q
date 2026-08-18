@@ -144,6 +144,12 @@ jq -e \
     and (.trials | type) == "array" and (.trials | length) == 4
     and .aggregate.minimum_improvement_percent == 15
     and .aggregate.maximum_short_regression_percent == 2
+    and (.aggregate.short_off_mean_decode_tokens_per_second | type) == "number"
+    and (.aggregate.short_auto_mean_decode_tokens_per_second | type) == "number"
+    and (.aggregate.short_off_within_arm_spread_percent | type) == "number"
+    and (.aggregate.short_auto_within_arm_spread_percent | type) == "number"
+    and (.aggregate.short_regression_percent | type) == "number"
+    and .aggregate.short_regression_percent <= 2
     and (.aggregate.exact_output_sha256 | test("^[0-9a-f]{64}$"))
     and (.aggregate.short_exact_output_sha256 | test("^[0-9a-f]{64}$"))
   ' "$summary" >/dev/null
