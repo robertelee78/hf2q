@@ -33,6 +33,8 @@ const SHORT_PROMPT_TOKENS: usize = 552;
 const LONG_PADDING_REPETITIONS: usize = 46_406;
 const SHORT_PADDING_REPETITIONS: usize = 496;
 const REQUEST_SHA256: &str = "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e";
+const RUNTIME_REQUEST_SHA256: &str =
+    "303261182d141d2fb8bef2d441e495996f116a8314004ce52737bc9a3034ae28";
 const TOOLS_SHA256: &str = "586e09658c8d4d69b1ad451c8218199e405eeb72de4e550741730e83ed653766";
 const SHORT_REQUEST_SHA256: &str =
     "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004";
@@ -202,6 +204,32 @@ fn public_watchdog_fixture_bytes_are_stable_without_a_model() {
         TOOLS_SHA256
     );
     assert_eq!(sha256_json(&short_request), SHORT_REQUEST_SHA256);
+}
+
+#[test]
+fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
+    let watchdog = include_str!("../../../scripts/test_qwen36_prefill_watchdog.sh");
+    let cancellation = include_str!("../../../scripts/test_qwen36_prefill_cancellation.sh");
+    let deepseek_overlap = include_str!("../../../scripts/test_deepseek4_interactive_overlap.sh");
+    let release_gate = include_str!("../../../scripts/run_agentic_cache_release_gate.sh");
+
+    for (name, script) in [
+        ("watchdog", watchdog),
+        ("cancellation", cancellation),
+        ("deepseek overlap", deepseek_overlap),
+        ("release gate", release_gate),
+    ] {
+        assert!(
+            script.contains(REQUEST_SHA256),
+            "{name} must pin the canonical long fixture digest"
+        );
+    }
+    for (name, script) in [("watchdog", watchdog), ("cancellation", cancellation)] {
+        assert!(
+            script.contains(RUNTIME_REQUEST_SHA256),
+            "{name} must pin the max_tokens=64 runtime request digest"
+        );
+    }
 }
 
 /// Header/tokenizer-only pin for the public 347-tool reproduction. The test
