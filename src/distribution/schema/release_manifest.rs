@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::common::{
-    BundleEntryType, BundlePath, FileMode, GitCommit, MacOsVersion, ReleaseVersion, Sha256Digest,
-    TargetTriple, UpdateChannel,
+    BundleEntryType, BundlePath, FileMode, GitCommit, MacOsVersion, ReleaseVersion,
+    SchemaValueError, Sha256Digest, TargetTriple, UpdateChannel,
 };
 
 pub const RELEASE_MANIFEST_KIND: &str = "hf2q.release-manifest";
@@ -67,6 +67,15 @@ impl ReleaseManifestError {
         Self::InvalidField {
             field,
             reason: reason.into(),
+        }
+    }
+}
+
+impl From<SchemaValueError> for ReleaseManifestError {
+    fn from(error: SchemaValueError) -> Self {
+        Self::InvalidField {
+            field: error.field,
+            reason: error.reason,
         }
     }
 }

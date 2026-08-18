@@ -2,23 +2,36 @@ use std::fmt;
 
 use serde::Serialize;
 
-use super::release_manifest::ReleaseManifestError;
-
 const MAX_RELEASE_VERSION_BYTES: usize = 64;
 const MAX_BUNDLE_PATH_BYTES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaValueError {
+    pub(crate) field: &'static str,
+    pub(crate) reason: String,
+}
+
+impl SchemaValueError {
+    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct Sha256Digest(String);
 
 impl Sha256Digest {
-    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, SchemaValueError> {
         if value.len() != 64
             || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "must be exactly 64 lowercase hexadecimal characters",
             ));
@@ -42,13 +55,13 @@ impl fmt::Display for Sha256Digest {
 pub struct GitCommit(String);
 
 impl GitCommit {
-    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, SchemaValueError> {
         if value.len() != 40
             || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "must be exactly 40 lowercase hexadecimal characters",
             ));
@@ -69,24 +82,23 @@ impl ReleaseVersion {
     pub(crate) fn parse_stable(
         field: &'static str,
         value: String,
-    ) -> Result<Self, ReleaseManifestError> {
+    ) -> Result<Self, SchemaValueError> {
         if value.is_empty() || value.len() > MAX_RELEASE_VERSION_BYTES {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "must be a bounded semantic version",
             ));
         }
-        let parsed = semver::Version::parse(&value).map_err(|_| {
-            ReleaseManifestError::invalid(field, "must be a canonical semantic version")
-        })?;
+        let parsed = semver::Version::parse(&value)
+            .map_err(|_| SchemaValueError::new(field, "must be a canonical semantic version"))?;
         if !parsed.pre.is_empty() || !parsed.build.is_empty() {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "stable releases cannot contain prerelease or build metadata",
             ));
         }
         if parsed.to_string() != value {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "semantic version is not in canonical form",
             ));
@@ -106,10 +118,10 @@ pub enum TargetTriple {
 }
 
 impl TargetTriple {
-    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, SchemaValueError> {
         match value.as_str() {
             "aarch64-apple-darwin" => Ok(Self::Aarch64AppleDarwin),
-            _ => Err(ReleaseManifestError::invalid(
+            _ => Err(SchemaValueError::new(
                 field,
                 "v1 supports only aarch64-apple-darwin",
             )),
@@ -130,10 +142,10 @@ pub enum UpdateChannel {
 }
 
 impl UpdateChannel {
-    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, SchemaValueError> {
         match value.as_str() {
             "stable" => Ok(Self::Stable),
-            _ => Err(ReleaseManifestError::invalid(
+            _ => Err(SchemaValueError::new(
                 field,
                 "v1 supports only the stable channel",
             )),
@@ -146,9 +158,9 @@ impl UpdateChannel {
 pub struct MacOsVersion(String);
 
 impl MacOsVersion {
-    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, SchemaValueError> {
         if value.is_empty() || value.len() > 16 {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "must be a bounded major.minor or major.minor.patch version",
             ));
@@ -163,7 +175,7 @@ impl MacOsVersion {
             })
             || parts[0] == "0"
         {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "must be canonical major.minor or major.minor.patch decimal components",
             ));
@@ -181,7 +193,7 @@ impl MacOsVersion {
 pub struct BundlePath(String);
 
 impl BundlePath {
-    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, SchemaValueError> {
         if value.is_empty()
             || value.len() > MAX_BUNDLE_PATH_BYTES
             || !value.is_ascii()
@@ -201,14 +213,14 @@ impl BundlePath {
                     || component.len() > 255
             })
         {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "must be a canonical, safe ASCII bundle-relative path",
             ));
         }
 
         if value == "release-manifest.json" {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "release-manifest.json is the reserved envelope and is not self-inventoried",
             ));
@@ -229,7 +241,7 @@ impl BundlePath {
                 .strip_prefix("share/licenses/hf2q/")
                 .is_some_and(|suffix| !suffix.is_empty());
         if !allowed {
-            return Err(ReleaseManifestError::invalid(
+            return Err(SchemaValueError::new(
                 field,
                 "path is outside the v1 release-bundle allowlist",
             ));

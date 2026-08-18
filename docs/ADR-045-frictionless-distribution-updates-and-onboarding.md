@@ -101,13 +101,24 @@ state from PATH aliases or filenames:
   installer protocol, minimum updater protocol, and launcher-registry schema
   are independent integers: an unsupported document schema or a required
   protocol/schema above the verifier's capability fails closed.
-- **Install receipt**: installation root, active and two retained versions,
-  owner family (`standalone`, `homebrew`, `cargo-registry`, or
-  `unknown/manual`), selected update route (`standalone`, `brew`,
-  `cargo-install`, `cargo-binstall`, or confirmed migration), manifest digest,
-  and last successful transition. Cargo and cargo-binstall deliberately share
-  an owner family because both install into Cargo's registry/bin layout; the
-  route is a separately recorded preference rather than invented history.
+- **Installed-version marker**: immutable, version-local standalone ownership
+  state binding one installation ID and root to one version, target, release
+  manifest/archive digest, and nonzero installation sequence. It is local
+  correlation evidence, never transmitted update identity or authentication.
+- **Install receipt**: for standalone ownership, an immutable activation record
+  selected atomically with its version; for manager/manual ownership, a
+  non-authoritative last-observation record. It contains the configured state
+  root, installation root, active and two retained versions, last observed owner
+  family (`standalone`, `homebrew`, `cargo-registry`, or `unknown/manual`),
+  selected update route (`standalone`, `brew`, `cargo-install`,
+  `cargo-binstall`, or absent), release-bundle identity where that channel
+  provides one, standalone marker identity only for hf2q-owned versions, and
+  last successful transition. Cargo and cargo-binstall
+  deliberately share an owner family because both install into Cargo's
+  registry/bin layout; the route is a separately recorded preference rather
+  than invented history. A completed migration is a transition from
+  `unknown/manual` to `standalone`, after which the durable route is
+  `standalone`; one-time consent is never a reusable update route.
 - **Update metadata**: signed, expiring, monotonically versioned metadata that
   binds a channel and version to an exact release-manifest and archive digest.
 - **Hugging Face model reference**: the user's original input plus normalized
@@ -219,7 +230,11 @@ hf2q-owned state below one root, except for the user PATH entry point:
 ```text
 ~/.hf2q/
 ├── versions/X.Y.Z/
-├── current -> versions/X.Y.Z
+│   └── version-installation.json
+├── activations/N/
+│   ├── install-receipt.json
+│   └── version -> ../../versions/X.Y.Z
+├── current -> activations/N
 ├── models/
 ├── cache/sessions/
 ├── receipts/
@@ -228,7 +243,51 @@ hf2q-owned state below one root, except for the user PATH entry point:
 ~/.local/bin/hf2q
 ```
 
-The executable in `~/.local/bin` resolves the current version. Installed
+`current` is the sole standalone activation commit point. It selects one
+immutable activation directory containing both the install receipt and one
+fixed relative link to the verified version directory, so executable and
+receipt change with the same rename. Each complete version directory contains
+its immutable local `version-installation.json` in addition to the signed
+bundle contents. The marker is not an archive entry and is verified separately;
+the installed entry set is therefore the manifest envelope, its exact payload
+inventory, and this one fixed local marker. Its receipt digest binds the exact
+canonical marker bytes; hashing parsed or reserialized JSON is forbidden. No
+mutation proceeds merely because the activation receipt or marker parses; live
+descriptor-relative ownership, manifest, link, and entry-point evidence must
+agree. The activation directory's exact entry set is `install-receipt.json`
+and `version`; ownership verification and cleanup use descriptor-relative
+`lstat`/`fstatat`-style no-follow operations and reject any extra entry.
+
+`N` is the receipt's nonzero transition sequence rendered as one canonical
+20-digit zero-padded decimal component. The raw `current` target is exactly
+`activations/N`, and the activation's raw `version` target is exactly
+`../../versions/X.Y.Z`; absolute targets, traversal variants, extra components,
+and link chains fail ownership verification. Under the nonblocking installation
+lock, a transition builder verifies the live prior activation and requires
+`N = prior N + 1` without wraparound; the initial standalone activation is
+sequence one. The receipt schema additionally requires install, update, and
+confirmed-migration sequences to equal the newly installed version sequence,
+and rollback sequences to exceed every active or retained installation
+sequence. A parsed receipt alone cannot establish this live monotonic floor.
+
+Install-receipt v1 has independent receipt, state-layout, and
+installation-layout schema integers. It records a local-only random
+installation ID; active/retained standalone releases bind the target, manifest
+digest, archive digest, exact installed-marker digest, and nonzero installation
+sequence. Retained order is activation recency, not SemVer order, and contains
+at most two releases distinct from the active release. The last successful
+transition records a monotonically increasing nonzero sequence, type, from/to
+owner and release, its recorded evidence class, and a diagnostic completion
+time. Verified standalone
+install/update/migration transitions bind the versions of all four update
+metadata roles; rollback binds the retained manifest; manager updates bind the
+selected manager route. These are audit claims until live evidence is
+reverified. A manager/manual active release may omit bundle identity, or may
+bind a manifest/archive when that channel ships them, but it never claims a
+standalone marker or retained release. No receipt contains arbitrary deletion
+paths or manager argv.
+
+The executable in `~/.local/bin` resolves `current/version/bin/hf2q`. Installed
 launcher entry points resolve paths relative to that version and use the
 model/profile registry; they contain no `/opt/hf2q` assumption.
 
@@ -254,9 +313,12 @@ The installer:
 7. verifies the archive digest with macOS `shasum`, extracts the remaining
    allowlisted files, and verifies the manifest, every file digest/mode, and the
    complete inventory before activation;
-8. installs into a new version directory and atomically switches `current`;
-9. writes an install receipt and retains the active version plus two prior
-   verified versions; and
+8. writes and syncs the immutable installed-version marker and installs the
+   fully verified directory under a never-replaced version name;
+9. creates and syncs a never-replaced activation directory containing the
+   complete install receipt and exact relative version link, then atomically
+   switches and syncs `current` as the only activation commit while retaining
+   the active version plus two prior verified versions; and
 10. updates shell PATH idempotently when needed, then runs a
    packaged-install-aware
    `hf2q doctor`.
@@ -282,7 +344,11 @@ shell. `--no-modify-path` skips the edit, unknown shells receive copyable
 instructions, repeat installs do not duplicate text, and uninstall removes
 only the exact owned block.
 
-An interrupted or failed install leaves the prior `current` target usable.
+Before the `current` commit, interruption leaves the prior activation usable.
+After the commit, `current` selects the complete new activation receipt,
+relative version link, directory, and immutable marker. Partial activation
+directories are never selected, and no independent active-receipt rename can
+produce a receipt/current mismatch.
 The installer never requires `sudo` and never writes `/usr/local` or another
 system prefix by default. It installs no model or optional integration, invokes
 no third-party installer, and never runs npm, Docker, Homebrew, or an OpenCode
@@ -302,6 +368,20 @@ converted models, calibration receipts, session snapshots, OpenCode
 configuration, Agentic Kit state, and every third-party service by default,
 and prints the preserved data location. A separate explicit `--purge-data`
 confirmation is required to remove model and session data.
+
+The immutable activation receipt is never repurposed as mutable uninstall
+state. Before the first removal, uninstall durably creates the separate bounded
+`~/.hf2q/uninstall/uninstall-state.json` journal with a closed schema: package,
+schema version, installation ID, starting activation sequence, purge-data
+choice, and a phase enum. It contains no arbitrary paths. Each phase is written
+with private permissions, file sync, atomic same-directory rename, and parent
+directory sync before the next schema-derived removal begins. Resume requires
+the same live ownership evidence and installation identity; mismatch refuses
+mutation. The journal is removed only after the entry point, `current`, owned
+installation/update files, and owned PATH stanza reach the recorded terminal
+state. Default uninstall keeps the state root and user data, so this journal
+remains available across interruption. Purge-data is a subsequent explicit
+data transaction and cannot weaken the installation-uninstall recovery rule.
 
 ### 3. Update the whole managed installation atomically
 
@@ -374,8 +454,9 @@ standalone layout; it never silently overwrites the executable. Package
 ownership determines how an update is performed, not whether the user can
 invoke `hf2q update`.
 
-Ownership resolution is evidence-based and ordered: a valid standalone receipt
-whose entry point resolves into its recorded root; a Homebrew formula query
+Ownership resolution is evidence-based and ordered: a live standalone layout
+whose entry point, raw `current` target, version marker, manifest, and receipt
+all verify within the opened recorded root; a Homebrew formula query
 whose Cellar path owns the running executable; then Cargo's installed-package
 registry plus its configured install root. Location alone is never sufficient.
 Cargo's installed-package records are an internal, unstabilized part of
@@ -387,6 +468,16 @@ existing valid preference wins; otherwise an available cargo-binstall in the
 same Cargo home is selected and plain Cargo is the fallback. Ambiguous or
 contradictory evidence becomes `unknown/manual` and cannot authorize an
 overwrite.
+
+The receipt's owner and route are only the last observation. Every mutation
+reruns the ordered live evidence while holding the nonblocking installation
+lock. The valid route matrix is `standalone -> standalone`,
+`homebrew -> brew`, `cargo-registry -> cargo-install|cargo-binstall`, and
+`unknown/manual -> absent`. Manager/manual receipts have no retained releases;
+their active release-manifest identity may be absent when that package channel
+does not install an hf2q release bundle. The shared state root and the
+owner-controlled installation root are distinct fields; they are equal for a
+standalone install and may differ for manager/manual ownership.
 
 Automatic `--rollback` is a standalone-only operation because only the
 standalone layout owns retained versions. Under Homebrew or Cargo-registry
@@ -767,7 +858,7 @@ support.
 | Replayed old metadata or release | Version/expiry/role checks reject rollback and freeze; no downgrade occurs without explicit selection of a previously verified retained version. |
 | Published asset replacement | Immutable draft-to-publish flow forbids overwrite; clients bind exact hashes rather than trusting a mutable tag alone. |
 | Malicious archive path/link | A listing-only allowlist/path/type pass precedes any extraction; only the signed binary is extracted first, all remaining files stay in private staging until their signed inventory/digests verify, and no write escapes staging or the new version directory. |
-| Interrupted install/update | The old `current` target and receipt remain active; partial staging is not executable. |
+| Interrupted install/update | Before activation, old `current` selects the complete old activation. After the sole commit, new `current` selects one complete immutable receipt, relative version link, version, and marker. Partial staging is never executable. |
 | Concurrent updater | Installation lock admits one transition and leaves no ambiguous active version. |
 | Package-manager collision | Receipt plus manager-database ownership evidence prevents self-overwrite; Cargo route history is never guessed, and `hf2q update` delegates through the recorded/selected route and verifies the result. |
 | Offline or hostile update endpoint | Normal commands continue and only verified cached metadata may produce a notice. Installation uses the immutable release's signed bootstrap snapshot rather than the live endpoint; absent or invalid required release files fail before activation. |
@@ -796,6 +887,9 @@ before public self-update ships.
    its application target records. Every schema lands with bounded hostile
    input and golden-byte fixtures; schema parsing alone never creates an
    authenticated or ownership-verified capability.
+   Before uninstall implementation, freeze and adversarially test its separate
+   bounded journal schema and recovery state machine; activation receipts stay
+   immutable.
 2. Implement `hf2q setup`, the unified `~/.hf2q` state layout, idempotent
    Bash/zsh PATH ownership, hardware inventory, and the one-question bounded
    session policy.
@@ -856,7 +950,7 @@ files.
   Agentic Kit, and third-party service state, and never follows a changed path
   or symlink outside that inventory; `--purge-data` without explicit
   confirmation removes nothing, and interruption leaves either the prior
-  runnable installation or a receipt-marked retryable uninstall state with no
+  runnable installation or a journal-marked retryable uninstall state with no
   dangling `current` target;
 - each packaged launcher has already passed its governing family release gate,
   resolves only installed relative paths, and rejects missing/incompatible
