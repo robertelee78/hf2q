@@ -106,6 +106,14 @@ to a sibling checkout.
 space, optional RuVector backend); run it after `cargo install` if
 anything misbehaves.
 
+Release builds also provision tab completion automatically on the first normal
+invocation. Bash, Zsh, and Fish registrations stay synchronized with the
+installed clap grammar; start a new shell after the first run. Existing
+non-hf2q completion files are left untouched. Set
+`HF2Q_NO_COMPLETION_INSTALL=1` to disable this behavior. The
+`hf2q completions --shell <shell>` command remains available for packaging or
+manual setup.
+
 ## CLI subcommands
 
 | Command | What it does |

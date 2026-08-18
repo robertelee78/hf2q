@@ -1,7 +1,7 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
-- Status: Proposed; product interview reconciled, implementation and
-  exact-artifact proof pending
+- Status: Proposed; product interview reconciled, shell-completion bootstrap
+  implemented, remaining distribution work and exact-artifact proof pending
 - Date: 2026-08-17
 - Updated: 2026-08-17
 - Owners: hf2q release engineering and operator experience
@@ -87,6 +87,19 @@ release is known, hf2q prints one non-forcing notice to stderr and continues
 the requested command. `hf2q update` is the universal user-facing update
 command: it self-updates standalone installs atomically and delegates through
 the detected package owner when the executable is package-managed.
+
+Every normal release-binary invocation also best-effort reconciles hf2q-owned
+static clap completion scripts in the standard per-user Bash, Zsh, and Fish
+locations. The preferred Bash or Zsh startup file receives one bounded managed
+source block, so a newly started shell has Tab completion without a manual
+activation command. Setup failures never fail the requested hf2q command;
+foreign completion files, symlinks, non-regular paths, and malformed managed
+startup blocks are preserved. `HF2Q_NO_COMPLETION_INSTALL=1` opts out, while
+debug/test binaries require explicit isolated destinations and never discover
+live user paths. `hf2q completions --shell <shell>` remains the packaging and
+manual-generation surface. A child process cannot modify the already-running
+parent shell, so the zero-config guarantee begins with the next shell after the
+first normal hf2q invocation.
 
 ## Domain model
 

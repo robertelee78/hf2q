@@ -86,6 +86,13 @@ impl std::fmt::Display for AppError {
 }
 
 fn main() -> ExitCode {
+    // Best-effort zero-config tab completion. Release builds reconcile
+    // hf2q-owned Bash, Zsh, and Fish registrations in their per-user loader
+    // locations; debug/test builds require explicit isolated destinations.
+    // This must precede clap parsing so even --help/--version and parse errors
+    // can complete first-run setup. Failures never block the requested command.
+    cli::completion_install::reconcile();
+
     // Emit one-shot warning / ack-gate summary for any investigation-only
     // env vars that are set. Uses direct eprintln! (not tracing), so it
     // runs correctly before the subscriber is installed. Placed before
