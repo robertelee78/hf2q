@@ -334,15 +334,23 @@ history resets on every request.
 
 ## SOTA optimization program (August 2026)
 
-The first exact-output kernel candidate groups two query heads per KV head and
-reuses each packed K/V load and codebook lookup. Its Metal spike is bit-exact
-against the scalar kernel for TQ5/6/8 and measured 1.497x isolated GPU speedup
-at 8,192 KV tokens and 1.437x at 104,966. Q3 was slower because larger
-per-workgroup state reduced occupancy and was removed from the landing code.
-The downstream real-model release gate remains at least 15% end-to-end
-improvement at 105K and exact greedy output. Short contexts below 8,192 retain
-the legacy dispatch by construction; selector and invalid-geometry tests pin
-that no-route-change contract instead of publishing an unmeasured percentage.
+The first exact-output kernel groups two query heads per KV head and reuses
+each packed K/V load and codebook lookup. The published 0.10.9 version was
+bit-exact against the scalar kernel for TQ5/6/8, but its first sealed hf2q
+OFF/AUTO/AUTO/OFF run improved 17.1767 to 19.5490 tok/s, only 13.8112%, and
+correctly failed the fixed 15% gate. NSG and NWG sweeps did not supply enough
+margin. Keeping each lane's query slice in registers instead reduced
+threadgroup memory from 11,264 to 10,240 bytes and moved Q2 across the 32 KiB
+three-workgroup occupancy boundary. Three isolated 104,966-token processes
+then measured 1.603x, 1.610x, and 1.615x; the 1,000-step thermal ratio was
+0.999. A local path-patched hf2q spike improved 16.5732 to 20.6089 tok/s
+(24.3506%) with identical semantic hashes. That is hypothesis proof, not
+release authority; publication, immutable dependency pinning, and the
+protected exact-artifact receipt remain mandatory. Q3 was slower because
+larger per-workgroup state reduced occupancy and was removed from the landing
+code. Short contexts below 8,192 retain the legacy dispatch, and the protected
+gate must re-verify no more than 2% regression rather than assuming the old
+crossover transfers.
 
 That release gate binds its throughput calculation to one exactly-once
 `Qwen35 decode complete` event from the request's real SlotAware completion

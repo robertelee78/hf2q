@@ -316,13 +316,26 @@ The same model predicted 24.09 tok/s at 17,807 tokens versus 22.1 observed and
 loss as a kernel-layout limit, independent of the separate model/tool retry
 loop.
 
-Published `mlx-native 0.10.9` adds a bit-exact D=256 GQA-cooperative Q2 TQ-HB
-kernel. It shares one packed K/V load and dequantization across two query heads
-without changing per-query online-softmax state or the final reduction layout.
-The isolated Apple M5 Max gate measured 1.497x at 8K and 1.437x at 104,966 KV
-tokens, with multi-chunk bit equality and a 1.001 first-versus-last median ratio
-over 1,000 sustained 105K steps. Q3 was not retained because its threadgroup
-memory and occupancy tradeoff did not justify a second production variant.
+Published `mlx-native 0.10.9` added the first bit-exact D=256
+GQA-cooperative Q2 TQ-HB kernel. It shares one packed K/V load and
+dequantization across two query heads without changing per-query
+online-softmax state or the final reduction layout. Its first sealed hf2q
+OFF/AUTO/AUTO/OFF run measured 17.1767 versus 19.5490 tok/s, a 13.8112% gain,
+and correctly failed the fixed 15% release gate.
+
+Split retuning did not close the gap: NSG4 remained faster than NSG2/NSG1,
+and the best NWG point improved the candidate by only about 1.3%. The revised
+kernel instead retains each lane's query slice in registers. It remains
+bit-identical across TQ5/TQ6/TQ8 and reduces threadgroup memory from 11,264 to
+10,240 bytes, crossing the 32 KiB three-workgroup occupancy boundary. Three
+isolated 104,966-token processes measured 1.603x, 1.610x, and 1.615x; a
+1,000-step run had a 0.999 first-versus-last median ratio. A local
+path-patched hf2q spike then measured 16.5732 versus 20.6089 tok/s, a 24.3506%
+gain, with identical semantic hashes. That spike proves the reformulated
+hypothesis but is not release authority: the register-resident kernel must be
+published in an immutable mlx-native crate and consumed without a Cargo patch.
+Q3 was not retained because its threadgroup-memory and occupancy tradeoff did
+not justify a second production variant.
 
 hf2q's candidate selector defaults to `auto`: it remains on the legacy kernel
 below 8,192 KV tokens and requires the exact Qwen3.8 D=256/GQA/no-mask geometry
