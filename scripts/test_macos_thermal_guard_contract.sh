@@ -133,6 +133,35 @@ kill -TERM "$supervised_pid" 2>/dev/null || true
 wait "$supervised_pid" 2>/dev/null || true
 test "$(tail -1 "$tmp_dir/supervised-fair.log" | awk -F '\t' '{print $2}')" = fair
 
+# Long calibrated workloads may reach Fair after a Nominal start. The bounded
+# monitor accepts Fair but still fails closed on Serious/Critical.
+sequence=(nominal fair fair)
+sequence_index=0
+thermal_read_state() { read_sequence_state; }
+(sleep 0.1) &
+supervised_pid=$!
+thermal_monitor_fair_or_better_while_pid "$tmp_dir/supervised-bounded.log" \
+  supervised-bounded "$supervised_pid" 0
+wait "$supervised_pid"
+test -s "$tmp_dir/supervised-bounded.log"
+
+sequence=(fair serious)
+sequence_index=0
+thermal_read_state() { read_sequence_state; }
+(sleep 5) &
+supervised_pid=$!
+if thermal_monitor_fair_or_better_while_pid \
+  "$tmp_dir/supervised-bounded-serious.log" supervised-bounded-serious \
+  "$supervised_pid" 0; then
+  echo "bounded thermal monitor accepted a serious state" >&2
+  kill -TERM "$supervised_pid" 2>/dev/null || true
+  wait "$supervised_pid" 2>/dev/null || true
+  exit 1
+fi
+kill -TERM "$supervised_pid" 2>/dev/null || true
+wait "$supervised_pid" 2>/dev/null || true
+test "$(tail -1 "$tmp_dir/supervised-bounded-serious.log" | awk -F '\t' '{print $2}')" = serious
+
 # Cold-cohort measurement ends only after the exact number of non-empty,
 # atomically published cold receipts exists. Later functional phases are not
 # part of the calibrated thermal envelope.
@@ -232,6 +261,20 @@ fi
 printf '100\tnominal\tstart\n102\tfair\tend\n' >"$tmp_dir/non-nominal.log"
 if thermal_validate_measurement_log "$tmp_dir/non-nominal.log" 5; then
   echo "thermal validator accepted a non-Nominal measurement" >&2
+  exit 1
+fi
+printf '100\tnominal\tstart\n102\tfair\tmiddle\n104\tfair\tend\n' \
+  >"$tmp_dir/valid-bounded-measurement.log"
+thermal_validate_fair_or_better_measurement_log \
+  "$tmp_dir/valid-bounded-measurement.log" 5
+test "$THERMAL_LOG_SAMPLES" = 3
+test "$THERMAL_LOG_FAIR_SAMPLES" = 2
+test "$THERMAL_LOG_OVER_LIMIT_SAMPLES" = 0
+printf '100\tfair\tstart\n102\tserious\tend\n' \
+  >"$tmp_dir/invalid-bounded-measurement.log"
+if thermal_validate_fair_or_better_measurement_log \
+  "$tmp_dir/invalid-bounded-measurement.log" 5; then
+  echo "bounded thermal validator accepted a serious measurement" >&2
   exit 1
 fi
 printf '100\tnominal\tsettle\n160\tnominal\tsettle\n' >"$tmp_dir/settle-gap.log"

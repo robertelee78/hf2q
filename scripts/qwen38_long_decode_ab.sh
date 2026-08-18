@@ -20,9 +20,12 @@ readonly PROMPT_PADDING_TOKENS=105000
 readonly MIN_PROMPT_TOKENS=100000
 readonly MAX_PROMPT_TOKENS=120000
 readonly MIN_IMPROVEMENT_PERCENT=15
+readonly TRIAL_SETTLE_SECONDS=30
 readonly TRIAL_ORDER='off auto auto off'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$script_dir/macos_thermal_guard.sh"
 
 for command in awk basename cp curl date find grep jq lsof mv rg sed shasum \
   sort stat sw_vers sysctl uname wc; do
@@ -121,6 +124,15 @@ jq -n --rawfile prompt "$OUT_DIR/prompt.txt" \
 mv "$OUT_DIR/request.json.tmp" "$OUT_DIR/request.json"
 jq -e 'has("seed") | not' "$OUT_DIR/request.json" >/dev/null
 request_sha=$(sha256_file "$OUT_DIR/request.json")
+: >"$OUT_DIR/phase.log"
+
+record_phase() {
+  local trial_index=$1
+  local mode=$2
+  local event=$3
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$trial_index" "$mode" "$event" \
+    >>"$OUT_DIR/phase.log"
+}
 
 server_pid=''
 request_pid=''
@@ -196,6 +208,10 @@ run_trial() {
   cp "$OUT_DIR/request.json" "$trial_dir/request.json"
   printf 'HF2Q_QWEN_GQA_Q2=%s\nHF2Q_PIPELINE_PREWARM_LOG=1\nQWEN38_VISION=off\n' \
     "$mode" >"$trial_dir/environment.txt"
+  thermal_wait_for_nominal "$trial_dir/settle.log" \
+    "qwen38-trial-${trial_index}-${mode}-settle" \
+    "$TRIAL_SETTLE_SECONDS" 900 5
+  record_phase "$trial_index" "$mode" trial-start
 
   "$script_dir/seal_release_binary.sh" --verify "$BINARY_PATH" "$BINARY_SHA256" \
     >/dev/null
@@ -223,6 +239,7 @@ run_trial() {
     return 1
   }
 
+  record_phase "$trial_index" "$mode" request-start
   curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 1800 \
     -H 'Content-Type: application/json' \
     --data-binary "@$trial_dir/request.json" \
@@ -233,12 +250,14 @@ run_trial() {
   request_pid=$!
   wait "$request_pid"
   request_pid=''
+  record_phase "$trial_index" "$mode" request-end
   grep -qx 'http_code=200' "$trial_dir/curl.metrics"
   ready_code=$(curl --silent --show-error --max-time 3 \
     -o "$trial_dir/readyz.json" -w '%{http_code}' \
     "http://127.0.0.1:$PORT/readyz")
   [[ "$ready_code" == 200 ]]
   stop_server
+  record_phase "$trial_index" "$mode" trial-end
 
   jq -e --arg model "$MODEL_ID" --argjson max_tokens "$MAX_TOKENS" \
     --argjson min_prompt "$MIN_PROMPT_TOKENS" \
@@ -295,7 +314,7 @@ run_trial() {
   fi
 
   artifacts_json=$(
-    for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
+    for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
       jq -n --arg name "$name" --arg sha256 "$(sha256_file "$trial_dir/$name")" \
         '{name:$name,sha256:$sha256}'
     done | jq -s .
@@ -358,6 +377,8 @@ done
 test "$(file_identity "$BINARY_PATH")" = "$binary_identity"
 test "$(file_identity "$MODEL_PATH")" = "$model_identity"
 test "$(sha256_file "$MODEL_PATH")" = "$MODEL_SHA256"
+phase_sha=$(sha256_file "$OUT_DIR/phase.log")
+phase_bytes=$(file_bytes "$OUT_DIR/phase.log")
 
 jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --arg source_sha "$SOURCE_SHA" --arg crate_sha256 "$CRATE_SHA256" \
@@ -366,6 +387,7 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --arg model_path "$MODEL_PATH" --arg model_sha256 "$MODEL_SHA256" \
   --arg model_file_identity "$model_identity" --argjson model_bytes "$model_bytes" \
   --arg prompt_sha256 "$prompt_sha" --argjson prompt_bytes "$prompt_bytes" \
+  --arg phase_sha256 "$phase_sha" --argjson phase_bytes "$phase_bytes" \
   --arg request_sha256 "$request_sha" --arg hardware_model "$hardware_model" \
   --arg hardware_chip "$hardware_chip" --arg hardware_arch "$hardware_arch" \
   --arg hardware_os "$hardware_os" --argjson hardware_memory_bytes "$hardware_memory_bytes" \
@@ -373,6 +395,7 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --argjson prompt_padding_tokens "$PROMPT_PADDING_TOKENS" \
   --argjson min_prompt_tokens "$MIN_PROMPT_TOKENS" \
   --argjson max_prompt_tokens "$MAX_PROMPT_TOKENS" \
+  --argjson trial_settle_seconds "$TRIAL_SETTLE_SECONDS" \
   --argjson minimum_improvement_percent "$MIN_IMPROVEMENT_PERCENT" \
   --argjson off_median "$off_median" --argjson auto_median "$auto_median" \
   --argjson improvement_percent "$improvement_percent" \
@@ -388,12 +411,13 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
         file_identity:$model_file_identity,bytes:$model_bytes},
       prompt:{path:"prompt.txt",sha256:$prompt_sha256,bytes:$prompt_bytes,
         padding_tokens:$prompt_padding_tokens},
+      phase_log:{path:"phase.log",sha256:$phase_sha256,bytes:$phase_bytes},
       request:{path:"request.json",sha256:$request_sha256},
       hardware:{model:$hardware_model,chip:$hardware_chip,arch:$hardware_arch,
         memory_bytes:$hardware_memory_bytes,os_version:$hardware_os}},
     settings:{temperature:0,max_tokens:$max_tokens,stream:false,
       thinking:false,repetition_penalty:1.0,min_prompt_tokens:$min_prompt_tokens,
-      max_prompt_tokens:$max_prompt_tokens},
+      max_prompt_tokens:$max_prompt_tokens,trial_settle_seconds:$trial_settle_seconds},
     trial_order:["off","auto","auto","off"],
     trials:[$trial1[0],$trial2[0],$trial3[0],$trial4[0]],
     aggregate:{off_median_decode_tokens_per_second:$off_median,

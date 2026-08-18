@@ -103,6 +103,9 @@ jq -e \
     and (.identity.prompt.sha256 | test("^[0-9a-f]{64}$"))
     and (.identity.prompt.bytes | type) == "number" and .identity.prompt.bytes > 0
     and .identity.prompt.padding_tokens == 105000
+    and .identity.phase_log.path == "phase.log"
+    and (.identity.phase_log.sha256 | test("^[0-9a-f]{64}$"))
+    and (.identity.phase_log.bytes | type) == "number" and .identity.phase_log.bytes > 0
     and .identity.request.path == "request.json"
     and (.identity.request.sha256 | test("^[0-9a-f]{64}$"))
     and (.identity.hardware.model | type) == "string" and (.identity.hardware.model | length) > 0
@@ -120,13 +123,14 @@ jq -e \
     and .settings.repetition_penalty == 1.0
     and .settings.min_prompt_tokens == 100000
     and .settings.max_prompt_tokens == 120000
+    and .settings.trial_settle_seconds == 30
     and .trial_order == ["off","auto","auto","off"]
     and (.trials | type) == "array" and (.trials | length) == 4
     and .aggregate.minimum_improvement_percent == 15
     and (.aggregate.exact_output_sha256 | test("^[0-9a-f]{64}$"))
   ' "$summary" >/dev/null
 
-for root_artifact in prompt.txt request.json; do
+for root_artifact in prompt.txt request.json phase.log; do
   [[ -s "$benchmark_dir/$root_artifact" ]] || {
     echo "Qwen3.8 benchmark root artifact is missing: $root_artifact" >&2
     exit 1
@@ -138,6 +142,10 @@ test "$(file_bytes "$benchmark_dir/prompt.txt")" = \
   "$(jq -er .identity.prompt.bytes "$summary")"
 test "$(sha256_file "$benchmark_dir/request.json")" = \
   "$(jq -er .identity.request.sha256 "$summary")"
+test "$(sha256_file "$benchmark_dir/phase.log")" = \
+  "$(jq -er .identity.phase_log.sha256 "$summary")"
+test "$(file_bytes "$benchmark_dir/phase.log")" = \
+  "$(jq -er .identity.phase_log.bytes "$summary")"
 jq -e '
   ([.. | objects | has("seed")] | any | not)
   and .model == "Qwen3.8 27B"
@@ -156,6 +164,22 @@ cleanup_verifier() { rm -rf "$tmp"; }
 trap cleanup_verifier EXIT
 jq -jr '.messages[1].content' "$benchmark_dir/request.json" >"$tmp/request-prompt.txt"
 cmp "$benchmark_dir/prompt.txt" "$tmp/request-prompt.txt"
+expected_phase="$tmp/expected-phase"
+actual_phase="$tmp/actual-phase"
+phase_trial=0
+for phase_mode in off auto auto off; do
+  phase_trial=$((phase_trial + 1))
+  for phase_event in trial-start request-start request-end trial-end; do
+    printf '%s\t%s\t%s\n' "$phase_trial" "$phase_mode" "$phase_event"
+  done
+done >"$expected_phase"
+awk -F '\t' '
+  NF != 4 || $1 !~ /^[0-9]+$/ { exit 1 }
+  NR > 1 && $1 < previous { exit 1 }
+  { previous = $1; print $2 "\t" $3 "\t" $4 }
+  END { if (NR != 16) exit 1 }
+' "$benchmark_dir/phase.log" >"$actual_phase"
+cmp "$expected_phase" "$actual_phase"
 
 off_tps=()
 auto_tps=()
@@ -175,7 +199,7 @@ for mode in off auto auto off; do
   expected_inventory="$tmp/expected-inventory-$trial_index"
   actual_inventory="$tmp/actual-inventory-$trial_index"
   printf '%s\n' curl.metrics environment.txt models.json readyz.json request.json \
-    response.json semantic.json server.log trial.json | sort >"$expected_inventory"
+    response.json semantic.json server.log settle.log trial.json | sort >"$expected_inventory"
   find "$trial_dir" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; \
     | sort >"$actual_inventory"
   cmp "$expected_inventory" "$actual_inventory"
@@ -203,12 +227,12 @@ for mode in off auto auto off; do
       and (.decode_seconds | type) == "number" and .decode_seconds > 0
       and (.decode_tokens_per_second | type) == "number"
       and .decode_tokens_per_second > 0
-      and (.artifacts | type) == "array" and (.artifacts | length) == 8
-      and ([.artifacts[].name] | unique | length) == 8
+      and (.artifacts | type) == "array" and (.artifacts | length) == 9
+      and ([.artifacts[].name] | unique | length) == 9
       and all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")))
     ' "$trial_json" >/dev/null
 
-  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
+  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
     [[ -s "$trial_dir/$artifact" ]] || {
       echo "Qwen3.8 raw trial artifact is missing or empty: $artifact" >&2
       exit 1
@@ -236,6 +260,10 @@ for mode in off auto auto off; do
     (.object == "list")
     and ([.data[] | select(.loaded == true) | .id] == ["Qwen3.8 27B"])
   ' "$trial_dir/models.json" >/dev/null
+  thermal_validate_settle_log "$trial_dir/settle.log" 30 8
+  awk -F '\t' -v phase="qwen38-trial-${trial_index}-${mode}-settle" '
+    $3 != phase { exit 1 }
+  ' "$trial_dir/settle.log"
 
   response="$trial_dir/response.json"
   jq -e '
@@ -349,7 +377,8 @@ if [[ "$verification_scope" == release ]]; then
   jq -e --arg benchmark_sha256 "$(sha256_file "$summary")" '
     .status == "pass"
     and .phase == "qwen38-long-decode"
-    and .required_state == "nominal"
+    and .required_start_state == "nominal"
+    and .maximum_measurement_state == "fair"
     and .runtime_preflight == "pass"
     and .measurement_scope == "full-abba-benchmark"
     and .benchmark_summary_sha256 == $benchmark_sha256
@@ -362,7 +391,9 @@ if [[ "$verification_scope" == release ]]; then
     and .maximum_sample_gap_seconds == 5
     and .settle_sample_interval_seconds == 5
     and .maximum_settle_sample_gap_seconds == 8
-    and .non_nominal_measurement_samples == 0
+    and .non_nominal_measurement_samples >= 0
+    and .fair_measurement_samples >= 0
+    and .over_limit_measurement_samples == 0
     and .settle_telemetry_gaps == 0
     and .telemetry_gaps == 0
     and (.settle_log_sha256 | test("^[0-9a-f]{64}$"))
@@ -372,21 +403,63 @@ if [[ "$verification_scope" == release ]]; then
     "$(jq -er .measurement_log_sha256 "$thermal_summary")"
   test "$(sha256_file "$settle_log")" = \
     "$(jq -er .settle_log_sha256 "$thermal_summary")"
-  thermal_validate_measurement_log "$measurement_log" 5
+  thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
   test "$THERMAL_LOG_SAMPLES" = "$(jq -er .measurement_samples "$thermal_summary")"
   test "$THERMAL_LOG_DURATION_SECONDS" = \
     "$(jq -er .measurement_duration_seconds "$thermal_summary")"
   test "$THERMAL_LOG_NON_NOMINAL_SAMPLES" = \
     "$(jq -er .non_nominal_measurement_samples "$thermal_summary")"
+  test "$THERMAL_LOG_FAIR_SAMPLES" = \
+    "$(jq -er .fair_measurement_samples "$thermal_summary")"
+  test "$THERMAL_LOG_OVER_LIMIT_SAMPLES" = \
+    "$(jq -er .over_limit_measurement_samples "$thermal_summary")"
   test "$THERMAL_LOG_GAPS" = "$(jq -er .telemetry_gaps "$thermal_summary")"
   test "$(head -1 "$measurement_log" | awk -F '\t' '{print $3}')" = \
     qwen38-long-decode-measurement-start
+  test "$(head -1 "$measurement_log" | awk -F '\t' '{print $2}')" = nominal
   test "$(tail -1 "$measurement_log" | awk -F '\t' '{print $3}')" = \
     qwen38-long-decode-measurement-end
   awk -F '\t' '
     NR > 1 && $3 != "qwen38-long-decode-measurement" &&
       $3 != "qwen38-long-decode-measurement-end" { exit 1 }
   ' "$measurement_log"
+
+  decode_state_ranks=()
+  trial_index=0
+  for mode in off auto auto off; do
+    trial_index=$((trial_index + 1))
+    request_end=$(awk -F '\t' -v trial="$trial_index" -v mode="$mode" '
+      $2 == trial && $3 == mode && $4 == "request-end" { print $1 }
+    ' "$benchmark_dir/phase.log")
+    decode_seconds=$(jq -er .decode_seconds \
+      "$benchmark_dir/trial-${trial_index}-${mode}/trial.json")
+    decode_start=$(awk -v end="$request_end" -v seconds="$decode_seconds" \
+      'BEGIN { print int(end - seconds - 2) }')
+    decode_end=$((request_end + 2))
+    decode_rank=$(awk -F '\t' -v start="$decode_start" -v end="$decode_end" '
+      function rank(state) {
+        if (state == "nominal") return 0
+        if (state == "fair") return 1
+        if (state == "serious") return 2
+        if (state == "critical") return 3
+        return 4
+      }
+      $1 >= start && $1 <= end {
+        value = rank($2)
+        if (value > maximum) maximum = value
+        samples++
+      }
+      END {
+        if (samples < 2 || maximum > 1) exit 1
+        print maximum
+      }
+    ' "$measurement_log")
+    decode_state_ranks+=("$decode_rank")
+  done
+  [[ ${#decode_state_ranks[@]} == 4 ]]
+  test "${decode_state_ranks[0]}" = "${decode_state_ranks[1]}"
+  test "${decode_state_ranks[0]}" = "${decode_state_ranks[2]}"
+  test "${decode_state_ranks[0]}" = "${decode_state_ranks[3]}"
   thermal_validate_settle_log "$settle_log" 60 8
   test "$THERMAL_LOG_SAMPLES" = "$(jq -er .settle_samples "$thermal_summary")"
   test "$THERMAL_LOG_DURATION_SECONDS" = \

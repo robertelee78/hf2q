@@ -513,7 +513,9 @@ jobs:
                and ($q38.long_decode.benchmark.settings | has("seed") | not)
                and $q38.long_decode.benchmark.aggregate.improvement_percent >= 15
                and $q38.long_decode.thermal.status == "pass"
-               and $q38.long_decode.thermal.required_state == "nominal"
+               and $q38.long_decode.thermal.required_start_state == "nominal"
+               and $q38.long_decode.thermal.maximum_measurement_state == "fair"
+               and $q38.long_decode.thermal.over_limit_measurement_samples == 0
                and $q38.long_decode.thermal.measurement_scope == "full-abba-benchmark")' \
             "$manifest" >/dev/null
           expected_crate_sha=$(jq -er '.crate_sha256' "$manifest")

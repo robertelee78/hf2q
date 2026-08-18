@@ -20,6 +20,7 @@ build_fixture() {
   local slow_auto=${3:-0}
   local benchmark_dir="$destination/benchmark"
   local trial_index mode decode_tps decode_seconds elapsed_ms prewarm
+  local trial_start request_start request_end trial_end
   local trial_dir artifacts_json prompt_sha prompt_bytes request_sha semantic_sha
   mkdir -p "$benchmark_dir" "$destination/thermal"
   printf 'synthetic canonical prompt\n' >"$benchmark_dir/prompt.txt"
@@ -37,6 +38,7 @@ build_fixture() {
   prompt_sha=$(sha256_file "$benchmark_dir/prompt.txt")
   prompt_bytes=$(wc -c <"$benchmark_dir/prompt.txt" | tr -d ' ')
   request_sha=$(sha256_file "$benchmark_dir/request.json")
+  : >"$benchmark_dir/phase.log"
 
   trial_index=0
   for mode in off auto auto off; do
@@ -59,6 +61,18 @@ build_fixture() {
         ;;
       4) decode_tps=12; decode_seconds=42.6666666667 ;;
     esac
+    case "$trial_index" in
+      1) trial_start=2000; request_start=2001; request_end=2053; trial_end=2054 ;;
+      2) trial_start=2055; request_start=2056; request_end=2094; trial_end=2095 ;;
+      3) trial_start=2096; request_start=2097; request_end=2130; trial_end=2131 ;;
+      4) trial_start=2132; request_start=2133; request_end=2177; trial_end=2178 ;;
+    esac
+    {
+      printf '%s\t%s\t%s\ttrial-start\n' "$trial_start" "$trial_index" "$mode"
+      printf '%s\t%s\t%s\trequest-start\n' "$request_start" "$trial_index" "$mode"
+      printf '%s\t%s\t%s\trequest-end\n' "$request_end" "$trial_index" "$mode"
+      printf '%s\t%s\t%s\ttrial-end\n' "$trial_end" "$trial_index" "$mode"
+    } >>"$benchmark_dir/phase.log"
     elapsed_ms=$(awk -v seconds="$decode_seconds" 'BEGIN { printf "%.6f", seconds * 1000 }')
     if [[ "$mode" == auto ]]; then prewarm=true; else prewarm=false; fi
     trial_dir="$benchmark_dir/trial-${trial_index}-${mode}"
@@ -81,6 +95,10 @@ build_fixture() {
     printf '{"ready":true,"detail":"ready"}\n' >"$trial_dir/readyz.json"
     printf '{"object":"list","data":[{"id":"Qwen3.8 27B","loaded":true}]}\n' \
       >"$trial_dir/models.json"
+    for offset in 0 5 10 15 20 25 30; do
+      printf '%s\tnominal\tqwen38-trial-%s-%s-settle\n' \
+        "$((1000 + trial_index * 100 + offset))" "$trial_index" "$mode"
+    done >"$trial_dir/settle.log"
     printf 'HF2Q_QWEN_GQA_Q2=%s\nHF2Q_PIPELINE_PREWARM_LOG=1\nQWEN38_VISION=off\n' \
       "$mode" >"$trial_dir/environment.txt"
     {
@@ -93,7 +111,7 @@ build_fixture() {
     } >"$trial_dir/server.log"
     semantic_sha=$(sha256_file "$trial_dir/semantic.json")
     artifacts_json=$(
-      for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
+      for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
         jq -n --arg name "$name" --arg sha256 "$(sha256_file "$trial_dir/$name")" \
           '{name:$name,sha256:$sha256}'
       done | jq -s .
@@ -121,9 +139,12 @@ build_fixture() {
   improvement_percent=$(awk -v baseline="$off_median" -v candidate="$auto_median" \
     'BEGIN { printf "%.6f", ((candidate / baseline) - 1) * 100 }')
   semantic_sha=$(sha256_file "$benchmark_dir/trial-1-off/semantic.json")
+  phase_sha=$(sha256_file "$benchmark_dir/phase.log")
+  phase_bytes=$(wc -c <"$benchmark_dir/phase.log" | tr -d ' ')
   jq -n --arg source_sha "$source_sha" --arg crate_sha256 "$crate_sha" \
     --arg binary_sha256 "$binary_sha" --arg model_sha256 "$model_sha" \
     --arg prompt_sha256 "$prompt_sha" --argjson prompt_bytes "$prompt_bytes" \
+    --arg phase_sha256 "$phase_sha" --argjson phase_bytes "$phase_bytes" \
     --arg request_sha256 "$request_sha" --arg semantic_sha256 "$semantic_sha" \
     --argjson off_median "$off_median" --argjson auto_median "$auto_median" \
     --argjson improvement_percent "$improvement_percent" \
@@ -138,11 +159,13 @@ build_fixture() {
          sha256:$model_sha256,file_identity:"3:4",bytes:123456},
        prompt:{path:"prompt.txt",sha256:$prompt_sha256,bytes:$prompt_bytes,
          padding_tokens:105000},
+       phase_log:{path:"phase.log",sha256:$phase_sha256,bytes:$phase_bytes},
        request:{path:"request.json",sha256:$request_sha256},
        hardware:{model:"Mac16,1",chip:"Apple M5 Max",arch:"arm64",
          memory_bytes:137438953472,os_version:"26.0"}},
      settings:{temperature:0,max_tokens:512,stream:false,thinking:false,
-       repetition_penalty:1.0,min_prompt_tokens:100000,max_prompt_tokens:120000},
+       repetition_penalty:1.0,min_prompt_tokens:100000,max_prompt_tokens:120000,
+       trial_settle_seconds:30},
      trial_order:["off","auto","auto","off"],
      trials:[$trial1[0],$trial2[0],$trial3[0],$trial4[0]],
      aggregate:{off_median_decode_tokens_per_second:$off_median,
@@ -156,21 +179,27 @@ build_fixture() {
   for offset in 0 5 10 15 20 25 30 35 40 45 50 55 60; do
     printf '%d\tnominal\tqwen38-long-decode-settle\n' "$((1000 + offset))"
   done >"$destination/thermal/settle.log"
-  {
-    printf '2000\tnominal\tqwen38-long-decode-measurement-start\n'
-    printf '2002\tnominal\tqwen38-long-decode-measurement\n'
-    printf '2004\tnominal\tqwen38-long-decode-measurement-end\n'
-  } >"$destination/thermal/measurement.log"
+  for epoch in $(seq 1998 2 2180); do
+    if [[ "$epoch" == 1998 ]]; then
+      printf '%s\tnominal\tqwen38-long-decode-measurement-start\n' "$epoch"
+    elif [[ "$epoch" == 2180 ]]; then
+      printf '%s\tfair\tqwen38-long-decode-measurement-end\n' "$epoch"
+    else
+      printf '%s\tfair\tqwen38-long-decode-measurement\n' "$epoch"
+    fi
+  done >"$destination/thermal/measurement.log"
   jq -n --arg benchmark_summary_sha256 "$(sha256_file "$benchmark_dir/summary.json")" \
     --arg settle_log_sha256 "$(sha256_file "$destination/thermal/settle.log")" \
     --arg measurement_log_sha256 "$(sha256_file "$destination/thermal/measurement.log")" '
-    {status:"pass",phase:"qwen38-long-decode",required_state:"nominal",
+    {status:"pass",phase:"qwen38-long-decode",required_start_state:"nominal",
+     maximum_measurement_state:"fair",
      runtime_preflight:"pass",measurement_scope:"full-abba-benchmark",
      benchmark_summary_sha256:$benchmark_summary_sha256,settle_seconds:60,
-     settle_duration_seconds:60,settle_samples:13,measurement_samples:3,
-     measurement_duration_seconds:4,sample_interval_seconds:2,
+     settle_duration_seconds:60,settle_samples:13,measurement_samples:92,
+     measurement_duration_seconds:182,sample_interval_seconds:2,
      maximum_sample_gap_seconds:5,settle_sample_interval_seconds:5,
-     maximum_settle_sample_gap_seconds:8,non_nominal_measurement_samples:0,
+     maximum_settle_sample_gap_seconds:8,non_nominal_measurement_samples:91,
+     fair_measurement_samples:91,over_limit_measurement_samples:0,
      settle_telemetry_gaps:0,telemetry_gaps:0,
      settle_log_sha256:$settle_log_sha256,
      measurement_log_sha256:$measurement_log_sha256}
@@ -208,7 +237,7 @@ rehash_trial_into_summary() {
   local trial_json="$trial_dir/trial.json"
   local summary="$fixture/benchmark/summary.json"
   local artifact
-  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
+  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt settle.log; do
     jq --arg name "$artifact" --arg sha "$(sha256_file "$trial_dir/$artifact")" '
       .artifacts |= map(if .name == $name then .sha256 = $sha else . end)
     ' "$trial_json" >"$trial_json.tmp"
@@ -271,11 +300,14 @@ expect_rejected "$slow" below-fifteen-percent
 
 non_nominal="$tmp/non-nominal"
 cp -R "$valid" "$non_nominal"
-sed '2s/nominal/fair/' "$non_nominal/thermal/measurement.log" \
+sed '2s/fair/serious/' "$non_nominal/thermal/measurement.log" \
   >"$non_nominal/thermal/measurement.tmp"
 mv "$non_nominal/thermal/measurement.tmp" "$non_nominal/thermal/measurement.log"
 jq --arg sha "$(sha256_file "$non_nominal/thermal/measurement.log")" \
-  '.measurement_log_sha256 = $sha' "$non_nominal/thermal/summary.json" \
+  '.measurement_log_sha256 = $sha
+   | .fair_measurement_samples = 90
+   | .over_limit_measurement_samples = 1' \
+  "$non_nominal/thermal/summary.json" \
   >"$non_nominal/thermal/summary.tmp"
 mv "$non_nominal/thermal/summary.tmp" "$non_nominal/thermal/summary.json"
 jq -n --slurpfile benchmark "$non_nominal/benchmark/summary.json" \
@@ -283,5 +315,28 @@ jq -n --slurpfile benchmark "$non_nominal/benchmark/summary.json" \
   '{schema_version:1,status:"pass",benchmark:$benchmark[0],thermal:$thermal[0]}' \
   >"$non_nominal/receipt.json"
 expect_rejected "$non_nominal" non-nominal-thermal-state
+
+mismatched_envelope="$tmp/mismatched-envelope"
+cp -R "$valid" "$mismatched_envelope"
+awk -F '\t' 'BEGIN { OFS="\t" }
+  $1 >= 2000 && $1 <= 2054 { $2="nominal" }
+  { print }
+' "$mismatched_envelope/thermal/measurement.log" \
+  >"$mismatched_envelope/thermal/measurement.tmp"
+mv "$mismatched_envelope/thermal/measurement.tmp" \
+  "$mismatched_envelope/thermal/measurement.log"
+jq --arg sha "$(sha256_file "$mismatched_envelope/thermal/measurement.log")" '
+  .measurement_log_sha256 = $sha
+  | .non_nominal_measurement_samples = 63
+  | .fair_measurement_samples = 63
+' "$mismatched_envelope/thermal/summary.json" \
+  >"$mismatched_envelope/thermal/summary.tmp"
+mv "$mismatched_envelope/thermal/summary.tmp" \
+  "$mismatched_envelope/thermal/summary.json"
+jq -n --slurpfile benchmark "$mismatched_envelope/benchmark/summary.json" \
+  --slurpfile thermal "$mismatched_envelope/thermal/summary.json" \
+  '{schema_version:1,status:"pass",benchmark:$benchmark[0],thermal:$thermal[0]}' \
+  >"$mismatched_envelope/receipt.json"
+expect_rejected "$mismatched_envelope" mismatched-decode-thermal-envelope
 
 echo "Qwen3.8 long-decode receipt contract tests passed" >&2

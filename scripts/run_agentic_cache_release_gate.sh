@@ -585,7 +585,8 @@ run_qwen38_long_decode_release_gate() {
   local harness_rc=0
   local thermal_rc=0
   local measurement_samples measurement_duration_seconds
-  local non_nominal_measurement_samples telemetry_gaps
+  local non_nominal_measurement_samples fair_measurement_samples
+  local over_limit_measurement_samples telemetry_gaps
   local settle_samples settle_duration_seconds settle_telemetry_gaps
   local sample_interval_seconds=2
   local maximum_sample_gap_seconds=5
@@ -610,7 +611,7 @@ run_qwen38_long_decode_release_gate() {
       >"$out/benchmark.stdout" 2>"$out/benchmark.stderr" &
   wave_harness_pid=$!
   set +e
-  thermal_monitor_nominal_while_pid "$thermal_measurement_log" \
+  thermal_monitor_fair_or_better_while_pid "$thermal_measurement_log" \
     qwen38-long-decode-measurement "$wave_harness_pid" \
     "$sample_interval_seconds"
   thermal_rc=$?
@@ -630,13 +631,15 @@ run_qwen38_long_decode_release_gate() {
   ensure_guard_health
   thermal_sample "$thermal_measurement_log" \
     qwen38-long-decode-measurement-end
-  test "$THERMAL_STATE" = nominal
+  [[ "$THERMAL_STATE" == nominal || "$THERMAL_STATE" == fair ]]
 
-  thermal_validate_measurement_log "$thermal_measurement_log" \
+  thermal_validate_fair_or_better_measurement_log "$thermal_measurement_log" \
     "$maximum_sample_gap_seconds"
   measurement_samples=$THERMAL_LOG_SAMPLES
   measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
   non_nominal_measurement_samples=$THERMAL_LOG_NON_NOMINAL_SAMPLES
+  fair_measurement_samples=$THERMAL_LOG_FAIR_SAMPLES
+  over_limit_measurement_samples=$THERMAL_LOG_OVER_LIMIT_SAMPLES
   telemetry_gaps=$THERMAL_LOG_GAPS
   thermal_validate_settle_log "$thermal_settle_log" 60 \
     "$maximum_settle_sample_gap_seconds"
@@ -658,9 +661,12 @@ run_qwen38_long_decode_release_gate() {
     --argjson settle_sample_interval_seconds "$settle_sample_interval_seconds" \
     --argjson maximum_settle_sample_gap_seconds "$maximum_settle_sample_gap_seconds" \
     --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
+    --argjson fair_measurement_samples "$fair_measurement_samples" \
+    --argjson over_limit_measurement_samples "$over_limit_measurement_samples" \
     --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
     --argjson telemetry_gaps "$telemetry_gaps" \
-    '{status:"pass",phase:"qwen38-long-decode",required_state:"nominal",
+    '{status:"pass",phase:"qwen38-long-decode",required_start_state:"nominal",
+      maximum_measurement_state:"fair",
       runtime_preflight:"pass",measurement_scope:"full-abba-benchmark",
       benchmark_summary_sha256:$benchmark_summary_sha256,
       settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
@@ -671,6 +677,8 @@ run_qwen38_long_decode_release_gate() {
       settle_sample_interval_seconds:$settle_sample_interval_seconds,
       maximum_settle_sample_gap_seconds:$maximum_settle_sample_gap_seconds,
       non_nominal_measurement_samples:$non_nominal_measurement_samples,
+      fair_measurement_samples:$fair_measurement_samples,
+      over_limit_measurement_samples:$over_limit_measurement_samples,
       settle_telemetry_gaps:$settle_telemetry_gaps,telemetry_gaps:$telemetry_gaps,
       settle_log_sha256:$settle_log_sha256,
       measurement_log_sha256:$measurement_log_sha256}' >"$thermal_summary.tmp"

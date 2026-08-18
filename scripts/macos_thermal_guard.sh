@@ -157,6 +157,41 @@ thermal_monitor_nominal_while_pid() {
   done
 }
 
+thermal_monitor_fair_or_better_while_pid() {
+  local log_file=$1
+  local phase=$2
+  local producer_pid=$3
+  local sample_seconds=$4
+
+  [[ "$producer_pid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "thermal producer pid must be a positive integer" >&2
+    return 2
+  }
+  [[ "$sample_seconds" =~ ^[0-9]+$ ]] || {
+    echo "thermal sample interval must be a non-negative integer" >&2
+    return 2
+  }
+  while :; do
+    thermal_read_process_state "$producer_pid" || return 1
+    if [[ -z "$THERMAL_PROCESS_STATE" || "$THERMAL_PROCESS_STATE" == Z* ]]; then
+      return 0
+    fi
+    thermal_sample "$log_file" "$phase" || return 1
+    case "$THERMAL_STATE" in
+      nominal|fair) ;;
+      serious|critical)
+        echo "calibrated phase $phase exceeded fair thermal state: $THERMAL_STATE" >&2
+        return 1
+        ;;
+      *)
+        echo "calibrated phase $phase observed invalid thermal state: $THERMAL_STATE" >&2
+        return 1
+        ;;
+    esac
+    sleep "$sample_seconds"
+  done
+}
+
 thermal_prepare_cold_receipt_dir() {
   local receipt_dir=$1
   local existing_receipt
@@ -277,12 +312,56 @@ thermal_validate_measurement_log() {
         non_nominal, gaps, invalid
     }
   ' "$log_file") || return 1
+  # These globals are the validator's output contract for release callers.
+  # shellcheck disable=SC2034
   IFS=$'\t' read -r THERMAL_LOG_SAMPLES THERMAL_LOG_DURATION_SECONDS \
     THERMAL_LOG_NON_NOMINAL_SAMPLES THERMAL_LOG_GAPS THERMAL_LOG_INVALID_ROWS \
     <<<"$stats"
   ((THERMAL_LOG_SAMPLES >= 2)) \
     && ((THERMAL_LOG_DURATION_SECONDS > 0)) \
     && ((THERMAL_LOG_NON_NOMINAL_SAMPLES == 0)) \
+    && ((THERMAL_LOG_GAPS == 0)) \
+    && ((THERMAL_LOG_INVALID_ROWS == 0))
+}
+
+thermal_validate_fair_or_better_measurement_log() {
+  local log_file=$1
+  local maximum_gap_seconds=$2
+  local stats
+
+  [[ "$maximum_gap_seconds" =~ ^[0-9]+$ ]] || return 2
+  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" '
+    BEGIN { invalid = 0; gaps = 0; non_nominal = 0; fair = 0; over_limit = 0 }
+    {
+      if (NF != 3 || $1 !~ /^[0-9]+$/ \
+          || $2 !~ /^(nominal|fair|serious|critical)$/) {
+        invalid++
+        next
+      }
+      samples++
+      if ($2 != "nominal") non_nominal++
+      if ($2 == "fair") fair++
+      if ($2 == "serious" || $2 == "critical") over_limit++
+      if (samples == 1) first = $1
+      if (samples > 1 && ($1 < previous || $1 - previous > maximum)) gaps++
+      previous = $1
+      last = $1
+    }
+    END {
+      duration = samples > 0 ? last - first : -1
+      printf "%d\t%d\t%d\t%d\t%d\t%d\t%d\n", samples, duration,
+        non_nominal, fair, over_limit, gaps, invalid
+    }
+  ' "$log_file") || return 1
+  # These globals are the validator's output contract for release callers.
+  # shellcheck disable=SC2034
+  IFS=$'\t' read -r THERMAL_LOG_SAMPLES THERMAL_LOG_DURATION_SECONDS \
+    THERMAL_LOG_NON_NOMINAL_SAMPLES THERMAL_LOG_FAIR_SAMPLES \
+    THERMAL_LOG_OVER_LIMIT_SAMPLES THERMAL_LOG_GAPS \
+    THERMAL_LOG_INVALID_ROWS <<<"$stats"
+  ((THERMAL_LOG_SAMPLES >= 2)) \
+    && ((THERMAL_LOG_DURATION_SECONDS > 0)) \
+    && ((THERMAL_LOG_OVER_LIMIT_SAMPLES == 0)) \
     && ((THERMAL_LOG_GAPS == 0)) \
     && ((THERMAL_LOG_INVALID_ROWS == 0))
 }
