@@ -715,12 +715,21 @@ historically authenticates and repairs the selected rollback floor, removes
 only the structurally exact never-selected transaction under the shared lock,
 then requires a wholly fresh transcript.
 
-The production v1 local metadata journal is frozen independently of the
+The production v2 local metadata journal is frozen independently of the
 network verifier. It remains crate-private and unreachable from command
-dispatch. Its canonical generation receipt is compact JSON followed by one LF
-and contains:
+dispatch. The earlier pre-publication v1 experiment had no floor-reset record
+and was never reachable from a released CLI, installer, network transport, or
+production entry point. Rather than silently redefining those canonical v1
+bytes when root-authorized online-role recovery was added, this ADR retracts
+that dormant experiment and makes v2 the first public-state candidate. The
+reader rejects the retained exact v1 golden bytes; there is deliberately no
+migration authority for state that no shipped writer could create. Once a
+public writer exists, this pre-publication rebaseline exception no longer
+applies: every later wire change requires a dual-reader migration release
+before a new writer may select it. The canonical v2 generation receipt is
+compact JSON followed by one LF and contains:
 
-- kind `hf2q.update-metadata-generation`, schema version 1, state-layout
+- kind `hf2q.update-metadata-generation`, schema version 2, state-layout
   schema 1, and package `hf2q`;
 - the nonzero 64-bit generation sequence and, except for sequence one, the
   exact SHA-256 of the predecessor generation receipt;
@@ -740,7 +749,7 @@ and contains:
   root, and whose exact authenticated endpoint roots prove that the prior
   timestamp or snapshot quorum cannot satisfy the final threshold.
 
-The selector has kind `hf2q.update-metadata-selector`, schema version 1,
+The selector has kind `hf2q.update-metadata-selector`, schema version 2,
 sequence, and the exact generation-receipt SHA-256. Receipts are limited to
 64 KiB, selectors to 16 KiB, roots/timestamp/snapshot to 1 MiB each, and
 targets to 4 MiB. Hostile input rejects unknown or duplicate fields, trailing
@@ -1317,7 +1326,7 @@ before public self-update ships.
 ## Implementation sequence
 
 1. The release manifest, install receipt/version marker, durable first
-   activation, comparative TUF spike, shared lock, and production v1 metadata
+   activation, comparative TUF spike, shared lock, and production v2 metadata
    journal land first. The tokenized transport-free authenticated-update
    verifier, sealed selector-boundary freshness capability, durable-baseline
    replay, fresh-process discard recovery, root-authorized online-role floor

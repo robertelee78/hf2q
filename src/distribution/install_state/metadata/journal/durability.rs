@@ -1,4 +1,4 @@
-use super::super::schema::{MetadataGenerationReceiptV1, MetadataSelectorV1, MAX_SELECTOR_BYTES};
+use super::super::schema::{MetadataGenerationReceiptV2, MetadataSelectorV2, MAX_SELECTOR_BYTES};
 use super::super::{MetadataJournalError, VerifiedMetadataCandidate};
 use super::cleanup::{remove_generation, verify_prune_prefix};
 use super::fault::{trip, FaultPlan, TestBarrier};
@@ -19,9 +19,9 @@ impl LockedMetadataJournal {
         pending_selector: &str,
         selector_identity: EntryIdentity,
         selector_bytes: &[u8],
-        receipt: &MetadataGenerationReceiptV1,
+        receipt: &MetadataGenerationReceiptV2,
         candidate: &VerifiedMetadataCandidate,
-        prior: Option<&MetadataSelectorV1>,
+        prior: Option<&MetadataSelectorV2>,
     ) -> Result<LiveNamespace, MetadataJournalError> {
         let live = self.reopen_namespace()?;
         let _ = read_selector_with_mode(
@@ -69,7 +69,7 @@ impl LockedMetadataJournal {
 
     pub(super) fn repeat_postcommit_barriers(
         &self,
-        expected: &MetadataSelectorV1,
+        expected: &MetadataSelectorV2,
         faults: FaultPlan,
     ) -> Result<(), MetadataJournalError> {
         let sequence = expected.sequence();
@@ -126,7 +126,7 @@ impl LockedMetadataJournal {
 
     pub(super) fn finish_predecessor_cleanup(
         &self,
-        selected: &MetadataSelectorV1,
+        selected: &MetadataSelectorV2,
         faults: FaultPlan,
     ) -> Result<(), MetadataJournalError> {
         if selected.sequence() == 1 {

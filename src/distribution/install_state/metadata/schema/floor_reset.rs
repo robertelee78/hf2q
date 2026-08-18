@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    descriptor, validate_descriptor, validate_descriptor_bytes, MetadataGenerationReceiptV1,
-    MetadataRoleDescriptorV1, RoleKind,
+    descriptor, validate_descriptor, validate_descriptor_bytes, MetadataGenerationReceiptV2,
+    MetadataRoleDescriptorV2, RoleKind,
 };
 use crate::distribution::install_state::metadata::{
     ExactMetadataRole, MetadataJournalError, VerifiedMetadataCandidate,
@@ -10,23 +10,23 @@ use crate::distribution::install_state::metadata::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct MetadataFloorResetV1 {
-    from_trusted_root: MetadataRoleDescriptorV1,
-    to_trusted_root: MetadataRoleDescriptorV1,
+pub(super) struct MetadataFloorResetV2 {
+    from_trusted_root: MetadataRoleDescriptorV2,
+    to_trusted_root: MetadataRoleDescriptorV2,
 }
 
-pub(super) fn candidate(candidate: &VerifiedMetadataCandidate) -> Option<MetadataFloorResetV1> {
+pub(super) fn candidate(candidate: &VerifiedMetadataCandidate) -> Option<MetadataFloorResetV2> {
     candidate
         .timestamp_snapshot_floor_reset_from_root()
-        .map(|from_trusted_root| MetadataFloorResetV1 {
+        .map(|from_trusted_root| MetadataFloorResetV2 {
             from_trusted_root: descriptor(from_trusted_root),
             to_trusted_root: descriptor(candidate.trusted_root()),
         })
 }
 
 pub(super) fn validate_successor(
-    receipt: &MetadataGenerationReceiptV1,
-    prior: &MetadataGenerationReceiptV1,
+    receipt: &MetadataGenerationReceiptV2,
+    prior: &MetadataGenerationReceiptV2,
 ) -> Result<(), MetadataJournalError> {
     match &receipt.timestamp_snapshot_floor_reset {
         Some(reset)
@@ -44,7 +44,7 @@ pub(super) fn validate_successor(
 }
 
 pub(super) fn validate_receipt(
-    receipt: &MetadataGenerationReceiptV1,
+    receipt: &MetadataGenerationReceiptV2,
 ) -> Result<(), MetadataJournalError> {
     let Some(reset) = &receipt.timestamp_snapshot_floor_reset else {
         return Ok(());
@@ -67,7 +67,7 @@ pub(super) fn validate_receipt(
     Ok(())
 }
 
-impl MetadataGenerationReceiptV1 {
+impl MetadataGenerationReceiptV2 {
     pub(in crate::distribution) fn timestamp_snapshot_floor_reset_from_root_version(
         &self,
     ) -> Option<u64> {

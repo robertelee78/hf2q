@@ -56,7 +56,7 @@ fn process_abort_at_every_initial_and_successor_barrier_is_recoverable() {
             assert_eq!(selected.sequence, sequence);
             if sequence == 2 {
                 assert_eq!(
-                    MetadataGenerationReceiptV1::parse(selected.generation_receipt())
+                    MetadataGenerationReceiptV2::parse(selected.generation_receipt())
                         .expect("selected reset receipt parses")
                         .timestamp_snapshot_floor_reset_from_root_version(),
                     Some(2),

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::super::schema::{
-    MetadataGenerationReceiptV1, MetadataSelectorV1, MAX_GENERATION_RECEIPT_BYTES,
+    MetadataGenerationReceiptV2, MetadataSelectorV2, MAX_GENERATION_RECEIPT_BYTES,
 };
 use super::super::MetadataJournalError;
 use super::fault::{trip, trip_discard_entry, trip_prune_entry, FaultPlan, TestBarrier};
@@ -11,8 +11,8 @@ use crate::distribution::install_state::unix::{self, Directory};
 
 pub(super) fn verify_cleanup_residue(
     generations: &Directory,
-    selector: &MetadataSelectorV1,
-    selected_receipt: &MetadataGenerationReceiptV1,
+    selector: &MetadataSelectorV2,
+    selected_receipt: &MetadataGenerationReceiptV2,
 ) -> Result<(), MetadataJournalError> {
     if selector.sequence() == 1 {
         return Ok(());
@@ -223,7 +223,7 @@ pub(super) fn remove_generation(
     generations: &Directory,
     name: &str,
     directory: &Directory,
-    receipt: Option<&MetadataGenerationReceiptV1>,
+    receipt: Option<&MetadataGenerationReceiptV2>,
     expected_digest: &str,
     faults: FaultPlan,
 ) -> Result<(), MetadataJournalError> {
@@ -294,7 +294,7 @@ pub(super) fn remove_generation(
 pub(super) fn verify_prune_prefix(
     directory: &Directory,
     expected_digest: &str,
-) -> Result<Option<MetadataGenerationReceiptV1>, MetadataJournalError> {
+) -> Result<Option<MetadataGenerationReceiptV2>, MetadataJournalError> {
     let names = unix::list_names(directory)?;
     if names.is_empty() {
         return Ok(None);

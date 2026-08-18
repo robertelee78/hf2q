@@ -6,7 +6,7 @@ use super::verifier::{
     metadata_name, request_root, ClockSource, Phase, RoleFloor, VerificationState,
 };
 use super::{profile, TufVerifierError};
-use crate::distribution::install_state::metadata::schema::MetadataGenerationReceiptV1;
+use crate::distribution::install_state::metadata::schema::MetadataGenerationReceiptV2;
 use crate::distribution::install_state::metadata::{
     MetadataStateAuthorization, StoredMetadataGeneration,
 };
@@ -27,7 +27,7 @@ pub(super) fn begin_from_selected_with_clock(
     stored: StoredMetadataGeneration,
     mut clock: ClockSource,
 ) -> Result<VerificationStep, TufVerifierError> {
-    let receipt = MetadataGenerationReceiptV1::parse(stored.generation_receipt())?;
+    let receipt = MetadataGenerationReceiptV2::parse(stored.generation_receipt())?;
     if receipt.sequence() != stored.sequence() {
         return Err(TufVerifierError::AuthenticationFailed);
     }
@@ -47,7 +47,7 @@ pub(super) fn begin_from_selected_with_clock(
 
 pub(super) fn replay_selected(
     anchor: &EmbeddedTrustRoot,
-    receipt: &MetadataGenerationReceiptV1,
+    receipt: &MetadataGenerationReceiptV2,
     stored: StoredMetadataGeneration,
     historical_time: Timestamp,
 ) -> Result<VerificationState, TufVerifierError> {
