@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::super::schema::{
-    MetadataGenerationReceiptV1, MetadataSelectorV1, MAX_GENERATION_RECEIPT_BYTES,
+    MetadataGenerationReceiptV2, MetadataSelectorV2, MAX_GENERATION_RECEIPT_BYTES,
     MAX_SELECTOR_BYTES,
 };
 use super::super::{
@@ -90,7 +90,7 @@ pub(super) fn write_generation(
 
 pub(super) fn verify_generation(
     directory: &Directory,
-    receipt: &MetadataGenerationReceiptV1,
+    receipt: &MetadataGenerationReceiptV2,
     candidate: Option<&VerifiedMetadataCandidate>,
 ) -> Result<StoredMetadataGeneration, MetadataJournalError> {
     let expected = BTreeSet::from([
@@ -113,7 +113,7 @@ pub(super) fn verify_generation(
         0o600,
         MAX_GENERATION_RECEIPT_BYTES,
     )?;
-    if MetadataGenerationReceiptV1::parse(&receipt_bytes)? != *receipt {
+    if MetadataGenerationReceiptV2::parse(&receipt_bytes)? != *receipt {
         return Err(MetadataJournalError::Invalid(
             "stored metadata receipt changed after validation",
         ));
@@ -156,7 +156,7 @@ pub(super) fn verify_generation(
 
 pub(super) fn read_role(
     directory: &Directory,
-    receipt: &MetadataGenerationReceiptV1,
+    receipt: &MetadataGenerationReceiptV2,
     name: &str,
 ) -> Result<Box<[u8]>, MetadataJournalError> {
     let (_, bytes, _) = file::read_regular_file(directory, name, 0o600, receipt.role_limit(name)?)?;
@@ -168,12 +168,12 @@ pub(super) fn read_selector_with_mode(
     metadata: &Directory,
     generations: &Directory,
     mode: HistoryMode,
-) -> Result<Option<MetadataSelectorV1>, MetadataJournalError> {
+) -> Result<Option<MetadataSelectorV2>, MetadataJournalError> {
     let selector = unix::entry_identity(metadata, CURRENT)?
         .map(|_| {
             let (_, bytes, _) =
                 file::read_regular_file(metadata, CURRENT, 0o600, MAX_SELECTOR_BYTES)?;
-            MetadataSelectorV1::parse(&bytes)
+            MetadataSelectorV2::parse(&bytes)
         })
         .transpose()?;
     verify_history(metadata, generations, selector.as_ref(), mode)?;
@@ -204,7 +204,7 @@ pub(super) fn read_selected_with_mode(
 fn verify_history(
     metadata: &Directory,
     generations: &Directory,
-    selector: Option<&MetadataSelectorV1>,
+    selector: Option<&MetadataSelectorV2>,
     mode: HistoryMode,
 ) -> Result<(), MetadataJournalError> {
     let next = selector.map_or(Ok(1), |selector| {
@@ -313,7 +313,7 @@ fn verify_history(
         if has_pending_selector {
             let (_, bytes, _) =
                 file::read_regular_file(metadata, &pending_selector, 0o600, MAX_SELECTOR_BYTES)?;
-            let staged = MetadataSelectorV1::parse(&bytes)?;
+            let staged = MetadataSelectorV2::parse(&bytes)?;
             if staged.sequence() != next
                 || staged.generation_sha256() != successor_receipt.digest()?
             {
@@ -328,8 +328,8 @@ fn verify_history(
 
 pub(super) fn read_receipt(
     generations: &Directory,
-    selector: &MetadataSelectorV1,
-) -> Result<MetadataGenerationReceiptV1, MetadataJournalError> {
+    selector: &MetadataSelectorV2,
+) -> Result<MetadataGenerationReceiptV2, MetadataJournalError> {
     let generation = unix::open_directory_at(
         generations,
         &format!("{:020}", selector.sequence()),
@@ -349,14 +349,14 @@ pub(super) fn read_receipt(
 
 pub(super) fn read_receipt_from_directory(
     directory: &Directory,
-) -> Result<MetadataGenerationReceiptV1, MetadataJournalError> {
+) -> Result<MetadataGenerationReceiptV2, MetadataJournalError> {
     let (_, bytes, _) = file::read_regular_file(
         directory,
         "generation.json",
         0o600,
         MAX_GENERATION_RECEIPT_BYTES,
     )?;
-    MetadataGenerationReceiptV1::parse(&bytes)
+    MetadataGenerationReceiptV2::parse(&bytes)
 }
 
 pub(super) fn generation_matches_candidate(
@@ -390,7 +390,7 @@ fn bind_selection(
     authorization: &MetadataStateAuthorization,
 ) -> Result<(), MetadataJournalError> {
     if let Some(selected) = selected {
-        MetadataGenerationReceiptV1::parse(&selected.generation_receipt)?.validate_state_identity(
+        MetadataGenerationReceiptV2::parse(&selected.generation_receipt)?.validate_state_identity(
             &authorization.installation_id,
             authorization.root.canonical.as_str(),
         )?;

@@ -1,5 +1,5 @@
 use super::schema::{
-    MetadataGenerationReceiptV1, MetadataSelectorV1, MAX_GENERATION_RECEIPT_BYTES, MAX_ROOT_CHAIN,
+    MetadataGenerationReceiptV2, MetadataSelectorV2, MAX_GENERATION_RECEIPT_BYTES, MAX_ROOT_CHAIN,
     MAX_SELECTOR_BYTES,
 };
 use super::{

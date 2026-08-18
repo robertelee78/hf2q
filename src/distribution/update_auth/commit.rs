@@ -6,7 +6,7 @@ use super::model::{
 use super::replay::{begin_from_selected_with_clock, replay_selected};
 use super::verifier::{begin_from_anchor_with_clock, ClockSource};
 use super::TufVerifierError;
-use crate::distribution::install_state::metadata::schema::MetadataGenerationReceiptV1;
+use crate::distribution::install_state::metadata::schema::MetadataGenerationReceiptV2;
 use crate::distribution::install_state::metadata::{
     lock_metadata_state, read_selected, MetadataCommitOutcome, MetadataRestartCleanup,
     MetadataStateAuthorization, StoredMetadataGeneration,
@@ -308,7 +308,7 @@ fn authenticate_stored_selection(
     anchor: &EmbeddedTrustRoot,
     stored: StoredMetadataGeneration,
 ) -> Result<DurableMetadataBaseline, TufVerifierError> {
-    let receipt = MetadataGenerationReceiptV1::parse(stored.generation_receipt())?;
+    let receipt = MetadataGenerationReceiptV2::parse(stored.generation_receipt())?;
     let sequence = stored.sequence();
     let generation_sha256 = Sha256::digest(stored.generation_receipt()).into();
     let completed = receipt.verification_completed_at()?;
@@ -354,7 +354,7 @@ fn selection_matches_candidate(
     stored: &StoredMetadataGeneration,
     candidate: &VerifiedMetadataCandidate,
 ) -> Result<bool, TufVerifierError> {
-    let receipt = MetadataGenerationReceiptV1::parse(stored.generation_receipt())?;
+    let receipt = MetadataGenerationReceiptV2::parse(stored.generation_receipt())?;
     Ok(receipt.matches_candidate(candidate)
         && stored.anchor_root() == candidate.anchor_root().bytes()
         && stored.trusted_root() == candidate.trusted_root().bytes()

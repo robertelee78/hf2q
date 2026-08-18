@@ -65,7 +65,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │       │                stored bytes are not cryptographic authority
 │       └── …           sequence-one activation and bounded restart cleanup
 │   └── update_auth/    transport-free strict TUF profile, one-use request
-│                       tokens, historical replay floors, sealed advancing
+│                       tokens, historical replay floors, root-authorized
+│                       timestamp/snapshot recovery, sealed advancing
 │                       commit guard, and durable metadata-baseline proof;
 │                       all internal until the real root, transport, and
 │                       application release binding exist
@@ -553,7 +554,10 @@ harness leans on three patterns:
    The production module owns no URL, HTTP, target lookup, archive, activation,
    installer, or CLI authority. Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected
-   write prefix, and requires a wholly fresh transcript.
+   write prefix, and requires a wholly fresh transcript. An authenticated root
+   transition that changes the effective timestamp or snapshot authorization
+   may reset only those two floors; the sealed receipt binds the exact prior
+   and final roots, while root and targets floors remain monotonic.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.
