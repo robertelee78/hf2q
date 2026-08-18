@@ -1,9 +1,11 @@
-//! Intelligence module — hardware profiling, model fingerprinting, auto mode.
+//! Intelligence module — hardware profiling, model fingerprinting, and
+//! evidence-backed or capacity-planning auto mode.
 //!
 //! Orchestrates:
 //! - HardwareProfiler: detect chip, memory, cores
 //! - ModelFingerprint: stable identifier from config.json
-//! - AutoResolver: RuVector query -> heuristic fallback
+//! - measured_auto_quant: fail-closed selection from exact benchmark receipts
+//! - AutoResolver: legacy capacity estimate (RuVector -> heuristic fallback)
 //! - RuVector: self-learning conversion result storage
 
 pub mod auto_quant;
@@ -11,6 +13,7 @@ pub mod fingerprint;
 // B1.4 — hardware migrated to `crate::core::hardware`; all callers
 // updated in the same sweep so no re-export is needed here.
 pub mod heuristics;
+pub mod measured_auto_quant;
 pub mod ruvector;
 
 use serde::{Deserialize, Serialize};
@@ -85,7 +88,11 @@ impl std::fmt::Display for ResolvedSource {
     }
 }
 
-/// The auto mode resolver — queries RuVector first, falls back to heuristics.
+/// Legacy capacity-planning resolver — queries RuVector first, then estimates.
+///
+/// This API does not establish an inference-optimal artifact. Production
+/// artifact selection must use [`measured_auto_quant`] so quality and matched
+/// Apple-Silicon performance evidence fail closed.
 pub struct AutoResolver;
 
 /// Optional output format hint for auto mode resolution.

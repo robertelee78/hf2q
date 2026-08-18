@@ -93,12 +93,12 @@ pub enum QuantSelectorError {
     #[error("--quant apex-custom requires --tensor-type-file <path>")]
     ApexCustomRequiresTensorTypeFile,
 
-    /// `--quant dwq` is reserved for a future training-loop entry point
-    /// (ADR-020 follow-up). Surface a typed error rather than silently
-    /// treating it as an unknown quant.
+    /// `--quant dwq` is reserved until ADR-046's native affine artifact,
+    /// trainer, quality, and runtime gates land. Surface a typed error
+    /// rather than silently treating it as an unknown quant.
     #[error(
-        "--quant dwq is reserved for the future DWQ-train pipeline; \
-         not implemented in convert-v2"
+        "--quant dwq is reserved until ADR-046's native affine artifact, \
+         trainer, quality, and runtime gates are implemented"
     )]
     DwqReserved,
 

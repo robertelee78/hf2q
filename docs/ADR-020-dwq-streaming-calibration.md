@@ -1,8 +1,17 @@
 # ADR-020: DWQ + Mixed-Precision Quantization for hf2q (port from mlx-lm)
 
-**Status**: Proposed — last revised 2026-05-07 evening (Python-subprocess path REVERTED — see "Path revert" note below + iter table)
+**Status**: Superseded by ADR-046 (2026-08-18). Historical experiment record
+only; its removed producer, completion labels, and performance statements are
+not current product authority.
 
-**Path revert (2026-05-07 evening):** Iters 19b (half-1, half-2, live), 19d, and 19e were Python-subprocess-path work (vendored `mlx_lm.kld`, `mlx_lm.dwq`-fork, JSON line protocol seam to a `bin/dwq_python_driver.py`, draft ADR-022 superseder). All reverted under §11 "no external tools". Native track (iters 6–17 + 19a + 19c) remains in force. iter-19b's published RTN-Q4 KL=0.0664 number is retained as a documented peer reference (see iter 19a quality gate); iter-19c's native single-Linear KL=2.73e-3 measurement is retained.
+**Supersession note:** ADR-046 retains the useful algorithm/format separation
+and bounded-memory lessons, but replaces this proposal with a
+source-transformation-agnostic, exact-evidence selection contract. Current
+`--quant dwq` remains reserved; the surviving overlay consumer is not evidence
+of a production DWQ converter. Any inline "stock teacher" requirement is also
+superseded: ADR-046 requires the exact supplied checkpoint as teacher.
+
+**Path revert (2026-05-07 evening):** Iters 19b (half-1, half-2, live), 19d, and 19e were Python-subprocess-path work (vendored `mlx_lm.kld`, `mlx_lm.dwq`-fork, JSON line protocol seam to a `bin/dwq_python_driver.py`, draft ADR-022 superseder). All reverted under §11 "no external tools". The native track (iters 6–17 + 19a + 19c) was retained after that revert but is now historical under the supersession above. iter-19b's published RTN-Q4 KL=0.0664 number is retained as a documented peer reference (see iter 19a quality gate); iter-19c's native single-Linear KL=2.73e-3 measurement is retained.
 
 **Driver**: User mission — make working DWQ quants (46 + 48) for the Gemma 4 and Qwen 3.6 abliterated model families on a 128 GB Mac M5 Max without OOM, with NO quality compromise ("no cheating, real DWQ"). Both DWQ proper AND mixed-precision must be supported. Per `~/Documents/mantra.txt`: "Measure 3x, cut once. No fallback. No stub. Pure excellence."
 

@@ -16,9 +16,9 @@ prior-art inference path see `docs/arch-current-inference-path.md`.
 
 1. **Convert** — read a HuggingFace model directory (`config.json` +
    `*.safetensors`), normalize tensor names per architecture, run a
-   quantization algorithm, and emit either a GGUF file (single binary,
-   `llama.cpp` consumers) or an mlx-lm-shaped safetensors directory
-   (mlx-lm, Candle, vLLM, hf2q's own serve loader).
+   quantization algorithm, and currently emit a GGUF file. A production
+   MLX-affine output is target-state work governed by ADR-046, not a current
+   converter backend.
 
 2. **Serve / Generate** — load a GGUF, run prefill + decode on the
    Apple-Silicon GPU through the `mlx-native` crate, and expose
@@ -27,8 +27,9 @@ prior-art inference path see `docs/arch-current-inference-path.md`.
    sampling, and a persistent block-prefix KV cache.
 
 Both halves share the same internal IR (`src/ir/`) and the same arch
-registry (`src/arch/`), so adding a new model family is one ADR + one
-module under `src/models/` and `src/inference/models/`.
+registry (`src/arch/`). Conversion-family implementations live under
+`src/convert/arch/`; runtime-family graphs live under
+`src/inference/models/`.
 
 ### Sovereignty rule (`docs/arch-onboarding.md`)
 
@@ -56,7 +57,6 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/doctor.rs        `hf2q doctor` runtime diagnostic
 ├── src/preflight.rs     ADR-012 preflight checks (disk, token, …)
 ├── src/progress.rs      indicatif-based progress reporting
-├── src/report.rs        machine-readable convert-result report
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
 ├── src/distribution/   ADR-045 release/install bounded context
 │   ├── schema/         strict bounded manifest, receipt, marker schemas;
@@ -101,67 +101,36 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── mod.rs           ModelMetadata, TensorMap, DType, QuantizedTensor, …
 │   └── lazy.rs          lazy-tensor handle (ADR-014 streaming convert)
 │
-├── src/models/          per-arch conversion (tensor rename, MoE merge, metadata)
-│   ├── qwen35/          ADR-012 Qwen 3.5 / 3.6 convert (dense + MoE)
+├── src/models/          legacy/shared model conversion support
 │   └── vit/             ADR-012 P10 pure-Rust mmproj (ViT) emitter
 │
-├── src/quantize/        every Q-format codec
-│   ├── q_legacy.rs      Q4_0 / Q5_0 / Q8_0 (`llama.cpp` block formats)
-│   ├── k_quant.rs       K-quant common super-block math
-│   ├── k_quant_codec.rs Q2_K…Q6_K block encoders / decoders
-│   ├── k_quant_codec_quantizer.rs  the bind-it-all-together quantizer
-│   ├── variant_quantizer.rs        K-quant variant dispatch
-│   ├── mixed.rs                    dynamic-quant-{4-6,4-8,6-8,2-8}
-│   ├── layer_mix.rs                per-layer sensitivity → bit choice
-│   ├── dwq_k_quantizer.rs          DWQ-overlay K-quant adapter
-│   └── static_quant.rs             dynamic→static plan freezer
+├── src/convert/arch/    active per-family conversion and metadata mapping
+│   ├── qwen35_dense.rs  Qwen 3.5/3.8 dense conversion
+│   ├── qwen35moe*.rs    Qwen 3.5/3.6 MoE conversion
+│   └── …                other explicit supported families
 │
-├── src/calibrate/       activation capture + DWQ training (ADR-020)
-│   ├── imatrix.rs              imatrix capture
-│   ├── imatrix_calibrator.rs   imatrix → sensitivity prior
-│   ├── imatrix_xvalidate.rs    leave-one-out validation
-│   ├── dwq.rs                  per-Linear DWQ training entry
-│   ├── dwq_loop.rs             multi-Linear orchestration
-│   ├── dwq_e2e.rs              end-to-end DWQ run + bookkeeping
-│   ├── dwq_targets.rs          FP32-teacher target derivation
-│   ├── dwq_activation.rs       activation cache for hybrid arches
-│   ├── dwq_calibrator.rs       teacher provider + Adam loop
-│   ├── dwq_benchmark.rs        benchmark harness
-│   ├── adam.rs                 Adam optimizer (CPU + GPU variants)
-│   ├── autograd*.rs            forward-mode-tape autograd primitives
-│   ├── gguf_teacher.rs         GGUF as FP32 teacher provider
-│   ├── hf_safetensors_teacher.rs HF safetensors teacher
-│   ├── qdq_gpu.rs              quantize-dequantize round-trip on GPU
-│   ├── fd_sensitivity.rs       finite-difference sensitivity
-│   ├── sensitivity.rs          Hessian-trace sensitivity prior
-│   ├── sensitivity_comparison.rs cross-method comparison
-│   ├── dynamic_quant{_gpu}.rs  dynamic-quant kernels
-│   ├── calibrator.rs           top-level calibrate orchestration
-│   ├── calibration_batcher.rs  windowed-corpus tokenizer
-│   ├── cache.rs                calibrate-side cache
-│   ├── apex.rs                 APEX adaptive-quant planner
-│   ├── mlx_safetensors_loader.rs mlx-lm overlay loader
-│   ├── qwen35_*.rs             qwen35-specific per-layer DWQ ops
-│   └── …                       (~35 files; this is the dense quarter)
+├── src/quantize/        active pure-Rust quantization stack (ADR-033)
+│   ├── ggml_quants/           block/K/IQ codecs + StandardPolicy
+│   │   ├── apex/              APEX mixed-precision policy
+│   │   ├── q{2,3,4,5,6}_k.rs K-quant codecs
+│   │   ├── q{4,5}_{0,1}.rs    legacy block codecs
+│   │   └── quantizer.rs       codec dispatch
+│   └── imatrix/               corpus, capture, accumulator, GGUF I/O
 │
-├── src/backends/        output writers — GGUF + mlx-lm safetensors
-│   ├── gguf.rs                GGUF emitter (header, tensor stream, sidecars)
-│   ├── safetensors_out.rs     mlx-lm safetensors directory writer
-│   ├── chat_templates.rs      per-arch chat template lookup
-│   └── chat_templates/        canonical Jinja2 templates
+├── src/backends/        active output writers
+│   └── gguf/                  streaming GGUF metadata + tensor writer
 │
-├── src/quality/         post-convert quality measurement
+├── src/quality/         disconnected experimental quality code (not production-wired)
 │   ├── cosine_sim.rs          weight-level cosine similarity
 │   ├── kl_divergence.rs       output-logit KL
 │   ├── perplexity.rs          PPL on a corpus
 │   ├── ppl_driver.rs          forward-pass driver for PPL
-│   ├── kernel_parity.rs       kernel-equivalence proofs
 │   └── regression.rs          regression-gate accountant
 │
-├── src/intelligence/    hardware probe + auto-quant + RuVector
-│   ├── hardware.rs            chip detection, MTL device, memory probe
+├── src/intelligence/    capacity planning + measured selection + RuVector
 │   ├── fingerprint.rs         stable model fingerprint (for cache keys)
-│   ├── auto_quant.rs          auto-mode planner
+│   ├── auto_quant.rs          legacy estimate-only planner
+│   ├── measured_auto_quant.rs ADR-046 exact-evidence selector
 │   ├── heuristics.rs          rule-based fallback when RuVector is silent
 │   └── ruvector.rs            optional self-learning store (cargo feature)
 │
@@ -246,49 +215,42 @@ CLI surface (via `assert_cmd`) or to that narrow lib facade.
                                        v
                   ┌─────────────────────────────────────────┐
                   │  src/arch/   look up arch entry         │
-                  │  src/models/<arch>/   rename + MoE merge│
+                  │  src/convert/arch/ map names + metadata │
                   └────────────────────┬────────────────────┘
                                        │ canonical-named TensorMap
                                        v
                   ┌─────────────────────────────────────────┐
-                  │  src/quantize/   pick codec by --quant   │
-                  │      [optional] src/calibrate/   DWQ    │
-                  │      [optional] imatrix sensitivity     │
+                  │  src/quantize/ggml_quants/ policy+codec │
+                  │      [optional] imatrix importance      │
                   └────────────────────┬────────────────────┘
                                        │ QuantizedModel
                                        v
                   ┌─────────────────────────────────────────┐
-                  │  src/backends/                          │
-                  │      gguf.rs  →  *.gguf                 │
-                  │      safetensors_out.rs  →  mlx-lm dir  │
-                  └────────────────────┬────────────────────┘
-                                       │
-                  ┌────────────────────┴────────────────────┐
-                  │  src/quality/   cosine + (optional) PPL │
-                  │  src/report.rs   structured convert log  │
+                  │  src/backends/gguf/  →  *.gguf          │
+                  │  conversion receipt + tensor manifest   │
                   └─────────────────────────────────────────┘
 ```
 
-Streaming is real: `safetensors` shards are mmap'd, tensors are
-quantized in rayon-parallel chunks (`src/quantize/`), and the writer
-sinks blocks to disk as soon as they're ready. Memory ceiling is set
-by the largest individual tensor + its quant scratch — typically a few
-GB even for 35 B-parameter models.
+Streaming is real: `safetensors` shards are mmap'd, tensors are quantized in
+bounded chunks, and the writer sinks blocks to disk as soon as they are ready.
+ADR-033 owns the exact memory contract. The files under `src/quality/` are not
+declared by the production crate, and real quantized quality acceptance must
+not be inferred from their presence; ADR-046 tracks the receipt-producing
+replacement.
 
 ### Quantization families
 
 | Family | Where it lives | Notes |
 |---|---|---|
-| **Legacy block** (`q4_0`, `q5_0`, `q8_0`) | `src/quantize/q_legacy.rs` | Per-block 32-element row layout. Single scale; no min. |
-| **K-quant** (`q2_k`…`q6_k`, `q4_k_m`, `q5_k_m`, …) | `src/quantize/k_quant*.rs`, `variant_quantizer.rs` | 256-element super-blocks with per-row scale + min. Codec maths verified bit-identical to `llama.cpp` via round-trip + spec-citation tests. |
-| **Imatrix-K-quant** (`imatrix-q4_k_m`, `imatrix-adaptive`, …) | `src/calibrate/imatrix*.rs` + same codecs | Activation-imatrix-weighted residual minimization. Per-layer sensitivity threshold drives bit assignment. |
-| **Dynamic / DWQ-mixed** (`dynamic-quant-{4-6,4-8,6-8,2-8}`) | `src/quantize/mixed.rs`, `layer_mix.rs` | Per-layer mixed-bit; `static_quant.rs` freezes a dynamic plan. |
-| **DWQ-overlay** (`dwq-4`, `hf2q dwq-train`) | `src/calibrate/dwq*.rs`, `src/quantize/dwq_k_quantizer.rs` | Trains `<stem>.scales` + `<stem>.biases` per-Linear over an FP32 teacher (GGUF or HF safetensors) with Adam to minimize KL. Emits an mlx-format safetensors overlay. |
+| **Legacy block** (`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`) | `src/quantize/ggml_quants/q*.rs` | Pure-Rust 32-element block codecs. Converter support does not imply runtime support; ADR-046 Gate 0 tracks the current Q4_1/Q5_0 seam. |
+| **K-quant** (`q2_k`…`q6_k`, `q4_k_m`, `q5_k_m`, …) | `src/quantize/ggml_quants/` | 256-element super-block codecs and llama.cpp-parity `StandardPolicy`. |
+| **APEX mixed precision** | `src/quantize/ggml_quants/apex/` | Per-tensor GGUF policy; exact tensor encodings still use the codecs above. |
+| **Imatrix input** | `src/quantize/imatrix/` | Corpus/capture and `.imatrix.gguf` producer/consumer for supported families. It is importance evidence, not DWQ. |
+| **MLX affine overlay consumer (legacy)** | `src/core/mlx_safetensors_loader.rs`, `src/serve/forward_mlx_shared.rs` | Narrow Q4/group-32 consume-only path. There is no current DWQ producer or production full-model affine artifact. |
 
-The full menu, gated by per-arch availability, lives in
-`docs/converting-a-model.md`. The decommissioned variants (e.g. `apex`,
-`dwq-mixed-*`) emit structured "did you mean" errors via
-`src/cli.rs:map_deleted_quant`.
+`dwq` remains a typed reserved selector. ADR-046 defines the source-agnostic
+quality, artifact, kernel, and benchmark gates required before that name can be
+activated.
 
 ---
 
@@ -483,18 +445,17 @@ pub struct ArchEntry {
 }
 ```
 
-Per-arch GGUF metadata emission and the HF→GGUF tensor-name function
-live in `src/models/<arch>/` modules (not on the `ArchEntry` itself);
-the layer-map dispatch lives in `src/backends/gguf.rs`.
+Per-family GGUF metadata emission and HF→GGUF tensor-name mapping live in
+`src/convert/arch/`; the writer lives under `src/backends/gguf/`.
 
 Adding a new arch is mechanical: add `src/arch/entries/<arch>.rs`
 register it in `src/arch/entries/mod.rs`, transcribe the tensor
 catalog with `// citation:` lines, add a smoke prompt, and the
-following tooling all "just works":
+following registry-driven tooling becomes available, while conversion and
+runtime mappings still require explicit family implementations:
 
 - `hf2q smoke --arch <arch>` (ADR-012 Decision 16 end-gate)
 - `hf2q parity --arch <arch>` (ADR-009 parity validation)
-- `hf2q dwq-train` (ADR-020) cohort sensitivity priors
 - the convert pipeline (rename + metadata emission)
 - the `hf2q info` inspector
 
@@ -521,10 +482,10 @@ every new arch paid pre-`src/arch/`. The canonical reference is
 - **Metrics.** Prometheus exposition on `GET /metrics` covering
   request latency, token throughput, KV-cache hit rate, MTL dispatch
   count and the regression-gate counters.
-- **Structured convert report** (`src/report.rs`): every convert run
-  emits a machine-readable JSON manifest pointing at the input
-  hashes, the arch entry version, the chosen quant, per-tensor
-  drift summaries, and the wall-clock breakdown.
+- **Verified remote-conversion receipt** (`src/convert/receipt.rs`): a
+  successful remote-source conversion atomically binds exact source files,
+  converter revision, selected quant, output identity, and peak chunk bounds.
+  It is not yet the quality/performance candidate receipt defined by ADR-046.
 - **Environment flags.** Investigation-only env vars are listed in
   `docs/operator-env-vars.md`. Defaults are the safe-production
   choice; opt-in flags carry a one-shot ack at startup.
@@ -672,7 +633,7 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-017** | Persistent Block Prefix Cache for serve mode — `serve/kv_persist/`. |
 | **ADR-018** | Uniform Model-Load UX Across Families — `hf2q serve --model PATH` invariants. |
 | **ADR-019** | mlx-native Encoder Architecture — Per-Stage Fence Design. |
-| **ADR-020** | DWQ + Mixed-Precision Quantization (port from mlx-lm) — `hf2q dwq-train`. |
+| **ADR-020** | Historical DWQ + mixed-precision work; superseded by ADR-046. |
 | **ADR-021** | Qwen3VL ViT prelude GPU port — vision tower. |
 | **ADR-022** | Kernel-coverage parity with `llama.cpp`. |
 | **ADR-027** | Qwen3.5 TQ KV cache + persist family. |
@@ -680,6 +641,7 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-029** | Gemma4 MoE pipeline is the gap — perf investigation. |
 | **ADR-030** | dFlash block-diffusion spec-decode. |
 | **ADR-040** | Full-context agent slots, scheduler admission, fairness, and per-slot state. |
+| **ADR-046** | Evidence-driven Apple-Silicon auto quantization and the hf2q/mlx-native ownership seam. |
 
 Each ADR carries phase status, acceptance tests, and a "what comes
 next" section. ADRs are append-only; superseded ones are linked
