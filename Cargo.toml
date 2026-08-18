@@ -208,6 +208,14 @@ sigstore-tuf = { version = "=0.11.0", default-features = false }
 # We do NOT enable `stream` here (that stays in dev-dep below for SSE testing)
 # nor `json` — vision fetch only needs raw bytes.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# The custom classic-ZIP profile must prove that a Deflate stream consumes its
+# entire declared compressed range. Pin the same backend selected for `zip` so
+# hf2q can require `StreamEnd` plus exact `total_in`/`total_out` counters.
+flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] }
+# ADR-045 release archives are a deliberately narrow ZIP profile. Pin the
+# parser proven by the isolated hostile-archive spike and enable only stored
+# entries plus pure-Rust Deflate decoding; extraction remains hf2q-owned.
+zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 # Deterministic Ed25519 fixture signing for the production TUF verifier's
