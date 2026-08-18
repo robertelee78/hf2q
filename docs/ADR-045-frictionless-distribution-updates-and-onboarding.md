@@ -1,0 +1,934 @@
+# ADR-045: Frictionless distribution, updates, and guided onboarding
+
+- Status: Proposed; product interview reconciled, implementation and
+  exact-artifact proof pending
+- Date: 2026-08-17
+- Updated: 2026-08-17
+- Owners: hf2q release engineering and operator experience
+- Related: `docs/ADR-044-qwen38-native.md`,
+  `docs/ADR-017-persistent-block-prefix-cache.md`,
+  `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`,
+  `docs/shipping-contract.md`
+
+## Context
+
+hf2q can convert Hugging Face source weights, quantize them, and serve the
+result through its Rust and `mlx-native` implementation. Installing and
+operating that surface is still a contributor workflow rather than a product
+workflow:
+
+- the README starts with a Rust checkout and release build;
+- the GitHub release workflow publishes the crate and checksum, but no
+  end-user Apple Silicon bundle;
+- the CLI has no self-update or first-run setup command;
+- one remote conversion path shells out to the `hf` CLI, even though
+  `src/input/hf_download.rs` already contains a native `hf-hub` downloader;
+- the canonical `scripts/serve_*_opencode.sh` launchers assume paths under
+  `/opt/hf2q`, so copying them out of the checkout is not sufficient; and
+- OpenCode and Agentic Kit setup is scattered outside one tested guide.
+
+The desired first-run experience is a user-owned, no-`sudo` installation,
+followed by a small hf2q-only setup step and explicit Hugging Face operations.
+The user keeps the upstream identity visible from preparation through serving:
+`Qwen/Qwen3.8-27B` is downloaded from its official repository, converted and
+quantized by hf2q, then served under that same identity. Qwen3.8 is the
+reference demo because it exercises text, vision, tool calling, source
+provenance, prefix reuse, and restart-safe session restoration.
+
+This ADR governs distribution and onboarding. It does not weaken the product
+boundary: installation and official-source conversion may not introduce
+Python, `hf`, llama.cpp, MLX-LM, a vendor converter, a pre-quantized substitute,
+or an external inference process as an hf2q runtime dependency. An explicitly
+named third-party GGUF may be downloaded and served through hf2q's Rust and
+`mlx-native` runtime, but it is recorded as upstream-prequantized and never
+presented as an hf2q conversion result. This reconciles the conversion boundary
+with the existing documented ability to serve explicitly supported external
+GGUF files.
+
+## Observable contract
+
+For the first supported target, `aarch64-apple-darwin`, the intended public
+workflow is:
+
+```sh
+curl -fsSL https://hf2q.us/install.sh | bash
+hf2q setup
+hf2q convert Qwen/Qwen3.8-27B
+hf2q serve Qwen/Qwen3.8-27B
+```
+
+Before the branded redirect is enabled, the direct GitHub equivalent is:
+
+```sh
+curl -fsSL https://github.com/robertelee78/hf2q/releases/latest/download/install.sh | bash
+```
+
+`https://hf2q.us/install.sh` issues an HTTP redirect to the immutable
+`releases/download/vX.Y.Z/install.sh` asset selected for the stable channel. It
+never hosts a second mutable copy. The GitHub URL is sufficient for the first
+public installer and remains usable when the branded front door is unavailable;
+enabling the branded route is not a first-release blocker.
+
+The installation contains only hf2q-owned files: the hf2q binary, canonical
+supported model launchers, release manifest, licenses, and local hf2q
+documentation. It does not install model weights, OpenCode, Node/npm, Agentic
+Kit, SearXNG, Firecrawl, Crawl4AI, or another third-party tool or service.
+Models are downloaded only when the user later invokes `hf2q convert` or
+explicitly asks `hf2q serve` to acquire a published GGUF.
+
+The core guide is complete without an integration. Separate optional guides
+show how to install OpenCode through its official distribution, connect that
+existing installation to hf2q, optionally add Agentic Kit, and optionally add
+search/crawling services. `--opencode` or an `hf2q opencode` command means
+"configure an already installed OpenCode"; it never means "install OpenCode."
+
+Every hf2q invocation evaluates trusted local update state. When a newer stable
+release is known, hf2q prints one non-forcing notice to stderr and continues
+the requested command. `hf2q update` is the universal user-facing update
+command: it self-updates standalone installs atomically and delegates through
+the detected package owner when the executable is package-managed.
+
+## Domain model
+
+Distribution and model preparation use explicit records rather than inferring
+state from PATH aliases or filenames:
+
+- **Release bundle**: an immutable archive for one version and target,
+  containing the binary, launchers, docs, licenses, and release manifest.
+- **Release manifest**: version, target, minimum macOS version, source commit,
+  exact file inventory and modes, digests, signing identity, update channel,
+  and compatibility/schema versions.
+- **Install receipt**: installation root, active and two retained versions,
+  owner family (`standalone`, `homebrew`, `cargo-registry`, or
+  `unknown/manual`), selected update route (`standalone`, `brew`,
+  `cargo-install`, `cargo-binstall`, or confirmed migration), manifest digest,
+  and last successful transition. Cargo and cargo-binstall deliberately share
+  an owner family because both install into Cargo's registry/bin layout; the
+  route is a separately recorded preference rather than invented history.
+- **Update metadata**: signed, expiring, monotonically versioned metadata that
+  binds a channel and version to an exact release-manifest and archive digest.
+- **Hugging Face model reference**: the user's original input plus normalized
+  repository ID/type, canonical URL, immutable revision, and optional exact
+  filename. Repository IDs and equivalent `huggingface.co` model, `tree`,
+  `blob`, and `resolve` URLs share one parser and canonical identity.
+- **Model recipe**: a checked-in supported recipe binding the canonical model
+  reference, accepted source files, text/projector outputs, independently
+  accepted quantization candidates, disk preflight, and acceptance status.
+- **Prepared model**: hf2q-produced local artifacts plus a conversion receipt
+  binding source revision and hashes, converter identity, recipe, output
+  digests, and exact text/projector relationship.
+- **Verified external GGUF**: an explicitly requested upstream-prequantized
+  artifact plus repository revision, filename, size, digest, projector binding,
+  embedded metadata, and honest external provenance.
+- **Hardware profile**: measured hardware, unified memory, disk state, and the
+  candidate-selection inputs produced by `hf2q setup`.
+- **Artifact calibration receipt**: bounded runtime measurements for one exact
+  artifact/hardware/hf2q combination, including memory residency, context,
+  slots, shared KV budget, prefill batch, TTFT, prefill, and decode results.
+- **Session restore policy**: setup-recorded consent, storage root, byte limit,
+  permissions, eviction rules, and eligible family/scheduler combinations for
+  persisted prefix/KV checkpoints.
+
+Model and session data are not stored below the versioned installation root
+and are never removed, replaced, or migrated by `hf2q update`.
+
+## Decision
+
+### 1. Build and promote one exact release bundle
+
+The release pipeline produces a versioned Apple Silicon archive such as
+`hf2q-vX.Y.Z-aarch64-apple-darwin.zip` with this logical layout:
+
+```text
+bin/hf2q
+libexec/serve_qwen38_opencode.sh
+libexec/serve_qwen36_opencode.sh
+libexec/serve_gemma4_opencode.sh
+libexec/serve_deepseek4_opencode.sh
+share/doc/hf2q/
+share/licenses/hf2q/
+release-manifest.json
+```
+
+The binary is Developer ID signed with Hardened Runtime and a secure timestamp.
+The final ZIP is submitted with `notarytool`; release promotion requires an
+`Accepted` result and retained submission log for those exact bytes. [Apple
+documents](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
+that ZIP archives are accepted for notarization but tickets cannot be stapled
+to a ZIP or standalone executable, so notarization is release evidence, not an
+install-time `spctl` dependency. The archive and manifest are
+checksummed and covered by GitHub artifact attestation. The pipeline records
+the exact source commit, Developer ID team identifier, and minimum supported
+macOS version.
+
+The candidate archive is created before real-hardware release acceptance. The
+Apple Silicon gate installs and runs that archive, not a neighboring workspace
+binary. Publication promotes those identical archive bytes. It does not
+rebuild, re-sign, re-archive, or replace an asset after the hardware gate.
+The manifest also lists every non-system dynamic dependency, and the clean-host
+gate proves the bundle does not accidentally depend on a Rust toolchain, source
+checkout, Homebrew library, or build-machine-only path.
+
+The existing crate publication remains supported, but the current release
+workflow's mutable `gh release upload --clobber` path is not used for immutable
+binary releases. A release is drafted, all final assets are attached once, and
+the draft is published only after exact-artifact gates pass. A published asset
+or tag is never overwritten. GitHub immutable releases are enabled before the
+first bundle is published, and every GitHub release eligible to become
+`latest` carries an `install.sh` asset so
+`releases/latest/download/install.sh` cannot point at a crate-only release.
+Crate-only publication either creates no GitHub release or marks it as a
+prerelease that cannot become the stable `latest` target.
+
+The launcher list is an allowlist, not an assertion that a filename alone is
+supported. A launcher enters a public bundle only after its governing model
+family's exact-artifact release gates have passed. Every included launcher also
+has an installed-layout test that proves relative binary/profile resolution and
+that missing, incompatible, or conflicting prerequisites fail before a large
+model load with the correct recovery command.
+
+The accepted bundle is bound to the hardware gate's exact head SHA. Publication
+requires that SHA to remain an ancestor of `origin/main`; it does not require
+the gated SHA to remain the current tip after a long hardware run. This
+supersedes the release workflow's tip-equality rule for binary-bundle
+promotion, while the tag and every receipt remain bound to the gated SHA.
+
+### 2. Install without root and preserve rollback
+
+The standalone installer is a small auditable script compatible with Bash 3.2
+and with zsh, the standard interactive shell on current macOS. It installs all
+hf2q-owned state below one root, except for the user PATH entry point:
+
+```text
+~/.hf2q/
+├── versions/X.Y.Z/
+├── current -> versions/X.Y.Z
+├── models/
+├── cache/sessions/
+├── receipts/
+├── update/
+└── config.toml
+~/.local/bin/hf2q
+```
+
+The executable in `~/.local/bin` resolves the current version. Installed
+launcher entry points resolve paths relative to that version and use the
+model/profile registry; they contain no `/opt/hf2q` assumption.
+
+The installer:
+
+1. fails early unless the host and target are supported;
+2. supports a pinned `--version`, `--no-modify-path`, and an explicit install
+   root override;
+3. downloads the archive and its release-attached signed bootstrap metadata
+   snapshot into a private temporary directory; the expected metadata location
+   is an immutable versioned release URL, not the mutable update endpoint;
+4. performs a listing-only archive validation, rejecting duplicate or
+   unexpected entries, absolute paths, traversal, device nodes, and links
+   before extracting anything;
+5. extracts only the uniquely named regular `bin/hf2q` into private staging,
+   checks its SHA-256 against the target-specific value embedded in the
+   immutable versioned `install.sh`, validates it with
+   `codesign --verify --strict`, and requires the exact release-pinned Developer
+   ID team identifier before executing it;
+6. uses that staged binary's constrained verification mode and embedded
+   threshold root to authenticate the bootstrap metadata, then obtains the
+   expected archive and manifest digests only from that verified metadata;
+7. verifies the archive digest with macOS `shasum`, extracts the remaining
+   allowlisted files, and verifies the manifest, every file digest/mode, and the
+   complete inventory before activation;
+8. installs into a new version directory and atomically switches `current`;
+9. writes an install receipt and retains the active version plus two prior
+   verified versions; and
+10. updates shell PATH idempotently when needed, then runs a
+   packaged-install-aware
+   `hf2q doctor`.
+
+The live update-metadata service is not required while a release-attached
+signed snapshot is still valid. The normal and high-assurance local-file flows
+can then finish when the live update endpoint and Apple's notary service are
+unreachable. An explicitly selected older `--version` whose attached metadata
+has expired must obtain current threshold-signed metadata or fail before
+activation; explicit downgrade intent never bypasses signature or expiry
+checks. The release pipeline's accepted notarization record is checked before
+publication, while installer trust rests on local Developer ID verification,
+threshold-signed metadata, and exact digests. It does not treat `spctl`
+acceptance of an extracted bare CLI as a portable gate.
+
+PATH mutation supports zsh and Bash in the first release. The installer first
+checks the effective PATH and recognizes equivalent `$HOME/.local/bin` forms.
+If no change is required it writes nothing. Otherwise it preserves existing
+PATH logic and permissions and atomically adds exactly one marked hf2q-owned
+block to the active shell's appropriate user startup file, with a backup.
+It never edits Bash files merely because they exist when zsh is the active
+shell. `--no-modify-path` skips the edit, unknown shells receive copyable
+instructions, repeat installs do not duplicate text, and uninstall removes
+only the exact owned block.
+
+An interrupted or failed install leaves the prior `current` target usable.
+The installer never requires `sudo` and never writes `/usr/local` or another
+system prefix by default. It installs no model or optional integration, invokes
+no third-party installer, and never runs npm, Docker, Homebrew, or an OpenCode
+installation command. Its final action is to print `hf2q setup`; it does not
+run an interactive wizard inside the `curl | bash` pipeline.
+
+`curl | bash` necessarily trusts the initial HTTPS name resolution and
+response before the script can verify anything. The guide states that
+bootstrap limitation and also provides a high-assurance, version-pinned flow:
+download the installer and release assets, inspect the script, verify the
+GitHub attestation and published digests, then execute it locally.
+
+`hf2q uninstall` is receipt-driven. It removes hf2q-owned version directories,
+the hf2q entry points it created, update state, its receipt, and only the exact
+PATH stanza it owns. It preserves configuration, downloaded source weights,
+converted models, calibration receipts, session snapshots, OpenCode
+configuration, Agentic Kit state, and every third-party service by default,
+and prints the preserved data location. A separate explicit `--purge-data`
+confirmation is required to remove model and session data.
+
+### 3. Update the whole managed installation atomically
+
+The CLI adds:
+
+```text
+hf2q update --check
+hf2q update
+hf2q update --version X.Y.Z
+hf2q update --rollback
+```
+
+The default channel is stable. Update metadata uses a TUF-style trust model:
+the binary embeds a multi-key threshold root, metadata has signed roles and
+expiry, versions are monotonic, and the target binds the exact archive and
+release-manifest hashes. The v1 wire format supports root rotation through a
+threshold-signed rollover chain; reinstalling through a newly verified
+installer is the documented recovery of last resort. This must resist
+rollback, freeze, mix-and-match, and replayed-metadata attacks. The exact Rust
+client/library is selected only after a Rust 1.88-compatible implementation
+spike and hostile-metadata tests; plain unsigned `latest` JSON is not an
+acceptable updater authority.
+
+The initial stable metadata repository is served from GitHub Pages under the
+hf2q repository (for example,
+`https://robertelee78.github.io/hf2q/updates/stable/`). A branded route may
+redirect to or mirror those bytes, but signed metadata—not either transport—is
+the update authority. GitHub Pages enablement, key separation, offline-root
+handling, rotation, expiry refresh, and recovery are release prerequisites;
+the unsigned GitHub Releases `latest` response is only installer discovery.
+The key-generation, offline-root, online-role, rotation, revocation, expiry,
+and disaster-recovery runbook must exist and be exercised before self-update is
+made public; these choices are not deferred until after the first trust root is
+embedded.
+
+For a receipt-owned standalone install, update downloads and verifies the
+complete bundle, installs a new version directory, and atomically changes the
+active version. It never patches the running binary in place. A concurrent
+installer/updater is rejected by an installation-scoped lock. Rollback may
+select only a retained, previously verified release and records the change.
+
+`hf2q update` must work as the single front door regardless of installation
+method; "universal" does not mean overwriting across ownership boundaries. For
+Homebrew or Cargo-registry ownership, hf2q invokes the selected `brew`,
+`cargo install`, or `cargo binstall` route, propagates its result, and verifies
+the resulting hf2q version. For unknown/manual ownership, it explains the
+ambiguity and offers an explicitly confirmed migration to the managed
+standalone layout; it never silently overwrites the executable. Package
+ownership determines how an update is performed, not whether the user can
+invoke `hf2q update`.
+
+Ownership resolution is evidence-based and ordered: a valid standalone receipt
+whose entry point resolves into its recorded root; a Homebrew formula query
+whose Cellar path owns the running executable; then Cargo's installed-package
+registry plus its configured install root. Location alone is never sufficient.
+Cargo's installed-package records are an internal, unstabilized part of
+[Cargo home](https://doc.rust-lang.org/cargo/guide/cargo-home.html), and
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) describes itself
+as a drop-in `cargo install` replacement. They do not provide a supported
+historical-installer distinction, so hf2q records a route preference: an
+existing valid preference wins; otherwise an available cargo-binstall in the
+same Cargo home is selected and plain Cargo is the fallback. Ambiguous or
+contradictory evidence becomes `unknown/manual` and cannot authorize an
+overwrite.
+
+Automatic `--rollback` is a standalone-only operation because only the
+standalone layout owns retained versions. Under Homebrew or Cargo-registry
+ownership it fails closed without changing the executable and prints the
+tested owner-specific version/downgrade command when that manager supports one,
+or the manager's recovery instructions when it does not. `--version` likewise
+delegates an exact version only when the detected manager can express it;
+otherwise it fails without mutation. Unknown/manual ownership may migrate only
+after explicit confirmation.
+
+### 4. Check for updates on every launch with bounded refresh cost
+
+Startup evaluates a trusted local metadata cache before argument parsing, but
+does not emit the resulting notice until output format is known. The CLI uses a
+non-exiting parser path so a cached notice is emitted before command dispatch
+or before returning help, version, or parse-error output. A syntactically valid
+`--log-format json` selects a structured notice even for help/version exits;
+otherwise parser failures use one text stderr line. Stdout and
+machine-readable command output remain untouched.
+
+When the cache is stale, at most one process attempts a refresh, no more than
+once per 24 hours. That elected stale-cache invocation performs one foreground
+refresh with a 500 ms connection timeout and 1,500 ms total timeout. This
+explicit bounded delay, at most once per 24 hours for the shared state root, is
+the accepted cost of allowing the current invocation to report newly verified
+metadata; all other launches use only local state. Network, DNS, clock,
+signature, lock, or parse failure is silent at normal verbosity and never fails
+the requested hf2q command or exceeds those bounds. Invalid metadata is not
+cached.
+
+In text log mode, the notice is a single stderr line with installed/new
+versions and the correct owner-aware update instruction. Under
+`--log-format json`, it is one valid structured log event so the existing
+one-JSON-object-per-line contract is preserved. It never downloads or installs
+automatically, and notice emission is not suppressed merely because stderr is
+piped or non-interactive. `HF2Q_NO_UPDATE_CHECK=1` disables automatic network
+refresh and notices but never disables an explicit `hf2q update`; it is
+classified in `docs/operator-env-vars.md` and the shipping contract.
+Metadata and its single-flight lock live under the configured hf2q state root,
+`~/.hf2q/update/` by default, regardless of executable owner. Reading cached
+state creates nothing; only an elected stale refresh or explicit update may
+create that private directory. The request uses a fixed generic User-Agent and
+carries no installation identifier, exact installed version, telemetry, model
+inventory, or command name. "Every launch checks" means every launch evaluates
+the verified local state; it does not mean an unconditional network request on
+every launch.
+
+### 5. Configure hf2q with one small setup command
+
+`hf2q setup` is an idempotent hf2q-only host configuration step. It inventories
+Apple Silicon generation/GPU shape, unified memory, filesystem capacity and
+free space, active shell, existing hf2q configuration, and safe system limits,
+then writes `~/.hf2q/config.toml` atomically. It downloads no model, performs no
+conversion, starts no server, installs no integration, and does not edit
+OpenCode.
+
+Setup asks one simple session-persistence question:
+
+```text
+Keep inactive sessions on disk for fast resume? [Y/n]
+```
+
+When the user accepts, setup displays a disk-aware recommended byte limit and
+lets Enter accept it or an explicit value override it. The recommendation is
+the smallest of 100 GiB, 10% of the containing volume, 25% of currently free
+space, and the bytes remaining after reserving the greater of 20 GiB or 15% of
+the volume. Checked arithmetic floors a negative result to zero; when no safe
+positive band remains, setup refuses to enable persistence. The answer and
+exact limit are recorded. Non-interactive setup requires either
+`--session-cache off` or
+`--session-cache on --session-cache-limit <SIZE>` and never guesses consent.
+For the stored policy, zero means persistence is disabled; it never means
+unlimited, and `--session-cache on` rejects a zero limit. Re-running setup
+merges the current configuration without duplicate keys or stale managed
+fragments.
+
+Setup records a hardware profile used to rank accepted model candidates, but
+does not pretend to calibrate inference before a model exists. Exact runtime
+calibration occurs only after conversion or a requested published GGUF has
+been acquired.
+
+### 6. Treat Hugging Face identities as the public model interface
+
+One resolver accepts and normalizes:
+
+```text
+Qwen/Qwen3.8-27B
+https://huggingface.co/Qwen/Qwen3.8-27B
+https://huggingface.co/Qwen/Qwen3.8-27B/tree/<revision>
+https://huggingface.co/<owner>/<repo>/blob/<revision>/<file.gguf>
+https://huggingface.co/<owner>/<repo>/resolve/<revision>/<file.gguf>
+```
+
+A URL-embedded revision and `--revision` must agree or resolution fails. A
+branch or tag is resolved to an immutable commit before transfer. Receipts keep
+the user's original string and the normalized repository ID/type, canonical
+URL, exact revision, selected files, byte sizes, and digests. Public repositories
+need no credential; private/gated repositories use standard Hugging Face token
+discovery without copying tokens into hf2q configuration. Local paths remain
+supported explicitly.
+
+The guide uses `Qwen/Qwen3.8-27B` everywhere. A private local alias is not part
+of the documented workflow and never governs receipts, cache identity,
+diagnostics, or `/v1/models` identity.
+
+### 7. Make official-source preparation native, explicit, and device-aware
+
+The canonical official-source preparation command is:
+
+```sh
+hf2q convert Qwen/Qwen3.8-27B
+```
+
+It executes an hf2q-only resumable plan:
+
+1. resolve the checked-in recipe and ADR-044-accepted immutable revision;
+2. run host, free-space, memory, credential, and packaged-file preflight;
+3. download the official safetensors, configuration, tokenizer, template, and
+   multimodal preprocessing assets through the in-process `hf-hub` path;
+4. verify every recipe file by identity, size, and SHA-256 before conversion;
+5. choose the strongest independently acceptance-gated quantization that fits
+   measured unified memory, disk, temporary-space, and safety constraints;
+6. convert/quantize the language model and emit the source-matched F16 vision
+   projector through hf2q's Rust implementation;
+7. write immutable conversion receipts and register the artifact by canonical
+   Hugging Face identity; and
+8. run the bounded exact-artifact runtime calibration defined below.
+
+`--quant` remains an expert override, but cannot select a candidate that lacks
+the model-family quality and compatibility gate. Insufficient hardware fails
+before authentication or a large transfer and reports exact requirements. The
+product path never shells out to `hf` or `huggingface-cli`; external-CLI and pip
+remediation paths are unreachable from this command.
+
+The default layout is:
+
+```text
+~/.hf2q/models/huggingface/Qwen/Qwen3.8-27B/<revision>/
+├── source/
+├── artifacts/
+├── receipts/
+└── profile.json
+```
+
+The source download is resumable and shared by text/projector conversion. At
+successful completion, interactive conversion reports the exact source bytes
+and asks whether to retain them. Non-interactive use requires
+`--source-retention keep|delete`. Deletion occurs only after every output and
+receipt verifies, never after a failed/interrupted conversion, and never
+removes source data owned by an existing external Hugging Face cache.
+
+### 8. Resolve, calibrate, and serve exact artifacts
+
+The bundle contains the Qwen3.8, Qwen3.6, Gemma 4, and DeepSeek-V4 launchers,
+but they become thin relocatable entry points over a typed Rust profile
+registry. They resolve the installed binary and `~/.hf2q/models`, never
+`/opt/hf2q` or another checkout path.
+
+The canonical prepared-model command is:
+
+```sh
+hf2q serve Qwen/Qwen3.8-27B
+```
+
+Resolution order is: an explicit revision/`--quant`; the most recently
+successfully served compatible local artifact for that repository; the
+device-appropriate compatible cached artifact; otherwise a clear failure that
+prints `hf2q convert Qwen/Qwen3.8-27B`. A failed load never changes the
+preference. Every launch prints the chosen immutable revision, quantization,
+projector, and calibrated profile. Serving an official source ID never performs
+an implicit conversion or large source download.
+
+After conversion, or after first acquisition of a published GGUF, hf2q spends
+a bounded approximately one-minute run measuring the exact artifact's resident
+memory, safe prefill batch, KV bytes/token, slot count, shared physical KV
+budget, semantic TTFT, prefill, decode, text health, and image health when
+applicable. This is runtime calibration, not imatrix/DWQ quantization-quality
+calibration, and it cannot promote an unaccepted quantization. The receipt is
+keyed by artifact/projector digests, hardware fingerprint, hf2q/MLX ABI,
+tokenizer/template, scheduler, and inference settings. An incompatible change
+invalidates it. On commands that would initiate calibration—official-source
+`hf2q convert` and first-time external-GGUF `hf2q serve` acquisition—an explicit
+`--skip-calibration` chooses the accepted hardware-table profile immediately
+and records that fallback in the receipt. An ordinary serve of an already
+prepared artifact does not silently recalibrate it.
+
+Profiles optimize for agentic coding rather than minimum-memory conservatism.
+For Qwen3.8, every slot retains the model's 262,144-token logical context; slot
+count never divides that advertised limit. hf2q targets up to eight slots and,
+when measured safe, about 1,048,576 aggregate resident tokens in one dynamically
+shared physical KV budget. Admission, spill, and eviction enforce physical
+capacity without silently truncating a slot's logical context. Active requests
+are never evicted.
+
+An explicitly requested upstream-prequantized model uses a distinct path:
+
+```sh
+hf2q serve unsloth/Qwen3.8-27B-GGUF
+hf2q serve unsloth/Qwen3.8-27B-GGUF --quant Q5_K_M
+```
+
+hf2q resolves an immutable repository revision, deterministically selects only
+a runtime-supported GGUF candidate compatible with the hardware, downloads it
+plus the matching F16 projector, verifies bytes/metadata/binding, records
+upstream-prequantized provenance, calibrates it, caches it, and serves it with
+hf2q's runtime. It never claims hf2q converted that artifact. In the first
+release, external GGUF acquisition is limited to checked-in recipes that pin
+the repository revision, allowed GGUF/projector filenames, sizes, and SHA-256
+digests. A specific Hugging Face `blob`/`resolve` GGUF URL selects that exact
+file only when it normalizes into such a recipe; other external GGUF URLs fail
+closed rather than treating bytes and a digest from the same untrusted fetch as
+independent verification. Vision is disabled unless the recipe binds the exact
+F16 projector. Once an artifact has downloaded and served successfully, later
+serves use the cached immutable revision without checking Hugging Face for
+changes; network access requires an explicit `--refresh` or a missing cache
+entry.
+
+Qwen3.8 advertises image input only when its exact projector is present, bound,
+loaded, and reported as multimodal by `/v1/models`. The first public installer
+waits for ADR-044's packaged exact-artifact text-plus-vision gate; there is no
+public text-first installer shortcut under this ADR.
+
+### 9. Persist inactive sessions as a bounded acceleration cache
+
+hf2q builds on ADR-017 and ADR-027 rather than creating a second persistence
+system. Active and recently used sessions form the hot unified-memory tier;
+stable request-boundary prefix/KV checkpoints form a cold SSD tier under
+`~/.hf2q/cache/sessions/`. The client transcript remains authoritative: a
+checkpoint is only an acceleration artifact and its loss never loses the
+conversation.
+
+After each successful turn, hf2q atomically commits a sparse latest-useful
+checkpoint. On memory pressure it spills or reuses the durable checkpoint for
+the least-recently-used inactive session, frees its memory, and restores the
+longest exact matching prefix when that conversation returns. Active requests
+are never spilled or evicted. Graceful shutdown drains bounded pending writes;
+after a crash, only the last completely renamed verified checkpoint is
+eligible.
+
+Restore requires exact model and projector digests, tokenizer/template,
+rendered prompt prefix, KV substrate/codec and ABI, scheduler/inference
+configuration, and vision fingerprint. A client session identifier may improve
+indexing but is neither sufficient nor required because OpenAI-compatible
+clients normally resend the transcript. Any mismatch, corruption, unsafe
+permission, or incompatible version becomes a cache miss and normal prefill.
+
+The setup-recorded byte limit is mandatory. A disabled policy is encoded as
+zero; every enabled policy has a positive limit, and zero never means unlimited.
+Writes use private directories/files, checksums, atomic publication, sparse
+checkpoints, and LRU disk eviction before the limit or free-space guard is
+crossed. A disk write failure warns and falls back to safe transcript replay
+rather than blocking unrelated new work. The current tree
+already proves selected SerialFifo Qwen restart hydration; multi-slot Qwen3.8
+vision restoration remains release work and must pass exact-artifact semantic,
+isolation, disk-budget, cancellation, crash, and restart gates before the guide
+claims it.
+
+### 10. Keep every external integration optional
+
+The core installer, setup, conversion, server, direct API smoke test, and update path
+have no integration prerequisite. OpenCode, Agentic Kit, SearXNG, Firecrawl,
+Crawl4AI, Node/npm, container runtimes, and their dependencies are never
+installed, updated, started, stopped, or removed by the hf2q installer or
+updater.
+
+After a user installs OpenCode separately,
+`hf2q opencode configure Qwen/Qwen3.8-27B`
+emits an `@ai-sdk/openai-compatible` provider pointing at the local `/v1`
+endpoint, with a stable provider/model ID, context/output limits, tool support,
+and text/image modalities derived from the live server rather than hardcoded
+optimism. If OpenCode is absent, hf2q makes no system change and points to the
+tested official installation step in the guide. If the endpoint is unreachable
+or `/v1/models` does not expose the exact selected artifact and capabilities,
+the command writes nothing and instructs the user to start
+`hf2q serve Qwen/Qwen3.8-27B` first.
+
+The default target is the user's global
+`~/.config/opencode/opencode.json`, matching OpenCode's user-wide provider/model
+scope and merge behavior. An explicit
+`hf2q opencode configure Qwen/Qwen3.8-27B --project .` writes a project override.
+Existing global/project configuration, providers, models, plugins, and Agentic
+Kit additions are preserved. A write uses a lock, same-directory temporary
+file, fsync, atomic rename, restrictive permissions, and a backup. Strict JSON
+may be merged structurally. JSONC with comments is changed only through a
+parser that preserves its syntax; otherwise hf2q fails with a generated snippet
+and makes no edit. It never replaces an unparseable file. `hf2q setup` does not
+perform this optional integration step.
+
+OpenCode and Node.js remain third-party tools with their own release and trust
+boundaries. The guide uses the current official OpenCode installation method
+and records the exact version used by the acceptance demo.
+
+OpenCode and Agentic Kit have the same status: both are optional integrations,
+not hf2q requirements. The full agentic-demo guide adds Agentic Kit only after
+OpenCode is installed. Its reproducible acceptance path pins the exact
+prerelease resolved in the demo receipt:
+
+```sh
+npm install -g @pacphi/agentic-kit@<accepted-version>
+ak setup --opencode
+ak sync
+```
+
+The published guide replaces `<accepted-version>` with a concrete version; it
+does not ship that placeholder. It may also show
+`npm install -g @pacphi/agentic-kit@next` as an explicitly moving opt-in update
+channel, but `@next` is not the version-bound acceptance command. The guide
+states the Node/npm prerequisite and third-party trust boundary.
+Running Agentic Kit before or after hf2q configuration must converge without
+clobbering either tool's provider/plugin entries.
+
+SearXNG, Firecrawl, and Crawl4AI each receive a separate optional integration
+guide. Each guide uses the service's official installation and update boundary,
+records the tested version, names its ports/data/credential locations, shows
+how to connect it through the supported OpenCode or Agentic Kit mechanism,
+runs one deterministic smoke test, and explains shutdown and removal. The
+service remains independently owned; hf2q does not proxy, supervise, configure,
+or claim support for its internals. New services follow the same guide template
+instead of expanding the hf2q installer.
+
+`/var/tmp/search-fetch-setup.md` is lab-notebook source material only. Public
+guides must not reproduce its user names, absolute home paths, local tokens,
+temporary-file dependencies, launch-agent state, or machine-specific claims.
+Required wrappers/plugins/templates are checked into the repository with
+portable paths. Commands and versions are revalidated against official service
+documentation. Fetch/crawl examples bind locally and include redirect-aware
+SSRF defenses, private/link-local address rejection, `file:` rejection,
+response/time limits, and explicit credential handling; they do not promise
+that a free public search engine will remain available.
+
+### 11. Provide one progressive guide
+
+Implementation adds a progressive documentation set:
+
+```text
+docs/guides/getting-started.md
+docs/guides/qwen38.md
+docs/guides/integrations/opencode.md
+docs/guides/integrations/agentic-kit.md
+docs/guides/integrations/searxng.md
+docs/guides/integrations/firecrawl.md
+docs/guides/integrations/crawl4ai.md
+```
+
+The two core guides cover:
+
+- supported host/storage prerequisites and Hugging Face authentication;
+- installer, version-pinned verification, update, rollback, and uninstall;
+- `hf2q setup`, the canonical Hugging Face ID/URL grammar, and source-retention
+  and session-cache choices;
+- `hf2q convert Qwen/Qwen3.8-27B`, automatic quantization selection,
+  source-matched projector conversion, calibration, receipt inspection, and
+  `hf2q serve Qwen/Qwen3.8-27B`;
+- the explicit `hf2q serve unsloth/Qwen3.8-27B-GGUF` upstream-prequantized
+  path and its different provenance guarantees;
+- direct curl examples for unary/SSE text, image, tool call, and tool-result
+  continuation; and
+- troubleshooting by stable error and recovery action.
+
+The optional integration guides then cover OpenCode installation/configuration,
+the full OpenCode plus Agentic Kit demo, and each external search/crawling
+service. Every third-party command is researched against its current official
+documentation, version-bound in the acceptance receipt, and clearly separated
+from commands owned by hf2q.
+
+The README leads with the hf2q-only install/setup/convert/serve path. Optional integrations
+appear afterward and are never prerequisites for core success. Contributor
+build instructions remain available but are no longer presented as the normal
+installation route. CLI help, `doctor`, README, and guides are audited together
+so the clean-account path never recommends Python or claims stale family
+support.
+
+## Threat model and failure behavior
+
+| Threat or failure | Required behavior |
+|---|---|
+| Compromised mirror/CDN asset | A uniquely staged binary must pass exact Developer ID/team validation before it authenticates threshold-signed bootstrap metadata; only that metadata supplies the archive/manifest digests. Any mismatch fails closed, and the high-assurance flow additionally verifies GitHub attestation. |
+| Replayed old metadata or release | Version/expiry/role checks reject rollback and freeze; no downgrade occurs without explicit selection of a previously verified retained version. |
+| Published asset replacement | Immutable draft-to-publish flow forbids overwrite; clients bind exact hashes rather than trusting a mutable tag alone. |
+| Malicious archive path/link | A listing-only allowlist/path/type pass precedes any extraction; only the signed binary is extracted first, all remaining files stay in private staging until their signed inventory/digests verify, and no write escapes staging or the new version directory. |
+| Interrupted install/update | The old `current` target and receipt remain active; partial staging is not executable. |
+| Concurrent updater | Installation lock admits one transition and leaves no ambiguous active version. |
+| Package-manager collision | Receipt plus manager-database ownership evidence prevents self-overwrite; Cargo route history is never guessed, and `hf2q update` delegates through the recorded/selected route and verifies the result. |
+| Offline or hostile update endpoint | Normal commands continue and only verified cached metadata may produce a notice. Installation uses the immutable release's signed bootstrap snapshot rather than the live endpoint; absent or invalid required release files fail before activation. |
+| Corrupt/partial model download | Shard identity, size, and SHA-256 fail before conversion; resumable state is retained or quarantined safely. |
+| Ambiguous or hostile Hugging Face reference | Only normalized Hugging Face IDs/URLs and explicit local paths are accepted; host, revision, filename, and URL/flag conflicts fail closed. |
+| Untrusted external GGUF | The first release accepts only recipe-pinned revision/file/size/digest/projector combinations; architecture, metadata, runtime codec, and projector checks fail before load, and provenance remains upstream-prequantized. |
+| Wrong text/projector pair | Preparation, startup, `/v1/models`, and image requests fail closed. |
+| Stale or incompatible calibration | Artifact, hardware, ABI, template, scheduler, or settings mismatch invalidates the profile and requires recalibration or a hardware-table profile. |
+| KV checkpoint leakage or corruption | Exact prefix/identity/codec/vision gates reject cross-session reuse; corruption becomes a cache miss and is quarantined. |
+| Session cache fills disk | Setup-recorded byte/free-space guards and LRU eviction stop writes before the boundary; unlimited mode is not accepted. |
+| Existing optional-integration config | Parse/merge validation or no write; never truncate, replace, or silently discard entries. |
+| Port or memory conflict | Calibration/launcher refuses before loading the large model and gives a direct recovery command. |
+
+The bootstrap HTTPS request, a compromised maintainer signing identity, a
+compromised Apple/GitHub trust root, and a fully compromised local account are
+outside what a shell installer can eliminate. Key rotation/revocation and
+update-root recovery require the exercised operational runbook specified above
+before public self-update ships.
+
+## Implementation sequence
+
+1. Freeze and adversarially test the release/install/update schemas, canonical
+   Hugging Face reference grammar, prepared/external artifact provenance,
+   calibration receipt, session policy, and hostile-input fixtures.
+2. Implement `hf2q setup`, the unified `~/.hf2q` state layout, idempotent
+   Bash/zsh PATH ownership, hardware inventory, and the one-question bounded
+   session policy.
+3. Converge conversion on the exact-revision native downloader, add positional
+   canonical model references, the accepted Qwen3.8 quantization/profile
+   matrix, source-retention transaction, and receipt-bound text/projector
+   output.
+4. Add canonical-ID prepared-model resolution and the separately labeled
+   external-GGUF resolver; pin the exact accepted Unsloth revision, filenames,
+   sizes, and SHA-256 values in release recipes.
+5. Implement exact-artifact runtime calibration and ambitious shared-KV
+   profile selection, then make every canonical launcher relocatable over the
+   same typed profile registry.
+6. Lift ADR-017/ADR-027 persistence into bounded setup-controlled multi-slot
+   Qwen3.8 vision sessions, with isolation, crash, quota, and semantic replay
+   gates.
+7. Build the candidate bundle; add signing, notarization, GitHub attestation,
+   immutable-release enforcement, draft publication, and installed-artifact
+   hardware gates.
+8. Implement and adversarially test the standalone installer, atomic switch,
+   active-plus-two rollback retention, ownership detection, universal
+   manager-delegating `hf2q update`, launch notices, and receipt-driven
+   uninstall.
+9. Implement safe global-by-default optional OpenCode configuration and live
+   capability verification without adding an OpenCode installation path.
+10. Research, write, and run the core and optional integration guides, then
+    update `docs/shipping-contract.md` and the README only for surfaces whose
+    exact packaged-artifact gates have passed.
+
+Each phase lands with focused tests before the next expands the public surface.
+No installer URL is advertised until it returns an immutable, verified bundle.
+
+## Acceptance gates
+
+The release candidate is tested from a clean supported Apple Silicon account
+with no Rust toolchain, Python, `hf` CLI, source checkout, or pre-existing hf2q
+files.
+
+### Core distribution gates
+
+- the direct GitHub asset installs the exact hardware-accepted archive without
+  `sudo`; when enabled, `hf2q.us/install.sh` redirects to that version's
+  immutable asset and never serves independent bytes;
+- every stable-`latest` GitHub release contains `install.sh`, while crate-only
+  releases cannot become that pointer;
+- stock macOS Bash 3.2 and zsh both parse and run the installer, including
+  version-pinned and no-PATH-mutation flows;
+- signed-bootstrap verification passes with the live update endpoint and Apple
+  notarization service offline while attached metadata is valid; missing,
+  expired, or tampered bootstrap state and a wrong Developer ID team block
+  activation, while a non-accepted notarization record blocks promotion;
+- the installed binary, all packaged launchers/docs/licenses/manifests,
+  receipts, smart Bash/zsh PATH behavior, `doctor`, uninstall, and shell restart
+  work from `~/.hf2q` plus `~/.local/bin/hf2q`;
+- default uninstall removes only receipt-owned installation files and the exact
+  owned PATH stanza, preserves and reports the location of config, models,
+  source weights, conversion/calibration receipts, session snapshots, OpenCode,
+  Agentic Kit, and third-party service state, and never follows a changed path
+  or symlink outside that inventory; `--purge-data` without explicit
+  confirmation removes nothing, and interruption leaves either the prior
+  runnable installation or a receipt-marked retryable uninstall state with no
+  dangling `current` target;
+- each packaged launcher has already passed its governing family release gate,
+  resolves only installed relative paths, and rejects missing/incompatible
+  artifacts or port/memory conflicts before model load with the right canonical
+  recovery command;
+- the installed inventory contains only hf2q-owned files and invokes no model,
+  OpenCode, npm, Agentic Kit, container, or service installer;
+- setup passes fresh, cancelled, repeated, malformed-existing-config, and
+  non-interactive cases, including no-positive-safe-disk-band and zero-limit
+  rejection, without destructive or duplicate changes;
+- tampered metadata/archive/manifest, traversal/link archives, interrupted and
+  concurrent transitions, unsupported host/macOS, and owner mismatch fail as
+  specified;
+- `hf2q update` passes a real standalone lifecycle plus PATH-isolated recording
+  manager fixtures for Homebrew, Cargo, cargo-binstall, contradictory/unknown
+  ownership, exact-version, manager-specific rollback refusal, concurrent,
+  offline, and manager-failure cases without touching model, calibration,
+  session, or integration data; each actual package channel adds a real-manager
+  installed-artifact gate before its support claim is published;
+- launch notices evaluate cached state on every launch, refresh no more than
+  once per 24 hours with a 500 ms connect and 1,500 ms total timeout, never
+  contaminate stdout, remain valid JSON events, cover help/version/parse-error
+  exits, print the owner-aware update route, honor opt-out, preserve privacy,
+  create no state on cache-only reads, and never force an update; and
+- threshold-root rotation, expired/replayed/mixed metadata, and recovery by a
+  newly verified installer pass before self-update is advertised.
+
+### Official Qwen3.8 gates
+
+- Hugging Face ID, canonical repository URL, and pinned `tree` URL normalize to
+  one identity; hostile/ambiguous URL, revision, and filename combinations fail;
+- `hf2q convert Qwen/Qwen3.8-27B` downloads the accepted official revision
+  once, verifies every shard, performs hf2q-owned quantization/projector
+  conversion, safely implements keep/delete source retention, and produces
+  complete reproducible receipts;
+- every automatically selectable quantization independently passes quality,
+  memory, conversion, text, vision, and agentic serving acceptance; a host
+  below all accepted profiles fails before authentication or transfer;
+- post-artifact calibration is bounded and reproducible, and stale artifact,
+  hardware, ABI, template, scheduler, or setting combinations invalidate it;
+  explicit `--skip-calibration` on a calibration-triggering command selects
+  only an accepted hardware-table profile and records that fallback;
+- `hf2q serve Qwen/Qwen3.8-27B` resolves only the matching local prepared
+  artifact, obeys explicit/MRU/device-compatible selection, and performs no
+  surprise source download or conversion; and
+- the exact installed text/projector pair passes ADR-044's remaining vision
+  promotion gate plus `/readyz`, `/v1/models`, unary/SSE text, a real image,
+  native tools, tool-result continuation, semantic TTFT, cancellation, and
+  unchanged-prefix reuse.
+
+### External GGUF and session-restoration gates
+
+- one exact `unsloth/Qwen3.8-27B-GGUF` revision, selected GGUF(s), F16
+  projector, sizes, and hashes are recipe-pinned and served end-to-end with
+  upstream-prequantized provenance;
+- unsupported architecture/quantization, corrupt bytes, incompatible metadata,
+  missing/mismatched projector, and unsafe URL forms fail before model load;
+- a successfully served cached external artifact triggers no remote update
+  check, while explicit `--refresh` is deterministic and receipt-bound;
+- setup's `[Y/n]` policy records the displayed byte limit, enforces sparse LRU
+  disk use and the free-space guard, and never permits an unlimited product
+  cache;
+- cold-process Qwen3.8 text and image conversations restore the longest exact
+  prefix with correct output/tool semantics, while unrelated conversation,
+  tenant, image, model, template, codec, scheduler, and settings cases cannot
+  reuse it; and
+- disk corruption/full, cancellation, SIGKILL during write, graceful restart,
+  memory-pressure spill, and restore failure degrade to safe replay without
+  cross-session leakage or blocking unrelated work.
+
+### Documentation and optional-integration gates
+
+- the core direct-API guide completes the packaged Qwen3.8 scenario with no
+  optional tool installed;
+- the optional OpenCode guide installs OpenCode through its official method,
+  configures the live `Qwen/Qwen3.8-27B` provider globally without manual JSON,
+  and completes the same text/image/tool scenario;
+- global/project, JSON/JSONC, malformed, repeat-run, and Agentic Kit convergence
+  fixtures preserve every unrelated provider, model, plugin, and comment, while
+  server-down or model/capability-mismatch cases perform no write and print the
+  exact serve-first recovery command;
+- the optional Agentic Kit guide's setup/sync preserves the hf2q provider and
+  completes the OpenCode scenario using the exact receipted package version;
+  any displayed `@next` alternative is labeled moving and is not acceptance
+  evidence; and
+- each SearXNG, Firecrawl, and Crawl4AI guide passes its pinned-version smoke
+  test without adding files to or ownership claims inside the hf2q install.
+
+An optional integration failure blocks publication of that guide's verified
+claim, not the unrelated core installer. The first public installer itself is
+blocked on working self-update, launch notices, and the packaged Qwen3.8 vision
+proof enumerated above.
+
+Receipts bind the exact archive, source commit, target, macOS/hardware, model
+source/output hashes, prompt/settings, cached-token counts, TTFT,
+prefill/decode rates, tool semantics, image identity, and client versions.
+
+## Consequences and non-claims
+
+The primary installation becomes independent of Rust, Python, and a checkout,
+while the standalone supported operator surface moves as one rollback-capable
+unit.
+The cost is a larger release/security surface: signing credentials, notarized
+artifacts, trusted metadata rotation, immutable release discipline, installer
+testing, and clean-account hardware acceptance become release-blocking work.
+
+The first bundle supports Apple Silicon only. Homebrew formula publication,
+Linux, Intel macOS, Windows, background daemons, automatic third-party tool
+installation, delta updates, and nightly channels are deferred. cargo-dist may
+help generate archives or formulae, but
+its installer model does not replace this bundle's scripts/docs/receipt and
+atomic-update contract.
+
+Nothing in this ADR is shipped merely because the document exists. Until the
+implementation and acceptance gates pass, the checkout build, existing CLI,
+and current release assets remain the truthful public behavior. Qwen3.8 text
+acceptance and vision-candidate status remain exactly as recorded in ADR-044.
