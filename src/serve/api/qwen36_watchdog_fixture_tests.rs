@@ -212,12 +212,14 @@ fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
     let cancellation = include_str!("../../../scripts/test_qwen36_prefill_cancellation.sh");
     let deepseek_overlap = include_str!("../../../scripts/test_deepseek4_interactive_overlap.sh");
     let release_gate = include_str!("../../../scripts/run_agentic_cache_release_gate.sh");
+    let release_workflow = include_str!("../../../.github/workflows/release.yml");
 
     for (name, script) in [
         ("watchdog", watchdog),
         ("cancellation", cancellation),
         ("deepseek overlap", deepseek_overlap),
         ("release gate", release_gate),
+        ("release workflow", release_workflow),
     ] {
         assert!(
             script.contains(REQUEST_SHA256),
