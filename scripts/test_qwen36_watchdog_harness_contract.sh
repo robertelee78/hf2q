@@ -358,6 +358,13 @@ grep -Fq '$q.cancellation.chunks_after_cancel == ($q.cancellation.chunks_after_c
   "$script_dir/../.github/workflows/release.yml"
 grep -Fq 'qwen36_validate_cancellation_transaction_counts' \
   "$script_dir/../.github/workflows/release.yml"
+grep -Fq 'fixture_sha256 == "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e"' \
+  "$script_dir/../.github/workflows/release.yml"
+if grep -Fq 'fixture_sha256 == "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d"' \
+  "$script_dir/../.github/workflows/release.yml"; then
+  echo "release verifier still accepts the historical key-sorted fixture" >&2
+  exit 1
+fi
 # Literal jq source; `$qwen_cancellation` must not expand in this contract.
 # shellcheck disable=SC2016
 grep -Fq '($qwen_cancellation | length) != 1' \
