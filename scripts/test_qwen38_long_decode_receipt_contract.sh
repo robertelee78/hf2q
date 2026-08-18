@@ -3,9 +3,22 @@ set -euo pipefail
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 verifier="$root_dir/scripts/verify_qwen38_long_decode_receipt.sh"
+runner="$root_dir/scripts/qwen38_long_decode_ab.sh"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-qwen38-contract.XXXXXX")
 cleanup_contract() { rm -rf "$tmp"; }
 trap cleanup_contract EXIT
+
+# ripgrep's `-E` selects an encoding instead of enabling extended regexes.
+# Keep the authoritative runner's fatal-signature scan on grep(1), matching
+# the independent verifier, so a bad option cannot silently disable the gate.
+if ! grep -Fq "if grep -Eiq 'GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|engine_unhealthy|panicked at|worker-fatal'" "$runner"; then
+  echo "Qwen3.8 runner must fail closed on fatal signatures with grep -Eiq" >&2
+  exit 1
+fi
+if grep -Fq "rg -Eiq 'GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|engine_unhealthy|panicked at|worker-fatal'" "$runner"; then
+  echo "Qwen3.8 runner uses ripgrep's incompatible -E option" >&2
+  exit 1
+fi
 
 source_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 crate_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

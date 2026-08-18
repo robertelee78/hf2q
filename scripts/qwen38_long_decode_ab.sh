@@ -330,7 +330,7 @@ run_trial() {
     echo "Qwen3.8 off trial selected the GQA Q2 candidate" >&2
     return 1
   fi
-  if rg -Eiq 'GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|engine_unhealthy|panicked at|worker-fatal' "$server_log"; then
+  if grep -Eiq 'GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|engine_unhealthy|panicked at|worker-fatal' "$server_log"; then
     echo "Qwen3.8 long-decode trial observed a fatal runtime signature" >&2
     return 1
   fi
