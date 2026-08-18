@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Exact-artifact Qwen3.8 long-context decode comparison. Each trial starts a
-# fresh one-slot server from the same sealed binary and uses the same greedy
-# request bytes. The fixed ABBA order limits monotonic warmup/cooldown bias.
+# Exact-artifact Qwen3.8 short/long decode comparison. Each trial starts a
+# fresh one-slot server from the same sealed binary, proves the scalar route
+# below the crossover, then runs the same long greedy request bytes. The fixed
+# ABBA order limits monotonic warmup/cooldown bias.
 
 SOURCE_SHA=${SOURCE_SHA:?SOURCE_SHA is required}
 CRATE_SHA256=${CRATE_SHA256:?CRATE_SHA256 is required}

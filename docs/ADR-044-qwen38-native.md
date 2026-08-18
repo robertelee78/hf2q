@@ -332,10 +332,17 @@ isolated 104,966-token processes measured 1.603x, 1.610x, and 1.615x; a
 1,000-step run had a 0.999 first-versus-last median ratio. A local
 path-patched hf2q spike then measured 16.5732 versus 20.6089 tok/s, a 24.3506%
 gain, with identical semantic hashes. That spike proves the reformulated
-hypothesis but is not release authority: the register-resident kernel must be
-published in an immutable mlx-native crate and consumed without a Cargo patch.
-Q3 was not retained because its threadgroup-memory and occupancy tradeoff did
-not justify a second production variant.
+hypothesis but is not release authority. The same register-resident
+implementation is now published and checksum-pinned as `mlx-native 0.10.10`
+without a Cargo patch; the packed hf2q short/long receipt remains the required
+downstream authority. Q3 was not retained because its threadgroup-memory and
+occupancy tradeoff did not justify a second production variant.
+
+Upstream release workflow `32148168017` tested the exact source, packed
+archive, and archive downloaded back from crates.io; it then verified the
+GitHub release bytes. Tag `v0.10.10` resolves to
+`c6c5092f6f5a0cc4f3c79e98c3caa63eef78d542`, and both public crate surfaces
+have SHA-256 `b390c48281b0134b821d6da300b1e385580b9e6456f0536fd744e1bc711572cf`.
 
 hf2q's candidate selector defaults to `auto`: it remains on the legacy kernel
 below 8,192 KV tokens and requires the exact Qwen3.8 D=256/GQA/no-mask geometry

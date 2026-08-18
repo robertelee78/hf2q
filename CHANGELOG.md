@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Pin published `mlx-native 0.10.9` and add its bit-exact GQA-cooperative Q2
-  TQ-HB attention path behind a measured context-length selector. Publication
+- Pin published `mlx-native 0.10.10` and add its register-resident,
+  bit-exact GQA-cooperative Q2 TQ-HB attention path behind a measured
+  context-length selector. Publication
   requires an exact-source, thermally guarded OFF/AUTO ABBA receipt with at
   least 15% end-to-end improvement near 105K tokens, identical greedy output,
   and no short-context route regression.
