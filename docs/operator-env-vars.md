@@ -56,6 +56,14 @@ rerank logic.
 | `HF2Q_NO_FA` | off | `1`/`true`/`on` | Diagnostic A/B knob.  When set, routes the global D=512 attention path through F32 tensor-mm instead of flash-attention.  Forced off at `seq_len < 32` (the dense-matmul kernel requires K ≥ 32).  Per ADR-032 the FA path is the production default — peer-aligned with llama.cpp's `kernel_flash_attn_ext_*_dk512_dv512`.  This flag exists for bisection work against the tensor-mm reference, not for production use. |
 | `HF2Q_FA_F16` | on | `0`/`false`/`off` | F16 (`half`, 10-bit mantissa) Q/K/V in flash-attention shared memory.  Matches llama.cpp's default `FA_TYPES` template specialisation for F16 KV cache (the standard production path).  Per ADR-032 this is the peer-aligned default — Q-shmem precision is the binding constraint on argmax stability at D=512 global layers (BF16's 7-bit mantissa accumulates ~9% relative error over a 512-element dot product, flipping argmax on narrow-margin greedy decode).  Opt-out reverts to BF16 (`bfloat`, 7-bit mantissa) shmem — peer's `FA_TYPES_BF` specialisation, only used in llama.cpp when KV cache is explicitly BF16.  Provided for diagnostic A/B against the BF16 instantiation; not for production. |
 
+## Qwen reasoning and decode
+
+| Var | Default | Values | Effect |
+|---|---|---|---|
+| `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET` | unset globally; `2048` in the canonical Qwen launcher | non-negative integer tokens | Server-default ceiling for Qwen reasoning when the request omits `thinking_token_budget`. `0` disables the default. The handler still reserves answer capacity inside `max_tokens`; an explicit request budget remains exact and takes precedence. |
+| `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` | `512` in the canonical Qwen launcher | non-negative integer tokens | Ceiling for the first tool-result continuation when the request omits an explicit budget. Deeper tool cycles reduce deterministically to a 256-token floor. `0` disables the launcher override. Invalid values are rejected by the launcher and fail requests from noncanonical startup paths. |
+| `HF2Q_QWEN_GQA_Q2` | `auto` | `auto`, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 TQ-HB decode shares each KV-head load/dequantization across two query heads when the exact D=256/GQA/no-mask geometry is supported. `auto` selects it at KV length ≥8,192; `off` is the production escape hatch; `on` forces the candidate only where its hard geometry checks pass. Invalid values fail safe to `off`. Release requires the exact-output, thermally supervised short/long receipt in the shipping contract. |
+
 ## Dense KV / decode layout
 
 `dense_kv_capacity` is sized per-layer at prefill time. Sliding layers

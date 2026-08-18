@@ -185,6 +185,10 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::install_state:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::update_auth:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features qwen_thinking_budget -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features gqa_q2_policy_tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features loaded_registration_overrides -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features serve::operator_ui::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen35_serving_tokenizer_is_sidecar_free_and_detects_vision_markers -- --test-threads=1
           cargo test --locked --bin hf2q --all-features vision_projector_binding -- --test-threads=1
           cargo test --locked --bin hf2q --all-features model_advertisement_contract_ -- --test-threads=1
@@ -212,6 +216,9 @@ jobs:
             scripts/verify_macos_thermal_receipt.sh \
             scripts/verify_gemma4_wave_thermal_receipt.sh \
             scripts/verify_gemma4_parity_receipt.sh \
+            scripts/qwen38_long_decode_ab.sh \
+            scripts/verify_qwen38_long_decode_receipt.sh \
+            scripts/test_qwen38_long_decode_receipt_contract.sh \
             scripts/test_macos_thermal_guard_contract.sh \
             scripts/test_gemma4_wave_thermal_contract.sh \
             scripts/test_gemma4_eight_slot_receipt_contract.sh \
@@ -233,6 +240,7 @@ jobs:
           bash scripts/test_macos_thermal_guard_contract.sh
           bash scripts/test_gemma4_wave_thermal_contract.sh
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
+          bash scripts/test_qwen38_long_decode_receipt_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh

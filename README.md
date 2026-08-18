@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
-| **Status** | hf2q 0.1.6 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.10.8`. Public availability is authoritative only when the `v0.1.6` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.7 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.10.10`. Public availability is authoritative only when the `v0.1.7` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
@@ -424,7 +424,8 @@ widen genuinely mixed work: a runnable decoder beside prefill remains clamped
 to the eight-token/two-window interactive budget above.
 
 Large DeepSeek MoE prefills also pair the routed expert gate and up
-projections through the family-neutral `mlx-native 0.10.8` schedule primitive.
+projections through the family-neutral schedule primitive introduced in
+`mlx-native 0.10.9` and retained by the pinned `mlx-native 0.10.10`.
 That primitive constructs the expert routing schedule once, then encodes the
 two existing quantized projections; it is not a new approximate arithmetic
 kernel. Decode-sized work, forced matvec/slotted diagnostics, calls without
@@ -463,7 +464,7 @@ serving and cannot replace hf2q's exact packed-artifact cache gate.
 The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
 they are not final hf2q artifact authority. Release requires rerunning the same
-gates from a clean hf2q package resolving published `mlx-native 0.10.8`:
+gates from a clean hf2q package resolving published `mlx-native 0.10.10`:
 
 - `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
   552-token SSE lane immediately before the public 87,972-token/347-tool lane,
@@ -486,7 +487,8 @@ gates from a clean hf2q package resolving published `mlx-native 0.10.8`:
   family artifacts on a 128 GiB host.
 - `scripts/run_agentic_cache_release_gate.sh` is the release wrapper used by
   the manual `Cache lifecycle` workflow. It packages the exact main commit,
-  runs DeepSeek, Gemma, and Qwen sequentially under continuous AC and
+  runs DeepSeek, Gemma, Qwen, and the Qwen3.8 short/long decode discriminator
+  sequentially under continuous AC and
   `caffeinate` guards, verifies each GGUF against a protected SHA-256, and
   emits a source/crate/binary/model-bound manifest that the publication
   workflow must download and verify. Its calibrated four-slot Gemma waves run
@@ -499,7 +501,7 @@ are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.6 serving release
+#### Test the 0.1.7 serving release
 
 Build and verify the exact checkout before loading a model:
 

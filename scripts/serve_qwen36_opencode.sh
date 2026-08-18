@@ -30,6 +30,14 @@
 #                           limits this is an adaptive ceiling that reserves
 #                           roughly one quarter of max_tokens for the answer.
 #                           Set THINKING_TOKEN_BUDGET=0 to disable.
+#   HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET=512
+#                           Smaller default for tool-result continuations.
+#                           Deeper tool-result turns in one user tool chain
+#                           reduce this deterministically to a 256-token
+#                           floor. Explicit request budgets always win. Set
+#                           TOOL_THINKING_TOKEN_BUDGET=0 to disable the
+#                           continuation default without disabling fresh-turn
+#                           thinking budgets.
 #   HF2Q_ENCODER_SESSION=1
 #                           Reuses ordered Metal command-buffer sessions
 #                           across Qwen prefill stages. Recovery-state capture
@@ -81,6 +89,7 @@ HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 THINKING_TOKEN_BUDGET="${THINKING_TOKEN_BUDGET:-2048}"
+TOOL_THINKING_TOKEN_BUDGET="${TOOL_THINKING_TOKEN_BUDGET:-512}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
@@ -98,6 +107,10 @@ if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 
 fi
 if ! [[ "$THINKING_TOKEN_BUDGET" =~ ^[0-9]+$ ]]; then
     echo "THINKING_TOKEN_BUDGET must be a non-negative integer (got: $THINKING_TOKEN_BUDGET)" >&2
+    exit 3
+fi
+if ! [[ "$TOOL_THINKING_TOKEN_BUDGET" =~ ^[0-9]+$ ]]; then
+    echo "TOOL_THINKING_TOKEN_BUDGET must be a non-negative integer (got: $TOOL_THINKING_TOKEN_BUDGET)" >&2
     exit 3
 fi
 case "$VISION_MODE" in
@@ -172,6 +185,7 @@ HF2Q_SERVE_ARGS+=(
 exec env \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
     HF2Q_DEFAULT_THINKING_TOKEN_BUDGET="$THINKING_TOKEN_BUDGET" \
+    HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET="$TOOL_THINKING_TOKEN_BUDGET" \
     HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \

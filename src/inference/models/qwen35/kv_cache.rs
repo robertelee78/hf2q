@@ -47,6 +47,57 @@ pub use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gated_delta_net_c
 
 use super::{Qwen35Config, Qwen35LayerKind};
 
+/// The isolated M5 Max kernel A/B first covered 8K and above. Keep shorter
+/// requests on the scalar kernel until a separate short-context gate proves a
+/// lower crossover. The specialized PSO is compiled during model warmup.
+const GQA_Q2_MIN_KV_SEQ_LEN: u32 = 8_192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GqaQ2Mode {
+    Off,
+    Auto,
+    On,
+}
+
+fn parse_gqa_q2_mode(value: Option<&str>) -> GqaQ2Mode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "off" | "false") => GqaQ2Mode::Off,
+        Some("1" | "on" | "true") => GqaQ2Mode::On,
+        Some("auto") | None => GqaQ2Mode::Auto,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "invalid HF2Q_QWEN_GQA_Q2 value; disabling cooperative attention"
+            );
+            GqaQ2Mode::Off
+        }
+    }
+}
+
+pub(super) fn gqa_q2_mode() -> GqaQ2Mode {
+    static MODE: std::sync::OnceLock<GqaQ2Mode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_gqa_q2_mode(std::env::var("HF2Q_QWEN_GQA_Q2").ok().as_deref()))
+}
+
+fn use_gqa_q2_tq_sdpa_for_mode(params: &Qwen35TqSdpaParams, mode: GqaQ2Mode) -> bool {
+    mode != GqaQ2Mode::Off
+        && (mode == GqaQ2Mode::On || params.kv_seq_len >= GQA_Q2_MIN_KV_SEQ_LEN)
+        && params.head_dim == 256
+        && params.num_kv_heads > 0
+        && params
+            .num_attention_heads_per_kv()
+            .is_some_and(|group| group % 2 == 0)
+        && params.mask_type == 0
+        && params.sliding_window == 0
+        && params.ring_start == 0
+        && params.softcap == 0.0
+        && matches!(params.codebook_bits, 5 | 6 | 8)
+}
+
+fn use_gqa_q2_tq_sdpa(params: &Qwen35TqSdpaParams) -> bool {
+    use_gqa_q2_tq_sdpa_for_mode(params, gqa_q2_mode())
+}
+
 /// Per-full-attention-layer KV slot.
 pub struct FullAttnKvSlot {
     /// Keys buffer `[head_dim, n_kv_heads, max_seq_len, n_seqs]` f32.
@@ -492,20 +543,47 @@ impl FullAttnKvSlot {
             // cross-simdgroup reduce is verified at NSG=2,4.
             nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(params.kv_seq_len),
         };
-        mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
-            encoder,
-            registry,
-            device,
-            q,
-            &views.k_packed,
-            &views.k_norms,
-            &views.v_packed,
-            &views.v_norms,
-            output,
-            tmp,
-            &kernel_params,
-        )
-        .map_err(|e| anyhow!("dispatch_tq_sdpa: flash_attn_vec_tq_hb: {e}"))?;
+        if use_gqa_q2_tq_sdpa(params) {
+            static FIRST_GQA_Q2: std::sync::Once = std::sync::Once::new();
+            FIRST_GQA_Q2.call_once(|| {
+                tracing::info!(
+                    kv_seq_len = params.kv_seq_len,
+                    num_heads = params.num_heads,
+                    num_kv_heads = params.num_kv_heads,
+                    "Qwen TQ-HB decode selected GQA-cooperative Q2 attention"
+                );
+            });
+            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_gqa(
+                encoder,
+                registry,
+                device,
+                q,
+                &views.k_packed,
+                &views.k_norms,
+                &views.v_packed,
+                &views.v_norms,
+                output,
+                tmp,
+                &kernel_params,
+                mlx_native::ops::flash_attn_vec_tq_hb::GqaTile::Q2,
+            )
+            .map_err(|e| anyhow!("dispatch_tq_sdpa: cooperative TQ-HB Q2: {e}"))?;
+        } else {
+            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+                encoder,
+                registry,
+                device,
+                q,
+                &views.k_packed,
+                &views.k_norms,
+                &views.v_packed,
+                &views.v_norms,
+                output,
+                tmp,
+                &kernel_params,
+            )
+            .map_err(|e| anyhow!("dispatch_tq_sdpa: flash_attn_vec_tq_hb: {e}"))?;
+        }
         Ok(())
     }
 
@@ -829,6 +907,76 @@ pub struct Qwen35TqSdpaParams {
     pub scale_factor_d512: f32,
     /// Codebook bit-width (5, 6, or 8 — qwen35 default = 8).
     pub codebook_bits: u32,
+}
+
+impl Qwen35TqSdpaParams {
+    fn num_attention_heads_per_kv(self) -> Option<u32> {
+        (self.num_kv_heads > 0 && self.num_heads % self.num_kv_heads == 0)
+            .then_some(self.num_heads / self.num_kv_heads.max(1))
+    }
+}
+
+#[cfg(test)]
+mod gqa_q2_policy_tests {
+    use super::*;
+
+    fn params() -> Qwen35TqSdpaParams {
+        Qwen35TqSdpaParams {
+            num_heads: 24,
+            num_kv_heads: 4,
+            head_dim: 256,
+            kv_seq_len: 8_192,
+            kv_capacity: 262_144,
+            scale: 1.0 / 16.0,
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        }
+    }
+
+    #[test]
+    fn qwen38_geometry_selects_q2_at_measured_crossover() {
+        let mut p = params();
+        p.kv_seq_len = GQA_Q2_MIN_KV_SEQ_LEN - 1;
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::Auto));
+        p.kv_seq_len = GQA_Q2_MIN_KV_SEQ_LEN;
+        assert!(use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::Auto));
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::Off));
+        p.kv_seq_len = 1;
+        assert!(use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+    }
+
+    #[test]
+    fn unsupported_geometry_and_attention_modes_fall_back() {
+        let mut p = params();
+        p.head_dim = 512;
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        p = params();
+        p.num_heads = 20;
+        p.num_kv_heads = 4;
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        p = params();
+        p.mask_type = 2;
+        p.sliding_window = 4_096;
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        p = params();
+        p.codebook_bits = 4;
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+    }
+
+    #[test]
+    fn operator_mode_parser_is_explicit_and_fail_safe() {
+        assert_eq!(parse_gqa_q2_mode(None), GqaQ2Mode::Auto);
+        assert_eq!(parse_gqa_q2_mode(Some("auto")), GqaQ2Mode::Auto);
+        assert_eq!(parse_gqa_q2_mode(Some("off")), GqaQ2Mode::Off);
+        assert_eq!(parse_gqa_q2_mode(Some("0")), GqaQ2Mode::Off);
+        assert_eq!(parse_gqa_q2_mode(Some("on")), GqaQ2Mode::On);
+        assert_eq!(parse_gqa_q2_mode(Some("1")), GqaQ2Mode::On);
+        assert_eq!(parse_gqa_q2_mode(Some("invalid")), GqaQ2Mode::Off);
+    }
 }
 
 impl LinearAttnStateSlot {

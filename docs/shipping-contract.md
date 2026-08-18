@@ -1,6 +1,6 @@
 # hf2q Shipping Contract
 
-This document defines the public hf2q 0.1.5 product surface and the
+This document defines the public hf2q 0.1.6 product surface and the
 **Unreleased next-release candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
@@ -27,7 +27,7 @@ family's graph, cache, or scheduler contract by approximation.
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
   `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
   otherwise F16.
-- **Public by 0.1.5; strengthened in the Unreleased 0.1.6 candidate:**
+- **Public by 0.1.6; strengthened in the Unreleased 0.1.7 candidate:**
   Qwen3.5/Qwen3.6 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
   Slot-aware Qwen prefill
@@ -38,14 +38,14 @@ family's graph, cache, or scheduler contract by approximation.
   before Qwen LM scheduler/SSE admission until their own prefill and decode are scheduler-yielding;
   the historical multimodal primitive remains available only under
   SerialFifo. The separate chunk-scan prefill experiment remains Category 3.
-- **Public by 0.1.5; strengthened in the Unreleased 0.1.6 candidate:** long
+- **Public by 0.1.6; strengthened in the Unreleased 0.1.7 candidate:** long
   plain-text Gemma SlotAware prefill advances in
   at most 4,096-token transactions, split at the stable-prefix boundary. The
   transaction publishes all configured per-layer cache cursors together.
   Compatible installed prefill states may share those 4,096 aggregate rows;
   the bound never multiplies by the number of slots. Long soft-token work
   remains fail-closed until a resumable graph is proven.
-- **Public by 0.1.5; strengthened in the Unreleased 0.1.6 candidate:** DeepSeek
+- **Public by 0.1.6; strengthened in the Unreleased 0.1.7 candidate:** DeepSeek
   meaningful cached suffixes use the same
   atomic resumable verifier transactions as cold prefill. Lopsided cold waves
   use an interactive budget of up to eight decode tokens between prefill slices
@@ -58,8 +58,8 @@ family's graph, cache, or scheduler contract by approximation.
   Outside a cold-cohort barrier, staggered warm work may occupy any free
   physical slot. Cancellation restores only a valid, position-consistent
   pre-request turn anchor; poisoned or inconsistent state resets fully.
-  The Unreleased 0.1.6 candidate also pairs large automatic MoE gate/up
-  projections through the published `mlx-native 0.10.8` routing-schedule
+  The Unreleased 0.1.7 candidate also pairs large automatic MoE gate/up
+  projections through the published `mlx-native 0.10.10` routing-schedule
   primitive. Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -82,7 +82,7 @@ Every Gemma change that could affect the forward pass or lm_head must pass
 | `sliding_wrap` common-byte-prefix with locked hf2q reference | ≥ 700 bytes |
 | Decode perf sanity on the sourdough prompt | ≥ 95 tok/s |
 
-Before the Unreleased 0.1.6 Qwen cache-lifecycle corrections may ship, every
+Before the Unreleased 0.1.7 Qwen cache-lifecycle corrections may ship, every
 Qwen SlotAware serving change must additionally pass all of these gates
 from a clean packed artifact that resolves the published, checksum-pinned
 `mlx-native` dependency:
@@ -94,6 +94,7 @@ from a clean packed artifact that resolves the published, checksum-pinned
 | Exact overlap | The deterministic 552-token SSE lane is enqueued immediately before the 87,972-token/347-tool lane; the short lane makes semantic progress while the long lane completes exactly 42×2,048 + 1,956 prompt tokens. |
 | Disconnect | Dropping the long SSE is observed at a transaction boundary, releases the same physical slot once, and a following request succeeds. |
 | Agentic four-slot gate | Required/automatic tools, unary/SSE, tool-result continuation, exact arguments, and retained-prefix reuse pass for four independent slots. Qwen uses the canonical prompt-visible `/opt/hf2q/Cargo.toml` path, a direct-tool system instruction, and an unambiguous completed-tool-result envelope; their SHA-256 identities are receipt-bound so an ephemeral package path or prompt rewrite cannot silently change the workload. |
+| Qwen3.8 short/long decode | The same packed binary and model run a fixed OFF/AUTO/AUTO/OFF comparison. Every fresh server first emits 512 greedy tokens below the 8,192-token selector crossover, then emits 512 greedy tokens at 100K–120K prompt tokens. Short and long output bytes must match across all arms; AUTO's short mean may regress by at most 2%; AUTO must improve long mean decode throughput by at least 15%; and each short and long arm's two trials must remain within 5%. AUTO must reduce mean long-request curl wall time. Every request binds curl time and shell phase time within two seconds of the response's total timer, requires its own unary SlotAware decode-complete event from the same decode clock, and runs inside the release gate's continuous fair-or-better thermal envelope. The short log snapshot must prove AUTO stayed on the scalar path below crossover; the long AUTO log must prove Q2 selection. A benchmark-only summary is diagnostic evidence, not release authority. |
 | Native lifetime/fatal recovery | Exact-artifact hardware waves keep command-buffer and CFString populations bounded and reject every timeout or ignored-submission signature. Packed model-free fail-stop and supervisor tests inject the fatal return/dead-worker state, prove no post-fatal submission, preserve `/health` as process liveness, and require `/readyz` plus new generation to fail closed. The hardware gate does not intentionally poison Metal. |
 
 The shared cross-family changes additionally require:
@@ -114,6 +115,9 @@ not remove or silently change them without an ADR.
 | Var | Values | Purpose |
 |---|---|---|
 | `HF2Q_LMHEAD_Q8` | `1`, `0`, unset | Force Q8 on, force F16, or auto-select. Escape hatch for models the auto heuristic classifies incorrectly. |
+| `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator default for Qwen reasoning when a request omits `thinking_token_budget`; the canonical Qwen launcher uses 2,048 and the handler still reserves answer capacity. `0` disables the default. Explicit request budgets take precedence. |
+| `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator ceiling for the first Qwen tool-result continuation; the canonical launcher uses 512 and deeper cycles reduce to a 256-token floor. `0` disables this launcher override. |
+| `HF2Q_QWEN_GQA_Q2` | `auto`/unset, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 long-context TQ-HB selector. Auto uses the bit-exact Q2 cooperative kernel only at KV length ≥8,192 and only for its hard D=256/GQA/no-mask geometry. Off is the supported escape hatch. On cannot bypass geometry checks. Invalid values fail safe to off. |
 | `HF2Q_BATCHED_PREFILL` | `0`/`false`/`off`, unset | Opt out of the default batched prefill path (Category 1) back to per-token `forward_prefill`. For parity diagnostics only — per-token is 14-45× slower than peer. Default-on since ADR-028 iter-344; decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack at that iter. The remaining `sliding_wrap` long-sequence byte-parity gap is the operator-signed deferral (2026-04-16; see ADR-010), a coherence deferral — not a runtime error. |
 | `HF2Q_STREAMING_PHASE3` | `1`, unset | ADR-014 P7 iter-3 production wire-up. Routes all 4 Phase 3 quantize dispatch arms (K-quant codec direct / ImatrixAdaptive / StaticQuantizer / DwqK) and Phase 4.5 quality measurement through the streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed` + `measure_quality_streaming_lazy`). Output is byte-identical to the eager path — every wired arm has a per-arm byte-identity gate. Currently a TEST INTEGRATION channel, not a memory win (wedge clones bytes ~2× peak briefly); actual memory savings land when iter-3 wholesale surgery removes the upstream `materialize_all()` bridge. Default OFF; default behavior unchanged. |
 

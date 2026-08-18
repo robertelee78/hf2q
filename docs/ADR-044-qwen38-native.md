@@ -153,6 +153,16 @@ and the same required `calculate_sum` call with integer arguments 17 and 25;
 the result continuation completed normally. This closes the original dense
 fallback performance defect without weakening the quality gate.
 
+A later matched long-context peer run used llama.cpp build 10451
+(`10bf611e5`) with the same Q4_K_M artifact, one 131,072-token slot, Metal
+flash attention, default F16 K/V, temperature zero, and thinking disabled. A
+cold 105,029-token prefill took 493.839 seconds. Five exact-prefix 128-token
+decode runs measured 15.734, 15.266, 15.934, 15.890, and 15.374 tok/s, a
+15.734 tok/s median, with identical output. This is a production-default peer
+comparison rather than cache-format parity because hf2q uses compressed TQ-HB
+K/V. It replaces the former absence of any matched approximately 105K
+llama.cpp evidence; it does not replace the exact hf2q legacy/Q2 release gate.
+
 The exact native server artifact passed `/readyz`, unary and SSE text,
 required-tool unary and SSE calls, schema-correct arguments, tool-result
 continuation with 407 of 429 prompt tokens cached, automatic thinking without
@@ -293,3 +303,64 @@ historical 10-second wall-clock bound missed by 732 ms on the first run, then
 passed under an explicit 15-second bound without relaxing any semantic or
 cache assertion. This residual latency is recorded rather than conflated with
 the corrected first-image cache and reasoning failures.
+
+### Long-context GQA-cooperative decode candidate (2026-08-18)
+
+At a 104,966-token prefix, Qwen3.8's 24 query heads and four KV heads cause the
+legacy TQ-HB kernel to request roughly 20.96 GB of KV traffic per generated
+token: each six-head GQA group reloads and dequantizes its shared KV head per
+query head. A bandwidth model built from the accepted 29.19 tok/s short-context
+baseline predicts 12.99 tok/s; the observed agentic turn measured 13.4 tok/s.
+The same model predicted 24.09 tok/s at 17,807 tokens versus 22.1 observed and
+18.43 at 49,169 versus 18.0 observed. This identifies the long-context decode
+loss as a kernel-layout limit, independent of the separate model/tool retry
+loop.
+
+Published `mlx-native 0.10.9` added the first bit-exact D=256
+GQA-cooperative Q2 TQ-HB kernel. It shares one packed K/V load and
+dequantization across two query heads without changing per-query
+online-softmax state or the final reduction layout. Its first sealed hf2q
+OFF/AUTO/AUTO/OFF run measured 17.1767 versus 19.5490 tok/s, a 13.8112% gain,
+and correctly failed the fixed 15% release gate.
+
+Split retuning did not close the gap: NSG4 remained faster than NSG2/NSG1,
+and the best NWG point improved the candidate by only about 1.3%. The revised
+kernel instead retains each lane's query slice in registers. It remains
+bit-identical across TQ5/TQ6/TQ8 and reduces threadgroup memory from 11,264 to
+10,240 bytes, crossing the 32 KiB three-workgroup occupancy boundary. Three
+isolated 104,966-token processes measured 1.603x, 1.610x, and 1.615x; a
+1,000-step run had a 0.999 first-versus-last median ratio. A local
+path-patched hf2q spike then measured 16.5732 versus 20.6089 tok/s, a 24.3506%
+gain, with identical semantic hashes. That spike proves the reformulated
+hypothesis but is not release authority. The same register-resident
+implementation is now published and checksum-pinned as `mlx-native 0.10.10`
+without a Cargo patch; the packed hf2q short/long receipt remains the required
+downstream authority. Q3 was not retained because its threadgroup-memory and
+occupancy tradeoff did not justify a second production variant.
+
+Upstream release workflow `32148168017` tested the exact source, packed
+archive, and archive downloaded back from crates.io; it then verified the
+GitHub release bytes. Tag `v0.10.10` resolves to
+`c6c5092f6f5a0cc4f3c79e98c3caa63eef78d542`, and both public crate surfaces
+have SHA-256 `b390c48281b0134b821d6da300b1e385580b9e6456f0536fd744e1bc711572cf`.
+
+hf2q's candidate selector defaults to `auto`: it remains on the legacy kernel
+below 8,192 KV tokens and requires the exact Qwen3.8 D=256/GQA/no-mask geometry
+above that threshold. `HF2Q_QWEN_GQA_Q2=off` is the supported escape hatch;
+`on` still cannot bypass hard geometry checks, and invalid values fail safe to
+off. This default is accepted for merge only when the same packed hf2q binary
+passes the shipping contract's OFF/AUTO/AUTO/OFF release receipt: identical
+greedy output at both a sub-8,192 short prompt and near 105K, no more than 2%
+short-context regression, at least 15% mean long-context decode gain, no arm
+above 5% spread, lower independently measured long-request curl wall time,
+one exactly-once SlotAware completion event per request derived from the
+finalized result, and a continuous fair-or-better thermal envelope. The short
+log snapshot must prove `auto` retained the scalar route before the long AUTO
+request proves Q2 selection. Isolated mlx-native numbers are dependency
+evidence, not hf2q release authority.
+
+The next exact-output optimization sequence is a two-dimensional H2xP2
+query-head/query-position verifier, then native Qwen3.8 MTP and a dynamic
+suffix-automaton proposer behind measured acceptance/cost routing. Split-K
+retuning and true packed TQ6/TQ5 storage follow only after the cooperative
+kernel and verifier establish their new bandwidth/occupancy regime.

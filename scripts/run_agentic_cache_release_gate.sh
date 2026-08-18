@@ -14,9 +14,11 @@ EXPECTED_BINARY_SHA256=${EXPECTED_BINARY_SHA256:?EXPECTED_BINARY_SHA256 is requi
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL:?DEEPSEEK_MODEL is required}
 GEMMA_MODEL=${GEMMA_MODEL:?GEMMA_MODEL is required}
 QWEN_MODEL=${QWEN_MODEL:?QWEN_MODEL is required}
+QWEN38_MODEL=${QWEN38_MODEL:?QWEN38_MODEL is required}
 DEEPSEEK_MODEL_SHA256=${DEEPSEEK_MODEL_SHA256:?DEEPSEEK_MODEL_SHA256 is required}
 GEMMA_MODEL_SHA256=${GEMMA_MODEL_SHA256:?GEMMA_MODEL_SHA256 is required}
 QWEN_MODEL_SHA256=${QWEN_MODEL_SHA256:?QWEN_MODEL_SHA256 is required}
+QWEN38_MODEL_SHA256=${QWEN38_MODEL_SHA256:?QWEN38_MODEL_SHA256 is required}
 OUT_ROOT=${OUT_ROOT:-$(mktemp -d /var/tmp/hf2q-cache-release.XXXXXX)}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
@@ -56,10 +58,11 @@ done
   echo "EXPECTED_BINARY_SHA256 must be a lowercase 64-character digest" >&2
   exit 2
 }
-for model in "$DEEPSEEK_MODEL" "$GEMMA_MODEL" "$QWEN_MODEL"; do
+for model in "$DEEPSEEK_MODEL" "$GEMMA_MODEL" "$QWEN_MODEL" "$QWEN38_MODEL"; do
   [[ -f "$model" ]] || { echo "model not found: $model" >&2; exit 2; }
 done
-for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" "$QWEN_MODEL_SHA256"; do
+for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" \
+  "$QWEN_MODEL_SHA256" "$QWEN38_MODEL_SHA256"; do
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
     echo "model SHA-256 values must be lowercase 64-character digests" >&2
     exit 2
@@ -333,6 +336,7 @@ test "$(stat -f %z "$agentic_fixture")" = 21204
 verify_model deepseek "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256"
 verify_model gemma "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256"
 verify_model qwen "$QWEN_MODEL" "$QWEN_MODEL_SHA256"
+verify_model qwen38 "$QWEN38_MODEL" "$QWEN38_MODEL_SHA256"
 
 mkdir -p "$OUT_ROOT/fixtures"
 HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
@@ -569,6 +573,123 @@ run_qwen_release_gates() {
   qwen36_validate_cancellation_transaction_counts \
     "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
   finish_server_phase
+}
+
+run_qwen38_long_decode_release_gate() {
+  local out="$OUT_ROOT/qwen38/long-decode"
+  local benchmark_dir="$out/benchmark"
+  local thermal_dir="$out/thermal"
+  local thermal_measurement_log="$thermal_dir/measurement.log"
+  local thermal_settle_log="$thermal_dir/settle.log"
+  local thermal_summary="$thermal_dir/summary.json"
+  local harness_rc=0
+  local thermal_rc=0
+  local measurement_samples measurement_duration_seconds
+  local non_nominal_measurement_samples fair_measurement_samples
+  local over_limit_measurement_samples telemetry_gaps
+  local settle_samples settle_duration_seconds settle_telemetry_gaps
+  local sample_interval_seconds=2
+  local maximum_sample_gap_seconds=5
+  local settle_sample_interval_seconds=5
+  local maximum_settle_sample_gap_seconds=8
+
+  mkdir -p "$out" "$thermal_dir"
+  ensure_guard_health
+  require_no_model_runtime
+  thermal_wait_for_nominal "$thermal_settle_log" \
+    qwen38-long-decode-settle 60 900 "$settle_sample_interval_seconds"
+  : >"$thermal_measurement_log"
+  thermal_sample "$thermal_measurement_log" \
+    qwen38-long-decode-measurement-start
+  test "$THERMAL_STATE" = nominal
+
+  SOURCE_SHA="$EXPECTED_SHA" CRATE_SHA256="$CRATE_SHA256" \
+  BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
+  MODEL_PATH="$QWEN38_MODEL" MODEL_SHA256="$QWEN38_MODEL_SHA256" \
+  OUT_DIR="$benchmark_dir" PORT=18083 \
+    scripts/qwen38_long_decode_ab.sh \
+      >"$out/benchmark.stdout" 2>"$out/benchmark.stderr" &
+  wave_harness_pid=$!
+  set +e
+  thermal_monitor_fair_or_better_while_pid "$thermal_measurement_log" \
+    qwen38-long-decode-measurement "$wave_harness_pid" \
+    "$sample_interval_seconds"
+  thermal_rc=$?
+  if ((thermal_rc != 0)); then
+    kill -TERM "$wave_harness_pid" 2>/dev/null || true
+  fi
+  wait "$wave_harness_pid"
+  harness_rc=$?
+  wave_harness_pid=''
+  set -e
+  ((thermal_rc == 0)) || {
+    echo "Qwen3.8 long-decode thermal supervision failed" >&2
+    return 1
+  }
+  ((harness_rc == 0)) || return "$harness_rc"
+  require_no_model_runtime
+  ensure_guard_health
+  thermal_sample "$thermal_measurement_log" \
+    qwen38-long-decode-measurement-end
+  [[ "$THERMAL_STATE" == nominal || "$THERMAL_STATE" == fair ]]
+
+  thermal_validate_fair_or_better_measurement_log "$thermal_measurement_log" \
+    "$maximum_sample_gap_seconds"
+  measurement_samples=$THERMAL_LOG_SAMPLES
+  measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+  non_nominal_measurement_samples=$THERMAL_LOG_NON_NOMINAL_SAMPLES
+  fair_measurement_samples=$THERMAL_LOG_FAIR_SAMPLES
+  over_limit_measurement_samples=$THERMAL_LOG_OVER_LIMIT_SAMPLES
+  telemetry_gaps=$THERMAL_LOG_GAPS
+  thermal_validate_settle_log "$thermal_settle_log" 60 \
+    "$maximum_settle_sample_gap_seconds"
+  settle_samples=$THERMAL_LOG_SAMPLES
+  settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+  settle_telemetry_gaps=$THERMAL_LOG_GAPS
+
+  jq -n --arg benchmark_summary_sha256 \
+    "$(sha256_file "$benchmark_dir/summary.json")" \
+    --arg settle_log_sha256 "$(sha256_file "$thermal_settle_log")" \
+    --arg measurement_log_sha256 "$(sha256_file "$thermal_measurement_log")" \
+    --argjson settle_seconds 60 \
+    --argjson settle_duration_seconds "$settle_duration_seconds" \
+    --argjson settle_samples "$settle_samples" \
+    --argjson measurement_samples "$measurement_samples" \
+    --argjson measurement_duration_seconds "$measurement_duration_seconds" \
+    --argjson sample_interval_seconds "$sample_interval_seconds" \
+    --argjson maximum_sample_gap_seconds "$maximum_sample_gap_seconds" \
+    --argjson settle_sample_interval_seconds "$settle_sample_interval_seconds" \
+    --argjson maximum_settle_sample_gap_seconds "$maximum_settle_sample_gap_seconds" \
+    --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
+    --argjson fair_measurement_samples "$fair_measurement_samples" \
+    --argjson over_limit_measurement_samples "$over_limit_measurement_samples" \
+    --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
+    --argjson telemetry_gaps "$telemetry_gaps" \
+    '{status:"pass",phase:"qwen38-long-decode",required_start_state:"nominal",
+      maximum_measurement_state:"fair",
+      runtime_preflight:"pass",measurement_scope:"full-abba-benchmark",
+      benchmark_summary_sha256:$benchmark_summary_sha256,
+      settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
+      settle_samples:$settle_samples,measurement_samples:$measurement_samples,
+      measurement_duration_seconds:$measurement_duration_seconds,
+      sample_interval_seconds:$sample_interval_seconds,
+      maximum_sample_gap_seconds:$maximum_sample_gap_seconds,
+      settle_sample_interval_seconds:$settle_sample_interval_seconds,
+      maximum_settle_sample_gap_seconds:$maximum_settle_sample_gap_seconds,
+      non_nominal_measurement_samples:$non_nominal_measurement_samples,
+      fair_measurement_samples:$fair_measurement_samples,
+      over_limit_measurement_samples:$over_limit_measurement_samples,
+      settle_telemetry_gaps:$settle_telemetry_gaps,telemetry_gaps:$telemetry_gaps,
+      settle_log_sha256:$settle_log_sha256,
+      measurement_log_sha256:$measurement_log_sha256}' >"$thermal_summary.tmp"
+  mv "$thermal_summary.tmp" "$thermal_summary"
+  jq -n --slurpfile benchmark "$benchmark_dir/summary.json" \
+    --slurpfile thermal "$thermal_summary" \
+    '{schema_version:1,status:"pass",benchmark:$benchmark[0],thermal:$thermal[0]}' \
+    >"$out/receipt.json.tmp"
+  mv "$out/receipt.json.tmp" "$out/receipt.json"
+  bash scripts/verify_qwen38_long_decode_receipt.sh release "$out" \
+    "$EXPECTED_SHA" "$CRATE_SHA256" "$binary_sha" "$QWEN38_MODEL_SHA256"
 }
 
 run_gemma_wave() {
@@ -912,6 +1033,7 @@ run_gemma_release_gates() {
 run_deepseek_release_gates
 run_gemma_release_gates
 run_qwen_release_gates
+run_qwen38_long_decode_release_gate
 
 ensure_guard_health
 pmset -g assertions > "$OUT_ROOT/power-assertions.after.txt"
@@ -929,6 +1051,7 @@ power_snapshot_manifest_sha=$(sha256_file "$power_snapshot_manifest")
 deepseek_bytes=$(stat -f '%z' "$DEEPSEEK_MODEL")
 gemma_bytes=$(stat -f '%z' "$GEMMA_MODEL")
 qwen_bytes=$(stat -f '%z' "$QWEN_MODEL")
+qwen38_bytes=$(stat -f '%z' "$QWEN38_MODEL")
 qwen36_validate_cancellation_transaction_counts \
   "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
 bash scripts/verify_gemma4_parity_receipt.sh \
@@ -942,9 +1065,11 @@ jq -n \
   --arg deepseek_path "$DEEPSEEK_MODEL" \
   --arg gemma_path "$GEMMA_MODEL" \
   --arg qwen_path "$QWEN_MODEL" \
+  --arg qwen38_path "$QWEN38_MODEL" \
   --arg deepseek_sha "$DEEPSEEK_MODEL_SHA256" \
   --arg gemma_sha "$GEMMA_MODEL_SHA256" \
   --arg qwen_sha "$QWEN_MODEL_SHA256" \
+  --arg qwen38_sha "$QWEN38_MODEL_SHA256" \
   --arg deepseek_lifecycle_sha "$(sha256_file "$OUT_ROOT/deepseek/lifecycle/summary.json")" \
   --arg deepseek_interactive_sha "$(sha256_file "$OUT_ROOT/deepseek/interactive/summary.json")" \
   --arg deepseek_cached_sha "$(sha256_file "$OUT_ROOT/deepseek/cached-suffix/summary.json")" \
@@ -967,10 +1092,12 @@ jq -n \
   --arg qwen_lifecycle_sha "$(sha256_file "$OUT_ROOT/qwen/lifecycle/summary.json")" \
   --arg qwen_cumulative_sha "$(sha256_file "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json")" \
   --arg qwen_cancellation_sha "$(sha256_file "$OUT_ROOT/qwen/cancellation/cancellation-summary.json")" \
+  --arg qwen38_long_decode_sha "$(sha256_file "$OUT_ROOT/qwen38/long-decode/receipt.json")" \
   --argjson power_guarded_ac "$power_guarded_ac" \
   --argjson deepseek_bytes "$deepseek_bytes" \
   --argjson gemma_bytes "$gemma_bytes" \
   --argjson qwen_bytes "$qwen_bytes" \
+  --argjson qwen38_bytes "$qwen38_bytes" \
   --slurpfile deepseek_lifecycle "$OUT_ROOT/deepseek/lifecycle/summary.json" \
   --slurpfile deepseek_interactive "$OUT_ROOT/deepseek/interactive/summary.json" \
   --slurpfile deepseek_cached "$OUT_ROOT/deepseek/cached-suffix/summary.json" \
@@ -988,6 +1115,7 @@ jq -n \
   --slurpfile qwen_lifecycle "$OUT_ROOT/qwen/lifecycle/summary.json" \
   --slurpfile qwen_cumulative "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json" \
   --slurpfile qwen_cancellation "$OUT_ROOT/qwen/cancellation/cancellation-summary.json" \
+  --slurpfile qwen38_long_decode "$OUT_ROOT/qwen38/long-decode/receipt.json" \
   'if ($qwen_cancellation | length) != 1 then
     error("Qwen cancellation receipt must contain exactly one JSON document")
   else {
@@ -1000,17 +1128,20 @@ jq -n \
     models: {
       deepseek: {path: $deepseek_path, bytes: $deepseek_bytes, sha256: $deepseek_sha},
       gemma: {path: $gemma_path, bytes: $gemma_bytes, sha256: $gemma_sha},
-      qwen: {path: $qwen_path, bytes: $qwen_bytes, sha256: $qwen_sha}
+      qwen: {path: $qwen_path, bytes: $qwen_bytes, sha256: $qwen_sha},
+      qwen38: {path: $qwen38_path, bytes: $qwen38_bytes, sha256: $qwen38_sha}
     },
     receipt_sha256: {
       deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha},
       gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,eight_slots_thermal:$gemma_wave8_thermal_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
-      qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha}
+      qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha},
+      qwen38:{long_decode:$qwen38_long_decode_sha}
     },
     families: {
       deepseek: {status:"pass",lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
       gemma: {status:"pass",lifecycle:$gemma_lifecycle[0],overlap_and_cancellation:$gemma_overlap[0],agent_waves:[$gemma_wave1[0],$gemma_wave2[0],$gemma_wave8[0]],transactions:[$gemma_transactions4[0],$gemma_transactions8[0]],parity:$gemma_parity[0],heap:$gemma_heap[0]},
-      qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]}
+      qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]},
+      qwen38: {status:"pass",long_decode:$qwen38_long_decode[0]}
     }
   } end' > "$OUT_ROOT/manifest.json.tmp"
 mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"

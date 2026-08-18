@@ -7,8 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-18
+
+### Added
+
+- Add native Qwen3.8 conversion and Apple-Silicon inference, including the
+  model's hybrid attention graph, multimodal projector path, OpenAI-compatible
+  reasoning/tools, retained-prefix serving, and exact-artifact agentic gates.
+- Add strict signed distribution, activation-state, and update-journal schemas,
+  plus automatic shell completion for the CLI.
+
+### Changed
+
+- Pin published `mlx-native 0.10.10` and add its register-resident,
+  bit-exact GQA-cooperative Q2 TQ-HB attention path behind a measured
+  context-length selector. Publication
+  requires an exact-source, thermally guarded OFF/AUTO ABBA receipt with at
+  least 15% end-to-end improvement near 105K tokens, identical greedy output,
+  and no short-context route regression.
+- Bound Qwen's fresh-turn and tool-continuation reasoning budgets, expose the
+  effective thinking phase and answer progress in the operator dashboard, and
+  warn on repeated tool-result signatures without blocking legitimate retries.
+- Preserve text-prefix KV across a first image suffix when exact tokens,
+  multimodal spans, DeepStack positions, and all mRoPE axes prove the earlier
+  text state is causally reusable.
+
 ### Fixed
 
+- Emit authoritative, exactly-once Qwen SlotAware decode-complete telemetry so
+  the long-context receipt cannot accept response timing detached from the
+  engine path that generated it; requests with a detected client cancellation
+  never publish success.
+- Update `h2` to 0.4.16 to resolve RUSTSEC-2026-0258 and keep the exact-source
+  security rebuild inside the release gate.
+- Upgrade the direct `indicatif` dependency to 0.18.4, removing the
+  unmaintained `number_prefix` transitive dependency from the release graph.
+- Isolate Hugging Face cache environment mutation so parallel hosted tests no
+  longer race over process-global cache paths.
 - Preserve client JSON-object insertion order while rendering native chat
   templates. DeepSeek-V4's published encoder treats the serialized tool schema
   as prompt bytes; sorting the function and parameter keys changed the greedy
@@ -699,7 +734,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/robertelee78/hf2q/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/robertelee78/hf2q/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/robertelee78/hf2q/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/robertelee78/hf2q/compare/v0.1.3...v0.1.4

@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.88.0"
 build = "src/build_script.rs"
@@ -103,7 +103,7 @@ rayon = "1.10"
 memmap2 = "0.9"
 
 # UX
-indicatif = "0.17"
+indicatif = "0.18.4"
 console = "0.15"
 
 # Serialization
@@ -122,9 +122,9 @@ thiserror = "2"
 # DeepSeek-V4 Q3_K, Q8 embeddings, scalable indexer, sparse decode, and
 # long-lived SlotAware Metal lifetime safety plus unlabeled GraphSession
 # command-buffer drop performance and paired MoE prefill scheduling require
-# mlx-native 0.10.8.
+# mlx-native 0.10.10.
 # Pin the immutable registry release so clean builds cannot drift.
-mlx-native = "=0.10.8"
+mlx-native = "=0.10.10"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

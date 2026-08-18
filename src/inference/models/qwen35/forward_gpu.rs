@@ -2503,13 +2503,39 @@ impl Qwen35Model {
                         fa_entries,
                     );
 
+                    let gqa_q2_warmed = if !crate::debug::INVESTIGATION_ENV.use_dense
+                        && super::kv_cache::gqa_q2_mode()
+                            != super::kv_cache::GqaQ2Mode::Off
+                        && self.cfg.head_dim == 256
+                        && self.cfg.num_key_value_heads > 0
+                        && self.cfg.num_attention_heads % self.cfg.num_key_value_heads == 0
+                        && (self.cfg.num_attention_heads / self.cfg.num_key_value_heads) % 2 == 0
+                    {
+                        let codebook_bits =
+                            match crate::debug::INVESTIGATION_ENV.tq_codebook_bits {
+                                bits @ (5 | 6 | 8) => bits,
+                                _ => 8,
+                            };
+                        mlx_native::ops::flash_attn_vec_tq_hb::prewarm_gqa_tile(
+                            &mut registry,
+                            device.metal_device(),
+                            codebook_bits,
+                            mlx_native::ops::flash_attn_vec_tq_hb::GqaTile::Q2,
+                        )
+                        .context("prewarm Qwen GQA-cooperative TQ-HB Q2 pipeline")?;
+                        true
+                    } else {
+                        false
+                    };
+
                     if std::env::var("HF2Q_PIPELINE_PREWARM_LOG").as_deref() == Ok("1") {
                         eprintln!(
-                            "[prewarm] warmed {} / {} no-const kernels + {} / {} fa-prefill variants in {:.2}ms",
+                            "[prewarm] warmed {} / {} no-const kernels + {} / {} fa-prefill variants + gqa_q2={} in {:.2}ms",
                             warmed,
                             hot_kernels.len(),
                             fa_warmed,
                             fa_entries.len(),
+                            gqa_q2_warmed,
                             prewarm_start.elapsed().as_secs_f64() * 1000.0,
                         );
                     }

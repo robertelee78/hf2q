@@ -3754,6 +3754,10 @@ impl Qwen35ThinkingBudgetState {
         }
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(1);
     }
+
+    fn was_forced_closed(&self) -> bool {
+        self.forced_cursor.is_some() && self.closed
+    }
 }
 
 impl Qwen35DecodeState {
@@ -4040,6 +4044,20 @@ impl Qwen35DecodeState {
         let generated = self.generated_tokens.len();
         let rate = generated as f64 / self.decode_start.elapsed().as_secs_f64().max(f64::EPSILON);
         (generated, self.max_tokens, rate)
+    }
+
+    pub(crate) fn operator_thinking_progress(&self) -> (Option<usize>, Option<usize>, bool, bool) {
+        self.thinking_budget.as_ref().map_or(
+            (None, None, false, self.answer_event_reported),
+            |budget| {
+                (
+                    Some(budget.reasoning_tokens.min(budget.limit)),
+                    Some(budget.limit),
+                    budget.was_forced_closed(),
+                    self.answer_event_reported,
+                )
+            },
+        )
     }
 
     pub(crate) fn operator_prefill_progress(&self) -> (usize, usize, f64) {
@@ -7784,6 +7802,7 @@ mod tests {
             budget.observe_generated(&generated, false);
         }
         assert_eq!(budget.next_forced_token(), Some((90, true)));
+        assert!(!budget.was_forced_closed());
         generated.push(90);
         budget.observe_generated(&generated, false);
         assert_eq!(budget.next_forced_token(), Some((91, false)));
@@ -7791,6 +7810,7 @@ mod tests {
         budget.observe_generated(&generated, false);
         assert_eq!(budget.next_forced_token(), None);
         assert!(budget.closed);
+        assert!(budget.was_forced_closed());
     }
 
     #[test]
