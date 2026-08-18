@@ -650,6 +650,14 @@ jobs:
             actual_generator="$(shasum -a 256 "$fixture/generate.py" | awk '{print $1}')"
             test "$actual_generator" = "$expected_generator"
             for required in \
+              src/distribution/schema/first_standalone_record.rs \
+              src/distribution/schema/install_receipt.rs \
+              src/distribution/schema/install_receipt_validation.rs \
+              src/distribution/schema/install_receipt_tests.rs \
+              src/distribution/schema/installed_version_marker.rs \
+              src/distribution/schema/testdata/install_receipt_v1_initial_marker_v2.json \
+              src/distribution/schema/testdata/installed_version_marker_v1.json \
+              src/distribution/schema/testdata/installed_version_marker_v2.json \
               src/distribution/install_state/artifact.rs \
               src/distribution/install_state/artifact/tests.rs \
               src/distribution/install_state/unix.rs \

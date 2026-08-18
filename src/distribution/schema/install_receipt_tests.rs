@@ -1,8 +1,18 @@
 use super::*;
+use crate::distribution::schema::{
+    InstalledVersionMarkerV2, RecordedPreparationEvidenceV2, MAX_INSTALLED_VERSION_MARKER_BYTES,
+};
 use sha2::{Digest, Sha256};
 
 const VALID_RECEIPT: &[u8] = include_bytes!("testdata/install_receipt_v1_standalone.json");
-const VALID_MARKER: &[u8] = include_bytes!("testdata/installed_version_marker_v1.json");
+const INITIAL_RECEIPT_WITH_MARKER_V2: &[u8] =
+    include_bytes!("testdata/install_receipt_v1_initial_marker_v2.json");
+const VALID_MARKER: &[u8] = include_bytes!("testdata/installed_version_marker_v2.json");
+const PREPUBLICATION_MARKER_V1: &[u8] = include_bytes!("testdata/installed_version_marker_v1.json");
+const MARKER_V1_SHA256: &str = "82947959430d40e75101148568604dc08a4301964255e2cfe82d07c13272f78d";
+const MARKER_V2_SHA256: &str = "6ad66bf5ef01270bf032422086f0ae16f144b2c535b4bd7d76382dd6274a4ad0";
+const INITIAL_RECEIPT_WITH_MARKER_V2_SHA256: &str =
+    "3796a3f1ceea31b624d3b7230f32c6f1b0d9fc96895d5527b2951a94351b9675";
 
 fn receipt_value() -> serde_json::Value {
     serde_json::from_slice(VALID_RECEIPT).expect("valid receipt fixture JSON")
@@ -18,8 +28,8 @@ fn parse_receipt(value: serde_json::Value) -> Result<InstallReceiptV1, InstallRe
     )
 }
 
-fn parse_marker(value: serde_json::Value) -> Result<InstalledVersionMarkerV1, InstallReceiptError> {
-    InstalledVersionMarkerV1::parse_and_validate(
+fn parse_marker(value: serde_json::Value) -> Result<InstalledVersionMarkerV2, InstallReceiptError> {
+    InstalledVersionMarkerV2::parse_and_validate(
         &serde_json::to_vec(&value).expect("serialize hostile marker fixture"),
     )
 }
@@ -84,28 +94,215 @@ fn golden_receipt_and_marker_are_deterministic() {
         VALID_RECEIPT
     );
 
-    let marker = InstalledVersionMarkerV1::parse_and_validate(VALID_MARKER).expect("valid marker");
+    let marker = InstalledVersionMarkerV2::parse_and_validate(VALID_MARKER).expect("valid marker");
     assert_eq!(marker.release().version().as_str(), "0.2.0");
+    assert_eq!(marker.prepared_from().role_versions(), (1, 1, 1, 1));
     assert_eq!(marker.installation_sequence(), 1);
     assert_eq!(
         marker.to_deterministic_json().expect("encode marker"),
         VALID_MARKER
     );
-    InstalledVersionMarkerV1::parse_and_validate_exact(VALID_MARKER, &digest(VALID_MARKER))
+    InstalledVersionMarkerV2::parse_and_validate_exact(VALID_MARKER, &digest(VALID_MARKER))
         .expect("exact marker bytes");
+}
+
+#[test]
+fn first_standalone_record_builds_exact_cross_bound_marker_and_receipt() {
+    let record = crate::distribution::schema::FirstStandaloneInstallRecord::build(
+        InstallationId::parse("550e8400-e29b-41d4-a716-446655440000".to_owned())
+            .expect("installation id"),
+        AbsoluteInstallPath::parse("installation_root", "/Users/alice/.hf2q".to_owned())
+            .expect("installation root"),
+        ReleaseVersion::parse_stable("version", "0.2.0".to_owned()).expect("version"),
+        TargetTriple::parse("target", "aarch64-apple-darwin".to_owned()).expect("target"),
+        Sha256Digest::parse(
+            "manifest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        )
+        .expect("manifest digest"),
+        Sha256Digest::parse(
+            "archive",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        )
+        .expect("archive digest"),
+        RecordedPreparationEvidenceV2::verified_update_metadata(1, 1, 1, 1)
+            .expect("metadata evidence"),
+        1_787_011_200,
+    )
+    .expect("first standalone record");
+
+    assert_eq!(record.marker_bytes(), VALID_MARKER);
+    assert_eq!(hex::encode(Sha256::digest(VALID_MARKER)), MARKER_V2_SHA256);
+    assert_eq!(record.marker_sha256(), &digest(VALID_MARKER));
+    assert_eq!(
+        std::str::from_utf8(record.receipt_bytes()).expect("generated receipt UTF-8"),
+        std::str::from_utf8(INITIAL_RECEIPT_WITH_MARKER_V2).expect("golden receipt UTF-8")
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(INITIAL_RECEIPT_WITH_MARKER_V2)),
+        INITIAL_RECEIPT_WITH_MARKER_V2_SHA256
+    );
+    assert_eq!(
+        record.marker().prepared_from().role_versions(),
+        (1, 1, 1, 1)
+    );
+    assert_eq!(record.receipt().active().version().as_str(), "0.2.0");
+    assert_eq!(
+        record
+            .receipt()
+            .active()
+            .bundle()
+            .and_then(RecordedBundleIdentityV1::installed_version_marker_sha256),
+        Some(record.marker_sha256())
+    );
+
+    let recovered =
+        crate::distribution::schema::FirstStandaloneInstallRecord::reconstruct_from_exact_marker(
+            VALID_MARKER,
+        )
+        .expect("restart reconstruction from durable marker");
+    assert_eq!(recovered.marker_sha256(), record.marker_sha256());
+    assert_eq!(recovered.receipt_bytes(), record.receipt_bytes());
+}
+
+#[test]
+fn dormant_prepublication_marker_v1_is_rejected_fail_closed() {
+    assert_eq!(
+        hex::encode(Sha256::digest(PREPUBLICATION_MARKER_V1)),
+        MARKER_V1_SHA256
+    );
+    assert!(matches!(
+        InstalledVersionMarkerV2::parse_and_validate(PREPUBLICATION_MARKER_V1),
+        Err(InstallReceiptError::UnsupportedSchema {
+            document: "installed-version marker",
+            actual: 1
+        })
+    ));
+    assert!(matches!(
+        crate::distribution::schema::FirstStandaloneInstallRecord::reconstruct_from_exact_marker(
+            PREPUBLICATION_MARKER_V1
+        ),
+        Err(InstallReceiptError::UnsupportedSchema {
+            document: "installed-version marker",
+            actual: 1
+        })
+    ));
+}
+
+#[test]
+fn marker_v2_requires_complete_nonzero_preparation_evidence() {
+    let mut missing = marker_value();
+    missing
+        .as_object_mut()
+        .expect("marker object")
+        .remove("prepared_from");
+    assert!(parse_marker(missing).is_err());
+
+    for field in [
+        "root_version",
+        "timestamp_version",
+        "snapshot_version",
+        "targets_version",
+    ] {
+        let mut zero = marker_value();
+        zero["prepared_from"][field] = serde_json::json!(0);
+        assert!(parse_marker(zero).is_err(), "accepted zero {field}");
+    }
+
+    let mut wrong_kind = marker_value();
+    wrong_kind["prepared_from"]["kind"] = serde_json::json!("manual");
+    assert!(parse_marker(wrong_kind).is_err());
+
+    let mut unknown = marker_value();
+    unknown["prepared_from"]["unexpected"] = serde_json::json!(1);
+    assert!(parse_marker(unknown).is_err());
+
+    let duplicate = String::from_utf8(VALID_MARKER.to_vec())
+        .expect("UTF-8 marker fixture")
+        .replace(
+            "\"root_version\":1",
+            "\"root_version\":1,\"root_version\":2",
+        );
+    assert!(InstalledVersionMarkerV2::parse_and_validate(duplicate.as_bytes()).is_err());
+}
+
+#[test]
+fn marker_role_versions_map_to_the_same_receipt_fields() {
+    let mut value = marker_value();
+    for (field, version) in [
+        ("root_version", 11),
+        ("timestamp_version", 12),
+        ("snapshot_version", 13),
+        ("targets_version", 14),
+    ] {
+        value["prepared_from"][field] = serde_json::json!(version);
+    }
+    let marker_bytes = parse_marker(value)
+        .expect("asymmetric marker")
+        .to_deterministic_json()
+        .expect("canonical marker");
+    let record =
+        crate::distribution::schema::FirstStandaloneInstallRecord::reconstruct_from_exact_marker(
+            &marker_bytes,
+        )
+        .expect("reconstructed record");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(record.receipt_bytes()).expect("receipt JSON");
+    assert_eq!(
+        receipt["last_successful_transition"]["authority"],
+        serde_json::json!({
+            "kind": "verified-update-metadata",
+            "root_version": 11,
+            "timestamp_version": 12,
+            "snapshot_version": 13,
+            "targets_version": 14
+        })
+    );
+}
+
+#[test]
+fn first_standalone_reconstruction_rejects_noncanonical_or_noninitial_markers() {
+    assert!(matches!(
+        crate::distribution::schema::FirstStandaloneInstallRecord::reconstruct_from_exact_marker(
+            &vec![b' '; MAX_INSTALLED_VERSION_MARKER_BYTES + 1]
+        ),
+        Err(InstallReceiptError::InputTooLarge {
+            document: "installed-version marker",
+            ..
+        })
+    ));
+
+    let noncanonical =
+        serde_json::to_vec_pretty(&marker_value()).expect("pretty marker representation");
+    assert!(
+        crate::distribution::schema::FirstStandaloneInstallRecord::reconstruct_from_exact_marker(
+            &noncanonical
+        )
+        .is_err()
+    );
+
+    let sequence_two = String::from_utf8(VALID_MARKER.to_vec())
+        .expect("UTF-8 marker fixture")
+        .replace("\"installation_sequence\":1", "\"installation_sequence\":2");
+    assert!(
+        crate::distribution::schema::FirstStandaloneInstallRecord::reconstruct_from_exact_marker(
+            sequence_two.as_bytes()
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn exact_marker_validation_never_hashes_reserialized_json() {
     let noncanonical =
         serde_json::to_vec_pretty(&marker_value()).expect("pretty marker representation");
-    assert!(InstalledVersionMarkerV1::parse_and_validate(&noncanonical).is_ok());
+    assert!(InstalledVersionMarkerV2::parse_and_validate(&noncanonical).is_ok());
     assert!(matches!(
-        InstalledVersionMarkerV1::parse_and_validate_exact(&noncanonical, &digest(VALID_MARKER)),
+        InstalledVersionMarkerV2::parse_and_validate_exact(&noncanonical, &digest(VALID_MARKER)),
         Err(InstallReceiptError::MarkerDigestMismatch)
     ));
     assert!(matches!(
-        InstalledVersionMarkerV1::parse_and_validate_exact(&noncanonical, &digest(&noncanonical)),
+        InstalledVersionMarkerV2::parse_and_validate_exact(&noncanonical, &digest(&noncanonical)),
         Err(InstallReceiptError::NonCanonicalMarkerEncoding)
     ));
 }
@@ -120,7 +317,7 @@ fn rejects_oversized_documents_before_json_parse() {
         })
     ));
     assert!(matches!(
-        InstalledVersionMarkerV1::parse_and_validate(&vec![
+        InstalledVersionMarkerV2::parse_and_validate(&vec![
             b' ';
             MAX_INSTALLED_VERSION_MARKER_BYTES + 1
         ]),
@@ -130,7 +327,7 @@ fn rejects_oversized_documents_before_json_parse() {
         })
     ));
     assert!(matches!(
-        InstalledVersionMarkerV1::parse_and_validate_exact(
+        InstalledVersionMarkerV2::parse_and_validate_exact(
             &vec![b' '; MAX_INSTALLED_VERSION_MARKER_BYTES + 1],
             &digest(VALID_MARKER)
         ),
@@ -497,7 +694,7 @@ fn rejects_transition_endpoint_authority_and_floor_mismatches() {
 fn validates_marker_envelope_identity_and_bounds() {
     for (field, value) in [
         ("kind", serde_json::json!("other.marker")),
-        ("schema_version", serde_json::json!(2)),
+        ("schema_version", serde_json::json!(1)),
         ("package", serde_json::json!("other")),
         ("installation_layout_schema", serde_json::json!(0)),
         ("installation_sequence", serde_json::json!(0)),

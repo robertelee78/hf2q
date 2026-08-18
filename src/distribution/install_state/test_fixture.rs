@@ -108,7 +108,7 @@ impl Fixture {
         let root_text = root.to_str().expect("UTF-8 fixture root");
         let marker_bytes = deterministic_marker(json!({
             "kind": "hf2q.installed-version",
-            "schema_version": 1,
+            "schema_version": 2,
             "package": "hf2q",
             "installation_layout_schema": 1,
             "installation_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -118,6 +118,13 @@ impl Fixture {
                 "target": "aarch64-apple-darwin",
                 "release_manifest_sha256": manifest_digest,
                 "archive_sha256": ARCHIVE_DIGEST
+            },
+            "prepared_from": {
+                "kind": "verified-update-metadata",
+                "root_version": 1,
+                "timestamp_version": 1,
+                "snapshot_version": 1,
+                "targets_version": 1
             },
             "installation_sequence": 1,
             "installed_at_unix_seconds": 1787011200_u64
@@ -217,7 +224,7 @@ fn deterministic_manifest(raw: Value) -> Vec<u8> {
 
 fn deterministic_marker(raw: Value) -> Vec<u8> {
     let bytes = serde_json::to_vec(&raw).expect("marker JSON");
-    schema::InstalledVersionMarkerV1::parse_and_validate(&bytes)
+    schema::InstalledVersionMarkerV2::parse_and_validate(&bytes)
         .expect("valid fixture marker")
         .to_deterministic_json()
         .expect("deterministic marker")

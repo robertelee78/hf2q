@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use super::file;
 use super::host;
 use super::schema::{
-    AbsoluteInstallPath, BundleEntryType, InstallReceiptV1, InstalledVersionMarkerV1,
+    AbsoluteInstallPath, BundleEntryType, FirstStandaloneInstallRecord, InstallReceiptV1,
     ReleaseManifestV1, MAX_INSTALLED_VERSION_MARKER_BYTES, MAX_INSTALL_RECEIPT_BYTES,
     MAX_RELEASE_MANIFEST_BYTES,
 };
@@ -106,7 +106,13 @@ pub(super) fn verify_prepared_version(
             "installed marker changed while verifying",
         ));
     }
-    let marker = InstalledVersionMarkerV1::parse_and_validate_exact(&marker_bytes, marker_digest)?;
+    let record = FirstStandaloneInstallRecord::reconstruct_from_exact_marker(&marker_bytes)?;
+    if record.marker_sha256() != marker_digest || record.receipt() != receipt {
+        return Err(InstallStateError::InvalidLayout(
+            "install receipt is not the exact record derived from the installed marker",
+        ));
+    }
+    let marker = record.marker();
     if marker.installation_id() != receipt.installation_id()
         || marker.installation_root() != receipt.installation_root()
         || marker.release().version() != release.version()

@@ -1,16 +1,13 @@
 use std::fmt;
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use super::common::{ReleaseVersion, SchemaValueError, Sha256Digest, TargetTriple};
+use super::installed_version_marker::InstalledVersionMarkerV2;
 
 pub const INSTALL_RECEIPT_KIND: &str = "hf2q.install-receipt";
 pub const INSTALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
-pub const INSTALLED_VERSION_MARKER_KIND: &str = "hf2q.installed-version";
-pub const INSTALLED_VERSION_MARKER_SCHEMA_VERSION: u32 = 1;
 pub const MAX_INSTALL_RECEIPT_BYTES: usize = 64 * 1024;
-pub const MAX_INSTALLED_VERSION_MARKER_BYTES: usize = 16 * 1024;
 pub const STATE_LAYOUT_SCHEMA_V1: u32 = 1;
 pub const INSTALLATION_LAYOUT_SCHEMA_V1: u32 = 1;
 
@@ -396,104 +393,87 @@ impl InstallReceiptV1 {
     }
 }
 
-/// Immutable marker written inside a fully verified standalone version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct InstalledVersionMarkerV1 {
-    kind: String,
-    schema_version: u32,
-    package: String,
-    installation_layout_schema: u32,
-    installation_id: InstallationId,
-    installation_root: AbsoluteInstallPath,
-    release: MarkerReleaseV1,
-    installation_sequence: u64,
-    installed_at_unix_seconds: u64,
+#[allow(dead_code)]
+pub(super) fn build_first_install_receipt(
+    marker: &InstalledVersionMarkerV2,
+    marker_sha256: &Sha256Digest,
+) -> Result<(InstallReceiptV1, Vec<u8>), InstallReceiptError> {
+    let release = marker.release();
+    let bundle = RecordedBundleIdentityV1 {
+        release_manifest_sha256: release.release_manifest_sha256().clone(),
+        archive_sha256: release.archive_sha256().clone(),
+        installed_version_marker_sha256: Some(marker_sha256.clone()),
+        installation_sequence: Some(1),
+    };
+    let active = InstalledReleaseV1 {
+        version: release.version().clone(),
+        target: release.target(),
+        bundle: Some(bundle),
+    };
+    let (root_version, timestamp_version, snapshot_version, targets_version) =
+        marker.prepared_from().role_versions();
+    let receipt = InstallReceiptV1 {
+        kind: INSTALL_RECEIPT_KIND.to_owned(),
+        schema_version: INSTALL_RECEIPT_SCHEMA_VERSION,
+        package: "hf2q".to_owned(),
+        state_layout_schema: STATE_LAYOUT_SCHEMA_V1,
+        installation_layout_schema: Some(INSTALLATION_LAYOUT_SCHEMA_V1),
+        installation_id: marker.installation_id().clone(),
+        state_root: marker.installation_root().clone(),
+        installation_root: marker.installation_root().clone(),
+        owner_family: OwnerFamily::Standalone,
+        update_route: Some(UpdateRoute::Standalone),
+        active: active.clone(),
+        retained: Vec::new(),
+        last_successful_transition: Some(SuccessfulTransitionV1 {
+            sequence: 1,
+            transition_type: TransitionKind::Install,
+            from: None,
+            to: TransitionEndpointV1 {
+                owner_family: OwnerFamily::Standalone,
+                release: active,
+            },
+            recorded_evidence: RecordedTransitionEvidenceV1::UpdateMetadataVersions {
+                root_version,
+                timestamp_version,
+                snapshot_version,
+                targets_version,
+            },
+            completed_at_unix_seconds: marker.installed_at_unix_seconds(),
+        }),
+    };
+    let receipt_bytes = receipt.to_deterministic_json()?;
+    let receipt = InstallReceiptV1::parse_and_validate(&receipt_bytes)?;
+    Ok((receipt, receipt_bytes))
 }
 
-impl InstalledVersionMarkerV1 {
-    /// Structurally validates an untrusted marker without authenticating it.
-    pub fn parse_and_validate(bytes: &[u8]) -> Result<Self, InstallReceiptError> {
-        validation::parse_installed_version_marker(bytes)
+pub(super) fn validate_envelope(
+    actual_kind: &str,
+    actual_schema: u32,
+    package: &str,
+    expected_kind: &str,
+    expected_schema: u32,
+    document: &'static str,
+) -> Result<(), InstallReceiptError> {
+    if actual_kind != expected_kind {
+        return Err(InstallReceiptError::UnsupportedKind(document));
     }
-
-    /// Binds and validates the exact marker bytes recorded by an activation.
-    ///
-    /// Ownership verification must use this entry point. Hashing a parsed or
-    /// reserialized JSON value is never equivalent to hashing `bytes`.
-    pub fn parse_and_validate_exact(
-        bytes: &[u8],
-        expected_sha256: &Sha256Digest,
-    ) -> Result<Self, InstallReceiptError> {
-        if bytes.len() > MAX_INSTALLED_VERSION_MARKER_BYTES {
-            return Err(InstallReceiptError::InputTooLarge {
-                document: "installed-version marker",
-                limit: MAX_INSTALLED_VERSION_MARKER_BYTES,
-                actual: bytes.len(),
-            });
-        }
-        let actual = hex::encode(Sha256::digest(bytes));
-        if actual != expected_sha256.as_str() {
-            return Err(InstallReceiptError::MarkerDigestMismatch);
-        }
-        let marker = Self::parse_and_validate(bytes)?;
-        if marker.to_deterministic_json()? != bytes {
-            return Err(InstallReceiptError::NonCanonicalMarkerEncoding);
-        }
-        Ok(marker)
+    if actual_schema != expected_schema {
+        return Err(InstallReceiptError::UnsupportedSchema {
+            document,
+            actual: actual_schema,
+        });
     }
-
-    pub fn to_deterministic_json(&self) -> Result<Vec<u8>, InstallReceiptError> {
-        deterministic_json("installed-version marker", self)
+    if package != "hf2q" {
+        return Err(InstallReceiptError::invalid(
+            "package",
+            "must be exactly `hf2q`",
+        ));
     }
-
-    pub fn installation_id(&self) -> &InstallationId {
-        &self.installation_id
-    }
-
-    pub fn installation_root(&self) -> &AbsoluteInstallPath {
-        &self.installation_root
-    }
-
-    pub fn release(&self) -> &MarkerReleaseV1 {
-        &self.release
-    }
-
-    pub fn installation_sequence(&self) -> u64 {
-        self.installation_sequence
-    }
-
-    pub fn installed_at_unix_seconds(&self) -> u64 {
-        self.installed_at_unix_seconds
-    }
+    Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MarkerReleaseV1 {
-    version: ReleaseVersion,
-    target: TargetTriple,
-    release_manifest_sha256: Sha256Digest,
-    archive_sha256: Sha256Digest,
-}
-
-impl MarkerReleaseV1 {
-    pub fn version(&self) -> &ReleaseVersion {
-        &self.version
-    }
-
-    pub fn target(&self) -> TargetTriple {
-        self.target
-    }
-
-    pub fn release_manifest_sha256(&self) -> &Sha256Digest {
-        &self.release_manifest_sha256
-    }
-
-    pub fn archive_sha256(&self) -> &Sha256Digest {
-        &self.archive_sha256
-    }
-}
-
-fn deterministic_json<T: Serialize>(
+pub(super) fn deterministic_json<T: Serialize>(
     document: &'static str,
     value: &T,
 ) -> Result<Vec<u8>, InstallReceiptError> {
@@ -503,7 +483,10 @@ fn deterministic_json<T: Serialize>(
     Ok(bytes)
 }
 
-fn sanitize_json_error(document: &'static str, error: serde_json::Error) -> InstallReceiptError {
+pub(super) fn sanitize_json_error(
+    document: &'static str,
+    error: serde_json::Error,
+) -> InstallReceiptError {
     let category = match error.classify() {
         serde_json::error::Category::Io => "I/O",
         serde_json::error::Category::Syntax => "syntax",

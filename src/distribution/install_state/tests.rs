@@ -4,9 +4,26 @@ use std::path::Path;
 use std::sync::{mpsc, Arc, Barrier};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::test_fixture::{chmod, copy_directory, Fixture};
 use super::*;
+
+fn canonical_marker(value: serde_json::Value) -> Vec<u8> {
+    schema::InstalledVersionMarkerV2::parse_and_validate(
+        &serde_json::to_vec(&value).expect("marker JSON"),
+    )
+    .expect("valid marker")
+    .to_deterministic_json()
+    .expect("canonical marker")
+}
+
+fn canonical_receipt(value: serde_json::Value) -> Vec<u8> {
+    schema::InstallReceiptV1::parse_and_validate(&serde_json::to_vec(&value).expect("receipt JSON"))
+        .expect("valid receipt")
+        .to_deterministic_json()
+        .expect("canonical receipt")
+}
 
 #[test]
 fn first_activation_commits_exact_state_and_retry_is_idempotent() {
@@ -158,6 +175,93 @@ fn confirmed_migration_requires_a_separate_future_authorization() {
             "receipt is not a standalone sequence-one activation"
         ))
     ));
+}
+
+#[test]
+fn receipt_evidence_and_completion_time_must_be_derived_from_marker() {
+    for field in [
+        "root_version",
+        "timestamp_version",
+        "snapshot_version",
+        "targets_version",
+        "completed_at_unix_seconds",
+    ] {
+        let fixture = Fixture::new();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fixture.receipt_bytes).expect("receipt value");
+        if field == "completed_at_unix_seconds" {
+            value["last_successful_transition"][field] = json!(1_787_011_201_u64);
+        } else {
+            value["last_successful_transition"]["authority"][field] = json!(2);
+        }
+        let receipt_bytes = canonical_receipt(value);
+
+        assert!(
+            matches!(
+                prepare_first_activation(
+                    ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+                    AuthenticatedPreparedVersion::for_test_only(receipt_bytes),
+                ),
+                Err(InstallStateError::InvalidLayout(
+                    "install receipt is not the exact record derived from the installed marker"
+                ))
+            ),
+            "accepted receipt with mismatched {field}"
+        );
+        assert!(!fixture.root.join("current").exists());
+    }
+}
+
+#[test]
+fn noncanonical_receipt_bytes_cannot_activate() {
+    let fixture = Fixture::new();
+    let value: serde_json::Value =
+        serde_json::from_slice(&fixture.receipt_bytes).expect("receipt value");
+    let noncanonical = serde_json::to_vec_pretty(&value).expect("pretty receipt");
+
+    assert!(matches!(
+        prepare_first_activation(
+            ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+            AuthenticatedPreparedVersion::for_test_only(noncanonical),
+        ),
+        Err(InstallStateError::InvalidLayout(
+            "install receipt is not in canonical byte encoding"
+        ))
+    ));
+    assert!(!fixture.root.join("current").exists());
+}
+
+#[test]
+fn changed_marker_cannot_reuse_stale_receipt_evidence() {
+    let fixture = Fixture::new();
+    let marker_path = fixture.version.join("version-installation.json");
+    let mut marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker_path).expect("marker bytes"))
+            .expect("marker value");
+    marker["prepared_from"]["root_version"] = json!(2);
+    marker["installed_at_unix_seconds"] = json!(1_787_011_201_u64);
+    let marker_bytes = canonical_marker(marker);
+    fs::write(&marker_path, &marker_bytes).expect("replace marker");
+    chmod(&marker_path, 0o600);
+    let marker_digest = hex::encode(Sha256::digest(&marker_bytes));
+
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fixture.receipt_bytes).expect("receipt value");
+    receipt["active"]["bundle"]["installed_version_marker_sha256"] = json!(marker_digest.clone());
+    receipt["last_successful_transition"]["to"]["release"]["bundle"]
+        ["installed_version_marker_sha256"] = json!(marker_digest);
+    let receipt_bytes = canonical_receipt(receipt);
+
+    assert!(matches!(
+        prepare_first_activation(
+            ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+            AuthenticatedPreparedVersion::for_test_only(receipt_bytes),
+        ),
+        Err(InstallStateError::InvalidLayout(
+            "install receipt is not the exact record derived from the installed marker"
+        ))
+    ));
+    assert!(!fixture.root.join("current").exists());
 }
 
 #[test]
