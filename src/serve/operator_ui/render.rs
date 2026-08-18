@@ -98,13 +98,31 @@ pub(super) fn render_request(request: &RequestView, width: usize) -> String {
                 }
             )
         }
-        Phase::Decode => format!(
-            "generated {:>5} / {:<5} budget  ·  {:>5.1} tok/s  ·  elapsed {}",
-            request.generated_tokens,
-            request.max_tokens,
-            request.rate,
-            format_duration(request.started.elapsed())
-        ),
+        Phase::Decode => {
+            let thinking = match (request.thinking_tokens, request.thinking_budget) {
+                (Some(tokens), Some(budget)) if request.thinking_forced_closed => {
+                    format!(
+                        "  ·  think capped {tokens}/{budget}  ·  output {}",
+                        if request.answer_event_delivered {
+                            "started"
+                        } else {
+                            "pending"
+                        }
+                    )
+                }
+                (Some(tokens), Some(budget)) => format!("  ·  think {tokens}/{budget}"),
+                _ => String::new(),
+            };
+            format!(
+                "completion {:>5}/{:<5}{thinking}  ·  prompt {} cache {}  ·  {:>5.1} tok/s  ·  elapsed {}",
+                request.generated_tokens,
+                request.max_tokens,
+                request.prompt_tokens,
+                request.cached_tokens,
+                request.rate,
+                format_duration(request.started.elapsed())
+            )
+        }
         Phase::Queued => format!(
             "prompt {} tokens  ·  completion budget {}",
             request.prompt_tokens, request.max_tokens

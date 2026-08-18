@@ -153,6 +153,16 @@ and the same required `calculate_sum` call with integer arguments 17 and 25;
 the result continuation completed normally. This closes the original dense
 fallback performance defect without weakening the quality gate.
 
+A later matched long-context peer run used llama.cpp build 10451
+(`10bf611e5`) with the same Q4_K_M artifact, one 131,072-token slot, Metal
+flash attention, default F16 K/V, temperature zero, and thinking disabled. A
+cold 105,029-token prefill took 493.839 seconds. Five exact-prefix 128-token
+decode runs measured 15.734, 15.266, 15.934, 15.890, and 15.374 tok/s, a
+15.734 tok/s median, with identical output. This is a production-default peer
+comparison rather than cache-format parity because hf2q uses compressed TQ-HB
+K/V. It replaces the former absence of any matched approximately 105K
+llama.cpp evidence; it does not replace the exact hf2q legacy/Q2 release gate.
+
 The exact native server artifact passed `/readyz`, unary and SSE text,
 required-tool unary and SSE calls, schema-correct arguments, tool-result
 continuation with 407 of 429 prompt tokens cached, automatic thinking without

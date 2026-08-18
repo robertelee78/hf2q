@@ -17700,12 +17700,17 @@ fn finish_qwen35_prefill(
         (prompt.to_vec(), params.clone())
     };
     let (generated, max_tokens, decode_rate) = state.operator_progress();
-    crate::serve::operator_ui::decode_progress(
-        "qwen35",
+    let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
+        state.operator_thinking_progress();
+    crate::serve::operator_ui::qwen_decode_progress(
         qwen35_operator_request_id(handle),
         generated,
         max_tokens,
         decode_rate,
+        thinking_tokens,
+        thinking_budget,
+        thinking_forced_closed,
+        answer_event_delivered,
     );
 
     // Qwen's stable checkpoint is normally captured inside bounded prefill,
@@ -17791,6 +17796,19 @@ fn finish_qwen35_prefill(
             slot = handle.slot_id.0,
             prompt_tokens = prompt_tokens.len(),
             "Qwen35 first answer event delivered"
+        );
+        let (generated, max_tokens, decode_rate) = state.operator_progress();
+        let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
+            state.operator_thinking_progress();
+        crate::serve::operator_ui::qwen_decode_progress(
+            qwen35_operator_request_id(handle),
+            generated,
+            max_tokens,
+            decode_rate,
+            thinking_tokens,
+            thinking_budget,
+            thinking_forced_closed,
+            answer_event_delivered,
         );
     }
     if seed_dropped {
@@ -18066,12 +18084,17 @@ fn decode_batch_qwen35(
             finished: qtick.finished,
         };
         let (generated, max_tokens, decode_rate) = state.operator_progress();
-        crate::serve::operator_ui::decode_progress(
-            "qwen35",
+        let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
+            state.operator_thinking_progress();
+        crate::serve::operator_ui::qwen_decode_progress(
             qwen35_operator_request_id(handle),
             generated,
             max_tokens,
             decode_rate,
+            thinking_tokens,
+            thinking_budget,
+            thinking_forced_closed,
+            answer_event_delivered,
         );
 
         let client_dropped = slot_emit_token(&mut reply, &tick);
@@ -18080,6 +18103,19 @@ fn decode_batch_qwen35(
                 slot = handle.slot_id.0,
                 prompt_tokens = state.prompt_cache_identity().0.len(),
                 "Qwen35 first answer event delivered"
+            );
+            let (generated, max_tokens, decode_rate) = state.operator_progress();
+            let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
+                state.operator_thinking_progress();
+            crate::serve::operator_ui::qwen_decode_progress(
+                qwen35_operator_request_id(handle),
+                generated,
+                max_tokens,
+                decode_rate,
+                thinking_tokens,
+                thinking_budget,
+                thinking_forced_closed,
+                answer_event_delivered,
             );
         }
         if tick.finished && !client_dropped {

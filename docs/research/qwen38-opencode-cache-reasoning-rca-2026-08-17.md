@@ -226,6 +226,151 @@ run exposed that two `cache_clear` tests require the release binary at their
 documented fallback path; after `cargo build --release --locked`, the exact
 same full command passed, including 4,148 binary tests with zero failures.
 
+## Follow-on evidence: the 8,192-token incident was a real reasoning exhaust
+
+The later OpenCode record `msg_013096680001N2xVh2FWxKhXtv` removes the last
+ambiguity about the reported seven-minute wait. It ran from 21:02:58.304 to
+21:10:35.605 (457.301 seconds end to end). The reasoning part ran for 423.178
+seconds, contained 8,192 tokens, and ended with `finish=length`; content tokens
+were zero, no tool call was emitted, and no error or client cancellation was
+recorded. Prompt accounting was 11,291 new plus 17,498 cached tokens.
+
+This is a server/model control failure, not a UI-loss theory: the target spent
+the entire completion allowance inside reasoning and had no answer capacity
+left. The incident runtime also emitted the old pre-router `semantic fragment
+ready` wording and did not exhibit the tokenizer-forced 2,048-token boundary.
+The corrected runtime subsequently logged both `thinking token budget reached`
+and `first answer event delivered`. The operator dashboard's former
+`generated N / 8192 budget` label was additionally misleading: 8,192 is the
+total completion limit, not the effective reasoning ceiling.
+
+## Follow-on evidence: the edit thrash was not a KV cache miss
+
+The later `ses_fece26df0ffeUYOA5Bk1w9uRQx` melody-edit session retained its
+prompt normally. The screenshot turn reused 103,402 of 104,966 prompt tokens
+and prefilled only 1,564. Across 13 completed assistant turns after the first
+failure, however, the model spent 2,583.5 seconds (43.1 minutes), emitted
+12,803 reasoning tokens plus 13,666 non-reasoning tokens, and hit the forced
+thinking boundary five times. Tool outcomes were five successful reads, two
+successful edits, and six failed edits.
+
+The edit payload was highly repetitive. One successful edit was followed by
+an exact repeat of the same 3,100-byte `oldString` and 2,113-byte `newString`;
+because the first call had already changed the file, the repeated call was
+necessarily stale and failed. Other failed calls used old text that no longer
+matched the immediately preceding read. This is cross-assistant-message plan
+and tool-result disregard. It is separate from cache correctness and separate
+from the reasoning-only completion exhaust.
+
+OpenCode 1.18.18's doom-loop guard examines tool calls within the current
+assistant message and requires exact tool name plus serialized input equality.
+It therefore cannot catch identical or semantically equivalent calls spread
+across assistant messages. hf2q can observe the replayed transcript and warn
+about exact call+arguments+result signatures, but it does not own the
+filesystem or tool executor and cannot safely declare that a repeated edit is
+semantically invalid. A hard server-side cross-message tool block would break
+legitimate retry after transient failure.
+
+## Decode-rate root cause at 105K
+
+Qwen3.8 has 16 full-attention layers with Hq=24, Hkv=4, and D=256. The scalar
+TQ-HB decode kernel dispatches by query head; each of the six query heads in a
+GQA group independently reloads and dequantizes its shared KV head. At prompt
+length 104,966, the resulting requested index traffic is 20.637 GB/token and
+norm traffic is 0.322 GB/token: 20.960 GB/token total, versus 3.493 GB of
+unique cache data.
+
+The bandwidth model predicts the observed context curve:
+
+| Prompt tokens | Predicted tok/s | Observed tok/s |
+|---:|---:|---:|
+| 17,807 | 24.09 | 22.1 |
+| 49,169 | 18.43 | 18.0 |
+| 104,966 | 12.99 | 13.4 |
+
+The prior accepted short-context hf2q median was 29.19 tok/s. At 13.4 tok/s,
+a 2,048-token reasoning allowance alone costs 152.8 seconds before any answer
+or tool JSON. Kernel performance and reasoning/tool-loop control are therefore
+independent required fixes; neither substitutes for the other.
+
+A matched long-context llama.cpp comparator was run serially after unloading
+hf2q. llama.cpp build 10451 (`10bf611e5`) loaded the same Q4_K_M artifact with
+one 131,072-token slot, Metal flash attention, its default F16 K/V cache,
+temperature zero, repetition penalty 1.0, and thinking disabled. Its cold
+105,029-token prefill took 493.839 seconds. Five exact-prefix 128-token decode
+runs measured 15.734, 15.266, 15.934, 15.890, and 15.374 tok/s, a 15.734 tok/s
+median, with identical output and `finish_reason=length`. This is a valid
+production-default peer result, not a cache-format parity claim: hf2q uses its
+compressed TQ-HB cache while llama.cpp used F16 K/V.
+
+## Implemented agentic controls
+
+The continuation policy now keeps the 2,048-token launcher default for a
+fresh user turn, uses 512 tokens after the first tool result, and
+deterministically reduces deeper tool-result turns to a 256-token floor. The
+policy is derived from message structure since the latest genuine user turn;
+it does not trust a spoofable natural-language sentinel. An explicit caller
+budget remains exact and wins over every server default.
+
+The server also:
+
+- detects exact repeated tool+arguments+result signatures in linear time and
+  emits a Qwen-only warning without pretending to own tool semantics;
+- resolves reasoning and tool grammar from the loaded model registration, so
+  opaque request aliases cannot bypass Qwen behavior;
+- reports completion tokens separately from `think current/limit`,
+  marks `think capped` only after the forced close has completed, and shows
+  `output pending` versus a delivered answer/tool event;
+- preserves the terminal reasoning-only warning and post-router
+  answer-progress latch.
+
+The launcher's global repetition penalty remains an explicit A/B item rather
+than an unmeasured fix. In an `oldString`/`newString` edit tool, the generated
+old text precedes the replacement text, so penalty 1.05 can penalize the exact
+source tokens that must be copied into `newString`. The safe gate is 1.00
+versus 1.05 on byte-exact edit fixtures and real recovery traces;
+cross-request repetition cannot be fixed by a penalty whose generated-token
+history resets on every request.
+
+## SOTA optimization program (August 2026)
+
+The first exact-output kernel candidate groups two query heads per KV head and
+reuses each packed K/V load and codebook lookup. Its Metal spike is bit-exact
+against the scalar kernel for TQ5/6/8 and measured 1.497x isolated GPU speedup
+at 8,192 KV tokens and 1.437x at 104,966. Q3 was slower because larger
+per-workgroup state reduced occupancy and was removed from the landing code.
+The downstream real-model release gate remains at least 15% end-to-end
+improvement at 105K, exact greedy/tool output, and no more than 2%
+short-context regression.
+
+The next lossless stages are deliberately ordered:
+
+1. Add a two-dimensional H2xP2 verifier kernel that shares the 105K KV scan
+   across both GQA heads and speculative query positions. Current batched and
+   tree kernels rescan KV per query position, and the Qwen tree wrapper rejects
+   D=256, so simply enabling existing speculation would repeat the known
+   long-context regression.
+2. After that verifier passes parity and cost gates, A/B Qwen3.8's native MTP
+   K1/K2 and a dynamic suffix-automaton/prompt-lookup proposer. Repository edit
+   traces are unusually copy-heavy, making model-free proposals valuable, but
+   target verification must remain exact.
+3. Retune split-K only after cooperative tiling changes occupancy. The current
+   NSG4/NWG32 schedule is already near the useful B1 split regime and cannot
+   remove the duplicated bytes by itself.
+4. Treat true sub-byte TQ6/TQ5 storage as an optional quality contract. Current
+   5/6/8-bit caches all store one byte per index, so selecting a smaller
+   codebook does not yet save bandwidth. Learned/VQ cache methods remain later
+   research until Qwen3.8 long-context coding/tool quality is proven.
+
+Primary design comparators include
+[PersistentKV](https://arxiv.org/abs/2606.26666) for KV-head-group scheduling,
+[Open-TQ-Metal](https://arxiv.org/abs/2604.16957) for fused compressed-domain
+Apple-Silicon attention, and the current
+[TensorRT-LLM speculative-decoding design](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md)
+for suffix-automaton and draft-model composition. Their headline numbers are
+not imported as hf2q claims; each local stage retains exact-artifact Metal and
+agentic gates.
+
 ## Non-causes and remaining limits
 
 - Four slots and the shared physical KV budget did not evict the prefix; the

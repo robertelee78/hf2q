@@ -1029,6 +1029,116 @@ struct PreparedChatContext {
     positions_flat: Option<Vec<i32>>,
 }
 
+const QWEN_TOOL_CONTINUATION_THINKING_CEILING: usize = 512;
+const QWEN_REPEATED_CAP_THINKING_FLOOR: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct QwenToolChainState {
+    is_tool_continuation: bool,
+    /// Assistant turns that requested one or more tools since the latest user turn.
+    /// Parallel tool results belong to the same cycle and must not deepen the chain.
+    tool_cycles_since_user: usize,
+}
+
+fn qwen_tool_chain_state(messages: &[ChatMessage]) -> QwenToolChainState {
+    let is_tool_continuation = messages
+        .iter()
+        .rev()
+        .find(|message| message.role != "system")
+        .is_some_and(|message| message.role == "tool");
+    let chain_start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map_or(0, |index| index.saturating_add(1));
+    let tool_cycles_since_user = messages[chain_start..]
+        .iter()
+        .filter(|message| {
+            message.role == "assistant"
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+        })
+        .count();
+    QwenToolChainState {
+        is_tool_continuation,
+        tool_cycles_since_user,
+    }
+}
+
+fn adaptive_qwen_default_thinking_budget(
+    base: Option<usize>,
+    continuation_override: Option<Option<usize>>,
+    chain: QwenToolChainState,
+) -> Option<usize> {
+    if !chain.is_tool_continuation {
+        return base;
+    }
+    let configured = continuation_override.unwrap_or_else(|| {
+        base.map(|budget| budget.min(QWEN_TOOL_CONTINUATION_THINKING_CEILING))
+    })?;
+    let reductions = chain
+        .tool_cycles_since_user
+        .saturating_sub(1)
+        .min(usize::BITS as usize - 1);
+    let reduced = configured >> reductions;
+    Some(reduced.max(configured.min(QWEN_REPEATED_CAP_THINKING_FLOOR)))
+}
+
+fn repeated_tool_result_signature(
+    messages: &[ChatMessage],
+    threshold: usize,
+) -> Option<(&str, usize)> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+
+    let chain_start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map_or(0, |index| index.saturating_add(1));
+    let mut calls: HashMap<&str, (&str, &str)> = HashMap::new();
+    let mut signatures: HashMap<u64, (&str, usize)> = HashMap::new();
+    for message in &messages[chain_start..] {
+        if message.role == "assistant" {
+            for call in message.tool_calls.as_deref().unwrap_or_default() {
+                calls.insert(
+                    call.id.as_str(),
+                    (
+                        call.function.name.as_str(),
+                        call.function.arguments.as_str(),
+                    ),
+                );
+            }
+            continue;
+        }
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(&(name, arguments)) = calls.get(call_id) else {
+            continue;
+        };
+        let result = message
+            .content
+            .as_ref()
+            .map(MessageContent::text)
+            .unwrap_or_default();
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        arguments.hash(&mut hasher);
+        result.hash(&mut hasher);
+        let entry = signatures.entry(hasher.finish()).or_insert((name, 0));
+        entry.1 += 1;
+        if entry.1 >= threshold {
+            return Some((entry.0, entry.1));
+        }
+    }
+    None
+}
+
 fn effective_qwen_thinking_budget(
     configured: Option<usize>,
     explicit: bool,
@@ -1089,6 +1199,204 @@ mod qwen_thinking_budget_tests {
         }))
         .unwrap();
         assert_eq!(request.thinking_token_budget, Some(1536));
+    }
+
+    fn message(role: &str, reasoning: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: None,
+            reasoning_content: reasoning.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn tool_call_message(ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: Some("I need to answer now.".into()),
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| super::super::schema::ToolCall {
+                        id: (*id).into(),
+                        call_type: "function".into(),
+                        function: super::super::schema::ToolCallFunction {
+                            name: "edit".into(),
+                            arguments: "{}".into(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn tool_result_message(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: Some(MessageContent::Text("ok".into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn tool_continuations_use_a_small_default_and_deeper_cycles_reach_a_floor() {
+        let mut messages = vec![
+            message("user", None),
+            tool_call_message(&["call-1"]),
+            tool_result_message("call-1"),
+        ];
+        let first = qwen_tool_chain_state(&messages);
+        assert_eq!(
+            first,
+            QwenToolChainState {
+                is_tool_continuation: true,
+                tool_cycles_since_user: 1
+            }
+        );
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, first),
+            Some(512)
+        );
+        messages.push(tool_call_message(&["call-2"]));
+        messages.push(tool_result_message("call-2"));
+        let repeated = qwen_tool_chain_state(&messages);
+        assert_eq!(repeated.tool_cycles_since_user, 2);
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, repeated),
+            Some(256)
+        );
+
+        messages.push(tool_call_message(&["call-3"]));
+        messages.push(tool_result_message("call-3"));
+        let floor = qwen_tool_chain_state(&messages);
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, floor),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_count_as_one_continuation_cycle() {
+        let mut messages = vec![
+            message("user", None),
+            tool_call_message(&["call-1", "call-2", "call-3"]),
+            tool_result_message("call-1"),
+            tool_result_message("call-2"),
+            tool_result_message("call-3"),
+        ];
+        let first = qwen_tool_chain_state(&messages);
+        assert_eq!(first.tool_cycles_since_user, 1);
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, first),
+            Some(512)
+        );
+
+        messages.push(tool_call_message(&["call-4", "call-5"]));
+        messages.push(tool_result_message("call-4"));
+        messages.push(tool_result_message("call-5"));
+        let second = qwen_tool_chain_state(&messages);
+        assert_eq!(second.tool_cycles_since_user, 2);
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, second),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn explicit_continuation_default_and_new_user_reset_are_deterministic() {
+        let continuation = QwenToolChainState {
+            is_tool_continuation: true,
+            tool_cycles_since_user: 1,
+        };
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), Some(Some(768)), continuation),
+            Some(768)
+        );
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), Some(None), continuation),
+            None
+        );
+
+        let messages = vec![
+            message("assistant", Some("I need to answer now.")),
+            message("user", None),
+            message("assistant", Some("ordinary short thought")),
+        ];
+        let reset = qwen_tool_chain_state(&messages);
+        assert_eq!(reset, QwenToolChainState::default());
+        assert_eq!(
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, reset),
+            Some(2_048)
+        );
+    }
+
+    #[test]
+    fn repeated_tool_result_detection_requires_the_complete_signature() {
+        let call = |id: &str, arguments: &str| ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![super::super::schema::ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: super::super::schema::ToolCallFunction {
+                    name: "edit".into(),
+                    arguments: arguments.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let result = |id: &str, text: &str| ChatMessage {
+            role: "tool".into(),
+            content: Some(MessageContent::Text(text.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            name: None,
+        };
+        let repeated = vec![
+            call("a", r#"{"old":"stale"}"#),
+            result("a", "oldString not found"),
+            call("b", r#"{"old":"stale"}"#),
+            result("b", "oldString not found"),
+            call("c", r#"{"old":"stale"}"#),
+            result("c", "oldString not found"),
+        ];
+        assert_eq!(
+            repeated_tool_result_signature(&repeated, 3),
+            Some(("edit", 3))
+        );
+
+        let changed = vec![
+            call("a", r#"{"old":"one"}"#),
+            result("a", "oldString not found"),
+            call("b", r#"{"old":"two"}"#),
+            result("b", "oldString not found"),
+            call("c", r#"{"old":"three"}"#),
+            result("c", "oldString not found"),
+        ];
+        assert_eq!(repeated_tool_result_signature(&changed, 3), None);
+
+        let reset = vec![
+            call("a", r#"{"old":"stale"}"#),
+            result("a", "oldString not found"),
+            call("b", r#"{"old":"stale"}"#),
+            result("b", "oldString not found"),
+            call("c", r#"{"old":"stale"}"#),
+            result("c", "oldString not found"),
+            message("user", None),
+            call("d", r#"{"old":"stale"}"#),
+            result("d", "oldString not found"),
+        ];
+        assert_eq!(repeated_tool_result_signature(&reset, 3), None);
     }
 }
 
@@ -1304,10 +1612,11 @@ where
     // output is either a tool call OR a structured JSON response, never both.
     // The tool grammar is the more specific constraint; response_grammar is
     // ignored when a tool grammar is produced.
-    let tool_grammar: Option<grammar::Grammar> = match compile_tool_grammar(req, &tool_choice) {
-        Ok(g) => g,
-        Err(resp) => return Err(resp),
-    };
+    let tool_grammar: Option<grammar::Grammar> =
+        match compile_tool_grammar_with_registration(req, &tool_choice, engine.registration()) {
+            Ok(g) => g,
+            Err(resp) => return Err(resp),
+        };
     // Select the effective grammar: tool > response > none.
     //
     // Wave 2.6 W-α5 Q1 + Wave 2.7 W-η Q-A: also pick the `GrammarKind`
@@ -1408,7 +1717,7 @@ where
     // so a minimal-transcript probe render yields the same tail as the
     // real prompt without re-rendering the full transcript. Render
     // failure → false (pre-iter-230 behavior).
-    let reasoning_forced_open = match super::registry::find_for(&req.model) {
+    let reasoning_forced_open = match engine.registration() {
         Some(reg) => {
             let probe_msgs = [super::schema::ChatMessage {
                 role: "user".to_string(),
@@ -1432,7 +1741,7 @@ where
                 enable_thinking,
                 template_kwargs,
             )?;
-            super::registry::prompt_seeds_reasoning_open(&rendered, &reg)
+            super::registry::prompt_seeds_reasoning_open(&rendered, reg)
         }
         None => false,
     };
@@ -1449,9 +1758,19 @@ where
         && engine
             .registration()
             .is_some_and(|registration| registration.family == "qwen35");
+    let chain_state = qwen_tool_chain_state(&messages_for_render);
+    if qwen_thinking_mode {
+        if let Some((tool, repeats)) = repeated_tool_result_signature(&messages_for_render, 3) {
+            tracing::warn!(
+                tool,
+                repeats,
+                "identical Qwen tool call and result repeated across assistant turns"
+            );
+        }
+    }
     let default_thinking_budget =
         if explicit_thinking_budget.is_none() && qwen_thinking_mode && !constrained_tool_choice {
-            match std::env::var("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET") {
+            let base = match std::env::var("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET") {
                 Ok(value) => match value.parse::<usize>() {
                     Ok(0) => None,
                     Ok(value) => Some(value),
@@ -1464,7 +1783,23 @@ where
                     }
                 },
                 Err(_) => None,
-            }
+            };
+            let continuation_override =
+                match std::env::var("HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET") {
+                    Ok(value) => match value.parse::<usize>() {
+                        Ok(0) => Some(None),
+                        Ok(value) => Some(Some(value)),
+                        Err(_) => {
+                            return Err(ApiError::invalid_request(
+                        "HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET must be a non-negative integer",
+                        Some("thinking_token_budget".into()),
+                    )
+                    .into_response());
+                        }
+                    },
+                    Err(_) => None,
+                };
+            adaptive_qwen_default_thinking_budget(base, continuation_override, chain_state)
         } else {
             None
         };
@@ -1476,6 +1811,15 @@ where
         .into_response());
     }
     let configured_thinking_budget = explicit_thinking_budget.or(default_thinking_budget);
+    if qwen_thinking_mode {
+        tracing::info!(
+            tool_continuation = chain_state.is_tool_continuation,
+            tool_cycles_since_user = chain_state.tool_cycles_since_user,
+            explicit_thinking_budget,
+            effective_default_thinking_budget = default_thinking_budget,
+            "Qwen thinking budget policy resolved"
+        );
+    }
     let (thinking_token_budget, reasoning_end_tokens, reasoning_close_tokens) =
         if let Some(budget) = configured_thinking_budget {
             let Some(registration) = engine.registration() else {
@@ -4071,6 +4415,15 @@ fn compile_tool_grammar(
     req: &super::schema::ChatCompletionRequest,
     tool_choice: &super::schema::ToolChoiceValue,
 ) -> std::result::Result<Option<grammar::Grammar>, Response> {
+    let registration = registry::find_for(&req.model);
+    compile_tool_grammar_with_registration(req, tool_choice, registration.as_ref())
+}
+
+fn compile_tool_grammar_with_registration(
+    req: &super::schema::ChatCompletionRequest,
+    tool_choice: &super::schema::ToolChoiceValue,
+    registration: Option<&registry::ModelRegistration>,
+) -> std::result::Result<Option<grammar::Grammar>, Response> {
     use super::schema::ToolChoiceValue;
 
     // None never produces a grammar (tools are suppressed at render).
@@ -4148,7 +4501,7 @@ fn compile_tool_grammar(
     // body-parse-failure → content fallback remains the safety net for
     // unregistered families; the new Auto-lazy path only activates on
     // registered ones.
-    let reg = match registry::find_for(&req.model) {
+    let reg = match registration {
         Some(r) => r,
         None => {
             if !constrain {
@@ -4520,6 +4873,29 @@ mod compile_tool_grammar_precondition_tests {
         let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
         let g = res.expect("Auto + unknown model MUST stay Ok(None)");
         assert!(g.is_none());
+    }
+
+    #[test]
+    fn loaded_registration_overrides_an_opaque_request_alias() {
+        let req = req_with("local-build-model", Some(one_scalar_tool("edit")));
+        assert!(registry::find_for(&req.model).is_none());
+        let registration = registry::find_for("Qwen3.8 27B").expect("Qwen registration");
+
+        let auto = compile_tool_grammar_with_registration(
+            &req,
+            &ToolChoiceValue::Auto,
+            Some(&registration),
+        )
+        .expect("loaded Qwen alias auto grammar");
+        assert!(auto.is_some());
+
+        let required = compile_tool_grammar_with_registration(
+            &req,
+            &ToolChoiceValue::Required,
+            Some(&registration),
+        )
+        .expect("loaded Qwen alias required grammar");
+        assert!(required.is_some());
     }
 
     /// None choice → MUST keep returning Ok(None) (regression-preserve).

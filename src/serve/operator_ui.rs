@@ -68,6 +68,10 @@ enum Event {
         generated_tokens: usize,
         max_tokens: usize,
         tokens_per_second: f64,
+        thinking_tokens: Option<usize>,
+        thinking_budget: Option<usize>,
+        thinking_forced_closed: bool,
+        answer_event_delivered: bool,
     },
     Finished {
         key: RequestKey,
@@ -99,6 +103,10 @@ struct RequestView {
     completed_tokens: usize,
     work_tokens: usize,
     generated_tokens: usize,
+    thinking_tokens: Option<usize>,
+    thinking_budget: Option<usize>,
+    thinking_forced_closed: bool,
+    answer_event_delivered: bool,
     rate: f64,
     started: Instant,
     finished_at: Option<Instant>,
@@ -315,6 +323,36 @@ pub(crate) fn decode_progress(
         generated_tokens,
         max_tokens,
         tokens_per_second,
+        thinking_tokens: None,
+        thinking_budget: None,
+        thinking_forced_closed: false,
+        answer_event_delivered: false,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_decode_progress(
+    id: u64,
+    generated_tokens: usize,
+    max_tokens: usize,
+    tokens_per_second: f64,
+    thinking_tokens: Option<usize>,
+    thinking_budget: Option<usize>,
+    thinking_forced_closed: bool,
+    answer_event_delivered: bool,
+) {
+    let _ = publish(Event::DecodeProgress {
+        key: RequestKey {
+            family: "qwen35",
+            id,
+        },
+        generated_tokens,
+        max_tokens,
+        tokens_per_second,
+        thinking_tokens,
+        thinking_budget,
+        thinking_forced_closed,
+        answer_event_delivered,
     });
 }
 
@@ -411,6 +449,10 @@ fn apply_event(state: &mut DashboardState, event: Event) -> bool {
                     completed_tokens: 0,
                     work_tokens: prompt_tokens,
                     generated_tokens: 0,
+                    thinking_tokens: None,
+                    thinking_budget: None,
+                    thinking_forced_closed: false,
+                    answer_event_delivered: false,
                     rate: 0.0,
                     started: Instant::now(),
                     finished_at: None,
@@ -447,12 +489,20 @@ fn apply_event(state: &mut DashboardState, event: Event) -> bool {
             generated_tokens,
             max_tokens,
             tokens_per_second,
+            thinking_tokens,
+            thinking_budget,
+            thinking_forced_closed,
+            answer_event_delivered,
         } => {
             if let Some(request) = state.requests.get_mut(&key) {
                 request.phase = Phase::Decode;
                 request.generated_tokens = generated_tokens;
                 request.max_tokens = max_tokens;
                 request.rate = tokens_per_second;
+                request.thinking_tokens = thinking_tokens;
+                request.thinking_budget = thinking_budget;
+                request.thinking_forced_closed = thinking_forced_closed;
+                request.answer_event_delivered = answer_event_delivered;
             }
         }
         Event::Finished { key, outcome } => {
@@ -602,6 +652,41 @@ mod tests {
         assert!(row.contains("50.0%"));
         assert!(row.contains("cache   99007"));
         assert!(state.logs.is_empty());
+
+        assert!(apply_event(
+            &mut state,
+            Event::DecodeProgress {
+                key,
+                generated_tokens: 2_459,
+                max_tokens: 8_192,
+                tokens_per_second: 13.4,
+                thinking_tokens: Some(2_048),
+                thinking_budget: Some(2_048),
+                thinking_forced_closed: true,
+                answer_event_delivered: false,
+            }
+        ));
+        let row = render_request(state.requests.get(&key).expect("decode row"), 240);
+        assert!(row.contains("completion  2459/8192"));
+        assert!(row.contains("think capped 2048/2048"));
+        assert!(row.contains("output pending"));
+        assert!(row.contains("prompt 99029 cache 99007"));
+
+        assert!(apply_event(
+            &mut state,
+            Event::DecodeProgress {
+                key,
+                generated_tokens: 2_460,
+                max_tokens: 8_192,
+                tokens_per_second: 13.4,
+                thinking_tokens: Some(2_048),
+                thinking_budget: Some(2_048),
+                thinking_forced_closed: true,
+                answer_event_delivered: true,
+            }
+        ));
+        let row = render_request(state.requests.get(&key).expect("answer row"), 240);
+        assert!(row.contains("output started"));
 
         assert!(apply_event(
             &mut state,
