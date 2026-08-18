@@ -1,4 +1,8 @@
+use super::adversarial::complete_fixture;
 use super::*;
+use crate::distribution::update_auth::test_repository::{
+    stable_release_successor_pair, RetainedReleaseMutation,
+};
 
 #[test]
 fn candidate_is_reauthenticated_under_lock_and_after_reopen() {
@@ -41,6 +45,107 @@ fn candidate_is_reauthenticated_under_lock_and_after_reopen() {
     assert_eq!(outcome, MetadataCommitOutcome::Committed { sequence: 2 });
     assert_eq!(durable.sequence(), 2);
     assert_ne!(durable.generation_sha256(), [0; 32]);
+}
+
+#[test]
+fn retained_release_pairs_are_append_only_across_lock_held_signed_successors() {
+    for mutation in [
+        RetainedReleaseMutation::RebindManifestDigest,
+        RetainedReleaseMutation::RebindArchiveLength,
+        RetainedReleaseMutation::RemoveManifest,
+        RetainedReleaseMutation::RemovePair,
+    ] {
+        let (initial, successor) = stable_release_successor_pair(mutation);
+        let (_temp, authorization) = authorization();
+        let anchor = EmbeddedTrustRoot::from_compiled(Box::leak(
+            initial.repository.anchor.clone().into_boxed_slice(),
+        ));
+        let first = complete_fixture(
+            begin_from_anchor_for_test(
+                &authorization,
+                &anchor,
+                [
+                    instant("2026-08-18T10:00:00Z"),
+                    instant("2026-08-18T10:00:01Z"),
+                ],
+            )
+            .expect("initial stable inventory authenticates"),
+            &initial.repository,
+            0,
+        );
+        commit_at_recorded_completion(&authorization, &anchor, first)
+            .expect("initial stable inventory commits");
+        let selected = read_selected(&authorization)
+            .expect("selected stable floor reads")
+            .expect("selected stable floor exists");
+        let next = complete_fixture(
+            begin_from_selected_for_test(
+                &authorization,
+                &anchor,
+                selected,
+                [
+                    instant("2026-08-18T10:01:00Z"),
+                    instant("2026-08-18T10:01:01Z"),
+                ],
+            )
+            .expect("signed successor authenticates at TUF layer"),
+            &successor.repository,
+            0,
+        );
+        assert!(matches!(
+            commit_at_recorded_completion(&authorization, &anchor, next),
+            Err(TufVerifierError::RetainedReleaseMutation)
+        ));
+        assert_eq!(
+            read_selected(&authorization)
+                .expect("rejected successor leaves stable floor readable")
+                .expect("stable floor remains selected")
+                .sequence(),
+            1,
+            "mutation {mutation:?}"
+        );
+    }
+
+    let (initial, successor) = stable_release_successor_pair(RetainedReleaseMutation::AppendOnly);
+    let (_temp, authorization) = authorization();
+    let anchor = EmbeddedTrustRoot::from_compiled(Box::leak(
+        initial.repository.anchor.clone().into_boxed_slice(),
+    ));
+    let first = complete_fixture(
+        begin_from_anchor_for_test(
+            &authorization,
+            &anchor,
+            [
+                instant("2026-08-18T10:02:00Z"),
+                instant("2026-08-18T10:02:01Z"),
+            ],
+        )
+        .expect("initial stable inventory authenticates"),
+        &initial.repository,
+        0,
+    );
+    commit_at_recorded_completion(&authorization, &anchor, first)
+        .expect("initial stable inventory commits");
+    let selected = read_selected(&authorization)
+        .expect("selected stable floor reads")
+        .expect("selected stable floor exists");
+    let next = complete_fixture(
+        begin_from_selected_for_test(
+            &authorization,
+            &anchor,
+            selected,
+            [
+                instant("2026-08-18T10:03:00Z"),
+                instant("2026-08-18T10:03:01Z"),
+            ],
+        )
+        .expect("append-only successor replays from stable floor"),
+        &successor.repository,
+        0,
+    );
+    let (outcome, _) = commit_at_recorded_completion(&authorization, &anchor, next)
+        .expect("byte-identical retained pair plus new pair commits");
+    assert_eq!(outcome, MetadataCommitOutcome::Committed { sequence: 2 });
 }
 
 #[test]

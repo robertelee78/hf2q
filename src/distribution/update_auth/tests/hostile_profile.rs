@@ -156,6 +156,28 @@ fn cardinality_and_crypto_cpu_bounds_reject_maximum_plus_one() {
         profile::targets(&serde_json::to_vec(&hashes).expect("hash-bound JSON")),
         Err(TufVerifierError::MalformedMetadata)
     ));
+
+    for field in ["custom", "unexpected"] {
+        let mut extra: serde_json::Value = serde_json::from_slice(TARGETS).expect("targets JSON");
+        let first = extra["signed"]["targets"]
+            .as_object_mut()
+            .expect("target inventory")
+            .values_mut()
+            .next()
+            .expect("one descriptor");
+        first[field] = serde_json::Value::Null;
+        assert!(matches!(
+            profile::targets(&serde_json::to_vec(&extra).expect("extra target field JSON")),
+            Err(TufVerifierError::MalformedMetadata)
+        ));
+    }
+
+    let mut delegations: serde_json::Value = serde_json::from_slice(TARGETS).expect("targets JSON");
+    delegations["signed"]["delegations"] = serde_json::Value::Null;
+    assert!(matches!(
+        profile::targets(&serde_json::to_vec(&delegations).expect("delegations JSON")),
+        Err(TufVerifierError::MalformedMetadata)
+    ));
 }
 
 #[test]

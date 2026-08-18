@@ -119,6 +119,7 @@ pub(super) fn snapshot(bytes: &[u8]) -> Result<Metadata<Snapshot>, TufVerifierEr
 pub(super) fn targets(bytes: &[u8]) -> Result<Metadata<Targets>, TufVerifierError> {
     strict_json::validate(bytes, MAX_TARGETS_BYTES)?;
     require_exact_envelope(bytes)?;
+    require_exact_targets_shape(bytes)?;
     let metadata =
         Metadata::<Targets>::from_slice(bytes).map_err(|_| TufVerifierError::MalformedMetadata)?;
     require_signatures(&metadata)?;
@@ -130,6 +131,7 @@ pub(super) fn targets(bytes: &[u8]) -> Result<Metadata<Targets>, TufVerifierErro
     for (name, target) in &role.targets {
         if !bounded_nonempty(name, MAX_TARGET_NAME_BYTES)
             || !target.extra.is_empty()
+            || target.custom.is_some()
             || target.hashes.len() > MAX_HASHES_PER_DESCRIPTOR
         {
             return Err(TufVerifierError::MalformedMetadata);
@@ -137,6 +139,32 @@ pub(super) fn targets(bytes: &[u8]) -> Result<Metadata<Targets>, TufVerifierErro
         require_sha256(&target.hashes)?;
     }
     Ok(metadata)
+}
+
+fn require_exact_targets_shape(bytes: &[u8]) -> Result<(), TufVerifierError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| TufVerifierError::MalformedMetadata)?;
+    let signed = value
+        .get("signed")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TufVerifierError::MalformedMetadata)?;
+    let expected = ["_type", "expires", "spec_version", "targets", "version"];
+    if signed.len() != expected.len() || expected.iter().any(|key| !signed.contains_key(*key)) {
+        return Err(TufVerifierError::MalformedMetadata);
+    }
+    let targets = signed
+        .get("targets")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TufVerifierError::MalformedMetadata)?;
+    for target in targets.values() {
+        let object = target
+            .as_object()
+            .ok_or(TufVerifierError::MalformedMetadata)?;
+        if object.len() != 2 || !object.contains_key("length") || !object.contains_key("hashes") {
+            return Err(TufVerifierError::MalformedMetadata);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn require_fresh<T: Role>(role: &T, reference: Instant) -> Result<(), TufVerifierError> {

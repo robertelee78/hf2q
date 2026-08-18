@@ -7,6 +7,12 @@ pub(super) use recovery::{
     online_key_rotation_recovery, targets_key_rotation_with_lower_rollback,
     transient_online_rotation_with_lower_rollback, unrelated_root_rotation_with_lower_rollback,
 };
+mod releases;
+pub(super) use releases::{
+    stable_release_repository, stable_release_repository_with_expiry,
+    stable_release_repository_with_mismatched_pointer, stable_release_successor_pair,
+    RetainedReleaseMutation,
+};
 
 const EXPIRES: &str = "2999-01-01T00:00:00Z";
 pub(super) const STATIC_KEY_ID: &str =
@@ -319,9 +325,53 @@ pub(super) fn online_binding_change_cases() -> Vec<OnlineBindingChangeCase> {
 }
 
 fn lower_roles(version: u64, expires: &str, signers: &[&TestKey]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    lower_roles_for_roles(
-        version, version, version, expires, signers, signers, signers,
-    )
+    lower_roles_with_targets(version, expires, signers, json!({}))
+}
+
+fn lower_roles_with_targets(
+    version: u64,
+    expires: &str,
+    signers: &[&TestKey],
+    targets_value: Value,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let targets = envelope(
+        json!({
+            "_type": "targets",
+            "expires": expires,
+            "spec_version": "1.0.0",
+            "targets": targets_value,
+            "version": version
+        }),
+        signers,
+    );
+    let snapshot = envelope(
+        json!({
+            "_type": "snapshot",
+            "expires": expires,
+            "meta": {"targets.json": descriptor(version, &targets)},
+            "spec_version": "1.0.0",
+            "version": version
+        }),
+        signers,
+    );
+    let timestamp = envelope(
+        json!({
+            "_type": "timestamp",
+            "expires": expires,
+            "meta": {"snapshot.json": descriptor(version, &snapshot)},
+            "spec_version": "1.0.0",
+            "version": version
+        }),
+        signers,
+    );
+    (timestamp, snapshot, targets)
+}
+
+fn target_descriptor(bytes: &[u8]) -> Value {
+    json!({
+        "hashes": {"sha256": hex::encode(Sha256::digest(bytes))},
+        "length": bytes.len()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

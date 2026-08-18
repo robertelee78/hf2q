@@ -29,7 +29,7 @@ fn leaked_anchor(bytes: &[u8]) -> EmbeddedTrustRoot {
     EmbeddedTrustRoot::from_compiled(Box::leak(bytes.to_vec().into_boxed_slice()))
 }
 
-fn complete_fixture(
+pub(super) fn complete_fixture(
     mut step: VerificationStep,
     fixture: &RepositoryFixture,
     already_trusted_roots: usize,

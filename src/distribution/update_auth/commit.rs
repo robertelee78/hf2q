@@ -202,6 +202,7 @@ fn reauthenticate_candidate(
     let selected_root_count = selected
         .as_ref()
         .map_or(0, |stored| stored.root_chain().len());
+    let prior_targets = selected.as_ref().map(|stored| stored.targets().to_vec());
     if candidate.root_chain().len() < selected_root_count {
         return Err(TufVerifierError::RollbackOrEquivocation);
     }
@@ -235,6 +236,12 @@ fn reauthenticate_candidate(
     )?;
     match step {
         VerificationStep::Candidate(reverified) if reverified.exactly_matches(candidate) => {
+            if let Some(prior_targets) = prior_targets {
+                super::target_set::require_retained_release_floor(
+                    &prior_targets,
+                    reverified.targets().bytes(),
+                )?;
+            }
             Ok(CandidateDisposition::Advancing)
         }
         VerificationStep::Candidate(_) | VerificationStep::Request(_) => {
