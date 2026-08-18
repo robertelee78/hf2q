@@ -110,6 +110,9 @@ console = "0.15"
 serde = { version = "1", features = ["derive"] }
 # Chat templates consume client JSON object order as part of their wire format.
 serde_json = { version = "1", features = ["preserve_order"] }
+# Release manifests use strict SemVer parsing at their untrusted wire boundary.
+# Keep this direct instead of relying on a transitive crate.
+semver = "1"
 
 # Error handling
 anyhow = "1"

@@ -97,7 +97,10 @@ state from PATH aliases or filenames:
   containing the binary, launchers, docs, licenses, and release manifest.
 - **Release manifest**: version, target, minimum macOS version, source commit,
   exact file inventory and modes, digests, signing identity, update channel,
-  and compatibility/schema versions.
+  and compatibility/schema versions. The manifest wire schema, minimum
+  installer protocol, minimum updater protocol, and launcher-registry schema
+  are independent integers: an unsupported document schema or a required
+  protocol/schema above the verifier's capability fails closed.
 - **Install receipt**: installation root, active and two retained versions,
   owner family (`standalone`, `homebrew`, `cargo-registry`, or
   `unknown/manual`), selected update route (`standalone`, `brew`,
@@ -149,6 +152,20 @@ share/doc/hf2q/
 share/licenses/hf2q/
 release-manifest.json
 ```
+
+The four launcher names shown above are the complete v1 path allowlist, not a
+requirement that every release contain all four. Each release includes only
+the subset whose family-specific exact-artifact gates have already passed.
+
+`release-manifest.json` is the bundle's reserved envelope. Its sorted file
+array inventories every payload entry except itself; every representable entry
+is a regular file with an exact path, type, size, mode, and SHA-256. Archive
+verification requires the entry set to equal
+`{release-manifest.json} ∪ manifest.files`. Signed update targets bind the
+external manifest bytes, and the embedded copy must be byte-for-byte identical
+to that separately verified external target. Neither the manifest nor its
+embedded copy attempts the impossible operation of hashing itself or its
+containing archive.
 
 The binary is Developer ID signed with Hardened Runtime and a secure timestamp.
 The final ZIP is submitted with `notarytool`; release promotion requires an
@@ -307,6 +324,27 @@ rollback, freeze, mix-and-match, and replayed-metadata attacks. The exact Rust
 client/library is selected only after a Rust 1.88-compatible implementation
 spike and hostile-metadata tests; plain unsigned `latest` JSON is not an
 acceptable updater authority.
+
+Top-level targets independently bind the stable channel pointer, versioned
+external release manifest, and versioned archive by target name, byte length,
+and SHA-256. The signed pointer names the exact manifest and archive targets
+and repeats their length/digest descriptors; disagreement with the enclosing
+targets metadata is a hard failure. V1 uses top-level targets only and does not
+use delegations. The manifest never contains the archive digest because an
+identical embedded manifest would make that relationship self-referential.
+
+The first Rust 1.88 comparison found no production-ready library selection.
+[`tough` 0.24.0](https://docs.rs/tough/0.24.0/tough/) compiles at the project
+MSRV, but its stock persistent metadata store does not yet prove the
+crash-durable, cross-role transaction required by this ADR.
+[`sigstore-tuf` 0.11.0](https://docs.rs/sigstore-tuf/0.11.0/sigstore_tuf/) has a
+promising I/O-independent verifier and conformance coverage, but the published
+crate predates its delegated-path
+[wildcard fix](https://github.com/sigstore/sigstore-rust/pull/174) and its stock
+file store is not cross-role atomic. Both remain
+spike candidates; no dependency lands and no signed wire schema freezes until
+the same rollback, freeze, replay, rotation, crash, and concurrency corpus
+passes with durable version-floor state.
 
 The initial stable metadata repository is served from GitHub Pages under the
 hf2q repository (for example,
@@ -751,9 +789,13 @@ before public self-update ships.
 
 ## Implementation sequence
 
-1. Freeze and adversarially test the release/install/update schemas, canonical
-   Hugging Face reference grammar, prepared/external artifact provenance,
-   calibration receipt, session policy, and hostile-input fixtures.
+1. Freeze and adversarially test the release manifest first, then the install
+   receipt, canonical Hugging Face reference grammar, prepared/external
+   artifact provenance, calibration receipt, and session policy. Run the
+   comparative TUF spike before freezing the authenticated update adapter and
+   its application target records. Every schema lands with bounded hostile
+   input and golden-byte fixtures; schema parsing alone never creates an
+   authenticated or ownership-verified capability.
 2. Implement `hf2q setup`, the unified `~/.hf2q` state layout, idempotent
    Bash/zsh PATH ownership, hardware inventory, and the one-question bounded
    session policy.

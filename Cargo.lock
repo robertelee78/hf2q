@@ -1436,6 +1436,7 @@ dependencies = [
  "reqwest",
  "ruvector-core",
  "safetensors",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

@@ -1,0 +1,267 @@
+use std::fmt;
+
+use serde::Serialize;
+
+use super::release_manifest::ReleaseManifestError;
+
+const MAX_RELEASE_VERSION_BYTES: usize = 64;
+const MAX_BUNDLE_PATH_BYTES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct Sha256Digest(String);
+
+impl Sha256Digest {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "must be exactly 64 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct GitCommit(String);
+
+impl GitCommit {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+        if value.len() != 40
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "must be exactly 40 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ReleaseVersion(String);
+
+impl ReleaseVersion {
+    pub(crate) fn parse_stable(
+        field: &'static str,
+        value: String,
+    ) -> Result<Self, ReleaseManifestError> {
+        if value.is_empty() || value.len() > MAX_RELEASE_VERSION_BYTES {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "must be a bounded semantic version",
+            ));
+        }
+        let parsed = semver::Version::parse(&value).map_err(|_| {
+            ReleaseManifestError::invalid(field, "must be a canonical semantic version")
+        })?;
+        if !parsed.pre.is_empty() || !parsed.build.is_empty() {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "stable releases cannot contain prerelease or build metadata",
+            ));
+        }
+        if parsed.to_string() != value {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "semantic version is not in canonical form",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum TargetTriple {
+    #[serde(rename = "aarch64-apple-darwin")]
+    Aarch64AppleDarwin,
+}
+
+impl TargetTriple {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+        match value.as_str() {
+            "aarch64-apple-darwin" => Ok(Self::Aarch64AppleDarwin),
+            _ => Err(ReleaseManifestError::invalid(
+                field,
+                "v1 supports only aarch64-apple-darwin",
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aarch64AppleDarwin => "aarch64-apple-darwin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum UpdateChannel {
+    #[serde(rename = "stable")]
+    Stable,
+}
+
+impl UpdateChannel {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+        match value.as_str() {
+            "stable" => Ok(Self::Stable),
+            _ => Err(ReleaseManifestError::invalid(
+                field,
+                "v1 supports only the stable channel",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct MacOsVersion(String);
+
+impl MacOsVersion {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+        if value.is_empty() || value.len() > 16 {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "must be a bounded major.minor or major.minor.patch version",
+            ));
+        }
+        let parts: Vec<_> = value.split('.').collect();
+        if !(2..=3).contains(&parts.len())
+            || parts.iter().any(|part| {
+                part.is_empty()
+                    || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    || (part.len() > 1 && part.starts_with('0'))
+                    || part.parse::<u16>().is_err()
+            })
+            || parts[0] == "0"
+        {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "must be canonical major.minor or major.minor.patch decimal components",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct BundlePath(String);
+
+impl BundlePath {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, ReleaseManifestError> {
+        if value.is_empty()
+            || value.len() > MAX_BUNDLE_PATH_BYTES
+            || !value.is_ascii()
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains("//")
+            || value.contains('\\')
+            || value.contains(':')
+            || value.bytes().any(|byte| byte.is_ascii_control())
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+            })
+            || value.split('/').any(|component| {
+                component.is_empty()
+                    || component == "."
+                    || component == ".."
+                    || component.len() > 255
+            })
+        {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "must be a canonical, safe ASCII bundle-relative path",
+            ));
+        }
+
+        if value == "release-manifest.json" {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "release-manifest.json is the reserved envelope and is not self-inventoried",
+            ));
+        }
+
+        let allowed = value == "bin/hf2q"
+            || matches!(
+                value.as_str(),
+                "libexec/serve_qwen38_opencode.sh"
+                    | "libexec/serve_qwen36_opencode.sh"
+                    | "libexec/serve_gemma4_opencode.sh"
+                    | "libexec/serve_deepseek4_opencode.sh"
+            )
+            || value
+                .strip_prefix("share/doc/hf2q/")
+                .is_some_and(|suffix| !suffix.is_empty())
+            || value
+                .strip_prefix("share/licenses/hf2q/")
+                .is_some_and(|suffix| !suffix.is_empty());
+        if !allowed {
+            return Err(ReleaseManifestError::invalid(
+                field,
+                "path is outside the v1 release-bundle allowlist",
+            ));
+        }
+
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub enum BundleEntryType {
+    #[serde(rename = "regular")]
+    Regular,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub enum FileMode {
+    #[serde(rename = "0644")]
+    Data,
+    #[serde(rename = "0755")]
+    Executable,
+}
+
+impl FileMode {
+    pub fn as_octal(self) -> u32 {
+        match self {
+            Self::Data => 0o644,
+            Self::Executable => 0o755,
+        }
+    }
+}

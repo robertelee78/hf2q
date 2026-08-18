@@ -17,6 +17,7 @@ pub mod cli;
 pub mod convert;
 pub mod core;
 mod debug;
+pub mod distribution;
 mod doctor;
 pub mod gguf_patch;
 pub mod inference;

@@ -100,6 +100,7 @@ jobs:
           cargo test --locked --test convert_integration --all-features
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
+          cargo test --locked --bin hf2q --all-features distribution::schema::release_manifest::tests::
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen35_serving_tokenizer_is_sidecar_free_and_detects_vision_markers -- --test-threads=1
           cargo test --locked --bin hf2q --all-features vision_projector_binding -- --test-threads=1
