@@ -200,6 +200,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features slotaware_fail_stop_tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features engine_supervisor::tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features public_watchdog_fixture_bytes_are_stable_without_a_model -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features public_watchdog_fixture_consumers_share_the_canonical_digests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
           bash -n scripts/qwen36_watchdog_validate.sh \
             scripts/serve_qwen38_opencode.sh \
