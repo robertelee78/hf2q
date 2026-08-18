@@ -24,7 +24,7 @@ build_fixture() {
   mkdir -p "$benchmark_dir" "$destination/thermal"
   printf 'synthetic canonical prompt\n' >"$benchmark_dir/prompt.txt"
   jq -n --rawfile prompt "$benchmark_dir/prompt.txt" '
-    {model:"Qwen/Qwen3.8-27B",messages:[
+    {model:"Qwen3.8 27B",messages:[
       {role:"system",content:"synthetic"},{role:"user",content:$prompt}],
       temperature:0,max_tokens:512,stream:false,hf2q_enable_thinking:false,
       repetition_penalty:1.0}
@@ -66,7 +66,7 @@ build_fixture() {
     cp "$benchmark_dir/request.json" "$trial_dir/request.json"
     jq -n --argjson decode_seconds "$decode_seconds" --argjson decode_tps "$decode_tps" '
       {id:"synthetic",object:"chat.completion",created:1,
-       model:"Qwen/Qwen3.8-27B",choices:[{index:0,
+       model:"Qwen3.8 27B",choices:[{index:0,
          message:{role:"assistant",content:"same exact output"},
          finish_reason:"length"}],
        usage:{prompt_tokens:105100,completion_tokens:512,total_tokens:105612},
@@ -79,6 +79,8 @@ build_fixture() {
       >"$trial_dir/semantic.json"
     printf 'http_code=200\ntotal_seconds=60\n' >"$trial_dir/curl.metrics"
     printf '{"ready":true,"detail":"ready"}\n' >"$trial_dir/readyz.json"
+    printf '{"object":"list","data":[{"id":"Qwen3.8 27B","loaded":true}]}\n' \
+      >"$trial_dir/models.json"
     printf 'HF2Q_QWEN_GQA_Q2=%s\nHF2Q_PIPELINE_PREWARM_LOG=1\nQWEN38_VISION=off\n' \
       "$mode" >"$trial_dir/environment.txt"
     {
@@ -91,7 +93,7 @@ build_fixture() {
     } >"$trial_dir/server.log"
     semantic_sha=$(sha256_file "$trial_dir/semantic.json")
     artifacts_json=$(
-      for name in request.json response.json semantic.json curl.metrics server.log readyz.json environment.txt; do
+      for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
         jq -n --arg name "$name" --arg sha256 "$(sha256_file "$trial_dir/$name")" \
           '{name:$name,sha256:$sha256}'
       done | jq -s .
@@ -132,7 +134,7 @@ build_fixture() {
     {schema_version:1,status:"pass",benchmark:"qwen38-long-decode-gqa-q2",
      identity:{source_sha:$source_sha,crate_sha256:$crate_sha256,
        binary:{path:"/sealed/hf2q",sha256:$binary_sha256,file_identity:"1:2"},
-       model:{id:"Qwen/Qwen3.8-27B",path:"/models/qwen38.gguf",
+       model:{id:"Qwen3.8 27B",path:"/models/qwen38.gguf",
          sha256:$model_sha256,file_identity:"3:4",bytes:123456},
        prompt:{path:"prompt.txt",sha256:$prompt_sha256,bytes:$prompt_bytes,
          padding_tokens:105000},
@@ -189,6 +191,36 @@ expect_rejected() {
   fi
 }
 
+expect_benchmark_rejected() {
+  local fixture=$1
+  local label=$2
+  if bash "$verifier" benchmark "$fixture/benchmark" "$source_sha" "$crate_sha" \
+    "$binary_sha" "$model_sha" >/dev/null 2>&1; then
+    echo "Qwen3.8 verifier accepted invalid benchmark evidence: $label" >&2
+    exit 1
+  fi
+}
+
+rehash_trial_into_summary() {
+  local fixture=$1
+  local trial_index=$2
+  local trial_dir=$3
+  local trial_json="$trial_dir/trial.json"
+  local summary="$fixture/benchmark/summary.json"
+  local artifact
+  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
+    jq --arg name "$artifact" --arg sha "$(sha256_file "$trial_dir/$artifact")" '
+      .artifacts |= map(if .name == $name then .sha256 = $sha else . end)
+    ' "$trial_json" >"$trial_json.tmp"
+    mv "$trial_json.tmp" "$trial_json"
+  done
+  jq --argjson index "$trial_index" --slurpfile trial "$trial_json" '
+    .trials[$index] = $trial[0]
+  ' "$summary" >"$summary.tmp"
+  mv "$summary.tmp" "$summary"
+  printf '%s  summary.json\n' "$(sha256_file "$summary")" >"$summary.sha256"
+}
+
 valid="$tmp/valid"
 build_fixture "$valid"
 bash "$verifier" release "$valid" "$source_sha" "$crate_sha" \
@@ -216,6 +248,22 @@ tampered="$tmp/tampered"
 cp -R "$valid" "$tampered"
 printf 'tamper\n' >>"$tampered/benchmark/trial-2-auto/server.log"
 expect_rejected "$tampered" tampered-raw-artifact
+
+wrong_loaded_model="$tmp/wrong-loaded-model"
+cp -R "$valid" "$wrong_loaded_model"
+printf '{"object":"list","data":[{"id":"downloaded-shadow","loaded":true}]}\n' \
+  >"$wrong_loaded_model/benchmark/trial-2-auto/models.json"
+rehash_trial_into_summary "$wrong_loaded_model" 1 \
+  "$wrong_loaded_model/benchmark/trial-2-auto"
+expect_benchmark_rejected "$wrong_loaded_model" wrong-loaded-model
+
+download_fallback="$tmp/download-fallback"
+cp -R "$valid" "$download_fallback"
+printf 'INFO auto-pipeline: downloading from HF Hub repo="Qwen/Qwen3.8-27B"\n' \
+  >>"$download_fallback/benchmark/trial-2-auto/server.log"
+rehash_trial_into_summary "$download_fallback" 1 \
+  "$download_fallback/benchmark/trial-2-auto"
+expect_benchmark_rejected "$download_fallback" auto-pipeline-download
 
 slow="$tmp/slow"
 build_fixture "$slow" 0 1

@@ -94,7 +94,7 @@ jq -e \
     and .identity.binary.sha256 == $binary_sha256
     and (.identity.binary.path | type) == "string" and (.identity.binary.path | length) > 0
     and (.identity.binary.file_identity | test("^[0-9]+:[0-9]+$"))
-    and .identity.model.id == "Qwen/Qwen3.8-27B"
+    and .identity.model.id == "Qwen3.8 27B"
     and .identity.model.sha256 == $model_sha256
     and (.identity.model.path | type) == "string" and (.identity.model.path | length) > 0
     and (.identity.model.file_identity | test("^[0-9]+:[0-9]+$"))
@@ -140,7 +140,7 @@ test "$(sha256_file "$benchmark_dir/request.json")" = \
   "$(jq -er .identity.request.sha256 "$summary")"
 jq -e '
   ([.. | objects | has("seed")] | any | not)
-  and .model == "Qwen/Qwen3.8-27B"
+  and .model == "Qwen3.8 27B"
   and .temperature == 0
   and .max_tokens == 512
   and .stream == false
@@ -174,8 +174,8 @@ for mode in off auto auto off; do
   }
   expected_inventory="$tmp/expected-inventory-$trial_index"
   actual_inventory="$tmp/actual-inventory-$trial_index"
-  printf '%s\n' curl.metrics environment.txt readyz.json request.json response.json \
-    semantic.json server.log trial.json | sort >"$expected_inventory"
+  printf '%s\n' curl.metrics environment.txt models.json readyz.json request.json \
+    response.json semantic.json server.log trial.json | sort >"$expected_inventory"
   find "$trial_dir" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; \
     | sort >"$actual_inventory"
   cmp "$expected_inventory" "$actual_inventory"
@@ -203,12 +203,12 @@ for mode in off auto auto off; do
       and (.decode_seconds | type) == "number" and .decode_seconds > 0
       and (.decode_tokens_per_second | type) == "number"
       and .decode_tokens_per_second > 0
-      and (.artifacts | type) == "array" and (.artifacts | length) == 7
-      and ([.artifacts[].name] | unique | length) == 7
+      and (.artifacts | type) == "array" and (.artifacts | length) == 8
+      and ([.artifacts[].name] | unique | length) == 8
       and all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")))
     ' "$trial_json" >/dev/null
 
-  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json environment.txt; do
+  for artifact in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
     [[ -s "$trial_dir/$artifact" ]] || {
       echo "Qwen3.8 raw trial artifact is missing or empty: $artifact" >&2
       exit 1
@@ -232,10 +232,14 @@ for mode in off auto auto off; do
   [[ "$total_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]
   awk -v seconds="$total_seconds" 'BEGIN { exit !(seconds > 0) }'
   jq -e '.ready == true' "$trial_dir/readyz.json" >/dev/null
+  jq -e '
+    (.object == "list")
+    and ([.data[] | select(.loaded == true) | .id] == ["Qwen3.8 27B"])
+  ' "$trial_dir/models.json" >/dev/null
 
   response="$trial_dir/response.json"
   jq -e '
-    .model == "Qwen/Qwen3.8-27B"
+    .model == "Qwen3.8 27B"
     and (.choices | length) == 1
     and .choices[0].finish_reason == "length"
     and .choices[0].message.role == "assistant"
@@ -302,6 +306,10 @@ for mode in off auto auto off; do
   fi
   if grep -Eiq 'GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|engine_unhealthy|panicked at|worker-fatal' "$server_log"; then
     echo "Qwen3.8 verifier observed a fatal runtime signature" >&2
+    exit 1
+  fi
+  if grep -Fq 'auto-pipeline: downloading from HF Hub' "$server_log"; then
+    echo "Qwen3.8 verifier observed an unsealed auto-pipeline download" >&2
     exit 1
   fi
 done

@@ -14,7 +14,7 @@ MODEL_SHA256=${MODEL_SHA256:?MODEL_SHA256 is required}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required}
 PORT=${PORT:-18083}
 
-readonly MODEL_ID='Qwen/Qwen3.8-27B'
+readonly MODEL_ID='Qwen3.8 27B'
 readonly MAX_TOKENS=512
 readonly PROMPT_PADDING_TOKENS=105000
 readonly MIN_PROMPT_TOKENS=100000
@@ -196,6 +196,16 @@ run_trial() {
   server_pid=$!
   wait_ready "$server_log"
 
+  curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+    "http://127.0.0.1:$PORT/v1/models" -o "$trial_dir/models.json"
+  jq -e --arg model "$MODEL_ID" '
+    (.object == "list")
+    and ([.data[] | select(.loaded == true) | .id] == [$model])
+  ' "$trial_dir/models.json" >/dev/null || {
+    echo "Qwen3.8 trial server did not expose exactly the sealed loaded model: $MODEL_ID" >&2
+    return 1
+  }
+
   curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 1800 \
     -H 'Content-Type: application/json' \
     --data-binary "@$trial_dir/request.json" \
@@ -259,9 +269,13 @@ run_trial() {
     echo "Qwen3.8 long-decode trial observed a fatal runtime signature" >&2
     return 1
   fi
+  if rg -Fq 'auto-pipeline: downloading from HF Hub' "$server_log"; then
+    echo "Qwen3.8 long-decode trial escaped the sealed loaded-model path" >&2
+    return 1
+  fi
 
   artifacts_json=$(
-    for name in request.json response.json semantic.json curl.metrics server.log readyz.json environment.txt; do
+    for name in request.json response.json semantic.json curl.metrics server.log readyz.json models.json environment.txt; do
       jq -n --arg name "$name" --arg sha256 "$(sha256_file "$trial_dir/$name")" \
         '{name:$name,sha256:$sha256}'
     done | jq -s .
