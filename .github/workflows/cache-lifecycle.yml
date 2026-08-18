@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 300
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
-      EXPECTED_VERSION: "0.1.6"
+      EXPECTED_VERSION: "0.1.7"
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout exact candidate

@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.88.0"
 build = "src/build_script.rs"
@@ -103,7 +103,7 @@ rayon = "1.10"
 memmap2 = "0.9"
 
 # UX
-indicatif = "0.17"
+indicatif = "0.18.4"
 console = "0.15"
 
 # Serialization
