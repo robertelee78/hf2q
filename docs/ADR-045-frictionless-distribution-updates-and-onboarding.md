@@ -126,8 +126,11 @@ state from PATH aliases or filenames:
   protocol/schema above the verifier's capability fails closed.
 - **Installed-version marker**: immutable, version-local standalone ownership
   state binding one installation ID and root to one version, target, release
-  manifest/archive digest, and nonzero installation sequence. It is local
-  correlation evidence, never transmitted update identity or authentication.
+  manifest/archive digest, nonzero installation sequence, preparation time,
+  and the four authenticated metadata-role versions that prepared it. The
+  recorded role versions make the exact activation receipt reconstructible
+  after a crash or later metadata refresh. They are local correlation and
+  audit evidence, never transmitted update identity or authentication.
 - **Install receipt**: for standalone ownership, an immutable activation record
   selected atomically with its version; for manager/manual ownership, a
   non-authoritative last-observation record. It contains the configured state
@@ -426,6 +429,25 @@ reverified. A manager/manual active release may omit bundle identity, or may
 bind a manifest/archive when that channel ships them, but it never claims a
 standalone marker or retained release. No receipt contains arbitrary deletion
 paths or manager argv.
+
+Installed-version marker v2 is the first public-state candidate. It adds the
+closed `prepared_from` evidence object with kind `verified-update-metadata` and
+nonzero root, timestamp, snapshot, and targets versions. A narrow typed builder
+emits the canonical marker bytes, hashes those exact bytes into install-receipt
+v1, and derives the receipt transition evidence and completion time from the
+same marker inputs. This makes a completely published version self-sufficient
+for exact receipt reconstruction after restart. First-activation verification
+reconstructs that record from the exact durable marker bytes and requires the
+candidate receipt to equal the derived receipt in full; a matching marker
+digest alone is insufficient. The marker's `installed_at_unix_seconds` is the
+single diagnostic time fixed for first-install preparation and copied into the
+receipt's `completed_at_unix_seconds`; recovery never resamples or rewrites it,
+and it is not a claim about the wall-clock instant of a later `current` rename.
+The earlier marker-v1 bytes
+were reachable only from dormant code with no production entry point; they are
+retained as a regression fixture and rejected as unsupported rather than
+silently migrated. Once any public writer exists, a future marker change
+requires an explicit dual-reader migration release before a new writer.
 
 The executable in `~/.local/bin` resolves `current/version/bin/hf2q`. Installed
 launcher entry points resolve paths relative to that version and use the
@@ -1517,11 +1539,12 @@ before public self-update ships.
    current-time authenticated target inventory, sealed pointer cross-binding,
    origin-locked transport, lock-reauthenticated fetch capability, and exact
    external manifest/same-FD streamed archive binding plus exact
-   embedded-manifest/classic-ZIP inventory verification have landed as dormant
-   bounded contexts. Next, embed the real stable root and implement
-   descriptor-relative extraction, codesign verification, crash-durable
-   prepared-version publication, live installed-release downgrade floor,
-   canonical Hugging
+   embedded-manifest/classic-ZIP inventory verification, marker-v2 exact
+   preparation evidence, and the first-standalone marker/receipt builder have
+   landed as dormant bounded contexts. Next, embed the real stable root and
+   implement descriptor-relative extraction, codesign verification,
+   crash-durable prepared-version publication, live installed-release downgrade
+   floor, canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration
    receipt, and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated

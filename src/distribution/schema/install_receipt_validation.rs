@@ -76,29 +76,6 @@ enum RawRecordedTransitionEvidenceV1 {
     RetainedRelease { release_manifest_sha256: String },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawInstalledVersionMarkerV1 {
-    kind: String,
-    schema_version: u32,
-    package: String,
-    installation_layout_schema: u32,
-    installation_id: String,
-    installation_root: String,
-    release: RawMarkerReleaseV1,
-    installation_sequence: u64,
-    installed_at_unix_seconds: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawMarkerReleaseV1 {
-    version: String,
-    target: String,
-    release_manifest_sha256: String,
-    archive_sha256: String,
-}
-
 pub(super) fn parse_install_receipt(bytes: &[u8]) -> Result<InstallReceiptV1, InstallReceiptError> {
     if bytes.len() > MAX_INSTALL_RECEIPT_BYTES {
         return Err(InstallReceiptError::InputTooLarge {
@@ -110,21 +87,6 @@ pub(super) fn parse_install_receipt(bytes: &[u8]) -> Result<InstallReceiptV1, In
     let raw: RawInstallReceiptV1 = serde_json::from_slice(bytes)
         .map_err(|error| sanitize_json_error("install receipt", error))?;
     validate_install_receipt(raw)
-}
-
-pub(super) fn parse_installed_version_marker(
-    bytes: &[u8],
-) -> Result<InstalledVersionMarkerV1, InstallReceiptError> {
-    if bytes.len() > MAX_INSTALLED_VERSION_MARKER_BYTES {
-        return Err(InstallReceiptError::InputTooLarge {
-            document: "installed-version marker",
-            limit: MAX_INSTALLED_VERSION_MARKER_BYTES,
-            actual: bytes.len(),
-        });
-    }
-    let raw: RawInstalledVersionMarkerV1 = serde_json::from_slice(bytes)
-        .map_err(|error| sanitize_json_error("installed-version marker", error))?;
-    validate_marker(raw)
 }
 
 fn validate_install_receipt(
@@ -210,85 +172,6 @@ fn validate_install_receipt(
         retained,
         last_successful_transition,
     })
-}
-
-fn validate_marker(
-    raw: RawInstalledVersionMarkerV1,
-) -> Result<InstalledVersionMarkerV1, InstallReceiptError> {
-    validate_envelope(
-        &raw.kind,
-        raw.schema_version,
-        &raw.package,
-        INSTALLED_VERSION_MARKER_KIND,
-        INSTALLED_VERSION_MARKER_SCHEMA_VERSION,
-        "installed-version marker",
-    )?;
-    if raw.installation_layout_schema != INSTALLATION_LAYOUT_SCHEMA_V1 {
-        return Err(InstallReceiptError::invalid(
-            "installation_layout_schema",
-            "must equal the supported standalone v1 installation layout schema",
-        ));
-    }
-    if raw.installation_sequence == 0 {
-        return Err(InstallReceiptError::invalid(
-            "installation_sequence",
-            "must be nonzero",
-        ));
-    }
-    if raw.installed_at_unix_seconds == 0 {
-        return Err(InstallReceiptError::invalid(
-            "installed_at_unix_seconds",
-            "must be nonzero",
-        ));
-    }
-    Ok(InstalledVersionMarkerV1 {
-        kind: raw.kind,
-        schema_version: raw.schema_version,
-        package: raw.package,
-        installation_layout_schema: raw.installation_layout_schema,
-        installation_id: InstallationId::parse(raw.installation_id)?,
-        installation_root: AbsoluteInstallPath::parse("installation_root", raw.installation_root)?,
-        release: MarkerReleaseV1 {
-            version: ReleaseVersion::parse_stable("release.version", raw.release.version)?,
-            target: TargetTriple::parse("release.target", raw.release.target)?,
-            release_manifest_sha256: Sha256Digest::parse(
-                "release.release_manifest_sha256",
-                raw.release.release_manifest_sha256,
-            )?,
-            archive_sha256: Sha256Digest::parse(
-                "release.archive_sha256",
-                raw.release.archive_sha256,
-            )?,
-        },
-        installation_sequence: raw.installation_sequence,
-        installed_at_unix_seconds: raw.installed_at_unix_seconds,
-    })
-}
-
-fn validate_envelope(
-    actual_kind: &str,
-    actual_schema: u32,
-    package: &str,
-    expected_kind: &str,
-    expected_schema: u32,
-    document: &'static str,
-) -> Result<(), InstallReceiptError> {
-    if actual_kind != expected_kind {
-        return Err(InstallReceiptError::UnsupportedKind(document));
-    }
-    if actual_schema != expected_schema {
-        return Err(InstallReceiptError::UnsupportedSchema {
-            document,
-            actual: actual_schema,
-        });
-    }
-    if package != "hf2q" {
-        return Err(InstallReceiptError::invalid(
-            "package",
-            "must be exactly `hf2q`",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_owner_layout_and_route(

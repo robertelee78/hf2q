@@ -204,6 +204,14 @@ jobs:
           for required in \
             src/distribution/schema/channel_pointer.rs \
             src/distribution/schema/testdata/channel_pointer_v1.json \
+            src/distribution/schema/first_standalone_record.rs \
+            src/distribution/schema/install_receipt.rs \
+            src/distribution/schema/install_receipt_validation.rs \
+            src/distribution/schema/install_receipt_tests.rs \
+            src/distribution/schema/installed_version_marker.rs \
+            src/distribution/schema/testdata/install_receipt_v1_initial_marker_v2.json \
+            src/distribution/schema/testdata/installed_version_marker_v1.json \
+            src/distribution/schema/testdata/installed_version_marker_v2.json \
             src/distribution/schema/target_name.rs \
             src/distribution/install_state/artifact.rs \
             src/distribution/install_state/artifact/tests.rs \

@@ -59,7 +59,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/report.rs        machine-readable convert-result report
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
 ├── src/distribution/   ADR-045 release/install bounded context
-│   ├── schema/         strict bounded manifest, receipt, marker schemas
+│   ├── schema/         strict bounded manifest, receipt, marker schemas;
+│                       marker v2 records exact preparation-role versions and
+│                       deterministically reconstructs first-install receipts
 │   ├── install_state/  shared descriptor-relative installation lock,
 │       ├── metadata/   canonical crash-durable update-metadata journal;
 │       │                stored bytes are not cryptographic authority
@@ -585,6 +587,14 @@ harness leans on three patterns:
    a byte-identical deterministic embedded manifest, and every streamed payload
    digest. Its non-cloneable result is still inert and grants no filesystem,
    codesign, prepared-version, activation, installer, or CLI authority.
+   The schema boundary now defines installed-version marker v2 and a narrow
+   first-standalone record builder. Marker v2 carries the exact metadata-role
+   versions needed to regenerate the same install-receipt-v1 transition after
+   a crash, and first activation requires full equality with that derived
+   receipt rather than trusting only its marker digest. Dormant marker-v1
+   fixture bytes are rejected fail-closed. This
+   builder remains structural output and cannot authenticate or publish a
+   prepared version.
    Verifier-request metadata HTTP remains a pending production-root slice.
    Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected
