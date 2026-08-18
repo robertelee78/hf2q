@@ -303,3 +303,41 @@ historical 10-second wall-clock bound missed by 732 ms on the first run, then
 passed under an explicit 15-second bound without relaxing any semantic or
 cache assertion. This residual latency is recorded rather than conflated with
 the corrected first-image cache and reasoning failures.
+
+### Long-context GQA-cooperative decode candidate (2026-08-18)
+
+At a 104,966-token prefix, Qwen3.8's 24 query heads and four KV heads cause the
+legacy TQ-HB kernel to request roughly 20.96 GB of KV traffic per generated
+token: each six-head GQA group reloads and dequantizes its shared KV head per
+query head. A bandwidth model built from the accepted 29.19 tok/s short-context
+baseline predicts 12.99 tok/s; the observed agentic turn measured 13.4 tok/s.
+The same model predicted 24.09 tok/s at 17,807 tokens versus 22.1 observed and
+18.43 at 49,169 versus 18.0 observed. This identifies the long-context decode
+loss as a kernel-layout limit, independent of the separate model/tool retry
+loop.
+
+Published `mlx-native 0.10.9` adds a bit-exact D=256 GQA-cooperative Q2 TQ-HB
+kernel. It shares one packed K/V load and dequantization across two query heads
+without changing per-query online-softmax state or the final reduction layout.
+The isolated Apple M5 Max gate measured 1.497x at 8K and 1.437x at 104,966 KV
+tokens, with multi-chunk bit equality and a 1.001 first-versus-last median ratio
+over 1,000 sustained 105K steps. Q3 was not retained because its threadgroup
+memory and occupancy tradeoff did not justify a second production variant.
+
+hf2q's candidate selector defaults to `auto`: it remains on the legacy kernel
+below 8,192 KV tokens and requires the exact Qwen3.8 D=256/GQA/no-mask geometry
+above that threshold. `HF2Q_QWEN_GQA_Q2=off` is the supported escape hatch;
+`on` still cannot bypass hard geometry checks, and invalid values fail safe to
+off. This default is accepted for merge only when the same packed hf2q binary
+passes the shipping contract's OFF/AUTO/AUTO/OFF release receipt: identical
+greedy output, at least 15% mean end-to-end decode gain near 105K, no arm above
+5% spread, lower independently measured curl wall time, exactly-once
+SlotAware completion telemetry derived from the finalized result, and a
+continuous fair-or-better thermal envelope. Isolated mlx-native numbers are
+dependency evidence, not hf2q release authority.
+
+The next exact-output optimization sequence is a two-dimensional H2xP2
+query-head/query-position verifier, then native Qwen3.8 MTP and a dynamic
+suffix-automaton proposer behind measured acceptance/cost routing. Split-K
+retuning and true packed TQ6/TQ5 storage follow only after the cooperative
+kernel and verifier establish their new bandwidth/occupancy regime.

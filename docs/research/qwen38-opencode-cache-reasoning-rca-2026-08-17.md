@@ -340,8 +340,25 @@ against the scalar kernel for TQ5/6/8 and measured 1.497x isolated GPU speedup
 at 8,192 KV tokens and 1.437x at 104,966. Q3 was slower because larger
 per-workgroup state reduced occupancy and was removed from the landing code.
 The downstream real-model release gate remains at least 15% end-to-end
-improvement at 105K, exact greedy/tool output, and no more than 2%
-short-context regression.
+improvement at 105K and exact greedy output. Short contexts below 8,192 retain
+the legacy dispatch by construction; selector and invalid-geometry tests pin
+that no-route-change contract instead of publishing an unmeasured percentage.
+
+That release gate binds its throughput calculation to one exactly-once
+`Qwen35 decode complete` event from the request's real SlotAware completion
+path. The event reports the same generated-token count and decode clock used
+by the response timing fields and is suppressed for client cancellation. The
+first end-to-end gate attempt correctly rejected an otherwise valid
+105,097-prompt-token response because SlotAware lacked this SerialFifo-parity
+telemetry; the missing path is now pinned by a model-free regression test, and
+no GQA result is release-authoritative until the exact-source ABBA receipt
+passes. The verifier independently compares curl wall time, shell phase time,
+and the response timer within a two-second bound; requires the AUTO wall-time
+mean to fall as well as the server-reported throughput mean to improve by at
+least 15%; and rejects either two-trial arm above 5% spread. The fixed
+`/usr/bin/swift` thermal probe is identity-bound, and only the continuously
+supervised release envelope—not the benchmark-only summary—can authorize
+shipping.
 
 The next lossless stages are deliberately ordered:
 

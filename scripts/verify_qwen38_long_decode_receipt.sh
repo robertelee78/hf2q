@@ -7,6 +7,8 @@ expected_source_sha=${3:?expected source SHA is required}
 expected_crate_sha256=${4:?expected crate SHA-256 is required}
 expected_binary_sha256=${5:?expected binary SHA-256 is required}
 expected_model_sha256=${6:?expected model SHA-256 is required}
+readonly MAX_WITHIN_ARM_SPREAD_PERCENT=5
+readonly MAX_WALL_TIMING_DELTA_SECONDS=2
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -115,6 +117,8 @@ jq -e \
     and .identity.hardware.memory_bytes > 0
     and (.identity.hardware.os_version | type) == "string"
     and (.identity.hardware.os_version | length) > 0
+    and .identity.hardware.thermal_probe.path == "/usr/bin/swift"
+    and (.identity.hardware.thermal_probe.sha256 | test("^[0-9a-f]{64}$"))
     and .settings.temperature == 0
     and (.settings | has("seed") | not)
     and .settings.max_tokens == 512
@@ -124,6 +128,8 @@ jq -e \
     and .settings.min_prompt_tokens == 100000
     and .settings.max_prompt_tokens == 120000
     and .settings.trial_settle_seconds == 30
+    and .settings.maximum_within_arm_spread_percent == 5
+    and .settings.maximum_wall_timing_delta_seconds == 2
     and .trial_order == ["off","auto","auto","off"]
     and (.trials | type) == "array" and (.trials | length) == 4
     and .aggregate.minimum_improvement_percent == 15
@@ -183,6 +189,8 @@ cmp "$expected_phase" "$actual_phase"
 
 off_tps=()
 auto_tps=()
+off_wall=()
+auto_wall=()
 semantic_sha=''
 request_sha=$(jq -er .identity.request.sha256 "$summary")
 binary_file_identity=$(jq -er .identity.binary.file_identity "$summary")
@@ -227,6 +235,10 @@ for mode in off auto auto off; do
       and (.decode_seconds | type) == "number" and .decode_seconds > 0
       and (.decode_tokens_per_second | type) == "number"
       and .decode_tokens_per_second > 0
+      and (.response_total_seconds | type) == "number"
+      and .response_total_seconds > 0
+      and (.wall_total_seconds | type) == "number"
+      and .wall_total_seconds > 0
       and (.artifacts | type) == "array" and (.artifacts | length) == 9
       and ([.artifacts[].name] | unique | length) == 9
       and all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")))
@@ -280,17 +292,45 @@ for mode in off auto auto off; do
     and .x_hf2q_timing.decode_time_secs > 0
     and (.x_hf2q_timing.decode_tokens_per_sec | type) == "number"
     and .x_hf2q_timing.decode_tokens_per_sec > 0
+    and (.x_hf2q_timing.total_time_secs | type) == "number"
+    and .x_hf2q_timing.total_time_secs > 0
   ' "$response" >/dev/null
   prompt_tokens=$(jq -er .usage.prompt_tokens "$response")
   completion_tokens=$(jq -er .usage.completion_tokens "$response")
   decode_seconds=$(jq -er .x_hf2q_timing.decode_time_secs "$response")
   decode_tps=$(jq -er .x_hf2q_timing.decode_tokens_per_sec "$response")
-  awk -v total="$total_seconds" -v decode="$decode_seconds" \
-    'BEGIN { exit !(total >= decode) }'
+  response_total_seconds=$(jq -er .x_hf2q_timing.total_time_secs "$response")
+  awk -v wall="$total_seconds" -v response="$response_total_seconds" \
+    -v decode="$decode_seconds" -v tolerance="$MAX_WALL_TIMING_DELTA_SECONDS" '
+      BEGIN {
+        delta = wall - response
+        if (delta < 0) delta = -delta
+        exit !(wall >= decode && response >= decode && delta <= tolerance)
+      }
+    '
+  request_start=$(awk -F '\t' -v trial="$trial_index" -v mode="$mode" '
+    $2 == trial && $3 == mode && $4 == "request-start" { print $1 }
+  ' "$benchmark_dir/phase.log")
+  request_end=$(awk -F '\t' -v trial="$trial_index" -v mode="$mode" '
+    $2 == trial && $3 == mode && $4 == "request-end" { print $1 }
+  ' "$benchmark_dir/phase.log")
+  [[ "$request_start" =~ ^[0-9]+$ && "$request_end" =~ ^[0-9]+$ ]]
+  phase_wall_seconds=$((request_end - request_start))
+  awk -v phase="$phase_wall_seconds" -v wall="$total_seconds" \
+    -v tolerance="$MAX_WALL_TIMING_DELTA_SECONDS" '
+      BEGIN {
+        delta = phase - wall
+        if (delta < 0) delta = -delta
+        exit !(phase > 0 && delta <= tolerance)
+      }
+    '
   test "$prompt_tokens" = "$(jq -er .prompt_tokens "$trial_json")"
   test "$completion_tokens" = "$(jq -er .completion_tokens "$trial_json")"
   float_close "$decode_seconds" "$(jq -er .decode_seconds "$trial_json")" 0.000001
   float_close "$decode_tps" "$(jq -er .decode_tokens_per_second "$trial_json")" 0.000001
+  float_close "$response_total_seconds" \
+    "$(jq -er .response_total_seconds "$trial_json")" 0.000001
+  float_close "$total_seconds" "$(jq -er .wall_total_seconds "$trial_json")" 0.000001
   calculated_tps=$(awk -v tokens="$completion_tokens" -v seconds="$decode_seconds" \
     'BEGIN { printf "%.6f", tokens / seconds }')
   float_close "$decode_tps" "$calculated_tps" 0.01
@@ -323,6 +363,7 @@ for mode in off auto auto off; do
     grep -Fq 'Qwen TQ-HB decode selected GQA-cooperative Q2 attention' \
       "$server_log"
     auto_tps+=("$decode_tps")
+    auto_wall+=("$total_seconds")
   else
     grep -Fq '+ gqa_q2=false ' "$server_log"
     if grep -Fq 'Qwen TQ-HB decode selected GQA-cooperative Q2 attention' \
@@ -331,6 +372,7 @@ for mode in off auto auto off; do
       exit 1
     fi
     off_tps+=("$decode_tps")
+    off_wall+=("$total_seconds")
   fi
   if grep -Eiq 'GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|engine_unhealthy|panicked at|worker-fatal' "$server_log"; then
     echo "Qwen3.8 verifier observed a fatal runtime signature" >&2
@@ -343,16 +385,41 @@ for mode in off auto auto off; do
 done
 
 [[ ${#off_tps[@]} == 2 && ${#auto_tps[@]} == 2 ]]
-off_median=$(awk -v a="${off_tps[0]}" -v b="${off_tps[1]}" \
+[[ ${#off_wall[@]} == 2 && ${#auto_wall[@]} == 2 ]]
+off_mean=$(awk -v a="${off_tps[0]}" -v b="${off_tps[1]}" \
   'BEGIN { printf "%.6f", (a+b)/2 }')
-auto_median=$(awk -v a="${auto_tps[0]}" -v b="${auto_tps[1]}" \
+auto_mean=$(awk -v a="${auto_tps[0]}" -v b="${auto_tps[1]}" \
   'BEGIN { printf "%.6f", (a+b)/2 }')
-improvement_percent=$(awk -v baseline="$off_median" -v candidate="$auto_median" \
+off_spread_percent=$(awk -v a="${off_tps[0]}" -v b="${off_tps[1]}" \
+  -v mean="$off_mean" '
+    BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
+auto_spread_percent=$(awk -v a="${auto_tps[0]}" -v b="${auto_tps[1]}" \
+  -v mean="$auto_mean" '
+    BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
+for spread in "$off_spread_percent" "$auto_spread_percent"; do
+  awk -v observed="$spread" -v maximum="$MAX_WITHIN_ARM_SPREAD_PERCENT" \
+    'BEGIN { exit !(observed <= maximum) }'
+done
+off_wall_mean=$(awk -v a="${off_wall[0]}" -v b="${off_wall[1]}" \
+  'BEGIN { printf "%.6f", (a+b)/2 }')
+auto_wall_mean=$(awk -v a="${auto_wall[0]}" -v b="${auto_wall[1]}" \
+  'BEGIN { printf "%.6f", (a+b)/2 }')
+awk -v baseline="$off_wall_mean" -v candidate="$auto_wall_mean" \
+  'BEGIN { exit !(candidate < baseline) }'
+improvement_percent=$(awk -v baseline="$off_mean" -v candidate="$auto_mean" \
   'BEGIN { if (baseline <= 0) exit 1; printf "%.6f", ((candidate / baseline) - 1) * 100 }')
-float_close "$off_median" \
-  "$(jq -er .aggregate.off_median_decode_tokens_per_second "$summary")" 0.000001
-float_close "$auto_median" \
-  "$(jq -er .aggregate.auto_median_decode_tokens_per_second "$summary")" 0.000001
+float_close "$off_mean" \
+  "$(jq -er .aggregate.off_mean_decode_tokens_per_second "$summary")" 0.000001
+float_close "$auto_mean" \
+  "$(jq -er .aggregate.auto_mean_decode_tokens_per_second "$summary")" 0.000001
+float_close "$off_spread_percent" \
+  "$(jq -er .aggregate.off_within_arm_spread_percent "$summary")" 0.000001
+float_close "$auto_spread_percent" \
+  "$(jq -er .aggregate.auto_within_arm_spread_percent "$summary")" 0.000001
+float_close "$off_wall_mean" \
+  "$(jq -er .aggregate.off_mean_wall_seconds "$summary")" 0.000001
+float_close "$auto_wall_mean" \
+  "$(jq -er .aggregate.auto_mean_wall_seconds "$summary")" 0.000001
 float_close "$improvement_percent" \
   "$(jq -er .aggregate.improvement_percent "$summary")" 0.000001
 test "$semantic_sha" = "$(jq -er .aggregate.exact_output_sha256 "$summary")"
@@ -468,4 +535,8 @@ if [[ "$verification_scope" == release ]]; then
   awk -F '\t' '$3 != "qwen38-long-decode-settle" { exit 1 }' "$settle_log"
 fi
 
-echo "Qwen3.8 long-decode $verification_scope receipt verified" >&2
+if [[ "$verification_scope" == release ]]; then
+  echo "Qwen3.8 long-decode release receipt verified" >&2
+else
+  echo "Qwen3.8 benchmark structure verified; release authority requires thermal evidence" >&2
+fi

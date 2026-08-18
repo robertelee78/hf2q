@@ -20,10 +20,21 @@ readonly PROMPT_PADDING_TOKENS=105000
 readonly MIN_PROMPT_TOKENS=100000
 readonly MAX_PROMPT_TOKENS=120000
 readonly MIN_IMPROVEMENT_PERCENT=15
+readonly MAX_WITHIN_ARM_SPREAD_PERCENT=5
+readonly MAX_WALL_TIMING_DELTA_SECONDS=2
 readonly TRIAL_SETTLE_SECONDS=30
 readonly TRIAL_ORDER='off auto auto off'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [[ ${HF2Q_THERMAL_SWIFT_BIN+x} ]]; then
+  echo "HF2Q_THERMAL_SWIFT_BIN is reserved for isolated contract tests" >&2
+  exit 2
+fi
+readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
+[[ -x "$HF2Q_THERMAL_SWIFT_BIN" ]] || {
+  echo "required system Swift probe is unavailable: $HF2Q_THERMAL_SWIFT_BIN" >&2
+  exit 2
+}
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
 
@@ -83,6 +94,7 @@ hardware_chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || printf unknown
 hardware_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null || printf 0)
 hardware_arch=$(uname -m)
 hardware_os=$(sw_vers -productVersion 2>/dev/null || uname -r)
+thermal_probe_sha=$(sha256_file "$HF2Q_THERMAL_SWIFT_BIN")
 [[ "$hardware_arch" == arm64 ]] || {
   echo "Qwen3.8 calibrated long-decode gate requires Apple Silicon arm64" >&2
   exit 2
@@ -201,6 +213,7 @@ run_trial() {
   local server_log="$trial_dir/server.log"
   local decode_line log_generated log_elapsed_ms log_tps
   local prompt_tokens completion_tokens decode_seconds decode_tps finish_reason
+  local response_total_seconds wall_total_seconds
   local semantic_sha ready_code
   local artifacts_json
 
@@ -252,6 +265,8 @@ run_trial() {
   request_pid=''
   record_phase "$trial_index" "$mode" request-end
   grep -qx 'http_code=200' "$trial_dir/curl.metrics"
+  wall_total_seconds=$(sed -n 's/^total_seconds=//p' "$trial_dir/curl.metrics")
+  [[ "$wall_total_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]
   ready_code=$(curl --silent --show-error --max-time 3 \
     -o "$trial_dir/readyz.json" -w '%{http_code}' \
     "http://127.0.0.1:$PORT/readyz")
@@ -276,6 +291,8 @@ run_trial() {
       and .x_hf2q_timing.decode_time_secs > 0
       and (.x_hf2q_timing.decode_tokens_per_sec | type) == "number"
       and .x_hf2q_timing.decode_tokens_per_sec > 0
+      and (.x_hf2q_timing.total_time_secs | type) == "number"
+      and .x_hf2q_timing.total_time_secs > 0
     ' "$response" >/dev/null
   jq -S '{model,choices,usage}' "$response" >"$trial_dir/semantic.json"
 
@@ -283,8 +300,17 @@ run_trial() {
   completion_tokens=$(jq -er '.usage.completion_tokens' "$response")
   decode_seconds=$(jq -er '.x_hf2q_timing.decode_time_secs' "$response")
   decode_tps=$(jq -er '.x_hf2q_timing.decode_tokens_per_sec' "$response")
+  response_total_seconds=$(jq -er '.x_hf2q_timing.total_time_secs' "$response")
   finish_reason=$(jq -er '.choices[0].finish_reason' "$response")
   semantic_sha=$(sha256_file "$trial_dir/semantic.json")
+  awk -v wall="$wall_total_seconds" -v response="$response_total_seconds" \
+    -v tolerance="$MAX_WALL_TIMING_DELTA_SECONDS" '
+      BEGIN {
+        delta = wall - response
+        if (delta < 0) delta = -delta
+        exit !(wall > 0 && response > 0 && delta <= tolerance)
+      }
+    '
 
   [[ "$(rg -c 'Qwen35 decode complete' "$server_log")" == 1 ]]
   decode_line=$(rg 'Qwen35 decode complete' "$server_log")
@@ -327,6 +353,8 @@ run_trial() {
     --arg finish_reason "$finish_reason" --argjson prompt_tokens "$prompt_tokens" \
     --argjson completion_tokens "$completion_tokens" \
     --argjson decode_seconds "$decode_seconds" --argjson decode_tps "$decode_tps" \
+    --argjson response_total_seconds "$response_total_seconds" \
+    --argjson wall_total_seconds "$wall_total_seconds" \
     --argjson artifacts "$artifacts_json" \
     '{index:$index,mode:$mode,status:$status,binary_sha256:$binary_sha256,
       binary_file_identity:$binary_file_identity,model_sha256:$model_sha256,
@@ -334,6 +362,8 @@ run_trial() {
       semantic_sha256:$semantic_sha256,prompt_tokens:$prompt_tokens,
       completion_tokens:$completion_tokens,finish_reason:$finish_reason,
       decode_seconds:$decode_seconds,decode_tokens_per_second:$decode_tps,
+      response_total_seconds:$response_total_seconds,
+      wall_total_seconds:$wall_total_seconds,
       artifacts:$artifacts}' >"$trial_dir/trial.json.tmp"
   mv "$trial_dir/trial.json.tmp" "$trial_dir/trial.json"
 }
@@ -352,15 +382,40 @@ off_a=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-1-off/trial.json")
 off_b=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-4-off/trial.json")
 auto_a=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-2-auto/trial.json")
 auto_b=$(jq -er .decode_tokens_per_second "$OUT_DIR/trial-3-auto/trial.json")
-off_median=$(awk -v a="$off_a" -v b="$off_b" \
+off_mean=$(awk -v a="$off_a" -v b="$off_b" \
   'BEGIN { printf "%.6f", (a+b)/2 }')
-auto_median=$(awk -v a="$auto_a" -v b="$auto_b" \
+auto_mean=$(awk -v a="$auto_a" -v b="$auto_b" \
   'BEGIN { printf "%.6f", (a+b)/2 }')
-improvement_percent=$(awk -v baseline="$off_median" -v candidate="$auto_median" \
+off_spread_percent=$(awk -v a="$off_a" -v b="$off_b" -v mean="$off_mean" '
+  BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
+auto_spread_percent=$(awk -v a="$auto_a" -v b="$auto_b" -v mean="$auto_mean" '
+  BEGIN { delta=a-b; if (delta<0) delta=-delta; printf "%.6f", delta/mean*100 }')
+for spread in "$off_spread_percent" "$auto_spread_percent"; do
+  awk -v observed="$spread" -v maximum="$MAX_WITHIN_ARM_SPREAD_PERCENT" \
+    'BEGIN { exit !(observed <= maximum) }' || {
+      echo "Qwen3.8 within-arm decode spread ${spread}% exceeds ${MAX_WITHIN_ARM_SPREAD_PERCENT}%" >&2
+      exit 1
+    }
+done
+improvement_percent=$(awk -v baseline="$off_mean" -v candidate="$auto_mean" \
   'BEGIN { if (baseline <= 0) exit 1; printf "%.6f", ((candidate / baseline) - 1) * 100 }')
 awk -v observed="$improvement_percent" -v required="$MIN_IMPROVEMENT_PERCENT" \
   'BEGIN { exit !(observed >= required) }' || {
     echo "Qwen3.8 GQA Q2 improvement ${improvement_percent}% is below ${MIN_IMPROVEMENT_PERCENT}%" >&2
+    exit 1
+  }
+
+off_wall_mean=$(awk \
+  -v a="$(jq -er .wall_total_seconds "$OUT_DIR/trial-1-off/trial.json")" \
+  -v b="$(jq -er .wall_total_seconds "$OUT_DIR/trial-4-off/trial.json")" \
+  'BEGIN { printf "%.6f", (a+b)/2 }')
+auto_wall_mean=$(awk \
+  -v a="$(jq -er .wall_total_seconds "$OUT_DIR/trial-2-auto/trial.json")" \
+  -v b="$(jq -er .wall_total_seconds "$OUT_DIR/trial-3-auto/trial.json")" \
+  'BEGIN { printf "%.6f", (a+b)/2 }')
+awk -v baseline="$off_wall_mean" -v candidate="$auto_wall_mean" \
+  'BEGIN { exit !(candidate < baseline) }' || {
+    echo "Qwen3.8 candidate did not reduce independently measured request wall time" >&2
     exit 1
   }
 
@@ -391,13 +446,21 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --arg request_sha256 "$request_sha" --arg hardware_model "$hardware_model" \
   --arg hardware_chip "$hardware_chip" --arg hardware_arch "$hardware_arch" \
   --arg hardware_os "$hardware_os" --argjson hardware_memory_bytes "$hardware_memory_bytes" \
+  --arg thermal_probe_path "$HF2Q_THERMAL_SWIFT_BIN" \
+  --arg thermal_probe_sha256 "$thermal_probe_sha" \
   --argjson max_tokens "$MAX_TOKENS" \
   --argjson prompt_padding_tokens "$PROMPT_PADDING_TOKENS" \
   --argjson min_prompt_tokens "$MIN_PROMPT_TOKENS" \
   --argjson max_prompt_tokens "$MAX_PROMPT_TOKENS" \
   --argjson trial_settle_seconds "$TRIAL_SETTLE_SECONDS" \
   --argjson minimum_improvement_percent "$MIN_IMPROVEMENT_PERCENT" \
-  --argjson off_median "$off_median" --argjson auto_median "$auto_median" \
+  --argjson maximum_within_arm_spread_percent "$MAX_WITHIN_ARM_SPREAD_PERCENT" \
+  --argjson maximum_wall_timing_delta_seconds "$MAX_WALL_TIMING_DELTA_SECONDS" \
+  --argjson off_mean "$off_mean" --argjson auto_mean "$auto_mean" \
+  --argjson off_spread_percent "$off_spread_percent" \
+  --argjson auto_spread_percent "$auto_spread_percent" \
+  --argjson off_wall_mean "$off_wall_mean" \
+  --argjson auto_wall_mean "$auto_wall_mean" \
   --argjson improvement_percent "$improvement_percent" \
   --arg semantic_sha256 "$semantic_sha" \
   --slurpfile trial1 "$OUT_DIR/trial-1-off/trial.json" \
@@ -414,14 +477,21 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
       phase_log:{path:"phase.log",sha256:$phase_sha256,bytes:$phase_bytes},
       request:{path:"request.json",sha256:$request_sha256},
       hardware:{model:$hardware_model,chip:$hardware_chip,arch:$hardware_arch,
-        memory_bytes:$hardware_memory_bytes,os_version:$hardware_os}},
+        memory_bytes:$hardware_memory_bytes,os_version:$hardware_os,
+        thermal_probe:{path:$thermal_probe_path,sha256:$thermal_probe_sha256}}},
     settings:{temperature:0,max_tokens:$max_tokens,stream:false,
       thinking:false,repetition_penalty:1.0,min_prompt_tokens:$min_prompt_tokens,
-      max_prompt_tokens:$max_prompt_tokens,trial_settle_seconds:$trial_settle_seconds},
+      max_prompt_tokens:$max_prompt_tokens,trial_settle_seconds:$trial_settle_seconds,
+      maximum_within_arm_spread_percent:$maximum_within_arm_spread_percent,
+      maximum_wall_timing_delta_seconds:$maximum_wall_timing_delta_seconds},
     trial_order:["off","auto","auto","off"],
     trials:[$trial1[0],$trial2[0],$trial3[0],$trial4[0]],
-    aggregate:{off_median_decode_tokens_per_second:$off_median,
-      auto_median_decode_tokens_per_second:$auto_median,
+    aggregate:{off_mean_decode_tokens_per_second:$off_mean,
+      auto_mean_decode_tokens_per_second:$auto_mean,
+      off_within_arm_spread_percent:$off_spread_percent,
+      auto_within_arm_spread_percent:$auto_spread_percent,
+      off_mean_wall_seconds:$off_wall_mean,
+      auto_mean_wall_seconds:$auto_wall_mean,
       improvement_percent:$improvement_percent,
       minimum_improvement_percent:$minimum_improvement_percent,
       exact_output_sha256:$semantic_sha256}}' >"$OUT_DIR/summary.json.tmp"
@@ -432,4 +502,5 @@ printf '%s  summary.json\n' "$(sha256_file "$OUT_DIR/summary.json")" \
 bash "$script_dir/verify_qwen38_long_decode_receipt.sh" benchmark "$OUT_DIR" \
   "$SOURCE_SHA" "$CRATE_SHA256" "$BINARY_SHA256" "$MODEL_SHA256"
 
-echo "Qwen3.8 long-decode ABBA receipt: $OUT_DIR/summary.json" >&2
+echo "Qwen3.8 long-decode ABBA benchmark evidence: $OUT_DIR/summary.json" >&2
+echo "Release authority additionally requires the thermally supervised release envelope" >&2

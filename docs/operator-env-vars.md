@@ -63,6 +63,10 @@ use a ring buffer capped at `sliding_window` (1024 on Gemma-4); global
 layers use a linear buffer of `seq_len + max_decode_tokens`. No env var
 controls this — it's a correctness property, not a tunable.
 
+| Var | Default | Values | Effect |
+|---|---|---|---|
+| `HF2Q_QWEN_GQA_Q2` | `auto` | `auto`, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 TQ-HB decode shares each KV-head load/dequantization across two query heads when the exact D=256/GQA/no-mask geometry is supported. `auto` selects it at KV length ≥8,192; `off` is the production escape hatch; `on` forces the candidate only where its hard geometry checks pass. Invalid values fail safe to `off`. Release requires the exact-output, thermally supervised long-context receipt in the shipping contract. |
+
 ## Diagnostic dumps
 
 These are for investigation work only. Output goes to `HF2Q_DUMP_DIR`

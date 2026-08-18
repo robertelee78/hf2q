@@ -17679,6 +17679,34 @@ fn advance_qwen35_prefill(
     None
 }
 
+fn log_qwen35_slot_decode_complete(
+    result: &GenerationResult,
+    reply: &SlotReply,
+    client_dropped: bool,
+) {
+    if client_dropped {
+        return;
+    }
+    let elapsed = result.decode_duration.as_secs_f64();
+    let tokens_per_second = if result.decode_duration.is_zero() {
+        0.0
+    } else {
+        result.completion_tokens as f64 / elapsed
+    };
+    let mode = match reply {
+        SlotReply::Unary(_) => "unary",
+        SlotReply::Stream { .. } => "stream",
+    };
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        mode,
+        generated_tokens = result.completion_tokens,
+        elapsed_ms = elapsed * 1000.0,
+        tokens_per_second,
+        "Qwen35 decode complete"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_qwen35_prefill(
     guard: &mut Qwen35KvGuard<'_>,
@@ -17851,6 +17879,7 @@ fn finish_qwen35_prefill(
         finish_qwen35_operator_request(handle, "complete");
         let result = Ok(state.finish(guard.model, registration));
         if let Ok(generation) = result.as_ref() {
+            log_qwen35_slot_decode_complete(generation, &reply, false);
             prompt_caches[slot_idx].store(&prompt_tokens, &params, generation);
         }
         slot_fire_done(reply, result, false);
@@ -18157,8 +18186,9 @@ fn decode_batch_qwen35(
                 (prompt.to_vec(), params.clone())
             };
             let gr = Ok(state.finish(guard.model, registration));
-            if !client_dropped {
-                if let Ok(result) = gr.as_ref() {
+            if let Ok(result) = gr.as_ref() {
+                log_qwen35_slot_decode_complete(result, &reply, client_dropped);
+                if !client_dropped {
                     prompt_caches[slot_idx].store(&cache_prompt, &cache_params, result);
                 }
             }
@@ -54858,5 +54888,178 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             })
             .collect();
         assert_eq!(content, "OK");
+    }
+}
+
+#[cfg(test)]
+mod qwen38_slot_decode_telemetry_tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tracing_subscriber::prelude::*;
+
+    use super::{log_qwen35_slot_decode_complete, GenerationResult, SlotReply};
+
+    #[derive(Clone, Default)]
+    struct RecordingLayer {
+        events: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    struct FieldVisitor<'a> {
+        fields: &'a mut BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for RecordingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldVisitor {
+                fields: &mut fields,
+            });
+            self.events.lock().expect("events lock").push(fields);
+        }
+    }
+
+    fn result() -> GenerationResult {
+        GenerationResult {
+            text: "done".to_string(),
+            reasoning_text: None,
+            prompt_tokens: 105_100,
+            completion_tokens: 512,
+            reasoning_tokens: None,
+            finish_reason: "length",
+            prefill_duration: Duration::from_secs(1),
+            decode_duration: Duration::from_secs(32),
+            cached_tokens: 0,
+            logprobs: None,
+        }
+    }
+
+    fn capture(reply: &SlotReply, client_dropped: bool) -> Vec<BTreeMap<String, String>> {
+        let layer = RecordingLayer::default();
+        let events = layer.events.clone();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            log_qwen35_slot_decode_complete(&result(), reply, client_dropped);
+        });
+        let captured = events.lock().expect("events lock").clone();
+        captured
+    }
+
+    #[test]
+    fn qwen38_decode_complete_uses_final_result_metrics_and_suppresses_drops() {
+        let (unary_tx, _unary_rx) = tokio::sync::oneshot::channel();
+        let unary = SlotReply::Unary(unary_tx);
+        let unary_events = capture(&unary, false);
+        assert_eq!(unary_events.len(), 1);
+        let event = &unary_events[0];
+        assert_eq!(event.get("mode").map(String::as_str), Some("unary"));
+        assert_eq!(
+            event.get("generated_tokens").map(String::as_str),
+            Some("512")
+        );
+        assert_eq!(event.get("elapsed_ms").map(String::as_str), Some("32000"));
+        assert_eq!(
+            event.get("tokens_per_second").map(String::as_str),
+            Some("16")
+        );
+
+        let (stream_tx, _stream_rx) = tokio::sync::mpsc::channel(1);
+        let stream = SlotReply::Stream {
+            events: stream_tx,
+            cancel: None,
+            admission: None,
+            router: None,
+        };
+        let stream_events = capture(&stream, false);
+        assert_eq!(stream_events.len(), 1);
+        assert_eq!(
+            stream_events[0].get("mode").map(String::as_str),
+            Some("stream")
+        );
+        assert!(capture(&unary, true).is_empty());
+    }
+
+    #[test]
+    fn qwen38_slotaware_completion_has_exactly_two_terminal_callsites() {
+        let src = include_str!("engine.rs");
+        let seed_call = concat!(
+            "log_qwen35_slot_",
+            "decode_complete(generation, &reply, false);"
+        );
+        let decode_call = concat!(
+            "log_qwen35_slot_",
+            "decode_complete(result, &reply, client_dropped);"
+        );
+        assert_eq!(src.matches(seed_call).count(), 1);
+        assert_eq!(src.matches(decode_call).count(), 1);
+
+        let helper_start = src
+            .find(concat!("fn log_qwen35_slot_", "decode_complete("))
+            .expect("Qwen SlotAware decode-complete helper");
+        let helper_end = helper_start
+            + src[helper_start..]
+                .find("\n#[allow(clippy::too_many_arguments)]\nfn finish_qwen35_prefill(")
+                .expect("finish_qwen35_prefill follows telemetry helper");
+        let helper = &src[helper_start..helper_end];
+        for required in [
+            "result.decode_duration",
+            "result.completion_tokens",
+            "tokens_per_second",
+            "if client_dropped",
+        ] {
+            assert!(
+                helper.contains(required),
+                "Qwen SlotAware decode-complete telemetry lost {required}"
+            );
+        }
+
+        let seed_start = src
+            .find("fn finish_qwen35_prefill(")
+            .expect("finish_qwen35_prefill");
+        let seed_end = seed_start
+            + src[seed_start..]
+                .find("\nfn embed_qwen35_inline(")
+                .expect("embed_qwen35_inline follows finish_qwen35_prefill");
+        assert!(src[seed_start..seed_end].contains(seed_call));
+
+        let decode_start = src
+            .find("fn decode_batch_qwen35(")
+            .expect("decode_batch_qwen35");
+        let decode_end = decode_start
+            + src[decode_start..]
+                .find("\nfn worker_run(")
+                .expect("worker_run follows decode_batch_qwen35");
+        let decode = &src[decode_start..decode_end];
+        assert!(decode.contains(decode_call));
     }
 }
