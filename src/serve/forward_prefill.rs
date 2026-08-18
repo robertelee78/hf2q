@@ -6559,6 +6559,25 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
+    fn build_qwen3vl_positions_tail_image_preserves_text_prefix_on_every_axis() {
+        let prompt_len = 12;
+        let image_start = 8;
+        let grid = Qwen3VlImageGrid { n_x: 2, n_y: 2 };
+        let multimodal = build_qwen3vl_positions(prompt_len, &[(grid, image_start)]).unwrap();
+        let text_only = build_qwen3vl_positions(image_start as usize, &[]).unwrap();
+
+        for axis_index in 0..4 {
+            assert_eq!(
+                &multimodal
+                    [axis_index * prompt_len..axis_index * prompt_len + image_start as usize],
+                &text_only
+                    [axis_index * image_start as usize..(axis_index + 1) * image_start as usize],
+                "an appended image must not rewrite the preceding text mRoPE axis {axis_index}"
+            );
+        }
+    }
+
+    #[test]
     fn build_qwen3vl_positions_multiple_images_global_counter_advances() {
         // [text_0, IMG1(2x2=4), text_5, IMG2(3x3=9), text_15]
         // IMG1 at seq 1, advance by max(2,2)=2 → t after IMG1 = 0+1+2 = 3

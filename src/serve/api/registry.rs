@@ -462,6 +462,10 @@ pub fn register(entry: ModelRegistration) {
 pub struct ReasoningSplitter {
     open_marker: &'static str,
     close_marker: &'static str,
+    /// Qwen may transition directly from thinking into a native tool call
+    /// without first emitting `</think>`. Treat the tool opener as an
+    /// implicit reasoning boundary, but preserve it for ToolCallSplitter.
+    implicit_reasoning_close_marker: Option<&'static str>,
     /// Some native templates place a structural separator immediately after
     /// the reasoning close marker. That separator belongs to the wire
     /// protocol, not to OpenAI `content`.
@@ -501,10 +505,17 @@ impl ReasoningSplitter {
             (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => (o, c),
             _ => return None,
         };
-        let cap = open.len().max(close.len()).max(1);
+        let implicit_reasoning_close_marker =
+            (reg.family == "qwen35").then_some(reg.tool_open).flatten();
+        let cap = open
+            .len()
+            .max(close.len())
+            .max(implicit_reasoning_close_marker.map_or(0, str::len))
+            .max(1);
         Some(Self {
             open_marker: open,
             close_marker: close,
+            implicit_reasoning_close_marker,
             post_close_separator: if close == "</think>" { "\n\n" } else { "" },
             awaiting_post_close_separator: false,
             in_reasoning: forced_open,
@@ -547,10 +558,25 @@ impl ReasoningSplitter {
                 }
                 self.awaiting_post_close_separator = false;
             }
-            let active_marker = if self.in_reasoning {
-                self.close_marker
+            let (active_marker, implicit_close) = if self.in_reasoning {
+                let close = scan[scan_cursor..]
+                    .find(self.close_marker)
+                    .map(|offset| (offset, self.close_marker, false));
+                let implicit = self.implicit_reasoning_close_marker.and_then(|marker| {
+                    scan[scan_cursor..]
+                        .find(marker)
+                        .map(|offset| (offset, marker, true))
+                });
+                match (close, implicit) {
+                    (Some(close), Some(implicit)) if implicit.0 < close.0 => {
+                        (implicit.1, implicit.2)
+                    }
+                    (Some(close), _) => (close.1, close.2),
+                    (None, Some(implicit)) => (implicit.1, implicit.2),
+                    (None, None) => (self.close_marker, false),
+                }
             } else {
-                self.open_marker
+                (self.open_marker, false)
             };
             match scan[scan_cursor..].find(active_marker) {
                 Some(rel) => {
@@ -563,6 +589,15 @@ impl ReasoningSplitter {
                     };
                     if marker_start > out_cursor {
                         out.push((slot, scan[out_cursor..marker_start].to_string()));
+                    }
+                    // A Qwen tool opener closes the reasoning channel
+                    // implicitly, but it is input to the downstream tool
+                    // splitter and therefore must not be swallowed here.
+                    if implicit_close {
+                        self.in_reasoning = false;
+                        scan_cursor = marker_start;
+                        out_cursor = marker_start;
+                        continue;
                     }
                     // Flip state + skip past marker.
                     let closed_reasoning = self.in_reasoning;
@@ -3831,6 +3866,38 @@ mod tests {
         }
         assert_eq!(reasoning, "I think therefore");
         assert_eq!(content, "I am");
+    }
+
+    #[test]
+    fn qwen_tool_open_implicitly_closes_reasoning_without_consuming_marker() {
+        let mut splitter = make_reasoning_splitter(&QWEN35, true).unwrap();
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for fragment in [
+            "I should inspect it<tool_",
+            "call><function=read_file>",
+            "</function></tool_call>",
+        ] {
+            for (slot, text) in splitter.feed(fragment) {
+                match slot {
+                    SplitSlot::Reasoning => reasoning.push_str(&text),
+                    SplitSlot::Content => content.push_str(&text),
+                }
+            }
+        }
+        if let Some((slot, text)) = splitter.finish() {
+            match slot {
+                SplitSlot::Reasoning => reasoning.push_str(&text),
+                SplitSlot::Content => content.push_str(&text),
+            }
+        }
+
+        assert_eq!(reasoning, "I should inspect it");
+        assert_eq!(
+            content, "<tool_call><function=read_file></function></tool_call>",
+            "the implicit boundary must preserve native tool syntax for ToolCallSplitter"
+        );
+        assert!(!splitter.in_reasoning());
     }
 
     /// A Qwen reasoning close is followed by two protocol newlines before

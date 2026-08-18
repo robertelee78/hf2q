@@ -208,3 +208,88 @@ tokens, then returned the correct two-panel answer in 20 seconds. This closes
 the former out-of-memory correctness boundary. It does not yet establish the
 desired comparative latency, so vision performance remains an optimization
 gate rather than an inflated release claim.
+
+### Multimodal continuation and answer-progress correction (2026-08-17)
+
+A real 90,044-token OpenCode image turn exposed two independent serving
+defects. The preceding 88,559-token text continuation had reused 84,522 tokens,
+but adding the conversation's first image selected a cold slot and performed a
+full prefill. Source tracing showed that the request-global vision fingerprint
+added on 2026-08-16 excluded the text-only anchor before token-prefix affinity
+could consider it. The same request then produced 1,889 reasoning tokens over
+6 minutes 56 seconds and could legally continue to the 8,192-token completion
+limit without emitting content or a tool call. The existing "semantic fragment
+ready" log fired on raw decoded text before reasoning/tool routing and was
+therefore not evidence of answer progress.
+
+The accepted correction is:
+
+1. Restore an idle text-only anchor into a first-image request only when its
+   exact tokens precede the first soft span and the request proves ordinary
+   text coordinates on all four mRoPE axes over the complete anchor. Reuse is
+   limited to the snapshot. Active affinity, live retained state, and every
+   image-bearing anchor remain exact-vision-fingerprint-only.
+2. Expose the vLLM-compatible `thinking_token_budget` request field. The Qwen
+   SlotAware decoder counts generated reasoning tokens in transport-neutral
+   state; at the boundary it emits a tokenizer-derived transition and
+   `</think>`, then continues decoding the answer. Natural `</think>` or
+   `<tool_call>` ends budget enforcement. Required or named tool grammars and
+   SerialFifo reject the option rather than accepting unsupported semantics.
+3. The canonical Qwen launcher sets a 2,048-token default ceiling. Shorter
+   completion windows adapt the ceiling to preserve roughly one quarter for
+   the answer; `THINKING_TOKEN_BUDGET=0` disables it. Explicit per-request
+   budgets are exact and fail when they leave no answer capacity.
+4. Qwen `<tool_call>` implicitly closes a still-open reasoning channel, as in
+   current Qwen-aware serving parsers, while preserving the native marker for
+   structured tool routing. "First answer event" now means a successfully
+   delivered non-empty content or structured tool-call delta after routing.
+   Reasoning-only completion is logged explicitly and never reported as answer
+   readiness.
+
+The cache design comparator is vLLM's parent-hash block chain with typed extra
+hashes: multimodal identity affects blocks containing the multimedia input,
+not causally earlier text blocks. The longer-term Qwen cache layout should
+encode an ordered text/media event chain, including model/template/position
+namespace, media content hash, ordinal, token span, grid, and DeepStack shape.
+That redesign is not required to repair the proven first-image suffix case and
+must not weaken exact image identity.
+
+Primary comparators:
+
+- vLLM automatic prefix caching design:
+  <https://docs.vllm.ai/en/latest/design/prefix_caching/>
+- vLLM multimodal cache identity:
+  <https://docs.vllm.ai/en/latest/features/multimodal_inputs/>
+- vLLM thinking-budget control:
+  <https://docs.vllm.ai/en/v0.20.1/features/reasoning_outputs/#thinking-budget-control>
+- Qwen thinking-mode and budget guidance:
+  <https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md>
+
+Acceptance requires model-free rejection/acceptance matrices for mRoPE and
+image identity, exact budget-boundary state tests, implicit tool-boundary and
+post-router progress tests, then a real Qwen3.8 text-turn -> first-image-turn
+SSE gate. The real gate must report nonzero cached prompt tokens on the image
+turn, a delivered answer event before the completion limit, valid terminal
+usage, coherent grounded output, and healthy `/readyz` after completion.
+
+The exact-artifact gate passed on 2026-08-17 on an Apple M5 Max. The release
+binary SHA-256 was
+`24f47b0394b231ce58d00213e118d190f5c3efa1ad270846283626d61e5f4e90`;
+the text and projector hashes remained the bound candidates above. A cold text
+turn established an 86,072-token idle snapshot inside an 86,077-token prompt.
+The first-image continuation then reported 86,072 cached of 86,172 prompt
+tokens and prefilled only the 100-token suffix. Its real GPU vision forward
+completed, the 64-token reasoning budget forced the tokenizer-derived close,
+and the SSE stream delivered `The dominant color in this image is red.` with
+82 completion tokens, `finish_reason=stop`, one terminal `[DONE]`, 9-second
+wall time, and HTTP 200 readiness afterward. Server telemetry independently
+recorded the 86,072-token prompt-boundary hit, the budget transition, and the
+first delivered answer event.
+
+The matched agentic gate also passed exact cached replay, automatic and
+required tools, SSE reconstruction, tool-result continuation, and byte-exact
+source arguments. The tool-result turn measured 14.303 seconds; the gate's
+historical 10-second wall-clock bound missed by 732 ms on the first run, then
+passed under an explicit 15-second bound without relaxing any semantic or
+cache assertion. This residual latency is recorded rather than conflated with
+the corrected first-image cache and reasoning failures.

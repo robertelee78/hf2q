@@ -400,6 +400,17 @@ pub struct SamplingParams {
     /// `false` (the default) = pre-iter-230 behavior.
     pub reasoning_forced_open: bool,
 
+    /// Optional generated-token budget for an open reasoning span. The Qwen
+    /// worker forces `reasoning_end_tokens` at the boundary, then continues
+    /// decoding the answer within `max_tokens`.
+    pub thinking_token_budget: Option<usize>,
+    /// Tokenizer-derived transition + reasoning-close sequence. Internal
+    /// layout metadata populated by the HTTP handler when a budget is active.
+    pub reasoning_end_tokens: Option<Arc<Vec<u32>>>,
+    /// Tokenizer-derived bare reasoning-close marker used to detect a natural
+    /// close before the budget is exhausted.
+    pub reasoning_close_tokens: Option<Arc<Vec<u32>>>,
+
     // --- Internal prompt-layout metadata (not a sampling parameter) ---
     /// Exact token length of the family-rendered conversation before the
     /// template appends its generation cue. The HTTP handler accepts this
@@ -444,6 +455,9 @@ impl Default for SamplingParams {
             tool_call_policy: ToolCallPolicy::Auto,
             tool_argument_wire_kinds: None,
             reasoning_forced_open: false,
+            thinking_token_budget: None,
+            reasoning_end_tokens: None,
+            reasoning_close_tokens: None,
             stable_prompt_prefix_tokens: None,
             vision_fingerprint: None,
         }
@@ -2659,6 +2673,9 @@ pub struct PromptCacheKey {
     /// Whether the reasoning splitter begins inside a reasoning span. This
     /// changes the public `text` / `reasoning_text` response shape.
     pub reasoning_forced_open: bool,
+    pub thinking_token_budget: Option<usize>,
+    pub reasoning_end_tokens: Option<Arc<Vec<u32>>>,
+    pub reasoning_close_tokens: Option<Arc<Vec<u32>>>,
     /// See [`SamplingParams::vision_fingerprint`]. This participates in
     /// terminal-response replay keys for the same collision-safety reason.
     pub vision_fingerprint: Option<[u8; 32]>,
@@ -2688,6 +2705,9 @@ impl PromptCacheKey {
             top_logprobs: params.top_logprobs,
             parallel_tool_calls: params.parallel_tool_calls,
             reasoning_forced_open: params.reasoning_forced_open,
+            thinking_token_budget: params.thinking_token_budget,
+            reasoning_end_tokens: params.reasoning_end_tokens.clone(),
+            reasoning_close_tokens: params.reasoning_close_tokens.clone(),
             vision_fingerprint: params.vision_fingerprint,
         }
     }
@@ -2965,6 +2985,9 @@ impl PromptCache {
                 top_logprobs: 0,
                 parallel_tool_calls: true,
                 reasoning_forced_open: false,
+                thinking_token_budget: None,
+                reasoning_end_tokens: None,
+                reasoning_close_tokens: None,
                 vision_fingerprint: None,
             },
             text: String::new(),
@@ -5838,6 +5861,16 @@ impl SlotReply {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    fn stream_saw_answer_event(&self) -> bool {
+        matches!(
+            self,
+            Self::Stream {
+                router: Some(router),
+                ..
+            } if router.saw_answer_event()
+        )
+    }
 }
 
 /// Per-request family-aware streaming state for the generic Gemma/Qwen slot
@@ -5854,6 +5887,8 @@ struct SlotStreamRouter {
     policy: ToolCallPolicy,
     tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
     accumulated_text_len: usize,
+    saw_reasoning_event: bool,
+    saw_answer_event: bool,
 }
 
 impl SlotStreamRouter {
@@ -5874,6 +5909,8 @@ impl SlotStreamRouter {
             policy: params.tool_call_policy,
             tool_argument_wire_kinds: params.tool_argument_wire_kinds.clone(),
             accumulated_text_len: 0,
+            saw_reasoning_event: false,
+            saw_answer_event: false,
         }
     }
 
@@ -5895,15 +5932,17 @@ impl SlotStreamRouter {
         for (slot, text) in classified {
             match slot {
                 super::registry::SplitSlot::Reasoning => {
-                    if !text.is_empty()
-                        && sink
+                    if !text.is_empty() {
+                        if sink
                             .blocking_send(super::sse::GenerationEvent::Delta {
                                 kind: super::sse::DeltaKind::Reasoning,
                                 text,
                             })
                             .is_err()
-                    {
-                        return Err(());
+                        {
+                            return Err(());
+                        }
+                        self.saw_reasoning_event = true;
                     }
                 }
                 super::registry::SplitSlot::Content => self.emit_content(&sink, &text)?,
@@ -5917,26 +5956,30 @@ impl SlotStreamRouter {
             return Ok(());
         }
         let Some(splitter) = self.tools.as_mut() else {
-            return events
+            events
                 .blocking_send(super::sse::GenerationEvent::Delta {
                     kind: super::sse::DeltaKind::Content,
                     text: text.to_string(),
                 })
-                .map_err(|_| ());
+                .map_err(|_| ())?;
+            self.saw_answer_event = true;
+            return Ok(());
         };
         let registration = self.registration.as_ref();
         for event in splitter.feed(text) {
             match event {
                 super::registry::ToolCallEvent::Content(text) => {
-                    if !text.is_empty()
-                        && events
+                    if !text.is_empty() {
+                        if events
                             .blocking_send(super::sse::GenerationEvent::Delta {
                                 kind: super::sse::DeltaKind::Content,
                                 text,
                             })
                             .is_err()
-                    {
-                        return Err(());
+                        {
+                            return Err(());
+                        }
+                        self.saw_answer_event = true;
                     }
                 }
                 super::registry::ToolCallEvent::ToolCallOpen => {
@@ -5951,6 +5994,7 @@ impl SlotStreamRouter {
                     self.tool_body.push_str(&text);
                     if let Some(emitter) = self.tool_emitter.as_mut() {
                         emitter.advance(&self.tool_body, events)?;
+                        self.saw_answer_event |= emitter.emitted_any_delta();
                     }
                 }
                 super::registry::ToolCallEvent::ToolCallClose => {
@@ -5970,6 +6014,7 @@ impl SlotStreamRouter {
                         &mut self.saw_tool_call,
                         events,
                     )?;
+                    self.saw_answer_event |= self.saw_tool_call;
                 }
             }
         }
@@ -5989,15 +6034,17 @@ impl SlotStreamRouter {
             if let Some((slot, tail)) = splitter.finish() {
                 match slot {
                     super::registry::SplitSlot::Reasoning => {
-                        if !tail.is_empty()
-                            && sink
+                        if !tail.is_empty() {
+                            if sink
                                 .blocking_send(super::sse::GenerationEvent::Delta {
                                     kind: super::sse::DeltaKind::Reasoning,
                                     text: tail,
                                 })
                                 .is_err()
-                        {
-                            return Err(());
+                            {
+                                return Err(());
+                            }
+                            self.saw_reasoning_event = true;
                         }
                     }
                     super::registry::SplitSlot::Content => self.emit_content(&sink, &tail)?,
@@ -6012,12 +6059,21 @@ impl SlotStreamRouter {
             completion_tokens,
             self.accumulated_text_len,
             &sink,
+            Some(&mut self.saw_answer_event),
         ) {
             FinalizeStreamingAction::Continue => Ok(self.saw_tool_call.then_some("tool_calls")),
             FinalizeStreamingAction::ClientDropped | FinalizeStreamingAction::ErrorEmitted => {
                 Err(())
             }
         }
+    }
+
+    fn saw_answer_event(&self) -> bool {
+        self.saw_answer_event
+    }
+
+    fn saw_reasoning_event(&self) -> bool {
+        self.saw_reasoning_event
     }
 }
 
@@ -9654,10 +9710,31 @@ fn slot_fire_done(reply: SlotReply, gr: Result<GenerationResult>, client_dropped
                         let _ = tx.send(Ok(()));
                     }
                     if let Some(router) = router.as_mut() {
+                        let had_answer_event = router.saw_answer_event();
                         match router.finish(&events, r.completion_tokens) {
                             Ok(Some(finish_reason)) => r.finish_reason = finish_reason,
                             Ok(None) => {}
                             Err(()) => return,
+                        }
+                        let is_qwen = router
+                            .registration
+                            .as_ref()
+                            .is_some_and(|registration| registration.family == "qwen35");
+                        if is_qwen && !had_answer_event && router.saw_answer_event() {
+                            tracing::info!(
+                                prompt_tokens = r.prompt_tokens,
+                                "Qwen35 first answer event delivered"
+                            );
+                        }
+                        if is_qwen && !router.saw_answer_event() {
+                            tracing::warn!(
+                                prompt_tokens = r.prompt_tokens,
+                                completion_tokens = r.completion_tokens,
+                                reasoning_tokens = r.reasoning_tokens,
+                                finish_reason = r.finish_reason,
+                                reasoning_delivered = router.saw_reasoning_event(),
+                                "Qwen35 stream completed without an answer event"
+                            );
                         }
                     }
                     let _ = events.blocking_send(super::sse::GenerationEvent::Done {
@@ -15816,6 +15893,77 @@ fn qwen35_request_vision_fingerprint(request: &Request) -> Option<[u8; 32]> {
     }
 }
 
+/// Return the longest pure-text prefix that may be restored from a text-only
+/// Qwen anchor before this request's first vision span.
+///
+/// A request-global vision fingerprint deliberately prevents image-backed KV
+/// from colliding with different pixels behind identical placeholder tokens.
+/// It is too coarse for the text prefix *before* the first image, however:
+/// causal attention and Qwen's left-to-right mRoPE construction make that
+/// prefix independent of a later image. This helper proves that narrow case
+/// from the actual expanded prompt layout. Any malformed or non-text mRoPE
+/// coordinate fails closed.
+pub(crate) fn qwen35_text_anchor_reuse_limit(
+    prompt_len: usize,
+    soft_ranges: &[std::ops::Range<usize>],
+    deepstack_positions: Option<&[u32]>,
+    positions_flat: Option<&[i32]>,
+) -> Option<usize> {
+    let first = soft_ranges.first()?;
+    let positions = positions_flat?;
+    if prompt_len == 0
+        || positions.len() != 4usize.checked_mul(prompt_len)?
+        || first.is_empty()
+        || first.end > prompt_len
+    {
+        return None;
+    }
+
+    let mut prior_end = 0usize;
+    for range in soft_ranges {
+        if range.is_empty()
+            || range.end > prompt_len
+            || range.start < prior_end
+            || range.start < first.start
+        {
+            return None;
+        }
+        prior_end = range.end;
+    }
+    if let Some(deepstack_positions) = deepstack_positions {
+        if !deepstack_positions.windows(2).all(|pair| pair[0] < pair[1])
+            || deepstack_positions.iter().any(|&position| {
+                let position = position as usize;
+                position < first.start || position >= prompt_len
+            })
+        {
+            return None;
+        }
+    }
+
+    for axis in 0..4 {
+        let channel = &positions[axis * prompt_len..(axis + 1) * prompt_len];
+        for (index, &position) in channel[..first.start].iter().enumerate() {
+            if position != i32::try_from(index).ok()? {
+                return None;
+            }
+        }
+    }
+    Some(first.start)
+}
+
+fn qwen35_anchor_vision_compatible(
+    anchor_fingerprint: Option<[u8; 32]>,
+    anchor_tokens: usize,
+    request_fingerprint: Option<[u8; 32]>,
+    text_anchor_reuse_limit: Option<usize>,
+) -> bool {
+    anchor_fingerprint == request_fingerprint
+        || (anchor_fingerprint.is_none()
+            && request_fingerprint.is_some()
+            && text_anchor_reuse_limit.is_some_and(|limit| anchor_tokens <= limit))
+}
+
 fn qwen35_request_has_response_cache_hit(request: &Request, prompt_caches: &[PromptCache]) -> bool {
     let (prompt_tokens, params) = match request {
         Request::Generate {
@@ -17030,6 +17178,16 @@ fn admit_qwen35_slot(
             return None;
         }
     };
+    if let Some(vision) = vision.as_ref() {
+        if let Err(error) = vision.validate(prompt_tokens.len(), guard.model.hidden_size) {
+            slot_fire_done(
+                reply,
+                Err(error.context("Qwen35 multimodal validation before slot admission")),
+                false,
+            );
+            return None;
+        }
+    }
     if let Some(result) = prompt_caches
         .iter()
         .find_map(|cache| cache.lookup(&prompt_tokens, &params))
@@ -17039,6 +17197,9 @@ fn admit_qwen35_slot(
         return None;
     }
     let request_vision_fingerprint = params.vision_fingerprint;
+    let text_anchor_reuse_limit = vision
+        .as_ref()
+        .and_then(|vision| vision.text_anchor_reuse_limit(prompt_tokens.len()));
     let preferred = preferred_qwen35_slot(
         retained_tokens
             .iter()
@@ -17046,15 +17207,23 @@ fn admit_qwen35_slot(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let anchor_matches = anchor
+                let exact_anchor_matches = anchor
                     .as_ref()
                     .is_some_and(|anchor| anchor.vision_fingerprint == request_vision_fingerprint);
+                let anchor_matches = anchor.as_ref().is_some_and(|anchor| {
+                    qwen35_anchor_vision_compatible(
+                        anchor.vision_fingerprint,
+                        anchor.prompt_tokens.len(),
+                        request_vision_fingerprint,
+                        text_anchor_reuse_limit,
+                    )
+                });
                 let active_matches = active.as_ref().is_some_and(|(work, _, _)| {
                     work.vision_fingerprint() == request_vision_fingerprint
                 });
                 (
                     index,
-                    if anchor_matches {
+                    if exact_anchor_matches {
                         retained.as_slice()
                     } else {
                         &[]
@@ -17609,13 +17778,6 @@ fn finish_qwen35_prefill(
         }
     }
 
-    if !state.seed_fragment().is_empty() && state.mark_first_semantic_fragment() {
-        tracing::info!(
-            slot = handle.slot_id.0,
-            prompt_tokens = prompt_tokens.len(),
-            "Qwen35 semantic fragment ready"
-        );
-    }
     let seed_dropped = slot_emit_token(
         &mut reply,
         &TickOutcome {
@@ -17624,6 +17786,13 @@ fn finish_qwen35_prefill(
             finished: state.finished_at_seed(),
         },
     );
+    if !seed_dropped && reply.stream_saw_answer_event() && state.mark_first_answer_event() {
+        tracing::info!(
+            slot = handle.slot_id.0,
+            prompt_tokens = prompt_tokens.len(),
+            "Qwen35 first answer event delivered"
+        );
+    }
     if seed_dropped {
         reply = match recover_qwen35_slot_after_cancellation_for_reply(
             guard,
@@ -17905,15 +18074,14 @@ fn decode_batch_qwen35(
             decode_rate,
         );
 
-        if !tick.fragment.is_empty() && !tick.is_reasoning && state.mark_first_semantic_fragment() {
+        let client_dropped = slot_emit_token(&mut reply, &tick);
+        if !client_dropped && reply.stream_saw_answer_event() && state.mark_first_answer_event() {
             tracing::info!(
                 slot = handle.slot_id.0,
                 prompt_tokens = state.prompt_cache_identity().0.len(),
-                "Qwen35 semantic fragment ready"
+                "Qwen35 first answer event delivered"
             );
         }
-
-        let client_dropped = slot_emit_token(&mut reply, &tick);
         if tick.finished && !client_dropped {
             let valid_tokens = guard
                 .kv
@@ -24806,6 +24974,7 @@ fn finalize_streaming_tool_state(
     completion_tokens: usize,
     accumulated_text_len: usize,
     events: &EventSink<'_>,
+    mut answer_emitted: Option<&mut bool>,
 ) -> FinalizeStreamingAction {
     use super::sse::{DeltaKind, GenerationEvent};
 
@@ -24822,7 +24991,8 @@ fn finalize_streaming_tool_state(
         if let Some(ev) = tcs.finish() {
             match ev {
                 super::registry::ToolCallEvent::Content(t) => {
-                    if !t.is_empty()
+                    let emitted_content = !t.is_empty();
+                    if emitted_content
                         && events
                             .blocking_send(GenerationEvent::Delta {
                                 kind: DeltaKind::Content,
@@ -24831,6 +25001,11 @@ fn finalize_streaming_tool_state(
                             .is_err()
                     {
                         return FinalizeStreamingAction::ClientDropped;
+                    }
+                    if emitted_content {
+                        if let Some(answer_emitted) = answer_emitted.as_deref_mut() {
+                            *answer_emitted = true;
+                        }
                     }
                 }
                 super::registry::ToolCallEvent::ToolCallText(t) => {
@@ -24872,7 +25047,8 @@ fn finalize_streaming_tool_state(
                     // swallowed the open marker when it flipped state).
                     let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
                     let fallback = format!("{prefix}{t}");
-                    if !fallback.is_empty()
+                    let emitted_fallback = !fallback.is_empty();
+                    if emitted_fallback
                         && events
                             .blocking_send(GenerationEvent::Delta {
                                 kind: DeltaKind::Content,
@@ -24881,6 +25057,11 @@ fn finalize_streaming_tool_state(
                             .is_err()
                     {
                         return FinalizeStreamingAction::ClientDropped;
+                    }
+                    if emitted_fallback {
+                        if let Some(answer_emitted) = answer_emitted.as_deref_mut() {
+                            *answer_emitted = true;
+                        }
                     }
                 }
                 super::registry::ToolCallEvent::ToolCallOpen
@@ -25055,6 +25236,10 @@ impl ToolCallStreamEmitter {
             kvs_emitted: 0,
             scan_cursor: 0,
         }
+    }
+
+    fn emitted_any_delta(&self) -> bool {
+        self.name_emitted || self.args_open_emitted || self.kvs_emitted > 0
     }
 
     /// Advance the emitter against the current `body` after a `ToolCallText`
@@ -27280,6 +27465,7 @@ fn generate_stream_once(
         completion_tokens,
         accumulated_text.len(),
         events,
+        None,
     ) {
         FinalizeStreamingAction::Continue => {}
         FinalizeStreamingAction::ClientDropped => {
@@ -37914,6 +38100,7 @@ mod finalize_streaming_tool_state_tests {
             64,
             0,
             &EventSink::new(&tx),
+            None,
         );
 
         assert_eq!(action, FinalizeStreamingAction::ClientDropped);
@@ -37953,6 +38140,7 @@ mod finalize_streaming_tool_state_tests {
             /* completion_tokens */ 7,
             /* accumulated_text_len */ 18,
             &EventSink::new(&tx),
+            None,
         );
 
         assert_eq!(
@@ -38013,6 +38201,7 @@ mod finalize_streaming_tool_state_tests {
             /* completion_tokens */ 64,
             /* accumulated_text_len */ 0,
             &EventSink::new(&tx),
+            None,
         );
 
         assert_eq!(
@@ -38059,6 +38248,7 @@ mod finalize_streaming_tool_state_tests {
             /* completion_tokens */ 7,
             /* accumulated_text_len */ 18,
             &EventSink::new(&tx),
+            None,
         );
         assert_eq!(
             action,
@@ -38101,6 +38291,7 @@ mod finalize_streaming_tool_state_tests {
             64,
             0,
             &EventSink::new(&tx),
+            None,
         );
         assert_eq!(action, FinalizeStreamingAction::Continue);
         drop(tx);
@@ -38146,6 +38337,7 @@ mod finalize_streaming_tool_state_tests {
             /* completion_tokens */ 7,
             /* accumulated_text_len */ 18,
             &EventSink::new(&tx),
+            None,
         );
 
         assert_eq!(
@@ -38219,6 +38411,7 @@ mod finalize_streaming_tool_state_tests {
             64,
             0,
             &EventSink::new(&tx),
+            None,
         );
         assert_eq!(
             action,
@@ -38264,6 +38457,7 @@ mod finalize_streaming_tool_state_tests {
             12,
             18,
             &EventSink::new(&tx),
+            None,
         );
         assert_eq!(action, FinalizeStreamingAction::Continue);
         drop(tx);
@@ -41575,6 +41769,74 @@ mod qwen35_bounded_prefill_watchdog_tests {
     }
 
     #[test]
+    fn qwen_text_anchor_vision_reuse_requires_suffix_only_mrope_proof() {
+        use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
+
+        let prompt_len = 12;
+        let image_start = 8usize;
+        let positions = build_qwen3vl_positions(
+            prompt_len,
+            &[(Qwen3VlImageGrid { n_x: 2, n_y: 2 }, image_start as u32)],
+        )
+        .unwrap();
+        let ranges = [image_start..prompt_len];
+        let deepstack: Vec<u32> = (image_start as u32..prompt_len as u32).collect();
+        let limit =
+            qwen35_text_anchor_reuse_limit(prompt_len, &ranges, Some(&deepstack), Some(&positions));
+        assert_eq!(limit, Some(image_start));
+        assert!(qwen35_anchor_vision_compatible(
+            None,
+            image_start,
+            Some([0x11; 32]),
+            limit,
+        ));
+        assert!(!qwen35_anchor_vision_compatible(
+            None,
+            image_start + 1,
+            Some([0x11; 32]),
+            limit,
+        ));
+
+        let mut corrupt_positions = positions.clone();
+        corrupt_positions[prompt_len + 3] += 1;
+        assert_eq!(
+            qwen35_text_anchor_reuse_limit(
+                prompt_len,
+                &ranges,
+                Some(&deepstack),
+                Some(&corrupt_positions),
+            ),
+            None,
+            "every mRoPE axis before the image must be ordinary text positions"
+        );
+        assert_eq!(
+            qwen35_text_anchor_reuse_limit(prompt_len, &ranges, Some(&deepstack), None),
+            None,
+            "missing mRoPE evidence must fail closed"
+        );
+    }
+
+    #[test]
+    fn qwen_vision_anchor_compatibility_keeps_image_identity_fail_closed() {
+        let image_a = Some([0x11; 32]);
+        let image_b = Some([0x22; 32]);
+        assert!(qwen35_anchor_vision_compatible(image_a, 32, image_a, None));
+        assert!(!qwen35_anchor_vision_compatible(
+            image_a,
+            32,
+            image_b,
+            Some(64),
+        ));
+        assert!(!qwen35_anchor_vision_compatible(
+            image_a,
+            32,
+            None,
+            Some(64),
+        ));
+        assert!(!qwen35_anchor_vision_compatible(None, 32, image_b, None,));
+    }
+
+    #[test]
     fn qwen_continuation_waits_for_the_strongest_active_anchor() {
         let prompt = vec![21_u32; 64];
         assert_eq!(
@@ -44869,10 +45131,14 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
                 .unwrap_or_else(|| panic!("H73: {fn_marker} not defined"));
             // Locate the fn body — bound by next `pub fn` or end-of-file.
             let body_after = &engine_q[fn_start..];
+            let fallback_end = (0..=body_after.len().min(60_000))
+                .rev()
+                .find(|&offset| body_after.is_char_boundary(offset))
+                .unwrap_or(0);
             let body_end_off = body_after[fn_marker.len()..]
                 .find("\npub fn ")
                 .map(|off| off + fn_marker.len())
-                .unwrap_or(body_after.len().min(60_000));
+                .unwrap_or(fallback_end);
             let fn_body = &body_after[..body_end_off];
 
             let reset_calls = fn_body.matches("reset_for_slot(slot_id)").count();
@@ -54450,6 +54716,10 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .finish(&events, 8)
                 .expect("slot stream finalize");
             assert_eq!(finish_override, Some("tool_calls"));
+            assert!(
+                router.saw_answer_event(),
+                "{model} tool delta is answer progress"
+            );
             drop(events);
 
             let mut saw_name = false;
@@ -54480,5 +54750,77 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 serde_json::from_str(&arguments).expect("arguments must concatenate to JSON");
             assert_eq!(parsed["path"], "/tmp/a.rs");
         }
+    }
+
+    #[test]
+    fn qwen_slot_stream_tool_call_implicitly_ends_forced_open_reasoning() {
+        let registration = super::super::registry::find_for("Qwen3.8").unwrap();
+        let params = SamplingParams {
+            reasoning_forced_open: true,
+            ..SamplingParams::default()
+        };
+        let mut router = SlotStreamRouter::new(Some(&registration), &params);
+        let (events, mut receiver) = tokio::sync::mpsc::channel(32);
+
+        router
+            .emit(
+                &events,
+                "I need the file<tool_call><function=read_file><parameter=path>\"/tmp/a.rs\"</parameter></function></tool_call>",
+            )
+            .expect("route forced-open Qwen tool call");
+        assert_eq!(
+            router.finish(&events, 16).expect("finalize stream"),
+            Some("tool_calls")
+        );
+        assert!(router.saw_reasoning_event());
+        assert!(router.saw_answer_event());
+        drop(events);
+
+        let mut reasoning = String::new();
+        let mut saw_tool = false;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                super::super::sse::GenerationEvent::Delta {
+                    kind: super::super::sse::DeltaKind::Reasoning,
+                    text,
+                } => reasoning.push_str(&text),
+                super::super::sse::GenerationEvent::ToolCallDelta { .. } => saw_tool = true,
+                super::super::sse::GenerationEvent::Delta { text, .. } => assert!(
+                    !text.contains("tool_call") && !text.contains("function="),
+                    "native tool syntax leaked into content: {text:?}"
+                ),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "I need the file");
+        assert!(saw_tool);
+    }
+
+    #[test]
+    fn qwen_slot_stream_tail_flush_counts_as_answer_progress() {
+        let registration = super::super::registry::find_for("Qwen3.8").unwrap();
+        let params = SamplingParams::default();
+        let mut router = SlotStreamRouter::new(Some(&registration), &params);
+        let (events, mut receiver) = tokio::sync::mpsc::channel(8);
+
+        router.emit(&events, "OK").expect("buffer short answer");
+        assert!(
+            !router.saw_answer_event(),
+            "marker splitters should still be holding the short tail"
+        );
+        assert_eq!(router.finish(&events, 1).unwrap(), None);
+        assert!(router.saw_answer_event());
+        drop(events);
+
+        let content: String = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                super::super::sse::GenerationEvent::Delta {
+                    kind: super::super::sse::DeltaKind::Content,
+                    text,
+                } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "OK");
     }
 }

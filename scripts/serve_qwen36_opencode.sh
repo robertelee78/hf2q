@@ -23,6 +23,13 @@
 #                           never to the T=0 greedy argmax path. 1.05 is
 #                           the gentle coding-safe setting; raise toward
 #                           1.1 if loops persist on creative workloads.
+#   HF2Q_DEFAULT_THINKING_TOKEN_BUDGET=2048
+#                           Caps a Qwen thinking span, forces the native
+#                           reasoning close sequence at the boundary, and
+#                           continues decoding the answer. For shorter client
+#                           limits this is an adaptive ceiling that reserves
+#                           roughly one quarter of max_tokens for the answer.
+#                           Set THINKING_TOKEN_BUDGET=0 to disable.
 #   HF2Q_ENCODER_SESSION=1
 #                           Reuses ordered Metal command-buffer sessions
 #                           across Qwen prefill stages. Recovery-state capture
@@ -73,6 +80,7 @@ PORT="${PORT:-8081}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
+THINKING_TOKEN_BUDGET="${THINKING_TOKEN_BUDGET:-2048}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
@@ -86,6 +94,10 @@ if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); the
 fi
 if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 )); then
     echo "KV_CACHE_BUDGET_BYTES must be a positive integer (got: $KV_CACHE_BUDGET_BYTES)" >&2
+    exit 3
+fi
+if ! [[ "$THINKING_TOKEN_BUDGET" =~ ^[0-9]+$ ]]; then
+    echo "THINKING_TOKEN_BUDGET must be a non-negative integer (got: $THINKING_TOKEN_BUDGET)" >&2
     exit 3
 fi
 case "$VISION_MODE" in
@@ -159,6 +171,7 @@ HF2Q_SERVE_ARGS+=(
 
 exec env \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
+    HF2Q_DEFAULT_THINKING_TOKEN_BUDGET="$THINKING_TOKEN_BUDGET" \
     HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \

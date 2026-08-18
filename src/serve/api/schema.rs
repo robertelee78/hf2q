@@ -816,6 +816,13 @@ pub struct ChatCompletionRequest {
     /// extension. Valid values are `low`, `high`, and `max`.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional per-request cap on tokens emitted while the model remains in
+    /// its reasoning span. When reached, reasoning-capable families force
+    /// their tokenizer-derived close sequence and continue with the remaining
+    /// completion budget so callers receive an answer rather than a truncated
+    /// reasoning-only response. Compatible with vLLM's extension name.
+    #[serde(default)]
+    pub thinking_token_budget: Option<usize>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]

@@ -1029,6 +1029,69 @@ struct PreparedChatContext {
     positions_flat: Option<Vec<i32>>,
 }
 
+fn effective_qwen_thinking_budget(
+    configured: Option<usize>,
+    explicit: bool,
+    max_tokens: usize,
+    transition_tokens: usize,
+) -> Result<Option<usize>, String> {
+    let Some(budget) = configured else {
+        return Ok(None);
+    };
+    let maximum_safe_budget = max_tokens.saturating_sub(transition_tokens.saturating_add(1));
+    if explicit && budget > maximum_safe_budget {
+        return Err(format!(
+            "thinking_token_budget ({budget}) plus its {transition_tokens}-token forced transition must be less than max_tokens ({max_tokens}) so answer capacity remains"
+        ));
+    }
+    let effective = if explicit {
+        budget
+    } else {
+        budget
+            .min(max_tokens.saturating_mul(3) / 4)
+            .min(maximum_safe_budget)
+    };
+    Ok((effective > 0).then_some(effective))
+}
+
+#[cfg(test)]
+mod qwen_thinking_budget_tests {
+    use super::*;
+
+    #[test]
+    fn launcher_budget_is_an_adaptive_ceiling_with_answer_reserve() {
+        assert_eq!(
+            effective_qwen_thinking_budget(Some(2_048), false, 8_192, 8).unwrap(),
+            Some(2_048)
+        );
+        assert_eq!(
+            effective_qwen_thinking_budget(Some(2_048), false, 256, 8).unwrap(),
+            Some(192)
+        );
+        assert_eq!(
+            effective_qwen_thinking_budget(Some(2_048), false, 8, 8).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_budget_fails_when_it_cannot_leave_answer_capacity() {
+        let error = effective_qwen_thinking_budget(Some(250), true, 256, 8).unwrap_err();
+        assert!(error.contains("must be less than max_tokens (256)"));
+    }
+
+    #[test]
+    fn chat_schema_accepts_vllm_thinking_budget_field() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "Qwen3.8",
+            "messages": [{"role": "user", "content": "answer briefly"}],
+            "thinking_token_budget": 1536
+        }))
+        .unwrap();
+        assert_eq!(request.thinking_token_budget, Some(1536));
+    }
+}
+
 fn resolve_api_enable_thinking(request_override: Option<bool>, template: &str) -> bool {
     request_override.unwrap_or_else(|| crate::serve::template_supports_enable_thinking(template))
 }
@@ -1377,6 +1440,116 @@ where
         .max_completion_tokens
         .or(req.max_tokens)
         .unwrap_or(SamplingParams::default().max_tokens);
+    let explicit_thinking_budget = req.thinking_token_budget;
+    let constrained_tool_choice = matches!(
+        &tool_choice,
+        super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_)
+    );
+    let qwen_thinking_mode = reasoning_forced_open
+        && engine
+            .registration()
+            .is_some_and(|registration| registration.family == "qwen35");
+    let default_thinking_budget =
+        if explicit_thinking_budget.is_none() && qwen_thinking_mode && !constrained_tool_choice {
+            match std::env::var("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET") {
+                Ok(value) => match value.parse::<usize>() {
+                    Ok(0) => None,
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        return Err(ApiError::invalid_request(
+                            "HF2Q_DEFAULT_THINKING_TOKEN_BUDGET must be a non-negative integer",
+                            Some("thinking_token_budget".into()),
+                        )
+                        .into_response());
+                    }
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+    if explicit_thinking_budget == Some(0) {
+        return Err(ApiError::invalid_request(
+            "thinking_token_budget must be greater than zero",
+            Some("thinking_token_budget".into()),
+        )
+        .into_response());
+    }
+    let configured_thinking_budget = explicit_thinking_budget.or(default_thinking_budget);
+    let (thinking_token_budget, reasoning_end_tokens, reasoning_close_tokens) =
+        if let Some(budget) = configured_thinking_budget {
+            let Some(registration) = engine.registration() else {
+                return Err(ApiError::invalid_request(
+                    "thinking_token_budget requires a registered reasoning-capable model",
+                    Some("thinking_token_budget".into()),
+                )
+                .into_response());
+            };
+            if registration.family != "qwen35" || !reasoning_forced_open {
+                return Err(ApiError::invalid_request(
+                    "thinking_token_budget currently requires Qwen thinking mode",
+                    Some("thinking_token_budget".into()),
+                )
+                .into_response());
+            }
+            if !matches!(engine.mode(), engine::EngineMode::SlotAware { .. }) {
+                return Err(ApiError::invalid_request(
+                    "thinking_token_budget requires the Qwen inflight-batched scheduler",
+                    Some("thinking_token_budget".into()),
+                )
+                .into_response());
+            }
+            let close = registration.reasoning_close.ok_or_else(|| {
+                ApiError::invalid_request(
+                    "thinking_token_budget requires a registered reasoning close marker",
+                    Some("thinking_token_budget".into()),
+                )
+                .into_response()
+            })?;
+            let transition = format!("\nI need to answer now.{close}");
+            let encode = |text: &str| {
+                engine
+                    .tokenizer()
+                    .encode(text, false)
+                    .map(|encoding| std::sync::Arc::new(encoding.get_ids().to_vec()))
+                    .map_err(|error| {
+                        ApiError::invalid_request(
+                            format!("failed to tokenize Qwen reasoning boundary: {error}"),
+                            Some("thinking_token_budget".into()),
+                        )
+                        .into_response()
+                    })
+            };
+            let end_tokens = encode(&transition)?;
+            let close_tokens = encode(close)?;
+            if end_tokens.is_empty() || close_tokens.is_empty() {
+                return Err(ApiError::invalid_request(
+                    "Qwen reasoning boundary tokenized to an empty sequence",
+                    Some("thinking_token_budget".into()),
+                )
+                .into_response());
+            }
+            // The launcher default is a ceiling, not a reason for ordinary
+            // short requests to fail. Reserve at least roughly one quarter of
+            // the caller's completion window for the answer and transition.
+            let effective_budget = effective_qwen_thinking_budget(
+                Some(budget),
+                explicit_thinking_budget.is_some(),
+                max_tokens,
+                end_tokens.len(),
+            )
+            .map_err(|message| {
+                ApiError::invalid_request(message, Some("thinking_token_budget".into()))
+                    .into_response()
+            })?;
+            if let Some(effective_budget) = effective_budget {
+                (Some(effective_budget), Some(end_tokens), Some(close_tokens))
+            } else {
+                (None, None, None)
+            }
+        } else {
+            (None, None, None)
+        };
     let stop_strings = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
     // Translate request logit_bias (HashMap<String, f32>) → HashMap<u32, f32>.
     // OpenAI keys are stringified token ids; we accept any string that parses
@@ -1443,6 +1616,13 @@ where
         }
         _ => engine::ToolCallPolicy::Auto,
     };
+    if thinking_token_budget.is_some() && tc_policy == engine::ToolCallPolicy::Constrained {
+        return Err(ApiError::invalid_request(
+            "thinking_token_budget cannot be combined with required or named tool_choice",
+            Some("thinking_token_budget".into()),
+        )
+        .into_response());
+    }
     let tool_argument_wire_kinds = match (engine.registration(), req_tools) {
         (Some(registration), Some(tools)) if registration.family == "qwen35" => {
             match registry::qwen35_tool_argument_wire_kinds(tools) {
@@ -1477,6 +1657,9 @@ where
         tool_call_policy: tc_policy,
         tool_argument_wire_kinds,
         reasoning_forced_open,
+        thinking_token_budget,
+        reasoning_end_tokens,
+        reasoning_close_tokens,
         stable_prompt_prefix_tokens,
         vision_fingerprint,
     };
@@ -4193,6 +4376,7 @@ mod compile_tool_grammar_precondition_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9438,6 +9622,7 @@ mod readiness_guard_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9550,6 +9735,7 @@ mod readiness_guard_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9793,6 +9979,7 @@ mod pool_error_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -9879,6 +10066,7 @@ mod iter215_qwen35_chat_501_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,
@@ -10814,6 +11002,7 @@ mod a5d_handler_429_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
             stream_options: None,

@@ -1292,13 +1292,29 @@ their forward graphs. Gemma's candidate 4,096-token text transaction and
 DeepSeek's native verifier transaction require separate parity and latency
 gates; neither inherits Qwen's 2,048-token constant.
 
-The production Qwen SlotAware contract here is plain-text chat. Embed work is
-limited to one <=2,048-token forward per admission quantum. Soft-token,
-deepstack, and 3D-position generation is rejected before Qwen SlotAware
-scheduler/SSE admission and before Qwen LM generation because its
-legacy implementation performs a whole-request inline decode; SerialFifo
-retains that historical multimodal path. Accepting and then dropping those
-fields is forbidden.
+The production Qwen SlotAware contract includes bounded multimodal prefill.
+Embed work is limited to one <=2,048-token forward per admission quantum.
+Soft-token, DeepStack, and 3D-position state is retained by the installed
+prefill work, validated before the first Metal transaction, and sliced by the
+same authoritative prompt offset as the language-model tokens. Accepting and
+then dropping those fields remains forbidden. SerialFifo retains its
+historical multimodal path, but the canonical Qwen3.8 launcher uses
+SlotAware/inflight-batched serving.
+
+An idle Qwen text-only prompt anchor may be restored for a later request whose
+first image begins strictly after that anchor. This is a narrow span-local
+exception to request-global vision-fingerprint equality: the incoming request
+must prove that every soft-token and DeepStack position is in the suffix and
+that all four mRoPE axes over the restored prefix are ordinary text positions.
+Only the snapshotted prompt anchor is eligible; a longer live retained cursor
+is not. Image-bearing anchors, active-owner affinity, missing position proof,
+and changed image fingerprints remain exact-match-only and fail closed.
+
+This span-local identity rule follows the block-local multimedia identity used
+by vLLM's automatic prefix cache rather than attaching a request-global media
+hash to every earlier text block. A future cache-layout revision may encode a
+chained text/media event identity directly. The present correction deliberately
+does not broaden reuse beyond the observed first-image-after-text failure.
 
 ## 7.GEMMA-PREFILL — candidate resumable text transactions (2026-08-08)
 

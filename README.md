@@ -212,7 +212,7 @@ Start the launcher for the model family you want to serve:
 # Qwen 3.6 (default port 8081)
 ./scripts/serve_qwen36_opencode.sh
 
-# Qwen 3.8-27B text (default port 8081)
+# Qwen 3.8-27B multimodal (default port 8081)
 ./scripts/serve_qwen38_opencode.sh
 
 # DeepSeek-V4 (default port 8081; run one large family at a time)
@@ -316,11 +316,17 @@ after the verifier full-attention cursors agree. The optional MTP cursor is
 tracked independently until speculative decoding runs. For a bound Qwen3.8
 projector, image requests carry soft-token embeddings, the explicit DeepStack
 layout, and 3D positions through the same scheduler-yielding prefill state;
-the payload is validated before its first GPU transaction. Image identity is
-part of slot affinity, response caching, and retained-prefix reuse, so a text
-turn or different image cannot inherit vision state. Qwen3-VL remains a
-distinct model family rather than an approximate fallback through another
-Qwen text family.
+the payload is validated before its first GPU transaction. Image-bearing KV
+remains exact-image isolated. A later first-image turn may reuse only the
+causally earlier text-only snapshot when every soft/DeepStack position is in
+the suffix and all four cached mRoPE axes are proven to be ordinary text.
+
+The canonical Qwen launcher also bounds a still-open reasoning span at 2,048
+tokens and continues decoding the answer. For smaller `max_tokens` values the
+default adapts to retain answer capacity. Set `THINKING_TOKEN_BUDGET=0` to
+disable this policy, or send the vLLM-compatible `thinking_token_budget` field
+per request. Qwen3-VL remains a distinct model family rather than an
+approximate fallback through another Qwen text family.
 
 Long Gemma 4 text prefills use 4,096-token transactions and split at
 the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and

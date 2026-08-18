@@ -1001,6 +1001,9 @@ pub struct HybridPromptCacheKey {
     pub stop_strings: Vec<String>,
     pub tool_argument_wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
     pub vision_fingerprint: Option<[u8; 32]>,
+    pub thinking_token_budget: Option<usize>,
+    pub reasoning_end_tokens: Option<Arc<Vec<u32>>>,
+    pub reasoning_close_tokens: Option<Arc<Vec<u32>>>,
 }
 
 impl HybridPromptCacheKey {
@@ -1010,6 +1013,9 @@ impl HybridPromptCacheKey {
             stop_strings: params.stop_strings.clone(),
             tool_argument_wire_kinds: params.tool_argument_wire_kinds.clone(),
             vision_fingerprint: params.vision_fingerprint,
+            thinking_token_budget: params.thinking_token_budget,
+            reasoning_end_tokens: params.reasoning_end_tokens.clone(),
+            reasoning_close_tokens: params.reasoning_close_tokens.clone(),
         }
     }
 }
@@ -3188,7 +3194,23 @@ impl Qwen35VisionPrefillData {
         }
     }
 
-    fn validate(&self, prompt_len: usize, hidden_size: usize) -> Result<()> {
+    pub(crate) fn text_anchor_reuse_limit(&self, prompt_len: usize) -> Option<usize> {
+        let soft_ranges: Vec<_> = self
+            .soft_tokens
+            .iter()
+            .map(|soft| soft.range.clone())
+            .collect();
+        super::engine::qwen35_text_anchor_reuse_limit(
+            prompt_len,
+            &soft_ranges,
+            self.deepstack
+                .as_ref()
+                .map(|data| data.image_token_positions.as_slice()),
+            self.positions_flat.as_deref(),
+        )
+    }
+
+    pub(crate) fn validate(&self, prompt_len: usize, hidden_size: usize) -> Result<()> {
         anyhow::ensure!(
             !self.soft_tokens.is_empty()
                 || self.deepstack.is_some()
@@ -3673,9 +3695,65 @@ pub(crate) struct Qwen35DecodeState {
     finish_reason: &'static str,
     /// Decode-step counter, mirrors the serial ref `step` (starts at 1).
     step: usize,
-    semantic_fragment_reported: bool,
+    answer_event_reported: bool,
+    thinking_budget: Option<Qwen35ThinkingBudgetState>,
     prefill_duration: Duration,
     decode_start: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen35ThinkingBudgetState {
+    limit: usize,
+    reasoning_tokens: usize,
+    forced_tokens: Arc<Vec<u32>>,
+    close_tokens: Arc<Vec<u32>>,
+    forced_cursor: Option<usize>,
+    closed: bool,
+}
+
+impl Qwen35ThinkingBudgetState {
+    fn from_params(params: &SamplingParams) -> Option<Self> {
+        let limit = params.thinking_token_budget?;
+        let forced_tokens = params.reasoning_end_tokens.clone()?;
+        let close_tokens = params.reasoning_close_tokens.clone()?;
+        (params.reasoning_forced_open
+            && limit > 0
+            && !forced_tokens.is_empty()
+            && !close_tokens.is_empty())
+        .then_some(Self {
+            limit,
+            reasoning_tokens: 0,
+            forced_tokens,
+            close_tokens,
+            forced_cursor: None,
+            closed: false,
+        })
+    }
+
+    fn next_forced_token(&mut self) -> Option<(u32, bool)> {
+        if self.closed {
+            return None;
+        }
+        let started = self.forced_cursor.is_none() && self.reasoning_tokens >= self.limit;
+        if started {
+            self.forced_cursor = Some(0);
+        }
+        let cursor = self.forced_cursor?;
+        let token = self.forced_tokens.get(cursor).copied()?;
+        self.forced_cursor = Some(cursor + 1);
+        Some((token, started))
+    }
+
+    fn observe_generated(&mut self, generated_tokens: &[u32], tool_opened: bool) {
+        if self.closed {
+            return;
+        }
+        if tool_opened || generated_tokens.ends_with(self.close_tokens.as_slice()) {
+            self.closed = true;
+            return;
+        }
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(1);
+    }
 }
 
 impl Qwen35DecodeState {
@@ -3857,12 +3935,13 @@ impl Qwen35DecodeState {
             .tokenizer
             .decode(&[next_token], false)
             .unwrap_or_default();
+        let mut tool_opened = false;
         if let Some(splitter) = tool_splitter.as_mut() {
             let marker_events = splitter.feed(&decoded_text);
-            if marker_events
+            tool_opened = marker_events
                 .iter()
-                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen))
-            {
+                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen));
+            if tool_opened {
                 if let Some(runtime) = grammar_runtime.as_mut() {
                     runtime.trigger();
                 }
@@ -3879,6 +3958,13 @@ impl Qwen35DecodeState {
         } else if qwen35_hit_stop_string(&decoded_text, &stop_strings) {
             qwen35_strip_trailing_stop(&mut decoded_text, &stop_strings);
             finish_reason = "stop";
+        }
+
+        let mut thinking_budget = Qwen35ThinkingBudgetState::from_params(&params);
+        if finish_reason == "length" {
+            if let Some(budget) = thinking_budget.as_mut() {
+                budget.observe_generated(&generated_tokens, tool_opened);
+            }
         }
 
         Ok(Self {
@@ -3900,7 +3986,8 @@ impl Qwen35DecodeState {
             stop_strings,
             finish_reason,
             step: 1,
-            semantic_fragment_reported: false,
+            answer_event_reported: false,
+            thinking_budget,
             prefill_duration,
             decode_start: Instant::now(),
         })
@@ -3937,14 +4024,14 @@ impl Qwen35DecodeState {
         (&self.prompt_tokens, &self.params)
     }
 
-    /// Return true exactly once for the first non-reasoning semantic fragment.
-    /// The SlotAware overlap gate uses this request-scoped marker, while later
-    /// decode tokens stay out of the INFO hot path.
-    pub(crate) fn mark_first_semantic_fragment(&mut self) -> bool {
-        if self.semantic_fragment_reported {
+    /// Return true exactly once after the stream router has delivered content
+    /// or a structured tool-call delta. Raw decoded reasoning is deliberately
+    /// not treated as answer progress.
+    pub(crate) fn mark_first_answer_event(&mut self) -> bool {
+        if self.answer_event_reported {
             false
         } else {
-            self.semantic_fragment_reported = true;
+            self.answer_event_reported = true;
             true
         }
     }
@@ -3984,6 +4071,18 @@ impl Qwen35DecodeState {
         let pos_i32 = pos as i32;
         let positions: Vec<i32> = vec![pos_i32; 4];
         let last_input = &self.generated_tokens[self.generated_tokens.len() - 1..];
+        let forced_token = self
+            .thinking_budget
+            .as_mut()
+            .and_then(Qwen35ThinkingBudgetState::next_forced_token);
+        if forced_token.is_some_and(|(_, started)| started) {
+            tracing::warn!(
+                slot = self.slot_id.0,
+                budget = self.params.thinking_token_budget,
+                generated_tokens = self.generated_tokens.len(),
+                "Qwen35 thinking token budget reached; forcing reasoning close and continuing answer"
+            );
+        }
         let tok = if self.is_greedy && !self.want_logprobs {
             let lease =
                 supervisor.arm("Qwen35 decode greedy", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
@@ -3991,13 +4090,14 @@ impl Qwen35DecodeState {
                 qwen.model
                     .forward_gpu_greedy(last_input, &positions, kv_cache, self.slot_id);
             lease.finish()?;
-            forward.with_context(|| {
+            let predicted = forward.with_context(|| {
                 format!(
                     "Qwen35Model::forward_gpu_greedy (slot-aware decode step {}; \
                          ADR-040 Phase F M1)",
                     self.step
                 )
-            })?
+            })?;
+            forced_token.map_or(predicted, |(token, _)| token)
         } else {
             let lease =
                 supervisor.arm("Qwen35 decode logits", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
@@ -4017,14 +4117,18 @@ impl Qwen35DecodeState {
                 logits.len(),
                 qwen.vocab_size
             );
-            let mut logits = logits;
-            let (token, logprob) = sample_logits_qwen35_constrained(
-                &mut logits,
-                &self.params,
-                &self.generated_tokens,
-                self.grammar_runtime.as_ref(),
-                self.want_logprobs,
-            )?;
+            let (token, logprob) = if let Some((token, _)) = forced_token {
+                (token, self.want_logprobs.then_some(0.0))
+            } else {
+                let mut logits = logits;
+                sample_logits_qwen35_constrained(
+                    &mut logits,
+                    &self.params,
+                    &self.generated_tokens,
+                    self.grammar_runtime.as_ref(),
+                    self.want_logprobs,
+                )?
+            };
             if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
                 values.push(logprob);
             }
@@ -4050,16 +4154,20 @@ impl Qwen35DecodeState {
         self.generated_tokens.push(tok);
         let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
         self.decoded_text.push_str(&frag);
+        let mut tool_opened = false;
         if let Some(splitter) = self.tool_splitter.as_mut() {
             let marker_events = splitter.feed(&frag);
-            if marker_events
+            tool_opened = marker_events
                 .iter()
-                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen))
-            {
+                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen));
+            if tool_opened {
                 if let Some(runtime) = self.grammar_runtime.as_mut() {
                     runtime.trigger();
                 }
             }
+        }
+        if let Some(budget) = self.thinking_budget.as_mut() {
+            budget.observe_generated(&self.generated_tokens, tool_opened);
         }
         if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
             qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
@@ -7654,6 +7762,50 @@ mod tests {
     };
     use mlx_native::{MlxBuffer, MlxDevice};
     use std::cell::Cell;
+
+    fn thinking_budget_params(limit: usize) -> SamplingParams {
+        SamplingParams {
+            reasoning_forced_open: true,
+            thinking_token_budget: Some(limit),
+            reasoning_end_tokens: Some(Arc::new(vec![90, 91])),
+            reasoning_close_tokens: Some(Arc::new(vec![91])),
+            ..SamplingParams::default()
+        }
+    }
+
+    #[test]
+    fn thinking_budget_forces_close_then_stops_overriding_answer_tokens() {
+        let mut budget =
+            Qwen35ThinkingBudgetState::from_params(&thinking_budget_params(2)).unwrap();
+        let mut generated = Vec::new();
+
+        for token in [11, 12] {
+            generated.push(token);
+            budget.observe_generated(&generated, false);
+        }
+        assert_eq!(budget.next_forced_token(), Some((90, true)));
+        generated.push(90);
+        budget.observe_generated(&generated, false);
+        assert_eq!(budget.next_forced_token(), Some((91, false)));
+        generated.push(91);
+        budget.observe_generated(&generated, false);
+        assert_eq!(budget.next_forced_token(), None);
+        assert!(budget.closed);
+    }
+
+    #[test]
+    fn thinking_budget_honors_natural_reasoning_and_tool_boundaries() {
+        let mut natural =
+            Qwen35ThinkingBudgetState::from_params(&thinking_budget_params(4)).unwrap();
+        natural.observe_generated(&[11, 91], false);
+        assert!(natural.closed);
+        assert_eq!(natural.next_forced_token(), None);
+
+        let mut tool = Qwen35ThinkingBudgetState::from_params(&thinking_budget_params(4)).unwrap();
+        tool.observe_generated(&[11], true);
+        assert!(tool.closed);
+        assert_eq!(tool.next_forced_token(), None);
+    }
 
     #[test]
     fn bounded_prefill_splits_exactly_at_the_rewriteable_prompt_boundary() {

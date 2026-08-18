@@ -141,6 +141,15 @@ pub fn try_serialize(cache: &PromptCache) -> Option<Vec<u8>> {
         // Never restore an image-conditioned answer under a text-only key.
         return None;
     }
+    if cache.key.thinking_token_budget.is_some()
+        || cache.key.reasoning_end_tokens.is_some()
+        || cache.key.reasoning_close_tokens.is_some()
+    {
+        // The legacy disk response-cache subset does not persist the forced
+        // reasoning-transition contract. Skip rather than restore an
+        // unlimited-response key for a budgeted generation.
+        return None;
+    }
     let snap = PromptCacheSnapshot {
         format_version: PROMPT_CACHE_FORMAT_VERSION,
         tokens: cache.tokens.clone(),
@@ -211,6 +220,9 @@ pub fn try_deserialize(bytes: &[u8]) -> Option<PromptCache> {
             top_logprobs: snap.key.top_logprobs,
             parallel_tool_calls: snap.key.parallel_tool_calls,
             reasoning_forced_open: snap.key.reasoning_forced_open,
+            thinking_token_budget: None,
+            reasoning_end_tokens: None,
+            reasoning_close_tokens: None,
             vision_fingerprint: None,
         },
         text: snap.text,

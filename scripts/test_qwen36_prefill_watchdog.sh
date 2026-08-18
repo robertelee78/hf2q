@@ -32,7 +32,7 @@ LONG_RECEIVED_PATTERN='chat completion request received.*messages=2 tools=347'
 CONTINUATION_RECEIVED_PATTERN='chat completion request received.*messages=4 tools=347'
 SHORT_SUBMIT_PATTERN='streaming request submitted to inference channel.*prompt_tokens=552'
 LONG_SUBMIT_PATTERN='streaming request submitted to inference channel.*prompt_tokens=87972'
-SHORT_SEMANTIC_PATTERN='Qwen35 semantic fragment ready.*prompt_tokens=552'
+SHORT_SEMANTIC_PATTERN='Qwen35 first answer event delivered.*prompt_tokens=552'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
