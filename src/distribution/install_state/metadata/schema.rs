@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{MetadataJournalError, VerifiedMetadataCandidate};
+use floor_reset::MetadataFloorResetV1;
+
+mod floor_reset;
 
 pub(super) const GENERATION_KIND: &str = "hf2q.update-metadata-generation";
 pub(super) const SELECTOR_KIND: &str = "hf2q.update-metadata-selector";
@@ -28,6 +31,7 @@ pub(in crate::distribution) struct MetadataGenerationReceiptV1 {
     anchor_root: MetadataRoleDescriptorV1,
     root_chain: Vec<MetadataRoleDescriptorV1>,
     trusted_root: MetadataRoleDescriptorV1,
+    timestamp_snapshot_floor_reset: Option<MetadataFloorResetV1>,
     timestamp: MetadataRoleDescriptorV1,
     snapshot: MetadataRoleDescriptorV1,
     targets: MetadataRoleDescriptorV1,
@@ -73,6 +77,7 @@ impl MetadataGenerationReceiptV1 {
             anchor_root: descriptor(candidate.anchor_root()),
             root_chain: candidate.root_chain().iter().map(descriptor).collect(),
             trusted_root: descriptor(candidate.trusted_root()),
+            timestamp_snapshot_floor_reset: floor_reset::candidate(candidate),
             timestamp: descriptor(candidate.timestamp()),
             snapshot: descriptor(candidate.snapshot()),
             targets: descriptor(candidate.targets()),
@@ -214,6 +219,7 @@ impl MetadataGenerationReceiptV1 {
                 .zip(candidate.root_chain())
                 .all(|(stored, actual)| descriptor_matches(stored, actual))
             && descriptor_matches(&self.trusted_root, candidate.trusted_root())
+            && self.timestamp_snapshot_floor_reset == floor_reset::candidate(candidate)
             && descriptor_matches(&self.timestamp, candidate.timestamp())
             && descriptor_matches(&self.snapshot, candidate.snapshot())
             && descriptor_matches(&self.targets, candidate.targets())
@@ -249,6 +255,7 @@ impl MetadataGenerationReceiptV1 {
                 "metadata root history changed below its trusted floor",
             ));
         }
+        floor_reset::validate_successor(self, prior)?;
 
         let prior_time = parse_canonical_time(&prior.verification_completed_at)?;
         let started = parse_canonical_time(&self.verification_started_at)?;
@@ -260,8 +267,6 @@ impl MetadataGenerationReceiptV1 {
         }
         for (old, new) in [
             (&prior.trusted_root, &self.trusted_root),
-            (&prior.timestamp, &self.timestamp),
-            (&prior.snapshot, &self.snapshot),
             (&prior.targets, &self.targets),
         ] {
             if new.version < old.version || (new.version == old.version && new.sha256 != old.sha256)
@@ -269,6 +274,20 @@ impl MetadataGenerationReceiptV1 {
                 return Err(MetadataJournalError::Invalid(
                     "metadata role floor moved backward or equivocated",
                 ));
+            }
+        }
+        if self.timestamp_snapshot_floor_reset.is_none() {
+            for (old, new) in [
+                (&prior.timestamp, &self.timestamp),
+                (&prior.snapshot, &self.snapshot),
+            ] {
+                if new.version < old.version
+                    || (new.version == old.version && new.sha256 != old.sha256)
+                {
+                    return Err(MetadataJournalError::Invalid(
+                        "metadata role floor moved backward or equivocated",
+                    ));
+                }
             }
         }
         Ok(())
@@ -381,6 +400,7 @@ impl MetadataGenerationReceiptV1 {
         validate_descriptor(&self.timestamp, RoleKind::Timestamp)?;
         validate_descriptor(&self.snapshot, RoleKind::Snapshot)?;
         validate_descriptor(&self.targets, RoleKind::Targets)?;
+        floor_reset::validate_receipt(self)?;
 
         let expected_chain_len = self
             .trusted_root

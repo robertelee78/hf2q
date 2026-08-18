@@ -45,6 +45,40 @@ fn generation_and_selector_have_exact_canonical_v1_bytes() {
 }
 
 #[test]
+fn populated_floor_reset_has_exact_canonical_v1_bytes() {
+    let prior_candidate = candidate(
+        "2026-08-17T20:00:00.123456789Z",
+        "2026-08-17T20:00:01.123456789Z",
+        2,
+        100,
+    );
+    let prior = MetadataGenerationReceiptV1::new(1, None, &prior_candidate).expect("prior");
+    let predecessor = prior.digest().expect("predecessor digest");
+    let mut recovered = candidate(
+        "2026-08-17T20:00:01.123456789Z",
+        "2026-08-17T20:00:02.123456789Z",
+        3,
+        2,
+    );
+    recovered.set_timestamp_snapshot_floor_reset_for_test(Some(2));
+    let receipt = MetadataGenerationReceiptV1::new(2, Some(predecessor), &recovered)
+        .expect("populated reset receipt");
+    let receipt_bytes = receipt.to_bytes().expect("receipt bytes");
+    assert_eq!(
+        receipt_bytes,
+        include_bytes!("../testdata/generation-v1-floor-reset.json"),
+        "populated reset schema drift requires an explicit v2 wire contract"
+    );
+    let selector = MetadataSelectorV1::new(2, receipt.digest().expect("receipt digest"))
+        .expect("reset selector");
+    assert_eq!(
+        selector.to_bytes().expect("selector bytes"),
+        include_bytes!("../testdata/selector-v1-floor-reset.json"),
+        "populated reset selector drift requires an explicit v2 wire contract"
+    );
+}
+
+#[test]
 fn successor_enforces_clock_and_role_floors() {
     let prior_candidate = candidate("2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 2, 3);
     let prior = MetadataGenerationReceiptV1::new(1, None, &prior_candidate).expect("prior");
@@ -86,6 +120,43 @@ fn successor_enforces_clock_and_role_floors() {
         changed_history.validate_successor(&prior, &digest),
         Err(MetadataJournalError::Invalid(
             "metadata root history changed below its trusted floor"
+        ))
+    ));
+
+    let mut reset_candidate = candidate("2026-08-17T20:00:01Z", "2026-08-17T20:00:02Z", 3, 4);
+    reset_candidate.set_timestamp_snapshot_floor_reset_for_test(Some(2));
+    let reset = MetadataGenerationReceiptV1::new(2, Some(digest.clone()), &reset_candidate)
+        .expect("sealed reset receipt");
+    reset
+        .validate_successor(&prior, &digest)
+        .expect("reset is bound to the appended root transition");
+    assert!(reset.matches_candidate(&reset_candidate));
+    reset_candidate.set_timestamp_snapshot_floor_reset_for_test(None);
+    assert!(
+        !reset.matches_candidate(&reset_candidate),
+        "receipt reset evidence cannot be added or removed without changing the sealed candidate"
+    );
+
+    assert!(matches!(
+        reset.validate_timestamp_snapshot_floor_reset(
+            reset_candidate.anchor_root().bytes(),
+            reset_candidate.root_chain(),
+            reset_candidate.trusted_root().bytes(),
+            false,
+        ),
+        Err(MetadataJournalError::Invalid(
+            "online-role floor reset lacks an authenticated key rotation"
+        ))
+    ));
+
+    let mut wrong_source = candidate("2026-08-17T20:00:01Z", "2026-08-17T20:00:02Z", 3, 4);
+    wrong_source.set_timestamp_snapshot_floor_reset_for_test(Some(1));
+    let wrong_source = MetadataGenerationReceiptV1::new(2, Some(digest.clone()), &wrong_source)
+        .expect("structurally valid wrong-source receipt");
+    assert!(matches!(
+        wrong_source.validate_successor(&prior, &digest),
+        Err(MetadataJournalError::Invalid(
+            "online-role floor reset is not bound to the new root transition"
         ))
     ));
 }

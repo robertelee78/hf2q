@@ -87,6 +87,8 @@ pub(in crate::distribution) struct VerifiedMetadataCandidate {
     anchor_root: ExactMetadataRole,
     root_chain: Vec<ExactMetadataRole>,
     trusted_root: ExactMetadataRole,
+    /// Prior selected root that authorized the TUF step-11 online-role reset.
+    timestamp_snapshot_floor_reset_from_root_version: Option<u64>,
     timestamp: ExactMetadataRole,
     snapshot: ExactMetadataRole,
     targets: ExactMetadataRole,
@@ -102,6 +104,7 @@ impl VerifiedMetadataCandidate {
         anchor_root: ExactMetadataRole,
         root_chain: Vec<ExactMetadataRole>,
         trusted_root: ExactMetadataRole,
+        timestamp_snapshot_floor_reset_from_root_version: Option<u64>,
         timestamp: ExactMetadataRole,
         snapshot: ExactMetadataRole,
         targets: ExactMetadataRole,
@@ -116,6 +119,7 @@ impl VerifiedMetadataCandidate {
             anchor_root,
             root_chain,
             trusted_root,
+            timestamp_snapshot_floor_reset_from_root_version,
             timestamp,
             snapshot,
             targets,
@@ -158,6 +162,18 @@ impl VerifiedMetadataCandidate {
         &self.trusted_root
     }
 
+    pub(in crate::distribution) fn timestamp_snapshot_floor_reset_from_root(
+        &self,
+    ) -> Option<&ExactMetadataRole> {
+        let version = self.timestamp_snapshot_floor_reset_from_root_version?;
+        if self.anchor_root.version() == version {
+            return Some(&self.anchor_root);
+        }
+        self.root_chain
+            .iter()
+            .find(|root| root.version() == version)
+    }
+
     pub(in crate::distribution) fn timestamp(&self) -> &ExactMetadataRole {
         &self.timestamp
     }
@@ -185,6 +201,8 @@ impl VerifiedMetadataCandidate {
                 .zip(&other.root_chain)
                 .all(|(left, right)| left.exactly_matches(right))
             && self.trusted_root.exactly_matches(&other.trusted_root)
+            && self.timestamp_snapshot_floor_reset_from_root_version
+                == other.timestamp_snapshot_floor_reset_from_root_version
             && self.timestamp.exactly_matches(&other.timestamp)
             && self.snapshot.exactly_matches(&other.snapshot)
             && self.targets.exactly_matches(&other.targets)
@@ -212,6 +230,7 @@ impl VerifiedMetadataCandidate {
             anchor_root,
             root_chain,
             trusted_root,
+            None,
             timestamp,
             snapshot,
             targets,
@@ -226,6 +245,11 @@ impl VerifiedMetadataCandidate {
     #[cfg(test)]
     pub(crate) fn replace_root_for_test(&mut self, index: usize, role: ExactMetadataRole) {
         self.root_chain[index] = role;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_timestamp_snapshot_floor_reset_for_test(&mut self, version: Option<u64>) {
+        self.timestamp_snapshot_floor_reset_from_root_version = version;
     }
 
     #[cfg(test)]

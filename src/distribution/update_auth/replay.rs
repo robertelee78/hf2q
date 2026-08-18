@@ -68,6 +68,7 @@ pub(super) fn replay_selected(
     )?;
     let mut trusted = TrustedMetadataSet::from_root(anchor.bytes())
         .map_err(|_| TufVerifierError::AuthenticationFailed)?;
+    let reset_from_version = receipt.timestamp_snapshot_floor_reset_from_root_version();
     let mut root_chain = Vec::with_capacity(stored_roots.len());
     for (index, bytes) in stored_roots.into_iter().enumerate() {
         let parsed = profile::root(&bytes)?;
@@ -95,6 +96,27 @@ pub(super) fn replay_selected(
         &format!("{trusted_root_version}.root.json"),
         trusted_root_version,
         &trusted_root,
+    )?;
+    let reset_binding_change_observed = if let Some(version) = reset_from_version {
+        let base_bytes = if parsed_anchor.signed.version == version {
+            anchor_root_bytes.as_ref()
+        } else {
+            root_chain
+                .iter()
+                .find(|root| root.version() == version)
+                .map(ExactMetadataRole::bytes)
+                .ok_or(TufVerifierError::AuthenticationFailed)?
+        };
+        let base = profile::root(base_bytes)?;
+        super::verifier::online_role_binding_invalidated(&base.signed, trusted.root())?
+    } else {
+        false
+    };
+    receipt.validate_timestamp_snapshot_floor_reset(
+        &anchor_root_bytes,
+        &root_chain,
+        &trusted_root,
+        reset_binding_change_observed,
     )?;
     profile::require_fresh(trusted.root(), historical_time)?;
 
@@ -143,6 +165,7 @@ pub(super) fn replay_selected(
     trusted
         .update_targets(&targets, historical_time)
         .map_err(|_| TufVerifierError::AuthenticationFailed)?;
+    let floor_base_root = trusted.root().clone();
 
     Ok(VerificationState {
         installation_id: String::new(),
@@ -156,6 +179,8 @@ pub(super) fn replay_selected(
             anchor_root_bytes,
         ),
         root_chain,
+        timestamp_snapshot_floor_base_root: Some(floor_base_root),
+        timestamp_snapshot_floor_reset_from_root_version: None,
         timestamp_floor: Some(RoleFloor::new(parsed_timestamp.signed.version, &timestamp)),
         snapshot_floor: Some(RoleFloor::new(parsed_snapshot.signed.version, &snapshot)),
         targets_floor: Some(RoleFloor::new(parsed_targets.signed.version, &targets)),
