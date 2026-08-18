@@ -26,39 +26,84 @@ pub(in crate::distribution::update_auth) enum RetainedReleaseMutation {
 pub(in crate::distribution::update_auth) fn stable_release_repository(
     consistent_snapshot: bool,
 ) -> StableReleaseFixture {
-    stable_release_repository_fixture(consistent_snapshot, EXPIRES, false)
+    stable_release_repository_fixture(consistent_snapshot, EXPIRES, false, MANIFEST, NEW_ARCHIVE)
+}
+
+pub(in crate::distribution::update_auth) fn stable_release_repository_for_artifacts(
+    manifest: &[u8],
+    archive: &[u8],
+) -> StableReleaseFixture {
+    stable_release_repository_fixture(true, EXPIRES, false, manifest, archive)
+}
+
+pub(in crate::distribution::update_auth) fn stable_release_repository_for_artifacts_with_expiry(
+    manifest: &[u8],
+    archive: &[u8],
+    expires: &str,
+) -> StableReleaseFixture {
+    stable_release_repository_fixture(true, expires, false, manifest, archive)
+}
+
+pub(in crate::distribution::update_auth) fn stable_release_successor_for_artifacts(
+    manifest: &[u8],
+    archive: &[u8],
+) -> StableReleaseFixture {
+    let key = TestKey::seeded("stable-release-root", 0x91);
+    let anchor = envelope(root_value(1, &[&key], 1, true), &[&key]);
+    let pointer = pointer("0.2.0", manifest, archive);
+    let target_values = json!({
+        "channels/stable/aarch64-apple-darwin.json": target_descriptor(&pointer),
+        "releases/v0.2.0/aarch64-apple-darwin/release-manifest.json": target_descriptor(manifest),
+        "releases/v0.2.0/aarch64-apple-darwin/hf2q-v0.2.0-aarch64-apple-darwin.zip": target_descriptor(archive)
+    });
+    let (timestamp, snapshot, targets) =
+        lower_roles_with_targets(3, EXPIRES, &[&key], target_values);
+    StableReleaseFixture {
+        repository: RepositoryFixture {
+            anchor,
+            roots: Vec::new(),
+            timestamp,
+            snapshot,
+            targets,
+            consistent_snapshot: true,
+            metadata_version: 3,
+        },
+        pointer,
+    }
 }
 
 pub(in crate::distribution::update_auth) fn stable_release_repository_with_expiry(
     consistent_snapshot: bool,
     expires: &str,
 ) -> StableReleaseFixture {
-    stable_release_repository_fixture(consistent_snapshot, expires, false)
+    stable_release_repository_fixture(consistent_snapshot, expires, false, MANIFEST, NEW_ARCHIVE)
 }
 
 pub(in crate::distribution::update_auth) fn stable_release_repository_with_mismatched_pointer(
 ) -> StableReleaseFixture {
-    stable_release_repository_fixture(true, EXPIRES, true)
+    stable_release_repository_fixture(true, EXPIRES, true, MANIFEST, NEW_ARCHIVE)
 }
 
 fn stable_release_repository_fixture(
     consistent_snapshot: bool,
     expires: &str,
     mismatch_pointer_manifest: bool,
+    manifest: &[u8],
+    archive: &[u8],
 ) -> StableReleaseFixture {
     let key = TestKey::seeded("stable-release-root", 0x91);
     let anchor = envelope(root_value(1, &[&key], 1, consistent_snapshot), &[&key]);
-    let mut pointer = pointer("0.2.0", MANIFEST, NEW_ARCHIVE);
+    let mut pointer = pointer("0.2.0", manifest, archive);
     if mismatch_pointer_manifest {
         let mut value: Value = serde_json::from_slice(&pointer).expect("pointer JSON");
-        value["manifest"]["length"] = json!(MANIFEST.len() as u64 + 1);
+        value["manifest"]["length"] = json!(manifest.len() as u64 + 1);
         pointer = serde_json::to_vec(&value).expect("mismatched pointer JSON");
         pointer.push(b'\n');
     }
     let target_values = json!({
         "channels/stable/aarch64-apple-darwin.json": target_descriptor(&pointer),
-        "releases/v0.2.0/aarch64-apple-darwin/release-manifest.json": target_descriptor(MANIFEST),
-        "releases/v0.2.0/aarch64-apple-darwin/hf2q-v0.2.0-aarch64-apple-darwin.zip": target_descriptor(NEW_ARCHIVE)
+        "releases/v0.2.0/aarch64-apple-darwin/release-manifest.json": target_descriptor(manifest),
+        "releases/v0.2.0/aarch64-apple-darwin/hf2q-v0.2.0-aarch64-apple-darwin.zip": target_descriptor(archive)
     });
     let (timestamp, snapshot, targets) =
         lower_roles_with_targets(2, expires, &[&key], target_values);

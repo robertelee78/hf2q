@@ -9,9 +9,10 @@ pub(super) use recovery::{
 };
 mod releases;
 pub(super) use releases::{
-    stable_release_repository, stable_release_repository_with_expiry,
-    stable_release_repository_with_mismatched_pointer, stable_release_successor_pair,
-    RetainedReleaseMutation,
+    stable_release_repository, stable_release_repository_for_artifacts,
+    stable_release_repository_for_artifacts_with_expiry, stable_release_repository_with_expiry,
+    stable_release_repository_with_mismatched_pointer, stable_release_successor_for_artifacts,
+    stable_release_successor_pair, RetainedReleaseMutation,
 };
 
 const EXPIRES: &str = "2999-01-01T00:00:00Z";

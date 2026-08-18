@@ -91,6 +91,20 @@ impl LockedMetadataState {
         )
     }
 
+    pub(in crate::distribution) fn open_release_extraction<'lock>(
+        &'lock self,
+        authorization: crate::distribution::update_auth::ExtractionStageAuthorization,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+    ) -> Result<super::super::ReleaseExtractionStage<'lock>, super::super::ExtractionError> {
+        super::super::extraction::open_release_extraction(
+            &self.journal.locked,
+            authorization,
+            exact_manifest,
+            manifest,
+        )
+    }
+
     /// Read structurally complete selected bytes while allowing only the
     /// bounded transaction residue that this held lock is authorized to
     /// recover. The signed-update verifier must authenticate the result.

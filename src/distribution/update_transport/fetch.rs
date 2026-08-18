@@ -29,10 +29,10 @@ impl StableUpdateTransport {
         fetch_and_bind_pointer(&self.executor, authorization)
     }
 
-    pub(in crate::distribution) fn fetch_release_bundle(
+    pub(in crate::distribution) fn fetch_release_bundle<'a>(
         &self,
-        authorization: BoundArtifactFetchAuthorization<'_>,
-    ) -> Result<VerifiedReleaseBundle, UpdateTransportError> {
+        authorization: BoundArtifactFetchAuthorization<'a>,
+    ) -> Result<VerifiedReleaseBundle<'a>, UpdateTransportError> {
         fetch_release_bundle(&self.executor, authorization)
     }
 }
@@ -47,10 +47,10 @@ fn fetch_and_bind_pointer<'a>(
     Ok(authorization.bind_pointer(&bytes)?)
 }
 
-fn fetch_release_bundle(
+fn fetch_release_bundle<'a>(
     executor: &impl HttpExecutor,
-    mut authorization: BoundArtifactFetchAuthorization<'_>,
-) -> Result<VerifiedReleaseBundle, UpdateTransportError> {
+    mut authorization: BoundArtifactFetchAuthorization<'a>,
+) -> Result<VerifiedReleaseBundle<'a>, UpdateTransportError> {
     let manifest_spec = TargetFetchSpec::from_descriptor(authorization.manifest())?;
     let manifest_request = release_asset_url(authorization.version(), &manifest_spec)?;
     let manifest_bytes = fetch_release(executor, &manifest_request, &manifest_spec, false)?;

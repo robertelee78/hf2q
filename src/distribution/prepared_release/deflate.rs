@@ -16,12 +16,12 @@ pub(super) fn verify_exact_streams<R: Read + Seek>(
 ) -> Result<(), PreparedReleaseError> {
     let mut input = [0_u8; 64 * 1024];
     let mut output = [0_u8; 64 * 1024];
-    for entry in entries.iter().filter(|entry| entry.method == 8) {
+    for entry in entries.iter().filter(|entry| entry.method() == 8) {
         reader
-            .seek(SeekFrom::Start(entry.data_start))
+            .seek(SeekFrom::Start(entry.data_start()))
             .map_err(|_| PreparedReleaseError::ArchiveRead)?;
         let mut decoder = Decompress::new(false);
-        let mut remaining = u64::from(entry.compressed_size);
+        let mut remaining = u64::from(entry.compressed_size());
         let mut stream_end = false;
         while remaining != 0 {
             let count = usize::try_from(remaining.min(input.len() as u64))
@@ -43,7 +43,7 @@ pub(super) fn verify_exact_streams<R: Read + Seek>(
                 offset = offset
                     .checked_add(consumed)
                     .ok_or(PreparedReleaseError::ArchiveProfile)?;
-                if decoder.total_out() > u64::from(entry.uncompressed_size)
+                if decoder.total_out() > u64::from(entry.uncompressed_size())
                     || (consumed == 0 && produced == 0)
                 {
                     return Err(PreparedReleaseError::ArchiveProfile);
@@ -65,7 +65,7 @@ pub(super) fn verify_exact_streams<R: Read + Seek>(
             let status = decoder
                 .decompress(&[], &mut output, FlushDecompress::Finish)
                 .map_err(|_| PreparedReleaseError::ArchiveProfile)?;
-            if decoder.total_out() > u64::from(entry.uncompressed_size) {
+            if decoder.total_out() > u64::from(entry.uncompressed_size()) {
                 return Err(PreparedReleaseError::ArchiveProfile);
             }
             if status == Status::StreamEnd {
@@ -74,8 +74,8 @@ pub(super) fn verify_exact_streams<R: Read + Seek>(
                 return Err(PreparedReleaseError::ArchiveProfile);
             }
         }
-        if decoder.total_in() != u64::from(entry.compressed_size)
-            || decoder.total_out() != u64::from(entry.uncompressed_size)
+        if decoder.total_in() != u64::from(entry.compressed_size())
+            || decoder.total_out() != u64::from(entry.uncompressed_size())
         {
             return Err(PreparedReleaseError::ArchiveProfile);
         }

@@ -12,6 +12,23 @@ fn parse_value(value: serde_json::Value) -> Result<ReleaseManifestV1, ReleaseMan
     )
 }
 
+fn add_data_file(document: &mut serde_json::Value, path: &str) {
+    let files = document["files"].as_array_mut().expect("files array");
+    files.push(serde_json::json!({
+        "path": path,
+        "type": "regular",
+        "size": 1,
+        "mode": "0644",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }));
+    files.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .expect("left path")
+            .cmp(right["path"].as_str().expect("right path"))
+    });
+}
+
 #[test]
 fn valid_fixture_has_stable_deterministic_bytes() {
     let manifest = ReleaseManifestV1::parse_and_validate(VALID).expect("valid manifest");
@@ -240,6 +257,107 @@ fn rejects_duplicate_or_unsorted_inventory() {
             Err(ReleaseManifestError::PathCollision { .. })
         ));
     }
+}
+
+#[test]
+fn rejects_case_folded_directory_and_file_directory_collisions() {
+    let mut directory_alias = valid_value();
+    add_data_file(&mut directory_alias, "share/doc/hf2q/A/one.txt");
+    add_data_file(&mut directory_alias, "share/doc/hf2q/a/two.txt");
+    assert!(matches!(
+        parse_value(directory_alias),
+        Err(ReleaseManifestError::PathCollision { .. })
+    ));
+
+    let mut file_directory = valid_value();
+    add_data_file(&mut file_directory, "share/doc/hf2q/guide");
+    add_data_file(&mut file_directory, "share/doc/hf2q/guide/readme.txt");
+    assert!(matches!(
+        parse_value(file_directory),
+        Err(ReleaseManifestError::PathCollision { .. })
+    ));
+}
+
+#[test]
+fn derived_directory_inventory_has_an_exact_bound() {
+    let mut at_limit = BundleTreeInventory::default();
+    for index in 0..MAX_BUNDLE_DIRECTORIES - 3 {
+        let name = format!("preloaded-{index:04}");
+        at_limit.directories.insert(name.clone(), name);
+    }
+    let path = BundlePath::parse("files[].path", "share/doc/hf2q/limit.txt".into())
+        .expect("valid bundle path");
+    at_limit.record(&path).expect("exact directory cap");
+    assert_eq!(at_limit.directories.len(), MAX_BUNDLE_DIRECTORIES);
+
+    let mut over_limit = BundleTreeInventory::default();
+    for index in 0..MAX_BUNDLE_DIRECTORIES {
+        let name = format!("preloaded-{index:04}");
+        over_limit.directories.insert(name.clone(), name);
+    }
+    assert!(matches!(
+        over_limit.record(&path),
+        Err(ReleaseManifestError::TooManyEntries {
+            collection: "derived directories",
+            limit: MAX_BUNDLE_DIRECTORIES,
+            actual,
+        }) if actual == MAX_BUNDLE_DIRECTORIES + 1
+    ));
+}
+
+#[test]
+fn parser_enforces_the_derived_directory_cap() {
+    fn manifest_with_last_branch_depth(last_depth: usize) -> serde_json::Value {
+        let mut document = valid_value();
+        let files = document["files"].as_array_mut().expect("files array");
+        files.clear();
+        files.push(serde_json::json!({
+            "path": "bin/hf2q",
+            "type": "regular",
+            "size": 1,
+            "mode": "0755",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }));
+        for index in 0..17 {
+            let depth = if index == 16 { last_depth } else { 241 };
+            files.push(serde_json::json!({
+                "path": format!(
+                    "share/doc/hf2q/g{index:04}/{}file.txt",
+                    "a/".repeat(depth)
+                ),
+                "type": "regular",
+                "size": 1,
+                "mode": "0644",
+                "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }));
+        }
+        files.push(serde_json::json!({
+            "path": "share/licenses/hf2q/LICENSE",
+            "type": "regular",
+            "size": 1,
+            "mode": "0644",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }));
+        files.sort_by(|left, right| {
+            left["path"]
+                .as_str()
+                .expect("left path")
+                .cmp(right["path"].as_str().expect("right path"))
+        });
+        document
+    }
+
+    let at_limit =
+        parse_value(manifest_with_last_branch_depth(217)).expect("exact derived-directory cap");
+    assert_eq!(at_limit.derived_directories().len(), MAX_BUNDLE_DIRECTORIES);
+    assert!(matches!(
+        parse_value(manifest_with_last_branch_depth(218)),
+        Err(ReleaseManifestError::TooManyEntries {
+            collection: "derived directories",
+            limit: MAX_BUNDLE_DIRECTORIES,
+            actual,
+        }) if actual == MAX_BUNDLE_DIRECTORIES + 1
+    ));
 }
 
 #[test]

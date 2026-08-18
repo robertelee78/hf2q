@@ -7,11 +7,12 @@
   restart-discard, root-authorized online-role recovery, and dormant
   channel-pointer/selected-target binding, origin-locked artifact transport,
   lock-reauthenticated fetch capability, and same-descriptor streamed archive
-  staging, and dormant exact embedded-manifest/classic-ZIP validation are
+  staging, dormant exact embedded-manifest/classic-ZIP validation, and
+  lock-held descriptor-relative inert extraction are
   reconciled; the real release trust root, verifier-request metadata
-  transport, descriptor-relative extraction and codesign verification, public
-  update/install/onboarding implementation, and exact-artifact proof remain
-  pending
+  transport, codesign verification, signed-mode normalization, crash-durable
+  prepared-version publication, public update/install/onboarding
+  implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
 - Updated: 2026-08-18
 - Owners: hf2q release engineering and operator experience
@@ -228,6 +229,53 @@ the deterministic external manifest encoding. The archive is reverified on its
 original unlinked descriptor before and after this pass. This validation
 remains inert and creates no filesystem-write, prepared-version, activation, or
 install authority.
+
+The next dormant boundary consumes that exact profile and extracts only into
+`update/extractions/.extract-v{VERSION}-{ARCHIVE_SHA256}` while holding the
+shared installation lock. The stage name is derived solely from the
+authenticated stable SemVer and full lowercase archive SHA-256. There may be
+at most eight retained extraction stages; an existing requested stage remains
+resumable at the limit, while a ninth distinct stage fails closed. This slice
+has no deletion or garbage-collection authority, so exhaustion is recoverable
+only through a later explicitly authorized cleanup policy. At the 4 GiB
+expanded-payload ceiling, the deliberately conservative worst-case retained
+payload budget is about 32 GiB plus manifest and filesystem overhead.
+
+The manifest and every payload are decoded in canonical archive order into an
+exact descriptor-relative tree. The tree admits at most 4,096 unique derived
+directories. All stage and derived directories remain private `0700`, and all
+files—including payloads whose signed final mode is `0755`—remain inert `0600`.
+The later code-signing/publication transition must consume this capability,
+apply the signed final `0644`/`0755` modes, sync, and reverify before any name
+under `versions/` can exist. Extraction never calls a generic ZIP extractor and
+returns no path, file descriptor, marker, receipt, prepared-version, or
+activation capability.
+
+Restart recovery treats a correctly named, current-user, single-link,
+same-device `0600` expected file as reconstructible scratch. A newly
+authenticated copy of the exact archive is decoded from byte zero; retained
+bytes are compared, mismatching ranges are overwritten in the same inode, and
+missing suffixes are appended. No file is truncated, replaced, or deleted.
+Oversized files, non-prefix file ordering, extra names, wrong types, links,
+owners, devices, or modes remain diagnostic evidence and fail closed. This is
+required because Apple's [`fsync(2)` documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)
+does not promise power-loss write ordering. Each reconstructed file is checked
+for exact size/SHA-256, `F_FULLFSYNC`ed, reopened and rechecked; all directories
+are synced bottom-up, the named root/update/extractions/stage namespace is
+reopened and rebound, and the installation lock provides the final full-sync
+endpoint. A process crash or later corruption can therefore leave only inert
+reconstructible state: no retained byte is trusted, and a file that cannot be
+reconstructed exactly from a freshly authenticated archive remains fail closed
+rather than becoming release authority.
+
+The same selected metadata identity is replayed from the compiled anchor at
+current time before opening the stage and again after all archive and
+filesystem I/O. The archive's anonymous descriptor is independently
+length/hash-revalidated on both sides of extraction. Generation drift, pointer
+or descriptor mismatch, expiry at the final sample, clock rollback, namespace
+replacement, or archive mutation returns no extracted-release capability. The
+successful sealed result retains the shared lock and the unforgeable classic-
+ZIP profile, but is still inert and cannot authorize publication.
 
 The binary is Developer ID signed with Hardened Runtime and a secure timestamp.
 The final ZIP is submitted with `notarytool`; release promotion requires an
@@ -887,8 +935,8 @@ replays the current selected journal from the compiled anchor at current time,
 and requires the same installation/state identity, selected sequence and
 receipt digest, pointer/manifest/archive descriptors, and fresh role expiries.
 Any change discards the inert staged bytes and restarts planning. The fetched
-result still grants no extraction, codesign verification, prepared-version,
-installed-release-floor, activation, or update authority.
+result alone still grants no extraction, codesign verification,
+prepared-version, installed-release-floor, activation, or update authority.
 
 TUF metadata versions do not prevent newly signed metadata from moving the
 stable pointer to an older hf2q SemVer. `ReleaseVersion` therefore uses numeric
@@ -899,11 +947,12 @@ downgrade or rollback requires a separate one-use intent capability.
 
 Large archives are streamed and checked against the sealed descriptor by hf2q
 rather than buffered through either client's convenience target API. The
-origin-locked external-byte layer and exact classic-ZIP/embedded-manifest
-validator are implemented but remain deliberately dormant; descriptor-relative
-extraction, codesign verification, and prepared-version authority remain
-pending. Notarization is publisher promotion evidence for the exact archive,
-not runtime preparation authority. The implemented metadata layer
+origin-locked external-byte layer, exact classic-ZIP/embedded-manifest
+validator, and private descriptor-relative extraction are implemented but
+remain deliberately dormant. Codesign verification, signed-mode normalization,
+and prepared-version publication authority remain pending. Notarization is
+publisher promotion evidence for the exact archive, not runtime preparation
+authority. The implemented metadata layer
 already preserves the distinction between ordinary read authority and
 lock-held recovery: any partial or published-but-unselected
 successor is ambiguous and fails closed for an ordinary reader. A same-process
@@ -1067,12 +1116,12 @@ exact external manifest/archive bytes from closed origins, and reauthenticate
 the same selected generation under the shared lock before and after archive
 I/O. The private preparation boundary additionally proves the exact classic-ZIP
 layout, canonical embedded manifest, complete payload inventory, modes, sizes,
-CRCs, and SHA-256 values on the same archive descriptor. These boundaries still
-do not produce update authority. The next slice must embed the real stable
-trust root, retain lock-held freshness authority through preparation, extract
-descriptor-relatively, verify the fixed Developer ID policy, and durably
-publish and reopen the version before it can construct an authenticated
-prepared version.
+CRCs, and SHA-256 values on the same archive descriptor, then materializes the
+exact bytes into a private inert tree under the retained shared lock. These
+boundaries still do not produce update authority. The next slice must embed the
+real stable trust root, verify the fixed Developer ID policy against the staged
+binary, normalize and sync signed modes, and durably publish and reopen the
+version before it can construct an authenticated prepared version.
 Neither a receipt, parsed role, provisional candidate, durable baseline, nor
 selected target plan can download bytes or mutate an installation by itself.
 
@@ -1508,6 +1557,7 @@ support.
 | Replayed old metadata or release | Version/expiry/role checks reject rollback and freeze; no downgrade occurs without explicit selection of a previously verified retained version. |
 | Published asset replacement | Immutable draft-to-publish flow forbids overwrite; clients bind exact hashes rather than trusting a mutable tag alone. |
 | Malicious archive path/link | A bounded custom classic-ZIP pass preserves every raw record and rejects duplicates, noncanonical order, flags, links/types, ZIP64, comments/extras, local/central disagreement, gaps, overlaps, prefixes, and trailing bytes before the decoder or any extraction runs. The exact embedded manifest and every streamed payload digest must then match the signed inventory. |
+| Crash or torn private extraction | The shared-lock stage has a deterministic authenticated name, exact bounded inventory, private `0600`/`0700` modes, in-place exact reconstruction, per-file `F_FULLFSYNC`, bottom-up directory barriers, namespace rebinding, and a final metadata replay. Safe scratch is resumable; hostile shape is retained and fails closed; no version is published. |
 | Interrupted install/update | Before activation, old `current` selects the complete old activation. After the sole commit, new `current` selects one complete immutable receipt, relative version link, version, and marker. Partial staging is never executable. |
 | Concurrent updater | Installation lock admits one transition and leaves no ambiguous active version. |
 | Package-manager collision | Receipt plus manager-database ownership evidence prevents self-overwrite; Cargo route history is never guessed, and `hf2q update` delegates through the recorded/selected route and verifies the result. |
@@ -1539,11 +1589,12 @@ before public self-update ships.
    current-time authenticated target inventory, sealed pointer cross-binding,
    origin-locked transport, lock-reauthenticated fetch capability, and exact
    external manifest/same-FD streamed archive binding plus exact
-   embedded-manifest/classic-ZIP inventory verification, marker-v2 exact
+   embedded-manifest/classic-ZIP inventory verification, descriptor-relative
+   inert extraction with current-time lock-held replay, marker-v2 exact
    preparation evidence, and the first-standalone marker/receipt builder have
    landed as dormant bounded contexts. Next, embed the real stable root and
-   implement descriptor-relative extraction, codesign verification,
-   crash-durable prepared-version publication, live installed-release downgrade
+   implement codesign verification, signed-mode normalization, crash-durable
+   prepared-version publication, live installed-release downgrade
    floor, canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration
    receipt, and session policy. Every schema lands with bounded hostile input and

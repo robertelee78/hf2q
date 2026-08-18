@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,7 @@ pub const RELEASE_MANIFEST_KIND: &str = "hf2q.release-manifest";
 pub const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const MAX_RELEASE_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_BUNDLE_FILES: usize = 4096;
+pub const MAX_BUNDLE_DIRECTORIES: usize = 4096;
 pub const MAX_DYNAMIC_DEPENDENCIES: usize = 256;
 pub const MAX_BUNDLE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -93,6 +94,8 @@ pub struct ReleaseManifestV1 {
     code_signing: CodeSigningIdentityV1,
     compatibility: CompatibilityV1,
     files: Vec<BundleFileV1>,
+    #[serde(skip)]
+    derived_directories: Vec<String>,
     non_system_dynamic_dependencies: Vec<DynamicDependencyV1>,
 }
 
@@ -149,6 +152,10 @@ impl ReleaseManifestV1 {
 
     pub fn files(&self) -> &[BundleFileV1] {
         &self.files
+    }
+
+    pub(crate) fn derived_directories(&self) -> &[String] {
+        &self.derived_directories
     }
 
     pub fn payload_bytes(&self) -> u64 {
@@ -305,6 +312,74 @@ struct RawDynamicDependencyV1 {
     install_name: String,
 }
 
+#[derive(Default)]
+struct BundleTreeInventory {
+    files: BTreeMap<String, String>,
+    directories: BTreeMap<String, String>,
+}
+
+impl BundleTreeInventory {
+    fn record(&mut self, path: &BundlePath) -> Result<(), ReleaseManifestError> {
+        let exact = path.as_str();
+        let case_folded = exact.to_ascii_lowercase();
+
+        if let Some(first) = self.files.get(&case_folded) {
+            return if first == exact {
+                Err(ReleaseManifestError::DuplicatePath(exact.to_owned()))
+            } else {
+                Err(ReleaseManifestError::PathCollision {
+                    first: first.clone(),
+                    second: exact.to_owned(),
+                })
+            };
+        }
+        if let Some(first) = self.directories.get(&case_folded) {
+            return Err(ReleaseManifestError::PathCollision {
+                first: first.clone(),
+                second: exact.to_owned(),
+            });
+        }
+
+        for (index, _) in case_folded.match_indices('/') {
+            let folded_directory = &case_folded[..index];
+            let exact_directory = &exact[..index];
+            if let Some(first) = self.files.get(folded_directory) {
+                return Err(ReleaseManifestError::PathCollision {
+                    first: first.clone(),
+                    second: exact.to_owned(),
+                });
+            }
+            if let Some(first) = self.directories.get(folded_directory) {
+                if first != exact_directory {
+                    return Err(ReleaseManifestError::PathCollision {
+                        first: first.clone(),
+                        second: exact.to_owned(),
+                    });
+                }
+                continue;
+            }
+            if self.directories.len() == MAX_BUNDLE_DIRECTORIES {
+                return Err(ReleaseManifestError::TooManyEntries {
+                    collection: "derived directories",
+                    limit: MAX_BUNDLE_DIRECTORIES,
+                    actual: MAX_BUNDLE_DIRECTORIES + 1,
+                });
+            }
+            self.directories
+                .insert(folded_directory.to_owned(), exact_directory.to_owned());
+        }
+
+        self.files.insert(case_folded, exact.to_owned());
+        Ok(())
+    }
+
+    fn into_directories(self) -> Vec<String> {
+        let mut directories: Vec<_> = self.directories.into_values().collect();
+        directories.sort();
+        directories
+    }
+}
+
 impl TryFrom<RawReleaseManifestV1> for ReleaseManifestV1 {
     type Error = ReleaseManifestError;
 
@@ -345,8 +420,7 @@ impl TryFrom<RawReleaseManifestV1> for ReleaseManifestV1 {
         let compatibility = validate_compatibility(raw.compatibility)?;
 
         let mut files = Vec::with_capacity(raw.files.len());
-        let mut seen = BTreeSet::new();
-        let mut seen_case_folded = BTreeMap::<String, String>::new();
+        let mut tree = BundleTreeInventory::default();
         let mut previous: Option<String> = None;
         let mut payload_bytes = 0_u64;
         let mut has_binary = false;
@@ -354,37 +428,7 @@ impl TryFrom<RawReleaseManifestV1> for ReleaseManifestV1 {
         let mut has_license = false;
         for raw_file in raw.files {
             let path = BundlePath::parse("files[].path", raw_file.path)?;
-            if !seen.insert(path.as_str().to_owned()) {
-                return Err(ReleaseManifestError::DuplicatePath(
-                    path.as_str().to_owned(),
-                ));
-            }
-            let case_folded = path.as_str().to_ascii_lowercase();
-            if let Some(first) = seen_case_folded.get(&case_folded) {
-                return Err(ReleaseManifestError::PathCollision {
-                    first: first.clone(),
-                    second: path.as_str().into(),
-                });
-            }
-            for (index, _) in case_folded.match_indices('/') {
-                if let Some(first) = seen_case_folded.get(&case_folded[..index]) {
-                    return Err(ReleaseManifestError::PathCollision {
-                        first: first.clone(),
-                        second: path.as_str().into(),
-                    });
-                }
-            }
-            let descendant_prefix = format!("{case_folded}/");
-            if let Some((_, first)) = seen_case_folded
-                .range(descendant_prefix.clone()..)
-                .next()
-                .filter(|(candidate, _)| candidate.starts_with(&descendant_prefix))
-            {
-                return Err(ReleaseManifestError::PathCollision {
-                    first: first.clone(),
-                    second: path.as_str().into(),
-                });
-            }
+            tree.record(&path)?;
             if previous
                 .as_deref()
                 .is_some_and(|prior| prior >= path.as_str())
@@ -393,7 +437,6 @@ impl TryFrom<RawReleaseManifestV1> for ReleaseManifestV1 {
                     path.as_str().to_owned(),
                 ));
             }
-            seen_case_folded.insert(case_folded, path.as_str().into());
             previous = Some(path.as_str().to_owned());
 
             let is_binary = path.as_str() == "bin/hf2q";
@@ -486,6 +529,7 @@ impl TryFrom<RawReleaseManifestV1> for ReleaseManifestV1 {
             });
         }
 
+        let derived_directories = tree.into_directories();
         Ok(Self {
             kind: raw.kind,
             schema_version: raw.schema_version,
@@ -498,6 +542,7 @@ impl TryFrom<RawReleaseManifestV1> for ReleaseManifestV1 {
             code_signing,
             compatibility,
             files,
+            derived_directories,
             non_system_dynamic_dependencies: dependencies,
         })
     }

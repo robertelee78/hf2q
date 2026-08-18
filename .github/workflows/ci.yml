@@ -195,6 +195,20 @@ jobs:
               src/distribution/prepared_release || true
           )"
           test -z "$unexpected_preparation_authority"
+          unexpected_extraction_authority="$(
+            grep -InE \
+              'remove_named|remove_dir|remove_file|unlink|rename|fchmod|AuthenticatedPreparedVersion|version-installation|install-receipt|std::process::Command|reqwest|hyper|tokio::net|clap::' \
+              src/distribution/install_state/extraction.rs \
+              src/distribution/install_state/extraction/io.rs \
+              src/distribution/prepared_release/extract.rs || true
+          )"
+          test -z "$unexpected_extraction_authority"
+          unexpected_transport_extraction="$(
+            grep -RInE --include='*.rs' --exclude='tests.rs' \
+              'ReleaseExtractionStage|PostReplayExtraction|ExtractedRelease|extract_release|with_locked_extraction' \
+              src/distribution/update_transport || true
+          )"
+          test -z "$unexpected_transport_extraction"
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -209,21 +223,29 @@ jobs:
             src/distribution/schema/install_receipt_validation.rs \
             src/distribution/schema/install_receipt_tests.rs \
             src/distribution/schema/installed_version_marker.rs \
+            src/distribution/schema/release_manifest.rs \
+            src/distribution/schema/release_manifest_tests.rs \
             src/distribution/schema/testdata/install_receipt_v1_initial_marker_v2.json \
             src/distribution/schema/testdata/installed_version_marker_v1.json \
             src/distribution/schema/testdata/installed_version_marker_v2.json \
             src/distribution/schema/target_name.rs \
             src/distribution/install_state/artifact.rs \
             src/distribution/install_state/artifact/tests.rs \
+            src/distribution/install_state/extraction.rs \
+            src/distribution/install_state/extraction/io.rs \
+            src/distribution/install_state/extraction_tests.rs \
             src/distribution/install_state/unix.rs \
             src/distribution/prepared_release/mod.rs \
             src/distribution/prepared_release/archive.rs \
             src/distribution/prepared_release/deflate.rs \
+            src/distribution/prepared_release/extract.rs \
             src/distribution/prepared_release/tests.rs \
             src/distribution/update_auth/artifact_authorization.rs \
+            src/distribution/update_auth/artifact_authorization/extraction.rs \
             src/distribution/update_auth/commit.rs \
             src/distribution/update_auth/target_set.rs \
             src/distribution/update_auth/target_set_tests.rs \
+            src/distribution/update_auth/target_set_tests/extraction_cases.rs \
             src/distribution/update_transport/mod.rs \
             src/distribution/update_transport/fetch.rs \
             src/distribution/update_transport/http.rs \
@@ -261,6 +283,14 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::update_auth:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::update_transport:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
+          distribution_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
+          for required_test in \
+            distribution::install_state::extraction::tests::process_abort_mid_file_leaves_only_resumable_inert_state \
+            distribution::update_auth::target_set::tests::extraction_cases::stored_and_deflated_bundles_cross_the_complete_extraction_boundary \
+            distribution::update_auth::target_set::tests::extraction_cases::post_extraction_archive_revalidation_failure_returns_no_capability_and_is_retryable
+          do
+            grep -Fq -- "$required_test: test" <<<"$distribution_tests"
+          done
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen_thinking_budget -- --test-threads=1
           cargo test --locked --bin hf2q --all-features gqa_q2_policy_tests -- --test-threads=1

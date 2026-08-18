@@ -74,6 +74,8 @@ pub(in crate::distribution) struct VerifiedArchiveFile {
     identity: EntryIdentity,
     length: u64,
     sha256: Sha256Digest,
+    #[cfg(test)]
+    fail_revalidation_after: std::cell::Cell<Option<usize>>,
 }
 
 impl std::fmt::Debug for EphemeralArtifactStage {
@@ -244,6 +246,8 @@ impl EphemeralArtifactStage {
             identity: reread_identity,
             length: self.expected_length,
             sha256: expected_sha256.clone(),
+            #[cfg(test)]
+            fail_revalidation_after: std::cell::Cell::new(None),
         })
     }
 }
@@ -258,6 +262,14 @@ impl VerifiedArchiveFile {
     }
 
     pub(in crate::distribution) fn revalidate(&self) -> Result<(), ArtifactStageError> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_revalidation_after.get() {
+            if remaining == 1 {
+                self.fail_revalidation_after.set(None);
+                return Err(ArtifactStageError::Integrity);
+            }
+            self.fail_revalidation_after.set(Some(remaining - 1));
+        }
         let before = fs::fstat(&self.file).map_err(ArtifactStageError::errno)?;
         let before_identity = require_unlinked_private_file(&before, self.identity.device)?;
         if before_identity.device != self.identity.device
@@ -294,6 +306,12 @@ impl VerifiedArchiveFile {
             return Err(ArtifactStageError::Integrity);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::distribution) fn fail_revalidation_after_for_test(&self, calls: usize) {
+        assert!(calls != 0, "failure call must be nonzero");
+        self.fail_revalidation_after.set(Some(calls));
     }
 }
 

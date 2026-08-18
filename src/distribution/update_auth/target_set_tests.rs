@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
-
 use jiff::Timestamp;
 use sigstore_tuf::metadata::TargetFile;
+use std::collections::BTreeMap;
 
 use super::*;
 use crate::distribution::install_state::metadata::{
@@ -23,6 +22,9 @@ use crate::distribution::update_auth::ArtifactFetchAuthorizationError;
 
 const INSTALLATION_ID: &str = "7c907c7a-3125-4a40-a8b3-1c125080e46a";
 
+#[path = "target_set_tests/extraction_cases.rs"]
+mod extraction_cases;
+
 fn instant(value: &str) -> Timestamp {
     value.parse().expect("fixed timestamp")
 }
@@ -36,6 +38,37 @@ fn make_authorization() -> (tempfile::TempDir, MetadataStateAuthorization) {
         .join("state");
     let authorization = MetadataStateAuthorization::for_test_path(&root, INSTALLATION_ID);
     (temp, authorization)
+}
+
+fn finalized_artifact_authorization<'a>(
+    authorization: &'a MetadataStateAuthorization,
+    anchor: &'a EmbeddedTrustRoot,
+    pointer: &[u8],
+) -> crate::distribution::update_auth::artifact_authorization::FinalArtifactAuthorization<'a> {
+    let fetch = begin_artifact_fetch_for_test(
+        authorization,
+        anchor,
+        [
+            instant("2026-08-18T09:01:00Z"),
+            instant("2026-08-18T09:01:01Z"),
+        ],
+    )
+    .expect("artifact fetch authority");
+    let mut bound = fetch.bind_pointer(pointer).expect("bound pointer");
+    drop(
+        bound
+            .create_archive_stage_for_test([
+                instant("2026-08-18T09:01:02Z"),
+                instant("2026-08-18T09:01:03Z"),
+            ])
+            .expect("anonymous archive stage"),
+    );
+    bound
+        .finalize_for_test([
+            instant("2026-08-18T09:01:04Z"),
+            instant("2026-08-18T09:01:05Z"),
+        ])
+        .expect("final artifact authorization")
 }
 
 fn leaked_anchor(bytes: &[u8]) -> EmbeddedTrustRoot {
@@ -236,6 +269,23 @@ fn artifact_fetch_reauthenticates_under_lock_before_and_after_archive_io() {
         instant("2026-08-18T09:01:06Z")
     );
     assert_eq!(finalized.targets().selected_sequence(), 1);
+    let preparation = finalized
+        .lock_for_preparation_for_test([
+            instant("2026-08-18T09:01:07Z"),
+            instant("2026-08-18T09:01:08Z"),
+        ])
+        .expect("lock-held preparation proof");
+    let preparation = preparation
+        .reauthenticate_after_local_io_for_test([
+            instant("2026-08-18T09:01:09Z"),
+            instant("2026-08-18T09:01:10Z"),
+        ])
+        .expect("post-local-I/O preparation proof");
+    assert_eq!(
+        preparation.authenticated_at_for_test(),
+        instant("2026-08-18T09:01:10Z")
+    );
+    drop(preparation);
 
     let fetch = begin_artifact_fetch_for_test(
         &authorization,

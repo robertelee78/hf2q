@@ -55,14 +55,26 @@ pub(in crate::distribution) enum UpdateTransportError {
 /// later lock-held coordinator must reauthenticate the selected generation,
 /// validate the embedded manifest and ZIP inventory, verify code signing,
 /// and durably publish a version before activation is possible.
-pub(in crate::distribution) struct VerifiedReleaseBundle {
-    authorization: FinalArtifactAuthorization,
+pub(in crate::distribution) struct VerifiedReleaseBundle<'a> {
+    authorization: FinalArtifactAuthorization<'a>,
     manifest_bytes: Box<[u8]>,
     manifest: ReleaseManifestV1,
     archive: VerifiedArchiveFile,
 }
 
-impl std::fmt::Debug for VerifiedReleaseBundle {
+/// One-use transport output consumed only by the prepared-release boundary.
+///
+/// This remains inert transport data. In particular, it contains no archive
+/// profile, extracted-tree proof, publication capability, or activation
+/// authority.
+pub(super) struct ReleasePreparationParts<'a> {
+    pub(super) authorization: FinalArtifactAuthorization<'a>,
+    pub(super) manifest_bytes: Box<[u8]>,
+    pub(super) manifest: ReleaseManifestV1,
+    pub(super) archive: VerifiedArchiveFile,
+}
+
+impl std::fmt::Debug for VerifiedReleaseBundle<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VerifiedReleaseBundle")
@@ -70,10 +82,40 @@ impl std::fmt::Debug for VerifiedReleaseBundle {
     }
 }
 
-impl VerifiedReleaseBundle {
+impl<'a> VerifiedReleaseBundle<'a> {
     pub(super) fn preparation_parts_mut(
         &mut self,
     ) -> (&[u8], &ReleaseManifestV1, &mut VerifiedArchiveFile) {
         (&self.manifest_bytes, &self.manifest, &mut self.archive)
+    }
+
+    pub(super) fn into_preparation_parts(self) -> ReleasePreparationParts<'a> {
+        let Self {
+            authorization,
+            manifest_bytes,
+            manifest,
+            archive,
+        } = self;
+        ReleasePreparationParts {
+            authorization,
+            manifest_bytes,
+            manifest,
+            archive,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::distribution) fn from_test_parts(
+        authorization: FinalArtifactAuthorization<'a>,
+        manifest_bytes: Box<[u8]>,
+        manifest: ReleaseManifestV1,
+        archive: VerifiedArchiveFile,
+    ) -> Self {
+        Self {
+            authorization,
+            manifest_bytes,
+            manifest,
+            archive,
+        }
     }
 }
