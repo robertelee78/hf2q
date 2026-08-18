@@ -78,7 +78,7 @@ fn successor_enforces_clock_and_role_floors() {
 
     let mut changed_history_candidate =
         candidate("2026-08-17T20:00:01Z", "2026-08-17T20:00:02Z", 3, 4);
-    changed_history_candidate.root_chain[0] = role("2.root.json", 2, "different-root-2");
+    changed_history_candidate.replace_root_for_test(0, role("2.root.json", 2, "different-root-2"));
     let changed_history =
         MetadataGenerationReceiptV1::new(2, Some(digest.clone()), &changed_history_candidate)
             .expect("structurally valid receipt");
@@ -224,7 +224,9 @@ fn journal_commits_more_than_the_discarded_spikes_update_cap() {
 #[test]
 fn request_name_must_bind_the_parsed_role_version() {
     let mut candidate = candidate("2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 1, 2);
-    candidate.snapshot.request_name = "999.snapshot.json".to_owned();
+    candidate
+        .snapshot_mut_for_test()
+        .set_request_name_for_test("999.snapshot.json");
     assert!(matches!(
         MetadataGenerationReceiptV1::new(1, None, &candidate),
         Err(MetadataJournalError::Invalid(

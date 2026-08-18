@@ -2,9 +2,12 @@
 
 - Status: Proposed; product interview, shell-completion bootstrap,
   distribution schemas, first-activation transaction, signed-update verifier
-  selection, shared installation lock, and durable metadata-journal primitives
-  are reconciled; the production verifier, public update/install/onboarding
-  implementation, and exact-artifact proof remain pending
+  selection, shared installation lock, durable metadata journal, dormant
+  transport-free production verifier, commit-freshness capability, and
+  restart-discard recovery are reconciled; the real release trust root,
+  network transport, application target/archive binding, public
+  update/install/onboarding implementation, and exact-artifact proof remain
+  pending
 - Date: 2026-08-17
 - Updated: 2026-08-18
 - Owners: hf2q release engineering and operator experience
@@ -629,13 +632,56 @@ disposable evidence rather than compatibility promises; the production
 adapter freezes its schemas only after reusing these invariants in the main
 bounded distribution context.
 
-Large archives are streamed and checked against the verified target
+The main crate now contains that dormant transport-free adapter under
+`src/distribution/update_auth/`. The exact normal dependency is
+`sigstore-tuf = 0.11.0` with default features disabled. `TrustedMetadataSet`
+is the only library verification state machine that hf2q imports or uses; the
+stock `Updater`, `FileStore`, and `Repository` APIs are not imported or used,
+and the dependency's fetch/HTTP/TLS features are disabled. No URL policy,
+transport, or metadata store participates in this authority path. One-use
+request tokens derive the only accepted next role and wire name. Responses are
+bounded before parsing, reject duplicate/trailing or over-depth JSON, and
+preserve the exact authenticated bytes. The v1 profile
+requires positive versions, canonical expiry strings, exact lowercase SHA-256
+and length parent pins, timestamp/snapshot singleton metadata, no delegations,
+and a maximum of 256 lifetime root rotations. Root-chain termination advances
+only on an explicit not-found response; any other transport outcome remains a
+failure for the future transport layer.
+
+Authority remains deliberately staged. Structurally valid journal bytes are
+not cryptographic authority. A complete transcript becomes a non-cloneable
+`VerifiedMetadataCandidate` only after replay from the compiled anchor,
+gapless dual-threshold root verification, rollback/equivocation floors, and
+freshness checks. An advancing candidate is replayed again against the live
+selected floor while the shared installation lock is held. Only the TUF
+coordinator can construct its sealed `AdvancingCommitGuard`; the raw journal
+has no production advancing-commit surface. The guard parses and caches the
+four final role expiries, samples time after lock-held replay and again after
+all namespace/staged-byte revalidation immediately before the selector
+rename, rejects a backward second sample, and requires every expiry to be
+strictly greater than both samples. A selected exact retry instead repairs
+historical durability as a rollback floor without current freshness and
+returns no target bytes or lookup authority.
+
+After commit, the coordinator authenticates the exact selected bytes while
+the lock remains held, releases the lock, performs an ordinary fail-closed
+reopen, authenticates the bytes again from the compiled anchor, and requires
+both durable proofs to match. `DurableMetadataBaseline` exposes only the
+generation sequence and receipt digest. It is not target lookup, archive,
+prepared-version, activation, or update authority.
+
+Large archives will be streamed and checked against the verified target
 descriptor by hf2q rather than buffered through either client's convenience
-target API. The production adapter must preserve the spike's distinction
-between ordinary read authority and lock-held recovery: a complete published
-successor without its pending selector is ambiguous and fails closed for a
-reader, while an exact retry may reconstruct and commit it only after
-reverification under the installation lock.
+target API. That application-binding layer is still pending. The implemented
+metadata layer already preserves the distinction between ordinary read
+authority and lock-held recovery: any partial or published-but-unselected
+successor is ambiguous and fails closed for an ordinary reader. A same-process
+retry may resume exact staged bytes only while it still owns the sealed live
+candidate, including the explicit root-chain not-found proof that is not
+serialized in the journal. A fresh process never promotes residue: it
+historically authenticates and repairs the selected rollback floor, removes
+only the structurally exact never-selected transaction under the shared lock,
+then requires a wholly fresh transcript.
 
 The production v1 local metadata journal is frozen independently of the
 network verifier. It remains crate-private and unreachable from command
@@ -689,10 +735,33 @@ The journal remains bounded without the spike's disposable 1,024-update
 exhaustion rule. During a transition it permits only the selected generation,
 one exact successor transaction, and one exact predecessor cleanup residue.
 An ordinary unlocked reader rejects a partial or published-but-unselected
-successor; lock-held recovery may resume it only when the candidate, receipt,
-files, predecessor digest, and selector are byte-exact. After a successor is
-selected, its independently verifiable complete root history and role floors
-allow the old generation to be renamed no-replace to the one derived
+successor. A live same-process sealed candidate may exact-resume it, but a
+fresh process has no authority to infer the missing transport termination
+proof from disk. Fresh-process recovery first replays any selected generation
+from the compiled anchor at its historical completion time, repeats its
+postcommit barriers, and completes prior cleanup. It then classifies only the
+derived next sequence. A published successor must pass its canonical receipt,
+state identity, predecessor, exact file inventory, role descriptor, and staged
+selector binding before it can be renamed no-replace back to `.pending-N`. A
+pending generation must be an exact bounded prefix of the reserved write
+order: root-history directory, anchor, trusted root, timestamp, snapshot,
+targets, then receipt. Corrupt, non-prefix, symlinked, hard-linked,
+wrong-mode, oversized, or namespace-swapped residue is preserved fail-closed.
+No stored successor bytes become a verifier candidate.
+
+Authorized discard removes only `.current-N.json`, `N`, and `.pending-N`
+derived from the selected sequence. Fixed entries are removed in reverse
+creation order, each unlink/rmdir is followed by its containing-directory
+sync, and every crash leaves the same recognizable prefix. Discard then syncs
+the generations, metadata, update, and state-root directories and ends at
+`F_FULLFSYNC` on the exact selected selector, or the held lock file when no
+selection exists. The next network attempt starts from a wholly fresh TUF
+transcript and may reuse sequence N. No generic path, recursive deletion,
+quarantine, or candidate-construction API is granted.
+
+After a successor is selected, its independently verifiable complete root
+history and role floors allow the old generation to be renamed no-replace to
+the one derived
 `.prune-(N-1)` name and removed through an exact, descriptor-relative,
 no-follow inventory. A crash before or during cleanup leaves the newer
 selection authoritative and a bounded, receipt-bound cleanup residue; the
@@ -718,12 +787,35 @@ one selected generation, and demonstrates that the discarded spike's 1,024
 limit is not present in the production journal; schema proof separately accepts
 exactly 256 lifetime root rotations and rejects 257.
 
-The journal currently returns structurally complete stored bytes, not update
-authority. The next slice must reconstruct those exact bytes through the
-selected transport-free TUF verifier before producing a durable baseline, and
-must commit and reopen a fresh candidate before it can authorize top-level
-target lookup. Neither the journal receipt nor parsed metadata can construct
-an authenticated prepared version or mutate an installation.
+Production-verifier proof adds strict-expiry equality, backward-clock,
+rollback/equivocation, old/new threshold, request-name, root-limit,
+duplicate/trailing/over-depth JSON, wrong-role, delegation, and mixed-parent
+adversarial cases. Advancing commits are rejected both before staging and at
+the selector-boundary guard. The journal-layer fresh-process discard runs every
+removal/sync barrier through returned-error and real `SIGABRT` recovery for
+both an empty journal and selected-N plus unselected-N+1, proving that the
+selected selector and receipt remain byte-exact. The TUF coordinator separately
+proves the full composition: historically authenticate selected N, discard an
+unselected N+1, reopen the same durable floor, and commit a wholly fresh N+1
+transcript. A selected floor also accepts a later dual-threshold root rotation,
+commits the newly signed lower roles, and rejects a version rollback against
+that new durable floor. Truncated write prefixes are discardable while hostile
+shapes are preserved. An independently generated Python-TUF 7.0.0
+corpus uses canonical key IDs, a complete old/new two-of-two root rotation,
+two-of-two lower roles, consistent-snapshot wire names, exact parent pins, a
+fully hashed dependency lock, and retained provenance/checksums. Rust pins the
+five metadata digests, proves positive commit/reopen, and derives missing-old,
+missing-new, and missing-lower-signature failures from those independent
+bytes.
+
+The journal and verifier now compose to produce only a durable metadata floor,
+not update authority. The next slice must embed the real stable trust root,
+bind one repository/channel transport transcript to verified top-level target
+records, and stream/cross-bind the pointer, release manifest, archive, embedded
+manifest, codesign/notary evidence, and exact payload inventory before it can
+construct an authenticated prepared version. Neither a receipt, parsed role,
+provisional candidate, nor durable baseline can perform target lookup or
+mutate an installation by itself.
 
 The initial stable metadata repository is served from GitHub Pages under the
 hf2q repository (for example,
@@ -1181,9 +1273,12 @@ before public self-update ships.
 
 1. The release manifest, install receipt/version marker, durable first
    activation, comparative TUF spike, shared lock, and production v1 metadata
-   journal land first. Next, implement and adversarially test the tokenized
-   transport-free authenticated-update verifier and application target
-   records, then the canonical Hugging Face reference
+   journal land first. The tokenized transport-free authenticated-update
+   verifier, sealed selector-boundary freshness capability, durable-baseline
+   replay, fresh-process discard recovery, and independent Python-TUF corpus
+   land next. Then embed the real stable root and implement the bounded
+   transport, application target records, streamed archive binding, canonical
+   Hugging Face reference
    grammar, prepared/external artifact provenance, calibration receipt, and
    session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated

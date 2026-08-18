@@ -12,7 +12,7 @@ pub(super) const MAX_ROOT_CHAIN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct MetadataGenerationReceiptV1 {
+pub(in crate::distribution) struct MetadataGenerationReceiptV1 {
     kind: String,
     schema_version: u32,
     state_layout_schema: u32,
@@ -64,25 +64,25 @@ impl MetadataGenerationReceiptV1 {
             package: "hf2q".to_owned(),
             sequence,
             predecessor_generation_sha256,
-            installation_id: candidate.installation_id.clone(),
-            state_root: candidate.state_root.clone(),
-            repository_id: candidate.repository_id.clone(),
-            channel: candidate.channel.clone(),
-            verification_started_at: candidate.verification_started_at.to_string(),
-            verification_completed_at: candidate.verification_completed_at.to_string(),
-            anchor_root: descriptor(&candidate.anchor_root),
-            root_chain: candidate.root_chain.iter().map(descriptor).collect(),
-            trusted_root: descriptor(&candidate.trusted_root),
-            timestamp: descriptor(&candidate.timestamp),
-            snapshot: descriptor(&candidate.snapshot),
-            targets: descriptor(&candidate.targets),
+            installation_id: candidate.installation_id().to_owned(),
+            state_root: candidate.state_root().to_owned(),
+            repository_id: candidate.repository_id().to_owned(),
+            channel: candidate.channel().to_owned(),
+            verification_started_at: candidate.verification_started_at().to_string(),
+            verification_completed_at: candidate.verification_completed_at().to_string(),
+            anchor_root: descriptor(candidate.anchor_root()),
+            root_chain: candidate.root_chain().iter().map(descriptor).collect(),
+            trusted_root: descriptor(candidate.trusted_root()),
+            timestamp: descriptor(candidate.timestamp()),
+            snapshot: descriptor(candidate.snapshot()),
+            targets: descriptor(candidate.targets()),
         };
         // Construction and hostile parsing deliberately share one invariant
         // path so an in-memory value cannot be committed and then rejected.
         Self::parse(&receipt.to_bytes()?)
     }
 
-    pub(super) fn parse(bytes: &[u8]) -> Result<Self, MetadataJournalError> {
+    pub(in crate::distribution) fn parse(bytes: &[u8]) -> Result<Self, MetadataJournalError> {
         require_bound(bytes, MAX_GENERATION_RECEIPT_BYTES, "generation receipt")?;
         let receipt: Self = serde_json::from_slice(bytes)
             .map_err(|_| MetadataJournalError::Invalid("generation receipt JSON is invalid"))?;
@@ -104,8 +104,68 @@ impl MetadataGenerationReceiptV1 {
         Ok(bytes)
     }
 
-    pub(super) fn sequence(&self) -> u64 {
+    pub(in crate::distribution) fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(in crate::distribution) fn verification_started_at(
+        &self,
+    ) -> Result<jiff::Timestamp, MetadataJournalError> {
+        parse_canonical_time(&self.verification_started_at)
+    }
+
+    pub(in crate::distribution) fn verification_completed_at(
+        &self,
+    ) -> Result<jiff::Timestamp, MetadataJournalError> {
+        parse_canonical_time(&self.verification_completed_at)
+    }
+
+    pub(in crate::distribution) fn validate_authenticated_role(
+        &self,
+        stored_name: &str,
+        request_name: &str,
+        version: u64,
+        bytes: &[u8],
+    ) -> Result<(), MetadataJournalError> {
+        let descriptor = match stored_name {
+            "anchor-root.json" => &self.anchor_root,
+            "trusted-root.json" => &self.trusted_root,
+            "timestamp.json" => &self.timestamp,
+            "snapshot.json" => &self.snapshot,
+            "targets.json" => &self.targets,
+            _ => {
+                return Err(MetadataJournalError::Invalid(
+                    "unknown authenticated metadata role",
+                ))
+            }
+        };
+        if descriptor.request_name != request_name || descriptor.version != version {
+            return Err(MetadataJournalError::Invalid(
+                "authenticated metadata identity differs from its receipt",
+            ));
+        }
+        validate_descriptor_bytes(descriptor, bytes)
+    }
+
+    pub(in crate::distribution) fn validate_authenticated_root(
+        &self,
+        index: usize,
+        request_name: &str,
+        version: u64,
+        bytes: &[u8],
+    ) -> Result<(), MetadataJournalError> {
+        let descriptor = self
+            .root_chain
+            .get(index)
+            .ok_or(MetadataJournalError::Invalid(
+                "authenticated root is absent from its receipt",
+            ))?;
+        if descriptor.request_name != request_name || descriptor.version != version {
+            return Err(MetadataJournalError::Invalid(
+                "authenticated root identity differs from its receipt",
+            ));
+        }
+        validate_descriptor_bytes(descriptor, bytes)
     }
 
     pub(super) fn digest(&self) -> Result<String, MetadataJournalError> {
@@ -123,7 +183,7 @@ impl MetadataGenerationReceiptV1 {
         self.predecessor_generation_sha256.as_deref()
     }
 
-    pub(super) fn validate_state_identity(
+    pub(in crate::distribution) fn validate_state_identity(
         &self,
         installation_id: &str,
         state_root: &str,
@@ -136,24 +196,27 @@ impl MetadataGenerationReceiptV1 {
         Ok(())
     }
 
-    pub(super) fn matches_candidate(&self, candidate: &VerifiedMetadataCandidate) -> bool {
-        self.installation_id == candidate.installation_id
-            && self.state_root == candidate.state_root
-            && self.repository_id == candidate.repository_id
-            && self.channel == candidate.channel
-            && self.verification_started_at == candidate.verification_started_at.to_string()
-            && self.verification_completed_at == candidate.verification_completed_at.to_string()
-            && descriptor_matches(&self.anchor_root, &candidate.anchor_root)
-            && self.root_chain.len() == candidate.root_chain.len()
+    pub(in crate::distribution) fn matches_candidate(
+        &self,
+        candidate: &VerifiedMetadataCandidate,
+    ) -> bool {
+        self.installation_id == candidate.installation_id()
+            && self.state_root == candidate.state_root()
+            && self.repository_id == candidate.repository_id()
+            && self.channel == candidate.channel()
+            && self.verification_started_at == candidate.verification_started_at().to_string()
+            && self.verification_completed_at == candidate.verification_completed_at().to_string()
+            && descriptor_matches(&self.anchor_root, candidate.anchor_root())
+            && self.root_chain.len() == candidate.root_chain().len()
             && self
                 .root_chain
                 .iter()
-                .zip(&candidate.root_chain)
+                .zip(candidate.root_chain())
                 .all(|(stored, actual)| descriptor_matches(stored, actual))
-            && descriptor_matches(&self.trusted_root, &candidate.trusted_root)
-            && descriptor_matches(&self.timestamp, &candidate.timestamp)
-            && descriptor_matches(&self.snapshot, &candidate.snapshot)
-            && descriptor_matches(&self.targets, &candidate.targets)
+            && descriptor_matches(&self.trusted_root, candidate.trusted_root())
+            && descriptor_matches(&self.timestamp, candidate.timestamp())
+            && descriptor_matches(&self.snapshot, candidate.snapshot())
+            && descriptor_matches(&self.targets, candidate.targets())
     }
 
     pub(super) fn validate_successor(
@@ -419,10 +482,10 @@ enum RoleKind {
 
 fn descriptor(role: &super::ExactMetadataRole) -> MetadataRoleDescriptorV1 {
     MetadataRoleDescriptorV1 {
-        request_name: role.request_name.clone(),
-        version: role.version,
-        length: role.bytes.len() as u64,
-        sha256: hex::encode(Sha256::digest(&role.bytes)),
+        request_name: role.request_name().to_owned(),
+        version: role.version(),
+        length: role.bytes().len() as u64,
+        sha256: hex::encode(Sha256::digest(role.bytes())),
     }
 }
 

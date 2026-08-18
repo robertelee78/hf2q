@@ -4,7 +4,7 @@ use super::super::schema::{
     MetadataGenerationReceiptV1, MetadataSelectorV1, MAX_GENERATION_RECEIPT_BYTES,
 };
 use super::super::MetadataJournalError;
-use super::fault::{trip_prune_entry, FaultPlan};
+use super::fault::{trip, trip_discard_entry, trip_prune_entry, FaultPlan, TestBarrier};
 use super::validation::{read_receipt_from_directory, read_role, verify_generation};
 use crate::distribution::install_state::file;
 use crate::distribution::install_state::unix::{self, Directory};
@@ -63,7 +63,30 @@ pub(super) fn verify_cleanup_residue(
     Ok(())
 }
 
-pub(super) fn verify_pending_shape(directory: &Directory) -> Result<(), MetadataJournalError> {
+const MAX_PARTIAL_ROOT_BYTES: usize = 1024 * 1024;
+const MAX_PARTIAL_ROLE_BYTES: usize = 4 * 1024 * 1024;
+const PENDING_FILE_ORDER: [&str; 6] = [
+    "anchor-root.json",
+    "trusted-root.json",
+    "timestamp.json",
+    "snapshot.json",
+    "targets.json",
+    "generation.json",
+];
+
+pub(super) struct PendingWritePrefix {
+    root_names: Vec<String>,
+    fixed_names: Vec<&'static str>,
+}
+
+/// Validate the exact prefix produced by `write_generation`.
+///
+/// Recovery may delete this state because it never became selected, but it
+/// must not treat arbitrary allowed subsets as transaction state. Reverse
+/// deletion preserves this same prefix invariant after every crash.
+pub(super) fn verify_pending_shape(
+    directory: &Directory,
+) -> Result<PendingWritePrefix, MetadataJournalError> {
     let names = unix::list_names(directory)?;
     let allowed = BTreeSet::from([
         "anchor-root.json".to_owned(),
@@ -79,19 +102,121 @@ pub(super) fn verify_pending_shape(directory: &Directory) -> Result<(), Metadata
             "pending metadata generation contains unexpected state",
         ));
     }
-    if names.contains("root-chain") {
-        let chain = unix::open_directory_at(directory, "root-chain", Some(0o700), true)?;
-        if unix::list_names(&chain)?.iter().any(|name| {
-            name.len() != 30
-                || !name.ends_with(".root.json")
-                || !name[..20].bytes().all(|byte| byte.is_ascii_digit())
-        }) {
+    if names.is_empty() {
+        return Ok(PendingWritePrefix {
+            root_names: Vec::new(),
+            fixed_names: Vec::new(),
+        });
+    }
+    if !names.contains("root-chain") {
+        return Err(MetadataJournalError::Invalid(
+            "pending metadata generation is not a write-order prefix",
+        ));
+    }
+
+    let fixed_count = names.len() - 1;
+    let expected_fixed: BTreeSet<_> = PENDING_FILE_ORDER[..fixed_count]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    let actual_fixed: BTreeSet<_> = names
+        .iter()
+        .filter(|name| name.as_str() != "root-chain")
+        .cloned()
+        .collect();
+    if actual_fixed != expected_fixed {
+        return Err(MetadataJournalError::Invalid(
+            "pending metadata generation is not a write-order prefix",
+        ));
+    }
+
+    let chain = unix::open_directory_at(directory, "root-chain", Some(0o700), true)?;
+    let root_names: Vec<_> = unix::list_names(&chain)?.into_iter().collect();
+    if root_names.len() > super::super::schema::MAX_ROOT_CHAIN {
+        return Err(MetadataJournalError::Invalid(
+            "pending metadata root history exceeds its lifetime bound",
+        ));
+    }
+    let mut prior_version = None;
+    for name in &root_names {
+        if name.len() != 30
+            || !name.ends_with(".root.json")
+            || !name[..20].bytes().all(|byte| byte.is_ascii_digit())
+        {
             return Err(MetadataJournalError::Invalid(
                 "pending metadata root history is invalid",
             ));
         }
+        let version: u64 = name[..20].parse().map_err(|_| {
+            MetadataJournalError::Invalid("pending metadata root history is invalid")
+        })?;
+        if version == 0
+            || prior_version.is_some_and(|prior: u64| prior.checked_add(1) != Some(version))
+        {
+            return Err(MetadataJournalError::Invalid(
+                "pending metadata root history is not gapless",
+            ));
+        }
+        let _ = file::read_regular_file(&chain, name, 0o600, MAX_PARTIAL_ROOT_BYTES)?;
+        prior_version = Some(version);
     }
-    Ok(())
+
+    let fixed_names = PENDING_FILE_ORDER[..fixed_count].to_vec();
+    for name in &fixed_names {
+        let maximum = match *name {
+            "generation.json" => MAX_GENERATION_RECEIPT_BYTES,
+            "targets.json" => MAX_PARTIAL_ROLE_BYTES,
+            _ => MAX_PARTIAL_ROOT_BYTES,
+        };
+        let _ = file::read_regular_file(directory, name, 0o600, maximum)?;
+    }
+
+    Ok(PendingWritePrefix {
+        root_names,
+        fixed_names,
+    })
+}
+
+/// Delete only a structurally exact, never-selected write prefix.
+///
+/// Files are removed in reverse creation order. Each unlink is followed by a
+/// parent-directory fsync, so every power-loss residue remains a prefix that
+/// this same routine can validate and continue.
+pub(super) fn discard_pending_generation(
+    generations: &Directory,
+    name: &str,
+    directory: &Directory,
+    faults: FaultPlan,
+) -> Result<(), MetadataJournalError> {
+    let prefix = verify_pending_shape(directory)?;
+    let mut removal_step = 0_usize;
+    for file_name in prefix.fixed_names.iter().rev() {
+        let maximum = match *file_name {
+            "generation.json" => MAX_GENERATION_RECEIPT_BYTES,
+            "targets.json" => MAX_PARTIAL_ROLE_BYTES,
+            _ => MAX_PARTIAL_ROOT_BYTES,
+        };
+        let (_, _, identity) = file::read_regular_file(directory, file_name, 0o600, maximum)?;
+        unix::remove_named_regular_file(directory, file_name, identity)?;
+        unix::sync_directory(directory)?;
+        trip_discard_entry(faults, &mut removal_step)?;
+    }
+    if unix::entry_identity(directory, "root-chain")?.is_some() {
+        let chain = unix::open_directory_at(directory, "root-chain", Some(0o700), true)?;
+        for root_name in prefix.root_names.iter().rev() {
+            let (_, _, identity) =
+                file::read_regular_file(&chain, root_name, 0o600, MAX_PARTIAL_ROOT_BYTES)?;
+            unix::remove_named_regular_file(&chain, root_name, identity)?;
+            unix::sync_directory(&chain)?;
+            trip_discard_entry(faults, &mut removal_step)?;
+        }
+        unix::remove_empty_directory(directory, "root-chain", &chain)?;
+        unix::sync_directory(directory)?;
+        trip_discard_entry(faults, &mut removal_step)?;
+    }
+    unix::remove_empty_directory(generations, name, directory)?;
+    unix::sync_directory(generations)?;
+    trip(faults, TestBarrier::SuccessorDiscardDirectory)
 }
 
 pub(super) fn remove_generation(

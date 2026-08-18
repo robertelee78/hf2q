@@ -48,6 +48,16 @@ impl LockedInstallation {
         &self.update
     }
 
+    /// Flush all prior state-root directory barriers to stable media through
+    /// the exact lock file that anchors this installation transaction.
+    ///
+    /// This is the recovery endpoint when no selected metadata selector
+    /// exists yet, so there is no `current.json` file available to full-sync.
+    pub(super) fn full_sync_endpoint(&self) -> Result<(), InstallStateError> {
+        let _ = self.reopen()?;
+        unix::full_sync_file(&self._lock)
+    }
+
     /// Reopen every named component from the originally authorized path.
     ///
     /// Holding a descriptor is not enough: a same-user namespace replacement
