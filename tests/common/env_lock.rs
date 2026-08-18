@@ -8,6 +8,13 @@
 //! multiple test threads run by default; concurrent env mutations from
 //! different tests race and produce non-deterministic state.
 //!
+//! Prefer not to mutate the environment at all when the behavior can be
+//! expressed as a pure resolver over explicit inputs. A 2026-08-17 unit-test
+//! race in `src/input/hf_download.rs` was fixed by extracting
+//! `resolve_hf_cache_dir_from_inputs`; its precedence and fallback tests now
+//! supply values directly. Use this lock only when the environment boundary
+//! itself is the behavior under test.
+//!
 //! Historical bug (2026-05-08, surfaced in v0.1 release-plan §2.1
 //! baseline run): `tests/peer_parity_gates.rs` had `static ENV_LOCK:
 //! Mutex<()>` and `tests/common/llama_cpp_runner.rs::tests` had its own
