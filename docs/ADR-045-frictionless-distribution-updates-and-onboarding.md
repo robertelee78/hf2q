@@ -1,11 +1,12 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
 - Status: Proposed; product interview, shell-completion bootstrap,
-  distribution schemas, first-activation transaction, and signed-update
-  verifier selection are reconciled; production update/install/onboarding
-  implementation and exact-artifact proof remain pending
+  distribution schemas, first-activation transaction, signed-update verifier
+  selection, shared installation lock, and durable metadata-journal primitives
+  are reconciled; the production verifier, public update/install/onboarding
+  implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
-- Updated: 2026-08-17
+- Updated: 2026-08-18
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/ADR-044-qwen38-native.md`,
   `docs/ADR-017-persistent-block-prefix-cache.md`,
@@ -256,7 +257,18 @@ hf2q-owned state below one root, except for the user PATH entry point:
 ├── update/
 │   ├── install.lock
 │   ├── .noreplace-source
-│   └── .noreplace-target
+│   ├── .noreplace-target
+│   └── metadata/
+│       ├── current.json
+│       └── generations/
+│           └── N/
+│               ├── generation.json
+│               ├── anchor-root.json
+│               ├── root-chain/R.root.json
+│               ├── trusted-root.json
+│               ├── timestamp.json
+│               ├── snapshot.json
+│               └── targets.json
 └── config.toml
 ~/.local/bin/hf2q
 ```
@@ -357,6 +369,14 @@ or non-cooperating swaps, but no name-based POSIX protocol can defeat an
 actively malicious same-EUID process in the final check-to-rename instruction
 window. That case is part of the already excluded fully compromised local
 account threat, not an ownership guarantee claimed by this capability.
+
+Activation and authenticated-metadata transitions use one non-cloneable,
+descriptor-backed lock capability over the same `update/install.lock` entry.
+The first-activation behavior does not change when that lock ownership is
+shared: the root, named `update` directory, and lock inode are reopened and
+revalidated before either bounded context reaches a commit point. A metadata
+refresh therefore cannot race an installation transition, and neither path may
+acquire an independent lock with a different namespace meaning.
 
 Install-receipt v1 has independent receipt, state-layout, and
 installation-layout schema integers. It records a local-only random
@@ -616,6 +636,94 @@ between ordinary read authority and lock-held recovery: a complete published
 successor without its pending selector is ambiguous and fails closed for a
 reader, while an exact retry may reconstruct and commit it only after
 reverification under the installation lock.
+
+The production v1 local metadata journal is frozen independently of the
+network verifier. It remains crate-private and unreachable from command
+dispatch. Its canonical generation receipt is compact JSON followed by one LF
+and contains:
+
+- kind `hf2q.update-metadata-generation`, schema version 1, state-layout
+  schema 1, and package `hf2q`;
+- the nonzero 64-bit generation sequence and, except for sequence one, the
+  exact SHA-256 of the predecessor generation receipt;
+- the installation UUID and canonical state root, preventing cross-root
+  journal substitution;
+- logical repository ID `hf2q` and channel `stable`; transport origins and a
+  future branded mirror remain repository policy, not durable trust identity;
+- exact canonical RFC 3339 verification start and completion instants with
+  subsecond precision; a successor start cannot precede prior completion, and
+  completion cannot precede start; and
+- exact request name, positive role version, byte length, and lowercase
+  SHA-256 descriptors for the embedded anchor root, complete gapless root
+  history, final trusted root, timestamp, snapshot, and top-level targets.
+
+The selector has kind `hf2q.update-metadata-selector`, schema version 1,
+sequence, and the exact generation-receipt SHA-256. Receipts are limited to
+64 KiB, selectors to 16 KiB, roots/timestamp/snapshot to 1 MiB each, and
+targets to 4 MiB. Hostile input rejects unknown or duplicate fields, trailing
+documents, noncanonical encoding or timestamps, zero versions, version/name
+disagreement, wrong repository/channel/root identity, invalid digests, and
+rollback or same-version byte equivocation. The complete gapless root history
+starts at the compiled-in anchor and is capped at 256 lifetime rotations.
+That exceptional root-rotation recovery bound is not an update-count limit;
+ordinary metadata generations use a checked 64-bit sequence and do not stop
+after an arbitrary number of updates.
+
+All journal directories are `0700`; regular files are `0600` and single-link.
+Both are owned by the effective user, opened no-follow, and on the state-root
+device. A generation is written or exact-prefix-resumed below
+`generations/.pending-N`, each file is synced, the exact inventory is verified,
+and it is published by no-replace rename. The staged `.current-N.json` is then
+synced and rebound to its named inode. Replacing `current.json` is the sole
+successor commit point; the initial selector uses no-replace. Precommit checks
+reopen the authorized root, `update`, `metadata`, `generations`, published
+generation, lock, and staged selector, rejecting stale descriptors or a
+changed namespace. Postcommit checks reopen and reverify the selection and
+repeat file, generation, parent, update, root, and `F_FULLFSYNC` barriers. A
+postcommit failure is reported as
+`CommittedDurabilityUnknown { sequence }`. Every subsequent lock-held
+transition must repair that selected generation's durability before cleanup or
+new staging; an exact retry then returns `AlreadyCommitted`.
+
+The journal remains bounded without the spike's disposable 1,024-update
+exhaustion rule. During a transition it permits only the selected generation,
+one exact successor transaction, and one exact predecessor cleanup residue.
+An ordinary unlocked reader rejects a partial or published-but-unselected
+successor; lock-held recovery may resume it only when the candidate, receipt,
+files, predecessor digest, and selector are byte-exact. After a successor is
+selected, its independently verifiable complete root history and role floors
+allow the old generation to be renamed no-replace to the one derived
+`.prune-(N-1)` name and removed through an exact, descriptor-relative,
+no-follow inventory. A crash before or during cleanup leaves the newer
+selection authoritative and a bounded, receipt-bound cleanup residue; the
+next lock-held transition completes it before staging anything new. Every
+entry removal is followed by its containing-directory sync; cleanup then syncs
+the generation, metadata, update, and state-root directories and ends at a
+reopened, byte-exact selected-selector `F_FULLFSYNC` before later selection may
+advance. No generic path or recursive deletion API is granted, and corrupt
+selected state never falls back to an older floor.
+
+Acceptance proof pins literal v1 receipt and selector bytes, exercises bounded
+hostile parsing and namespace/inode/attribute swaps, and runs every initial,
+successor, and postcommit barrier through both returned-error recovery and real
+child-process abort recovery. The single-rotation matrix covers every cleanup
+barrier, while an independent nine-root history covers every root-file removal,
+the root-history-directory boundary, every role and receipt removal, and exact
+retry through both failure modes. The process matrix requires an actual
+`SIGABRT`, and a separately corrupted surviving root-history suffix fails closed
+without deleting its diagnostic residue. Cross-process tests prove that
+activation and metadata paths exclude one another through the shared lock. A
+blocking test also commits 1,025 successive stable-root generations, retains
+one selected generation, and demonstrates that the discarded spike's 1,024
+limit is not present in the production journal; schema proof separately accepts
+exactly 256 lifetime root rotations and rejects 257.
+
+The journal currently returns structurally complete stored bytes, not update
+authority. The next slice must reconstruct those exact bytes through the
+selected transport-free TUF verifier before producing a durable baseline, and
+must commit and reopen a fresh candidate before it can authorize top-level
+target lookup. Neither the journal receipt nor parsed metadata can construct
+an authenticated prepared version or mutate an installation.
 
 The initial stable metadata repository is served from GitHub Pages under the
 hf2q repository (for example,
@@ -1072,9 +1180,10 @@ before public self-update ships.
 ## Implementation sequence
 
 1. The release manifest, install receipt/version marker, durable first
-   activation, and comparative TUF spike land first. Next, freeze and
-   adversarially test the production authenticated-update adapter and
-   application target records, then the canonical Hugging Face reference
+   activation, comparative TUF spike, shared lock, and production v1 metadata
+   journal land first. Next, implement and adversarially test the tokenized
+   transport-free authenticated-update verifier and application target
+   records, then the canonical Hugging Face reference
    grammar, prepared/external artifact provenance, calibration receipt, and
    session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated

@@ -191,6 +191,9 @@ tempfile = "3"
 # corpus drift assertions, promoted to runtime deps here.
 sha2 = "0.10"
 hex = "0.4"
+# Crash-durable update metadata records preserve the exact sampled RFC 3339
+# instant, including subsecond precision, as a monotonic restart clock floor.
+jiff = { version = "0.2", features = ["serde"] }
 
 # ADR-005 Phase 2c T1.4: HTTPS image URL fetch in vision/mod.rs.
 # Promoted from dev-dep (where it served only E2E streaming tests) to runtime
