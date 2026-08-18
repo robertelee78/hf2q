@@ -1,4 +1,4 @@
-use super::super::schema::{MetadataSelectorV1, MAX_SELECTOR_BYTES};
+use super::super::schema::{MetadataSelectorV2, MAX_SELECTOR_BYTES};
 use super::super::{MetadataJournalError, MetadataRestartCleanup};
 use super::cleanup::discard_pending_generation;
 use super::fault::{trip, FaultPlan, TestBarrier};
@@ -64,7 +64,7 @@ impl LockedMetadataJournal {
             let successor =
                 unix::open_directory_at(&live.generations, &generation_name, Some(0o700), true)?;
             let receipt = read_receipt_from_directory(&successor)?;
-            let expected = MetadataSelectorV1::new(sequence, receipt.digest()?)?.to_bytes()?;
+            let expected = MetadataSelectorV2::new(sequence, receipt.digest()?)?.to_bytes()?;
             let (_, actual, identity) = file::read_regular_file(
                 &live.metadata,
                 &pending_selector,
@@ -111,7 +111,7 @@ impl LockedMetadataJournal {
 
     fn finish_discard_barriers(
         &self,
-        expected_selected: Option<&MetadataSelectorV1>,
+        expected_selected: Option<&MetadataSelectorV2>,
         faults: FaultPlan,
     ) -> Result<(), MetadataJournalError> {
         let live = self.reopen_namespace()?;

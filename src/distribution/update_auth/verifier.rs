@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::VecDeque;
 
@@ -94,6 +95,8 @@ pub(super) struct VerificationState {
     pub(super) trusted: TrustedMetadataSet,
     pub(super) anchor_root: ExactMetadataRole,
     pub(super) root_chain: Vec<ExactMetadataRole>,
+    pub(super) timestamp_snapshot_floor_base_root: Option<sigstore_tuf::metadata::Root>,
+    pub(super) timestamp_snapshot_floor_reset_from_root_version: Option<u64>,
     pub(super) timestamp_floor: Option<RoleFloor>,
     pub(super) snapshot_floor: Option<RoleFloor>,
     pub(super) targets_floor: Option<RoleFloor>,
@@ -126,6 +129,8 @@ pub(super) fn begin_from_anchor_with_clock(
         trusted,
         anchor_root: exact_root(anchor.bytes(), parsed.signed.version),
         root_chain: Vec::new(),
+        timestamp_snapshot_floor_base_root: None,
+        timestamp_snapshot_floor_reset_from_root_version: None,
         timestamp_floor: None,
         snapshot_floor: None,
         targets_floor: None,
@@ -176,6 +181,7 @@ pub(super) fn respond(
     match (state.phase, response) {
         (Phase::Root, MetadataResponse::ConfirmedNotFound) => {
             profile::require_fresh(state.trusted.root(), state.started_at)?;
+            apply_online_role_recovery(&mut state)?;
             state.phase = Phase::Timestamp;
             Ok(request(
                 state,
@@ -364,6 +370,7 @@ fn finish(mut state: VerificationState) -> Result<VerificationStep, TufVerifierE
         state.anchor_root,
         state.root_chain,
         trusted_root,
+        state.timestamp_snapshot_floor_reset_from_root_version,
         state
             .timestamp
             .take()
@@ -377,6 +384,52 @@ fn finish(mut state: VerificationState) -> Result<VerificationStep, TufVerifierE
             .take()
             .ok_or(TufVerifierError::IncompleteTranscript)?,
     )))
+}
+
+fn apply_online_role_recovery(state: &mut VerificationState) -> Result<(), TufVerifierError> {
+    if state.timestamp_floor.is_none() && state.snapshot_floor.is_none() {
+        return Ok(());
+    }
+    let base = state
+        .timestamp_snapshot_floor_base_root
+        .as_ref()
+        .ok_or(TufVerifierError::AuthenticationFailed)?;
+    // TUF 1.0.36 root-update step 11 permits recovery from an online
+    // fast-forward compromise after root authority revokes the old online
+    // quorum. Compare the selected predecessor directly with the final root:
+    // an additive or transient rotation cannot erase rollback floors.
+    if online_role_binding_invalidated(base, state.trusted.root())? {
+        state.timestamp_snapshot_floor_reset_from_root_version = Some(base.version);
+        state.timestamp_floor = None;
+        state.snapshot_floor = None;
+    }
+    Ok(())
+}
+
+pub(super) fn online_role_binding_invalidated(
+    old: &sigstore_tuf::metadata::Root,
+    new: &sigstore_tuf::metadata::Root,
+) -> Result<bool, TufVerifierError> {
+    Ok(role_binding_invalidated(old, new, "timestamp")?
+        || role_binding_invalidated(old, new, "snapshot")?)
+}
+
+fn role_binding_invalidated(
+    old: &sigstore_tuf::metadata::Root,
+    new: &sigstore_tuf::metadata::Root,
+    role: &str,
+) -> Result<bool, TufVerifierError> {
+    let old_binding = old.role(role).ok_or(TufVerifierError::MalformedMetadata)?;
+    let new_binding = new.role(role).ok_or(TufVerifierError::MalformedMetadata)?;
+    let old_ids: BTreeSet<_> = old_binding.keyids.iter().collect();
+    let surviving = new_binding
+        .keyids
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|key_id| old_ids.contains(key_id) && old.keys.get(*key_id) == new.keys.get(*key_id))
+        .count();
+    Ok(surviving < new_binding.threshold)
 }
 
 fn require_response_bound(spec: &RequestSpec, bytes: &[u8]) -> Result<(), TufVerifierError> {

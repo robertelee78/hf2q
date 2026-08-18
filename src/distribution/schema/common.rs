@@ -12,7 +12,7 @@ pub(crate) struct SchemaValueError {
 }
 
 impl SchemaValueError {
-    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(field: &'static str, reason: impl Into<String>) -> Self {
         Self {
             field,
             reason: reason.into(),
@@ -74,7 +74,7 @@ impl GitCommit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseVersion(String);
 
@@ -108,6 +108,22 @@ impl ReleaseVersion {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn parsed(&self) -> semver::Version {
+        semver::Version::parse(&self.0).expect("validated release version")
+    }
+}
+
+impl PartialOrd for ReleaseVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReleaseVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.parsed().cmp(&other.parsed())
     }
 }
 
@@ -149,6 +165,12 @@ impl UpdateChannel {
                 field,
                 "v1 supports only the stable channel",
             )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
         }
     }
 }

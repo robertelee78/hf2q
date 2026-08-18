@@ -2,6 +2,18 @@ use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+mod recovery;
+pub(super) use recovery::{
+    online_key_rotation_recovery, targets_key_rotation_with_lower_rollback,
+    transient_online_rotation_with_lower_rollback, unrelated_root_rotation_with_lower_rollback,
+};
+mod releases;
+pub(super) use releases::{
+    stable_release_repository, stable_release_repository_with_expiry,
+    stable_release_repository_with_mismatched_pointer, stable_release_successor_pair,
+    RetainedReleaseMutation,
+};
+
 const EXPIRES: &str = "2999-01-01T00:00:00Z";
 pub(super) const STATIC_KEY_ID: &str =
     "f506cd7b600c9ae23efbe499cbe2d1cb81e5fafde8d32f40e68b86ef6f93e2a2";
@@ -14,6 +26,13 @@ pub(super) struct RepositoryFixture {
     pub(super) targets: Vec<u8>,
     pub(super) consistent_snapshot: bool,
     pub(super) metadata_version: u64,
+}
+
+pub(super) struct OnlineBindingChangeCase {
+    pub(super) label: &'static str,
+    pub(super) old: Vec<u8>,
+    pub(super) new: Vec<u8>,
+    pub(super) changed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -218,13 +237,109 @@ pub(super) fn anchor_at_version(version: u64) -> Vec<u8> {
     envelope(root_value(version, &[&key], 1, false), &[&key])
 }
 
+pub(super) fn online_binding_change_cases() -> Vec<OnlineBindingChangeCase> {
+    let root = TestKey::seeded("binding-root", 0xc1);
+    let timestamp_a = TestKey::seeded("binding-timestamp-a", 0xc2);
+    let timestamp_b = TestKey::seeded("binding-timestamp-b", 0xc3);
+    let timestamp_a_rekeyed = TestKey::seeded("binding-timestamp-a", 0xc4);
+    let timestamp_c = TestKey::seeded("binding-timestamp-c", 0xc5);
+    let snapshot_a = TestKey::seeded("binding-snapshot-a", 0xc6);
+    let snapshot_b = TestKey::seeded("binding-snapshot-b", 0xc7);
+    let targets = TestKey::seeded("binding-targets", 0xc8);
+
+    let mut base = root_value_for_roles(
+        1,
+        &[&root],
+        &[&timestamp_a, &timestamp_b],
+        &[&snapshot_a],
+        &[&targets],
+        false,
+    );
+    base["roles"]["timestamp"]["threshold"] = json!(1);
+    let old = envelope(base.clone(), &[&root]);
+
+    let mut version_only = base.clone();
+    version_only["version"] = json!(2);
+
+    let mut reordered = version_only.clone();
+    reordered["roles"]["timestamp"]["keyids"] =
+        json!([timestamp_b.id.clone(), timestamp_a.id.clone()]);
+
+    let mut threshold_only = version_only.clone();
+    threshold_only["roles"]["timestamp"]["threshold"] = json!(2);
+
+    let mut rekeyed = version_only.clone();
+    rekeyed["keys"][&timestamp_a.id] = timestamp_a_rekeyed.key_value();
+
+    let mut rekeyed_quorum = rekeyed.clone();
+    rekeyed_quorum["roles"]["timestamp"]["threshold"] = json!(2);
+
+    let mut additive = version_only.clone();
+    additive["keys"][&timestamp_c.id] = timestamp_c.key_value();
+    additive["roles"]["timestamp"]["keyids"] = json!([
+        timestamp_a.id.clone(),
+        timestamp_b.id.clone(),
+        timestamp_c.id.clone()
+    ]);
+
+    let mut replacement = version_only.clone();
+    replacement["keys"][&timestamp_c.id] = timestamp_c.key_value();
+    replacement["roles"]["timestamp"]["keyids"] = json!([timestamp_c.id.clone()]);
+
+    let mut threshold_revocation = additive.clone();
+    threshold_revocation["roles"]["timestamp"]["threshold"] = json!(3);
+
+    let mut snapshot_only = version_only.clone();
+    snapshot_only["keys"][&snapshot_b.id] = snapshot_b.key_value();
+    snapshot_only["roles"]["snapshot"]["keyids"] =
+        json!([snapshot_a.id.clone(), snapshot_b.id.clone()]);
+
+    let mut snapshot_replacement = version_only.clone();
+    snapshot_replacement["keys"][&snapshot_b.id] = snapshot_b.key_value();
+    snapshot_replacement["roles"]["snapshot"]["keyids"] = json!([snapshot_b.id.clone()]);
+
+    let mut consistent_snapshot_only = version_only.clone();
+    consistent_snapshot_only["consistent_snapshot"] = json!(true);
+
+    [
+        ("root-version-only", version_only, false),
+        ("key-order-only", reordered, false),
+        ("surviving-threshold-change", threshold_only, false),
+        ("surviving-same-key-id-rekey", rekeyed, false),
+        ("same-key-id-rekey-invalidates-quorum", rekeyed_quorum, true),
+        ("timestamp-key-addition", additive, false),
+        ("timestamp-key-replacement", replacement, true),
+        ("timestamp-threshold-revocation", threshold_revocation, true),
+        ("snapshot-key-addition", snapshot_only, false),
+        ("snapshot-key-replacement", snapshot_replacement, true),
+        ("consistent-snapshot-only", consistent_snapshot_only, false),
+    ]
+    .into_iter()
+    .map(|(label, new, changed)| OnlineBindingChangeCase {
+        label,
+        old: old.clone(),
+        new: envelope(new, &[&root]),
+        changed,
+    })
+    .collect()
+}
+
 fn lower_roles(version: u64, expires: &str, signers: &[&TestKey]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    lower_roles_with_targets(version, expires, signers, json!({}))
+}
+
+fn lower_roles_with_targets(
+    version: u64,
+    expires: &str,
+    signers: &[&TestKey],
+    targets_value: Value,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let targets = envelope(
         json!({
             "_type": "targets",
             "expires": expires,
             "spec_version": "1.0.0",
-            "targets": {},
+            "targets": targets_value,
             "version": version
         }),
         signers,
@@ -248,6 +363,56 @@ fn lower_roles(version: u64, expires: &str, signers: &[&TestKey]) -> (Vec<u8>, V
             "version": version
         }),
         signers,
+    );
+    (timestamp, snapshot, targets)
+}
+
+fn target_descriptor(bytes: &[u8]) -> Value {
+    json!({
+        "hashes": {"sha256": hex::encode(Sha256::digest(bytes))},
+        "length": bytes.len()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_roles_for_roles(
+    timestamp_version: u64,
+    snapshot_version: u64,
+    targets_version: u64,
+    expires: &str,
+    timestamp_signers: &[&TestKey],
+    snapshot_signers: &[&TestKey],
+    targets_signers: &[&TestKey],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let targets = envelope(
+        json!({
+            "_type": "targets",
+            "expires": expires,
+            "spec_version": "1.0.0",
+            "targets": {},
+            "version": targets_version
+        }),
+        targets_signers,
+    );
+    let snapshot = envelope(
+        json!({
+            "_type": "snapshot",
+            "expires": expires,
+            "meta": {"targets.json": descriptor(targets_version, &targets)},
+            "spec_version": "1.0.0",
+            "version": snapshot_version
+        }),
+        snapshot_signers,
+    );
+    let timestamp = envelope(
+        json!({
+            "_type": "timestamp",
+            "expires": expires,
+            "meta": {"snapshot.json": descriptor(snapshot_version, &snapshot)},
+            "spec_version": "1.0.0",
+            "version": timestamp_version
+        }),
+        timestamp_signers,
     );
     (timestamp, snapshot, targets)
 }
@@ -285,6 +450,46 @@ fn root_value(
         },
         "spec_version": "1.0.0",
         "version": version
+    })
+}
+
+fn root_value_for_roles(
+    version: u64,
+    root_keys: &[&TestKey],
+    timestamp_keys: &[&TestKey],
+    snapshot_keys: &[&TestKey],
+    targets_keys: &[&TestKey],
+    consistent_snapshot: bool,
+) -> Value {
+    let mut key_values = Map::new();
+    for key in root_keys
+        .iter()
+        .chain(timestamp_keys)
+        .chain(snapshot_keys)
+        .chain(targets_keys)
+    {
+        key_values.insert(key.id.clone(), key.key_value());
+    }
+    json!({
+        "_type": "root",
+        "consistent_snapshot": consistent_snapshot,
+        "expires": EXPIRES,
+        "keys": key_values,
+        "roles": {
+            "root": role_binding(root_keys),
+            "snapshot": role_binding(snapshot_keys),
+            "targets": role_binding(targets_keys),
+            "timestamp": role_binding(timestamp_keys)
+        },
+        "spec_version": "1.0.0",
+        "version": version
+    })
+}
+
+fn role_binding(keys: &[&TestKey]) -> Value {
+    json!({
+        "keyids": keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>(),
+        "threshold": keys.len()
     })
 }
 

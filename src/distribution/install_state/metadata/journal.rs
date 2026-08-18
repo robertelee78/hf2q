@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use super::schema::{MetadataGenerationReceiptV1, MetadataSelectorV1, MAX_SELECTOR_BYTES};
+use super::schema::{MetadataGenerationReceiptV2, MetadataSelectorV2, MAX_SELECTOR_BYTES};
 use super::{
     MetadataCommitOutcome, MetadataJournalError, MetadataRestartCleanup,
     MetadataStateAuthorization, VerifiedMetadataCandidate,
@@ -216,7 +216,7 @@ impl LockedMetadataJournal {
             HistoryMode::LockedRecovery,
         )?;
         if let Some(stored) = &selected {
-            MetadataGenerationReceiptV1::parse(&stored.generation_receipt)?
+            MetadataGenerationReceiptV2::parse(&stored.generation_receipt)?
                 .validate_state_identity(&self.installation_id, &self.state_root)?;
         }
         Ok(selected)
@@ -287,7 +287,7 @@ impl LockedMetadataJournal {
         let predecessor = prior
             .as_ref()
             .map(|selector| selector.generation_sha256().to_owned());
-        let receipt = MetadataGenerationReceiptV1::new(sequence, predecessor, candidate)?;
+        let receipt = MetadataGenerationReceiptV2::new(sequence, predecessor, candidate)?;
         if let (Some(selector), Some(prior_receipt)) = (&prior, &prior_receipt) {
             receipt.validate_successor(prior_receipt, selector.generation_sha256())?;
         }
@@ -328,7 +328,7 @@ impl LockedMetadataJournal {
             directory
         };
 
-        let selector = MetadataSelectorV1::new(sequence, receipt_digest)?;
+        let selector = MetadataSelectorV2::new(sequence, receipt_digest)?;
         let selector_bytes = selector.to_bytes()?;
         let pending_selector = format!(".current-{sequence:020}.json");
         let selector_file =

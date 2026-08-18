@@ -31,9 +31,14 @@ fn process_abort_at_every_initial_and_successor_barrier_is_recoverable() {
             } else {
                 ("2026-08-17T20:00:01Z", "2026-08-17T20:00:02Z", 3, 4)
             };
+            let mut retry_candidate =
+                candidate_at(&root, started, completed, root_version, timestamp_version);
+            if sequence == 2 {
+                retry_candidate.set_timestamp_snapshot_floor_reset_for_test(Some(2));
+            }
             let retry = commit_candidate_for_test(
                 authorization(&root),
-                candidate_at(&root, started, completed, root_version, timestamp_version),
+                retry_candidate,
                 FaultPlan::default(),
             )
             .unwrap_or_else(|error| {
@@ -45,13 +50,19 @@ fn process_abort_at_every_initial_and_successor_barrier_is_recoverable() {
                     | MetadataCommitOutcome::AlreadyCommitted { sequence: actual }
                     if actual == sequence
             ));
-            assert_eq!(
-                read_selected(&authorization(&root))
-                    .expect("read recovered selection")
-                    .expect("recovered generation")
-                    .sequence,
-                sequence
-            );
+            let selected = read_selected(&authorization(&root))
+                .expect("read recovered selection")
+                .expect("recovered generation");
+            assert_eq!(selected.sequence, sequence);
+            if sequence == 2 {
+                assert_eq!(
+                    MetadataGenerationReceiptV2::parse(selected.generation_receipt())
+                        .expect("selected reset receipt parses")
+                        .timestamp_snapshot_floor_reset_from_root_version(),
+                    Some(2),
+                    "successor crash recovery preserves the sealed reset evidence"
+                );
+            }
             assert_eq!(
                 std::fs::read_dir(root.join("update/metadata/generations"))
                     .expect("bounded recovered inventory")
@@ -225,9 +236,15 @@ fn metadata_crash_worker_process() {
         .ok()
         .map(|value| value.parse::<u64>().expect("numeric timestamp version"))
         .unwrap_or(default_timestamp_version);
+    let mut candidate = candidate_at(root, started, completed, root_version, timestamp_version);
+    if let Ok(version) = std::env::var("HF2Q_METADATA_RESET_FROM_VERSION") {
+        candidate.set_timestamp_snapshot_floor_reset_for_test(Some(
+            version.parse().expect("numeric reset root version"),
+        ));
+    }
     let _ = commit_candidate_for_test(
         authorization(root),
-        candidate_at(root, started, completed, root_version, timestamp_version),
+        candidate,
         FaultPlan {
             barrier: Some(barrier),
         },
@@ -300,7 +317,12 @@ fn metadata_lock_worker_process() {
 
 fn spawn_crash_worker(root: &Path, sequence: u64, barrier: Barrier) -> std::process::Child {
     let (root_version, timestamp_version) = if sequence == 1 { (2, 3) } else { (3, 4) };
-    spawn_crash_worker_with_profile(root, sequence, barrier, root_version, timestamp_version)
+    let mut command =
+        crash_worker_command(root, sequence, barrier, root_version, timestamp_version);
+    if sequence == 2 {
+        command.env("HF2Q_METADATA_RESET_FROM_VERSION", "2");
+    }
+    command.spawn().expect("spawn crash worker")
 }
 
 fn spawn_crash_worker_with_profile(
@@ -310,6 +332,18 @@ fn spawn_crash_worker_with_profile(
     root_version: u64,
     timestamp_version: u64,
 ) -> std::process::Child {
+    crash_worker_command(root, sequence, barrier, root_version, timestamp_version)
+        .spawn()
+        .expect("spawn crash worker")
+}
+
+fn crash_worker_command(
+    root: &Path,
+    sequence: u64,
+    barrier: Barrier,
+    root_version: u64,
+    timestamp_version: u64,
+) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     command
         .arg("--exact")
@@ -329,7 +363,7 @@ fn spawn_crash_worker_with_profile(
         .env("HF2Q_METADATA_ABORT_ON_FAULT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    command.spawn().expect("spawn crash worker")
+    command
 }
 
 fn spawn_lock_worker(root: &Path, ready: &Path, mode: &str) -> std::process::Child {

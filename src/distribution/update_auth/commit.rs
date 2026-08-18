@@ -6,7 +6,7 @@ use super::model::{
 use super::replay::{begin_from_selected_with_clock, replay_selected};
 use super::verifier::{begin_from_anchor_with_clock, ClockSource};
 use super::TufVerifierError;
-use crate::distribution::install_state::metadata::schema::MetadataGenerationReceiptV1;
+use crate::distribution::install_state::metadata::schema::MetadataGenerationReceiptV2;
 use crate::distribution::install_state::metadata::{
     lock_metadata_state, read_selected, MetadataCommitOutcome, MetadataRestartCleanup,
     MetadataStateAuthorization, StoredMetadataGeneration,
@@ -202,6 +202,7 @@ fn reauthenticate_candidate(
     let selected_root_count = selected
         .as_ref()
         .map_or(0, |stored| stored.root_chain().len());
+    let prior_targets = selected.as_ref().map(|stored| stored.targets().to_vec());
     if candidate.root_chain().len() < selected_root_count {
         return Err(TufVerifierError::RollbackOrEquivocation);
     }
@@ -235,6 +236,12 @@ fn reauthenticate_candidate(
     )?;
     match step {
         VerificationStep::Candidate(reverified) if reverified.exactly_matches(candidate) => {
+            if let Some(prior_targets) = prior_targets {
+                super::target_set::require_retained_release_floor(
+                    &prior_targets,
+                    reverified.targets().bytes(),
+                )?;
+            }
             Ok(CandidateDisposition::Advancing)
         }
         VerificationStep::Candidate(_) | VerificationStep::Request(_) => {
@@ -308,7 +315,7 @@ fn authenticate_stored_selection(
     anchor: &EmbeddedTrustRoot,
     stored: StoredMetadataGeneration,
 ) -> Result<DurableMetadataBaseline, TufVerifierError> {
-    let receipt = MetadataGenerationReceiptV1::parse(stored.generation_receipt())?;
+    let receipt = MetadataGenerationReceiptV2::parse(stored.generation_receipt())?;
     let sequence = stored.sequence();
     let generation_sha256 = Sha256::digest(stored.generation_receipt()).into();
     let completed = receipt.verification_completed_at()?;
@@ -354,7 +361,7 @@ fn selection_matches_candidate(
     stored: &StoredMetadataGeneration,
     candidate: &VerifiedMetadataCandidate,
 ) -> Result<bool, TufVerifierError> {
-    let receipt = MetadataGenerationReceiptV1::parse(stored.generation_receipt())?;
+    let receipt = MetadataGenerationReceiptV2::parse(stored.generation_receipt())?;
     Ok(receipt.matches_candidate(candidate)
         && stored.anchor_root() == candidate.anchor_root().bytes()
         && stored.trusted_root() == candidate.trusted_root().bytes()

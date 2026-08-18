@@ -4,8 +4,10 @@
   distribution schemas, first-activation transaction, signed-update verifier
   selection, shared installation lock, durable metadata journal, dormant
   transport-free production verifier, commit-freshness capability, and
-  restart-discard recovery are reconciled; the real release trust root,
-  network transport, application target/archive binding, public
+  restart-discard, root-authorized online-role recovery, and dormant
+  channel-pointer/selected-target binding are reconciled; the real release
+  trust root, network transport, external manifest and streamed archive byte
+  binding, public
   update/install/onboarding implementation, and exact-artifact proof remain
   pending
 - Date: 2026-08-17
@@ -511,10 +513,11 @@ expiry, versions are monotonic, and the target binds the exact archive and
 release-manifest hashes. The eventual v1 wire contract must support root
 rotation through a threshold-signed rollover chain; reinstalling through a
 newly verified installer is the documented recovery of last resort. This must
-resist rollback, freeze, mix-and-match, and replayed-metadata attacks. The exact Rust
-client/library is selected only after a Rust 1.88-compatible implementation
-spike and hostile-metadata tests; plain unsigned `latest` JSON is not an
-acceptable updater authority.
+resist rollback, freeze, mix-and-match, and replayed-metadata attacks. Plain
+unsigned `latest` JSON is not an acceptable updater authority. The completed
+Rust 1.88 comparison and hostile-metadata corpus selected only `sigstore-tuf`
+0.11.0's transport-free `TrustedMetadataSet` behind hf2q-owned bounds and
+floors; it did not select the stock updater or store.
 
 Top-level targets independently bind the stable channel pointer, versioned
 external release manifest, and versioned archive by target name, byte length,
@@ -602,9 +605,9 @@ Both verifier paths reject delegations and compare every returned role version
 plus an hf2q-owned clock sample against a locked durable generation journal.
 The `tough` wrapper additionally brackets its separately sampled internal
 expiry time and accepts root-chain termination only after an actual not-found
-response. Those floors never decrease during ordinary root or role rotation;
-recovery that intentionally replaces them is the separately authenticated
-fresh-installer path.
+response. Those experimental floors never decrease; the production adapter
+adds the TUF 1.0.36 root-authorized timestamp/snapshot recovery exception
+described below rather than inheriting the spike's over-strict behavior.
 
 The Rust 1.88 locked corpus proves rollback, expiry/freeze, same-version byte
 replay, mix-and-match, duplicate/oversized metadata, wrong-role signatures,
@@ -623,8 +626,9 @@ This evidence selects only `sigstore-tuf` 0.11.0's transport-free
 `TrustedMetadataSet` as the production verification engine. Its stock
 `Updater`, transport, and `FileStore` remain rejected. hf2q owns transport,
 request sequencing, exact-byte capture, byte/role limits, the clock sample,
-monotonic version and digest floors, the durable generation transaction, and
-application target binding. `tough` 0.24.0 remains a dev-only independent
+version and digest floors, the narrowly root-authorized online-role reset, the
+durable generation transaction, and application target binding. `tough`
+0.24.0 remains a dev-only independent
 comparator over the same hostile corpus; neither its transport policy nor its
 datastore becomes production authority. V1 continues to reject all
 delegations. The spike's journal and pointer wire representations are
@@ -663,6 +667,36 @@ strictly greater than both samples. A selected exact retry instead repairs
 historical durability as a rollback floor without current freshness and
 returns no target bytes or lookup authority.
 
+TUF 1.0.36 client root-update step 11 (stable tag `v1.0.36`, commit
+`59e601ed29c0d2e497264ae8b31c11b8ef07df1e`) requires discarding trusted
+timestamp and snapshot state when either online role's keys rotate so a
+repository can recover from a fast-forward compromise. hf2q treats the
+role's complete effective authorization as that binding: the authorized key
+IDs, their exact public-key objects, and threshold. Because step 11 leaves
+"rotated" underspecified, hf2q applies the safe recovery predicate at the end
+of the gapless root update: fewer byte-identical keys from the prior selected
+authorization survive in the final role than the final threshold requires.
+Only that quorum invalidation clears both in-memory floors for one transcript.
+An additive key, threshold decrease, key ordering, or transient A-to-B-to-A
+chain therefore cannot create a rollback window; recovery ceremonies must
+actually revoke the prior online quorum. It does not clear the authenticated
+root or targets floor, and a root version bump, consistent-snapshot change,
+root-key rotation, or targets-key rotation alone does not trigger it. The
+sealed candidate records the prior selected root from which this exception
+began. Whenever a receipt claims this exception, lock-held and fresh-process
+replay must derive the same endpoint predicate from the exact dual-threshold
+root chain before treating that receipt as an authenticated floor.
+
+Preserving the authenticated targets floor is an intentional boundary. A
+snapshot-only compromise can fast-forward a targets-version *claim* but cannot
+produce authenticated targets bytes, so clearing timestamp and snapshot state
+is sufficient for recovery. If targets authority itself authenticates and
+commits a maliciously high targets version, ordinary online-role recovery must
+not lower it: operators must rotate the targets keys and publish actual targets
+metadata above the retained floor, or use the separately authenticated
+fresh-installer recovery path. The production key-custody runbook must make
+that consequence explicit before public self-update ships.
+
 After commit, the coordinator authenticates the exact selected bytes while
 the lock remains held, releases the lock, performs an ordinary fail-closed
 reopen, authenticates the bytes again from the compiled anchor, and requires
@@ -670,11 +704,85 @@ both durable proofs to match. `DurableMetadataBaseline` exposes only the
 generation sequence and receipt digest. It is not target lookup, archive,
 prepared-version, activation, or update authority.
 
-Large archives will be streamed and checked against the verified target
-descriptor by hf2q rather than buffered through either client's convenience
-target API. That application-binding layer is still pending. The implemented
-metadata layer already preserves the distinction between ordinary read
-authority and lock-held recovery: any partial or published-but-unselected
+The dormant application-target boundary now freezes `ChannelPointerV1`. Its
+deterministic producer encoding is compact JSON plus one LF and contains kind
+`hf2q.update-channel-pointer`, schema version 1, package and logical repository
+ID `hf2q`, stable channel, canonical stable SemVer, target
+`aarch64-apple-darwin`, and exact manifest/archive descriptors. Each descriptor
+contains only the canonical logical name, nonzero byte length, and lowercase
+SHA-256. Parsing is structural, bounded to 16 KiB, hostile-input safe, and
+never grants update authority. The manifest descriptor is capped at 1 MiB.
+The compressed tool-only release archive is separately capped at 512 MiB;
+the manifest's 4 GiB expanded-payload ceiling remains a distinct zip-bomb and
+inventory bound. Model weights are never release-bundle members.
+
+Logical target names are generated from typed values, never accepted as
+equivalent caller paths or URLs:
+
+- `channels/stable/aarch64-apple-darwin.json`;
+- `releases/vV/aarch64-apple-darwin/release-manifest.json`; and
+- `releases/vV/aarch64-apple-darwin/hf2q-vV-aarch64-apple-darwin.zip`.
+
+The stable repository profile requires authenticated
+`consistent_snapshot=true`. Signed targets and the pointer always carry the
+unprefixed logical name. The physical object name preserves its parent
+directories and prefixes only the basename with the full SHA-256 from the
+authenticated TUF target descriptor. A repeated digest inside the pointer
+never chooses that prefix. The future transport maps that exact typed physical
+name to an origin; neither the pointer nor TUF custom metadata contains a URL.
+GitHub Pages retains the full nested physical path for the channel pointer.
+GitHub Release assets are flat, so the manifest/archive origin mapper must use
+only the route-validated physical basename (including its authenticated digest
+prefix) while retaining the canonical logical path as the signed identity.
+
+Top-level targets remain bounded by the existing 4 MiB and 4,096-entry limits.
+The application profile accepts exactly one canonical stable pointer plus one
+or more complete canonical `(release-manifest, archive)` pairs for retained
+versions. It rejects orphan members, unrelated or hash-prefixed logical names,
+delegations, target custom/extra fields, zero/over-limit lengths, and anything
+other than one lowercase SHA-256. Retained older pairs are inert. Pointer
+binding consumes the fresh set and exposes exactly three role-specific
+descriptors: the pointer, its selected manifest, and its selected archive.
+There is no arbitrary target lookup surface.
+
+After the first selected generation enters this stable application profile,
+versioned release pairs form an append-only semantic floor across every
+successor `targets.json`. While the shared installation lock is held, hf2q
+replays the selected predecessor and candidate from the compiled anchor, then
+requires every prior canonical manifest/archive name, length, and SHA-256 to
+remain byte-identical. The pointer may move and new complete pairs may be
+appended; an old member may never be changed, renamed, or removed. This
+pairwise check occurs before the selector commit and is transitive, so normal
+postcommit predecessor cleanup loses no release-identity floor and requires no
+duplicate receipt field. Timestamp/snapshot floor recovery does not reset this
+release floor.
+
+`AuthenticatedTargetSet` is non-cloneable and can be created only by an
+ordinary fail-closed reread of the selected v2 journal followed by replay from
+the compiled anchor. It samples current time before and after replay, rejects
+clock rollback, and requires root, timestamp, snapshot, and targets expiry to
+be strictly later than the second sample. It binds installation/state identity,
+selected sequence and receipt digest, all four metadata versions, the final
+consistent-snapshot policy, and earliest expiry. Exact pointer bytes must then
+match the authenticated pointer descriptor before `ChannelPointerV1` is parsed;
+its repeated manifest/archive descriptors must exactly equal the selected TUF
+pair. The resulting sealed release-target plan still authorizes no URL,
+download, filesystem write, archive extraction, prepared version, activation,
+or downgrade. A later mutation must reacquire the shared installation lock,
+prove the same selected journal identity, and recheck freshness after I/O.
+
+TUF metadata versions do not prevent newly signed metadata from moving the
+stable pointer to an older hf2q SemVer. `ReleaseVersion` therefore uses numeric
+SemVer ordering (`0.10.0 > 0.9.0`), but this dormant binding deliberately does
+not compare against an unauthenticated receipt. Public update mutation remains
+blocked on a sealed live-installed-release floor; any user-requested pinned
+downgrade or rollback requires a separate one-use intent capability.
+
+Large archives will be streamed and checked against the sealed descriptor by
+hf2q rather than buffered through either client's convenience target API. That
+transport/archive layer is still pending. The implemented metadata layer
+already preserves the distinction between ordinary read authority and
+lock-held recovery: any partial or published-but-unselected
 successor is ambiguous and fails closed for an ordinary reader. A same-process
 retry may resume exact staged bytes only while it still owns the sealed live
 candidate, including the explicit root-chain not-found proof that is not
@@ -683,12 +791,21 @@ historically authenticates and repairs the selected rollback floor, removes
 only the structurally exact never-selected transaction under the shared lock,
 then requires a wholly fresh transcript.
 
-The production v1 local metadata journal is frozen independently of the
+The production v2 local metadata journal is frozen independently of the
 network verifier. It remains crate-private and unreachable from command
-dispatch. Its canonical generation receipt is compact JSON followed by one LF
-and contains:
+dispatch. The earlier pre-publication v1 experiment had no floor-reset record
+and was never reachable from a released CLI, installer, network transport, or
+production entry point. Rather than silently redefining those canonical v1
+bytes when root-authorized online-role recovery was added, this ADR retracts
+that dormant experiment and makes v2 the first public-state candidate. The
+reader rejects the retained exact v1 golden bytes; there is deliberately no
+migration authority for state that no shipped writer could create. Once a
+public writer exists, this pre-publication rebaseline exception no longer
+applies: every later wire change requires a dual-reader migration release
+before a new writer may select it. The canonical v2 generation receipt is
+compact JSON followed by one LF and contains:
 
-- kind `hf2q.update-metadata-generation`, schema version 1, state-layout
+- kind `hf2q.update-metadata-generation`, schema version 2, state-layout
   schema 1, and package `hf2q`;
 - the nonzero 64-bit generation sequence and, except for sequence one, the
   exact SHA-256 of the predecessor generation receipt;
@@ -701,15 +818,22 @@ and contains:
   completion cannot precede start; and
 - exact request name, positive role version, byte length, and lowercase
   SHA-256 descriptors for the embedded anchor root, complete gapless root
-  history, final trusted root, timestamp, snapshot, and top-level targets.
+  history, final trusted root, timestamp, snapshot, and top-level targets; and
+- an optional timestamp/snapshot floor-reset record containing exact prior and
+  final trusted-root descriptors. It is valid only on a successor whose root
+  history extends the predecessor, whose prior descriptor equals the selected
+  root, and whose exact authenticated endpoint roots prove that the prior
+  timestamp or snapshot quorum cannot satisfy the final threshold.
 
-The selector has kind `hf2q.update-metadata-selector`, schema version 1,
+The selector has kind `hf2q.update-metadata-selector`, schema version 2,
 sequence, and the exact generation-receipt SHA-256. Receipts are limited to
 64 KiB, selectors to 16 KiB, roots/timestamp/snapshot to 1 MiB each, and
 targets to 4 MiB. Hostile input rejects unknown or duplicate fields, trailing
 documents, noncanonical encoding or timestamps, zero versions, version/name
 disagreement, wrong repository/channel/root identity, invalid digests, and
-rollback or same-version byte equivocation. The complete gapless root history
+rollback or same-version byte equivocation outside the authenticated
+timestamp/snapshot recovery exception. Root and targets floors remain
+monotonic through that exception. The complete gapless root history
 starts at the compiled-in anchor and is capped at 256 lifetime rotations.
 That exceptional root-rotation recovery bound is not an update-count limit;
 ordinary metadata generations use a checked 64-bit sequence and do not stop
@@ -799,7 +923,13 @@ proves the full composition: historically authenticate selected N, discard an
 unselected N+1, reopen the same durable floor, and commit a wholly fresh N+1
 transcript. A selected floor also accepts a later dual-threshold root rotation,
 commits the newly signed lower roles, and rejects a version rollback against
-that new durable floor. Truncated write prefixes are discardable while hostile
+that new durable floor. A separate fast-forward recovery proof commits high
+timestamp/snapshot floors, rotates those online bindings through an
+offline-authorized root, accepts lower recovered timestamp/snapshot roles,
+preserves the targets floor, reopens the auditable receipt, and rejects a
+second rollback without another qualifying rotation. Root-only, targets-only,
+additive, surviving-threshold, and transient A-to-B-to-A transitions cannot
+mint the exception. Truncated write prefixes are discardable while hostile
 shapes are preserved. An independently generated Python-TUF 7.0.0
 corpus uses canonical key IDs, a complete old/new two-of-two root rotation,
 two-of-two lower roles, consistent-snapshot wire names, exact parent pins, a
@@ -808,14 +938,15 @@ five metadata digests, proves positive commit/reopen, and derives missing-old,
 missing-new, and missing-lower-signature failures from those independent
 bytes.
 
-The journal and verifier now compose to produce only a durable metadata floor,
-not update authority. The next slice must embed the real stable trust root,
-bind one repository/channel transport transcript to verified top-level target
-records, and stream/cross-bind the pointer, release manifest, archive, embedded
-manifest, codesign/notary evidence, and exact payload inventory before it can
-construct an authenticated prepared version. Neither a receipt, parsed role,
-provisional candidate, nor durable baseline can perform target lookup or
-mutate an installation by itself.
+The journal, verifier, and dormant application layer now compose a fresh,
+generation-bound selection of the stable pointer and its exact authenticated
+manifest/archive descriptors. They still do not produce update authority. The
+next slice must embed the real stable trust root, bind the selected typed
+physical names to origin-locked transport, and stream/cross-bind the external
+manifest, archive, embedded manifest, codesign/notary evidence, and exact
+payload inventory before it can construct an authenticated prepared version.
+Neither a receipt, parsed role, provisional candidate, durable baseline, nor
+selected target plan can download bytes or mutate an installation by itself.
 
 The initial stable metadata repository is served from GitHub Pages under the
 hf2q repository (for example,
@@ -1272,13 +1403,15 @@ before public self-update ships.
 ## Implementation sequence
 
 1. The release manifest, install receipt/version marker, durable first
-   activation, comparative TUF spike, shared lock, and production v1 metadata
+   activation, comparative TUF spike, shared lock, and production v2 metadata
    journal land first. The tokenized transport-free authenticated-update
    verifier, sealed selector-boundary freshness capability, durable-baseline
-   replay, fresh-process discard recovery, and independent Python-TUF corpus
+   replay, fresh-process discard recovery, root-authorized online-role floor
+   reset, independent Python-TUF corpus, canonical channel-pointer schema,
+   current-time authenticated target inventory, and sealed pointer cross-binding
    land next. Then embed the real stable root and implement the bounded
-   transport, application target records, streamed archive binding, canonical
-   Hugging Face reference
+   transport, external manifest and streamed archive binding, live
+   installed-release downgrade floor, canonical Hugging Face reference
    grammar, prepared/external artifact provenance, calibration receipt, and
    session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated

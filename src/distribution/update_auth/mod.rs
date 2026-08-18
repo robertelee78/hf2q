@@ -2,7 +2,8 @@
 //!
 //! This bounded context deliberately owns no HTTP client, URL, retry policy,
 //! target lookup, install path, or CLI surface. It turns one exact, bounded
-//! sequence of TUF responses into a sealed journal candidate. A parsed role or
+//! sequence of TUF responses into a sealed journal candidate. It owns no
+//! generic or caller-directed target lookup. A parsed role or
 //! a structurally valid journal generation is never authority by itself.
 
 mod commit;
@@ -10,6 +11,7 @@ mod model;
 mod profile;
 mod replay;
 mod strict_json;
+mod target_set;
 mod verifier;
 
 #[cfg(test)]
@@ -50,6 +52,18 @@ pub(in crate::distribution) enum TufVerifierError {
     IncompleteTranscript,
     #[error("the committed metadata does not exactly match the authenticated candidate")]
     DurableCommitMismatch,
+    #[error("no selected signed-metadata generation is available")]
+    NoSelectedMetadata,
+    #[error("the authenticated targets role is outside the stable repository profile")]
+    UnsupportedTargetProfile,
+    #[error("the authenticated targets inventory is malformed or incomplete")]
+    TargetInventory,
+    #[error("signed metadata attempted to rewrite or remove an immutable release target")]
+    RetainedReleaseMutation,
+    #[error("the channel pointer does not match the authenticated release targets")]
+    TargetBinding,
+    #[error(transparent)]
+    ChannelPointer(#[from] crate::distribution::schema::ChannelPointerError),
     #[error(transparent)]
     Journal(#[from] super::install_state::metadata::MetadataJournalError),
 }

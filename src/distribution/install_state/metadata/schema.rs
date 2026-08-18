@@ -2,17 +2,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{MetadataJournalError, VerifiedMetadataCandidate};
+use floor_reset::MetadataFloorResetV2;
+
+mod floor_reset;
 
 pub(super) const GENERATION_KIND: &str = "hf2q.update-metadata-generation";
 pub(super) const SELECTOR_KIND: &str = "hf2q.update-metadata-selector";
-pub(super) const SCHEMA_VERSION: u32 = 1;
+pub(super) const SCHEMA_VERSION: u32 = 2;
 pub(super) const MAX_GENERATION_RECEIPT_BYTES: usize = 64 * 1024;
 pub(super) const MAX_SELECTOR_BYTES: usize = 16 * 1024;
 pub(super) const MAX_ROOT_CHAIN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(in crate::distribution) struct MetadataGenerationReceiptV1 {
+pub(in crate::distribution) struct MetadataGenerationReceiptV2 {
     kind: String,
     schema_version: u32,
     state_layout_schema: u32,
@@ -25,17 +28,18 @@ pub(in crate::distribution) struct MetadataGenerationReceiptV1 {
     channel: String,
     verification_started_at: String,
     verification_completed_at: String,
-    anchor_root: MetadataRoleDescriptorV1,
-    root_chain: Vec<MetadataRoleDescriptorV1>,
-    trusted_root: MetadataRoleDescriptorV1,
-    timestamp: MetadataRoleDescriptorV1,
-    snapshot: MetadataRoleDescriptorV1,
-    targets: MetadataRoleDescriptorV1,
+    anchor_root: MetadataRoleDescriptorV2,
+    root_chain: Vec<MetadataRoleDescriptorV2>,
+    trusted_root: MetadataRoleDescriptorV2,
+    timestamp_snapshot_floor_reset: Option<MetadataFloorResetV2>,
+    timestamp: MetadataRoleDescriptorV2,
+    snapshot: MetadataRoleDescriptorV2,
+    targets: MetadataRoleDescriptorV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct MetadataRoleDescriptorV1 {
+pub(super) struct MetadataRoleDescriptorV2 {
     request_name: String,
     version: u64,
     length: u64,
@@ -44,14 +48,14 @@ pub(super) struct MetadataRoleDescriptorV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct MetadataSelectorV1 {
+pub(super) struct MetadataSelectorV2 {
     kind: String,
     schema_version: u32,
     sequence: u64,
     generation_sha256: String,
 }
 
-impl MetadataGenerationReceiptV1 {
+impl MetadataGenerationReceiptV2 {
     pub(super) fn new(
         sequence: u64,
         predecessor_generation_sha256: Option<String>,
@@ -73,6 +77,7 @@ impl MetadataGenerationReceiptV1 {
             anchor_root: descriptor(candidate.anchor_root()),
             root_chain: candidate.root_chain().iter().map(descriptor).collect(),
             trusted_root: descriptor(candidate.trusted_root()),
+            timestamp_snapshot_floor_reset: floor_reset::candidate(candidate),
             timestamp: descriptor(candidate.timestamp()),
             snapshot: descriptor(candidate.snapshot()),
             targets: descriptor(candidate.targets()),
@@ -89,7 +94,7 @@ impl MetadataGenerationReceiptV1 {
         receipt.validate_invariants()?;
         if receipt.to_bytes()? != bytes {
             return Err(MetadataJournalError::Invalid(
-                "generation receipt is not canonical v1 JSON",
+                "generation receipt is not canonical v2 JSON",
             ));
         }
         Ok(receipt)
@@ -214,6 +219,7 @@ impl MetadataGenerationReceiptV1 {
                 .zip(candidate.root_chain())
                 .all(|(stored, actual)| descriptor_matches(stored, actual))
             && descriptor_matches(&self.trusted_root, candidate.trusted_root())
+            && self.timestamp_snapshot_floor_reset == floor_reset::candidate(candidate)
             && descriptor_matches(&self.timestamp, candidate.timestamp())
             && descriptor_matches(&self.snapshot, candidate.snapshot())
             && descriptor_matches(&self.targets, candidate.targets())
@@ -249,6 +255,7 @@ impl MetadataGenerationReceiptV1 {
                 "metadata root history changed below its trusted floor",
             ));
         }
+        floor_reset::validate_successor(self, prior)?;
 
         let prior_time = parse_canonical_time(&prior.verification_completed_at)?;
         let started = parse_canonical_time(&self.verification_started_at)?;
@@ -260,8 +267,6 @@ impl MetadataGenerationReceiptV1 {
         }
         for (old, new) in [
             (&prior.trusted_root, &self.trusted_root),
-            (&prior.timestamp, &self.timestamp),
-            (&prior.snapshot, &self.snapshot),
             (&prior.targets, &self.targets),
         ] {
             if new.version < old.version || (new.version == old.version && new.sha256 != old.sha256)
@@ -269,6 +274,20 @@ impl MetadataGenerationReceiptV1 {
                 return Err(MetadataJournalError::Invalid(
                     "metadata role floor moved backward or equivocated",
                 ));
+            }
+        }
+        if self.timestamp_snapshot_floor_reset.is_none() {
+            for (old, new) in [
+                (&prior.timestamp, &self.timestamp),
+                (&prior.snapshot, &self.snapshot),
+            ] {
+                if new.version < old.version
+                    || (new.version == old.version && new.sha256 != old.sha256)
+                {
+                    return Err(MetadataJournalError::Invalid(
+                        "metadata role floor moved backward or equivocated",
+                    ));
+                }
             }
         }
         Ok(())
@@ -373,7 +392,7 @@ impl MetadataGenerationReceiptV1 {
         }
         if self.root_chain.len() > MAX_ROOT_CHAIN {
             return Err(MetadataJournalError::Invalid(
-                "root history exceeds the v1 lifetime bound",
+                "root history exceeds the v2 lifetime bound",
             ));
         }
         validate_descriptor(&self.anchor_root, RoleKind::Root)?;
@@ -381,6 +400,7 @@ impl MetadataGenerationReceiptV1 {
         validate_descriptor(&self.timestamp, RoleKind::Timestamp)?;
         validate_descriptor(&self.snapshot, RoleKind::Snapshot)?;
         validate_descriptor(&self.targets, RoleKind::Targets)?;
+        floor_reset::validate_receipt(self)?;
 
         let expected_chain_len = self
             .trusted_root
@@ -424,7 +444,7 @@ impl MetadataGenerationReceiptV1 {
     }
 }
 
-impl MetadataSelectorV1 {
+impl MetadataSelectorV2 {
     pub(super) fn new(
         sequence: u64,
         generation_sha256: String,
@@ -442,14 +462,17 @@ impl MetadataSelectorV1 {
         require_bound(bytes, MAX_SELECTOR_BYTES, "metadata selector")?;
         let selector: Self = serde_json::from_slice(bytes)
             .map_err(|_| MetadataJournalError::Invalid("metadata selector JSON is invalid"))?;
-        if selector.kind != SELECTOR_KIND
-            || selector.schema_version != SCHEMA_VERSION
-            || selector.sequence == 0
+        if selector.kind != SELECTOR_KIND || selector.schema_version != SCHEMA_VERSION {
+            return Err(MetadataJournalError::Invalid(
+                "metadata selector envelope is unsupported",
+            ));
+        }
+        if selector.sequence == 0
             || !is_sha256(&selector.generation_sha256)
             || selector.to_bytes()? != bytes
         {
             return Err(MetadataJournalError::Invalid(
-                "metadata selector is not canonical v1",
+                "metadata selector is not canonical v2",
             ));
         }
         Ok(selector)
@@ -480,8 +503,8 @@ enum RoleKind {
     Targets,
 }
 
-fn descriptor(role: &super::ExactMetadataRole) -> MetadataRoleDescriptorV1 {
-    MetadataRoleDescriptorV1 {
+fn descriptor(role: &super::ExactMetadataRole) -> MetadataRoleDescriptorV2 {
+    MetadataRoleDescriptorV2 {
         request_name: role.request_name().to_owned(),
         version: role.version(),
         length: role.bytes().len() as u64,
@@ -490,14 +513,14 @@ fn descriptor(role: &super::ExactMetadataRole) -> MetadataRoleDescriptorV1 {
 }
 
 fn descriptor_matches(
-    descriptor: &MetadataRoleDescriptorV1,
+    descriptor: &MetadataRoleDescriptorV2,
     role: &super::ExactMetadataRole,
 ) -> bool {
     descriptor == &self::descriptor(role)
 }
 
 fn validate_descriptor(
-    descriptor: &MetadataRoleDescriptorV1,
+    descriptor: &MetadataRoleDescriptorV2,
     role: RoleKind,
 ) -> Result<(), MetadataJournalError> {
     if descriptor.version == 0 || !is_sha256(&descriptor.sha256) {
@@ -541,7 +564,7 @@ fn validate_descriptor(
 }
 
 fn validate_descriptor_bytes(
-    descriptor: &MetadataRoleDescriptorV1,
+    descriptor: &MetadataRoleDescriptorV2,
     bytes: &[u8],
 ) -> Result<(), MetadataJournalError> {
     if bytes.len() as u64 != descriptor.length

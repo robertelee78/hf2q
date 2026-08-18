@@ -138,6 +138,12 @@ jobs:
               | grep -v '^src/distribution/update_auth/' || true
           )"
           test -z "$unexpected_imports"
+          unexpected_transport_authority="$(
+            grep -RInE --include='*.rs' \
+              '^[[:space:]]*use[[:space:]]+(reqwest|hyper|std::net|tokio::net|url::)|std::process::Command|clap::' \
+              src/distribution/update_auth || true
+          )"
+          test -z "$unexpected_transport_authority"
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -145,7 +151,11 @@ jobs:
           test "$actual_generator" = "$expected_generator"
           package_list="$(cargo +1.88.0 package --locked --list)"
           for required in \
+            src/distribution/schema/channel_pointer.rs \
+            src/distribution/schema/testdata/channel_pointer_v1.json \
+            src/distribution/schema/target_name.rs \
             src/distribution/update_auth/commit.rs \
+            src/distribution/update_auth/target_set.rs \
             src/distribution/update_auth/testdata/python-tuf-v1/1.root.json \
             src/distribution/update_auth/testdata/python-tuf-v1/2.root.json \
             src/distribution/update_auth/testdata/python-tuf-v1/timestamp.json \
