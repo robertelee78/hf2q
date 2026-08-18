@@ -7,6 +7,7 @@ use super::*;
 use crate::distribution::install_state::metadata::{
     MetadataCommitOutcome, MetadataStateAuthorization,
 };
+use crate::distribution::update_auth::artifact_authorization::begin_artifact_fetch_for_test;
 use crate::distribution::update_auth::commit::commit_and_reopen_for_test;
 use crate::distribution::update_auth::model::{
     MetadataResponse, PendingMetadataRequest, VerificationStep,
@@ -18,6 +19,7 @@ use crate::distribution::update_auth::test_repository::{
     RepositoryFixture, RetainedReleaseMutation,
 };
 use crate::distribution::update_auth::verifier::begin_from_anchor_for_test;
+use crate::distribution::update_auth::ArtifactFetchAuthorizationError;
 
 const INSTALLATION_ID: &str = "7c907c7a-3125-4a40-a8b3-1c125080e46a";
 
@@ -188,6 +190,133 @@ fn current_time_replay_mints_only_a_generation_bound_release_binding() {
         )
     );
     assert_ne!(release.selected_generation_sha256(), [0; 32]);
+}
+
+#[test]
+fn artifact_fetch_reauthenticates_under_lock_before_and_after_archive_io() {
+    let fixture = stable_release_repository(true);
+    let (_temp, authorization) = make_authorization();
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let fetch = begin_artifact_fetch_for_test(
+        &authorization,
+        &anchor,
+        [
+            instant("2026-08-18T09:01:00Z"),
+            instant("2026-08-18T09:01:01Z"),
+        ],
+    )
+    .expect("initial fetch authority");
+    let mut bound = fetch
+        .bind_pointer(&fixture.pointer)
+        .expect("pointer-bound authority");
+    let stage = bound
+        .create_archive_stage_for_test([
+            instant("2026-08-18T09:01:02Z"),
+            instant("2026-08-18T09:01:03Z"),
+        ])
+        .expect("lock-held pre-archive proof");
+    drop(stage);
+    assert!(matches!(
+        bound.create_archive_stage_for_test([
+            instant("2026-08-18T09:01:03Z"),
+            instant("2026-08-18T09:01:04Z"),
+        ]),
+        Err(ArtifactFetchAuthorizationError::ArchiveStageAlreadyCreated)
+    ));
+    let finalized = bound
+        .finalize_for_test([
+            instant("2026-08-18T09:01:05Z"),
+            instant("2026-08-18T09:01:06Z"),
+        ])
+        .expect("lock-held post-I/O proof");
+    assert_eq!(
+        finalized.authenticated_at(),
+        instant("2026-08-18T09:01:06Z")
+    );
+    assert_eq!(finalized.targets().selected_sequence(), 1);
+
+    let fetch = begin_artifact_fetch_for_test(
+        &authorization,
+        &anchor,
+        [
+            instant("2026-08-18T09:02:00Z"),
+            instant("2026-08-18T09:02:01Z"),
+        ],
+    )
+    .expect("second fetch authority");
+    let bound = fetch
+        .bind_pointer(&fixture.pointer)
+        .expect("second pointer-bound authority");
+    assert!(matches!(
+        bound.finalize_for_test([
+            instant("2026-08-18T09:02:02Z"),
+            instant("2026-08-18T09:02:03Z"),
+        ]),
+        Err(ArtifactFetchAuthorizationError::ArchiveStageMissing)
+    ));
+}
+
+#[test]
+fn artifact_fetch_rejects_cross_phase_clock_rollback_and_generation_drift() {
+    let (initial, successor) = stable_release_successor_pair(RetainedReleaseMutation::AppendOnly);
+    let (_temp, authorization) = make_authorization();
+    let anchor = leaked_anchor(&initial.repository.anchor);
+    commit_fixture(&authorization, &anchor, &initial.repository);
+
+    let fetch = begin_artifact_fetch_for_test(
+        &authorization,
+        &anchor,
+        [
+            instant("2026-08-18T09:01:00Z"),
+            instant("2026-08-18T09:01:01Z"),
+        ],
+    )
+    .expect("fetch authority");
+    let mut bound = fetch
+        .bind_pointer(&initial.pointer)
+        .expect("pointer-bound authority");
+    assert!(matches!(
+        bound.create_archive_stage_for_test([
+            instant("2026-08-18T09:00:58Z"),
+            instant("2026-08-18T09:00:59Z")
+        ]),
+        Err(
+            crate::distribution::update_auth::ArtifactFetchAuthorizationError::Authentication(
+                TufVerifierError::ClockRollback
+            )
+        )
+    ));
+
+    let fetch = begin_artifact_fetch_for_test(
+        &authorization,
+        &anchor,
+        [
+            instant("2026-08-18T09:02:00Z"),
+            instant("2026-08-18T09:02:01Z"),
+        ],
+    )
+    .expect("fresh authority");
+    let mut bound = fetch
+        .bind_pointer(&initial.pointer)
+        .expect("bound authority");
+    let candidate = successor_candidate(&authorization, &anchor, &successor.repository);
+    let completed = candidate.verification_completed_at();
+    commit_and_reopen_for_test(&authorization, &anchor, candidate, [completed, completed])
+        .expect("successor commits");
+    let error = bound
+        .create_archive_stage_for_test([
+            instant("2026-08-18T09:03:00Z"),
+            instant("2026-08-18T09:03:01Z"),
+        ])
+        .expect_err("generation drift must fail");
+    assert!(matches!(
+        error,
+        crate::distribution::update_auth::ArtifactFetchAuthorizationError::Authentication(
+            TufVerifierError::DurableCommitMismatch | TufVerifierError::TargetBinding
+        )
+    ));
 }
 
 #[test]

@@ -8,7 +8,9 @@
 mod journal;
 pub(in crate::distribution) mod schema;
 
-pub(in crate::distribution) use journal::{lock_metadata_state, read_selected};
+pub(in crate::distribution) use journal::{
+    lock_metadata_state, read_selected, LockedMetadataState,
+};
 
 #[cfg(test)]
 pub(in crate::distribution) use journal::{commit_candidate_for_test, Barrier, FaultPlan};
@@ -51,7 +53,7 @@ impl MetadataJournalError {
 /// copied metadata journal authoritative for another installation.
 #[derive(Debug)]
 pub(in crate::distribution) struct MetadataStateAuthorization {
-    root: ExplicitRootAuthorization,
+    pub(super) root: ExplicitRootAuthorization,
     installation_id: String,
 }
 

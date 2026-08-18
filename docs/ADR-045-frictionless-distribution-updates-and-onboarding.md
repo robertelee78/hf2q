@@ -5,9 +5,11 @@
   selection, shared installation lock, durable metadata journal, dormant
   transport-free production verifier, commit-freshness capability, and
   restart-discard, root-authorized online-role recovery, and dormant
-  channel-pointer/selected-target binding are reconciled; the real release
-  trust root, network transport, external manifest and streamed archive byte
-  binding, public
+  channel-pointer/selected-target binding, origin-locked artifact transport,
+  lock-reauthenticated fetch capability, and same-descriptor streamed archive
+  staging are reconciled; the real release trust root, verifier-request
+  metadata transport, embedded-manifest/ZIP inventory and codesign/notary
+  verification, public
   update/install/onboarding implementation, and exact-artifact proof remain
   pending
 - Date: 2026-08-17
@@ -771,6 +773,76 @@ download, filesystem write, archive extraction, prepared version, activation,
 or downgrade. A later mutation must reacquire the shared installation lock,
 prove the same selected journal identity, and recheck freshness after I/O.
 
+The v1 network routes are closed policy, not runtime configuration. Production
+accepts no caller-supplied base URL, mirror, path, redirect host, proxy, or
+HTTP client as update authority. Typed verifier requests and authenticated
+target descriptors map to exactly these HTTPS locations:
+
+- metadata: `https://robertelee78.github.io/hf2q/updates/stable/metadata/R`,
+  where `R` is the verifier-issued relative name;
+- the stable channel pointer:
+  `https://robertelee78.github.io/hf2q/updates/stable/targets/P`, where `P`
+  is its full authenticated consistent-snapshot physical path; and
+- manifest/archive assets:
+  `https://github.com/robertelee78/hf2q/releases/download/vV/B`, where `V`
+  is the authenticated release version and `B` is the route-validated,
+  digest-prefixed physical basename.
+
+The dormant artifact transport implements the pointer and release-asset
+routes. The verifier-issued metadata route is frozen here but remains pending
+alongside the compiled production root and live metadata-session coordinator;
+no current code claims to fetch or commit network metadata.
+
+Pages requests never redirect. A release-asset request accepts either an
+immediate 200 response or exactly one 302 from the exact `github.com` route to
+HTTPS host `release-assets.githubusercontent.com`, followed by a final 200.
+The redirect may carry GitHub's opaque expiring query, but it may not contain
+userinfo, a fragment, a non-HTTPS scheme, an IP literal, or a nondefault port.
+A second redirect, hostname suffix/lookalike, `/latest`, REST/API discovery,
+`hf2q.us`, or pointer/custom-metadata URL fails closed. Redirect URLs and
+queries are never logged.
+
+The dedicated client explicitly selects rustls, HTTPS-only requests, no
+referer, no automatic redirect, no automatic retry, and identity content
+encoding. Connects are bounded to 10 seconds; metadata, pointer, and manifest
+requests are bounded to 60 seconds; an archive is bounded to 30 minutes. A
+non-identity `Content-Encoding` fails. Standard HTTPS/system proxy settings
+are honored for corporate usability, but there is no runtime proxy override
+in this authority surface and a proxy remains hostile availability-only
+transport. Exact origins, WebPKI TLS, signed bytes, and the post-I/O TUF replay
+remain authoritative.
+
+`Content-Type`, `ETag`, `Age`, `Last-Modified`, CDN cache headers, and
+GitHub's release-API digest are diagnostic or publisher corroboration only;
+signed length and SHA-256 remain the client authority. A present
+`Content-Length` must equal the authenticated length, and every body is
+independently read only through expected length plus one byte. Status 206/range
+resume is not part of v1.
+
+Pointer and manifest bytes are bounded in memory. The archive is streamed
+through a fixed-size buffer into a private 0600 file created descriptor-
+relatively on the authorized state-root device and unlinked immediately after
+open. The same descriptor is counted and hashed while writing, synced, rewound,
+and re-read for exact length/SHA-256 before it can become a non-cloneable
+staged-file proof. The file-owning wrapper exposes only `Read`/`Seek`, uses
+redacted debug output, and can repeat the same-FD identity/length/hash check
+immediately before its later consumer. A crash between durable create and
+unlink may leave at most
+one exact empty UUIDv4 residue; the next shared-lock holder removes it only
+after a bounded complete-inventory and identity check. V1 restarts a failed
+archive download from the canonical GitHub URL. `ENOSPC`/`EDQUOT`,
+short/long bodies, digest mismatch, timeout, read failure, write failure, and
+sync failure yield no artifact or install capability.
+
+Fetching occurs outside the installation lock. Before the large archive and
+again after all I/O, the coordinator reacquires the shared installation lock,
+replays the current selected journal from the compiled anchor at current time,
+and requires the same installation/state identity, selected sequence and
+receipt digest, pointer/manifest/archive descriptors, and fresh role expiries.
+Any change discards the inert staged bytes and restarts planning. The fetched
+result still grants no extraction, codesign/notary, prepared-version,
+installed-release-floor, activation, or update authority.
+
 TUF metadata versions do not prevent newly signed metadata from moving the
 stable pointer to an older hf2q SemVer. `ReleaseVersion` therefore uses numeric
 SemVer ordering (`0.10.0 > 0.9.0`), but this dormant binding deliberately does
@@ -778,9 +850,11 @@ not compare against an unauthenticated receipt. Public update mutation remains
 blocked on a sealed live-installed-release floor; any user-requested pinned
 downgrade or rollback requires a separate one-use intent capability.
 
-Large archives will be streamed and checked against the sealed descriptor by
-hf2q rather than buffered through either client's convenience target API. That
-transport/archive layer is still pending. The implemented metadata layer
+Large archives are streamed and checked against the sealed descriptor by hf2q
+rather than buffered through either client's convenience target API. The
+origin-locked external-byte layer is implemented but remains deliberately
+dormant; embedded-manifest, extraction, codesign/notary, and prepared-version
+authority remain pending. The implemented metadata layer
 already preserves the distinction between ordinary read authority and
 lock-held recovery: any partial or published-but-unselected
 successor is ambiguous and fails closed for an ordinary reader. A same-process
@@ -938,13 +1012,14 @@ five metadata digests, proves positive commit/reopen, and derives missing-old,
 missing-new, and missing-lower-signature failures from those independent
 bytes.
 
-The journal, verifier, and dormant application layer now compose a fresh,
-generation-bound selection of the stable pointer and its exact authenticated
-manifest/archive descriptors. They still do not produce update authority. The
-next slice must embed the real stable trust root, bind the selected typed
-physical names to origin-locked transport, and stream/cross-bind the external
-manifest, archive, embedded manifest, codesign/notary evidence, and exact
-payload inventory before it can construct an authenticated prepared version.
+The journal, verifier, dormant application layer, and sibling transport now
+compose a fresh, generation-bound selection of the stable pointer, fetch its
+exact external manifest/archive bytes from closed origins, and reauthenticate
+the same selected generation under the shared lock before and after archive
+I/O. They still do not produce update authority. The next slice must embed the
+real stable trust root and cross-bind the embedded manifest, codesign/notary
+evidence, and exact ZIP/payload inventory before it can construct an
+authenticated prepared version.
 Neither a receipt, parsed role, provisional candidate, durable baseline, nor
 selected target plan can download bytes or mutate an installation by itself.
 
@@ -1408,12 +1483,14 @@ before public self-update ships.
    verifier, sealed selector-boundary freshness capability, durable-baseline
    replay, fresh-process discard recovery, root-authorized online-role floor
    reset, independent Python-TUF corpus, canonical channel-pointer schema,
-   current-time authenticated target inventory, and sealed pointer cross-binding
-   land next. Then embed the real stable root and implement the bounded
-   transport, external manifest and streamed archive binding, live
-   installed-release downgrade floor, canonical Hugging Face reference
-   grammar, prepared/external artifact provenance, calibration receipt, and
-   session policy. Every schema lands with bounded hostile input and
+   current-time authenticated target inventory, sealed pointer cross-binding,
+   origin-locked transport, lock-reauthenticated fetch capability, and exact
+   external manifest/same-FD streamed archive binding have landed as dormant
+   bounded contexts. Next, embed the real stable root and implement
+   embedded-manifest/ZIP inventory,
+   codesign/notary, live installed-release downgrade floor, canonical Hugging
+   Face reference grammar, prepared/external artifact provenance, calibration
+   receipt, and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate

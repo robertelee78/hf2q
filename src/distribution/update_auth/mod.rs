@@ -6,6 +6,7 @@
 //! generic or caller-directed target lookup. A parsed role or
 //! a structurally valid journal generation is never authority by itself.
 
+mod artifact_authorization;
 mod commit;
 mod model;
 mod profile;
@@ -19,8 +20,13 @@ mod test_repository;
 #[cfg(test)]
 mod tests;
 
+pub(in crate::distribution) use artifact_authorization::{
+    ArchiveStageAuthorization, ArtifactFetchAuthorization, ArtifactFetchAuthorizationError,
+    BoundArtifactFetchAuthorization, FinalArtifactAuthorization,
+};
 pub(in crate::distribution) use commit::AdvancingCommitGuard;
 pub(in crate::distribution) use model::{ExactMetadataRole, VerifiedMetadataCandidate};
+pub(in crate::distribution) use target_set::AuthenticatedTargetDescriptor;
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::distribution) enum TufVerifierError {

@@ -352,6 +352,13 @@ pub(super) fn preflight_noreplace(
 }
 
 pub(super) fn list_names(directory: &Directory) -> Result<BTreeSet<String>, InstallStateError> {
+    list_names_bounded(directory, usize::MAX)
+}
+
+pub(super) fn list_names_bounded(
+    directory: &Directory,
+    maximum: usize,
+) -> Result<BTreeSet<String>, InstallStateError> {
     let mut stream = Dir::read_from(directory.fd())
         .map_err(|error| InstallStateError::io("open directory inventory", error))?;
     let mut names = BTreeSet::new();
@@ -365,6 +372,11 @@ pub(super) fn list_names(directory: &Directory) -> Result<BTreeSet<String>, Inst
         let name = std::str::from_utf8(bytes)
             .map_err(|_| InstallStateError::InvalidLayout("directory entry name is not UTF-8"))?;
         validate_component(name)?;
+        if names.len() >= maximum {
+            return Err(InstallStateError::InvalidLayout(
+                "directory inventory exceeds its bounded maximum",
+            ));
+        }
         if !names.insert(name.to_owned()) {
             return Err(InstallStateError::InvalidLayout(
                 "directory inventory contains a duplicate entry",

@@ -73,6 +73,24 @@ pub(in crate::distribution) fn lock_metadata_state(
 }
 
 impl LockedMetadataState {
+    /// Read selected bytes under the shared installation lock with ordinary
+    /// authority semantics. Any unselected transaction residue fails closed.
+    pub(in crate::distribution) fn read_selected_for_authority(
+        &self,
+    ) -> Result<Option<super::StoredMetadataGeneration>, MetadataJournalError> {
+        self.journal.read_selected_for_authority()
+    }
+
+    pub(in crate::distribution) fn create_ephemeral_artifact_stage(
+        &self,
+        authorization: crate::distribution::update_auth::ArchiveStageAuthorization,
+    ) -> Result<super::super::EphemeralArtifactStage, super::super::ArtifactStageError> {
+        super::super::artifact::create_ephemeral_artifact_stage_under_lock(
+            &self.journal.locked,
+            authorization.expected_length(),
+        )
+    }
+
     /// Read structurally complete selected bytes while allowing only the
     /// bounded transaction residue that this held lock is authorized to
     /// recover. The signed-update verifier must authenticate the result.
@@ -214,6 +232,22 @@ impl LockedMetadataJournal {
             &live.metadata,
             &live.generations,
             HistoryMode::LockedRecovery,
+        )?;
+        if let Some(stored) = &selected {
+            MetadataGenerationReceiptV2::parse(&stored.generation_receipt)?
+                .validate_state_identity(&self.installation_id, &self.state_root)?;
+        }
+        Ok(selected)
+    }
+
+    fn read_selected_for_authority(
+        &self,
+    ) -> Result<Option<super::StoredMetadataGeneration>, MetadataJournalError> {
+        let live = self.reopen_namespace()?;
+        let selected = validation::read_selected_with_mode(
+            &live.metadata,
+            &live.generations,
+            HistoryMode::Authority,
         )?;
         if let Some(stored) = &selected {
             MetadataGenerationReceiptV2::parse(&stored.generation_receipt)?
