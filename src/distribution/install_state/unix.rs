@@ -102,6 +102,26 @@ pub(super) fn open_or_create_root(path: &Path) -> Result<Directory, InstallState
     Ok(current)
 }
 
+pub(super) fn open_existing_root(path: &Path) -> Result<Directory, InstallStateError> {
+    let components = authorized_components(path)?;
+    let root_fd = fs::open("/", DIRECTORY_FLAGS, Mode::empty())
+        .map_err(|error| InstallStateError::io("open filesystem root", error))?;
+    let root_stat = fs::fstat(&root_fd)
+        .map_err(|error| InstallStateError::io("inspect filesystem root", error))?;
+    let mut current = Directory {
+        fd: root_fd,
+        stat: root_stat,
+    };
+
+    for (index, component) in components.iter().enumerate() {
+        current = open_directory_at_policy(&current, component, None, false, false)?;
+        if index + 1 == components.len() {
+            require_directory_policy(&current.stat, Some(0o700), true, None, "state root")?;
+        }
+    }
+    Ok(current)
+}
+
 pub(super) fn ensure_private_directory(
     parent: &Directory,
     name: &str,
@@ -256,6 +276,54 @@ pub(super) fn rename_noreplace(
         RenameFlags::NOREPLACE,
     )
     .map_err(|error| InstallStateError::io("publish no-replace entry", error))
+}
+
+pub(super) fn rename_replace(
+    parent: &Directory,
+    from: &str,
+    to: &str,
+) -> Result<(), InstallStateError> {
+    validate_component(from)?;
+    validate_component(to)?;
+    fs::renameat(parent.fd(), from, parent.fd(), to)
+        .map_err(|error| InstallStateError::io("atomically replace named entry", error))
+}
+
+pub(super) fn regular_file_identity(
+    file: &File,
+    expected_device: u64,
+) -> Result<EntryIdentity, InstallStateError> {
+    let stat = fs::fstat(file)
+        .map_err(|error| InstallStateError::io("inspect opened regular file", error))?;
+    require_regular_policy(&stat, 0o600, expected_device)?;
+    Ok(identity(&stat))
+}
+
+pub(super) fn remove_named_regular_file(
+    parent: &Directory,
+    name: &str,
+    expected: EntryIdentity,
+) -> Result<(), InstallStateError> {
+    validate_component(name)?;
+    verify_named_identity(parent, name, expected)?;
+    fs::unlinkat(parent.fd(), name, AtFlags::empty())
+        .map_err(|error| InstallStateError::io("remove verified regular file", error))
+}
+
+pub(super) fn remove_empty_directory(
+    parent: &Directory,
+    name: &str,
+    expected: &Directory,
+) -> Result<(), InstallStateError> {
+    validate_component(name)?;
+    let named = open_directory_at(parent, name, Some(0o700), true)?;
+    if !named.same_object(expected) || !list_names(&named)?.is_empty() {
+        return Err(InstallStateError::InvalidLayout(
+            "directory changed or is not empty before removal",
+        ));
+    }
+    fs::unlinkat(parent.fd(), name, AtFlags::REMOVEDIR)
+        .map_err(|error| InstallStateError::io("remove verified empty directory", error))
 }
 
 pub(super) fn preflight_noreplace(

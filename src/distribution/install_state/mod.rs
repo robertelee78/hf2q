@@ -6,6 +6,8 @@
 
 mod file;
 mod host;
+mod locked;
+mod metadata;
 mod unix;
 mod verify;
 
@@ -22,7 +24,8 @@ use schema::{
     TransitionKind, UpdateRoute,
 };
 
-use self::unix::{Directory, EntryIdentity};
+use self::locked::LockedInstallation;
+use self::unix::Directory;
 use self::verify::VerifiedPreparedVersion;
 use super::schema;
 
@@ -147,12 +150,9 @@ pub(crate) enum FirstActivationPreparation {
 /// not grant update, overwrite, entry-point, pruning, or deletion authority.
 #[derive(Debug)]
 pub(crate) struct PreparedFirstActivation {
-    root: Directory,
+    locked: LockedInstallation,
     versions: Directory,
     activations: Directory,
-    update: Directory,
-    _lock: File,
-    lock_identity: EntryIdentity,
     receipt: InstallReceiptV1,
     receipt_bytes: Vec<u8>,
     version: VerifiedPreparedVersion,
@@ -169,39 +169,32 @@ pub(crate) fn prepare_first_activation(
 ) -> Result<FirstActivationPreparation, InstallStateError> {
     let receipt =
         verify::validate_first_receipt(&authenticated.receipt_bytes, &authorization.canonical)?;
-    let root = unix::open_or_create_root(&authorization.path)?;
-    // Root/update are the only race-safe bootstrap mutations. All transition
-    // state is created or inspected only after the installation lock is held.
-    let update = unix::ensure_private_directory(&root, "update")?;
-    let (lock, lock_identity) = unix::acquire_nonblocking_lock(&update)?;
-    file::write_or_resume_private_file(&update, ".noreplace-source", b"")?;
-    file::write_or_resume_private_file(&update, ".noreplace-target", b"")?;
-    unix::preflight_noreplace(&update, ".noreplace-source", ".noreplace-target")?;
-    let versions = unix::open_directory_at(&root, "versions", Some(0o700), true)?;
-    let activations = unix::ensure_private_directory(&root, "activations")?;
+    let locked = LockedInstallation::acquire(&authorization.path)?;
+    let versions = unix::open_directory_at(locked.root(), "versions", Some(0o700), true)?;
+    let activations = unix::ensure_private_directory(locked.root(), "activations")?;
 
-    if unix::entry_identity(&root, "current")?.is_some() {
+    if unix::entry_identity(locked.root(), "current")?.is_some() {
         let repair = || -> Result<(), InstallStateError> {
-            if unix::entry_identity(&root, PENDING_CURRENT)?.is_some() {
+            if unix::entry_identity(locked.root(), PENDING_CURRENT)?.is_some() {
                 return Err(InstallStateError::InvalidLayout(
                     "committed activation coexists with a pending current entry",
                 ));
             }
             let version = verify::verify_prepared_version(&versions, &receipt)?;
-            if unix::read_symlink(&root, "current")? != CURRENT_TARGET {
+            if unix::read_symlink(locked.root(), "current")? != CURRENT_TARGET {
                 return Err(InstallStateError::InvalidLayout(
                     "current does not select the canonical first activation",
                 ));
             }
             require_exact_activation_parent(&activations)?;
             let activation = verify::verify_committed_first_activation(
-                &root,
+                locked.root(),
                 &activations,
                 &receipt,
                 &authenticated.receipt_bytes,
                 &version,
             )?;
-            repeat_postcommit_barriers(&activation, &activations, &root)?;
+            repeat_postcommit_barriers(&activation, &activations, locked.root())?;
             Ok(())
         };
         repair().map_err(InstallStateError::after_commit)?;
@@ -213,12 +206,9 @@ pub(crate) fn prepare_first_activation(
     let version = verify::verify_prepared_version(&versions, &receipt)?;
 
     Ok(FirstActivationPreparation::Ready(PreparedFirstActivation {
-        root,
+        locked,
         versions,
         activations,
-        update,
-        _lock: lock,
-        lock_identity,
         receipt,
         receipt_bytes: authenticated.receipt_bytes,
         version,
@@ -228,7 +218,7 @@ pub(crate) fn prepare_first_activation(
 impl PreparedFirstActivation {
     pub(crate) fn commit(self) -> Result<FirstActivationOutcome, InstallStateError> {
         let (activations, version) = self.reopen_verified_namespace()?;
-        if unix::entry_identity(&self.root, "current")?.is_some() {
+        if unix::entry_identity(self.locked.root(), "current")?.is_some() {
             return Err(InstallStateError::InvalidLayout(
                 "current appeared after first-activation preparation",
             ));
@@ -249,15 +239,20 @@ impl PreparedFirstActivation {
             &self.receipt_bytes,
             &live_version,
         )?;
-        if unix::entry_identity(&self.root, "current")?.is_some()
-            || unix::read_symlink(&self.root, PENDING_CURRENT)? != CURRENT_TARGET
+        if unix::entry_identity(self.locked.root(), "current")?.is_some()
+            || unix::read_symlink(self.locked.root(), PENDING_CURRENT)? != CURRENT_TARGET
         {
             return Err(InstallStateError::InvalidLayout(
                 "current namespace changed before activation commit",
             ));
         }
         // This no-replace rename is the sole activation commit point.
-        unix::rename_noreplace(&self.root, PENDING_CURRENT, &self.root, "current")?;
+        unix::rename_noreplace(
+            self.locked.root(),
+            PENDING_CURRENT,
+            self.locked.root(),
+            "current",
+        )?;
 
         #[cfg(test)]
         if FAIL_AFTER_CURRENT_COMMIT.replace(false) {
@@ -272,13 +267,13 @@ impl PreparedFirstActivation {
             let (fresh_activations, fresh_version) = self.reopen_verified_namespace()?;
             require_exact_activation_parent(&fresh_activations)?;
             let activation = verify::verify_committed_first_activation(
-                &self.root,
+                self.locked.root(),
                 &fresh_activations,
                 &self.receipt,
                 &self.receipt_bytes,
                 &fresh_version,
             )?;
-            repeat_postcommit_barriers(&activation, &fresh_activations, &self.root)?;
+            repeat_postcommit_barriers(&activation, &fresh_activations, self.locked.root())?;
             Ok(())
         };
         finalize().map_err(InstallStateError::after_commit)?;
@@ -351,15 +346,9 @@ impl PreparedFirstActivation {
     fn reopen_verified_namespace(
         &self,
     ) -> Result<(Directory, VerifiedPreparedVersion), InstallStateError> {
-        let update = unix::open_directory_at(&self.root, "update", Some(0o700), true)?;
-        if !update.same_object(&self.update) {
-            return Err(InstallStateError::InvalidLayout(
-                "named update directory changed after preparation",
-            ));
-        }
-        unix::verify_named_identity(&update, "install.lock", self.lock_identity)?;
+        let live = self.locked.reopen()?;
 
-        let versions = unix::open_directory_at(&self.root, "versions", Some(0o700), true)?;
+        let versions = unix::open_directory_at(&live.root, "versions", Some(0o700), true)?;
         if !versions.same_object(&self.versions) {
             return Err(InstallStateError::InvalidLayout(
                 "named versions directory changed after preparation",
@@ -372,7 +361,7 @@ impl PreparedFirstActivation {
             ));
         }
 
-        let activations = unix::open_directory_at(&self.root, "activations", Some(0o700), true)?;
+        let activations = unix::open_directory_at(&live.root, "activations", Some(0o700), true)?;
         if !activations.same_object(&self.activations) {
             return Err(InstallStateError::InvalidLayout(
                 "named activations directory changed after preparation",
@@ -382,12 +371,13 @@ impl PreparedFirstActivation {
     }
 
     fn stage_current_link(&self) -> Result<(), InstallStateError> {
-        match unix::entry_identity(&self.root, PENDING_CURRENT)? {
+        match unix::entry_identity(self.locked.root(), PENDING_CURRENT)? {
             None => {
-                unix::create_symlink(&self.root, PENDING_CURRENT, CURRENT_TARGET)?;
-                unix::sync_directory(&self.root)?;
+                unix::create_symlink(self.locked.root(), PENDING_CURRENT, CURRENT_TARGET)?;
+                unix::sync_directory(self.locked.root())?;
             }
-            Some(_) if unix::read_symlink(&self.root, PENDING_CURRENT)? == CURRENT_TARGET => {}
+            Some(_)
+                if unix::read_symlink(self.locked.root(), PENDING_CURRENT)? == CURRENT_TARGET => {}
             Some(_) => {
                 return Err(InstallStateError::InvalidLayout(
                     "pending current link has conflicting contents",
