@@ -563,6 +563,11 @@ harness leans on three patterns:
    dependency's fetch/HTTP/TLS features are disabled. A retained Python-TUF
    corpus, generated with canonical key IDs and a fully hashed dependency lock,
    proves cross-implementation root rotation and lower-role authentication.
+   The closed root profile independently recomputes every canonical key ID and
+   accepts only exact Ed25519/Ed25519 keys with lowercase raw public bytes; key
+   IDs in maps, role bindings, and signatures use exact lowercase SHA-256 form.
+   Aliases, type/scheme mismatches, normalized key bytes, and extensions fail
+   before the library verification state machine.
    The same bounded context now owns the structural `ChannelPointerV1`, typed
    logical/consistent-snapshot target names, and a sealed current-time replay
    that accepts one stable pointer plus complete retained release pairs. Pointer

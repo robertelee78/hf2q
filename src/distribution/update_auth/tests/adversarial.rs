@@ -15,11 +15,11 @@ use crate::distribution::update_auth::model::{
 };
 use crate::distribution::update_auth::replay::begin_from_selected_for_test;
 use crate::distribution::update_auth::test_repository::{
-    anchor_at_version, multi_rotation, online_binding_change_cases, online_key_rotation_recovery,
-    same_key_chain, same_key_chain_with_expiry, same_key_lower_roles, static_lower_roles,
-    successive_threshold_rotations, targets_key_rotation_with_lower_rollback, threshold_rotation,
-    transient_online_rotation_with_lower_rollback, unrelated_root_rotation_with_lower_rollback,
-    RepositoryFixture, RotationSignatures,
+    anchor_at_version, hostile_root_profile_cases, multi_rotation, online_binding_change_cases,
+    online_key_rotation_recovery, same_key_chain, same_key_chain_with_expiry, same_key_lower_roles,
+    static_lower_roles, successive_threshold_rotations, targets_key_rotation_with_lower_rollback,
+    threshold_rotation, transient_online_rotation_with_lower_rollback,
+    unrelated_root_rotation_with_lower_rollback, RepositoryFixture, RotationSignatures,
 };
 use crate::distribution::update_auth::verifier::begin_from_anchor_for_test;
 use crate::distribution::update_auth::verifier::RoleFloor;

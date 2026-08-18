@@ -745,9 +745,16 @@ bounded before parsing, reject duplicate/trailing or over-depth JSON, and
 preserve the exact authenticated bytes. The v1 profile
 requires positive versions, canonical expiry strings, exact lowercase SHA-256
 and length parent pins, timestamp/snapshot singleton metadata, no delegations,
-and a maximum of 256 lifetime root rotations. Root-chain termination advances
-only on an explicit not-found response; any other transport outcome remains a
-failure for the future transport layer.
+and a maximum of 256 lifetime root rotations. Every root key-map ID, role-
+binding key ID, and envelope-signature key ID is exactly 64 lowercase
+hexadecimal characters. Each root key-map ID must equal SHA-256 of the
+canonical core key object, and that object is exactly Ed25519/Ed25519 with a
+64-character lowercase raw public key and no extension fields. This is hf2q's
+closed v1 POUF: it rejects aliased IDs, mismatched keytype/scheme pairs,
+case-folded or whitespace-normalized public keys, and producer extensions even
+when the pinned library could otherwise verify their signatures. Root-chain
+termination advances only on an explicit not-found response; any other
+transport outcome remains a failure for the future transport layer.
 
 Authority remains deliberately staged. Structurally valid journal bytes are
 not cryptographic authority. A complete transcript becomes a non-cloneable

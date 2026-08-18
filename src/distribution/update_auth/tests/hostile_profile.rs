@@ -2,6 +2,95 @@ use crate::distribution::update_auth::tests::TARGETS;
 use serde_json::json;
 
 #[test]
+fn canonical_root_key_identity_and_shape_wrap_the_stock_verifier() {
+    for case in hostile_root_profile_cases() {
+        assert!(
+            sigstore_tuf::TrustedMetadataSet::from_root(&case.hostile_anchor).is_ok(),
+            "{} hostile anchor must reach hf2q's stricter profile",
+            case.label
+        );
+        let mut stock = sigstore_tuf::TrustedMetadataSet::from_root(&case.valid_anchor)
+            .expect("valid canonical anchor");
+        assert!(
+            stock.update_root(&case.hostile_successor).is_ok(),
+            "{} hostile successor must reach hf2q's stricter profile",
+            case.label
+        );
+
+        assert!(matches!(
+            profile::root(&case.hostile_anchor),
+            Err(TufVerifierError::MalformedMetadata)
+        ));
+        let (_temp, authorization) = authorization();
+        let hostile_anchor = leaked_anchor(&case.hostile_anchor);
+        assert!(matches!(
+            begin_from_anchor_for_test(
+                &authorization,
+                &hostile_anchor,
+                [
+                    instant("2026-08-18T11:00:00Z"),
+                    instant("2026-08-18T11:00:01Z"),
+                ],
+            ),
+            Err(TufVerifierError::MalformedMetadata)
+        ));
+
+        let valid_anchor = leaked_anchor(&case.valid_anchor);
+        let successor = request(
+            begin_from_anchor_for_test(
+                &authorization,
+                &valid_anchor,
+                [
+                    instant("2026-08-18T11:00:00Z"),
+                    instant("2026-08-18T11:00:01Z"),
+                ],
+            )
+            .expect("valid canonical anchor starts"),
+            "2.root.json",
+        );
+        assert!(matches!(
+            successor.respond(MetadataResponse::Found(
+                case.hostile_successor.into_boxed_slice()
+            )),
+            Err(TufVerifierError::MalformedMetadata)
+        ));
+    }
+}
+
+#[test]
+fn root_key_ids_use_exact_lowercase_sha256_form_in_every_wire_position() {
+    let invalid_id = "A".repeat(64);
+
+    let mut key_map: serde_json::Value = serde_json::from_slice(ROOT).expect("root JSON");
+    let keys = key_map["signed"]["keys"]
+        .as_object_mut()
+        .expect("root key map");
+    let canonical_id = keys.keys().next().expect("one root key ID").clone();
+    let key = keys.remove(&canonical_id).expect("one root key");
+    key_map["signed"]["keys"][&invalid_id] = key;
+    assert!(matches!(
+        profile::root(&serde_json::to_vec(&key_map).expect("invalid key-map ID JSON")),
+        Err(TufVerifierError::MalformedMetadata)
+    ));
+
+    let mut binding: serde_json::Value = serde_json::from_slice(ROOT).expect("root JSON");
+    binding["signed"]["roles"]["root"]["keyids"][0] = json!(invalid_id);
+    assert!(matches!(
+        profile::root(&serde_json::to_vec(&binding).expect("invalid role-binding ID JSON")),
+        Err(TufVerifierError::MalformedMetadata)
+    ));
+
+    let mut signature: serde_json::Value = serde_json::from_slice(ROOT).expect("root JSON");
+    signature["signatures"][0]["keyid"] = json!(invalid_id);
+    assert!(matches!(
+        profile::root(&serde_json::to_vec(&signature).expect("invalid signature ID JSON")),
+        Err(TufVerifierError::MalformedMetadata)
+    ));
+
+    assert_eq!(canonical_id.len(), 64);
+}
+
+#[test]
 fn hostile_profile_rejects_missing_pins_extra_roles_and_noncanonical_depth() {
     let (timestamp, _, _) = static_lower_roles(3, "2999-01-01T00:00:00Z");
     let mut missing_hash: serde_json::Value =
@@ -212,13 +301,20 @@ fn wrong_role_duplicate_signature_and_mix_and_match_metadata_fail_closed() {
     );
     let mut wrong_role: serde_json::Value =
         serde_json::from_slice(&fixture.timestamp).expect("timestamp JSON");
+    let old_root = profile::root(&fixture.anchor).expect("canonical old root");
+    let old_root_ids = &old_root
+        .signed
+        .roles
+        .get("root")
+        .expect("root binding")
+        .keyids;
     for (index, signature) in wrong_role["signatures"]
         .as_array_mut()
         .expect("timestamp signatures")
         .iter_mut()
         .enumerate()
     {
-        signature["keyid"] = json!(format!("old-{}", if index == 0 { "a" } else { "b" }));
+        signature["keyid"] = json!(old_root_ids[index].clone());
     }
     assert!(matches!(
         timestamp.respond(MetadataResponse::Found(
