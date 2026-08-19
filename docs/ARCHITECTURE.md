@@ -613,14 +613,21 @@ harness leans on three patterns:
    closed without deletion. The same shared installation lock brackets a
    current-time selected-metadata replay before and after local I/O, and the
    anonymous archive descriptor is revalidated on both sides. The sealed result
-   remains inert and grants no path/FD, codesign, mode normalization,
+   remains inert and grants no path/FD, mode normalization,
    prepared-version publication, activation, installer, or CLI authority.
    The same private boundary contains a dormant filesystem-free bounded read-at
    validator for the exact thin arm64-ALL `MH_EXECUTE`/modern-dyld profile. It
    proves segment, section, link-edit, entry-point, deployment, and terminal
-   code-signature structure but grants no native-signature or prepared-version
-   authority. Descriptor-relative acquisition and native Security.framework
-   validation remain in the next retained-lock transaction.
+   code-signature structure. A sibling dormant macOS module pins the native
+   Security.framework wrappers, builds the closed Developer ID requirement,
+   validates all architectures with strict/trusted-anchor/no-network flags,
+   and type-checks the bounded signing-information dictionary, certificate
+   chain, timestamp, Hardened Runtime flags, entitlement absence, identifier,
+   Team ID, and leaf common name. Its only policy constructor is test-only;
+   the real Team ID and protected positive fixture are not yet present, so it
+   grants no native-signature or prepared-version authority. Descriptor-relative
+   acquisition and retained-lock integration remain in the publication
+   transaction.
    The schema boundary now defines installed-version marker v2 and a narrow
    first-standalone record builder. Marker v2 carries the exact metadata-role
    versions needed to regenerate the same install-receipt-v1 transition after

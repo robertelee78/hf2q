@@ -595,6 +595,47 @@ jobs:
                 and .uses_default_features == false
                 and .features == ["deflate-flate2-zlib-rs"]
             ' <<<"$direct_metadata"
+            jq -e '
+              [.packages[]
+                | select(.name == "hf2q")
+                | .dependencies[]
+                | select(
+                    .name == "core-foundation"
+                    or .name == "security-framework"
+                    or .name == "security-framework-sys"
+                  )
+                | {
+                    name,
+                    req,
+                    uses_default_features,
+                    features,
+                    target
+                  }]
+              | sort_by(.name)
+              == [
+                {
+                  "name":"core-foundation",
+                  "req":"=0.10.1",
+                  "uses_default_features":true,
+                  "features":[],
+                  "target":"cfg(target_os = \"macos\")"
+                },
+                {
+                  "name":"security-framework",
+                  "req":"=3.7.0",
+                  "uses_default_features":false,
+                  "features":["macos-12"],
+                  "target":"cfg(target_os = \"macos\")"
+                },
+                {
+                  "name":"security-framework-sys",
+                  "req":"=2.17.0",
+                  "uses_default_features":false,
+                  "features":["macos-12"],
+                  "target":"cfg(target_os = \"macos\")"
+                }
+              ]
+            ' <<<"$direct_metadata"
             resolved_metadata="$(cargo +1.88.0 metadata --locked --all-features --format-version 1)"
             jq -e '
               (.packages[]
@@ -697,6 +738,8 @@ jobs:
               src/distribution/install_state/unix.rs \
               src/distribution/prepared_release/mod.rs \
               src/distribution/prepared_release/archive.rs \
+              src/distribution/prepared_release/codesign.rs \
+              src/distribution/prepared_release/codesign_tests.rs \
               src/distribution/prepared_release/deflate.rs \
               src/distribution/prepared_release/extract.rs \
               src/distribution/prepared_release/macho.rs \

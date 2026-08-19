@@ -2,11 +2,15 @@
 //!
 //! This bounded context validates a listing-first exact-inventory ZIP and then
 //! materializes it only into private descriptor-relative inert staging while
-//! retaining the shared installation lock. It owns no codesign, signed-mode
-//! normalization, publication, marker, receipt, prepared-version, activation,
-//! installer, or CLI authority.
+//! retaining the shared installation lock. It also contains the dormant native
+//! Developer ID policy and typed signing-information verifier, but deliberately
+//! has no real compiled Team ID or production constructor yet. It owns no
+//! signed-mode normalization, publication, marker, receipt, prepared-version,
+//! activation, installer, or CLI authority.
 
 mod archive;
+#[cfg(target_os = "macos")]
+mod codesign;
 mod deflate;
 mod extract;
 mod macho;
@@ -95,6 +99,9 @@ fn validate_archive_reader<A: Read + Seek + ArchiveIntegrity>(
     Ok(profile)
 }
 
+#[cfg(test)]
+#[path = "codesign_tests.rs"]
+mod codesign_tests;
 #[cfg(test)]
 mod macho_tests;
 #[cfg(test)]
