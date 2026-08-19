@@ -504,6 +504,48 @@ capability and must independently beat eligible candidates.
   metrics, and required behavioral suites. Perplexity remains supplementary and
   cannot by itself make a candidate eligible.
 
+#### 2026-08-19 — bounded Dynamic allocation proposer substrate
+
+The first Phase-D implementation slice is deliberately narrower than a
+calibrator or production `--quant auto`. It establishes the fail-closed search
+and evidence boundary needed before either can be truthful:
+
+- the allocation problem must match its supplied canonical source-catalog
+  identity and count, with every supplied tensor occurring exactly once,
+  including atomic tied/fused groups and packed or separately stored experts.
+  Source ingestion must independently bind that catalog to the checkpoint
+  tensor bundle before production use;
+- each option binds the exact source, calibration/sensitivity definition,
+  Apple execution identity, workload profile, runtime capability profile, and
+  sufficient dense or per-expert activation coverage;
+- storage and execution are separate. Every tensor carries an ordered
+  stored-to-executed transform chain, final executed-tensor hash, and the
+  operation evidence that consumes it. A load-time Q6-to-Q4 conversion without
+  an explicit lossy transformation receipt is rejected;
+- fused operations such as gate+up carry one operation receipt and contribute
+  their measured cost once, while still covering every member tensor;
+- proposal search is a bounded exact multi-choice Pareto dynamic program over
+  payload bytes, fixed-point local loss, and every required Apple workload
+  regime. Exact dominance and exact metric-equivalence collapse are the only
+  reductions. One deterministic tensor assignment represents each equal proxy-metric vector, with collapsed
+  equivalents counted for later diversity repair. Exceeding the configured
+  live-state bound returns `FrontierLimitExceeded`; it never silently becomes
+  greedy or truncates the frontier;
+- every selected option retains its complete transform, route, measurement,
+  and sensitivity evidence in the policy hash. A verifier independently
+  regenerates the frontier from the allocation problem and rejects mutation.
+
+This closes only the **proposal substrate**. It does not yet produce structured
+calibration corpora, imatrices, KL gradients, quantized artifacts, repair a
+policy against full-model validation, or authorize a serving candidate.
+Unsloth Dynamic 3 motivates model-specific heterogeneous allocation and
+disjoint calibration/evaluation; its public material does not disclose a
+reproducible selector that hf2q can import. hf2q therefore keeps the exact
+owner-supplied checkpoint—including an abliterated or otherwise modified
+checkpoint—as teacher, generates its own source-bound evidence, and leaves
+final eligibility to held-out quality/behavior gates plus matched whole-model
+Apple measurements.
+
 ### Phase E — production `--quant auto`
 
 - Add an operator profile and budget surface.
