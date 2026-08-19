@@ -7,8 +7,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::distribution::install_state::locked::LockedInstallation;
+use crate::distribution::install_state::{
+    bootstrap_installation_identity_for_test, ExplicitRootAuthorization, IdentityFaultPlan,
+    LockedInstallationIdentity,
+};
 use crate::distribution::schema::ReleaseManifestV1;
+
+const INSTALLATION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 const PAYLOADS: [(&str, &[u8], &str); 3] = [
     ("bin/hf2q", b"signed binary\n", "0755"),
@@ -69,6 +74,18 @@ fn root() -> (tempfile::TempDir, std::path::PathBuf) {
     (temp, root)
 }
 
+fn locked_identity(root: &std::path::Path) -> LockedInstallationIdentity {
+    bootstrap_installation_identity_for_test(
+        ExplicitRootAuthorization::new(root).expect("root authorization"),
+        INSTALLATION_ID,
+        IdentityFaultPlan::default(),
+    )
+    .expect("installation identity")
+    .into_identity()
+    .lock()
+    .expect("installation lock")
+}
+
 fn authorization() -> ExtractionStageAuthorization {
     ExtractionStageAuthorization::for_test("0.2.0", b"archive identity")
 }
@@ -88,7 +105,7 @@ fn resume_all(
 #[test]
 fn exact_authenticated_replay_repairs_the_last_private_file_without_deleting_it() {
     let (_temp, root) = root();
-    let locked = LockedInstallation::acquire(&root).expect("installation lock");
+    let locked = locked_identity(&root);
     let (manifest, manifest_bytes) = manifest();
     let stage_name = authorization().stage_name();
 
@@ -131,7 +148,7 @@ fn exact_authenticated_replay_repairs_the_last_private_file_without_deleting_it(
 #[test]
 fn unexpected_tree_entries_fail_closed_and_are_never_deleted() {
     let (_temp, root) = root();
-    let locked = LockedInstallation::acquire(&root).expect("installation lock");
+    let locked = locked_identity(&root);
     let (manifest, manifest_bytes) = manifest();
     let stage_name = authorization().stage_name();
 
@@ -176,7 +193,7 @@ fn hostile_expected_nodes_and_nonprefix_trees_fail_closed() {
         Hostile::CompleteAfterAbsent,
     ] {
         let (_temp, root) = root();
-        let locked = LockedInstallation::acquire(&root).expect("installation lock");
+        let locked = locked_identity(&root);
         let (manifest, manifest_bytes) = manifest();
         let stage_name = authorization().stage_name();
         let stage = open_release_extraction(&locked, authorization(), &manifest_bytes, &manifest)
@@ -242,7 +259,7 @@ fn hostile_expected_nodes_and_nonprefix_trees_fail_closed() {
 #[test]
 fn detached_extractions_namespace_cannot_finish() {
     let (_temp, root) = root();
-    let locked = LockedInstallation::acquire(&root).expect("installation lock");
+    let locked = locked_identity(&root);
     let (manifest, manifest_bytes) = manifest();
     let mut stage = open_release_extraction(&locked, authorization(), &manifest_bytes, &manifest)
         .expect("new extraction");
@@ -273,9 +290,32 @@ fn detached_extractions_namespace_cannot_finish() {
 }
 
 #[test]
+fn replaced_identity_inode_cannot_finish_extraction() {
+    let (_temp, root) = root();
+    let locked = locked_identity(&root);
+    let (manifest, manifest_bytes) = manifest();
+    let mut stage = open_release_extraction(&locked, authorization(), &manifest_bytes, &manifest)
+        .expect("new extraction");
+    resume_all(&mut stage, &manifest, &manifest_bytes).expect("complete staged bytes");
+
+    let identity = root.join("update/installation-identity.json");
+    let bytes = std::fs::read(&identity).expect("identity bytes");
+    std::fs::rename(&identity, root.join("detached-installation-identity.json"))
+        .expect("detach identity inode");
+    std::fs::write(&identity, bytes).expect("same-byte identity replacement");
+    std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600))
+        .expect("private identity replacement");
+
+    assert!(stage.finish().is_err());
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
+}
+
+#[test]
 fn retained_stage_cap_allows_current_resume_but_rejects_a_ninth_stage() {
     let (_temp, root) = root();
-    let locked = LockedInstallation::acquire(&root).expect("installation lock");
+    let locked = locked_identity(&root);
     let extractions = unix::ensure_private_directory(locked.update(), EXTRACTIONS)
         .expect("extractions directory");
     let mut names = Vec::new();
@@ -302,7 +342,7 @@ fn retained_stage_cap_allows_current_resume_but_rejects_a_ninth_stage() {
 #[test]
 fn malformed_retained_siblings_and_incomplete_finish_are_preserved_and_rejected() {
     let (_temp, root) = root();
-    let locked = LockedInstallation::acquire(&root).expect("installation lock");
+    let locked = locked_identity(&root);
     let (manifest, manifest_bytes) = manifest();
     let mut stage = open_release_extraction(&locked, authorization(), &manifest_bytes, &manifest)
         .expect("new extraction");
@@ -346,7 +386,7 @@ fn process_abort_mid_file_leaves_only_resumable_inert_state() {
 
     if std::env::var_os(CHILD).is_some() {
         let root = std::path::PathBuf::from(std::env::var_os(ROOT).expect("child root"));
-        let locked = LockedInstallation::acquire(&root).expect("child installation lock");
+        let locked = locked_identity(&root);
         let (manifest, manifest_bytes) = manifest();
         let mut stage =
             open_release_extraction(&locked, authorization(), &manifest_bytes, &manifest)
@@ -373,7 +413,7 @@ fn process_abort_mid_file_leaves_only_resumable_inert_state() {
         "child must stop specifically at the extraction SIGABRT barrier"
     );
 
-    let locked = LockedInstallation::acquire(&root).expect("fresh-process installation lock");
+    let locked = locked_identity(&root);
     let (manifest, manifest_bytes) = manifest();
     let mut stage = open_release_extraction(&locked, authorization(), &manifest_bytes, &manifest)
         .expect("fresh process reopens exact residue");

@@ -203,6 +203,13 @@ jobs:
               src/distribution/prepared_release/extract.rs || true
           )"
           test -z "$unexpected_extraction_authority"
+          unexpected_identity_deletion="$(
+            grep -RInE --include='*.rs' \
+              'remove_named|remove_dir|remove_file|unlink|quarantine|trash' \
+              src/distribution/install_state/identity.rs \
+              src/distribution/install_state/identity || true
+          )"
+          test -z "$unexpected_identity_deletion"
           unexpected_transport_extraction="$(
             grep -RInE --include='*.rs' --exclude='tests.rs' \
               'ReleaseExtractionStage|PostReplayExtraction|ExtractedRelease|extract_release|with_locked_extraction' \
@@ -222,6 +229,9 @@ jobs:
             src/distribution/schema/install_receipt.rs \
             src/distribution/schema/install_receipt_validation.rs \
             src/distribution/schema/install_receipt_tests.rs \
+            src/distribution/schema/installation_identity.rs \
+            src/distribution/schema/installation_identity_tests.rs \
+            src/distribution/schema/testdata/installation_identity_v1.json \
             src/distribution/schema/installed_version_marker.rs \
             src/distribution/schema/release_manifest.rs \
             src/distribution/schema/release_manifest_tests.rs \
@@ -234,6 +244,11 @@ jobs:
             src/distribution/install_state/extraction.rs \
             src/distribution/install_state/extraction/io.rs \
             src/distribution/install_state/extraction_tests.rs \
+            src/distribution/install_state/identity.rs \
+            src/distribution/install_state/identity/fault.rs \
+            src/distribution/install_state/identity/inventory.rs \
+            src/distribution/install_state/identity_tests.rs \
+            src/distribution/install_state/identity_tests/process_cases.rs \
             src/distribution/install_state/unix.rs \
             src/distribution/prepared_release/mod.rs \
             src/distribution/prepared_release/archive.rs \
@@ -296,6 +311,8 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
           distribution_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \
+            distribution::install_state::identity::tests::process_cases::process_abort_at_every_identity_barrier_is_exactly_recoverable \
+            distribution::install_state::identity::tests::process_cases::shared_identity_lock_excludes_a_fresh_process_bootstrap \
             distribution::install_state::extraction::tests::process_abort_mid_file_leaves_only_resumable_inert_state \
             distribution::update_auth::target_set::tests::extraction_cases::stored_and_deflated_bundles_cross_the_complete_extraction_boundary \
             distribution::update_auth::target_set::tests::extraction_cases::post_extraction_archive_revalidation_failure_returns_no_capability_and_is_retryable

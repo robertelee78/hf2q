@@ -24,8 +24,14 @@ impl Fixture {
         // refuses it, so tests use the descriptor's canonical private path.
         let temp_path = temp.path().canonicalize().expect("canonical temp path");
         let root = temp_path.join("state");
+        bootstrap_installation_identity_for_test(
+            ExplicitRootAuthorization::new(&root).expect("root authorization"),
+            "550e8400-e29b-41d4-a716-446655440000",
+            IdentityFaultPlan::default(),
+        )
+        .expect("bootstrap fixture installation identity");
         let version = root.join("versions").join(VERSION);
-        for directory in [root.clone(), root.join("versions"), version.clone()] {
+        for directory in [root.join("versions"), version.clone()] {
             fs::create_dir_all(&directory).expect("create private fixture directory");
             chmod(&directory, 0o700);
         }
@@ -180,7 +186,8 @@ impl Fixture {
 
     pub(super) fn prepare(&self) -> Result<FirstActivationPreparation, InstallStateError> {
         prepare_first_activation(
-            ExplicitRootAuthorization::new(&self.root)?,
+            open_existing_installation_identity(ExplicitRootAuthorization::new(&self.root)?)?
+                .ok_or(InstallStateError::Missing("installation identity"))?,
             AuthenticatedPreparedVersion::for_test_only(self.receipt_bytes.clone()),
         )
     }

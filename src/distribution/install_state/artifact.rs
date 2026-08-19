@@ -6,7 +6,7 @@ use rustix::fs::{self, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
-use super::locked::LockedInstallation;
+use super::identity::LockedInstallationIdentity;
 use super::metadata::MetadataStateAuthorization;
 use super::unix::{self, EntryIdentity};
 use super::InstallStateError;
@@ -101,12 +101,12 @@ pub(in crate::distribution) fn create_ephemeral_artifact_stage(
     if expected_length == 0 {
         return Err(ArtifactStageError::Integrity);
     }
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
+    let locked = authorization.identity.lock()?;
     create_ephemeral_artifact_stage_under_lock(&locked, expected_length)
 }
 
 pub(super) fn create_ephemeral_artifact_stage_under_lock(
-    locked: &LockedInstallation,
+    locked: &LockedInstallationIdentity,
     expected_length: u64,
 ) -> Result<EphemeralArtifactStage, ArtifactStageError> {
     if expected_length == 0

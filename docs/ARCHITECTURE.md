@@ -557,7 +557,18 @@ harness leans on three patterns:
    and crash-durable journal hypotheses without adding either candidate to the
    production dependency graph or published crate. Its wire types grant no
    production authority.
-5. **Production signed-metadata boundary.** `distribution/update_auth/` uses
+5. **Installation identity boundary.** `distribution/install_state/identity.rs`
+   owns the 16 KiB canonical root-identity wire's descriptor-relative
+   publication and reopen protocol. A UUID-bearing exact-prefix intent is
+   full-synced before one no-replace final rename; real process-abort tests
+   exercise every durability barrier. The resulting non-cloneable capability
+   retains and repeats the exact root, update, lock, and identity inode/bytes.
+   Metadata, artifact staging, inert extraction, and first activation must
+   acquire/reopen through that capability rather than treating a path or
+   copied UUID as authority. The root inventory remains open for preserved
+   hf2q state, while the reserved `update/` identity inventory is bounded and
+   malformed residue is retained fail-closed.
+6. **Production signed-metadata boundary.** `distribution/update_auth/` uses
    `sigstore-tuf::TrustedMetadataSet` as its only library verification state
    machine behind hf2q's strict bounded profile. The stock `Updater`,
    `FileStore`, and `Repository` APIs are not imported or used, and the

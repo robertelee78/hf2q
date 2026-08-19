@@ -272,13 +272,14 @@ fn shared_installation_lock_excludes_both_process_entry_paths() {
     for mode in ["activation", "metadata"] {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = test_root(&parent);
+        let state = authorization(&root);
         let ready = parent.path().join(format!("{mode}-ready"));
         let mut child = spawn_lock_worker(&root, &ready, mode);
         wait_for_file(&ready);
         if mode == "activation" {
             assert!(matches!(
                 commit_candidate_for_test(
-                    authorization(&root),
+                    state,
                     candidate_at(&root, "2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 2, 3,),
                     FaultPlan::default(),
                 ),

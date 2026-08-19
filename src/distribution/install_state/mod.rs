@@ -9,6 +9,7 @@ mod artifact;
 mod extraction;
 mod file;
 mod host;
+mod identity;
 mod locked;
 pub(in crate::distribution) mod metadata;
 mod unix;
@@ -27,7 +28,6 @@ use schema::{
     TransitionKind, UpdateRoute,
 };
 
-use self::locked::LockedInstallation;
 use self::unix::Directory;
 use self::verify::VerifiedPreparedVersion;
 use super::schema;
@@ -39,6 +39,16 @@ pub(in crate::distribution) use artifact::{
 };
 pub(in crate::distribution) use extraction::{
     ExtractedReleaseTree, ExtractionError, ReleaseExtractionStage,
+};
+#[allow(unused_imports)]
+pub(in crate::distribution) use identity::{
+    bootstrap_installation_identity, open_existing_installation_identity,
+    DurableInstallationIdentity, InstallationIdentityBootstrap, LockedInstallationIdentity,
+};
+
+#[cfg(test)]
+pub(in crate::distribution) use identity::{
+    bootstrap_installation_identity_for_test, IdentityFaultPlan,
 };
 
 const FIRST_SEQUENCE: u64 = 1;
@@ -81,6 +91,16 @@ pub(crate) enum InstallStateError {
     Receipt(#[from] InstallReceiptError),
     #[error(transparent)]
     Manifest(#[from] ReleaseManifestError),
+    #[error(transparent)]
+    Identity(#[from] schema::InstallationIdentityError),
+    #[error(
+        "installation identity {installation_id} was committed, but its final durability is unknown: {source}"
+    )]
+    IdentityCommittedDurabilityUnknown {
+        installation_id: String,
+        #[source]
+        source: Box<InstallStateError>,
+    },
     #[error(
         "activation sequence {sequence} was committed, but its final durability is unknown: {source}"
     )]
@@ -106,6 +126,13 @@ impl InstallStateError {
     fn after_commit(self) -> Self {
         Self::CommittedDurabilityUnknown {
             sequence: FIRST_SEQUENCE,
+            source: Box::new(self),
+        }
+    }
+
+    fn after_identity_commit(self, installation_id: &schema::InstallationId) -> Self {
+        Self::IdentityCommittedDurabilityUnknown {
+            installation_id: installation_id.as_str().to_owned(),
             source: Box::new(self),
         }
     }
@@ -162,7 +189,7 @@ pub(crate) enum FirstActivationPreparation {
 /// not grant update, overwrite, entry-point, pruning, or deletion authority.
 #[derive(Debug)]
 pub(crate) struct PreparedFirstActivation {
-    locked: LockedInstallation,
+    locked: LockedInstallationIdentity,
     versions: Directory,
     activations: Directory,
     receipt: InstallReceiptV1,
@@ -175,15 +202,21 @@ pub(crate) struct FirstActivationOutcome {
     pub(crate) sequence: u64,
 }
 
-pub(crate) fn prepare_first_activation(
-    authorization: ExplicitRootAuthorization,
+pub(in crate::distribution) fn prepare_first_activation(
+    identity: DurableInstallationIdentity,
     authenticated: AuthenticatedPreparedVersion,
 ) -> Result<FirstActivationPreparation, InstallStateError> {
     let receipt =
-        verify::validate_first_receipt(&authenticated.receipt_bytes, &authorization.canonical)?;
-    let locked = LockedInstallation::acquire(&authorization.path)?;
-    let versions = unix::open_directory_at(locked.root(), "versions", Some(0o700), true)?;
-    let activations = unix::ensure_private_directory(locked.root(), "activations")?;
+        verify::validate_first_receipt(&authenticated.receipt_bytes, identity.state_root())?;
+    if receipt.installation_id() != identity.installation_id() {
+        return Err(InstallStateError::InvalidLayout(
+            "prepared version belongs to a different installation identity",
+        ));
+    }
+    let locked = identity.lock()?;
+    let live = locked.reopen()?;
+    let versions = unix::open_directory_at(&live.root, "versions", Some(0o700), true)?;
+    let activations = unix::ensure_private_directory(&live.root, "activations")?;
 
     if unix::entry_identity(locked.root(), "current")?.is_some() {
         let repair = || -> Result<(), InstallStateError> {
@@ -207,6 +240,7 @@ pub(crate) fn prepare_first_activation(
                 &version,
             )?;
             repeat_postcommit_barriers(&activation, &activations, locked.root())?;
+            locked.full_sync_endpoint()?;
             Ok(())
         };
         repair().map_err(InstallStateError::after_commit)?;
@@ -286,6 +320,7 @@ impl PreparedFirstActivation {
                 &fresh_version,
             )?;
             repeat_postcommit_barriers(&activation, &fresh_activations, self.locked.root())?;
+            self.locked.full_sync_endpoint()?;
             Ok(())
         };
         finalize().map_err(InstallStateError::after_commit)?;

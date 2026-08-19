@@ -48,6 +48,10 @@ impl LockedInstallation {
         &self.update
     }
 
+    pub(super) fn lock_identity(&self) -> EntryIdentity {
+        self.lock_identity
+    }
+
     /// Flush all prior state-root directory barriers to stable media through
     /// the exact lock file that anchors this installation transaction.
     ///

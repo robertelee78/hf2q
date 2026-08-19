@@ -5,7 +5,6 @@ use super::super::{
 use super::fault::FaultPlan;
 use super::validation::read_selector_with_mode;
 use super::{HistoryMode, LockedMetadataJournal};
-use crate::distribution::install_state::locked::LockedInstallation;
 
 #[cfg(test)]
 fn commit_candidate_with_faults(
@@ -13,20 +12,15 @@ fn commit_candidate_with_faults(
     candidate: VerifiedMetadataCandidate,
     faults: FaultPlan,
 ) -> Result<MetadataCommitOutcome, MetadataJournalError> {
-    if authorization.root.canonical.as_str() != candidate.state_root()
-        || authorization.installation_id != candidate.installation_id()
+    if authorization.state_root() != candidate.state_root()
+        || authorization.installation_id() != candidate.installation_id()
     {
         return Err(MetadataJournalError::Invalid(
             "candidate identity differs from the explicit metadata-state authorization",
         ));
     }
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
-    LockedMetadataJournal::open(
-        locked,
-        authorization.installation_id.clone(),
-        candidate.state_root().to_owned(),
-    )?
-    .commit(&candidate, faults)
+    let locked = authorization.identity.lock()?;
+    LockedMetadataJournal::open(locked)?.commit(&candidate, faults)
 }
 
 #[cfg(test)]
@@ -44,19 +38,15 @@ pub(in crate::distribution::install_state::metadata) fn commit_candidate_with_ho
     candidate: VerifiedMetadataCandidate,
     hook: impl FnOnce(),
 ) -> Result<MetadataCommitOutcome, MetadataJournalError> {
-    if authorization.root.canonical.as_str() != candidate.state_root()
-        || authorization.installation_id != candidate.installation_id()
+    if authorization.state_root() != candidate.state_root()
+        || authorization.installation_id() != candidate.installation_id()
     {
         return Err(MetadataJournalError::Invalid(
             "candidate identity differs from the explicit metadata-state authorization",
         ));
     }
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
-    let journal = LockedMetadataJournal::open(
-        locked,
-        authorization.installation_id,
-        candidate.state_root().to_owned(),
-    )?;
+    let locked = authorization.identity.lock()?;
+    let journal = LockedMetadataJournal::open(locked)?;
     hook();
     journal.commit(&candidate, FaultPlan::default())
 }
@@ -67,20 +57,15 @@ pub(in crate::distribution::install_state::metadata) fn commit_candidate_with_pr
     candidate: VerifiedMetadataCandidate,
     hook: impl FnOnce(),
 ) -> Result<MetadataCommitOutcome, MetadataJournalError> {
-    if authorization.root.canonical.as_str() != candidate.state_root()
-        || authorization.installation_id != candidate.installation_id()
+    if authorization.state_root() != candidate.state_root()
+        || authorization.installation_id() != candidate.installation_id()
     {
         return Err(MetadataJournalError::Invalid(
             "candidate identity differs from the explicit metadata-state authorization",
         ));
     }
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
-    LockedMetadataJournal::open(
-        locked,
-        authorization.installation_id,
-        candidate.state_root().to_owned(),
-    )?
-    .commit_with_precommit_hooks(
+    let locked = authorization.identity.lock()?;
+    LockedMetadataJournal::open(locked)?.commit_with_precommit_hooks(
         &candidate,
         FaultPlan::default(),
         || {
@@ -96,13 +81,8 @@ pub(in crate::distribution) fn discard_unselected_for_test(
     authorization: MetadataStateAuthorization,
     faults: FaultPlan,
 ) -> Result<MetadataRestartCleanup, MetadataJournalError> {
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
-    LockedMetadataJournal::open(
-        locked,
-        authorization.installation_id,
-        authorization.root.canonical.as_str().to_owned(),
-    )?
-    .discard_unselected_transaction(faults)
+    let locked = authorization.identity.lock()?;
+    LockedMetadataJournal::open(locked)?.discard_unselected_transaction(faults)
 }
 
 #[cfg(test)]
@@ -110,12 +90,8 @@ pub(in crate::distribution::install_state::metadata) fn discard_unselected_with_
     authorization: MetadataStateAuthorization,
     hook: impl FnOnce(),
 ) -> Result<MetadataRestartCleanup, MetadataJournalError> {
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
-    let journal = LockedMetadataJournal::open(
-        locked,
-        authorization.installation_id,
-        authorization.root.canonical.as_str().to_owned(),
-    )?;
+    let locked = authorization.identity.lock()?;
+    let journal = LockedMetadataJournal::open(locked)?;
     hook();
     journal.discard_unselected_transaction(FaultPlan::default())
 }
@@ -125,12 +101,8 @@ pub(in crate::distribution::install_state::metadata) fn cleanup_selected_with_ho
     authorization: MetadataStateAuthorization,
     hook: impl FnOnce(),
 ) -> Result<(), MetadataJournalError> {
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
-    let journal = LockedMetadataJournal::open(
-        locked,
-        authorization.installation_id,
-        authorization.root.canonical.as_str().to_owned(),
-    )?;
+    let locked = authorization.identity.lock()?;
+    let journal = LockedMetadataJournal::open(locked)?;
     let selected = read_selector_with_mode(
         &journal.metadata,
         &journal.generations,
@@ -148,13 +120,13 @@ pub(in crate::distribution::install_state::metadata) fn hold_metadata_lock_for_t
     root: &std::path::Path,
     ready: &std::path::Path,
 ) {
-    let locked = LockedInstallation::acquire(root).expect("acquire metadata installation lock");
-    let _journal = LockedMetadataJournal::open(
-        locked,
-        "7c907c7a-3125-4a40-a8b3-1c125080e46a".to_owned(),
-        root.to_str().expect("UTF-8 root").to_owned(),
-    )
-    .expect("open metadata journal");
+    let authorization =
+        MetadataStateAuthorization::for_test_path(root, "7c907c7a-3125-4a40-a8b3-1c125080e46a");
+    let locked = authorization
+        .identity
+        .lock()
+        .expect("acquire metadata installation lock");
+    let _journal = LockedMetadataJournal::open(locked).expect("open metadata journal");
     std::fs::write(ready, b"ready").expect("signal metadata lock");
     std::thread::sleep(std::time::Duration::from_secs(60));
 }

@@ -6,7 +6,7 @@ use super::{
     MetadataStateAuthorization, VerifiedMetadataCandidate,
 };
 use crate::distribution::install_state::file;
-use crate::distribution::install_state::locked::LockedInstallation;
+use crate::distribution::install_state::identity::LockedInstallationIdentity;
 use crate::distribution::install_state::unix::{self, Directory};
 use crate::distribution::update_auth::AdvancingCommitGuard;
 
@@ -62,13 +62,9 @@ pub(in crate::distribution) struct LockedMetadataState {
 pub(in crate::distribution) fn lock_metadata_state(
     authorization: &MetadataStateAuthorization,
 ) -> Result<LockedMetadataState, MetadataJournalError> {
-    let locked = LockedInstallation::acquire(&authorization.root.path)?;
+    let locked = authorization.identity.lock()?;
     Ok(LockedMetadataState {
-        journal: LockedMetadataJournal::open(
-            locked,
-            authorization.installation_id.clone(),
-            authorization.root.canonical.as_str().to_owned(),
-        )?,
+        journal: LockedMetadataJournal::open(locked)?,
     })
 }
 
@@ -118,8 +114,8 @@ impl LockedMetadataState {
         &self,
         candidate: &VerifiedMetadataCandidate,
     ) -> Result<MetadataCommitOutcome, MetadataJournalError> {
-        if self.journal.state_root != candidate.state_root()
-            || self.journal.installation_id != candidate.installation_id()
+        if self.journal.locked.state_root().as_str() != candidate.state_root()
+            || self.journal.locked.installation_id().as_str() != candidate.installation_id()
         {
             return Err(MetadataJournalError::Invalid(
                 "candidate identity differs from the locked metadata state",
@@ -134,8 +130,8 @@ impl LockedMetadataState {
         guard: &mut AdvancingCommitGuard<'_>,
     ) -> Result<MetadataCommitOutcome, MetadataJournalError> {
         let candidate = guard.candidate();
-        if self.journal.state_root != candidate.state_root()
-            || self.journal.installation_id != candidate.installation_id()
+        if self.journal.locked.state_root().as_str() != candidate.state_root()
+            || self.journal.locked.installation_id().as_str() != candidate.installation_id()
         {
             return Err(MetadataJournalError::Invalid(
                 "candidate identity differs from the locked metadata state",
@@ -160,11 +156,9 @@ impl LockedMetadataState {
 }
 
 struct LockedMetadataJournal {
-    locked: LockedInstallation,
+    locked: LockedInstallationIdentity,
     metadata: Directory,
     generations: Directory,
-    installation_id: String,
-    state_root: String,
 }
 
 struct LiveNamespace {
@@ -175,19 +169,13 @@ struct LiveNamespace {
 }
 
 impl LockedMetadataJournal {
-    fn open(
-        locked: LockedInstallation,
-        installation_id: String,
-        state_root: String,
-    ) -> Result<Self, MetadataJournalError> {
+    fn open(locked: LockedInstallationIdentity) -> Result<Self, MetadataJournalError> {
         let metadata = unix::ensure_private_directory(locked.update(), METADATA)?;
         let generations = unix::ensure_private_directory(&metadata, GENERATIONS)?;
         Ok(Self {
             locked,
             metadata,
             generations,
-            installation_id,
-            state_root,
         })
     }
 
@@ -205,7 +193,10 @@ impl LockedMetadataJournal {
             "selected metadata generation is absent",
         ))?;
         let receipt = read_receipt(&live.generations, &selector)?;
-        receipt.validate_state_identity(&self.installation_id, &self.state_root)?;
+        receipt.validate_state_identity(
+            self.locked.installation_id().as_str(),
+            self.locked.state_root().as_str(),
+        )?;
         let next = selector
             .sequence()
             .checked_add(1)
@@ -249,7 +240,10 @@ impl LockedMetadataJournal {
         )?;
         if let Some(stored) = &selected {
             MetadataGenerationReceiptV2::parse(&stored.generation_receipt)?
-                .validate_state_identity(&self.installation_id, &self.state_root)?;
+                .validate_state_identity(
+                    self.locked.installation_id().as_str(),
+                    self.locked.state_root().as_str(),
+                )?;
         }
         Ok(selected)
     }
@@ -265,7 +259,10 @@ impl LockedMetadataJournal {
         )?;
         if let Some(stored) = &selected {
             MetadataGenerationReceiptV2::parse(&stored.generation_receipt)?
-                .validate_state_identity(&self.installation_id, &self.state_root)?;
+                .validate_state_identity(
+                    self.locked.installation_id().as_str(),
+                    self.locked.state_root().as_str(),
+                )?;
         }
         Ok(selected)
     }
@@ -287,7 +284,10 @@ impl LockedMetadataJournal {
             .map(|selector| read_receipt(&self.generations, selector))
             .transpose()?;
         if let Some(receipt) = &prior_receipt {
-            receipt.validate_state_identity(&self.installation_id, &self.state_root)?;
+            receipt.validate_state_identity(
+                self.locked.installation_id().as_str(),
+                self.locked.state_root().as_str(),
+            )?;
         }
 
         if let Some(selector) = &prior {

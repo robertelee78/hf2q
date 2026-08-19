@@ -1,8 +1,9 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
 - Status: Proposed; product interview, shell-completion bootstrap,
-  distribution schemas, first-activation transaction, signed-update verifier
-  selection, shared installation lock, durable metadata journal, dormant
+  distribution schemas, crash-durable root identity capability,
+  first-activation transaction, signed-update verifier selection, shared
+  installation lock, durable metadata journal, dormant
   transport-free production verifier, commit-freshness capability, and
   restart-discard, root-authorized online-role recovery, and dormant
   channel-pointer/selected-target binding, origin-locked artifact transport,
@@ -14,7 +15,7 @@
   prepared-version publication, public update/install/onboarding
   implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
-- Updated: 2026-08-18
+- Updated: 2026-08-19
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/ADR-044-qwen38-native.md`,
   `docs/ADR-017-persistent-block-prefix-cache.md`,
@@ -457,6 +458,10 @@ hf2q-owned state below one root, except for the user PATH entry point:
 │   ├── install.lock
 │   ├── .noreplace-source
 │   ├── .noreplace-target
+│   ├── installation-identity.json
+│   ├── downloads/
+│   ├── extractions/
+│   ├── prepared/
 │   └── metadata/
 │       ├── current.json
 │       └── generations/
@@ -515,6 +520,48 @@ symlinks; only normal UTF-8 components are accepted. Existing ancestors need
 not be private or user-owned, but they must already exist: explicit authority
 to create one root never authorizes creation of missing ancestors. The final
 root may be created and must be current-user owned mode `0700`.
+
+Before metadata, download, extraction, prepared-version, activation, or
+uninstall state can exist, hf2q commits one immutable root identity at
+`update/installation-identity.json`. The canonical v1 wire is compact JSON plus
+one LF, capped at 16 KiB, and contains only kind
+`hf2q.installation-identity`, schema version 1, state-layout schema 1, package
+`hf2q`, one canonical lowercase UUIDv4 installation ID, and the canonical
+absolute state root. It deliberately has no creation timestamp: every byte is
+reconstructible from the reserved intent name and explicit root authority.
+Unknown/duplicate fields, trailing documents, noncanonical encoding, UUID
+aliases, a non-v4 UUID, and noncanonical roots fail closed.
+
+Bootstrap first creates and syncs the private root/update/no-replace/lock
+scaffold under the shared nonblocking lock. It then creates at most one
+`update/.installation-identity-v1-{UUID}.partial` regular `0600`, single-link,
+same-device intent. Existing intent bytes must be an exact prefix of the one
+canonical record; conflicting, oversized, wrongly typed/mode/owned/linked,
+malformed, multiple, or over-cap residue is retained without deletion and
+fails closed. The complete intent is synced and `F_FULLFSYNC`ed, the live
+root/update/lock/intent namespace and exact bytes are rebound, and a
+descriptor-relative no-replace rename to `installation-identity.json` is the
+sole commit point. After that rename, any reopen or
+file/update/root/lock-durability failure is
+`IdentityCommittedDurabilityUnknown { installation_id }`, and an exact retry
+recovers the UUID from the final or intent name, repeats all barriers, and
+returns the same identity. No retry generates a replacement UUID when either
+durable name exists.
+
+The final identity is not authority merely because its JSON parses. Ordinary
+open retains the exact root, update, lock, and identity-file inodes and exact
+identity bytes, then repeats the named snapshot. Lock acquisition and every
+metadata, artifact, extraction, and activation reopen require those same live
+bindings; replacing an inode with byte-identical content cannot authorize a
+transition. The bounded `update/` inventory recognizes only the fixed
+no-replace/lock/identity entries plus metadata, downloads, extractions, and
+prepared-version staging;
+the state-root inventory is intentionally not globally closed because hf2q
+also owns preserved state such as `ruvector`, models, and caches. When no final
+identity exists, any metadata/download/extraction/version/activation/current
+or uninstall state is inconsistent and bootstrap rejects it before mutation.
+A truly empty or unrelated preidentity root remains eligible, and read-only
+absence checks do not create it.
 
 The first filesystem implementation is deliberately narrower than ownership
 or update. Given explicit root authorization and an already authenticated,
@@ -708,6 +755,9 @@ installation/update files, and owned PATH stanza reach the recorded terminal
 state. Default uninstall keeps the state root and user data, so this journal
 remains available across interruption. Purge-data is a subsequent explicit
 data transaction and cannot weaken the installation-uninstall recovery rule.
+The data-preserving default retains the root identity as the ownership anchor
+for preserved state; a full purge may remove it only as the final
+identity-bound step immediately before removing an otherwise empty state root.
 
 ### 3. Update the whole managed installation atomically
 
@@ -1703,9 +1753,10 @@ before public self-update ships.
 
 ## Implementation sequence
 
-1. The release manifest, install receipt/version marker, durable first
-   activation, comparative TUF spike, shared lock, and production v2 metadata
-   journal land first. The tokenized transport-free authenticated-update
+1. The release manifest, install receipt/version marker, crash-durable
+   descriptor-bound installation identity, durable first activation,
+   comparative TUF spike, shared lock, and production v2 metadata journal land
+   first. The tokenized transport-free authenticated-update
    verifier, sealed selector-boundary freshness capability, durable-baseline
    replay, fresh-process discard recovery, root-authorized online-role floor
    reset, independent Python-TUF corpus, canonical channel-pointer schema,
