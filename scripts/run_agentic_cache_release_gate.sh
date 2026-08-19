@@ -350,6 +350,26 @@ test "$(sha256_file "$OUT_ROOT/fixtures/public-347.json")" = \
 test "$(sha256_file "$OUT_ROOT/fixtures/public-short.json")" = \
   "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004"
 
+# Fail fast on prompt-render/tokenizer drift before paying the cost of loading
+# the 100 GiB DeepSeek verifier. This request is byte-for-byte the first
+# request used by the four-agent wave below.
+deepseek_agentic_request="$OUT_ROOT/fixtures/deepseek-agentic-request.json"
+HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$deepseek_agentic_request" \
+RUN_ID=full-context-deepseek4-agent-1 \
+SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
+EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
+TOOL_RESULT_PATH="$PWD/Cargo.toml" \
+AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6684 \
+AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
+AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
+  scripts/test_deepseek4_agentic.sh
+HF2Q_DEEPSEEK4_GGUF="$DEEPSEEK_MODEL" \
+HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON="$deepseek_agentic_request" \
+HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS=6684 \
+  cargo test --locked --bin hf2q \
+    release_agentic_fixture_renders_to_expected_tokens -- \
+    --ignored --test-threads=1 >"$OUT_ROOT/fixtures/deepseek-prompt-preflight.log" 2>&1
+
 run_deepseek_wave() {
   local wave=$1
   local out="$OUT_ROOT/deepseek/full-context-$wave"
@@ -388,7 +408,7 @@ run_deepseek_wave() {
   WAVE_ID=default REQUIRE_COLD_FIRST=1 \
   EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
   TOOL_RESULT_PATH="$PWD/Cargo.toml" \
-  AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6685 \
+  AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6684 \
   AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
   AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
   MAX_COLD_TTFT_MS=60000 MAX_COLD_RESPONSE_MS=60000 \

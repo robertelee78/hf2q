@@ -208,6 +208,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opens the release DeepSeek GGUF and exact agentic request fixture"]
+    fn release_agentic_fixture_renders_to_expected_tokens() {
+        let gguf_path = std::env::var("HF2Q_DEEPSEEK4_GGUF")
+            .expect("set HF2Q_DEEPSEEK4_GGUF to the release DeepSeek artifact");
+        let request_path = std::env::var("HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON")
+            .expect("set HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON to the exact request fixture");
+        let expected_tokens = std::env::var("HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS")
+            .expect("set HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS")
+            .parse::<usize>()
+            .expect("HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS must be an integer");
+
+        let request_bytes = std::fs::read(&request_path)
+            .unwrap_or_else(|error| panic!("read request {request_path:?}: {error}"));
+        let request: crate::serve::api::schema::ChatCompletionRequest =
+            serde_json::from_slice(&request_bytes)
+                .unwrap_or_else(|error| panic!("parse request {request_path:?}: {error}"));
+        let gguf =
+            GgufFile::open(std::path::Path::new(&gguf_path)).expect("open release DeepSeek GGUF");
+        let template = gguf
+            .metadata_string("tokenizer.chat_template")
+            .expect("release DeepSeek GGUF carries tokenizer.chat_template");
+        let tokenizer = build_tokenizer_from_gguf(&gguf)
+            .expect("build tokenizer from the release DeepSeek GGUF");
+        let rendered = crate::serve::api::engine::render_chat_prompt_with_tools(
+            template,
+            &request.messages,
+            request.tools.as_deref(),
+            crate::serve::template_supports_enable_thinking(template),
+            request.chat_template_kwargs.as_ref(),
+        )
+        .expect("render request through the production DeepSeek-V4 path");
+        let encoded = tokenizer
+            .encode(rendered.as_str(), false)
+            .expect("tokenize release agentic prompt");
+
+        assert_eq!(
+            encoded.len(),
+            expected_tokens,
+            "release DeepSeek agentic prompt-token contract drifted"
+        );
+    }
+
+    #[test]
     #[ignore = "opens the locally converted official GGUF tokenizer metadata"]
     fn official_embedded_tokenizer_matches_source_json() {
         let gguf_path = std::env::var("HF2Q_DEEPSEEK4_GGUF")

@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trajectory and could push an otherwise correct required tool call beyond a
   128-token completion budget. The corrected renderer matches the source
   prompt, while conversion, quantization, and model weights remain unchanged.
+- Rebind the frozen DeepSeek four-agent release fixture to its deterministic
+  6,684-token insertion-ordered render. The prior 6,685-token assertion was the
+  legacy key-sorted count and stopped an otherwise coherent hardware wave.
+  Release validation now renders and tokenizes the exact first request before
+  loading the 100 GiB verifier, so future prompt drift fails early.
 - Recalibrate the public Qwen3.6 347-tool/87,972-token release fixture for that
   insertion-order contract. The production renderer adds 28 tokens per tool
   relative to the historical key-sorted fixture, so its deterministic padding
@@ -315,7 +320,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Freeze the four-agent agentic repository context to the exact 21,204-byte
   calibration fixture instead of embedding the growing live README. The
   producer and protected release path now require its fixture ID, SHA-256,
-  byte/character counts, exact 6,685-token DeepSeek render, zero cold reuse,
+  byte/character counts, exact 6,684-token DeepSeek render, zero cold reuse,
   semantic/tool proof, and the literal 60-second cold limits; a model-free
   negative matrix rejects stale or incomplete receipts.
 - Run the two calibrated DeepSeek four-agent waves before the long functional

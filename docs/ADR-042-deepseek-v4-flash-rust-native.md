@@ -1750,6 +1750,30 @@ the M5 Max and exact 100.05 GiB agentic Q2 artifact:
 These receipts close the local hardening candidate. They do not replace clean
 immutable source, exact-SHA CI, or packed-artifact publication authority.
 
+### Insertion-ordered release-fixture recalibration (2026-08-19)
+
+Exact-main cache-lifecycle run `32282861299` exposed a stale test contract, not
+an inference or thermal failure. Commit `d4874792` had correctly enabled
+`serde_json` insertion-order preservation so the DeepSeek chat template sees
+the client's tool schema in its original wire order. The immutable 21,204-byte
+repository fixture, prompt-visible path, model artifact, and request semantics
+were unchanged, but the corrected serialization renders to 6,684 tokens rather
+than the historical key-sorted 6,685.
+
+Four independent requests in the failed run all reported exactly 6,684 prompt
+tokens with zero cold reuse. Three completed the required `read_file` tool call
+before the first agent rejected the stale 6,685 assertion and the harness
+cleaned up the fourth. Prefill completed for all four under entirely Nominal
+thermal telemetry. The release fixture, receipt parser, publication verifier,
+and current operator documentation therefore bind 6,684 tokens; older 6,685
+measurements remain below as historical evidence for the superseded
+serialization. No latency SLO or semantic acceptance predicate changed.
+
+The protected gate now also generates the exact first-wave request and renders
+and tokenizes it directly from the release GGUF before loading the 100 GiB
+verifier. A future template/schema/tokenizer drift therefore fails during the
+cheap preflight instead of after model startup and a partial four-agent wave.
+
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
 This section records the rejected 89.65 GiB Q2_K_S artifact and the defects that

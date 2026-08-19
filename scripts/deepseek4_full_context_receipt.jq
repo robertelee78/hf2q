@@ -8,14 +8,17 @@ def valid_agent:
   and .agentic_context_fixture_bytes == 21204
   and .repository_context_chars == 20584
   and .expected_path == "/opt/hf2q-worktrees/full-context-slots/Cargo.toml"
-  and .expected_prompt_tokens == 6685
-  and .prompt_tokens == 6685
+  and .expected_prompt_tokens == 6684
+  and .prompt_tokens == 6684
   and .cold_cached_tokens == 0
   and (.cold_ttft_ms | number_between(0; 60000))
   and (.cold_semantic_response_ms | number_between(0; 60000))
-  and (.cached_tokens | type == "number" and . >= 6653)
-  and (.auto_cached_tokens | type == "number" and . >= 6653)
-  and (.continuation_cached_tokens | type == "number" and . >= 6653)
+  and (.cached_tokens | type == "number")
+  and .cached_tokens >= (.prompt_tokens - 32)
+  and (.auto_cached_tokens | type == "number")
+  and .auto_cached_tokens >= (.prompt_tokens - 32)
+  and (.continuation_cached_tokens | type == "number")
+  and .continuation_cached_tokens >= (.prompt_tokens - 32)
   and (.cached_ttft_ms | number_between(0; 5000))
   and (.cached_semantic_response_ms | number_between(0; 15000))
   and (.auto_semantic_response_ms | number_between(0; 15000))
@@ -36,8 +39,8 @@ and .fixture_id == "full-context-agentic-v1"
 and .agentic_context_fixture_sha256 == "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef"
 and .agentic_context_fixture_bytes == 21204
 and .repository_context_chars == 20584
-and .expected_prompt_tokens == 6685
-and .prompt_tokens == 6685
+and .expected_prompt_tokens == 6684
+and .prompt_tokens == 6684
 and (.maximum_cold_ttft_ms | number_between(0; 60000))
 and (.maximum_cold_semantic_response_ms | number_between(0; 60000))
 and (.cohort_cold_wall_ms | number_between(0; 60000))
