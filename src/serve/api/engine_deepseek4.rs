@@ -12,7 +12,8 @@ mod stream;
 
 pub(super) use sampling::generate_once;
 pub(super) use slots::{
-    Deepseek4PrefillAdvance, Deepseek4PrefillState, Deepseek4SlotCompletion, Deepseek4SlotState,
+    Deepseek4CooperativePrefillPlan, Deepseek4PrefillAdvance, Deepseek4PrefillState,
+    Deepseek4SlotCompletion, Deepseek4SlotState,
 };
 pub(super) use stream::generate_stream;
 
@@ -344,6 +345,58 @@ impl Deepseek4Session {
         &self.committed_tokens
     }
 
+    pub(super) fn cache_position(&self) -> usize {
+        self.cache.position()
+    }
+
+    pub(super) fn prepare_cooperative_prefill(
+        &mut self,
+        start: usize,
+        token_count: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.cache.position() == start
+                && self.committed_tokens.len() == start
+                && self.live_logits.is_none(),
+            "DeepSeek-V4 cooperative prefill start {start} disagrees with cache {} / token ledger {} / live logits {}",
+            self.cache.position(),
+            self.committed_tokens.len(),
+            self.live_logits.is_some()
+        );
+        self.committed_tokens
+            .try_reserve(token_count)
+            .context("reserve DeepSeek-V4 cooperative token ledger")?;
+        Ok(())
+    }
+
+    pub(super) fn validate_cooperative_prefill_result(
+        &self,
+        start: usize,
+        token_count: usize,
+    ) -> Result<()> {
+        let end = start
+            .checked_add(token_count)
+            .context("DeepSeek-V4 cooperative token ledger overflow")?;
+        anyhow::ensure!(
+            self.cache.position() == end
+                && self.committed_tokens.len() == start
+                && self.live_logits.is_none(),
+            "DeepSeek-V4 cooperative result end {end} disagrees with cache {} / token ledger {} / live logits {}",
+            self.cache.position(),
+            self.committed_tokens.len(),
+            self.live_logits.is_some()
+        );
+        Ok(())
+    }
+
+    pub(super) fn publish_cooperative_tokens(&mut self, tokens: &[u32]) {
+        debug_assert_eq!(
+            self.cache.position(),
+            self.committed_tokens.len() + tokens.len()
+        );
+        self.committed_tokens.extend_from_slice(tokens);
+    }
+
     /// Return the longest prefix this retained slot can safely resume for the
     /// rendered prompt. DeepSeek's native encoder may rewrite the generated
     /// reasoning/tool tail on the next turn, so scheduler affinity must
@@ -483,6 +536,42 @@ impl Deepseek4Session {
 }
 
 impl Deepseek4LoadedModel {
+    pub(super) fn supervised_verifier_prefill_cohort(
+        &mut self,
+        token_batches: &[&[u32]],
+        sessions: &mut [Deepseek4Session],
+        sorted_slot_indices: &[usize],
+        supervisor: &EngineSupervisor,
+    ) -> Result<Vec<MlxBuffer>> {
+        anyhow::ensure!(
+            (2..=4).contains(&sorted_slot_indices.len())
+                && token_batches.len() == sorted_slot_indices.len(),
+            "DeepSeek-V4 cooperative serving requires 2..=4 aligned lanes"
+        );
+        anyhow::ensure!(
+            sorted_slot_indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "DeepSeek-V4 cooperative slot indices must be unique and sorted"
+        );
+        let mut wanted = sorted_slot_indices.iter().copied().peekable();
+        let mut caches = Vec::with_capacity(sorted_slot_indices.len());
+        for (index, session) in sessions.iter_mut().enumerate() {
+            if wanted.peek().copied() == Some(index) {
+                caches.push(&mut session.cache);
+                wanted.next();
+            }
+        }
+        anyhow::ensure!(
+            wanted.next().is_none() && caches.len() == token_batches.len(),
+            "DeepSeek-V4 cooperative slot index is out of range"
+        );
+        let lease = supervisor.arm("deepseek4_cooperative_prefill", GPU_TRANSACTION_TIMEOUT)?;
+        self.model.forward_verifier_prefill_cohort_with_commit_gate(
+            token_batches,
+            &mut caches,
+            || lease.finish(),
+        )
+    }
+
     fn supervised_verifier_prefill(
         &mut self,
         token_ids: &[u32],

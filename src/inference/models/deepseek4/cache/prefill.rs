@@ -29,6 +29,11 @@ pub struct CacheSpan {
     pub layers: Vec<LayerCacheSpan>,
 }
 
+/// Opaque proof that one logical cache cursor publication was validated
+/// against the current cache state. The value cannot be forged by sibling
+/// modules, so cohort publication remains validate-all then infallible.
+pub(in crate::inference::models::deepseek4) struct PrefillCommitTicket(usize);
+
 impl Deepseek4Cache {
     /// Plan one layer-major prompt transaction without publishing logical
     /// visibility. Raw attention reads the transaction's compact KV source,
@@ -112,6 +117,19 @@ impl Deepseek4Cache {
         start_position: usize,
         token_count: usize,
     ) -> Result<(), CacheError> {
+        let end = self.validate_prefill_commit(start_position, token_count)?;
+        self.publish_prefill_end(end);
+        Ok(())
+    }
+
+    /// Validate a logical prefill publication without changing the cursor.
+    /// Cohort execution validates every lane first, then publishes all ends
+    /// infallibly so a stale peer cannot partially advance the batch.
+    pub(in crate::inference::models::deepseek4) fn validate_prefill_commit(
+        &self,
+        start_position: usize,
+        token_count: usize,
+    ) -> Result<PrefillCommitTicket, CacheError> {
         if self.is_poisoned() {
             return Err(CacheError::Poisoned);
         }
@@ -136,7 +154,16 @@ impl Deepseek4Cache {
                 maximum: self.plan.context_length,
             });
         }
+        Ok(PrefillCommitTicket(end))
+    }
+
+    pub(in crate::inference::models::deepseek4) fn publish_prefill_end(
+        &mut self,
+        ticket: PrefillCommitTicket,
+    ) {
+        let end = ticket.0;
+        debug_assert!(!self.poisoned);
+        debug_assert!(end > self.next_position && end <= self.plan.context_length);
         self.next_position = end;
-        Ok(())
     }
 }

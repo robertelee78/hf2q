@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Cooperatively execute compatible DeepSeek-V4 warm matrix suffixes across two
+  to four live Apple-Silicon sessions. Attention and cache state remain
+  sequence-local while the row-local FFN/MoE shares one bounded layer-major
+  transaction; cold, mixed, recovery-tail, and decode work keep their proven
+  serial paths. Exact-artifact acceptance prebuilds before thermal settle,
+  clears benchmark overrides, derives medians from sealed timing arrays, and
+  independently verifies every benchmark, thermal, and production-trace log.
 - Pin published `mlx-native 0.10.12` and use the register-resident,
   bit-exact GQA-cooperative Q2 TQ-HB attention path behind a measured
   context-length selector. Publication
@@ -50,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bind the DeepSeek four-agent release workload to the exact insertion-ordered
+  request, rendered prompt, token IDs, historical tool-result bytes, recovery
+  anchor, and continuation suffix. Artifact download revalidates every
+  per-agent digest and explicitly rejects the former key-sorted rendering.
 - Emit authoritative, exactly-once Qwen SlotAware decode-complete telemetry so
   the long-context receipt cannot accept response timing detached from the
   engine path that generated it; requests with a detected client cancellation

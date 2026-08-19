@@ -6,6 +6,10 @@ BUILDER="$ROOT_DIR/scripts/deepseek4_agentic_request.jq"
 FIXTURE="$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt"
 FIXTURE_SHA256=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
 FIXTURE_CHARS=20584
+CONTRACT="$ROOT_DIR/scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json"
+CONTRACT_SHA256=$(shasum -a 256 "$CONTRACT" | awk '{print $1}')
+TOOL_RESULT="$ROOT_DIR/scripts/fixtures/deepseek4-agentic-tool-result-863ea423.toml"
+PROVENANCE_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 
@@ -25,6 +29,10 @@ done
 }
 test "$(shasum -a 256 "$FIXTURE" | awk '{print $1}')" = "$FIXTURE_SHA256"
 test "$(jq -Rs 'length' "$FIXTURE")" = "$FIXTURE_CHARS"
+jq -e -f "$ROOT_DIR/scripts/deepseek4_agentic_prompt_contract.jq" \
+  "$CONTRACT" >/dev/null
+test "$(shasum -a 256 "$TOOL_RESULT" | awk '{print $1}')" = \
+  "$(jq -er '.tool_result.sha256' "$CONTRACT")"
 
 tmp_dir=$(mktemp -d -t hf2q-deepseek-agentic-contract.XXXXXX)
 cleanup() {
@@ -102,6 +110,24 @@ jq -e --argjson expected_chars "$FIXTURE_CHARS" \
 jq -j '.messages[1].content | split("Repository context follows:\n\n")[1]' \
   "$request_file" >"$rendered_context"
 cmp -s "$FIXTURE" "$rendered_context"
+
+for agent in 1 2 3 4; do
+  exact_request="$tmp_dir/exact-agent-$agent.json"
+  HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$exact_request" \
+  AGENTIC_PROMPT_CONTRACT="$CONTRACT" \
+  AGENTIC_PROMPT_CONTRACT_SHA256="$CONTRACT_SHA256" \
+  AGENT_INDEX="$agent" \
+  EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
+  TOOL_RESULT_PATH="$TOOL_RESULT" \
+  AGENTIC_CONTEXT_FIXTURE="$FIXTURE" \
+  AGENTIC_CONTEXT_FIXTURE_SHA256="$FIXTURE_SHA256" \
+  RUN_ID="full-context-deepseek4-agent-$agent" \
+  SENTINEL="HF2Q_DEEPSEEK4_AGENT_${agent}_OK" \
+    bash "$ROOT_DIR/scripts/test_deepseek4_agentic.sh"
+  test "$(shasum -a 256 "$exact_request" | awk '{print $1}')" = \
+    "$(jq -er --argjson agent "$agent" \
+      '.agents[] | select(.agent == $agent) | .request_sha256' "$CONTRACT")"
+done
 
 mkdir -p "$isolated_root/scripts/fixtures"
 cp "$ROOT_DIR/scripts/test_deepseek4_agentic.sh" "$isolated_root/scripts/"
@@ -181,59 +207,162 @@ expect_fixture_rejected appended "$tmp_dir/appended.txt"
 expect_fixture_rejected truncated "$tmp_dir/truncated.txt"
 expect_fixture_rejected mutated "$tmp_dir/mutated.txt"
 
-jq -n '
-  def agent: {
-    status: "pass",
-    fixture_id: "full-context-agentic-v1",
-    agentic_context_fixture_sha256: "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
-    agentic_context_fixture_bytes: 21204,
-    repository_context_chars: 20584,
-    expected_path: "/opt/hf2q-worktrees/full-context-slots/Cargo.toml",
-    expected_prompt_tokens: 6684,
-    prompt_tokens: 6684,
-    cold_cached_tokens: 0,
-    cold_ttft_ms: 60000,
-    cold_semantic_response_ms: 60000,
-    cached_tokens: 6676,
-    auto_cached_tokens: 6676,
-    continuation_cached_tokens: 6676,
-    cached_ttft_ms: 5000,
-    cached_semantic_response_ms: 15000,
-    auto_semantic_response_ms: 15000,
-    cached_sse_tool_call_ms: 15000,
-    tool_result_response_ms: 35000,
-    tool_semantics_pass: true,
-    cached_replay_equal: true,
-    automatic_tool_call_pass: true,
-    sse_tool_call_pass: true,
-    tool_result_continuation_pass: true,
-    source_tool_syntax_pass: true
-  };
-  {
-    status: "pass",
-    family: "deepseek4",
-    require_cold_first: 1,
-    concurrent_agents: 4,
-    fixture_id: "full-context-agentic-v1",
-    agentic_context_fixture_sha256: "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
-    agentic_context_fixture_bytes: 21204,
-    repository_context_chars: 20584,
-    expected_prompt_tokens: 6684,
-    prompt_tokens: 6684,
-    maximum_cold_ttft_ms: 60000,
-    maximum_cold_semantic_response_ms: 60000,
-    cohort_cold_wall_ms: 60000,
-    agents: [range(0; 4) | agent]
-  }
+expect_contract_rejected() {
+  local label=$1
+  local mutation=$2
+  local mutated_contract="$tmp_dir/$label-contract.json"
+  jq "$mutation" "$CONTRACT" >"$mutated_contract"
+  if HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$tmp_dir/$label-request.json" \
+    AGENTIC_PROMPT_CONTRACT="$mutated_contract" \
+    AGENT_INDEX=1 \
+    EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
+    TOOL_RESULT_PATH="$TOOL_RESULT" \
+    RUN_ID=full-context-deepseek4-agent-1 \
+    SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
+    bash "$ROOT_DIR/scripts/test_deepseek4_agentic.sh" \
+      >"$tmp_dir/$label.stdout" 2>"$tmp_dir/$label.stderr"; then
+    echo "DeepSeek agentic gate accepted mutated contract: $label" >&2
+    exit 1
+  fi
+}
+
+expect_contract_rejected stale_count '.serialization.expected_prompt_tokens = 6685'
+expect_contract_rejected missing_legacy_delta '.serialization.legacy_rejected_prompt_tokens = 6684'
+expect_contract_rejected wrong_policy '.serialization.policy = "recursive-lexicographic-key-order"'
+expect_contract_rejected builder_digest '.request_builder.sha256 = ("a" * 64)'
+expect_contract_rejected template_digest '.chat_template.sha256 = ("a" * 64)'
+expect_contract_rejected tool_digest '.tool_result.sha256 = ("a" * 64)'
+expect_contract_rejected request_digest '.agents[0].request_sha256 = ("a" * 64)'
+expect_contract_rejected rendered_digest '.agents[0].rendered_prompt_sha256 = ("a" * 64)'
+expect_contract_rejected token_digest '.agents[0].prompt_token_ids_sha256 = ("a" * 64)'
+
+provenance_receipt="$tmp_dir/prompt-provenance.json"
+jq -n --slurpfile contract "$CONTRACT" \
+  --arg contract_sha256 "$CONTRACT_SHA256" \
+  --arg model_sha256 "936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d" '
+  $contract[0] as $c
+  | {schema_version:2,status:"pass",prompt_contract_sha256:$contract_sha256,
+     model_sha256:$model_sha256,
+     agents:[$c.agents[] | {
+       schema_version:2,status:"pass",agent:.agent,
+       prompt_contract_sha256:$contract_sha256,
+       serialization_policy:$c.serialization.policy,
+       token_id_digest_encoding:$c.serialization.token_id_digest_encoding,
+       request_sha256:.request_sha256,request_bytes:.request_bytes,
+       rendered_prompt_sha256:.rendered_prompt_sha256,rendered_prompt_bytes:1,
+       prompt_token_ids_sha256:.prompt_token_ids_sha256,
+       prompt_tokens:$c.serialization.expected_prompt_tokens,
+       legacy_key_sorted_rendered_prompt_sha256:.legacy_key_sorted_rendered_prompt_sha256,
+       legacy_key_sorted_rendered_prompt_bytes:1,
+       legacy_key_sorted_prompt_token_ids_sha256:.legacy_key_sorted_prompt_token_ids_sha256,
+       legacy_key_sorted_prompt_tokens:$c.serialization.legacy_rejected_prompt_tokens,
+       preserve_order_delta_proven:true
+     }]}
+' >"$provenance_receipt"
+jq -e --slurpfile contract "$CONTRACT" \
+  --arg prompt_contract_sha256 "$CONTRACT_SHA256" \
+  --arg model_sha256 "936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d" \
+  -f "$ROOT_DIR/scripts/deepseek4_agentic_prompt_provenance.jq" \
+  "$provenance_receipt" >/dev/null
+
+expect_provenance_failure() {
+  local label=$1
+  local mutation=$2
+  jq "$mutation" "$provenance_receipt" >"$tmp_dir/$label-provenance.json"
+  if jq -e --slurpfile contract "$CONTRACT" \
+    --arg prompt_contract_sha256 "$CONTRACT_SHA256" \
+    --arg model_sha256 "936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d" \
+    -f "$ROOT_DIR/scripts/deepseek4_agentic_prompt_provenance.jq" \
+    "$tmp_dir/$label-provenance.json" >/dev/null; then
+    echo "DeepSeek provenance validator accepted invalid case: $label" >&2
+    exit 1
+  fi
+}
+
+expect_provenance_failure request_bytes '.agents[0].request_bytes += 1'
+expect_provenance_failure request_digest '.agents[0].request_sha256 = ("a" * 64)'
+expect_provenance_failure render_digest '.agents[0].rendered_prompt_sha256 = ("a" * 64)'
+expect_provenance_failure token_digest '.agents[0].prompt_token_ids_sha256 = ("a" * 64)'
+expect_provenance_failure legacy_render_digest '.agents[0].legacy_key_sorted_rendered_prompt_sha256 = ("a" * 64)'
+expect_provenance_failure legacy_token_digest '.agents[0].legacy_key_sorted_prompt_token_ids_sha256 = ("a" * 64)'
+expect_provenance_failure serialization_policy '.agents[0].serialization_policy = "sorted"'
+expect_provenance_failure token_encoding '.agents[0].token_id_digest_encoding = "native"'
+expect_provenance_failure prompt_tokens '.agents[0].prompt_tokens = 6685'
+expect_provenance_failure legacy_tokens '.agents[0].legacy_key_sorted_prompt_tokens = 6684'
+expect_provenance_failure delta '.agents[0].preserve_order_delta_proven = false'
+expect_provenance_failure duplicate '.agents[3] = .agents[2]'
+expect_provenance_failure swapped '.agents = [.agents[1],.agents[0],.agents[2],.agents[3]]'
+
+jq -n --slurpfile contract "$CONTRACT" \
+  --arg contract_sha "$CONTRACT_SHA256" \
+  --arg provenance_sha "$PROVENANCE_SHA256" '
+  $contract[0] as $c
+  | def agent($expected): {
+      status:"pass", agent:$expected.agent, run_id:$expected.run_id,
+      fixture_id:$c.fixture_id, prompt_contract_sha256:$contract_sha,
+      prompt_provenance_sha256:$provenance_sha,
+      serialization_policy:$c.serialization.policy,
+      request_sha256:$expected.request_sha256, request_bytes:$expected.request_bytes,
+      rendered_prompt_sha256:$expected.rendered_prompt_sha256,
+      prompt_token_ids_sha256:$expected.prompt_token_ids_sha256,
+      agentic_context_fixture_sha256:$c.repository_context.sha256,
+      agentic_context_fixture_bytes:$c.repository_context.bytes,
+      repository_context_chars:$c.repository_context.chars,
+      expected_path:$c.request.expected_path,
+      agentic_system_prompt_sha256:$c.request.system_prompt_sha256,
+      tool_result_success_prefix_sha256:$c.tool_result.success_prefix_sha256,
+      tool_result_fixture_sha256:$c.tool_result.sha256,
+      tool_result_fixture_bytes:$c.tool_result.bytes,
+      tool_result_payload_sha256:$c.tool_result.combined_payload_sha256,
+      expected_prompt_tokens:$c.prompt.tokens, prompt_tokens:$c.prompt.tokens,
+      cold_cached_tokens:0, cached_tokens:$c.prompt.cached_anchor_tokens,
+      auto_cached_tokens:$c.prompt.cached_anchor_tokens,
+      stream_cached_tokens:$c.prompt.cached_anchor_tokens,
+      continuation_cached_tokens:$c.prompt.cached_anchor_tokens,
+      continuation_uncached_tokens:$c.prompt.tool_result_uncached_suffix_tokens,
+      continuation_prompt_tokens:($c.prompt.cached_anchor_tokens +
+        $c.prompt.tool_result_uncached_suffix_tokens),
+      cold_ttft_ms:60000, cold_semantic_response_ms:60000,
+      cached_ttft_ms:5000, cached_semantic_response_ms:15000,
+      auto_semantic_response_ms:15000, cached_sse_tool_call_ms:15000,
+      tool_result_response_ms:35000, tool_semantics_pass:true,
+      cached_replay_equal:true, automatic_tool_call_pass:true,
+      sse_tool_call_pass:true, tool_result_continuation_pass:true,
+      source_tool_syntax_pass:true
+    };
+    {
+      status:"pass", family:"deepseek4", require_cold_first:1,
+      concurrent_agents:4, fixture_id:$c.fixture_id,
+      prompt_contract_sha256:$contract_sha,
+      prompt_provenance_sha256:$provenance_sha,
+      serialization_policy:$c.serialization.policy,
+      agentic_context_fixture_sha256:$c.repository_context.sha256,
+      agentic_context_fixture_bytes:$c.repository_context.bytes,
+      repository_context_chars:$c.repository_context.chars,
+      agentic_system_prompt_sha256:$c.request.system_prompt_sha256,
+      tool_result_success_prefix_sha256:$c.tool_result.success_prefix_sha256,
+      tool_result_fixture_sha256:$c.tool_result.sha256,
+      tool_result_fixture_bytes:$c.tool_result.bytes,
+      tool_result_payload_sha256:$c.tool_result.combined_payload_sha256,
+      expected_prompt_tokens:$c.prompt.tokens, prompt_tokens:$c.prompt.tokens,
+      maximum_cold_ttft_ms:60000, maximum_cold_semantic_response_ms:60000,
+      cohort_cold_wall_ms:60000, agents:[$c.agents[] | agent(.)]
+    }
 ' >"$positive_receipt"
-jq -e -f "$ROOT_DIR/scripts/deepseek4_full_context_receipt.jq" \
+jq -e --slurpfile contract "$CONTRACT" \
+  --arg prompt_contract_sha256 "$CONTRACT_SHA256" \
+  --arg prompt_provenance_sha256 "$PROVENANCE_SHA256" \
+  -f "$ROOT_DIR/scripts/deepseek4_full_context_receipt.jq" \
   "$positive_receipt" >/dev/null
 
 expect_receipt_failure() {
   local label=$1
   local mutation=$2
   jq "$mutation" "$positive_receipt" >"$mutated_receipt"
-  if jq -e -f "$ROOT_DIR/scripts/deepseek4_full_context_receipt.jq" \
+  if jq -e --slurpfile contract "$CONTRACT" \
+    --arg prompt_contract_sha256 "$CONTRACT_SHA256" \
+    --arg prompt_provenance_sha256 "$PROVENANCE_SHA256" \
+    -f "$ROOT_DIR/scripts/deepseek4_full_context_receipt.jq" \
     "$mutated_receipt" >/dev/null; then
     echo "DeepSeek receipt validator accepted invalid case: $label" >&2
     exit 1
@@ -244,17 +373,28 @@ expect_receipt_failure missing_prompt 'del(.agents[0].prompt_tokens)'
 expect_receipt_failure null_prompt '.agents[0].prompt_tokens = null'
 expect_receipt_failure string_prompt '.agents[0].prompt_tokens = "6684"'
 expect_receipt_failure zero_prompt '.agents[0].prompt_tokens = 0'
-expect_receipt_failure short_prompt '.agents[0].prompt_tokens = 6683'
-expect_receipt_failure long_prompt '.agents[0].prompt_tokens = 6685'
+expect_receipt_failure stale_key_sorted_prompt '.agents[0].prompt_tokens = 6685'
 expect_receipt_failure fixture_id '.agents[0].fixture_id = "mutable"'
 expect_receipt_failure fixture_digest '.agents[0].agentic_context_fixture_sha256 = ("a" * 64)'
 expect_receipt_failure fixture_bytes '.agents[0].agentic_context_fixture_bytes = 21205'
 expect_receipt_failure mixed_agent_fixture '.agents[3].repository_context_chars = 20583'
+expect_receipt_failure contract_digest '.agents[0].prompt_contract_sha256 = ("a" * 64)'
+expect_receipt_failure provenance_digest '.agents[0].prompt_provenance_sha256 = ("a" * 64)'
+expect_receipt_failure serialization_policy '.agents[0].serialization_policy = "sorted"'
+expect_receipt_failure request_digest '.agents[0].request_sha256 = ("a" * 64)'
+expect_receipt_failure render_digest '.agents[0].rendered_prompt_sha256 = ("a" * 64)'
+expect_receipt_failure token_digest '.agents[0].prompt_token_ids_sha256 = ("a" * 64)'
+expect_receipt_failure tool_result_digest '.agents[0].tool_result_fixture_sha256 = ("a" * 64)'
+expect_receipt_failure payload_digest '.agents[0].tool_result_payload_sha256 = ("a" * 64)'
 expect_receipt_failure cold_cache '.agents[2].cold_cached_tokens = 1'
+expect_receipt_failure retained_anchor '.agents[2].cached_tokens = 6675'
+expect_receipt_failure suffix '.agents[2].continuation_uncached_tokens = 2797'
 expect_receipt_failure negative_timing '.agents[1].cold_ttft_ms = -1'
 expect_receipt_failure over_boundary '.agents[1].cold_semantic_response_ms = 60001'
 expect_receipt_failure cohort_over_boundary '.cohort_cold_wall_ms = 60001'
 expect_receipt_failure wrong_agent_count '.agents = .agents[0:3]'
+expect_receipt_failure duplicate_agent '.agents[3] = .agents[2]'
+expect_receipt_failure swapped_agent '.agents = [.agents[1],.agents[0],.agents[2],.agents[3]]'
 expect_receipt_failure missing_semantics 'del(.agents[0].sse_tool_call_pass)'
 
 # The live gate writes both `agent-N.json` and `agent-N.cold.json`. Prove the
@@ -265,12 +405,14 @@ cp "$ROOT_DIR/scripts/test_full_context_agent_slots.sh" "$aggregate_root/scripts
 cat >"$aggregate_root/scripts/test_deepseek4_agentic.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-jq -n '{status:"pass", prompt_tokens:6684, cold_cached_tokens:0}' \
+jq -n --argjson agent "$AGENT_INDEX" \
+  '{status:"pass", agent:$agent, prompt_tokens:6684, cold_cached_tokens:0}' \
   >"$COLD_RESULT_PATH"
 sleep 2
-jq -n --arg run_id "$RUN_ID" '{
+jq -n --arg run_id "$RUN_ID" --argjson agent "$AGENT_INDEX" '{
   status:"pass",
-  fixture_id:"full-context-agentic-v1",
+  agent:$agent,
+  fixture_id:"full-context-agentic-v2",
   agentic_context_fixture_sha256:"2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
   agentic_context_fixture_bytes:21204,
   repository_context_chars:20584,
@@ -343,5 +485,16 @@ early_exit_elapsed_ms=$(( \
 }
 grep -F 'exited before publishing its cold receipt' \
   "$early_exit_root/stderr" >/dev/null
+
+cargo package --list --locked --allow-dirty >"$tmp_dir/package-list.txt"
+for packaged in \
+  scripts/deepseek4_agentic_prompt_contract.jq \
+  scripts/deepseek4_agentic_prompt_provenance.jq \
+  scripts/test_deepseek4_cooperative_prefill_receipt_contract.sh \
+  scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
+  scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json \
+  scripts/fixtures/deepseek4-agentic-tool-result-863ea423.toml; do
+  grep -Fx "$packaged" "$tmp_dir/package-list.txt" >/dev/null
+done
 
 echo "DeepSeek agentic fixture contract: pass"

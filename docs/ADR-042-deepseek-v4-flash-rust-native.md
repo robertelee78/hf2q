@@ -2,15 +2,13 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-17 — production prefill uses the exact gathered
-  attention path for every nonempty prompt and suffix; native JSON rendering
-  and DSML grammar accept the model's canonical separator spacing; and the
-  canonical launcher no longer injects a hidden repetition penalty. The
-  candidate request surface also accepts top-level `reasoning_effort`, and the
-  OpenCode gates pin explicit sampling/reasoning profiles. Earlier real-model
-  structured-tool, prefix-reuse, four-agent scheduling, and thermal evidence
-  remains as recorded below; the 2026-08-17 candidate additions require their
-  own hardware receipts before publication.
+- **Updated:** 2026-08-19 — the four-agent workload is bound to an immutable
+  insertion-ordered prompt contract and historical tool-result payload;
+  `mlx-native =0.10.12` fixes non-aligned D512 tail loads; and warm compatible
+  DeepSeek suffixes have a candidate cooperative FFN/MoE path. Earlier
+  real-model structured-tool, prefix-reuse, scheduling, and thermal evidence
+  remains as recorded below. The 2026-08-19 hf2q candidates require exact-SHA
+  CI and protected packed-artifact hardware receipts before publication.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1163,12 +1161,12 @@ does not prove or clear a scheduler regression.
 The gate now reads the exact 21,204-byte calibration context from
 `scripts/fixtures/deepseek4-agentic-repo-context.txt`, SHA-256
 `2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef`.
-The release wrapper verifies that artifact before model startup and preserves
-the prompt-visible calibration path
+At that revision, the release wrapper verified that artifact before model
+startup and preserved the prompt-visible calibration path
 `/opt/hf2q-worktrees/full-context-slots/Cargo.toml` from exact commit
-`863ea423`; the simulated tool result itself is still read from the packed
-candidate's `Cargo.toml`. This is workload identity, not a runtime dependency
-on that local path. Every cold agent must render exactly 6,685 tokens.
+`863ea423`; the simulated tool result was still read from the packed
+candidate's `Cargo.toml`. This was workload identity, not a runtime dependency
+on that local path. Every cold agent then rendered exactly 6,685 tokens.
 Producer, aggregate, and publication checks all
 bind the fixture ID, digest, byte/character counts, exact prompt count, zero
 cold reuse, semantic/tool assertions, and the then-literal 55,000 ms cold
@@ -1442,8 +1440,8 @@ After separate 180-second loaded-idle Nominal settles, both continuously
 Nominal four-agent waves returned the exact zero-cache `read_file` calls. Their
 cohort walls were 68.438 and 69.944 seconds (69.191-second median); manifest
 SHA-256 is `d31164f1eef641b6db98d38f504e02b2da26ff5a80f3cc50f3f0e8a69d3f8052`.
-The peer renders 6,695 prompt tokens, an explicitly receipted tokenizer delta
-of ten tokens from hf2q's 6,685.
+The peer renders 6,695 prompt tokens, an explicitly receipted then-current
+tokenizer delta of ten tokens from hf2q's 6,685.
 
 The old unreceipted approximately 54.1-second peer number is therefore
 superseded for current thermal authority. The protected hf2q cold ceiling is
@@ -1773,6 +1771,142 @@ The protected gate now also generates the exact first-wave request and renders
 and tokenizes it directly from the release GGUF before loading the 100 GiB
 verifier. A future template/schema/tokenizer drift therefore fails during the
 cheap preflight instead of after model startup and a partial four-agent wave.
+
+### Immutable agentic prompt provenance v2 (2026-08-19 candidate)
+
+Protected run `31854922028` passed with four 6,685-token prompts before
+`d4874792` enabled `serde_json` insertion-order preservation. Runs
+`32175556046` and `32272660422` then failed deterministically because all four
+native requests rendered 6,684 tokens while the harness still required 6,685.
+Exact-main run `32282861299` independently repeated that result for all four
+requests; its first two cold completions also crossed the unchanged 60-second
+acceptance ceiling, so it is diagnostic RCA evidence rather than a performance
+receipt.
+Their thermal samples remained entirely Nominal; the outer thermal failure was
+only fail-closed fallout from missing accepted cold receipts. The isolated
+semantic change and byte-identical context, builder, and template inputs bind
+the one-token delta to JSON key order, not to model execution or thermals.
+
+`full-context-agentic-v2` makes that ordering part of the checked-in workload.
+The accepted policy is client JSON insertion order: tool function keys are
+`name, description, parameters`, with parameter keys `type, properties,
+required, additionalProperties`. Its exact prompt is 6,684 tokens. A complete
+recursive lexicographic-key replay is separately rendered and must remain the
+explicitly rejected 6,685-token legacy case. The contract binds all four
+22,955-byte request bodies, rendered-prompt hashes, and little-endian token-ID
+hashes:
+
+| Agent | Request SHA-256 | Rendered prompt SHA-256 | Token IDs SHA-256 |
+|---:|---|---|---|
+| 1 | `f70f24bb875e0d99a8f1f6e3e15be3c8c69f55e09f9e0cc251a98dd24bf11f5e` | `ff031a247908832feefec530813161aee4debd2f22c20641f8afd5d2c6bdb9c2` | `daaada048f48d613f7e98181eae6c3849253147fed0181c3831a4cfba3de9a86` |
+| 2 | `6b6892f56dc256ebc4388d39be905fa6dcf7c1533a3c7b3c0f7e5315d8301693` | `2ed766812723f87adaf8633e1c0c265e6c3a029c643d39e774a16dc485f6b851` | `566df8f92d7eb2076898a5163ace03224c2fe7c562dc962fedacb08755d5b0eb` |
+| 3 | `0d7f2b983b24cdc1e7c634ba958d8ceba7dff8beb57f91e2b4b0bc1ccabafb0e` | `934db33f83e64e434ea7136dbb87429803f89e42ebbf84ed7842dda903187a71` | `367da8c22c59e326fac37d1851dbfd728c8ba06daf8312559d42fe7579ea5411` |
+| 4 | `bec7e1161537279a7b85c9b7e28fd5546bdc048df650c1f53e2ed21b96dfd9d4` | `cb1a369a0dc99054b290841618071ad2e485e4a7adf8cd74b0b0dc38157cbd98` | `3356019bef7e6cd323db78ec64264feba1e7daa50fc9a5a1bf398172164d8f88` |
+
+The tool result no longer reads the mutable, Cargo-normalized manifest from the
+packed release directory. It is the exact `Cargo.toml` bytes requested by the
+historical prompt-visible path at commit
+`863ea423a4ec4a4e46fc4bcce41ef2f439214a83`: 8,912 bytes, 8,892 characters,
+SHA-256
+`10d0410c76313d1783e491e17760a0946704e35c1566a93363dcb009f396bbbd`.
+The 43-byte success prefix plus that file is an 8,955-byte payload with SHA-256
+`34826d9e2ced0f41f4d57bf873ac6c1d8c294955893ae5f4d0815457e28b3c3c`.
+The contract requires the exact 6,676-token recovery anchor and 2,798-token
+uncached continuation suffix across unary, automatic-tool, SSE, and
+tool-result paths. This closes an unbound path/content drift where `$PWD` in a
+packed crate named the right file but supplied changing normalized bytes.
+
+Hosted negative tests now reject any changed policy, count, source digest,
+request mapping, rendered/token hash, tool payload, agent identity, duplicate,
+or swapped receipt. The protected gate additionally derives all counts and
+hashes from the same contract, replays both serializers with the embedded GGUF
+tokenizer, binds a four-agent prompt-provenance receipt into both waves, and
+revalidates it after artifact download. This section remains candidate-only
+until exact-SHA CI and both guarded four-agent waves pass. It does not waive or
+widen the existing 60-second cold, 15-second cached/automatic/SSE, or 35-second
+tool-result ceilings.
+
+### Non-aligned D512 tail-load correction (2026-08-19)
+
+The production gathered DeepSeek attention path exposed an `mlx-native` D512
+kernel defect for key lengths not divisible by 64. QK and V simdgroup loads
+read complete tiles before the validity mask was applied, so the final partial
+tile could read beyond the logical allocation. The structural repair in
+`mlx-native =0.10.12` populates partial matrices lane by lane, retains valid
+values, and writes zero for invalid rows before matrix arithmetic. Tests cover
+every modulo-64 tail for both four- and eight-simdgroup variants, guard-region
+independence, and CPU-reference parity. Release tag and main commit are
+`338392704d39786ae5f7a8145ac5e5f3fc087c81`; the crates.io and GitHub source
+archive SHA-256 is
+`a5791c12542c6232888c6d4391be62aad305974e92f61f70d2cddd7f21997355`.
+
+A competing hypothesis that Metal silently truncates the sparse gather's very
+large one-dimensional grid at 256 batches was falsified on the M5 Max. The
+exact production gather body overwrote poisoned full buffers correctly at
+255, 256, and 257 batches on repeated runs, and an independent coverage kernel
+showed no missing threadgroups. No speculative grid reshape is part of the
+accepted repair.
+
+### Cooperative warm-suffix FFN/MoE prefill (2026-08-19 candidate)
+
+The four-agent scheduler previously executed every warm matrix suffix as a
+complete sequence-serial verifier pass. The candidate keeps attention and all
+KV/compressor/indexer writes sequence-local, but packs the already available
+lanes after each attention layer and executes the row-local FFN/MoE once over
+the aggregate rows. It uses shared model weights as one ordinary matrix with
+`M = sum(sequence rows)`; `mlx-native`'s batched-quantized-matmul API represents
+independent batched weights and is not the correct primitive for this case.
+
+The serving boundary is deliberately narrow:
+
+- only already-installed warm cached matrix suffixes are eligible;
+- cold prefill, mixed prefill/decode, incremental tails, recovery-anchor
+  capture, final head publication, and decode retain the serial path;
+- the worker never waits to form a cohort, never skips an older incompatible
+  prefiller, and tries only the contiguous current FIFO prefix;
+- the serial round-robin cursor advances only when the serial fallback really
+  executes, so successful cohorts cannot skip a later serial lane;
+- two, three, and four lanes receive at most 1,024, 640, and 512 rows each,
+  keeping aggregate work at or below the existing 2,048-row transaction bound;
+- all lanes have the same start/cursor, token count, recovery boundary, and
+  reply class, otherwise the oldest request runs serially.
+
+Each lane encodes its attention, packs the resulting rows, and drains the
+command buffer before the combined FFN. All GPU work drains before one shared
+supervisor gate. Cache commits validate every lane first, reject/poison all on
+a stale peer or gate error, and then publish every opaque cursor ticket
+infallibly. Serving pre-reserves token ledgers and validates every cache,
+ledger, and request cursor before publishing any of them. Client cancellation
+does not reject the shared gate: a lane that closes during submitted work is
+made cache/ledger-consistent and recovered alone, while healthy peers keep
+their committed suffix. Fatal cleanup owns every removed reply.
+
+The protected benchmark compiles its release test binary before the Nominal
+settle, launches it from a minimal `env -i` allowlist with no hf2q, MLX, Metal,
+profiling, or scheduling override, and fixes the alternating pair count at
+five. CI, packed-artifact, release-check, and publication builds also reject a
+set `MLX_NATIVE_SKIP_METALLIB` before Cargo runs, because that build-script
+override would irreversibly replace the embedded Metal library before the
+clean runtime environment exists. Its completion trace is emitted only after
+cache, token-ledger, request-state, and scheduler publication. The receipt
+binds and independently rehashes the raw timing arrays, test log, measurement
+log, and settle log; publication recomputes both medians and speedup, replays
+the thermal timestamp/gap/phase validators, and rehashes and recounts each
+four-agent wave's production completion traces.
+
+Model-free tests cover the 2/3/4-lane width plan, exclusions, FIFO observation,
+pre-submit oversize failure, four-cache success, supervisor rejection, stale
+peer rejection, and prevalidated state publication. A full 43-layer spike on
+the exact 107,431,343,168-byte artifact produced bit-identical two-lane states
+and changed serial/cooperative 512-row timings from 3,384.780/2,649.979 ms on
+the first measured run to a three-run median 2,718.067/2,277.239 ms, or
+1.1936x. Those timings motivated production integration but are not release
+authority. The landing test now requires nonzero warm prefixes, exact state and
+logit equality, identical subsequent-token behavior for B=2/3/4 including the
+2,048-row bound, and at least five alternating-order timing pairs with a faster
+cooperative median and recorded process peak RSS. Protected agentic waves must
+still pass every unchanged semantic, cache, cancellation, thermal, and latency
+bound before this candidate is accepted.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

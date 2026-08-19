@@ -198,6 +198,71 @@ fn read_i32_array(gguf: &GgufFile, key: &str) -> Result<Vec<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn token_ids_sha256(ids: &[u32]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"hf2q-u32le-v1\0");
+        for id in ids {
+            hasher.update(id.to_le_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    fn sort_json_object_keys_recursively(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    sort_json_object_keys_recursively(value);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let mut entries = std::mem::take(map).into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                for (_, value) in &mut entries {
+                    sort_json_object_keys_recursively(value);
+                }
+                map.extend(entries);
+            }
+            _ => {}
+        }
+    }
+
+    fn render_agentic_request(
+        template: &str,
+        request: &crate::serve::api::schema::ChatCompletionRequest,
+    ) -> String {
+        crate::serve::api::engine::render_chat_prompt_with_tools(
+            template,
+            &request.messages,
+            request.tools.as_deref(),
+            crate::serve::template_supports_enable_thinking(template),
+            request.chat_template_kwargs.as_ref(),
+        )
+        .expect("render request through the hf2q DeepSeek-V4 path")
+    }
+
+    fn render_agentic_request_with_tools_json(
+        request: &crate::serve::api::schema::ChatCompletionRequest,
+        tools: Option<serde_json::Value>,
+    ) -> String {
+        crate::serve::api::engine::render_deepseek_v4_prompt_with_serialized_tools(
+            &request.messages,
+            tools,
+            request
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            request.chat_template_kwargs.as_ref(),
+        )
+        .expect("render request with pre-serialized DeepSeek-V4 tools")
+    }
 
     #[test]
     fn official_regex_sequence_is_pinned() {
@@ -209,45 +274,152 @@ mod tests {
 
     #[test]
     #[ignore = "opens the release DeepSeek GGUF and exact agentic request fixture"]
-    fn release_agentic_fixture_renders_to_expected_tokens() {
+    fn release_agentic_fixture_preserve_order_contract() {
         let gguf_path = std::env::var("HF2Q_DEEPSEEK4_GGUF")
             .expect("set HF2Q_DEEPSEEK4_GGUF to the release DeepSeek artifact");
         let request_path = std::env::var("HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON")
             .expect("set HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON to the exact request fixture");
-        let expected_tokens = std::env::var("HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS")
-            .expect("set HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS")
-            .parse::<usize>()
-            .expect("HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS must be an integer");
-
+        let contract_path = std::env::var("HF2Q_DEEPSEEK4_AGENTIC_PROMPT_CONTRACT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json")
+            });
+        let contract_bytes = std::fs::read(&contract_path)
+            .unwrap_or_else(|error| panic!("read contract {}: {error}", contract_path.display()));
+        let contract_sha256 = sha256_hex(&contract_bytes);
+        let contract: serde_json::Value = serde_json::from_slice(&contract_bytes)
+            .unwrap_or_else(|error| panic!("parse contract {}: {error}", contract_path.display()));
         let request_bytes = std::fs::read(&request_path)
             .unwrap_or_else(|error| panic!("read request {request_path:?}: {error}"));
+        let request_sha256 = sha256_hex(&request_bytes);
+        let expected_agent = contract["agents"]
+            .as_array()
+            .expect("prompt contract agents array")
+            .iter()
+            .find(|agent| agent["request_sha256"].as_str() == Some(request_sha256.as_str()))
+            .unwrap_or_else(|| panic!("request {request_sha256} is absent from prompt contract"));
         let request: crate::serve::api::schema::ChatCompletionRequest =
             serde_json::from_slice(&request_bytes)
                 .unwrap_or_else(|error| panic!("parse request {request_path:?}: {error}"));
+
         let gguf =
             GgufFile::open(std::path::Path::new(&gguf_path)).expect("open release DeepSeek GGUF");
-        let template = gguf
+        let chat_template = gguf
             .metadata_string("tokenizer.chat_template")
             .expect("release DeepSeek GGUF carries tokenizer.chat_template");
+        assert_eq!(
+            chat_template.len() as u64,
+            contract["chat_template"]["bytes"]
+                .as_u64()
+                .expect("chat-template byte count")
+        );
+        assert_eq!(
+            sha256_hex(chat_template.as_bytes()),
+            contract["chat_template"]["sha256"]
+                .as_str()
+                .expect("chat-template digest")
+        );
         let tokenizer = build_tokenizer_from_gguf(&gguf)
             .expect("build tokenizer from the release DeepSeek GGUF");
-        let rendered = crate::serve::api::engine::render_chat_prompt_with_tools(
-            template,
-            &request.messages,
-            request.tools.as_deref(),
-            crate::serve::template_supports_enable_thinking(template),
-            request.chat_template_kwargs.as_ref(),
-        )
-        .expect("render request through the production DeepSeek-V4 path");
+        let rendered = render_agentic_request(chat_template, &request);
         let encoded = tokenizer
             .encode(rendered.as_str(), false)
-            .expect("tokenize release agentic prompt");
+            .expect("tokenize insertion-ordered release prompt");
+
+        let mut legacy_tools = request
+            .tools
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .expect("serialize legacy DeepSeek-V4 tools");
+        if let Some(tools) = legacy_tools.as_mut() {
+            sort_json_object_keys_recursively(tools);
+        }
+        let legacy_rendered = render_agentic_request_with_tools_json(&request, legacy_tools);
+        let legacy_encoded = tokenizer
+            .encode(legacy_rendered.as_str(), false)
+            .expect("tokenize legacy key-sorted release prompt");
+
+        let rendered_sha256 = sha256_hex(rendered.as_bytes());
+        let prompt_token_ids_sha256 = token_ids_sha256(encoded.get_ids());
+        let legacy_rendered_sha256 = sha256_hex(legacy_rendered.as_bytes());
+        let legacy_prompt_token_ids_sha256 = token_ids_sha256(legacy_encoded.get_ids());
+        eprintln!(
+            "release agentic fixture: request={request_sha256} rendered={rendered_sha256} tokens={} token_ids={prompt_token_ids_sha256} legacy_rendered={legacy_rendered_sha256} legacy_tokens={} legacy_token_ids={legacy_prompt_token_ids_sha256}",
+            encoded.len(),
+            legacy_encoded.len(),
+        );
 
         assert_eq!(
-            encoded.len(),
-            expected_tokens,
-            "release DeepSeek agentic prompt-token contract drifted"
+            request_bytes.len() as u64,
+            expected_agent["request_bytes"]
+                .as_u64()
+                .expect("agent request bytes")
         );
+        assert_eq!(
+            rendered_sha256,
+            expected_agent["rendered_prompt_sha256"]
+                .as_str()
+                .expect("agent rendered prompt hash")
+        );
+        assert_eq!(
+            prompt_token_ids_sha256,
+            expected_agent["prompt_token_ids_sha256"]
+                .as_str()
+                .expect("agent prompt token hash")
+        );
+        assert_eq!(
+            encoded.len() as u64,
+            contract["serialization"]["expected_prompt_tokens"]
+                .as_u64()
+                .expect("expected prompt tokens")
+        );
+        assert_eq!(
+            legacy_rendered_sha256,
+            expected_agent["legacy_key_sorted_rendered_prompt_sha256"]
+                .as_str()
+                .expect("agent legacy rendered prompt hash")
+        );
+        assert_eq!(
+            legacy_prompt_token_ids_sha256,
+            expected_agent["legacy_key_sorted_prompt_token_ids_sha256"]
+                .as_str()
+                .expect("agent legacy prompt token hash")
+        );
+        assert_eq!(
+            legacy_encoded.len() as u64,
+            contract["serialization"]["legacy_rejected_prompt_tokens"]
+                .as_u64()
+                .expect("legacy rejected prompt tokens")
+        );
+        assert_ne!(rendered, legacy_rendered);
+
+        if let Ok(receipt_path) = std::env::var("HF2Q_DEEPSEEK4_AGENTIC_CONTRACT_RECEIPT") {
+            let receipt = serde_json::json!({
+                "schema_version": 2,
+                "status": "pass",
+                "agent": expected_agent["agent"],
+                "prompt_contract_sha256": contract_sha256,
+                "serialization_policy": contract["serialization"]["policy"],
+                "token_id_digest_encoding": contract["serialization"]["token_id_digest_encoding"],
+                "request_sha256": request_sha256,
+                "request_bytes": request_bytes.len(),
+                "rendered_prompt_sha256": rendered_sha256,
+                "rendered_prompt_bytes": rendered.len(),
+                "prompt_token_ids_sha256": prompt_token_ids_sha256,
+                "prompt_tokens": encoded.len(),
+                "legacy_key_sorted_rendered_prompt_sha256": legacy_rendered_sha256,
+                "legacy_key_sorted_rendered_prompt_bytes": legacy_rendered.len(),
+                "legacy_key_sorted_prompt_token_ids_sha256": legacy_prompt_token_ids_sha256,
+                "legacy_key_sorted_prompt_tokens": legacy_encoded.len(),
+                "preserve_order_delta_proven": rendered != legacy_rendered,
+            });
+            let receipt_bytes = serde_json::to_vec_pretty(&receipt)
+                .expect("serialize agentic prompt contract receipt");
+            std::fs::write(&receipt_path, receipt_bytes)
+                .unwrap_or_else(|error| panic!("write receipt {receipt_path:?}: {error}"));
+        }
     }
 
     #[test]

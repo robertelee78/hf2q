@@ -1,0 +1,222 @@
+[package]
+name = "hf2q"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.88.0"
+build = "src/build_script.rs"
+authors = ["Robert E. Lee <robert@agidreams.us>"]
+description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats and serving them over an OpenAI-compatible API on Apple Silicon"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/robertelee78/hf2q"
+homepage = "https://github.com/robertelee78/hf2q"
+documentation = "https://github.com/robertelee78/hf2q"
+readme = "README.md"
+keywords = ["llm", "gguf", "mlx", "quantization", "huggingface"]
+categories = ["command-line-utilities", "science"]
+
+# Drop heavy investigation logs + test fixtures + a reference PDF from
+# the published tarball.  Pre-exclude the package was 38.4 MiB / 698
+# files; the items below account for ~22 MiB and are all crate-internal
+# (consumers don't run our tests, don't read our iter-log ADRs, don't
+# need the TurboQuant paper to use the binary).  The smaller ADRs that
+# document architectural decisions (ADR-008 candle-divorce, ADR-009
+# parity, ADR-027 TQ-KV) stay in the published tarball so docs.rs / the
+# crates.io page can link them.
+exclude = [
+    # Test fixtures + harness directory (consumers don't run our tests).
+    "tests/",
+    # Reference paper PDF (TurboQuant arxiv 2504.19874).
+    "docs/2306.14048.pdf",
+    # Iter-log ADRs — internal investigation diaries, not user-facing
+    # architectural decisions.  Each is hundreds of KB to >1 MB.
+    "docs/ADR-005-inference-server.md",
+    "docs/ADR-011-phase*.md",
+    "docs/ADR-012-*.md",
+    "docs/ADR-013-*.md",
+    "docs/ADR-014-*.md",
+    "docs/ADR-015-*.md",
+    "docs/ADR-016-research-dossier-*.md",
+    "docs/ADR-017-persistent-block-prefix-cache.md",
+    "docs/ADR-017-phase-*.md",
+    "docs/ADR-017-tq-storage-delta.md",
+    "docs/ADR-019-*.md",
+    "docs/ADR-020-*.md",
+    "docs/ADR-021-*.md",
+    "docs/ADR-022-*.md",
+    "docs/ADR-028-*.md",
+    "docs/ADR-029-*.md",
+    "docs/ADR-030-*.md",
+    "docs/ADR-031-*.md",
+    # Investigation byproducts.
+    "docs/iter*.md",
+    "docs/spike-*.md",
+    "docs/tq-c*.md",
+    "docs/wave*.md",
+    "docs/peer_sdpa_comparison_iter_*.md",
+    "docs/perf-traces/",
+    "docs/phase0-*.json",
+    "docs/research/",
+    "docs/reddit/",
+    "docs/reference-lock.md",
+    "docs/adr007-pathC/",
+    # Per-runbook docs that ship at the URL via repository link.
+    "docs/operator-llama-refresh-runbook.md",
+]
+
+[features]
+default = []
+# Enable RuVector self-learning
+ruvector = ["dep:ruvector-core"]
+
+[dependencies]
+safetensors = "0.7"
+half = "2.4"
+
+# HuggingFace integration
+hf-hub = "0.5"
+
+# Self-learning intelligence — optional
+ruvector-core = { version = "2.1", optional = true }
+
+# CLI framework
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+
+# Performance
+rayon = "1.10"
+memmap2 = "0.9"
+
+# UX
+indicatif = "0.17"
+console = "0.15"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# ADR-008: mlx-native is the sole inference/compute backend.
+# DeepSeek-V4 Q3_K, Q8 embeddings, scalable indexer, and sparse decode
+# optimizations and bounded full-context staging require mlx-native 0.10.4.
+# Pin the immutable registry release so clean builds cannot drift.
+mlx-native = "=0.10.4"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# Transitive via tokenizers but we consume it directly to construct
+# the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
+ahash = "0.8"
+# ADR-030 Phase 6 — Leviathan rejection sampling for temp > 0 spec-decode.
+# rand 0.8 is already in the dep tree transitively; promote to direct.
+rand = "0.8"
+
+# Async runtime + HTTP server (for `serve` subcommand)
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+async-stream = "0.3"
+
+# System info
+sysinfo = "0.32"
+
+# File locking (unix)
+libc = "0.2"
+
+# Signal handling
+ctrlc = { version = "3.4", features = ["termination"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Phase 2c vision preprocessing (ADR-005 iter 22+). Keep features minimal
+# — PNG + JPEG cover OpenAI's `image_url` data-URI cases and the fixture
+# shapes we use in tests.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+
+# iter-20+ audit binaries (ADR-007): pattern matching for tok/s parsing
+regex = "1"
+
+# Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
+# common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681).
+#
+# `minijinja-contrib`'s `pycompat` feature is the canonical adapter for
+# chat templates authored against Python's Jinja2 (which transparently
+# exposes Python-string methods like `.split()`, `.strip()`, `.lstrip()`,
+# `.lower()` on strings). Without it, real-world templates that call
+# e.g. `text.split('<channel|>')` — present in the Gemma 4 chat
+# template's `strip_thinking` macro — fail at the second turn of any
+# multi-turn chat with `UnknownMethod: string has no method named split`.
+# Surfaced and fixed during ADR-005 Phase 2a iter-133 Iter A while
+# closing the Open WebUI multi-turn AC 2509 harness.
+minijinja = "2"
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+
+# tempfile is used at runtime by the convert pipeline (ADR-012 P9b two-pass
+# intermediate GGUF for qwen35 / qwen35moe activation capture) AND by tests.
+# Promoted from dev-dep to runtime dep when P9b.2 / P9b.3b shipped.
+tempfile = "3"
+
+# ADR-007 Gate H (W21 iter-108b): parity_quality fixture writer hashes the
+# GGUF + records git_head; sha2 + hex were previously dev-deps for ADR-012 P9
+# corpus drift assertions, promoted to runtime deps here.
+sha2 = "0.10"
+hex = "0.4"
+
+# ADR-005 Phase 2c T1.4: HTTPS image URL fetch in vision/mod.rs.
+# Promoted from dev-dep (where it served only E2E streaming tests) to runtime
+# dep to support `fetch_https_image`. The `blocking` feature pulls reqwest's
+# synchronous client; `rustls-tls` keeps TLS off system OpenSSL.
+# We do NOT enable `stream` here (that stays in dev-dep below for SSE testing)
+# nor `json` — vision fetch only needs raw bytes.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+criterion = "0.5"
+regex = "1"
+tower = { version = "0.4", features = ["util"] }
+
+# 2026-05-02 — H1 structural-audit integration test, item (b) of the
+# decode-test-gap dossier (docs/research/decode-test-gap-2026-05-02.md).
+# Parses src/serve/**/*.rs and fails on any new fn-body-local
+# `const X: &[&str]` declaration — those are unreachable from `mod tests`
+# (Rust fn-body const is fn-local-scope) and were the load-bearing variable
+# in the same-day SPECIAL_TOKEN_STOPS 3-commit thrash. Features: `full`
+# enables Item::Const + Stmt::Item parsing; `visit` enables the AST walker
+# trait (gated separately in syn 2.x); `extra-traits` is for Debug/Eq
+# derivations on AST nodes used in error messages.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+
+# ADR-005 Phase 2a iter-133 (Iter A): Open WebUI multi-turn streaming chat E2E test.
+# The test spawns `hf2q serve` as a subprocess and drives `/v1/chat/completions`
+# with `stream: true`, so it needs a real HTTP client capable of consuming a
+# chunked SSE response stream. `reqwest` with the `stream` feature exposes
+# `Response::bytes_stream()`, which lets us reassemble SSE chunks across TCP
+# packet boundaries cleanly (raw `TcpStream` would force us to re-implement
+# `Transfer-Encoding: chunked` and SSE framing). `rustls-tls` keeps the test
+# build off any system OpenSSL link; the server is plain HTTP so we never
+# negotiate TLS, but reqwest's default features include OpenSSL-linked TLS
+# which would add a system dep for nothing.
+# Note: reqwest is also a runtime dep (see [dependencies] above); Cargo
+# unifies features. `json` + `stream` here add test-only capabilities on top
+# of the runtime `blocking` + `rustls-tls` base.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Stream consumption helpers (`StreamExt`, `try_next`) for the SSE bytes_stream.
+# `futures` is a runtime dep but only re-exports a subset; `futures-util` is
+# the canonical home for `StreamExt::next`.
+futures-util = "0.3"
+
+# ADR-008: vendored candle patches removed (candle no longer used for inference).
+
+# Local mlx-native development: place this in a gitignored .cargo/config.toml
+# rather than this file, so fresh clones get the published crates.io version
+# by default.
+#
+#   [patch.crates-io]
+#   mlx-native = { path = "/opt/mlx-native" }
