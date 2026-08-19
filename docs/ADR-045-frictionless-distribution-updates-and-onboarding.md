@@ -9,9 +9,11 @@
   channel-pointer/selected-target binding, origin-locked artifact transport,
   lock-reauthenticated fetch capability, and same-descriptor streamed archive
   staging, dormant exact embedded-manifest/classic-ZIP validation, and
-  lock-held descriptor-relative inert extraction are
-  reconciled; the real release trust root, verifier-request metadata
-  transport, codesign verification, signed-mode normalization, crash-durable
+  lock-held descriptor-relative inert extraction, and dormant native Developer
+  ID requirement/signing-information verification are reconciled; the real
+  release trust root, verifier-request metadata transport, real compiled Team
+  ID plus protected positive fixture, descriptor-bound codesign integration,
+  signed-mode normalization, crash-durable
   prepared-version publication, public update/install/onboarding
   implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
@@ -385,6 +387,20 @@ Hardened Runtime, no ad-hoc or linker-signed flags, no raw or dictionary
 entitlements, and the manifest-bound leaf common name. Ordinary certificate
 expiry remains compatible with a valid secure timestamp; install-time
 verification does not force current-expiration or online revocation checks.
+
+The dormant verifier pins `core-foundation` 0.10.1,
+`security-framework` 3.7.0, and `security-framework-sys` 2.17.0 on macOS. The
+safe wrapper owns requirement/static-code construction and validation; one
+small private FFI bridge owns only `SecCodeCopySigningInformation` and the
+documented `kSecCodeInfo*` keys absent from the wrapper crate. Every returned
+Core Foundation value is type-checked, every create-rule object is released
+once, the certificate chain is bounded to one through eight and type-checked
+entry by entry, and neither errors nor `Debug` expose paths or signing data. A
+test-only policy exercises the complete fail-closed field matrix and the FFI
+bridge against an Apple-signed system binary. The current test executable is
+rejected. A protected real Developer ID Application positive test exists but
+remains explicitly ignored in hosted CI; no production policy constructor may
+exist until the real public Team ID is compiled and that gate passes.
 
 Security.framework is path-oriented. The updater keeps the descriptor-relative
 binary open, obtains its macOS path, requires a no-follow reopen of that path to
@@ -1292,8 +1308,10 @@ layout, canonical embedded manifest, complete payload inventory, modes, sizes,
 CRCs, and SHA-256 values on the same archive descriptor, then materializes the
 exact bytes into a private inert tree under the retained shared lock. These
 boundaries still do not produce update authority. The next slice must embed the
-real stable trust root, verify the fixed Developer ID policy against the staged
-binary, normalize and sync signed modes, and durably publish and reopen the
+real stable trust root, compile the real public Team ID, pass the protected
+positive Developer ID fixture, bind the native verifier to the staged
+descriptor/inode under the retained lock, normalize and sync signed modes, and
+durably publish and reopen the
 version before it can construct an authenticated prepared version.
 Neither a receipt, parsed role, provisional candidate, durable baseline, nor
 selected target plan can download bytes or mutate an installation by itself.
@@ -1766,8 +1784,12 @@ before public self-update ships.
    embedded-manifest/classic-ZIP inventory verification, descriptor-relative
    inert extraction with current-time lock-held replay, marker-v2 exact
    preparation evidence, and the first-standalone marker/receipt builder have
-   landed as dormant bounded contexts. Next, embed the real stable root and
-   implement codesign verification, signed-mode normalization, crash-durable
+   landed as dormant bounded contexts. The native Developer ID requirement and
+   typed signing-information verifier have also landed without a production
+   Team-ID constructor. Next, embed the real stable root, compile the real
+   public Team ID, pass the protected positive signing fixture, bind that proof
+   to the retained extraction inode/lock, and implement signed-mode
+   normalization, crash-durable
    prepared-version publication, live installed-release downgrade
    floor, canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration
