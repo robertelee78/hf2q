@@ -20,6 +20,8 @@ mod hf_download_plan_tests;
 #[cfg(test)]
 mod hf_reference_tests;
 #[cfg(test)]
+mod model_recipe_preparation_tests;
+#[cfg(test)]
 mod model_recipe_tests;
 
 use std::path::Path;

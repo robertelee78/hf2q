@@ -103,7 +103,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── hf_download.rs   exact-revision native Hub source-plan/download
 │   ├── integrity.rs     bounded index + LFS/Git byte verification
 │   ├── model_recipe.rs  embedded closed recipe schema + policy lookup
-│   └── model_recipe/    recipe validation + sealed source/artifact proofs
+│   └── model_recipe/    recipe validation + sealed source/artifact/host,
+│                       conversion, and inert preparation-pair proofs
 │
 ├── src/ir/              internal representation crossing modules
 │   ├── mod.rs           ModelMetadata, TensorMap, DType, QuantizedTensor, …
@@ -652,6 +653,15 @@ harness leans on three patterns:
    transition that changes the effective timestamp or snapshot authorization
    may reset only those two floors; the sealed receipt binds the exact prior
    and final roots, while root and targets floors remain monotonic.
+   The external-model input boundary embeds the one accepted Qwen3.8 recipe,
+   verifies exact immutable Hub source and accepted artifact bytes, seals the
+   proven host/memory/free-space selection, and consumes two bounded canonical
+   conversion receipts into one inert text/projector preparation proof. Its
+   compact v1 receipt binds the recipe, source, hardware profile, converter,
+   both artifacts, and both receipt digests while remaining explicitly
+   calibration-pending. Parsing it cannot mint the non-cloneable proof, and it
+   grants no model registration, serving, retention deletion, or filesystem
+   mutation authority; the no-options coordinator remains pending.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.

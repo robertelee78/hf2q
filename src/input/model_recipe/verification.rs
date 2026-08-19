@@ -39,12 +39,22 @@ impl VerifiedRecipeSource {
 /// serving, installation, or activation authority.
 #[derive(Debug)]
 pub struct VerifiedRecipeArtifact {
+    recipe_id: String,
+    recipe_sha256: String,
     role: RecipeArtifactRole,
     path: PathBuf,
     sha256: String,
 }
 
 impl VerifiedRecipeArtifact {
+    pub fn recipe_id(&self) -> &str {
+        &self.recipe_id
+    }
+
+    pub fn recipe_sha256(&self) -> &str {
+        &self.recipe_sha256
+    }
+
     pub fn role(&self) -> RecipeArtifactRole {
         self.role
     }
@@ -103,6 +113,8 @@ impl ModelRecipe {
         let sha256 = compute_file_sha256(path)?;
         self.verify_artifact_facts(role, size, &sha256)?;
         Ok(VerifiedRecipeArtifact {
+            recipe_id: self.recipe_id.clone(),
+            recipe_sha256: self.recipe_sha256()?,
             role,
             path: path.to_path_buf(),
             sha256,
@@ -139,6 +151,32 @@ impl ModelRecipe {
         sha256: &str,
     ) -> Result<(), ModelRecipeError> {
         self.verify_artifact_facts(role, size, sha256)
+    }
+
+    #[cfg(test)]
+    pub(in crate::input) fn verified_artifact_for_test(
+        &self,
+        role: RecipeArtifactRole,
+        path: PathBuf,
+    ) -> VerifiedRecipeArtifact {
+        let artifact = self.artifact(role).expect("recipe artifact");
+        VerifiedRecipeArtifact {
+            recipe_id: self.recipe_id.clone(),
+            recipe_sha256: self.recipe_sha256().expect("recipe sha256"),
+            role,
+            path,
+            sha256: artifact.sha256.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::input) fn verified_source_for_test(&self) -> VerifiedRecipeSource {
+        VerifiedRecipeSource {
+            recipe_id: self.recipe_id.clone(),
+            recipe_sha256: self.recipe_sha256().expect("recipe sha256"),
+            local_dir: PathBuf::from("/verified-recipe-source"),
+            verified: VerifiedSourceManifest::for_test(Vec::new()),
+        }
     }
 }
 

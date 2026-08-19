@@ -4,7 +4,9 @@
 //! the hf2q binary; a repository, URL, cache entry, or caller cannot supply a
 //! replacement recipe. The first v1 recipe binds the exact ADR-044 Qwen3.8
 //! source, paired text/projector artifacts, proven host profile, and peak disk
-//! floor used by ADR-045's future no-options preparation coordinator.
+//! floor used by ADR-045's future no-options preparation coordinator. The
+//! sibling preparation boundary additionally seals accepted host/disk facts
+//! and both canonical conversion receipts into one inert text/projector pair.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,9 +14,15 @@ use thiserror::Error;
 
 use crate::input::hf_reference::HfModelReference;
 
+mod preparation;
 mod validation;
 mod verification;
 
+pub use preparation::{
+    ModelPreparationError, ModelPreparationReceiptV1, VerifiedModelPreparation,
+    VerifiedRecipeConversion, VerifiedRecipeHost, MAX_MODEL_PREPARATION_RECEIPT_BYTES,
+    MODEL_PREPARATION_RECEIPT_SCHEMA_VERSION,
+};
 pub use verification::{VerifiedRecipeArtifact, VerifiedRecipeSource};
 
 pub const MODEL_RECIPE_SCHEMA_VERSION: u32 = 1;
