@@ -47,7 +47,7 @@ qwen36_require_empty_receipt_dir "$OUT_DIR"
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 [[ "$(sha256_file "$BINARY_PATH")" == "$BINARY_SHA256" ]] || exit 2
-[[ "$(sha256_file "$MODEL_PATH")" == "$MODEL_SHA256" ]] || exit 2
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256"
 qwen36_bind_server_process "$BASE_URL" "$SERVER_PID" "$BINARY_PATH" \
   "$MODEL_PATH" "$MAX_SLOTS"
 

@@ -435,6 +435,8 @@ jobs:
             scripts/test_gemma4_eight_slot_receipt_contract.sh \
             scripts/seal_release_binary.sh \
             scripts/test_release_binary_seal_contract.sh \
+            scripts/run_release_gate_process_group.sh \
+            scripts/test_release_gate_process_group_contract.sh \
             scripts/ensure_github_release_tag.sh \
             scripts/test_release_tag_recovery_contract.sh \
             scripts/test_deepseek4_cached_suffix.sh \
@@ -453,6 +455,7 @@ jobs:
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
           bash scripts/test_qwen38_long_decode_receipt_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
+          bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \

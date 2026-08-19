@@ -57,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy key-sorted count and stopped an otherwise coherent hardware wave.
   Release validation now renders and tokenizes the exact first request before
   loading the 100 GiB verifier, so future prompt drift fails early.
+- Hash each immutable release model once per stable file identity instead of
+  rereading the same large GGUF in every release run and child harness. Child
+  and terminal checks bind the verified digest to the unchanged path,
+  device/inode, size, modification time, and change time; standalone harnesses
+  retain full hashing.
+  The self-hosted runner persists that receipt across release attempts, so an
+  unchanged model is not content-hashed again on every rerun.
+- Supervise the hardware gate as its own process group so workflow cancellation
+  also stops an active compiler, model server, and power helpers instead of
+  leaving the canceled gate running as an orphan.
 - Recalibrate the public Qwen3.6 347-tool/87,972-token release fixture for that
   insertion-order contract. The production renderer adds 28 tokens per tool
   relative to the historical key-sorted fixture, so its deterministic padding

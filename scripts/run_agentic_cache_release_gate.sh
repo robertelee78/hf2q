@@ -20,6 +20,7 @@ GEMMA_MODEL_SHA256=${GEMMA_MODEL_SHA256:?GEMMA_MODEL_SHA256 is required}
 QWEN_MODEL_SHA256=${QWEN_MODEL_SHA256:?QWEN_MODEL_SHA256 is required}
 QWEN38_MODEL_SHA256=${QWEN38_MODEL_SHA256:?QWEN38_MODEL_SHA256 is required}
 OUT_ROOT=${OUT_ROOT:-$(mktemp -d /var/tmp/hf2q-cache-release.XXXXXX)}
+HF2Q_MODEL_VERIFICATION_CACHE_DIR=${HF2Q_MODEL_VERIFICATION_CACHE_DIR:-$OUT_ROOT/model-verification-cache}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
@@ -244,12 +245,12 @@ verify_model() {
   local family=$1
   local model=$2
   local expected=$3
-  local actual
   ensure_guard_health
-  actual=$(sha256_file "$model")
-  test "$actual" = "$expected"
   mkdir -p "$OUT_ROOT/$family"
-  printf '%s  %s\n' "$actual" "$model" > "$OUT_ROOT/$family/model.sha256"
+  hf2q_release_prepare_model_verification "$model" "$expected" \
+    "$OUT_ROOT/$family/model-verification.json" \
+    "$HF2Q_MODEL_VERIFICATION_CACHE_DIR"
+  printf '%s  %s\n' "$expected" "$model" > "$OUT_ROOT/$family/model.sha256"
 }
 
 current_dir=""
@@ -265,12 +266,33 @@ start_server() {
   local max_slots=$6
   local context_len=${7:-}
   local kv_budget=${8:-}
+  local model_sha256 model_verification_receipt
   local -a launcher_env
 
   # Cargo parity tests later in this gate may relink package-local bin targets.
   # Every model must execute the immutable copy sealed outside Cargo's target.
   assert_exact_binary
   ensure_guard_health
+  case "$family" in
+    deepseek)
+      model_sha256=$DEEPSEEK_MODEL_SHA256
+      model_verification_receipt="$OUT_ROOT/deepseek/model-verification.json"
+      ;;
+    gemma)
+      model_sha256=$GEMMA_MODEL_SHA256
+      model_verification_receipt="$OUT_ROOT/gemma/model-verification.json"
+      ;;
+    qwen)
+      model_sha256=$QWEN_MODEL_SHA256
+      model_verification_receipt="$OUT_ROOT/qwen/model-verification.json"
+      ;;
+    *)
+      echo "unknown release model family: $family" >&2
+      return 1
+      ;;
+  esac
+  hf2q_release_verify_model "$model" "$model_sha256" \
+    "$model_verification_receipt"
   current_dir="$OUT_ROOT/$family/$phase"
   current_log="$current_dir/server.log"
   current_url="http://127.0.0.1:$port"
@@ -540,6 +562,7 @@ run_deepseek_release_gates() {
   SERVER_LOG="$current_log" SERVER_PID="$server_pid" \
   OUT_DIR="$OUT_ROOT/deepseek/interactive" BINARY_PATH="$HF2Q_BIN" \
   BINARY_SHA256="$binary_sha" MODEL_SHA256="$DEEPSEEK_MODEL_SHA256" \
+  HF2Q_MODEL_VERIFICATION_RECEIPT="$OUT_ROOT/deepseek/model-verification.json" \
   MAX_SLOTS=4 NO_PROGRESS_SECONDS=30 \
     scripts/test_deepseek4_interactive_overlap.sh \
       >"$OUT_ROOT/deepseek/interactive.stdout" \
@@ -567,6 +590,7 @@ run_qwen_release_gates() {
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
   MODEL_PATH="$QWEN_MODEL" MODEL_SHA256="$QWEN_MODEL_SHA256" \
+  HF2Q_MODEL_VERIFICATION_RECEIPT="$OUT_ROOT/qwen/model-verification.json" \
   FIXTURE_JSON="$OUT_ROOT/fixtures/public-347.json" \
   SHORT_FIXTURE_JSON="$OUT_ROOT/fixtures/public-short.json" MAX_SLOTS=4 \
   EXPECTED_PATH=/opt/hf2q/Cargo.toml \
@@ -584,6 +608,7 @@ run_qwen_release_gates() {
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
   MODEL_PATH="$QWEN_MODEL" MODEL_SHA256="$QWEN_MODEL_SHA256" \
+  HF2Q_MODEL_VERIFICATION_RECEIPT="$OUT_ROOT/qwen/model-verification.json" \
   FIXTURE_JSON="$OUT_ROOT/fixtures/public-347.json" \
   SHORT_FIXTURE_JSON="$OUT_ROOT/fixtures/public-short.json" MAX_SLOTS=1 \
   REQUIRE_PROVENANCE=1 OUT_DIR="$OUT_ROOT/qwen/cancellation" \
@@ -626,6 +651,7 @@ run_qwen38_long_decode_release_gate() {
   SOURCE_SHA="$EXPECTED_SHA" CRATE_SHA256="$CRATE_SHA256" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
   MODEL_PATH="$QWEN38_MODEL" MODEL_SHA256="$QWEN38_MODEL_SHA256" \
+  HF2Q_MODEL_VERIFICATION_RECEIPT="$OUT_ROOT/qwen38/model-verification.json" \
   OUT_DIR="$benchmark_dir" PORT=18083 \
     scripts/qwen38_long_decode_ab.sh \
       >"$out/benchmark.stdout" 2>"$out/benchmark.stderr" &
@@ -943,6 +969,7 @@ run_gemma_release_gates() {
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
   BINARY_PATH="$HF2Q_BIN" BINARY_SHA256="$binary_sha" \
   MODEL_PATH="$GEMMA_MODEL" MODEL_SHA256="$GEMMA_MODEL_SHA256" MAX_SLOTS=4 \
+  HF2Q_MODEL_VERIFICATION_RECEIPT="$OUT_ROOT/gemma/model-verification.json" \
   CURL_MAX_TIME_SECONDS=1800 CANCELLATION_WAIT_SECONDS=180 \
   OUT_DIR="$OUT_ROOT/gemma/overlap" scripts/test_gemma4_long_short_overlap.sh \
     >"$OUT_ROOT/gemma/overlap.stdout" 2>"$OUT_ROOT/gemma/overlap.stderr"
@@ -1055,6 +1082,14 @@ run_gemma_release_gates
 run_qwen_release_gates
 run_qwen38_long_decode_release_gate
 
+hf2q_release_verify_model "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256" \
+  "$OUT_ROOT/deepseek/model-verification.json"
+hf2q_release_verify_model "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256" \
+  "$OUT_ROOT/gemma/model-verification.json"
+hf2q_release_verify_model "$QWEN_MODEL" "$QWEN_MODEL_SHA256" \
+  "$OUT_ROOT/qwen/model-verification.json"
+hf2q_release_verify_model "$QWEN38_MODEL" "$QWEN38_MODEL_SHA256" \
+  "$OUT_ROOT/qwen38/model-verification.json"
 ensure_guard_health
 pmset -g assertions > "$OUT_ROOT/power-assertions.after.txt"
 power_guarded_ac=true

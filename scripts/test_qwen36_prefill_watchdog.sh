@@ -65,10 +65,7 @@ sha256_file() {
   echo "BINARY_SHA256 does not match BINARY_PATH" >&2
   exit 2
 }
-[[ "$(sha256_file "$FIXTURE_MODEL")" == "$MODEL_SHA256" ]] || {
-  echo "MODEL_SHA256 does not match FIXTURE_MODEL" >&2
-  exit 2
-}
+hf2q_release_verify_model "$FIXTURE_MODEL" "$MODEL_SHA256"
 [[ "$MAX_SLOTS" == 4 ]] || {
   echo "Qwen overlap release gate requires MAX_SLOTS=4" >&2
   exit 2

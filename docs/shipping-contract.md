@@ -100,6 +100,19 @@ from a clean packed artifact that resolves the published, checksum-pinned
 
 The shared cross-family changes additionally require:
 
+The protected cross-family gate content-hashes a model artifact once for each
+stable file identity. It records the exact path, digest, device/inode, size,
+modification time, and change time in the self-hosted runner's persistent tool
+cache. Later release attempts, child gates, and the terminal manifest boundary
+reject a changed or replaced file using that receipt without rereading the
+complete GGUF. Standalone harnesses without a parent receipt continue to verify
+the full model digest themselves.
+
+The workflow replaces its step shell with a process-group supervisor before
+starting the hardware gate. Cancellation terminates that scoped group, so an
+in-flight compiler, model runtime, and power helpers cannot survive a canceled
+job as orphan processes.
+
 | Family | Candidate artifact gate |
 |---|---|
 | Gemma 4 | Fresh-versus-reused bounded output parity at the 4,096 boundary and the non-aligned 8,193-token tail; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The two four-slot calibrated waves retain the default latency limits, run before the destructive 175K/120K soak, and each require a trailing 60 seconds of Nominal state plus fail-closed two-second sampling through the complete cold/cached/tool-result sequence. The experimental eight-slot correctness/aggregate-cap wave is not a latency SLO, but its 40-second TTFT, 60-second whole-response, and 30-second tool-result functional ceilings are accepted only after the already-loaded eight-slot process receives its own trailing 60-second Nominal settle and continuous full-wave thermal receipt binding all eight cold requests. The transaction cap is not accepted until this passes. |
