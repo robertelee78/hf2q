@@ -16,6 +16,9 @@
   release semantic floor and explicit already-current planning outcome, and
   the closed verifier-request metadata route plus fresh-session
   durable commit coordinator are reconciled;
+  canonical Hugging Face model-reference parsing, immutable native Hub
+  resolution, bounded index-selected source transfer, Git/LFS byte
+  verification, and conversion receipt v3 are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -39,8 +42,9 @@ workflow:
 - the GitHub release workflow publishes the crate and checksum, but no
   end-user Apple Silicon bundle;
 - the CLI has no self-update or first-run setup command;
-- one remote conversion path shells out to the `hf` CLI, even though
-  `src/input/hf_download.rs` already contains a native `hf-hub` downloader;
+- remote conversion now has a native immutable-reference/download boundary,
+  but does not yet own the complete no-options recipe, device-aware selection,
+  paired text/projector preparation, retention, and calibration transaction;
 - the canonical `scripts/serve_*_opencode.sh` launchers assume paths under
   `/opt/hf2q`, so copying them out of the checkout is not sufficient; and
 - OpenCode and Agentic Kit setup is scattered outside one tested guide.
@@ -1543,6 +1547,30 @@ The guide uses `Qwen/Qwen3.8-27B` everywhere. A private local alias is not part
 of the documented workflow and never governs receipts, cache identity,
 diagnostics, or `/v1/models` identity.
 
+**Landed boundary (2026-08-19).** The positional model ID/URL grammar and the
+`--repo` compatibility spelling now converge on one bounded parser. It accepts
+the forms above, rejects credentials, alternate origins/ports, query/fragment,
+ambiguous routes, traversal, malformed percent escapes, mismatched revisions,
+and over-cap repository/revision/file components. File-specific `blob` and
+`resolve` forms are structural identities only; repository conversion rejects
+them until the separately recipe-bound external-GGUF path lands. Existing,
+absolute, `./`, and `../` paths remain explicitly local.
+
+The in-process `hf-hub` path pins the official endpoint, resolves repository
+information to a 40-hex commit before selected transfer, and requires each
+file's metadata to name that same commit. The complete repository name
+inventory is capped at 4,096; selected paths at 1,024 bytes/64 components;
+small metadata and the safetensors index at 16 MiB; tokenizer/vocabulary files
+at 512 MiB; and the index at 262,144 tensor entries. The authenticated index
+rejects duplicate/unknown structure and selects only required safetensors;
+unrelated weights, `.bin`, ONNX, and pre-quantized outputs remain inert.
+Safetensors require an LFS SHA-256. Git-managed metadata is checked through its
+canonical Git blob SHA-1 and every selected local file receives a SHA-256 in
+the schema-v3 conversion receipt. The receipt additionally binds the original
+reference, normalized repository ID/type, canonical URL, immutable revision,
+source bundle, converter commit, quant selector, and final GGUF identity.
+Standard Hub token/cache discovery is used without persisting a token in hf2q.
+
 ### 7. Make official-source preparation native, explicit, and device-aware
 
 The canonical official-source preparation command is:
@@ -1550,6 +1578,13 @@ The canonical official-source preparation command is:
 ```sh
 hf2q convert Qwen/Qwen3.8-27B
 ```
+
+That no-options command remains the target contract, not a claim about the
+current CLI. The landed immutable-source slice still requires explicit
+`--quant` and `--output`; it does not guess either. The next preparation slice
+must add the checked-in Qwen3.8 recipe, exact device/disk decision table,
+source-matched text/projector outputs, retention transaction, prepared profile,
+and bounded runtime calibration before removing those requirements.
 
 It executes an hf2q-only resumable plan:
 
@@ -1868,11 +1903,13 @@ before public self-update ships.
    The verifier-issued Pages metadata route and fresh-session durable commit
    coordinator have landed with root-only 404 termination, role caps, selected-
    floor replay, exact restart discard, and no target or artifact authority.
-   Next,
-   embed the real stable root, compile the real public Team ID, pass the
-   protected positive signing fixture, and implement canonical Hugging
-   Face reference grammar, prepared/external artifact provenance, calibration
-   receipt, and session policy. Every schema lands with bounded hostile input and
+   Canonical Hugging Face reference grammar, immutable native resolution,
+   bounded exact source selection, Git/LFS verification, and conversion
+   receipt v3 have now landed. Next, embed the real stable root, compile the
+   real public Team ID, pass the protected positive signing fixture, and add
+   the checked-in Qwen3.8 preparation recipe, device-aware text/projector
+   profile, source retention, prepared/external artifact provenance,
+   calibration receipt, and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate

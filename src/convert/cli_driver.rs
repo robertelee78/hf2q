@@ -218,21 +218,15 @@ pub enum ConvertError {
     /// [[feedback-no-loop-suppression-2026-05-17]]: refuse rather than
     /// silently pick one.
     RepoAndDirMutuallyExclusive,
-    /// Remote conversion must pin the exact immutable Hub commit.
-    ImmutableRevisionRequired { supplied: Option<String> },
+    /// Neither a positional source nor the compatibility `--repo` spelling
+    /// was supplied.
+    MissingInput,
     /// `--revision` has no meaning for an already-local source directory.
-    RevisionRequiresRepo,
-    /// Repo id is unsafe or outside HuggingFace's path-shaped id grammar.
-    InvalidRepoId { repo: String },
-    /// B1 — the allowed `hf download <repo>` source fetch exited non-zero. Captures
-    /// the exit code (`None` if the process was killed by a signal)
-    /// plus the captured stderr so the operator can diagnose auth /
-    /// network / missing-binary failures.
-    HfDownload {
-        repo: String,
-        exit_code: Option<i32>,
-        stderr: String,
-    },
+    RevisionRequiresRemote,
+    /// Canonical Hugging Face reference parsing or revision reconciliation.
+    HfReference(crate::input::hf_reference::HfReferenceError),
+    /// Native in-process Hugging Face download failure.
+    HfDownload(crate::input::hf_download::DownloadError),
 }
 
 impl std::fmt::Display for ConvertError {
@@ -309,31 +303,16 @@ impl std::fmt::Display for ConvertError {
                 "convert: `--repo <hf_repo>` and positional `<hf_dir>` are mutually exclusive — \
                  pass exactly one"
             ),
-            ConvertError::ImmutableRevisionRequired { supplied } => write!(
+            ConvertError::MissingInput => write!(
                 f,
-                "convert: `--repo` requires `--revision <40-hex-commit>`; got {}",
-                supplied.as_deref().unwrap_or("<missing>")
+                "convert: provide a local model directory or Hugging Face model reference"
             ),
-            ConvertError::RevisionRequiresRepo => write!(
+            ConvertError::RevisionRequiresRemote => write!(
                 f,
-                "convert: `--revision` is valid only with `--repo`; local directories are used as supplied"
+                "convert: `--revision` is valid only with a remote Hugging Face reference; explicit local directories are used as supplied"
             ),
-            ConvertError::InvalidRepoId { repo } => write!(
-                f,
-                "convert: invalid HuggingFace repo id `{repo}`; expected slash-separated ASCII name components"
-            ),
-            ConvertError::HfDownload {
-                repo,
-                exit_code,
-                stderr,
-            } => write!(
-                f,
-                "convert: HuggingFace download for {repo} exited with status {} — stderr:\n{}",
-                exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "<signal>".to_string()),
-                stderr.trim_end()
-            ),
+            ConvertError::HfReference(e) => write!(f, "convert/reference: {e}"),
+            ConvertError::HfDownload(e) => write!(f, "convert/download: {e}"),
         }
     }
 }
@@ -350,6 +329,8 @@ impl std::error::Error for ConvertError {
             ConvertError::Apex(e) => Some(e),
             ConvertError::Tokenizer(e) => Some(e),
             ConvertError::Imatrix(e) => Some(e),
+            ConvertError::HfReference(e) => Some(e),
+            ConvertError::HfDownload(e) => Some(e),
             _ => None,
         }
     }
@@ -388,6 +369,18 @@ impl From<crate::core::integrity::IntegrityError> for ConvertError {
 impl From<ReceiptError> for ConvertError {
     fn from(e: ReceiptError) -> Self {
         ConvertError::Receipt(e)
+    }
+}
+
+impl From<crate::input::hf_reference::HfReferenceError> for ConvertError {
+    fn from(e: crate::input::hf_reference::HfReferenceError) -> Self {
+        ConvertError::HfReference(e)
+    }
+}
+
+impl From<crate::input::hf_download::DownloadError> for ConvertError {
+    fn from(e: crate::input::hf_download::DownloadError) -> Self {
+        ConvertError::HfDownload(e)
     }
 }
 
@@ -477,7 +470,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
             &args.output,
             args.remote_source
                 .as_ref()
-                .map(|remote| remote.source_sha256.as_str()),
+                .map(RemoteConversionSource::source_sha256),
         )?;
 
         if let Some(remote) = args.remote_source.as_ref() {
@@ -820,7 +813,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         );
         orch.add_metadata(
             KEY_SOURCE_SHA256.to_string(),
-            MetaValue::String(remote.source_sha256.clone()),
+            MetaValue::String(remote.source_sha256().to_owned()),
         );
     }
 
@@ -976,7 +969,13 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
 fn conversion_model_basename(args: &ConvertArgs) -> Option<String> {
     args.remote_source
         .as_ref()
-        .and_then(|source| source.repo.rsplit('/').find(|part| !part.is_empty()))
+        .and_then(|source| {
+            source
+                .reference()
+                .repo_id()
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+        })
         .map(String::from)
         .or_else(|| {
             args.hf_dir
@@ -2826,6 +2825,16 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
 
+    fn remote_source(repo: &str) -> RemoteConversionSource {
+        RemoteConversionSource::for_test(
+            crate::input::hf_reference::HfModelReference::parse(repo, None)
+                .unwrap()
+                .resolve(&"a".repeat(40))
+                .unwrap(),
+            "b".repeat(64),
+        )
+    }
+
     fn basename_test_args(hf_dir: &str, repo: Option<&str>) -> ConvertArgs {
         ConvertArgs {
             hf_dir: PathBuf::from(hf_dir),
@@ -2837,12 +2846,7 @@ mod tests {
             imatrix_out: None,
             imatrix_n_ctx: None,
             mmproj: false,
-            remote_source: repo.map(|repo| RemoteConversionSource {
-                repo: repo.into(),
-                revision: "a".repeat(40),
-                source_sha256: "b".repeat(64),
-                files: Vec::new(),
-            }),
+            remote_source: repo.map(remote_source),
         }
     }
 
@@ -3742,12 +3746,7 @@ mod tests {
             imatrix_out: None,
             imatrix_n_ctx: None,
             mmproj: false,
-            remote_source: Some(RemoteConversionSource {
-                repo: "deepseek-ai/DeepSeek-V4-Flash-0731".into(),
-                revision: "a".repeat(40),
-                source_sha256: "b".repeat(64),
-                files: Vec::new(),
-            }),
+            remote_source: Some(remote_source("deepseek-ai/DeepSeek-V4-Flash-0731")),
         })
         .unwrap();
         let bytes = std::fs::read(&output).unwrap();

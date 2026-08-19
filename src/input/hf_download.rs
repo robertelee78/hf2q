@@ -1,7 +1,8 @@
 //! HuggingFace Hub download integration (Epic 3).
 //!
-//! Downloads model files from HuggingFace Hub via the `hf-hub` crate,
-//! with fallback to the `hf` CLI if the crate fails.
+//! Downloads model files from Hugging Face Hub through the in-process
+//! `hf-hub` client. Production never shells out to `hf` or
+//! `huggingface-cli`.
 //!
 //! Token resolution order (Story 3.2):
 //! 1. HF_TOKEN environment variable
@@ -42,13 +43,23 @@
 //! `hf2q` → verify only in-flight shard re-downloads, total wall-clock
 //! is proportionally shorter.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 
-use serde_json;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
+use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
+use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
 use crate::progress::ProgressReporter;
+
+const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";
+const DEFAULT_HF_REVISION: &str = "main";
+const QWEN38_REPO_ID: &str = "Qwen/Qwen3.8-27B";
+const QWEN38_ACCEPTED_REVISION: &str = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0";
+pub(super) const MAX_HF_REPO_FILES: usize = 4096;
+pub(super) const MAX_HF_SMALL_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_HF_TOKENIZER_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Minimum free disk space requirements by model class (Decision 14).
 ///
@@ -111,13 +122,12 @@ impl ModelClass {
 #[derive(Error, Debug)]
 pub enum DownloadError {
     #[error(
-        "Failed to download from HuggingFace Hub: {reason}\n\
+        "Failed to download from Hugging Face Hub: {reason}\n\
          \n\
          Troubleshooting:\n\
          - Check your network connection\n\
          - For gated models, ensure you have accepted the license at huggingface.co\n\
-         - Set HF_TOKEN env var or run: huggingface-cli login\n\
-         - Install hf CLI as fallback: pip install huggingface_hub[cli]"
+         - Set HF_TOKEN for private or gated repositories"
     )]
     DownloadFailed { reason: String },
 
@@ -128,7 +138,7 @@ pub enum DownloadError {
          1. Accept the model license at https://huggingface.co/{repo}\n\
          2. Set your token: export HF_TOKEN=hf_xxxx\n\
             Or create ~/.huggingface/token with your token\n\
-         3. Alternatively, run: huggingface-cli login"
+         3. Retry the same hf2q command"
     )]
     AuthError { repo: String },
 
@@ -146,13 +156,17 @@ pub enum DownloadError {
     )]
     NoModelFiles { repo: String },
 
-    #[error(
-        "hf CLI fallback also failed: {reason}\n\
-         \n\
-         Install the HuggingFace CLI: pip install huggingface_hub[cli]\n\
-         Then try again."
-    )]
-    CliFallbackFailed { reason: String },
+    #[error(transparent)]
+    InvalidReference(#[from] HfReferenceError),
+
+    #[error(transparent)]
+    Integrity(#[from] IntegrityError),
+
+    #[error("invalid or unsupported Hugging Face repository inventory: {reason}")]
+    InvalidRepositoryInventory { reason: String },
+
+    #[error("a file-specific Hugging Face URL cannot be converted as a model repository")]
+    FileReferenceUnsupported,
 
     /// Disk preflight failure (Decision 14).
     ///
@@ -178,12 +192,45 @@ const REQUIRED_FILES: &[&str] = &["config.json"];
 
 /// Files we want to download if present (non-fatal if missing).
 const OPTIONAL_FILES: &[&str] = &[
+    "chat_template.jinja",
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
     "tokenizer.model",
     "generation_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "processor_config.json",
+    "merges.txt",
+    "vocab.json",
 ];
+
+/// A completed native download bound to the exact Hub commit resolved before
+/// any model payload was transferred.
+#[derive(Debug)]
+pub struct DownloadedModel {
+    local_dir: PathBuf,
+    reference: ResolvedHfModelReference,
+    manifest: Vec<ShardIntegrity>,
+}
+
+impl DownloadedModel {
+    pub fn local_dir(&self) -> &Path {
+        &self.local_dir
+    }
+
+    pub fn reference(&self) -> &ResolvedHfModelReference {
+        &self.reference
+    }
+
+    pub fn manifest(&self) -> &[ShardIntegrity] {
+        &self.manifest
+    }
+
+    pub fn into_parts(self) -> (PathBuf, ResolvedHfModelReference, Vec<ShardIntegrity>) {
+        (self.local_dir, self.reference, self.manifest)
+    }
+}
 
 /// Check that enough disk space is available before starting a download (Decision 14).
 ///
@@ -279,322 +326,428 @@ pub fn download_model(
     repo_id: &str,
     progress: &ProgressReporter,
 ) -> Result<PathBuf, DownloadError> {
-    info!(repo = %repo_id, "Downloading model from HuggingFace Hub");
+    let reference = HfModelReference::parse(repo_id, None)?;
+    download_model_reference(reference, progress).map(|download| download.local_dir)
+}
+
+/// Resolve a parsed model reference to one immutable commit, then download the
+/// exact source-format inventory required by conversion from that commit.
+pub fn download_model_reference(
+    reference: HfModelReference,
+    progress: &ProgressReporter,
+) -> Result<DownloadedModel, DownloadError> {
+    info!(repo = %reference.repo_id(), "Downloading model from Hugging Face Hub");
 
     // Decision 14: disk preflight before any network activity.
     // Use the hf-hub default cache dir (~/.cache/huggingface/hub).
     let cache_dir = resolve_hf_cache_dir();
-    check_disk_preflight(repo_id, &cache_dir, None)?;
-
-    // Attempt 1: Use hf-hub crate (primary method)
-    match download_via_hf_hub(repo_id, progress) {
-        Ok(path) => Ok(path),
-        Err(e) => {
-            warn!(
-                "hf-hub crate download failed: {}. Trying hf CLI fallback...",
-                e
-            );
-
-            // Attempt 2: Fall back to hf CLI on PATH (Story 3.2)
-            match download_via_hf_cli(repo_id, progress) {
-                Ok(path) => Ok(path),
-                Err(cli_err) => {
-                    // Both methods failed — report both errors
-                    Err(DownloadError::DownloadFailed {
-                        reason: format!("hf-hub crate: {}. hf CLI: {}", e, cli_err),
-                    })
-                }
-            }
-        }
-    }
+    check_disk_preflight(reference.repo_id(), &cache_dir, None)?;
+    download_via_hf_hub(reference, &cache_dir, progress)
 }
 
 /// Download model files using the hf-hub crate.
 fn download_via_hf_hub(
-    repo_id: &str,
+    reference: HfModelReference,
+    cache_dir: &Path,
     progress: &ProgressReporter,
-) -> Result<PathBuf, DownloadError> {
+) -> Result<DownloadedModel, DownloadError> {
     use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::{Repo, RepoType};
+
+    if reference.filename().is_some() {
+        return Err(DownloadError::FileReferenceUnsupported);
+    }
 
     // Resolve auth token (Story 3.2)
     let token = resolve_auth_token();
     debug!(has_token = token.is_some(), "Auth token resolution");
 
-    // Build the API client
-    let mut builder = ApiBuilder::new().with_progress(true);
+    // Pin the official endpoint even when HF_ENDPOINT is set in the process.
+    let mut builder = ApiBuilder::new()
+        .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(true);
 
     if let Some(t) = token {
         builder = builder.with_token(Some(t));
     }
 
     let api = builder.build().map_err(|e| DownloadError::DownloadFailed {
-        reason: format!("Failed to initialize HuggingFace API client: {}", e),
+        reason: format!("Failed to initialize Hugging Face API client: {e}"),
     })?;
 
-    let repo = api.model(repo_id.to_string());
+    let requested_revision = reference
+        .requested_revision()
+        .unwrap_or_else(|| default_revision_for(reference.repo_id()))
+        .to_owned();
+    let lookup_repo = api.repo(Repo::with_revision(
+        reference.repo_id().to_owned(),
+        RepoType::Model,
+        requested_revision.clone(),
+    ));
 
-    // Get repo info to discover files
-    let repo_info = repo.info().map_err(|e| {
-        let err_str = format!("{}", e);
+    // Resolve branch/tag/default identity before downloading any source file.
+    let repo_info = lookup_repo.info().map_err(|e| {
+        let err_str = e.to_string();
         if err_str.contains("401") || err_str.contains("403") || err_str.contains("auth") {
             DownloadError::AuthError {
-                repo: repo_id.to_string(),
+                repo: reference.repo_id().to_owned(),
             }
         } else if err_str.contains("404") || err_str.contains("not found") {
             DownloadError::RepoNotFound {
-                repo: repo_id.to_string(),
+                repo: reference.repo_id().to_owned(),
             }
         } else {
             DownloadError::DownloadFailed {
-                reason: format!("Failed to get repository info: {}", e),
+                reason: format!("Failed to get repository info: {e}"),
             }
         }
     })?;
-
-    // Identify files to download
-    let all_files: Vec<String> = repo_info
-        .siblings
-        .iter()
-        .map(|s| s.rfilename.clone())
-        .collect();
+    let (resolved, inventory) =
+        resolve_repository_info(reference, &requested_revision, &repo_info)?;
+    let repo = api.repo(Repo::with_revision(
+        resolved.repo_id().to_owned(),
+        RepoType::Model,
+        resolved.revision().to_owned(),
+    ));
 
     debug!(
-        file_count = all_files.len(),
+        file_count = inventory.len(),
+        revision = resolved.revision(),
         "Repository file listing retrieved"
     );
-
-    // Find safetensors files
-    let safetensors_files: Vec<&String> = all_files
-        .iter()
-        .filter(|f| f.ends_with(".safetensors"))
-        .collect();
-
-    let index_file: Option<&String> = all_files
-        .iter()
-        .find(|f| f.as_str() == "model.safetensors.index.json");
-
-    if safetensors_files.is_empty() {
-        return Err(DownloadError::NoModelFiles {
-            repo: repo_id.to_string(),
-        });
+    let initial_files = initial_download_files(&inventory)?;
+    let mut downloaded_path = None;
+    let mut manifest = Vec::with_capacity(initial_files.len());
+    for filename in &initial_files {
+        let record = fetch_expected_file_metadata(&api, &repo, &resolved, filename)?;
+        let local = download_file(&repo, resolved.repo_id(), filename)?;
+        bind_snapshot_parent(&mut downloaded_path, &local, filename, resolved.revision())?;
+        verify_shard(resolved.repo_id(), resolved.revision(), &local, &record)?;
+        manifest.push(record);
     }
-
-    // Build the list of files to download
-    let mut files_to_download: Vec<&str> = Vec::new();
-
-    // Required files
-    for required in REQUIRED_FILES {
-        if all_files.iter().any(|f| f.as_str() == *required) {
-            files_to_download.push(required);
-        } else {
-            return Err(DownloadError::DownloadFailed {
-                reason: format!("Required file '{}' not found in repository", required),
-            });
-        }
-    }
-
-    // Optional files (silently skip if missing)
-    for optional in OPTIONAL_FILES {
-        if all_files.iter().any(|f| f.as_str() == *optional) {
-            files_to_download.push(optional);
-        }
-    }
-
-    // Index file — download FIRST so we know which shards are actually needed
-    let mut needed_shards: Option<Vec<String>> = None;
-    if let Some(idx) = index_file {
-        files_to_download.push(idx.as_str());
-
-        // Download the index now to discover required shards
-        debug!("Downloading index file to determine required shards");
-        let idx_path = repo
-            .get(idx.as_str())
-            .map_err(|e| DownloadError::DownloadFailed {
-                reason: format!("Failed to download index file: {}", e),
-            })?;
-
-        // Parse weight_map to find which shard files are actually referenced
-        if let Ok(content) = std::fs::read_to_string(&idx_path) {
-            if let Ok(index) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(weight_map) = index.get("weight_map").and_then(|v| v.as_object()) {
-                    let mut shard_names: Vec<String> = weight_map
-                        .values()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    shard_names.sort();
-                    shard_names.dedup();
-                    info!(
-                        total_safetensors = safetensors_files.len(),
-                        needed = shard_names.len(),
-                        "Index specifies {} of {} safetensors files",
-                        shard_names.len(),
-                        safetensors_files.len(),
-                    );
-                    needed_shards = Some(shard_names);
-                }
-            }
-        }
-    }
-
-    // Only download shards referenced by the index (or all if no index)
-    match &needed_shards {
-        Some(shards) => {
-            for shard in shards {
-                files_to_download.push(shard.as_str());
-            }
-        }
-        None => {
-            // No index file — download all safetensors files
-            for sf in &safetensors_files {
-                files_to_download.push(sf.as_str());
-            }
-        }
-    }
-
-    // Download all files with progress
-    let total_files = files_to_download.len();
-    let pb = progress.bar(total_files as u64, "Downloading model files");
-
-    let mut downloaded_path: Option<PathBuf> = None;
-
-    for filename in &files_to_download {
-        debug!(file = %filename, "Downloading");
-
-        let local_path = repo.get(filename).map_err(|e| {
-            let err_str = format!("{}", e);
-            if err_str.contains("401") || err_str.contains("403") {
-                DownloadError::AuthError {
-                    repo: repo_id.to_string(),
-                }
-            } else {
-                DownloadError::DownloadFailed {
-                    reason: format!("Failed to download '{}': {}", filename, e),
-                }
+    let model_dir = downloaded_path
+        .clone()
+        .ok_or_else(|| DownloadError::DownloadFailed {
+            reason: "No model metadata files were downloaded".to_owned(),
+        })?;
+    let required_shards =
+        crate::input::integrity::required_weight_shards(&model_dir).map_err(|error| {
+            DownloadError::InvalidRepositoryInventory {
+                reason: error.to_string(),
             }
         })?;
+    let files_to_download = complete_download_files(&inventory, &initial_files, &required_shards)?;
 
-        // The first downloaded file tells us where the cache directory is
-        if downloaded_path.is_none() {
-            if let Some(parent) = local_path.parent() {
-                downloaded_path = Some(parent.to_path_buf());
-            }
-        }
+    let additional_files = files_to_download
+        .iter()
+        .filter(|filename| !initial_files.contains(filename))
+        .collect::<Vec<_>>();
+    let pb = progress.bar(additional_files.len() as u64, "Downloading model weights");
 
+    for filename in additional_files {
+        debug!(file = %filename, "Downloading");
+        let record = fetch_expected_file_metadata(&api, &repo, &resolved, filename)?;
+        let local_path = download_file(&repo, resolved.repo_id(), filename)?;
+        bind_snapshot_parent(
+            &mut downloaded_path,
+            &local_path,
+            filename,
+            resolved.revision(),
+        )?;
+        verify_shard(
+            resolved.repo_id(),
+            resolved.revision(),
+            &local_path,
+            &record,
+        )?;
+        manifest.push(record);
         pb.inc(1);
     }
 
-    pb.finish_with_message(format!("Downloaded {} files", total_files));
-
-    let model_dir = downloaded_path.ok_or_else(|| DownloadError::DownloadFailed {
-        reason: "No files were downloaded".to_string(),
-    })?;
+    pb.finish_with_message(format!(
+        "Selected {} exact source files",
+        files_to_download.len()
+    ));
 
     info!(path = %model_dir.display(), "Model downloaded to cache");
 
-    Ok(model_dir)
+    manifest.sort_by(|left, right| left.filename.cmp(&right.filename));
+    Ok(DownloadedModel {
+        local_dir: model_dir,
+        reference: resolved,
+        manifest,
+    })
 }
 
-/// Attempt to download using the `hf` CLI as a fallback.
-fn download_via_hf_cli(
-    repo_id: &str,
-    _progress: &ProgressReporter,
-) -> Result<PathBuf, DownloadError> {
-    // Check if hf CLI is available — try both 'hf' and 'huggingface-cli'
-    let hf_check = std::process::Command::new("hf").arg("--version").output();
-
-    match hf_check {
-        Ok(output) if output.status.success() => {
-            debug!(
-                "hf CLI found: {}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
-            download_with_cli_command("hf", repo_id)
-        }
-        _ => {
-            let hfcli_check = std::process::Command::new("huggingface-cli")
-                .arg("--version")
-                .output();
-
-            match hfcli_check {
-                Ok(output) if output.status.success() => {
-                    debug!(
-                        "huggingface-cli found: {}",
-                        String::from_utf8_lossy(&output.stdout).trim()
-                    );
-                    download_with_cli_command("huggingface-cli", repo_id)
-                }
-                _ => Err(DownloadError::CliFallbackFailed {
-                    reason: "Neither 'hf' nor 'huggingface-cli' found on PATH".to_string(),
-                }),
-            }
-        }
-    }
+fn fetch_expected_file_metadata(
+    api: &hf_hub::api::sync::Api,
+    repo: &hf_hub::api::sync::ApiRepo,
+    resolved: &ResolvedHfModelReference,
+    filename: &str,
+) -> Result<ShardIntegrity, DownloadError> {
+    let metadata =
+        api.metadata(&repo.url(filename))
+            .map_err(|error| DownloadError::DownloadFailed {
+                reason: format!("Failed to fetch immutable metadata for `{filename}`: {error}"),
+            })?;
+    validate_file_metadata(
+        filename,
+        resolved.revision(),
+        metadata.commit_hash(),
+        metadata.etag(),
+        metadata.size() as u64,
+    )
 }
 
-/// Run the actual CLI download command.
-fn download_with_cli_command(cmd: &str, repo_id: &str) -> Result<PathBuf, DownloadError> {
-    info!(cmd = %cmd, repo = %repo_id, "Downloading via CLI");
-
-    let output = std::process::Command::new(cmd)
-        .args([
-            "download",
-            repo_id,
-            "--include",
-            "*.safetensors",
-            "--include",
-            "*.json",
-            "--include",
-            "tokenizer.model",
-            "--exclude",
-            "*.gguf",
-            "--exclude",
-            "*.bin",
-            "--exclude",
-            "*.pt",
-            "--exclude",
-            "*.h5",
-            "--exclude",
-            "*.msgpack",
-            "--exclude",
-            "*.ot",
-        ])
-        .output()
-        .map_err(|e| DownloadError::CliFallbackFailed {
-            reason: format!("Failed to execute '{}': {}", cmd, e),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DownloadError::CliFallbackFailed {
-            reason: format!("{} download failed: {}", cmd, stderr.trim()),
-        });
-    }
-
-    // Parse the output to find the download directory
-    // The hf CLI prints the snapshot path on the last line
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let download_path = stdout
-        .lines()
-        .last()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| DownloadError::CliFallbackFailed {
-            reason: format!("{} produced no output path", cmd),
-        })?;
-
-    if !download_path.exists() {
-        return Err(DownloadError::CliFallbackFailed {
+pub(super) fn validate_file_metadata(
+    filename: &str,
+    expected_revision: &str,
+    returned_revision: &str,
+    etag: &str,
+    size: u64,
+) -> Result<ShardIntegrity, DownloadError> {
+    validate_repo_filename(filename)?;
+    if returned_revision.len() != 40
+        || !returned_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !returned_revision.eq_ignore_ascii_case(expected_revision)
+    {
+        return Err(DownloadError::InvalidRepositoryInventory {
             reason: format!(
-                "Downloaded path does not exist: {}",
-                download_path.display()
+                "metadata for `{filename}` returned commit `{returned_revision}` instead of `{expected_revision}`"
             ),
         });
     }
+    if size == 0 {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!("metadata for `{filename}` reported an empty file"),
+        });
+    }
+    if let Some(cap) = metadata_size_cap(filename) {
+        if size > cap {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("metadata file `{filename}` is {size} bytes; limit is {cap}"),
+            });
+        }
+    }
+    let record = ShardIntegrity::from_metadata(filename, etag, size);
+    let has_supported_identity = record.sha256.is_some()
+        || (record.hf_etag.len() == 40
+            && record.hf_etag.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !has_supported_identity {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!("metadata for `{filename}` has no supported immutable identity"),
+        });
+    }
+    if filename.ends_with(".safetensors") && !record.is_lfs {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!("weight shard `{filename}` has no strong LFS SHA-256 identity"),
+        });
+    }
+    Ok(record)
+}
 
-    info!(path = %download_path.display(), "Model downloaded via CLI");
+pub(super) fn metadata_size_cap(filename: &str) -> Option<u64> {
+    if filename.ends_with(".safetensors") {
+        None
+    } else if matches!(
+        filename,
+        "tokenizer.json" | "tokenizer.model" | "merges.txt" | "vocab.json"
+    ) {
+        Some(MAX_HF_TOKENIZER_BYTES)
+    } else {
+        Some(MAX_HF_SMALL_METADATA_BYTES)
+    }
+}
 
-    Ok(download_path)
+pub(super) fn default_revision_for(repo_id: &str) -> &'static str {
+    if repo_id == QWEN38_REPO_ID {
+        QWEN38_ACCEPTED_REVISION
+    } else {
+        DEFAULT_HF_REVISION
+    }
+}
+
+pub(super) fn resolve_repository_info(
+    reference: HfModelReference,
+    requested_revision: &str,
+    info: &hf_hub::api::RepoInfo,
+) -> Result<(ResolvedHfModelReference, BTreeSet<String>), DownloadError> {
+    let requested_exact = requested_revision.len() == 40
+        && requested_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+    if requested_exact && !requested_revision.eq_ignore_ascii_case(&info.sha) {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "repository lookup returned commit `{}` instead of explicitly requested `{requested_revision}`",
+                info.sha
+            ),
+        });
+    }
+    let resolved = reference.resolve(&info.sha)?;
+    let inventory = validate_repo_inventory(
+        info.siblings
+            .iter()
+            .map(|sibling| sibling.rfilename.as_str()),
+    )?;
+    Ok((resolved, inventory))
+}
+
+pub(super) fn validate_repo_inventory<'a>(
+    filenames: impl IntoIterator<Item = &'a str>,
+) -> Result<BTreeSet<String>, DownloadError> {
+    let mut inventory = BTreeSet::new();
+    for filename in filenames {
+        if inventory.len() == MAX_HF_REPO_FILES {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("more than {MAX_HF_REPO_FILES} files"),
+            });
+        }
+        validate_repo_filename(filename)?;
+        if !inventory.insert(filename.to_owned()) {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("duplicate file `{filename}`"),
+            });
+        }
+    }
+    Ok(inventory)
+}
+
+fn validate_repo_filename(filename: &str) -> Result<(), DownloadError> {
+    let path = Path::new(filename);
+    let component_count = path.components().count();
+    let valid = !filename.is_empty()
+        && filename.len() <= crate::input::hf_reference::MAX_HF_FILENAME_BYTES
+        && component_count <= crate::input::hf_reference::MAX_HF_FILENAME_COMPONENTS
+        && !filename.contains('\\')
+        && filename.is_ascii()
+        && filename.bytes().all(|byte| !byte.is_ascii_control())
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if valid {
+        Ok(())
+    } else {
+        Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!("unsafe file path `{filename}`"),
+        })
+    }
+}
+
+pub(super) fn initial_download_files(
+    inventory: &BTreeSet<String>,
+) -> Result<Vec<String>, DownloadError> {
+    for required in REQUIRED_FILES {
+        if !inventory.contains(*required) {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("required file `{required}` is absent"),
+            });
+        }
+    }
+    let has_index = inventory.contains("model.safetensors.index.json");
+    if !has_index && !inventory.contains("model.safetensors") {
+        return Err(DownloadError::NoModelFiles {
+            repo: "selected model repository".to_owned(),
+        });
+    }
+
+    let mut files = REQUIRED_FILES
+        .iter()
+        .map(|filename| (*filename).to_owned())
+        .collect::<Vec<_>>();
+    if has_index {
+        files.push("model.safetensors.index.json".to_owned());
+    }
+    files.extend(
+        OPTIONAL_FILES
+            .iter()
+            .filter(|filename| inventory.contains(**filename))
+            .map(|filename| (*filename).to_owned()),
+    );
+    Ok(files)
+}
+
+pub(super) fn complete_download_files(
+    inventory: &BTreeSet<String>,
+    initial_files: &[String],
+    required_shards: &[String],
+) -> Result<Vec<String>, DownloadError> {
+    if required_shards.is_empty() {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: "weight index selected no safetensors shards".to_owned(),
+        });
+    }
+    let mut files = initial_files.iter().cloned().collect::<BTreeSet<_>>();
+    for shard in required_shards {
+        validate_repo_filename(shard)?;
+        if !shard.ends_with(".safetensors") || !inventory.contains(shard) {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("required shard `{shard}` is absent or not safetensors"),
+            });
+        }
+        files.insert(shard.clone());
+    }
+    Ok(files.into_iter().collect())
+}
+
+fn download_file(
+    repo: &hf_hub::api::sync::ApiRepo,
+    repo_id: &str,
+    filename: &str,
+) -> Result<PathBuf, DownloadError> {
+    repo.get(filename).map_err(|error| {
+        let rendered = error.to_string();
+        if rendered.contains("401") || rendered.contains("403") {
+            DownloadError::AuthError {
+                repo: repo_id.to_owned(),
+            }
+        } else {
+            DownloadError::DownloadFailed {
+                reason: format!("Failed to download `{filename}`: {error}"),
+            }
+        }
+    })
+}
+
+pub(super) fn bind_snapshot_parent(
+    selected: &mut Option<PathBuf>,
+    local_file: &Path,
+    filename: &str,
+    expected_revision: &str,
+) -> Result<(), DownloadError> {
+    let mut snapshot = local_file.to_path_buf();
+    for _ in Path::new(filename).components() {
+        if !snapshot.pop() {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("download path for `{filename}` has no snapshot parent"),
+            });
+        }
+    }
+    if snapshot.file_name().and_then(|name| name.to_str()) != Some(expected_revision) {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "downloaded `{filename}` resolved outside exact snapshot `{expected_revision}`"
+            ),
+        });
+    }
+    match selected {
+        Some(existing) if existing != &snapshot => Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "downloaded files crossed snapshots `{}` and `{}`",
+                existing.display(),
+                snapshot.display()
+            ),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            *selected = Some(snapshot);
+            Ok(())
+        }
+    }
 }
 
 /// Resolve an HF auth token from available sources (Story 3.2).
@@ -1038,7 +1191,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("HF_TOKEN"));
         assert!(msg.contains("huggingface.co"));
-        assert!(msg.contains("huggingface-cli login"));
+        assert!(!msg.contains("huggingface-cli"));
     }
 
     #[test]
@@ -1048,5 +1201,46 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("org/model-name"));
+    }
+
+    /// Opt-in live proof that the accepted Qwen3.8 revision resolves through
+    /// the exact production endpoint without transferring model payloads.
+    #[test]
+    fn live_qwen38_repository_info_matches_the_accepted_commit() {
+        if std::env::var("HF2Q_NETWORK_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
+            return;
+        }
+        use hf_hub::api::sync::ApiBuilder;
+        use hf_hub::{Repo, RepoType};
+
+        let api = ApiBuilder::new()
+            .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
+            .with_progress(false)
+            .build()
+            .expect("build exact-origin Hub client");
+        let info = api
+            .repo(Repo::with_revision(
+                QWEN38_REPO_ID.to_owned(),
+                RepoType::Model,
+                QWEN38_ACCEPTED_REVISION.to_owned(),
+            ))
+            .info()
+            .expect("fetch Qwen3.8 repository info");
+        let reference = HfModelReference::parse(QWEN38_REPO_ID, None).unwrap();
+        let (resolved, inventory) =
+            resolve_repository_info(reference, QWEN38_ACCEPTED_REVISION, &info).unwrap();
+        assert_eq!(resolved.revision(), QWEN38_ACCEPTED_REVISION);
+        assert!(inventory.contains("config.json"));
+        assert!(inventory.contains("model.safetensors.index.json"));
+        let exact_repo = api.repo(Repo::with_revision(
+            QWEN38_REPO_ID.to_owned(),
+            RepoType::Model,
+            QWEN38_ACCEPTED_REVISION.to_owned(),
+        ));
+        let config = fetch_expected_file_metadata(&api, &exact_repo, &resolved, "config.json")
+            .expect("authenticate bounded Qwen3.8 config metadata");
+        assert_eq!(config.filename, "config.json");
+        assert!(config.bytes > 0 && config.bytes <= MAX_HF_SMALL_METADATA_BYTES);
     }
 }

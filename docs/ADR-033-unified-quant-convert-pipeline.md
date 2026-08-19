@@ -134,7 +134,7 @@ Gemma 4 26B has 54.83s of canonical Step 1 work (Python doing per-expert `.trans
 
 **Honest reporting**: The previous "3.0× faster" claim was wrong at current HEAD. hf2q's real advantage is **modest on dense+small-MoE (10-30%) and inverts at large-MoE scale**. Investigating the Qwen 3.5 crossover is a real optimization opportunity — tracked as follow-up (no separate ADR yet; not gating §10 AC #2 closure since byte-identical correctness is preserved).
 
-- **Status**: SHIPPED + **§P1 BYTE-IDENTICAL 2026-05-19** (8 quants on Gemma 4, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`; root commit `50fd89c2`) — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest + §Pi Phase A (imatrix corpus loader + accumulator + .imatrix.gguf writer/loader + CLI flags + I-tier APEX wiring via `--imatrix <file>`) all on main. B1 (`--repo` auto-download via `huggingface-cli`) + B4 (`convert-v2` → `convert` rename; no alias per [[feedback-no-backwards-compat-2026-05-18]]) also shipped 2026-05-19. **§P1 quality-equivalence gate: PASS at BYTE-IDENTICAL level vs canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize Q4_K_M` (commit `50fd89c2`).** Per-arch scope: §P1 byte-identical is a per-arch correctness gate; **Gemma 4 26B-A4B-IT: GREEN** (8 quants × 658 tensors = 5,264 verifications, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`); **Qwen 3.5 35B-A3B (multimodal VLM): GREEN BYTE-IDENTICAL** on real-model Q4_K_M (0/21,701,419,520 bytes diff at HEAD `42b346fb`, 2026-05-20 — see "Authoritative real-model byte-cmp" table below). Convert successfully produces GGUFs at multiple quant tiers from operator's `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`, 1,811 safetensors patterns including 785 mtp.* + 26 model.visual.* dropped). Stock `/opt/llama.cpp/build/bin/llama-cli` loads + decodes **coherent English chain-of-thought** across multiple quants and prompts (113-116 tok/s decode).
+- **Status**: SHIPPED + **§P1 BYTE-IDENTICAL 2026-05-19** (8 quants on Gemma 4, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`; root commit `50fd89c2`) — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest + §Pi Phase A (imatrix corpus loader + accumulator + .imatrix.gguf writer/loader + CLI flags + I-tier APEX wiring via `--imatrix <file>`) all on main. B1 originally shipped `--repo` through `huggingface-cli` on 2026-05-19; ADR-045 superseded that transport in 2026-08 with the in-process immutable-reference path described below. B4 (`convert-v2` → `convert`; no alias per [[feedback-no-backwards-compat-2026-05-18]]) also shipped 2026-05-19. **§P1 quality-equivalence gate: PASS at BYTE-IDENTICAL level vs canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize Q4_K_M` (commit `50fd89c2`).** Per-arch scope: §P1 byte-identical is a per-arch correctness gate; **Gemma 4 26B-A4B-IT: GREEN** (8 quants × 658 tensors = 5,264 verifications, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`); **Qwen 3.5 35B-A3B (multimodal VLM): GREEN BYTE-IDENTICAL** on real-model Q4_K_M (0/21,701,419,520 bytes diff at HEAD `42b346fb`, 2026-05-20 — see "Authoritative real-model byte-cmp" table below). Convert successfully produces GGUFs at multiple quant tiers from operator's `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`, 1,811 safetensors patterns including 785 mtp.* + 26 model.visual.* dropped). Stock `/opt/llama.cpp/build/bin/llama-cli` loads + decodes **coherent English chain-of-thought** across multiple quants and prompts (113-116 tok/s decode).
 
 §P1 byte-cmp vs canonical `convert_hf_to_gguf.py | llama-quantize <tier>` (Qwen 3.5 35B-A3B):
 
@@ -890,11 +890,44 @@ After the Gemma 4 mapper rewrite shipped (mlx-native `93383cd`, hf2q `46c54876`)
 
 ### 2026-08-04 — Immutable remote-source gate and atomic conversion receipt
 
-`hf2q convert --repo` remains a Rust conversion path: the only subprocess is the explicitly allowed `hf download` source fetch. It now requires `--revision` to be an exact 40-hex commit before that subprocess can start, stores downloads in a revision-scoped cache, and includes source-format artifacts while excluding pre-quantized GGUF/bin-style artifacts. Quantization, GGUF writing, integrity checks, hashing, and receipt generation remain in-process.
+This boundary was tightened by ADR-045 on 2026-08-19. `hf2q convert`
+accepts a positional canonical model ID/URL; `--repo` is the compatibility
+spelling for the same path. The product process uses only the pinned official
+`https://huggingface.co` endpoint through `hf-hub`; no `hf`,
+`huggingface-cli`, Python, or converter subprocess is reachable. A requested
+branch, tag, or Qwen3.8 default is resolved through repository information to
+an exact 40-hex commit before any selected file transfer. A URL-embedded and
+explicit revision must agree. File-specific `blob`/`resolve` URLs share the
+structural parser but are rejected by repository conversion pending the
+separately recipe-bound external-GGUF path.
 
-Before opening any safetensors payload, the driver resolves the index-required shard set, requires every required weight shard to have a strong HuggingFace LFS SHA-256 identity, and verifies local size plus bytes through `core::integrity::verify_shard`. Missing, mutable, non-LFS, duplicate, unsafe-path, and mismatched inputs fail closed. The verified manifest produces the canonical `SourceShard` bundle hash; remote outputs carry both `hf2q.producer_version` and `hf2q.source_sha256` metadata.
+The repository inventory, paths, small metadata, tokenizer assets, index
+bytes, and index entries are bounded before they can expand authority. hf2q
+fetches immutable metadata before each selected transfer, requires that it
+name the resolved commit, authenticates the bounded index before parsing it,
+rejects duplicate/unknown index structure, and downloads only its exact
+required safetensors set. Weight shards require an LFS SHA-256. Git-managed
+configuration/tokenizer files are verified through canonical Git blob SHA-1,
+closing the prior size-only same-length-substitution gap. Missing, non-LFS
+weight, duplicate, unsafe-path, unrelated/pre-quantized, unsupported-identity,
+and mismatched inputs fail closed. The verified manifest produces the legacy
+LFS `SourceShard` bundle hash; remote outputs carry both
+`hf2q.producer_version` and `hf2q.source_sha256` metadata.
 
-After successful temporary-GGUF finalization and durable sync, hf2q hashes those exact bytes and prepares a schema-v2 `<output>.receipt.json`. The receipt binds repo + exact revision, sorted source file hashes/sizes, converter package/version and a required exact compile-time git SHA, quant selector, output hash/size, DSpark exclusion status/count, and observed peak chunk-buffer bounds. Registry builds obtain the SHA from Cargo's packaged `.cargo_vcs_info.json`; source builds must provide an exact release/CI SHA and otherwise fail closed before writing. The complete GGUF and receipt are then promoted by separate same-directory atomic renames. If receipt promotion fails after GGUF promotion, hf2q removes any stale sidecar and returns an error; the complete GGUF is not provenance-complete until conversion is rerun successfully. The pair is not claimed as a single filesystem transaction.
+After successful temporary-GGUF finalization and durable sync, hf2q hashes
+those exact bytes and prepares a schema-v3 `<output>.receipt.json`. Version 3
+adds the original operator reference, normalized repository ID/type, canonical
+URL, exact immutable revision, and optional file identity to the existing
+sorted source-file sizes/local SHA-256 values, source bundle hash, converter
+package/version and required compile-time git SHA, quant selector, output
+hash/size, DSpark exclusion status/count, and observed peak chunk-buffer
+bounds. Registry builds obtain the SHA from Cargo's packaged
+`.cargo_vcs_info.json`; source builds must provide an exact release/CI SHA and
+otherwise fail closed before writing. The complete GGUF and receipt are then
+promoted by separate same-directory atomic renames. If receipt promotion fails
+after GGUF promotion, hf2q removes any stale sidecar and returns an error; the
+complete GGUF is not provenance-complete until conversion is rerun
+successfully. The pair is not claimed as a single filesystem transaction.
 
 Build-provenance CI RCA (2026-08-19): `.cargo_vcs_info.json` is generated
 inside a packaged crate and is absent from a normal Git checkout. Cargo treats

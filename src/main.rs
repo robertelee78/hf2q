@@ -239,8 +239,9 @@ fn cmd_tokenizer(args: cli::TokenizerArgs) -> Result<(), AppError> {
 /// ADR-033 P4 — drive the convert pipeline.
 ///
 /// Parses `--quant <name>` via `QuantSelector::from_name`, resolves the
-/// HF input directory (positional `<hf_dir>` OR auto-download via
-/// `--repo <hf_repo>`; mutually exclusive — B1), hands the result to
+/// HF input directory (an explicit local path or a positional/`--repo`
+/// canonical Hub reference; mutually exclusive — B1), resolves remote input
+/// natively to one immutable commit, and hands the result to
 /// [`crate::convert::run_convert`], and maps the typed `ConvertError`
 /// onto `AppError::Input` (parse / arch / missing tensor — operator-input
 /// issues) vs `AppError::Conversion` (source read, orchestrator, IO —
@@ -264,49 +265,50 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
     // clap's `conflicts_with` rejects the "both set" case at parse time;
     // we still guard here as defense-in-depth so the typed error variant
     // survives any future plumbing change that bypasses clap.
-    let (hf_dir, mut remote_source) = match (args.hf_dir, args.repo, args.revision) {
-        (Some(_), Some(_), _) => {
-            return Err(AppError::Input(anyhow::anyhow!(
-                "{}",
-                ConvertError::RepoAndDirMutuallyExclusive
-            )));
-        }
-        (Some(_), None, Some(_)) => {
-            return Err(AppError::Input(anyhow::anyhow!(
-                "{}",
-                ConvertError::RevisionRequiresRepo
-            )));
-        }
-        (Some(path), None, None) => (path, None),
-        (None, Some(repo), revision) => {
-            validate_hf_repo_id(&repo).map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
-            let revision = immutable_hf_revision(revision.as_deref())
-                .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
-            let path = download_repo_via_hf_cli(&repo, &revision)
-                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
-            let verified =
-                crate::input::integrity::verify_remote_conversion_source(&repo, &revision, &path)
-                    .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
-            let source = RemoteConversionSource::from_verified(repo, revision, &path, &verified)
-                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+    let input = classify_convert_input(args.hf_dir, args.repo, args.revision.as_deref())
+        .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))?;
+    let (hf_dir, mut remote_source) = match input {
+        ConvertInput::Local(path) => (path, None),
+        ConvertInput::Remote(reference) => {
+            let progress = crate::progress::ProgressReporter::new();
+            let downloaded =
+                crate::input::hf_download::download_model_reference(reference, &progress)
+                    .map_err(|error| AppError::Conversion(anyhow::anyhow!("{error}")))?;
+            let (path, resolved, manifest) = downloaded.into_parts();
+            let verified = crate::input::integrity::verify_conversion_manifest(
+                resolved.repo_id(),
+                resolved.revision(),
+                &path,
+                manifest,
+            )
+            .map_err(|error| AppError::Conversion(anyhow::anyhow!("{error}")))?;
+            let source = RemoteConversionSource::from_verified(resolved, &path, &verified)
+                .map_err(|error| AppError::Conversion(anyhow::anyhow!("{error}")))?;
             (path, Some(source))
-        }
-        (None, None, _) => {
-            return Err(AppError::Input(anyhow::anyhow!(
-                "convert: either positional `<hf_dir>` or `--repo <hf_repo>` is required"
-            )));
         }
     };
 
     if let Some(repo) = source_repo {
-        validate_hf_repo_id(&repo).map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
-        let revision = immutable_hf_revision(source_revision.as_deref())
-            .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
-        let verified =
-            crate::input::integrity::verify_remote_conversion_source(&repo, &revision, &hf_dir)
-                .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
+        let reference =
+            crate::input::hf_reference::HfModelReference::parse(&repo, source_revision.as_deref())
+                .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))?;
+        let revision = reference.requested_revision().ok_or_else(|| {
+            AppError::Input(anyhow::anyhow!(
+                "convert: --source-repo requires an exact immutable --source-revision"
+            ))
+        })?;
+        let resolved = reference
+            .clone()
+            .resolve(revision)
+            .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))?;
+        let verified = crate::input::integrity::verify_remote_conversion_source(
+            resolved.repo_id(),
+            resolved.revision(),
+            &hf_dir,
+        )
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?;
         remote_source = Some(
-            RemoteConversionSource::from_verified(repo, revision, &hf_dir, &verified)
+            RemoteConversionSource::from_verified(resolved, &hf_dir, &verified)
                 .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?,
         );
     }
@@ -337,165 +339,67 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         | ConvertError::ImatrixRequiredForITier { .. }
         | ConvertError::ImatrixNCtxInvalid { .. }
         | ConvertError::RepoAndDirMutuallyExclusive
-        | ConvertError::ImmutableRevisionRequired { .. }
-        | ConvertError::RevisionRequiresRepo
-        | ConvertError::InvalidRepoId { .. } => AppError::Input(anyhow::anyhow!("{e}")),
+        | ConvertError::MissingInput
+        | ConvertError::RevisionRequiresRemote
+        | ConvertError::HfReference(_) => AppError::Input(anyhow::anyhow!("{e}")),
         ConvertError::Source(_)
         | ConvertError::Orchestrator(_)
         | ConvertError::Io(_)
         | ConvertError::Integrity(_)
         | ConvertError::Receipt(_)
         | ConvertError::Vision(_)
-        | ConvertError::HfDownload { .. } => AppError::Conversion(anyhow::anyhow!("{e}")),
+        | ConvertError::HfDownload(_) => AppError::Conversion(anyhow::anyhow!("{e}")),
     })
 }
 
-/// B1 — sanitize an HF repo id for filesystem use.
-///
-/// Replaces every `/` with `__` so `google/gemma-4-26b-a4b-it` becomes
-/// `google__gemma-4-26b-a4b-it`. Other characters pass through.
-/// Centralized as a pure function so the unit test can pin the contract
-/// without invoking the download subprocess.
-fn sanitize_repo_for_cache_dir(repo: &str) -> String {
-    let mut sanitized = String::with_capacity(repo.len() + 4);
-    for c in repo.chars() {
-        match c {
-            '/' => sanitized.push_str("__"),
-            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') => sanitized.push(c),
-            _ => sanitized.push('_'),
+#[derive(Debug)]
+enum ConvertInput {
+    Local(PathBuf),
+    Remote(crate::input::hf_reference::HfModelReference),
+}
+
+fn classify_convert_input(
+    positional: Option<PathBuf>,
+    repo: Option<String>,
+    revision: Option<&str>,
+) -> Result<ConvertInput, crate::convert::ConvertError> {
+    match (positional, repo) {
+        (Some(_), Some(_)) => Err(crate::convert::ConvertError::RepoAndDirMutuallyExclusive),
+        (None, None) => Err(crate::convert::ConvertError::MissingInput),
+        (None, Some(reference)) => Ok(ConvertInput::Remote(
+            crate::input::hf_reference::HfModelReference::parse(&reference, revision)?,
+        )),
+        (Some(path), None) if is_explicit_local_path(&path) => {
+            if revision.is_some() {
+                Err(crate::convert::ConvertError::RevisionRequiresRemote)
+            } else {
+                Ok(ConvertInput::Local(path))
+            }
+        }
+        (Some(path), None) => {
+            let input = path.to_str().ok_or_else(|| {
+                crate::convert::ConvertError::HfReference(
+                    crate::input::hf_reference::HfReferenceError::InvalidRepoId {
+                        repo: path.to_string_lossy().into_owned(),
+                    },
+                )
+            })?;
+            Ok(ConvertInput::Remote(
+                crate::input::hf_reference::HfModelReference::parse(input, revision)?,
+            ))
         }
     }
-    if matches!(sanitized.as_str(), "" | "." | "..") {
-        sanitized.insert(0, '_');
-    }
-    sanitized
 }
 
-fn immutable_hf_revision(revision: Option<&str>) -> Result<String, crate::convert::ConvertError> {
-    let Some(revision) = revision else {
-        return Err(crate::convert::ConvertError::ImmutableRevisionRequired { supplied: None });
-    };
-    if revision.len() != 40 || !revision.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(crate::convert::ConvertError::ImmutableRevisionRequired {
-            supplied: Some(revision.to_string()),
-        });
+fn is_explicit_local_path(path: &std::path::Path) -> bool {
+    if path.exists() || path.is_absolute() {
+        return true;
     }
-    Ok(revision.to_ascii_lowercase())
-}
-
-fn validate_hf_repo_id(repo: &str) -> Result<(), crate::convert::ConvertError> {
-    let valid = !repo.is_empty()
-        && !repo.starts_with('-')
-        && repo.split('/').all(|component| {
-            !component.is_empty()
-                && !matches!(component, "." | "..")
-                && component
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(crate::convert::ConvertError::InvalidRepoId {
-            repo: repo.to_string(),
-        })
-    }
-}
-
-/// Download source artifacts with the explicitly allowed `hf` CLI and
-/// return the revision-scoped cache directory on success.
-///
-/// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/<revision>/`.
-/// The directory is created if missing; existing partial downloads are
-/// resumed by `hf`'s own logic. On non-zero exit, captured stderr is
-/// returned through the typed
-/// `ConvertError::HfDownload` variant.
-fn download_repo_via_hf_cli(
-    repo: &str,
-    revision: &str,
-) -> Result<PathBuf, crate::convert::ConvertError> {
-    use crate::convert::ConvertError;
-
-    // Resolve cache root: ~/.cache/hf2q/repos/<sanitized>/.
-    // `home::home_dir()` is unavailable in std; fall back to $HOME env.
-    let home = std::env::var("HOME").map_err(|_| ConvertError::HfDownload {
-        repo: repo.to_string(),
-        exit_code: None,
-        stderr: "HOME env var not set — cannot resolve ~/.cache/hf2q/repos/".to_string(),
-    })?;
-    let cache_dir = PathBuf::from(home)
-        .join(".cache")
-        .join("hf2q")
-        .join("repos")
-        .join(sanitize_repo_for_cache_dir(repo))
-        .join(revision);
-    std::fs::create_dir_all(&cache_dir).map_err(|e| ConvertError::HfDownload {
-        repo: repo.to_string(),
-        exit_code: None,
-        stderr: format!("failed to create cache dir `{}`: {e}", cache_dir.display()),
-    })?;
-
-    eprintln!(
-        "[hf2q convert --repo] downloading {repo}@{revision} → {} via hf",
-        cache_dir.display()
-    );
-
-    let output = hf_download_command(repo, revision, &cache_dir).output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(ConvertError::HfDownload {
-                repo: repo.to_string(),
-                exit_code: None,
-                stderr: format!(
-                    "failed to spawn `hf`: {e} \
-                     (is the HuggingFace CLI on PATH? `pip install -U huggingface_hub[cli]`)"
-                ),
-            });
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(ConvertError::HfDownload {
-            repo: repo.to_string(),
-            exit_code: output.status.code(),
-            stderr,
-        });
-    }
-
-    Ok(cache_dir)
-}
-
-fn hf_download_command(
-    repo: &str,
-    revision: &str,
-    cache_dir: &std::path::Path,
-) -> std::process::Command {
-    let mut command = std::process::Command::new("hf");
-    command
-        .arg("download")
-        .arg(repo)
-        .arg("--revision")
-        .arg(revision)
-        .arg("--local-dir")
-        .arg(cache_dir);
-    for pattern in ["*.safetensors", "*.json", "tokenizer.model", "README.md"] {
-        command.arg("--include").arg(pattern);
-    }
-    for pattern in [
-        "*.gguf",
-        "*.bin",
-        "*.pt",
-        "*.pth",
-        "*.onnx",
-        "*.h5",
-        "*.msgpack",
-    ] {
-        command.arg("--exclude").arg(pattern);
-    }
-    command
+    let rendered = path.as_os_str().to_string_lossy();
+    matches!(rendered.as_ref(), "." | "..")
+        || rendered.starts_with("./")
+        || rendered.starts_with("../")
+        || rendered.starts_with('~')
 }
 
 fn cmd_gguf_patch(args: cli::GgufPatchArgs) -> Result<(), AppError> {
@@ -620,172 +524,62 @@ fn cmd_completions(args: cli::CompletionsArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// B1 — `/` in the HF repo id is replaced with `__` so the
-    /// resulting string is filesystem-safe. Pins the exact spec from
-    /// the rename/B1 mission.
     #[test]
-    fn sanitize_repo_for_cache_dir_replaces_slash_with_double_underscore() {
-        assert_eq!(
-            sanitize_repo_for_cache_dir("google/gemma-4-26b-a4b-it"),
-            "google__gemma-4-26b-a4b-it"
-        );
-    }
-
-    /// B1 — repo without `/` passes through unchanged (degenerate input
-    /// from a custom local URL alias; we still want it filesystem-safe).
-    #[test]
-    fn sanitize_repo_for_cache_dir_passes_through_when_no_slash() {
-        assert_eq!(sanitize_repo_for_cache_dir("local-only"), "local-only");
-    }
-
-    /// B1 — repo with multiple `/` (uncommon HF nested-org pattern)
-    /// replaces every separator, not just the first.
-    #[test]
-    fn sanitize_repo_for_cache_dir_replaces_every_slash() {
-        assert_eq!(
-            sanitize_repo_for_cache_dir("org/sub/model"),
-            "org__sub__model"
-        );
-    }
-
-    /// B1 — `cmd_convert` rejects "both `<hf_dir>` and `--repo`" with
-    /// the typed `RepoAndDirMutuallyExclusive` variant, mapped to
-    /// `AppError::Input` (exit code 3). clap's `conflicts_with` should
-    /// catch this at parse time; this test pins the defense-in-depth
-    /// path in case clap's rules change.
-    #[test]
-    fn cmd_convert_rejects_repo_and_dir_both_set() {
-        let args = cli::ConvertCliArgs {
-            hf_dir: Some(PathBuf::from("/tmp/example")),
-            repo: Some("org/repo".to_string()),
-            revision: Some("a".repeat(40)),
-            source_repo: None,
-            source_revision: None,
-            quant: "q8_0".to_string(),
-            output: PathBuf::from("/tmp/out.gguf"),
-            dry_run: false,
-            imatrix: None,
-            imatrix_corpus: None,
-            imatrix_out: None,
-            imatrix_n_ctx: None,
-            mmproj: false,
-        };
-        let err = cmd_convert(args).expect_err("must error");
-        match err {
-            AppError::Input(e) => {
-                let s = format!("{e:#}");
-                assert!(
-                    s.contains("mutually exclusive"),
-                    "expected mutually-exclusive diagnostic, got `{s}`"
-                );
-            }
-            other => panic!("expected AppError::Input, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn immutable_revision_accepts_and_normalizes_exact_sha() {
-        let upper = "A".repeat(40);
-        assert_eq!(immutable_hf_revision(Some(&upper)).unwrap(), "a".repeat(40));
-    }
-
-    #[test]
-    fn immutable_revision_rejects_missing_branch_and_short_sha() {
-        assert!(matches!(
-            immutable_hf_revision(None),
-            Err(crate::convert::ConvertError::ImmutableRevisionRequired { supplied: None })
-        ));
-        for mutable in ["main", "v1.0", "deadbeef"] {
-            assert!(matches!(
-                immutable_hf_revision(Some(mutable)),
-                Err(crate::convert::ConvertError::ImmutableRevisionRequired { supplied: Some(_) })
-            ));
-        }
-    }
-
-    #[test]
-    fn cmd_convert_rejects_mutable_remote_revision_before_download() {
-        let args = cli::ConvertCliArgs {
-            hf_dir: None,
-            repo: Some("org/model".into()),
-            revision: Some("main".into()),
-            source_repo: None,
-            source_revision: None,
-            quant: "q8_0".into(),
-            output: PathBuf::from("unused.gguf"),
-            dry_run: false,
-            imatrix: None,
-            imatrix_corpus: None,
-            imatrix_out: None,
-            imatrix_n_ctx: None,
-            mmproj: false,
-        };
-        let err = cmd_convert(args).expect_err("mutable revision must fail before download");
-        assert!(matches!(err, AppError::Input(_)));
-        assert!(err.to_string().contains("40-hex-commit"));
-    }
-
-    #[test]
-    fn cmd_convert_rejects_mutable_local_source_revision_before_hashing() {
-        let args = cli::ConvertCliArgs {
-            hf_dir: Some(PathBuf::from("/tmp/example")),
-            repo: None,
-            revision: None,
-            source_repo: Some("org/model".into()),
-            source_revision: Some("main".into()),
-            quant: "deepseek4-agentic-q2".into(),
-            output: PathBuf::from("unused.gguf"),
-            dry_run: false,
-            imatrix: None,
-            imatrix_corpus: None,
-            imatrix_out: None,
-            imatrix_n_ctx: None,
-            mmproj: false,
-        };
-        let err = cmd_convert(args).expect_err("mutable revision must fail before hashing");
-        assert!(matches!(err, AppError::Input(_)));
-        assert!(err.to_string().contains("40-hex-commit"));
-    }
-
-    #[test]
-    fn cache_slug_cannot_resolve_to_parent_component() {
-        assert_eq!(sanitize_repo_for_cache_dir(".."), "_..");
-        assert_eq!(
-            sanitize_repo_for_cache_dir("org/../../model"),
-            "org__..__..__model"
-        );
-    }
-
-    #[test]
-    fn repo_validation_blocks_option_and_path_injection() {
-        for invalid in ["", "--help", "../model", "org//model", "org/model?"] {
+    fn convert_source_classifier_preserves_explicit_local_paths() {
+        for local in ["/tmp/example", "./models/example", "../models/example"] {
+            let classified =
+                classify_convert_input(Some(PathBuf::from(local)), None, None).unwrap();
             assert!(
-                validate_hf_repo_id(invalid).is_err(),
-                "accepted {invalid:?}"
+                matches!(classified, ConvertInput::Local(path) if path == PathBuf::from(local))
             );
         }
-        validate_hf_repo_id("deepseek-ai/DeepSeek-V4").unwrap();
+        assert!(matches!(
+            classify_convert_input(Some(PathBuf::from("./models/example")), None, Some("main")),
+            Err(crate::convert::ConvertError::RevisionRequiresRemote)
+        ));
     }
 
     #[test]
-    fn hf_download_command_repeats_source_include_and_quant_exclude_flags() {
-        let command = hf_download_command(
-            "org/model",
-            &"a".repeat(40),
-            std::path::Path::new("/tmp/hf2q-fixture"),
-        );
-        assert_eq!(command.get_program(), "hf");
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args.iter().filter(|arg| *arg == "--include").count(), 4);
-        assert_eq!(args.iter().filter(|arg| *arg == "--exclude").count(), 7);
-        assert!(args
-            .windows(2)
-            .any(|pair| pair[0] == "--revision" && pair[1] == "a".repeat(40)));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair[0] == "--exclude" && pair[1] == "*.gguf"));
+    fn convert_source_classifier_accepts_positional_repo_and_url() {
+        for remote in [
+            "Qwen/Qwen3.8-27B",
+            "https://huggingface.co/Qwen/Qwen3.8-27B/tree/main",
+        ] {
+            let classified =
+                classify_convert_input(Some(PathBuf::from(remote)), None, None).unwrap();
+            let ConvertInput::Remote(reference) = classified else {
+                panic!("expected remote reference");
+            };
+            assert_eq!(reference.repo_id(), "Qwen/Qwen3.8-27B");
+        }
+    }
+
+    #[test]
+    fn convert_source_classifier_reconciles_revision_and_rejects_ambiguity() {
+        let classified = classify_convert_input(
+            Some(PathBuf::from(
+                "https://huggingface.co/Qwen/Qwen3.8-27B/tree/main",
+            )),
+            None,
+            Some("main"),
+        )
+        .unwrap();
+        assert!(matches!(classified, ConvertInput::Remote(_)));
+        assert!(classify_convert_input(
+            Some(PathBuf::from(
+                "https://huggingface.co/Qwen/Qwen3.8-27B/tree/main",
+            )),
+            None,
+            Some("other"),
+        )
+        .is_err());
+        assert!(matches!(
+            classify_convert_input(
+                Some(PathBuf::from("Qwen/Qwen3.8-27B")),
+                Some("Qwen/Qwen3.8-27B".to_owned()),
+                None,
+            ),
+            Err(crate::convert::ConvertError::RepoAndDirMutuallyExclusive)
+        ));
     }
 }

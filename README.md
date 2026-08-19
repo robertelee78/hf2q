@@ -149,11 +149,14 @@ Reserved names surface as typed errors with actionable hints:
 
 ## Quick start: convert + serve a model
 
-The `hf2q convert` pipeline reads a HuggingFace model directory
-(config.json + safetensors + tokenizer.json) and emits a single GGUF
-that loads in stock `llama.cpp` and in `hf2q serve`. The source can
-be a path that already exists on disk OR a `--repo <hf_repo>` that
-the driver auto-downloads via `huggingface-cli`.
+The `hf2q convert` pipeline reads a Hugging Face model directory
+(`config.json` + safetensors + tokenizer assets) and emits a single GGUF
+that loads in stock `llama.cpp` and in `hf2q serve`. The source can be an
+explicit local path or a canonical Hub repository ID/URL. Remote conversion
+uses hf2q's in-process `hf-hub` client, resolves a branch or tag to one exact
+commit before transferring files, verifies the exact index-selected source
+inventory, and writes a schema-v3 conversion receipt. It never invokes Python,
+`hf`, or `huggingface-cli`.
 
 At serve time, Qwen3.5/Qwen3.6 reads its tokenizer and chat template from
 the GGUF metadata; a sibling `tokenizer.json` is not required. Vision uses a
@@ -171,31 +174,32 @@ declaration because its generic OpenAI-compatible provider does not infer
 custom model capabilities from `/v1/models`.
 
 ```bash
-# 1. Pre-download the HF source explicitly:
-huggingface-cli download google/gemma-4-26b-a4b-it \
-  --local-dir ./models/google-gemma-4-26b-a4b-it
-
-# 2. Convert to Q5_K_M. Streaming convert keeps peak memory ~5 GB
+# 1. Resolve, download, verify, and convert the official Hub source to
+# Q5_K_M. Streaming convert keeps peak memory ~5 GB
 #    even on a 48 GB-source 26 B-param model. ~8-15 min on M-series.
-hf2q convert ./models/google-gemma-4-26b-a4b-it \
+hf2q convert google/gemma-4-26b-a4b-it \
   --quant q5_k_m \
   -o ./out/gemma4-26b-q5_k_m.gguf
 
-# Alternative: --repo auto-downloads via huggingface-cli into
-# ~/.cache/hf2q/repos/google__gemma-4-26b-a4b-it/ and then converts.
-# Mutually exclusive with the positional path form above.
+# `--repo` is retained as a compatibility spelling for the same native path.
 hf2q convert --repo google/gemma-4-26b-a4b-it \
   --quant q5_k_m \
   -o ./out/gemma4-26b-q5_k_m.gguf
 
-# 3a. Test load with stock llama.cpp (single-shot generation):
+# To convert an existing local checkout, use an existing path or make the
+# local intent explicit with ./, ../, or an absolute path.
+hf2q convert ./models/google-gemma-4-26b-a4b-it \
+  --quant q5_k_m \
+  -o ./out/gemma4-26b-q5_k_m.gguf
+
+# 2a. Test load with stock llama.cpp (single-shot generation):
 llama-cli -m ./out/gemma4-26b-q5_k_m.gguf \
   -p "What is the capital of France?" -n 64 --temp 0 --seed 42
 
-# 3b. Serve with hf2q's OpenAI-compatible HTTP API:
+# 2b. Serve with hf2q's OpenAI-compatible HTTP API:
 hf2q serve --model ./out/gemma4-26b-q5_k_m.gguf --port 8080
 
-# 4. Use it (OpenAI SDK works out of the box)
+# 3. Use it (OpenAI SDK works out of the box)
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gemma4","messages":[{"role":"user","content":"hello"}]}'
@@ -268,7 +272,7 @@ Create the Qwen3.8 artifact natively from its immutable source revision before
 using that launcher:
 
 ```bash
-hf2q convert --repo Qwen/Qwen3.8-27B \
+hf2q convert Qwen/Qwen3.8-27B \
   --revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
   --quant q4_k_m \
   --output /opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf

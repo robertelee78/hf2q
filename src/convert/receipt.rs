@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::convert::orchestrator::TensorChunkStats;
 use crate::core::provenance::source_shard::{compute_source_bundle_sha256, SourceShard};
 use crate::core::sha256::compute_file_sha256;
+use crate::input::hf_reference::ResolvedHfModelReference;
 use crate::input::integrity::VerifiedSourceManifest;
 
-pub const CONVERSION_RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const CONVERSION_RECEIPT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
@@ -28,6 +29,7 @@ pub enum ReceiptError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SourceFileReceipt {
     pub path: String,
     pub size: u64,
@@ -39,16 +41,22 @@ pub struct SourceFileReceipt {
 /// Remote source identity passed into conversion only after verification.
 #[derive(Debug, Clone)]
 pub struct RemoteConversionSource {
-    pub(crate) repo: String,
-    pub(crate) revision: String,
-    pub(crate) source_sha256: String,
-    pub(crate) files: Vec<SourceFileReceipt>,
+    reference: ResolvedHfModelReference,
+    source_sha256: String,
+    files: Vec<SourceFileReceipt>,
 }
 
 impl RemoteConversionSource {
+    pub fn reference(&self) -> &ResolvedHfModelReference {
+        &self.reference
+    }
+
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
     pub fn from_verified(
-        repo: String,
-        revision: String,
+        reference: ResolvedHfModelReference,
         local_dir: &Path,
         verified: &VerifiedSourceManifest,
     ) -> Result<Self, ReceiptError> {
@@ -74,15 +82,24 @@ impl RemoteConversionSource {
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Self {
-            repo,
-            revision,
+            reference,
             source_sha256,
             files,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(reference: ResolvedHfModelReference, source_sha256: String) -> Self {
+        Self {
+            reference,
+            source_sha256,
+            files: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PeakChunkBoundReceipt {
     pub strategy: String,
     pub scope: String,
@@ -122,6 +139,7 @@ impl PeakChunkBoundReceipt {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConversionReceipt {
     pub schema_version: u32,
     pub source: SourceReceipt,
@@ -133,14 +151,21 @@ pub struct ConversionReceipt {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SourceReceipt {
-    pub repo: String,
+    pub original_reference: String,
+    pub repository_id: String,
+    pub repository_type: String,
+    pub canonical_url: String,
     pub revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
     pub bundle_sha256: String,
     pub files: Vec<SourceFileReceipt>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConverterReceipt {
     pub package: String,
     pub version: String,
@@ -148,6 +173,7 @@ pub struct ConverterReceipt {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OutputReceipt {
     pub path: String,
     pub size: u64,
@@ -155,6 +181,7 @@ pub struct OutputReceipt {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExcludedDsparkReceipt {
     pub tensor_count: usize,
     pub status: String,
@@ -203,8 +230,12 @@ pub fn prepare_success_receipt(
     let receipt = ConversionReceipt {
         schema_version: CONVERSION_RECEIPT_SCHEMA_VERSION,
         source: SourceReceipt {
-            repo: remote.repo.clone(),
-            revision: remote.revision.clone(),
+            original_reference: remote.reference.original().to_owned(),
+            repository_id: remote.reference.repo_id().to_owned(),
+            repository_type: remote.reference.repository_type().as_str().to_owned(),
+            canonical_url: remote.reference.canonical_url().to_owned(),
+            revision: remote.reference.revision().to_owned(),
+            filename: remote.reference.filename().map(str::to_owned),
             bundle_sha256: remote.source_sha256.clone(),
             files: remote.files.clone(),
         },
@@ -270,9 +301,15 @@ mod tests {
     use super::*;
 
     fn remote() -> RemoteConversionSource {
+        let reference = crate::input::hf_reference::HfModelReference::parse(
+            "https://huggingface.co/org/model/tree/main",
+            Some("main"),
+        )
+        .unwrap()
+        .resolve(&"a".repeat(40))
+        .unwrap();
         RemoteConversionSource {
-            repo: "org/model".into(),
-            revision: "a".repeat(40),
+            reference,
             source_sha256: "b".repeat(64),
             files: vec![SourceFileReceipt {
                 path: "model.safetensors".into(),
@@ -289,6 +326,9 @@ mod tests {
         fs::write(dir.path().join("config.json"), b"{}").unwrap();
         fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
         let weight_sha = compute_file_sha256(&dir.path().join("model.safetensors")).unwrap();
+        let config_git_sha =
+            crate::core::integrity::compute_git_blob_sha1(&dir.path().join("config.json"), 2)
+                .unwrap();
         let verified = crate::input::integrity::verify_conversion_manifest(
             "org/model",
             &"a".repeat(40),
@@ -305,15 +345,17 @@ mod tests {
                     filename: "config.json".into(),
                     bytes: 2,
                     sha256: None,
-                    hf_etag: "git-etag".into(),
+                    hf_etag: config_git_sha,
                     is_lfs: false,
                 },
             ],
         )
         .unwrap();
         let source = RemoteConversionSource::from_verified(
-            "org/model".into(),
-            "a".repeat(40),
+            crate::input::hf_reference::HfModelReference::parse("org/model", None)
+                .unwrap()
+                .resolve(&"a".repeat(40))
+                .unwrap(),
             dir.path(),
             &verified,
         )
@@ -367,6 +409,17 @@ mod tests {
         assert_eq!(parsed.output.sha256, compute_file_sha256(&output).unwrap());
         assert_eq!(parsed.excluded_dspark.tensor_count, 3);
         assert_eq!(parsed.source.revision, "a".repeat(40));
+        assert_eq!(
+            parsed.source.original_reference,
+            "https://huggingface.co/org/model/tree/main"
+        );
+        assert_eq!(parsed.source.repository_id, "org/model");
+        assert_eq!(parsed.source.repository_type, "model");
+        assert_eq!(
+            parsed.source.canonical_url,
+            "https://huggingface.co/org/model"
+        );
+        assert_eq!(parsed.source.filename, None);
         assert_eq!(parsed.converter.git_commit, "d".repeat(40));
         assert_eq!(parsed.peak_chunk_bound.max_working_vec_bytes, 80);
     }
@@ -391,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_schema_rejects_a_missing_converter_commit() {
+    fn receipt_schema_v3_rejects_v2_identity_and_unknown_fields() {
         let mut value = serde_json::json!({
             "schema_version": CONVERSION_RECEIPT_SCHEMA_VERSION,
             "source": {
@@ -407,6 +460,42 @@ mod tests {
             "peak_chunk_bound": PeakChunkBoundReceipt::default()
         });
         assert!(serde_json::from_value::<ConversionReceipt>(value.take()).is_err());
+
+        let mut valid = serde_json::to_value(ConversionReceipt {
+            schema_version: CONVERSION_RECEIPT_SCHEMA_VERSION,
+            source: SourceReceipt {
+                original_reference: "org/model".into(),
+                repository_id: "org/model".into(),
+                repository_type: "model".into(),
+                canonical_url: "https://huggingface.co/org/model".into(),
+                revision: "a".repeat(40),
+                filename: None,
+                bundle_sha256: "b".repeat(64),
+                files: vec![],
+            },
+            converter: ConverterReceipt {
+                package: "hf2q".into(),
+                version: "0.1.0".into(),
+                git_commit: "c".repeat(40),
+            },
+            quant_selector: "q4_k_m".into(),
+            output: OutputReceipt {
+                path: "model.gguf".into(),
+                size: 1,
+                sha256: "d".repeat(64),
+            },
+            excluded_dspark: ExcludedDsparkReceipt {
+                tensor_count: 0,
+                status: "none_detected".into(),
+            },
+            peak_chunk_bound: PeakChunkBoundReceipt::default(),
+        })
+        .unwrap();
+        valid
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<ConversionReceipt>(valid).is_err());
     }
 
     #[test]

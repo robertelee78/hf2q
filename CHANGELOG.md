@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Accept canonical Hugging Face model IDs and official model/tree/blob/resolve
+  URLs at `hf2q convert`, resolving mutable names to an exact commit before
+  transfer and recording the normalized identity in conversion receipt v3.
+
+### Changed
+
+- Replace the external Hugging Face CLI conversion download path with the
+  in-process `hf-hub` client. The downloader authenticates bounded metadata
+  before transfer, consumes only index-selected safetensors, verifies LFS
+  SHA-256 and Git blob SHA-1 identities, and records every selected local
+  SHA-256 without granting authority to unrelated cache files.
+
 ## [0.1.7] — 2026-08-18
 
 ### Added

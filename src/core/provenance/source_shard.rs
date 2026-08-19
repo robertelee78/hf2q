@@ -148,7 +148,8 @@ mod tests {
 
     #[test]
     fn bundle_sha_returns_none_when_all_shards_lack_sha() {
-        // Non-LFS files (config.json, tokenizer.json) carry no sha256.
+        // Non-LFS files are verified through their Git blob SHA-1, but this
+        // legacy bundle field contains only LFS content SHA-256 values.
         let shards = vec![shard("config.json", None), shard("tokenizer.json", None)];
         assert!(compute_source_bundle_sha256(&shards).is_none());
     }
@@ -172,7 +173,8 @@ mod tests {
 
     #[test]
     fn bundle_sha_skips_shards_without_sha_but_includes_others() {
-        // Non-LFS files in the same list don't perturb the bundle hash —
+        // Non-LFS files in the same list don't perturb this legacy LFS bundle
+        // hash (the conversion receipt separately binds every local SHA-256).
         // a hf2q-emitted GGUF and the cache compute the SAME hash even
         // though the shard list passed in may include both kinds.
         let s = vec![

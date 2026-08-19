@@ -10,8 +10,14 @@
 
 pub mod config_parser;
 pub mod hf_download;
+pub mod hf_reference;
 pub mod integrity;
 pub mod safetensors;
+
+#[cfg(test)]
+mod hf_download_plan_tests;
+#[cfg(test)]
+mod hf_reference_tests;
 
 use std::path::Path;
 
