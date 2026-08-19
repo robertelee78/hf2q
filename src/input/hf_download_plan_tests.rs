@@ -141,6 +141,17 @@ fn indexed_plan_is_strict_deterministic_and_downloads_only_required_shards() {
 }
 
 #[test]
+fn model_card_is_selected_when_present_for_recipe_and_license_provenance() {
+    let inventory =
+        validate_repo_inventory(["README.md", "config.json", "model.safetensors"].into_iter())
+            .unwrap();
+    assert_eq!(
+        initial_download_files(&inventory).unwrap(),
+        ["config.json", "README.md"]
+    );
+}
+
+#[test]
 fn malformed_or_missing_index_shards_never_fall_back_to_all_weights() {
     let inventory = validate_repo_inventory(
         [

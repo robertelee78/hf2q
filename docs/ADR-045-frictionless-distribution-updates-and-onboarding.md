@@ -18,7 +18,8 @@
   durable commit coordinator are reconciled;
   canonical Hugging Face model-reference parsing, immutable native Hub
   resolution, bounded index-selected source transfer, Git/LFS byte
-  verification, and conversion receipt v3 are also reconciled;
+  verification, conversion receipt v3, and the closed checked-in Qwen3.8
+  source/artifact/hardware/disk recipe are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -43,8 +44,9 @@ workflow:
   end-user Apple Silicon bundle;
 - the CLI has no self-update or first-run setup command;
 - remote conversion now has a native immutable-reference/download boundary,
-  but does not yet own the complete no-options recipe, device-aware selection,
-  paired text/projector preparation, retention, and calibration transaction;
+  and a checked-in exact Qwen3.8 preparation recipe, but does not yet compose
+  those boundaries into the complete no-options paired text/projector
+  preparation, retention, registration, and calibration transaction;
 - the canonical `scripts/serve_*_opencode.sh` launchers assume paths under
   `/opt/hf2q`, so copying them out of the checkout is not sufficient; and
 - OpenCode and Agentic Kit setup is scattered outside one tested guide.
@@ -165,7 +167,10 @@ state from PATH aliases or filenames:
   `blob`, and `resolve` URLs share one parser and canonical identity.
 - **Model recipe**: a checked-in supported recipe binding the canonical model
   reference, accepted source files, text/projector outputs, independently
-  accepted quantization candidates, disk preflight, and acceptance status.
+  accepted quantization candidates, exact proven hardware profile, disk
+  preflight, source-retention policy, and acceptance status. Recipe bytes are
+  embedded policy, not caller, cache, or network input; parsing them alone
+  grants no conversion, serving, installation, or activation authority.
 - **Prepared model**: hf2q-produced local artifacts plus a conversion receipt
   binding source revision and hashes, converter identity, recipe, output
   digests, and exact text/projector relationship.
@@ -1581,10 +1586,50 @@ hf2q convert Qwen/Qwen3.8-27B
 
 That no-options command remains the target contract, not a claim about the
 current CLI. The landed immutable-source slice still requires explicit
-`--quant` and `--output`; it does not guess either. The next preparation slice
-must add the checked-in Qwen3.8 recipe, exact device/disk decision table,
-source-matched text/projector outputs, retention transaction, prepared profile,
-and bounded runtime calibration before removing those requirements.
+`--quant` and `--output`; it does not guess either. The checked-in recipe now
+provides the exact source/artifact/hardware/disk decision input, but the next
+preparation slice must consume that sealed evidence in one source-matched
+text/projector conversion, retention, registration, prepared-profile, and
+bounded-runtime-calibration transaction before removing those requirements.
+
+**Landed recipe boundary (2026-08-19).**
+`data/model-recipes/qwen38-27b-official-v1.json` is a canonical compact JSON
+document plus one LF, capped at 64 KiB and embedded into the binary. Its exact
+SHA-256 is
+`47a4cec7eb3b19ad68727f557ff47e83f1ef88c791734a76b5bd052d921c9d9d`.
+The v1 parser denies unknown, duplicate, trailing, over-depth, noncanonical,
+and over-cap input. It admits only the official `Qwen/Qwen3.8-27B` model at
+immutable revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, with 29 sorted
+basename-only source records. Each record binds exact bytes, SHA-256, Hub
+ETag, and—where applicable—the identical LFS SHA-256. The LFS inventory also
+derives the exact source-bundle digest rather than trusting a repeated total.
+
+The recipe admits exactly the ADR-044 accepted pair:
+
+- `Qwen3.8-27B-Q4_K_M.gguf`, 16,810,714,752 bytes, SHA-256
+  `0fa8acc661d0edc60276c43705619fd848682dbf768ced9fe46cd8a572b8043d`;
+- `Qwen3.8-27B-mmproj-F16.gguf`, 927,606,848 bytes, SHA-256
+  `6fa039b75244c0a28a013da30b92b1d221c61029acc19f9efa882b75a495b0d0`.
+
+Automatic selection is deliberately closed to the one independently proven
+profile: `aarch64-apple-darwin`, exact chip model `Apple M5 Max`, at least
+128 GiB unified memory, Q4_K_M text plus F16 projector, with runtime
+calibration still required. Other hardware fails before preparation; this
+slice does not extrapolate an unmeasured profile. The disk floor is derived
+from 55,586,101,511 source bytes, 17,738,321,600 output bytes, and an explicit
+8 GiB reserve: 81,914,357,703 free bytes. Below that exact floor fails before
+large work. Interactive retention defaults to keep; noninteractive deletion
+requires a future explicit choice and is limited to recipe-owned source.
+
+`VerifiedRecipeSource` is minted only when the complete immutable Hub manifest
+matches the recipe and Git-managed support files also hash locally. A separate
+sealed artifact proof requires exact size and SHA-256. Neither proof can be
+cloned or used as serving/install authority, and the two roles cannot be
+cross-bound. Live metadata proof covers all 29 official files at the exact
+revision; the opt-in local gate rehashes the already accepted 17.7 GB output
+pair. The no-options coordinator, conversion invocation, source-retention
+mutation, prepared-model registry, and calibration receipt remain pending and
+must consume these proofs rather than reconstructing policy from strings.
 
 It executes an hf2q-only resumable plan:
 
@@ -1905,11 +1950,14 @@ before public self-update ships.
    floor replay, exact restart discard, and no target or artifact authority.
    Canonical Hugging Face reference grammar, immutable native resolution,
    bounded exact source selection, Git/LFS verification, and conversion
-   receipt v3 have now landed. Next, embed the real stable root, compile the
-   real public Team ID, pass the protected positive signing fixture, and add
-   the checked-in Qwen3.8 preparation recipe, device-aware text/projector
-   profile, source retention, prepared/external artifact provenance,
-   calibration receipt, and session policy. Every schema lands with bounded hostile input and
+   receipt v3 have now landed. The closed checked-in Qwen3.8 recipe now binds
+   its immutable 29-file source, exact accepted text/projector pair, sole
+   proven M5 Max 128 GiB selection profile, derived disk floor, and retention
+   decision boundary. Next, embed the real stable root, compile the real
+   public Team ID, pass the protected positive signing fixture, and compose
+   that recipe into the no-options paired conversion, source-retention
+   transaction, prepared/external artifact provenance, calibration receipt,
+   and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate

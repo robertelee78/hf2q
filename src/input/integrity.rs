@@ -55,6 +55,11 @@ impl VerifiedSourceManifest {
     pub fn records(&self) -> &[ShardIntegrity] {
         &self.records
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(records: Vec<ShardIntegrity>) -> Self {
+        Self { records }
+    }
 }
 
 fn validate_relative_source_path(filename: &str) -> Result<(), IntegrityError> {

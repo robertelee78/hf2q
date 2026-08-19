@@ -319,6 +319,15 @@ jobs:
               <<<"$unexpected_hf_external_authority" || true
           )"
           test -z "$unexpected_hf_external_authority"
+          unexpected_recipe_external_authority="$(
+            grep -RInE --include='*.rs' \
+              'hf_hub|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
+              src/input/model_recipe.rs src/input/model_recipe || true
+          )"
+          test -z "$unexpected_recipe_external_authority"
+          recipe=data/model-recipes/qwen38-27b-official-v1.json
+          test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
+            47a4cec7eb3b19ad68727f557ff47e83f1ef88c791734a76b5bd052d921c9d9d
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -410,6 +419,11 @@ jobs:
             src/input/hf_download.rs \
             src/input/hf_download_plan_tests.rs \
             src/input/integrity.rs \
+            src/input/model_recipe.rs \
+            src/input/model_recipe/validation.rs \
+            src/input/model_recipe/verification.rs \
+            src/input/model_recipe_tests.rs \
+            data/model-recipes/qwen38-27b-official-v1.json \
             src/main.rs \
             src/cli.rs \
             src/core/integrity.rs \
@@ -449,6 +463,8 @@ jobs:
             input::hf_reference_tests::equivalent_model_references_share_one_canonical_identity \
             input::hf_download_plan_tests::immutable_file_metadata_is_checked_before_transfer \
             input::hf_download_plan_tests::metadata_transfer_caps_are_explicit_and_exact \
+            input::model_recipe_tests::embedded_recipe_is_exact_canonical_and_binds_accepted_outputs \
+            input::model_recipe_tests::semantic_cross_bindings_fail_closed \
             input::integrity::tests::safetensors_index_entry_cap_is_exact \
             convert::receipt::tests::prepared_success_receipt_binds_output_and_replaces_stale_atomically \
             tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity
@@ -457,6 +473,7 @@ jobs:
           done
           cargo test --locked --bin hf2q --all-features input::hf_reference_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download_plan_tests::
+          cargo test --locked --bin hf2q --all-features input::model_recipe_tests::
           cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features convert::receipt::tests::
           cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
