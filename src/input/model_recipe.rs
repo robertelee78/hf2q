@@ -7,6 +7,8 @@
 //! floor used by ADR-045's future no-options preparation coordinator. The
 //! sibling preparation boundary additionally seals accepted host/disk facts
 //! and both canonical conversion receipts into one inert text/projector pair.
+//! The plan boundary derives the canonical no-options layout while retaining
+//! the host proof, but deliberately cannot mutate that layout.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,10 +16,14 @@ use thiserror::Error;
 
 use crate::input::hf_reference::HfModelReference;
 
+mod plan;
 mod preparation;
 mod validation;
 mod verification;
 
+pub use plan::{
+    plan_current_model_preparation, ModelPreparationPlan, MAX_MODEL_PREPARATION_PATH_BYTES,
+};
 pub use preparation::{
     ModelPreparationError, ModelPreparationReceiptV1, VerifiedModelPreparation,
     VerifiedRecipeConversion, VerifiedRecipeHost, MAX_MODEL_PREPARATION_RECEIPT_BYTES,

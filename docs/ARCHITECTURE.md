@@ -657,8 +657,10 @@ harness leans on three patterns:
    verifies exact immutable Hub source and accepted artifact bytes, seals the
    proven host/memory/free-space selection from fixed in-process macOS sysctl
    reads plus the selected target filesystem (never caller facts or a
-   subprocess), and consumes two bounded canonical
-   conversion receipts into one inert text/projector preparation proof. Its
+   subprocess), derives one bounded canonical no-options
+   source/artifact/receipt/profile layout without mutating it, and consumes two
+   bounded canonical conversion receipts into one inert text/projector
+   preparation proof. Its
    compact v1 receipt binds the recipe, source, hardware profile, converter,
    both artifacts, and both receipt digests while remaining explicitly
    calibration-pending. Parsing it cannot mint the non-cloneable proof, and it
