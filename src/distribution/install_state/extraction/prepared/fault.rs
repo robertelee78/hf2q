@@ -54,6 +54,24 @@ pub(in crate::distribution) fn set_prepared_precommit_hook(hook: impl FnOnce() +
 }
 
 #[cfg(test)]
+pub(in crate::distribution) fn run_prepared_crash_worker(
+    worker: &str,
+    root: &std::path::Path,
+    barrier: usize,
+) -> std::process::ExitStatus {
+    std::process::Command::new(std::env::current_exe().expect("prepared crash test executable"))
+        .arg("--exact")
+        .arg(worker)
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env("HF2Q_PREPARED_CRASH_ROOT", root)
+        .env("HF2Q_PREPARED_CRASH_BARRIER", barrier.to_string())
+        .env("RUST_BACKTRACE", "0")
+        .status()
+        .expect("spawn prepared crash worker")
+}
+
+#[cfg(test)]
 pub(super) fn prepared_precommit_hook() {
     PREPARED_PRECOMMIT_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {

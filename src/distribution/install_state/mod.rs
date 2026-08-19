@@ -42,7 +42,7 @@ pub(in crate::distribution) use artifact::{
 #[cfg(test)]
 pub(in crate::distribution) use extraction::{
     abort_after_prepared_barrier, fail_after_prepared_barrier, observed_prepared_barriers,
-    reset_observed_prepared_barriers, set_prepared_precommit_hook,
+    reset_observed_prepared_barriers, run_prepared_crash_worker, set_prepared_precommit_hook,
 };
 pub(in crate::distribution) use extraction::{
     ExecutableReleaseBinding, ExtractedReleaseTree, ExtractionError,

@@ -153,18 +153,8 @@ fn process_abort_at_every_prepared_barrier_is_fresh_process_recoverable() {
         let anchor = leaked_anchor(&fixture.repository.anchor);
         commit_fixture(&authorization, &anchor, &fixture.repository);
 
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("prepared crash test executable"),
-        )
-        .arg("--exact")
-        .arg(WORKER)
-        .arg("--nocapture")
-        .arg("--test-threads=1")
-        .env("HF2Q_PREPARED_CRASH_ROOT", &root)
-        .env("HF2Q_PREPARED_CRASH_BARRIER", barrier.to_string())
-        .env("RUST_BACKTRACE", "0")
-        .status()
-        .expect("spawn prepared crash worker");
+        let status =
+            crate::distribution::install_state::run_prepared_crash_worker(WORKER, &root, barrier);
         assert_eq!(
             status.signal(),
             Some(libc::SIGABRT),
