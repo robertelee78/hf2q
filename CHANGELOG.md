@@ -19,12 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Pin published `mlx-native 0.10.10` and add its register-resident,
+- Pin published `mlx-native 0.10.12` and use the register-resident,
   bit-exact GQA-cooperative Q2 TQ-HB attention path behind a measured
   context-length selector. Publication
   requires an exact-source, thermally guarded OFF/AUTO ABBA receipt with at
   least 15% end-to-end improvement near 105K tokens, identical greedy output,
-  and no short-context route regression.
+  and no short-context route regression. The final dependency also bounds
+  D512 prefill reads at a partial logical KV tail without changing aligned
+  kernel performance.
 - Bound Qwen's fresh-turn and tool-continuation reasoning budgets, expose the
   effective thinking phase and answer progress in the operator dashboard, and
   warn on repeated tool-result signatures without blocking legitimate retries.
