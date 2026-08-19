@@ -51,12 +51,11 @@ use tracing::{debug, info};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
+use crate::input::model_recipe::{QWEN38_ACCEPTED_REVISION, QWEN38_REPOSITORY_ID};
 use crate::progress::ProgressReporter;
 
 const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";
 const DEFAULT_HF_REVISION: &str = "main";
-const QWEN38_REPO_ID: &str = "Qwen/Qwen3.8-27B";
-const QWEN38_ACCEPTED_REVISION: &str = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0";
 pub(super) const MAX_HF_REPO_FILES: usize = 4096;
 pub(super) const MAX_HF_SMALL_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_HF_TOKENIZER_BYTES: u64 = 512 * 1024 * 1024;
@@ -192,6 +191,7 @@ const REQUIRED_FILES: &[&str] = &["config.json"];
 
 /// Files we want to download if present (non-fatal if missing).
 const OPTIONAL_FILES: &[&str] = &[
+    "README.md",
     "chat_template.jinja",
     "tokenizer.json",
     "tokenizer_config.json",
@@ -563,7 +563,7 @@ pub(super) fn metadata_size_cap(filename: &str) -> Option<u64> {
 }
 
 pub(super) fn default_revision_for(repo_id: &str) -> &'static str {
-    if repo_id == QWEN38_REPO_ID {
+    if repo_id == QWEN38_REPOSITORY_ID {
         QWEN38_ACCEPTED_REVISION
     } else {
         DEFAULT_HF_REVISION
@@ -1221,20 +1221,20 @@ mod tests {
             .expect("build exact-origin Hub client");
         let info = api
             .repo(Repo::with_revision(
-                QWEN38_REPO_ID.to_owned(),
+                QWEN38_REPOSITORY_ID.to_owned(),
                 RepoType::Model,
                 QWEN38_ACCEPTED_REVISION.to_owned(),
             ))
             .info()
             .expect("fetch Qwen3.8 repository info");
-        let reference = HfModelReference::parse(QWEN38_REPO_ID, None).unwrap();
+        let reference = HfModelReference::parse(QWEN38_REPOSITORY_ID, None).unwrap();
         let (resolved, inventory) =
             resolve_repository_info(reference, QWEN38_ACCEPTED_REVISION, &info).unwrap();
         assert_eq!(resolved.revision(), QWEN38_ACCEPTED_REVISION);
         assert!(inventory.contains("config.json"));
         assert!(inventory.contains("model.safetensors.index.json"));
         let exact_repo = api.repo(Repo::with_revision(
-            QWEN38_REPO_ID.to_owned(),
+            QWEN38_REPOSITORY_ID.to_owned(),
             RepoType::Model,
             QWEN38_ACCEPTED_REVISION.to_owned(),
         ));

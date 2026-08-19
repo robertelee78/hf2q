@@ -101,7 +101,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── safetensors.rs   streaming mmap shard reader → TensorMap
 │   ├── hf_reference.rs  bounded canonical Hub ID/URL + immutable identity
 │   ├── hf_download.rs   exact-revision native Hub source-plan/download
-│   └── integrity.rs     bounded index + LFS/Git byte verification
+│   ├── integrity.rs     bounded index + LFS/Git byte verification
+│   ├── model_recipe.rs  embedded closed recipe schema + policy lookup
+│   └── model_recipe/    recipe validation + sealed source/artifact proofs
 │
 ├── src/ir/              internal representation crossing modules
 │   ├── mod.rs           ModelMetadata, TensorMap, DType, QuantizedTensor, …
@@ -215,7 +217,8 @@ CLI surface (via `assert_cmd`) or to that narrow lib facade.
                                        │
                   ┌────────────────────┴────────────────────┐
                   │ src/input/ parse identity, resolve exact │
-                  │ commit, select/authenticate bytes, mmap  │
+                  │ commit, apply embedded recipe, select/   │
+                  │ authenticate bytes, mmap                 │
                   └────────────────────┬────────────────────┘
                                        │ verified source + exact receipt identity
                                        v
