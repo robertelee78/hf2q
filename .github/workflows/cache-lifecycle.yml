@@ -112,19 +112,21 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PACKAGE_ROOT"
-          EXPECTED_SHA="$EXPECTED_SHA" \
-          CRATE_SHA256="$CRATE_SHA256" \
-          HF2Q_BIN="$HF2Q_BIN" \
-          EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256" \
-          DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
-          GEMMA_MODEL="$GEMMA_MODEL" \
-          QWEN_MODEL="$QWEN_MODEL" \
-          QWEN38_MODEL="$QWEN38_MODEL" \
-          DEEPSEEK_MODEL_SHA256="$DEEPSEEK_MODEL_SHA256" \
-          GEMMA_MODEL_SHA256="$GEMMA_MODEL_SHA256" \
-          QWEN_MODEL_SHA256="$QWEN_MODEL_SHA256" \
-          QWEN38_MODEL_SHA256="$QWEN38_MODEL_SHA256" \
-          OUT_ROOT="$OUT_ROOT" \
+          exec scripts/run_release_gate_process_group.sh env \
+            EXPECTED_SHA="$EXPECTED_SHA" \
+            CRATE_SHA256="$CRATE_SHA256" \
+            HF2Q_BIN="$HF2Q_BIN" \
+            EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256" \
+            DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
+            GEMMA_MODEL="$GEMMA_MODEL" \
+            QWEN_MODEL="$QWEN_MODEL" \
+            QWEN38_MODEL="$QWEN38_MODEL" \
+            DEEPSEEK_MODEL_SHA256="$DEEPSEEK_MODEL_SHA256" \
+            GEMMA_MODEL_SHA256="$GEMMA_MODEL_SHA256" \
+            QWEN_MODEL_SHA256="$QWEN_MODEL_SHA256" \
+            QWEN38_MODEL_SHA256="$QWEN38_MODEL_SHA256" \
+            HF2Q_MODEL_VERIFICATION_CACHE_DIR="$RUNNER_TOOL_CACHE/hf2q-model-verification" \
+            OUT_ROOT="$OUT_ROOT" \
             scripts/run_agentic_cache_release_gate.sh
 
       - name: Upload exact-artifact receipts

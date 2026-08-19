@@ -37,6 +37,127 @@ qwen36_file_identity() {
   stat -f '%d:%i' "$path" 2>/dev/null || stat -c '%d:%i' "$path" 2>/dev/null
 }
 
+# A release gate hashes each very large model exactly once, then passes the
+# resulting receipt to its child harnesses.  The children bind the expected
+# digest to the same unchanged file without rereading tens of GiB.  Standalone
+# harnesses intentionally retain the full-hash fallback.
+hf2q_release_model_snapshot() {
+  local path="$1"
+  stat -f '%d:%i:%z:%m:%c' "$path" 2>/dev/null \
+    || stat -c '%d:%i:%s:%Y:%Z' "$path" 2>/dev/null
+}
+
+hf2q_release_record_model_verification() {
+  local path="$1"
+  local expected_sha256="$2"
+  local receipt="$3"
+  local before_snapshot actual_sha256 after_snapshot
+
+  [[ -f "$path" && -r "$path" ]] || {
+    echo "release model is missing or unreadable: $path" >&2
+    return 1
+  }
+  [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "release model SHA-256 must be a lowercase 64-character digest" >&2
+    return 1
+  }
+  before_snapshot=$(hf2q_release_model_snapshot "$path") || return 1
+  actual_sha256=$(shasum -a 256 "$path" | awk '{print $1}') || return 1
+  after_snapshot=$(hf2q_release_model_snapshot "$path") || return 1
+  [[ "$before_snapshot" == "$after_snapshot" ]] || {
+    echo "release model changed while its content was being verified: $path" >&2
+    return 1
+  }
+  [[ "$actual_sha256" == "$expected_sha256" ]] || {
+    echo "release model SHA-256 mismatch: $path" >&2
+    return 1
+  }
+  jq -n --arg path "$path" --arg sha256 "$actual_sha256" \
+    --arg file_snapshot "$after_snapshot" \
+    '{schema_version:1,path:$path,sha256:$sha256,file_snapshot:$file_snapshot,
+      content_hash_verified:true}' >"$receipt.tmp.$$"
+  mv "$receipt.tmp.$$" "$receipt"
+}
+
+hf2q_release_verify_model() {
+  local path="$1"
+  local expected_sha256="$2"
+  local receipt="${3:-${HF2Q_MODEL_VERIFICATION_RECEIPT:-}}"
+  local actual_sha256 receipt_path receipt_sha256 expected_snapshot current_snapshot
+
+  [[ -f "$path" && -r "$path" ]] || {
+    echo "release model is missing or unreadable: $path" >&2
+    return 1
+  }
+  [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "release model SHA-256 must be a lowercase 64-character digest" >&2
+    return 1
+  }
+  if [[ -z "$receipt" ]]; then
+    actual_sha256=$(shasum -a 256 "$path" | awk '{print $1}') || return 1
+    [[ "$actual_sha256" == "$expected_sha256" ]] || {
+      echo "release model SHA-256 mismatch: $path" >&2
+      return 1
+    }
+    return 0
+  fi
+
+  [[ -f "$receipt" && -r "$receipt" ]] || {
+    echo "release model verification receipt is missing: $receipt" >&2
+    return 1
+  }
+  jq -e '
+    .schema_version == 1
+    and (.path | type == "string" and length > 0)
+    and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.file_snapshot | type == "string" and length > 0)
+    and .content_hash_verified == true
+  ' "$receipt" >/dev/null || {
+    echo "release model verification receipt is malformed: $receipt" >&2
+    return 1
+  }
+  receipt_path=$(jq -er .path "$receipt") || return 1
+  receipt_sha256=$(jq -er .sha256 "$receipt") || return 1
+  expected_snapshot=$(jq -er .file_snapshot "$receipt") || return 1
+  [[ "$receipt_path" == "$path" && "$receipt_sha256" == "$expected_sha256" ]] || {
+    echo "release model verification receipt does not match the requested artifact" >&2
+    return 1
+  }
+  current_snapshot=$(hf2q_release_model_snapshot "$path") || return 1
+  [[ "$current_snapshot" == "$expected_snapshot" ]] || {
+    echo "release model changed after its one-time content verification: $path" >&2
+    return 1
+  }
+}
+
+hf2q_release_prepare_model_verification() {
+  local path="$1"
+  local expected_sha256="$2"
+  local run_receipt="$3"
+  local cache_dir="$4"
+  local cache_receipt="$cache_dir/$expected_sha256.json"
+  local verification_mode=content_hash
+
+  [[ ! -e "$run_receipt" ]] || {
+    echo "per-run model verification receipt already exists: $run_receipt" >&2
+    return 1
+  }
+  mkdir -p "$cache_dir"
+  if [[ -s "$cache_receipt" ]] \
+    && hf2q_release_verify_model "$path" "$expected_sha256" "$cache_receipt" \
+      2>/dev/null; then
+    verification_mode=cached_unchanged_file
+  else
+    hf2q_release_record_model_verification \
+      "$path" "$expected_sha256" "$cache_receipt"
+  fi
+  jq --arg run_verification "$verification_mode" \
+    '. + {run_verification:$run_verification}' "$cache_receipt" \
+    >"$run_receipt.tmp.$$"
+  mv "$run_receipt.tmp.$$" "$run_receipt"
+  hf2q_release_verify_model "$path" "$expected_sha256" "$run_receipt"
+}
+
 qwen36_log_prefix_sha256() {
   local log_path="$1"
   local line_count="$2"

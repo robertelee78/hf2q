@@ -43,6 +43,8 @@ readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
 }
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
+source "$script_dir/qwen36_watchdog_validate.sh"
 
 for command in awk basename cp curl date find grep jq lsof mv rg sed shasum \
   sort stat sw_vers sysctl uname wc; do
@@ -89,7 +91,7 @@ file_bytes() {
 
 "$script_dir/seal_release_binary.sh" --verify "$BINARY_PATH" "$BINARY_SHA256" \
   >/dev/null
-test "$(sha256_file "$MODEL_PATH")" = "$MODEL_SHA256"
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256"
 binary_identity=$(file_identity "$BINARY_PATH")
 model_identity=$(file_identity "$MODEL_PATH")
 model_bytes=$(file_bytes "$MODEL_PATH")
@@ -580,7 +582,7 @@ done
   >/dev/null
 test "$(file_identity "$BINARY_PATH")" = "$binary_identity"
 test "$(file_identity "$MODEL_PATH")" = "$model_identity"
-test "$(sha256_file "$MODEL_PATH")" = "$MODEL_SHA256"
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256"
 phase_sha=$(sha256_file "$OUT_DIR/phase.log")
 phase_bytes=$(file_bytes "$OUT_DIR/phase.log")
 

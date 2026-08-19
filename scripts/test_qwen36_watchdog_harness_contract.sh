@@ -23,6 +23,115 @@ expect_fail() {
   fi
 }
 
+# The protected parent hashes a model exactly once. Child harnesses must accept
+# its receipt without invoking shasum again, while a changed/replaced file or a
+# mismatched receipt remains a hard failure. A standalone harness still hashes.
+model_path="$test_dir/model.gguf"
+model_receipt="$test_dir/model-verification.json"
+model_cache="$test_dir/model-cache"
+printf 'fixed-model-bytes\n' >"$model_path"
+model_sha256=$(shasum -a 256 "$model_path" | awk '{print $1}')
+hf2q_release_record_model_verification \
+  "$model_path" "$model_sha256" "$model_receipt"
+jq -e --arg path "$model_path" --arg sha256 "$model_sha256" '
+  .schema_version == 1
+  and .path == $path
+  and .sha256 == $sha256
+  and (.file_snapshot | type == "string" and length > 0)
+  and .content_hash_verified == true
+' "$model_receipt" >/dev/null
+
+unexpected_shasum="$test_dir/unexpected-shasum"
+# shellcheck disable=SC2329
+shasum() {
+  printf 'called\n' >>"$unexpected_shasum"
+  return 97
+}
+hf2q_release_verify_model "$model_path" "$model_sha256" "$model_receipt"
+[[ ! -e "$unexpected_shasum" ]]
+expect_fail hf2q_release_verify_model \
+  "$model_path" "$(printf '0%.0s' {1..64})" "$model_receipt"
+[[ ! -e "$unexpected_shasum" ]]
+expect_fail hf2q_release_verify_model "$model_path" "$model_sha256" ""
+[[ -s "$unexpected_shasum" ]]
+unset -f shasum
+
+replacement="$test_dir/model-replacement.gguf"
+printf 'fixed-model-bytes\n' >"$replacement"
+mv "$replacement" "$model_path"
+expect_fail hf2q_release_verify_model \
+  "$model_path" "$model_sha256" "$model_receipt"
+hf2q_release_verify_model "$model_path" "$model_sha256" ""
+
+# A second release run with an unchanged file reuses the persistent receipt
+# and performs no content scan. Replacing the file invalidates that cache and
+# forces exactly one new scan before a fresh per-run receipt is issued.
+first_run_receipt="$test_dir/first-run-model-verification.json"
+second_run_receipt="$test_dir/second-run-model-verification.json"
+hf2q_release_prepare_model_verification \
+  "$model_path" "$model_sha256" "$first_run_receipt" "$model_cache"
+[[ "$(jq -er .run_verification "$first_run_receipt")" == content_hash ]]
+unexpected_shasum="$test_dir/unexpected-cached-shasum"
+# shellcheck disable=SC2329
+shasum() {
+  printf 'called\n' >>"$unexpected_shasum"
+  return 97
+}
+hf2q_release_prepare_model_verification \
+  "$model_path" "$model_sha256" "$second_run_receipt" "$model_cache"
+[[ "$(jq -er .run_verification "$second_run_receipt")" == cached_unchanged_file ]]
+[[ ! -e "$unexpected_shasum" ]]
+unset -f shasum
+
+third_run_receipt="$test_dir/third-run-model-verification.json"
+replacement="$test_dir/cached-model-replacement.gguf"
+printf 'fixed-model-bytes\n' >"$replacement"
+mv "$replacement" "$model_path"
+rehash_calls="$test_dir/rehash-calls"
+# shellcheck disable=SC2329
+shasum() {
+  printf 'called\n' >>"$rehash_calls"
+  command shasum "$@"
+}
+hf2q_release_prepare_model_verification \
+  "$model_path" "$model_sha256" "$third_run_receipt" "$model_cache"
+unset -f shasum
+[[ "$(jq -er .run_verification "$third_run_receipt")" == content_hash ]]
+[[ "$(wc -l <"$rehash_calls" | tr -d ' ')" == 1 ]]
+
+wrong_receipt="$test_dir/wrong-model-verification.json"
+jq '.path = "/unexpected/model.gguf"' "$model_receipt" >"$wrong_receipt"
+expect_fail hf2q_release_verify_model \
+  "$model_path" "$model_sha256" "$wrong_receipt"
+printf '{}\n' >"$wrong_receipt"
+expect_fail hf2q_release_verify_model \
+  "$model_path" "$model_sha256" "$wrong_receipt"
+
+for model_consumer in \
+  test_deepseek4_interactive_overlap.sh \
+  test_gemma4_long_short_overlap.sh \
+  test_qwen36_cumulative_release.sh \
+  test_qwen36_prefill_watchdog.sh \
+  test_qwen36_prefill_cancellation.sh \
+  qwen38_long_decode_ab.sh; do
+  grep -Fq 'hf2q_release_verify_model' "$script_dir/$model_consumer" || {
+    echo "release model consumer bypasses the one-time verification receipt: $model_consumer" >&2
+    exit 1
+  }
+done
+if rg -n 'sha256_file "\$(MODEL_PATH|FIXTURE_MODEL)"' \
+  "$script_dir/test_deepseek4_interactive_overlap.sh" \
+  "$script_dir/test_gemma4_long_short_overlap.sh" \
+  "$script_dir/test_qwen36_cumulative_release.sh" \
+  "$script_dir/test_qwen36_prefill_watchdog.sh" \
+  "$script_dir/test_qwen36_prefill_cancellation.sh" \
+  "$script_dir/qwen38_long_decode_ab.sh"; then
+  echo "release child still rereads a complete model for SHA-256" >&2
+  exit 1
+fi
+[[ "$(rg -c 'HF2Q_MODEL_VERIFICATION_RECEIPT=' \
+  "$script_dir/run_agentic_cache_release_gate.sh")" == 5 ]]
+
 expect_fail qwen36_bind_server_process \
   'https://127.0.0.1:18081' 1 /bin/false /dev/null 4
 expect_fail qwen36_bind_server_process \
