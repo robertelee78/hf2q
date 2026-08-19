@@ -653,6 +653,16 @@ jobs:
                 }
               ]
             ' <<<"$direct_metadata"
+            jq -e '
+              .packages[]
+              | select(.name == "hf2q")
+              | .dependencies[]
+              | select(.name == "sysctl")
+              | .req == "=0.6.0"
+                and .uses_default_features == false
+                and .features == []
+                and .target == "cfg(target_os = \"macos\")"
+            ' <<<"$direct_metadata"
             resolved_metadata="$(cargo +1.88.0 metadata --locked --all-features --format-version 1)"
             jq -e '
               (.packages[]
@@ -876,6 +886,7 @@ jobs:
               src/input/model_recipe/validation.rs \
               src/input/model_recipe/verification.rs \
               src/input/model_recipe/preparation.rs \
+              src/input/model_recipe/preparation/host.rs \
               src/input/model_recipe/preparation/validation.rs \
               src/input/model_recipe_tests.rs \
               src/input/model_recipe_preparation_tests.rs \
@@ -905,6 +916,9 @@ jobs:
               input::model_recipe_tests::semantic_cross_bindings_fail_closed \
               input::model_recipe_preparation_tests::exact_pair_receipt_is_canonical_and_structurally_reparseable \
               input::model_recipe_preparation_tests::every_conversion_cross_binding_fails_closed \
+              input::model_recipe_preparation_tests::os_bound_disk_probe_uses_the_target_filesystem_and_rejects_file_ancestors \
+              input::model_recipe_preparation_tests::os_bound_host_preflight_rejects_a_file_as_the_preparation_root \
+              input::model_recipe_preparation_tests::current_recipe_host_preflight_passes_on_the_explicit_proof_machine \
               input::integrity::tests::safetensors_index_entry_cap_is_exact \
               convert::receipt::tests::prepared_success_receipt_binds_output_and_replaces_stale_atomically \
               tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity

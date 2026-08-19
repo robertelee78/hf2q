@@ -9,6 +9,7 @@ use super::{
     VerifiedRecipeArtifact, VerifiedRecipeSource,
 };
 
+mod host;
 mod validation;
 
 const PREPARATION_KIND: &str = "hf2q.model-preparation-receipt";
@@ -29,6 +30,8 @@ pub enum ModelPreparationError {
     ConversionMismatch { reason: String },
     #[error("model preparation pair does not match: {reason}")]
     PairMismatch { reason: String },
+    #[error("model preparation host preflight failed: {reason}")]
+    HostProbe { reason: String },
     #[error("model recipe: {0}")]
     Recipe(#[from] ModelRecipeError),
 }
@@ -45,10 +48,9 @@ pub struct VerifiedRecipeConversion {
     receipt_sha256: String,
 }
 
-/// Exact recipe policy selected against observed host and free-space facts.
+/// Exact recipe policy selected from in-process OS host and free-space reads.
 /// It is preparation policy evidence, not a serving or filesystem capability.
-/// This type does not authenticate how those observations were measured; the
-/// future no-options coordinator must supply them from its OS-bound preflight.
+/// Production construction accepts no caller-provided hardware facts.
 #[derive(Debug)]
 pub struct VerifiedRecipeHost {
     recipe_id: String,
@@ -289,9 +291,7 @@ impl VerifiedModelPreparation {
 }
 
 impl ModelRecipe {
-    /// Apply the closed recipe policy to host facts supplied by the future
-    /// OS-bound preflight coordinator. This function performs no probing.
-    pub fn verify_host_and_disk(
+    fn verify_host_and_disk_facts(
         &self,
         target: &str,
         chip_model: &str,

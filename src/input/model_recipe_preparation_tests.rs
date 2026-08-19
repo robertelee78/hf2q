@@ -190,6 +190,64 @@ fn host_and_disk_policy_is_sealed_before_pair_construction() {
 }
 
 #[test]
+fn os_bound_disk_probe_uses_the_target_filesystem_and_rejects_file_ancestors() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("models/Qwen/Qwen3.8-27B");
+    let available =
+        super::model_recipe::ModelRecipe::available_bytes_for_path_for_test(&nested).unwrap();
+    assert!(available > 0);
+
+    let file = root.path().join("not-a-directory");
+    std::fs::write(&file, b"occupied").unwrap();
+    assert!(matches!(
+        super::model_recipe::ModelRecipe::available_bytes_for_path_for_test(&file),
+        Err(ModelPreparationError::HostProbe { .. })
+    ));
+
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(root.path().join("models/Qwen/Qwen3.8-27B")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("models"), root.path().join("model-link"))
+            .unwrap();
+        let root_symlink = super::model_recipe::ModelRecipe::available_bytes_for_path_for_test(
+            &root.path().join("model-link"),
+        )
+        .unwrap();
+        assert!(root_symlink > 0);
+        let through_symlink = super::model_recipe::ModelRecipe::available_bytes_for_path_for_test(
+            &root.path().join("model-link/Qwen/Qwen3.8-27B"),
+        )
+        .unwrap();
+        assert!(through_symlink > 0);
+    }
+}
+
+#[test]
+fn os_bound_host_preflight_rejects_a_file_as_the_preparation_root() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("not-a-directory");
+    std::fs::write(&file, b"occupied").unwrap();
+    assert!(matches!(
+        embedded_qwen38_recipe()
+            .unwrap()
+            .verify_current_host_and_disk(&file),
+        Err(ModelPreparationError::HostProbe { .. })
+    ));
+}
+
+#[test]
+fn current_recipe_host_preflight_passes_on_the_explicit_proof_machine() {
+    if std::env::var_os("HF2Q_TEST_QWEN38_HOST_PREFLIGHT").is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    embedded_qwen38_recipe()
+        .unwrap()
+        .verify_current_host_and_disk(root.path())
+        .unwrap();
+}
+
+#[test]
 fn conversion_receipt_is_bounded_canonical_and_role_exact() {
     let recipe = embedded_qwen38_recipe().unwrap();
     let role = RecipeArtifactRole::Text;

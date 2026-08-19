@@ -226,6 +226,9 @@ flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] 
 zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# ADR-045 OS-bound preparation preflight. Read fixed sysctl keys in-process;
+# never trust caller facts or a PATH-resolved `sysctl` subprocess.
+sysctl = { version = "=0.6.0", default-features = false }
 # ADR-045 native Developer ID validation. These are already locked transitively,
 # but the dormant verifier consumes their exact APIs directly. The macOS 12
 # feature exposes SecTrustCopyCertificateChain without enabling network access.
