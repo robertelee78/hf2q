@@ -25,8 +25,9 @@ use super::sampling::{
 };
 use super::stream::StreamRouter;
 use super::{
-    release_completed_prefill_scratch, Deepseek4LoadedModel, Deepseek4ResumablePrefill,
-    Deepseek4ResumablePrefillAdvance, RequestScratchGuard,
+    plan_resumable_prefill_chunk, release_completed_prefill_scratch, Deepseek4LoadedModel,
+    Deepseek4PrefillOrigin, Deepseek4ResumablePrefill, Deepseek4ResumablePrefillAdvance,
+    RequestScratchGuard, ResumablePrefillChunk,
 };
 
 pub(crate) struct Deepseek4SlotCompletion {
@@ -55,6 +56,26 @@ pub(crate) struct Deepseek4PrefillState {
     progress: RequestProgress,
     scratch_guard: RequestScratchGuard,
     plan: Deepseek4ResumablePrefill,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Deepseek4CooperativePrefillPlan {
+    start: usize,
+    token_count: usize,
+}
+
+impl Deepseek4CooperativePrefillPlan {
+    pub(crate) fn start(self) -> usize {
+        self.start
+    }
+
+    pub(crate) fn token_count(self) -> usize {
+        self.token_count
+    }
+
+    pub(crate) fn end(self) -> usize {
+        self.start + self.token_count
+    }
 }
 
 impl Deepseek4PrefillState {
@@ -132,6 +153,84 @@ impl Deepseek4PrefillState {
 
     pub(crate) fn is_cold_wave(&self) -> bool {
         self.plan.is_cold_wave()
+    }
+
+    /// Plan a cooperative FFN chunk without changing request, cache, or
+    /// scheduler state. Only a warm matrix slice strictly before the recovery
+    /// checkpoint is eligible; anchor capture, incremental replay, and final
+    /// head publication stay on the established serial path.
+    pub(crate) fn plan_cooperative_prefill(
+        &self,
+        cache_position: usize,
+        committed_tokens: usize,
+        sliding_window: usize,
+        max_rows: usize,
+    ) -> Result<Option<Deepseek4CooperativePrefillPlan>> {
+        anyhow::ensure!(
+            cache_position == self.plan.cursor && committed_tokens == self.plan.cursor,
+            "DeepSeek-V4 cooperative candidate cursor {} disagrees with cache {} / token ledger {}",
+            self.plan.cursor,
+            cache_position,
+            committed_tokens
+        );
+        if self.plan.origin != Deepseek4PrefillOrigin::Cached
+            || self.plan.cursor >= self.plan.recovery_position
+            || max_rows < sliding_window
+        {
+            return Ok(None);
+        }
+        let remaining = self.plan.recovery_position - self.plan.cursor;
+        let window_multiplier = self.plan.window_multiplier.min(max_rows / sliding_window);
+        let slice = plan_resumable_prefill_chunk(
+            cache_position,
+            remaining,
+            sliding_window,
+            window_multiplier,
+            self.plan.recovery_position,
+        )?;
+        let ResumablePrefillChunk::Matrix(token_count) = slice.chunk else {
+            return Ok(None);
+        };
+        let plan = Deepseek4CooperativePrefillPlan {
+            start: self.plan.cursor,
+            token_count,
+        };
+        if slice.capture_anchor_after
+            || token_count > max_rows
+            || plan.end() >= self.plan.recovery_position
+        {
+            return Ok(None);
+        }
+        Ok(Some(plan))
+    }
+
+    pub(crate) fn cooperative_tokens(
+        &self,
+        plan: Deepseek4CooperativePrefillPlan,
+    ) -> Result<&[u32]> {
+        anyhow::ensure!(
+            plan.start == self.plan.cursor && plan.end() <= self.prompt_tokens.len(),
+            "DeepSeek-V4 cooperative prefill plan no longer matches request cursor"
+        );
+        Ok(&self.prompt_tokens[plan.start..plan.end()])
+    }
+
+    pub(crate) fn validate_cooperative_prefill_commit(
+        &self,
+        plan: Deepseek4CooperativePrefillPlan,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            plan.start == self.plan.cursor && plan.end() < self.plan.recovery_position,
+            "DeepSeek-V4 cooperative publication crossed a recovery checkpoint"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn publish_cooperative_prefill(&mut self, plan: Deepseek4CooperativePrefillPlan) {
+        debug_assert_eq!(plan.start, self.plan.cursor);
+        debug_assert!(plan.end() < self.plan.recovery_position);
+        self.plan.cursor = plan.end();
+        self.progress.advance_prefill(plan.token_count);
     }
 
     pub(crate) fn advance(
@@ -453,5 +552,87 @@ impl Deepseek4SlotState {
 
     pub(crate) fn failed(&self, error: &anyhow::Error) {
         self.progress.failed(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached_prefill_state(cursor: usize, recovery_position: usize) -> Deepseek4PrefillState {
+        Deepseek4PrefillState {
+            prompt_tokens: (0..recovery_position + 64)
+                .map(|token| (token % 120_000) as u32)
+                .collect(),
+            params: SamplingParams::default(),
+            stream: false,
+            request_started: Instant::now(),
+            prefill_started: Instant::now(),
+            progress: RequestProgress::start("cooperative-plan-test", recovery_position + 64, 1),
+            scratch_guard: RequestScratchGuard::new(),
+            plan: Deepseek4ResumablePrefill {
+                cursor,
+                recovery_position,
+                window_multiplier: 16,
+                cached_tokens: cursor,
+                origin: Deepseek4PrefillOrigin::Cached,
+            },
+        }
+    }
+
+    #[test]
+    fn cooperative_prefill_plan_matches_two_three_and_four_lane_serving_widths() {
+        let state = cached_prefill_state(6_676, 8_000);
+        for (lanes, expected_rows) in [(2, 1_024), (3, 640), (4, 512)] {
+            let lane_budget =
+                crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS / lanes / 128
+                    * 128;
+            let plan = state
+                .plan_cooperative_prefill(6_676, 6_676, 128, lane_budget)
+                .unwrap()
+                .expect("warm matrix suffix should be cooperative");
+            assert_eq!(plan.start(), 6_676);
+            assert_eq!(plan.token_count(), expected_rows);
+            assert!(plan.end() < 8_000);
+            assert_eq!(state.cooperative_tokens(plan).unwrap().len(), expected_rows);
+        }
+    }
+
+    #[test]
+    fn cooperative_prefill_excludes_cold_anchor_and_incremental_work() {
+        let mut cold = cached_prefill_state(0, 8_000);
+        cold.plan.origin = Deepseek4PrefillOrigin::Cold;
+        assert!(cold
+            .plan_cooperative_prefill(0, 0, 128, 512)
+            .unwrap()
+            .is_none());
+
+        let anchor = cached_prefill_state(7_488, 8_000);
+        assert!(anchor
+            .plan_cooperative_prefill(7_488, 7_488, 128, 512)
+            .unwrap()
+            .is_none());
+
+        let incremental = cached_prefill_state(7_968, 8_000);
+        assert!(incremental
+            .plan_cooperative_prefill(7_968, 7_968, 128, 512)
+            .unwrap()
+            .is_none());
+        assert!(incremental
+            .plan_cooperative_prefill(7_967, 7_968, 128, 512)
+            .is_err());
+    }
+
+    #[test]
+    fn cooperative_prefill_state_publication_is_prevalidated_and_infallible() {
+        let mut state = cached_prefill_state(6_676, 8_000);
+        let plan = state
+            .plan_cooperative_prefill(6_676, 6_676, 128, 512)
+            .unwrap()
+            .unwrap();
+        state.validate_cooperative_prefill_commit(plan).unwrap();
+        state.publish_cooperative_prefill(plan);
+        assert_eq!(state.plan.cursor, 7_188);
+        assert!(state.validate_cooperative_prefill_commit(plan).is_err());
     }
 }

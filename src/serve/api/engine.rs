@@ -8216,7 +8216,9 @@ fn choose_deepseek4_ready_request_index(
                 }
                 _ => None,
             })
-            .max_by_key(|(_, score)| *score)
+            // `Iterator::max_by_key` returns the last equal element. Reverse
+            // the queue index so equal cache affinities remain FIFO.
+            .max_by_key(|(index, score)| (*score, std::cmp::Reverse(*index)))
             .map(|(index, _)| index)
     };
     if prefer_cached {
@@ -8282,7 +8284,7 @@ fn pop_cached_deepseek4_request(
                 _ => None,
             }
         })
-        .max_by_key(|(_, score)| *score)?;
+        .max_by_key(|(index, score)| (*score, std::cmp::Reverse(*index)))?;
     pending
         .remove(index)
         .map(|request| (request, Some(score), score))
@@ -8329,16 +8331,36 @@ fn next_deepseek4_prefill_handle(
     slots: &[Option<Deepseek4Slot>],
     after: Option<SlotId>,
 ) -> Option<SlotHandle> {
-    if slots.is_empty() {
+    next_deepseek4_prefill_slot_index(slots.len(), after, |index| {
+        slots[index]
+            .as_ref()
+            .is_some_and(|(work, _, _)| matches!(work, Deepseek4SlotWork::Prefill(_)))
+    })
+    .and_then(|index| slots[index].as_ref().map(|(_, _, handle)| *handle))
+}
+
+fn next_deepseek4_prefill_slot_index(
+    slot_count: usize,
+    after: Option<SlotId>,
+    mut is_prefilling: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    if slot_count == 0 {
         return None;
     }
-    let start = after.map_or(0, |slot| (slot.0 as usize + 1) % slots.len());
-    (0..slots.len()).find_map(|offset| {
-        let index = (start + offset) % slots.len();
-        slots[index].as_ref().and_then(|(work, _, handle)| {
-            matches!(work, Deepseek4SlotWork::Prefill(_)).then_some(*handle)
-        })
-    })
+    let start = after.map_or(0, |slot| (slot.0 as usize + 1) % slot_count);
+    (0..slot_count)
+        .map(|offset| (start + offset) % slot_count)
+        .find(|index| is_prefilling(*index))
+}
+
+fn record_deepseek4_serial_prefill_fallback(
+    last_prefill_slot: &mut Option<SlotId>,
+    serial_fallback: SlotHandle,
+    used_serial_fallback: bool,
+) {
+    if used_serial_fallback {
+        *last_prefill_slot = Some(serial_fallback.slot_id);
+    }
 }
 
 fn choose_full_context_slot(
@@ -8823,20 +8845,30 @@ fn run_slot_aware_deepseek4(
                 publish(&scheduler, &scheduler_stats_snapshot);
             }
             Ok(SchedulerStep::Prefill { handle, .. }) => {
-                let handle =
+                // A pure-prefill step exposes the scheduler's oldest FIFO
+                // handle. Warm compatible peers may share row-local FFN/MoE
+                // work without waiting; cold and mixed work retain the proven
+                // serial transaction path.
+                let serial_fallback =
                     next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
-                last_prefill_slot = Some(handle.slot_id);
-                if let Some(fatal) = advance_deepseek4_prefill(
+                let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
                     &mut model,
                     &mut sessions,
                     &mut slots,
                     &mut scheduler,
                     registration.as_ref(),
                     handle,
+                    serial_fallback,
                     kv_bytes_per_token,
                     None,
                     &supervisor,
-                ) {
+                );
+                record_deepseek4_serial_prefill_fallback(
+                    &mut last_prefill_slot,
+                    serial_fallback,
+                    used_serial_fallback,
+                );
+                if let Some(fatal) = fatal {
                     fail_stop_deepseek4_worker(
                         &supervisor,
                         &mut rx,
@@ -9203,6 +9235,360 @@ fn seed_deepseek4_single(
         }
     }
     None
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deepseek4ReplyClass {
+    Unary,
+    Stream,
+}
+
+fn deepseek4_reply_class(reply: &SlotReply) -> Deepseek4ReplyClass {
+    match reply {
+        SlotReply::Unary(_) => Deepseek4ReplyClass::Unary,
+        SlotReply::Stream { .. } => Deepseek4ReplyClass::Stream,
+    }
+}
+
+#[derive(Clone)]
+struct Deepseek4CooperativeCandidate {
+    handle: SlotHandle,
+    plan: super::engine_deepseek4::Deepseek4CooperativePrefillPlan,
+    tokens: Vec<u32>,
+}
+
+struct Deepseek4CooperativeLane {
+    slot_index: usize,
+    handle: SlotHandle,
+    state: super::engine_deepseek4::Deepseek4PrefillState,
+    reply: SlotReply,
+    plan: super::engine_deepseek4::Deepseek4CooperativePrefillPlan,
+    tokens: Vec<u32>,
+}
+
+fn plan_deepseek4_prefill_cohort(
+    model: &super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    slots: &[Option<Deepseek4Slot>],
+    scheduler: &InflightBatchedScheduler,
+    primary: SlotHandle,
+) -> Result<Option<Vec<Deepseek4CooperativeCandidate>>> {
+    let handles = scheduler.prefill_handles_fifo();
+    anyhow::ensure!(
+        handles.first().copied() == Some(primary),
+        "DeepSeek-V4 cooperative primary is not the oldest scheduler prefill"
+    );
+    let sliding_window = model.model.cfg.sliding_window as usize;
+    anyhow::ensure!(sliding_window > 0, "DeepSeek-V4 sliding window is zero");
+    let maximum_width = handles.len().min(4);
+    for width in (2..=maximum_width).rev() {
+        let lane_rows = crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS
+            .checked_div(width)
+            .unwrap_or(0)
+            / sliding_window
+            * sliding_window;
+        if lane_rows == 0 {
+            continue;
+        }
+        let mut candidates = Vec::with_capacity(width);
+        let mut expected_plan = None;
+        let mut expected_reply_class = None;
+        let mut compatible = true;
+        for handle in handles.iter().copied().take(width) {
+            let index = handle.slot_id.0 as usize;
+            let Some((Deepseek4SlotWork::Prefill(state), reply, installed)) =
+                slots.get(index).and_then(Option::as_ref)
+            else {
+                compatible = false;
+                break;
+            };
+            if *installed != handle || reply.client_closed() {
+                compatible = false;
+                break;
+            }
+            let reply_class = deepseek4_reply_class(reply);
+            if expected_reply_class.is_some_and(|expected| expected != reply_class) {
+                compatible = false;
+                break;
+            }
+            expected_reply_class = Some(reply_class);
+            let Some(plan) = state.plan_cooperative_prefill(
+                sessions[index].cache_position(),
+                sessions[index].committed_tokens().len(),
+                sliding_window,
+                lane_rows,
+            )?
+            else {
+                compatible = false;
+                break;
+            };
+            if expected_plan.is_some_and(|expected| expected != plan) {
+                compatible = false;
+                break;
+            }
+            expected_plan = Some(plan);
+            candidates.push(Deepseek4CooperativeCandidate {
+                handle,
+                plan,
+                tokens: state.cooperative_tokens(plan)?.to_vec(),
+            });
+        }
+        if compatible && candidates.len() == width {
+            return Ok(Some(candidates));
+        }
+    }
+    Ok(None)
+}
+
+fn reinstall_deepseek4_cooperative_lanes(
+    slots: &mut [Option<Deepseek4Slot>],
+    lanes: Vec<Deepseek4CooperativeLane>,
+) {
+    for lane in lanes {
+        debug_assert!(slots[lane.slot_index].is_none());
+        slots[lane.slot_index] = Some((
+            Deepseek4SlotWork::Prefill(lane.state),
+            lane.reply,
+            lane.handle,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_deepseek4_prefill_quantum(
+    model: &mut super::engine_deepseek4::Deepseek4LoadedModel,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    primary: SlotHandle,
+    serial_fallback: SlotHandle,
+    kv_bytes_per_token: u64,
+    max_matrix_prefill_windows: Option<usize>,
+    supervisor: &EngineSupervisor,
+) -> (Option<SlotAwareGpuFatal>, bool) {
+    if max_matrix_prefill_windows.is_some() || deepseek4_cold_prefill_active(slots) > 0 {
+        return (
+            advance_deepseek4_prefill(
+                model,
+                sessions,
+                slots,
+                scheduler,
+                registration,
+                serial_fallback,
+                kv_bytes_per_token,
+                max_matrix_prefill_windows,
+                supervisor,
+            ),
+            true,
+        );
+    }
+    let candidates = match plan_deepseek4_prefill_cohort(model, sessions, slots, scheduler, primary)
+    {
+        Ok(Some(candidates)) => candidates,
+        Ok(None) => {
+            return (
+                advance_deepseek4_prefill(
+                    model,
+                    sessions,
+                    slots,
+                    scheduler,
+                    registration,
+                    serial_fallback,
+                    kv_bytes_per_token,
+                    None,
+                    supervisor,
+                ),
+                true,
+            )
+        }
+        Err(error) => {
+            return (
+                Some(SlotAwareGpuFatal::invariant_handle(primary, error)),
+                false,
+            )
+        }
+    };
+
+    for candidate in &candidates {
+        let index = candidate.handle.slot_id.0 as usize;
+        if let Err(error) = sessions[index]
+            .prepare_cooperative_prefill(candidate.plan.start(), candidate.plan.token_count())
+        {
+            return (
+                Some(SlotAwareGpuFatal::invariant_handle(primary, error)),
+                false,
+            );
+        }
+    }
+
+    let mut lanes = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let slot_index = candidate.handle.slot_id.0 as usize;
+        let Some((work, reply, installed)) = slots[slot_index].take() else {
+            reinstall_deepseek4_cooperative_lanes(slots, lanes);
+            return (
+                Some(SlotAwareGpuFatal::invariant_handle(
+                    candidate.handle,
+                    anyhow::anyhow!("DeepSeek-V4 cooperative prefill slot disappeared"),
+                )),
+                false,
+            );
+        };
+        if installed != candidate.handle {
+            slots[slot_index] = Some((work, reply, installed));
+            reinstall_deepseek4_cooperative_lanes(slots, lanes);
+            return (
+                Some(SlotAwareGpuFatal::invariant_handle(
+                    candidate.handle,
+                    anyhow::anyhow!("DeepSeek-V4 cooperative prefill handle changed"),
+                )),
+                false,
+            );
+        }
+        let Deepseek4SlotWork::Prefill(state) = work else {
+            slots[slot_index] = Some((work, reply, installed));
+            reinstall_deepseek4_cooperative_lanes(slots, lanes);
+            return (
+                Some(SlotAwareGpuFatal::invariant_handle(
+                    candidate.handle,
+                    anyhow::anyhow!("DeepSeek-V4 cooperative candidate stopped prefilling"),
+                )),
+                false,
+            );
+        };
+        lanes.push(Deepseek4CooperativeLane {
+            slot_index,
+            handle: candidate.handle,
+            state,
+            reply,
+            plan: candidate.plan,
+            tokens: candidate.tokens,
+        });
+    }
+
+    // Client channels can close between read-only planning and ownership.
+    // Restore every lane and let the oldest serial path perform its normal
+    // cancellation recovery instead of submitting canceled shared work.
+    if lanes.iter().any(|lane| lane.reply.client_closed()) {
+        reinstall_deepseek4_cooperative_lanes(slots, lanes);
+        return (
+            advance_deepseek4_prefill(
+                model,
+                sessions,
+                slots,
+                scheduler,
+                registration,
+                serial_fallback,
+                kv_bytes_per_token,
+                None,
+                supervisor,
+            ),
+            true,
+        );
+    }
+
+    lanes.sort_by_key(|lane| lane.slot_index);
+    let slot_indices = lanes.iter().map(|lane| lane.slot_index).collect::<Vec<_>>();
+    let token_batches = lanes
+        .iter()
+        .map(|lane| lane.tokens.as_slice())
+        .collect::<Vec<_>>();
+    let execution = model.supervised_verifier_prefill_cohort(
+        &token_batches,
+        sessions,
+        &slot_indices,
+        supervisor,
+    );
+    let outputs = match execution {
+        Ok(outputs) if outputs.len() == lanes.len() => outputs,
+        Ok(outputs) => {
+            let error = anyhow::anyhow!(
+                "DeepSeek-V4 cooperative prefill returned {} outputs for {} lanes",
+                outputs.len(),
+                lanes.len()
+            );
+            let mut owned = lanes.into_iter();
+            let first = owned.next().expect("cooperative cohort is nonempty");
+            let mut fatal = SlotAwareGpuFatal::invariant_slot(first.handle, first.reply, error);
+            fatal.extend_slots(owned.map(|lane| (Some(lane.handle), lane.reply)));
+            return (Some(fatal), false);
+        }
+        Err(error) => {
+            let mut owned = lanes.into_iter();
+            let first = owned.next().expect("cooperative cohort is nonempty");
+            let mut fatal = SlotAwareGpuFatal::slot(first.handle, first.reply, error);
+            fatal.extend_slots(owned.map(|lane| (Some(lane.handle), lane.reply)));
+            return (Some(fatal), false);
+        }
+    };
+    let completed_plan = lanes[0].plan;
+    drop(outputs);
+
+    for lane in &lanes {
+        if let Err(error) = sessions[lane.slot_index]
+            .validate_cooperative_prefill_result(lane.plan.start(), lane.plan.token_count())
+            .and_then(|_| lane.state.validate_cooperative_prefill_commit(lane.plan))
+        {
+            let mut owned = lanes.into_iter();
+            let first = owned.next().expect("cooperative cohort is nonempty");
+            let mut fatal = SlotAwareGpuFatal::invariant_slot(first.handle, first.reply, error);
+            fatal.extend_slots(owned.map(|lane| (Some(lane.handle), lane.reply)));
+            return (Some(fatal), false);
+        }
+    }
+    for lane in &lanes {
+        sessions[lane.slot_index].publish_cooperative_tokens(&lane.tokens);
+    }
+    for lane in &mut lanes {
+        lane.state.publish_cooperative_prefill(lane.plan);
+    }
+    for lane in &lanes {
+        scheduler.advance_after_prefill(lane.handle, lane.plan.token_count() as u32);
+    }
+    tracing::info!(
+        lanes = lanes.len(),
+        start = completed_plan.start(),
+        rows_per_lane = completed_plan.token_count(),
+        aggregate_rows = lanes.len().saturating_mul(completed_plan.token_count()),
+        "DeepSeek-V4 cooperative prefill complete"
+    );
+
+    let mut lanes = std::collections::VecDeque::from(lanes);
+    while let Some(lane) = lanes.pop_front() {
+        if lane.reply.client_closed() {
+            record_retained_slot_kv(
+                scheduler,
+                lane.handle,
+                sessions[lane.slot_index].committed_tokens().len(),
+                kv_bytes_per_token,
+            );
+            let reply = match recover_cancelled_deepseek4_session_for_reply(
+                sessions,
+                lane.handle,
+                lane.reply,
+            ) {
+                Ok(reply) => reply,
+                Err(mut fatal) => {
+                    fatal.extend_slots(
+                        lanes
+                            .into_iter()
+                            .map(|lane| (Some(lane.handle), lane.reply)),
+                    );
+                    return (Some(fatal), false);
+                }
+            };
+            scheduler.release(lane.handle);
+            reply.record_client_cancellation();
+        } else {
+            slots[lane.slot_index] = Some((
+                Deepseek4SlotWork::Prefill(lane.state),
+                lane.reply,
+                lane.handle,
+            ));
+        }
+    }
+    (None, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28070,6 +28456,23 @@ fn render_deepseek_v4_prompt(
     enable_thinking: bool,
     kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<String> {
+    let tools_json = tools
+        .filter(|tools| !tools.is_empty())
+        .map(serde_json::to_value)
+        .transpose()
+        .context("serialize DeepSeek-V4 tools")?;
+    render_deepseek_v4_prompt_with_serialized_tools(messages, tools_json, enable_thinking, kwargs)
+}
+
+/// Exact renderer seam for provenance tests that must replay an historical
+/// JSON-key policy after typed request parsing. Production calls the wrapper
+/// above with serde's client-preserving insertion order.
+pub(crate) fn render_deepseek_v4_prompt_with_serialized_tools(
+    messages: &[super::schema::ChatMessage],
+    tools: Option<serde_json::Value>,
+    enable_thinking: bool,
+    kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<String> {
     use crate::core::deepseek_v4_encoding::{
         encode_json, EncodeOptions, ReasoningEffort, ThinkingMode,
     };
@@ -28105,8 +28508,7 @@ fn render_deepseek_v4_prompt(
         .as_array()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("DeepSeek-V4 messages did not serialize as an array"))?;
-    if let Some(tools) = tools.filter(|v| !v.is_empty()) {
-        let tools = serde_json::to_value(tools).context("serialize DeepSeek-V4 tools")?;
+    if let Some(tools) = tools {
         if let Some(target) = values.iter_mut().find(|v| {
             matches!(
                 v.get("role").and_then(|r| r.as_str()),
@@ -28388,6 +28790,44 @@ mod tests {
             Some(1),
             "busy continuations wait instead of being misclassified as cold"
         );
+    }
+
+    #[test]
+    fn deepseek_serial_prefill_fallback_keeps_round_robin_order() {
+        let prefilling = [true, true, false, true];
+        let next = |after| {
+            next_deepseek4_prefill_slot_index(prefilling.len(), after, |index| prefilling[index])
+        };
+        assert_eq!(next(None), Some(0));
+        assert_eq!(next(Some(SlotId(0))), Some(1));
+        assert_eq!(next(Some(SlotId(1))), Some(3));
+        assert_eq!(next(Some(SlotId(3))), Some(0));
+        assert_eq!(
+            next_deepseek4_prefill_slot_index(4, Some(SlotId(1)), |_| false),
+            None
+        );
+
+        let handle = |slot_id| SlotHandle {
+            slot_id: SlotId(slot_id),
+            generation: 1,
+        };
+        let mut cursor = None;
+        record_deepseek4_serial_prefill_fallback(&mut cursor, handle(0), false);
+        assert_eq!(
+            cursor, None,
+            "cooperative work must not rotate serial state"
+        );
+        record_deepseek4_serial_prefill_fallback(&mut cursor, handle(0), true);
+        assert_eq!(cursor, Some(SlotId(0)));
+        record_deepseek4_serial_prefill_fallback(&mut cursor, handle(3), false);
+        assert_eq!(
+            cursor,
+            Some(SlotId(0)),
+            "a later cooperative cohort must preserve the last serial lane"
+        );
+        assert_eq!(next(cursor), Some(1));
+        record_deepseek4_serial_prefill_fallback(&mut cursor, handle(1), true);
+        assert_eq!(next(cursor), Some(3));
     }
 
     #[test]

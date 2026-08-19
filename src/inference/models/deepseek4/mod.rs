@@ -39,7 +39,9 @@ pub(crate) use forward_support::{
 };
 pub use model::Deepseek4Model;
 pub use residency::Deepseek4Weights;
-pub(crate) use verifier_forward::{matrix_prefill_chunk_len, MIN_MATRIX_APPEND_TOKENS};
+pub(crate) use verifier_forward::{
+    matrix_prefill_chunk_len, MAX_COOPERATIVE_PREFILL_ROWS, MIN_MATRIX_APPEND_TOKENS,
+};
 
 #[cfg(test)]
 mod attention_forward_tests;
@@ -51,6 +53,8 @@ mod ffn_forward_tests;
 mod forward_tests;
 #[cfg(test)]
 mod model_tests;
+#[cfg(test)]
+mod real_artifact_cohort_tests;
 #[cfg(test)]
 mod real_artifact_tests;
 #[cfg(test)]

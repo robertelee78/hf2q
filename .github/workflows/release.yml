@@ -117,15 +117,52 @@ jobs:
           check_receipt deepseek/lifecycle/summary.json '.receipt_sha256.deepseek.lifecycle'
           check_receipt deepseek/interactive/summary.json '.receipt_sha256.deepseek.interactive'
           check_receipt deepseek/cached-suffix/summary.json '.receipt_sha256.deepseek.cached_suffix'
+          check_receipt deepseek/cooperative-prefill/summary.json '.receipt_sha256.deepseek.cooperative_prefill'
           check_receipt deepseek/full-context-1/envelope.json '.receipt_sha256.deepseek.wave1'
           check_receipt deepseek/full-context-2/envelope.json '.receipt_sha256.deepseek.wave2'
           check_receipt deepseek/full-context-1/thermal/summary.json '.receipt_sha256.deepseek.wave1_thermal'
           check_receipt deepseek/full-context-2/thermal/summary.json '.receipt_sha256.deepseek.wave2_thermal'
+          check_receipt fixtures/deepseek4-agentic/prompt-provenance.json '.receipt_sha256.deepseek.prompt_provenance'
+          prompt_contract="$gate_dir/fixtures/deepseek4-agentic/deepseek4-agentic-prompt-contract-v2.json"
+          prompt_context="$gate_dir/fixtures/deepseek4-agentic/deepseek4-agentic-repo-context.txt"
+          prompt_tool_result="$gate_dir/fixtures/deepseek4-agentic/deepseek4-agentic-tool-result-863ea423.toml"
+          prompt_provenance="$gate_dir/fixtures/deepseek4-agentic/prompt-provenance.json"
+          cmp -s scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json "$prompt_contract"
+          cmp -s scripts/fixtures/deepseek4-agentic-repo-context.txt "$prompt_context"
+          cmp -s scripts/fixtures/deepseek4-agentic-tool-result-863ea423.toml "$prompt_tool_result"
+          prompt_contract_sha=$(shasum -a 256 "$prompt_contract" | awk '{print $1}')
+          prompt_provenance_sha=$(shasum -a 256 "$prompt_provenance" | awk '{print $1}')
+          test "$prompt_contract_sha" = "$(jq -er '.fixtures.deepseek_agentic.contract_sha256' "$manifest")"
+          test "$prompt_provenance_sha" = "$(jq -er '.fixtures.deepseek_agentic.prompt_provenance_sha256' "$manifest")"
+          test "$(shasum -a 256 "$prompt_context" | awk '{print $1}')" = "$(jq -er '.fixtures.deepseek_agentic.context_sha256' "$manifest")"
+          test "$(shasum -a 256 "$prompt_tool_result" | awk '{print $1}')" = "$(jq -er '.fixtures.deepseek_agentic.tool_result_sha256' "$manifest")"
+          jq -e -f scripts/deepseek4_agentic_prompt_contract.jq "$prompt_contract" >/dev/null
+          jq -e --slurpfile contract "$prompt_contract" \
+            --arg prompt_contract_sha256 "$prompt_contract_sha" \
+            --arg model_sha256 "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
+            -f scripts/deepseek4_agentic_prompt_provenance.jq \
+            "$prompt_provenance" >/dev/null
+          for agent in 1 2 3 4; do
+            request="$gate_dir/fixtures/deepseek4-agentic/request-agent-$agent.json"
+            test "$(stat -f %z "$request")" = \
+              "$(jq -er --argjson agent "$agent" '.agents[] | select(.agent == $agent) | .request_bytes' "$prompt_contract")"
+            test "$(shasum -a 256 "$request" | awk '{print $1}')" = \
+              "$(jq -er --argjson agent "$agent" '.agents[] | select(.agent == $agent) | .request_sha256' "$prompt_contract")"
+          done
+          cooperative_dir="$gate_dir/deepseek/cooperative-prefill"
+          bash scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
+            "$cooperative_dir/summary.json" "$cooperative_dir/raw.json" \
+            "$cooperative_dir/test.log" "$cooperative_dir/thermal.log" \
+            "$cooperative_dir/settle.log" "$EXPECTED_SHA" \
+            "$EXPECTED_DEEPSEEK_MODEL_SHA256"
           for wave in 1 2; do
             wave_dir="$gate_dir/deepseek/full-context-$wave"
             summary_sha=$(shasum -a 256 "$wave_dir/summary.json" | awk '{print $1}')
             test "$summary_sha" = "$(jq -er .summary_sha256 "$wave_dir/envelope.json")"
-            jq -e -f scripts/deepseek4_full_context_receipt.jq \
+            jq -e --slurpfile contract "$prompt_contract" \
+              --arg prompt_contract_sha256 "$prompt_contract_sha" \
+              --arg prompt_provenance_sha256 "$prompt_provenance_sha" \
+              -f scripts/deepseek4_full_context_receipt.jq \
               "$wave_dir/summary.json" >/dev/null
             thermal_summary="$wave_dir/thermal/summary.json"
             thermal_log="$wave_dir/thermal/measurement.log"
@@ -133,6 +170,15 @@ jobs:
             bash scripts/verify_macos_thermal_receipt.sh "$wave" \
               "$wave_dir/envelope.json" "$thermal_summary" \
               "$thermal_log" "$thermal_settle_log" "$wave_dir/agents"
+            server_log="$gate_dir/deepseek/process-wave-$wave/server.log"
+            test -s "$server_log"
+            test "$(shasum -a 256 "$server_log" | awk '{print $1}')" = \
+              "$(jq -er .server_log_sha256 "$wave_dir/envelope.json")"
+            cooperative_transactions=$(rg -c \
+              'DeepSeek-V4 cooperative prefill complete' "$server_log" || true)
+            test "$cooperative_transactions" = \
+              "$(jq -er .cooperative_prefill_transactions "$wave_dir/envelope.json")"
+            test "$cooperative_transactions" -gt 0
           done
           check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
           check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
@@ -187,7 +233,11 @@ jobs:
             --arg gemma_sha "$EXPECTED_GEMMA_MODEL_SHA256" \
             --arg qwen_sha "$EXPECTED_QWEN_MODEL_SHA256" \
             --arg qwen38_sha "$EXPECTED_QWEN38_MODEL_SHA256" \
+            --arg prompt_contract_sha256 "$prompt_contract_sha" \
+            --arg prompt_provenance_sha256 "$prompt_provenance_sha" \
+            --slurpfile prompt_contract "$prompt_contract" \
             '. as $root
+             | $prompt_contract[0] as $pc
              | .status == "pass"
              and .source_sha == $source_sha
              and .power_guarded_ac == true
@@ -197,8 +247,21 @@ jobs:
              and .models.gemma.sha256 == $gemma_sha
              and .models.qwen.sha256 == $qwen_sha
              and .models.qwen38.sha256 == $qwen38_sha
+             and .fixtures.deepseek_agentic.contract_sha256 == $prompt_contract_sha256
+             and .fixtures.deepseek_agentic.prompt_provenance_sha256 == $prompt_provenance_sha256
              and (.families.deepseek as $d
                | $d.status == "pass"
+               and $d.cooperative_prefill.status == "pass"
+               and $d.cooperative_prefill.source_sha == $source_sha
+               and $d.cooperative_prefill.model_sha256 == $deepseek_sha
+               and $d.cooperative_prefill.mlx_native_version == "0.10.12"
+               and $d.cooperative_prefill.prefix_rows == 148
+               and $d.cooperative_prefill.benchmark.speedup > 1
+               and $d.cooperative_prefill.thermal_status == "nominal"
+               and $d.prompt_provenance.status == "pass"
+               and $d.prompt_provenance.prompt_contract_sha256 == $prompt_contract_sha256
+               and $d.prompt_provenance.model_sha256 == $deepseek_sha
+               and ([$d.prompt_provenance.agents[].agent] == [1,2,3,4])
                and $d.lifecycle.status == "pass"
                and $d.lifecycle.active_stream_cancelled_without_done == true
                and $d.lifecycle.queued_exact_retry_cached_tokens > 0
@@ -252,6 +315,12 @@ jobs:
                  .status == "pass" and .binary_sha256 == $root.binary_sha256
                  and .model_sha256 == $deepseek_sha and .ready_http == 200
                  and .fatal_log_signatures == 0 and .receipt.status == "pass"
+                 and (.cooperative_prefill_transactions | type) == "number"
+                 and .cooperative_prefill_transactions > 0
+                 and .receipt.fixture_id == $pc.fixture_id
+                 and .receipt.prompt_contract_sha256 == $prompt_contract_sha256
+                 and .receipt.prompt_provenance_sha256 == $prompt_provenance_sha256
+                 and .receipt.serialization_policy == $pc.serialization.policy
                  and .thermal.status == "pass"
                  and .thermal.required_state == "nominal"
                  and .thermal.runtime_preflight == "pass"
@@ -295,22 +364,26 @@ jobs:
                  and all(.cold_prefill_tokens_per_second[]; type == "number" and . > 0)
                  and .receipt.family == "deepseek4" and .receipt.concurrent_agents == 4
                  and .receipt.require_cold_first == 1 and (.receipt.agents | length) == 4
-                 and .receipt.agentic_context_fixture_sha256 == "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef"
-                 and .receipt.agentic_context_fixture_bytes == 21204
-                 and .receipt.repository_context_chars == 20584
-                 and .receipt.prompt_tokens == 6684
+                 and .receipt.agentic_context_fixture_sha256 == $pc.repository_context.sha256
+                 and .receipt.agentic_context_fixture_bytes == $pc.repository_context.bytes
+                 and .receipt.repository_context_chars == $pc.repository_context.chars
+                 and .receipt.prompt_tokens == $pc.serialization.expected_prompt_tokens
+                 and .receipt.prompt_tokens != $pc.serialization.legacy_rejected_prompt_tokens
                  and all(.receipt.agents[];
                    .status == "pass" and .cold_cached_tokens == 0
-                   and .agentic_context_fixture_sha256 == "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef"
-                   and .agentic_context_fixture_bytes == 21204
-                   and .repository_context_chars == 20584
-                   and .expected_path == "/opt/hf2q-worktrees/full-context-slots/Cargo.toml"
-                   and .prompt_tokens == 6684
+                   and .agentic_context_fixture_sha256 == $pc.repository_context.sha256
+                   and .agentic_context_fixture_bytes == $pc.repository_context.bytes
+                   and .repository_context_chars == $pc.repository_context.chars
+                   and .expected_path == $pc.request.expected_path
+                   and .prompt_tokens == $pc.serialization.expected_prompt_tokens
+                   and .prompt_tokens != $pc.serialization.legacy_rejected_prompt_tokens
                    and .cold_ttft_ms <= 60000
                    and .cold_semantic_response_ms <= 60000
-                   and .cached_tokens >= (.prompt_tokens - 32)
-                   and .auto_cached_tokens >= (.prompt_tokens - 32)
-                   and .continuation_cached_tokens >= (.prompt_tokens - 32)
+                   and .cached_tokens == $pc.prompt.cached_anchor_tokens
+                   and .auto_cached_tokens == $pc.prompt.cached_anchor_tokens
+                   and .stream_cached_tokens == $pc.prompt.cached_anchor_tokens
+                   and .continuation_cached_tokens == $pc.prompt.cached_anchor_tokens
+                   and .continuation_uncached_tokens == $pc.prompt.tool_result_uncached_suffix_tokens
                    and .cached_ttft_ms <= 5000
                    and .cached_semantic_response_ms <= 15000
                    and .auto_semantic_response_ms <= 15000
@@ -542,6 +615,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
+            echo "MLX_NATIVE_SKIP_METALLIB is forbidden for release builds" >&2
+            exit 1
+          fi
           cargo package --locked
           crate="target/package/hf2q-${EXPECTED_VERSION}.crate"
           test -s "$crate"

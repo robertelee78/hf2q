@@ -1321,6 +1321,18 @@ impl InflightBatchedScheduler {
             .collect()
     }
 
+    /// Return every in-flight prefill handle in admission/FIFO order.
+    /// Family workers may use this read-only view to form an immediately
+    /// available cooperative transaction; it never waits for another lane or
+    /// changes scheduler ownership.
+    pub(crate) fn prefill_handles_fifo(&self) -> Vec<SlotHandle> {
+        self.in_flight
+            .iter()
+            .filter(|slot| matches!(slot.phase, SlotPhase::Prefilling { .. }))
+            .map(|slot| slot.handle)
+            .collect()
+    }
+
     /// Driver callback: report `n_consumed` tokens of prefill were
     /// executed against `handle`. Stale handles, wrong-phase slots, and
     /// unknown handles are silent no-ops.
@@ -2150,6 +2162,29 @@ mod tests {
             }
             other => panic!("expected Prefill, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn inflight_prefill_handles_preserve_current_fifo_order_without_mutation() {
+        let mut scheduler = InflightBatchedScheduler::new(4, 4);
+        let first = handle_of(&scheduler.admit(req(13, 32)).expect("admit first"));
+        let second = handle_of(&scheduler.admit(req(17, 32)).expect("admit second"));
+        let third = handle_of(&scheduler.admit(req(19, 32)).expect("admit third"));
+        assert_eq!(scheduler.prefill_handles_fifo(), vec![first, second, third]);
+        assert_eq!(
+            scheduler.prefill_handles_fifo(),
+            vec![first, second, third],
+            "the read-only cohort view must not rotate scheduler ownership"
+        );
+
+        scheduler.advance_after_prefill(first, 13);
+        assert_eq!(scheduler.prefill_handles_fifo(), vec![second, third]);
+        scheduler.yield_prefill_turn(second);
+        assert_eq!(
+            scheduler.prefill_handles_fifo(),
+            vec![third, second],
+            "an explicit family yield defines the new scheduling order"
+        );
     }
 
     #[test]

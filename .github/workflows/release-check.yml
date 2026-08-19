@@ -104,7 +104,12 @@ jobs:
           restore-keys: release-cargo-${{ runner.os }}-
 
       - name: cargo build --release
-        run: cargo build --release --locked
+        run: |
+          if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
+            echo "MLX_NATIVE_SKIP_METALLIB is forbidden for release checks" >&2
+            exit 1
+          fi
+          cargo build --release --locked
 
       - name: scripts/release-check.sh
         env:

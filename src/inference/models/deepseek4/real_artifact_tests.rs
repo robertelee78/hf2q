@@ -5,7 +5,7 @@ use mlx_native::gguf::GgufFile;
 use super::model::Deepseek4Model;
 use super::weights::required_tensor_specs;
 
-fn official_artifact() -> (PathBuf, GgufFile) {
+pub(super) fn official_artifact() -> (PathBuf, GgufFile) {
     let path = PathBuf::from(
         std::env::var("HF2Q_DEEPSEEK4_GGUF")
             .expect("set HF2Q_DEEPSEEK4_GGUF to the locally converted official GGUF"),

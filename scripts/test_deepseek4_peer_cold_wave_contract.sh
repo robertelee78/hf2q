@@ -43,7 +43,7 @@ apply_fake_curl
 
 positive="$tmp/positive"
 FAKE_EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
-FAKE_PROMPT_TOKENS=6685 EXPECTED_PROMPT_TOKENS=6685 \
+FAKE_PROMPT_TOKENS=6695 EXPECTED_PROMPT_TOKENS=6695 \
 CURL_BIN="$fake_curl" AGENTS=4 \
 OUT_DIR="$positive" WAVE_ID=contract-positive \
   "$ROOT_DIR/scripts/test_deepseek4_peer_cold_wave.sh" \
@@ -52,7 +52,9 @@ jq -e '
   .status == "pass"
   and .runtime == "llama.cpp"
   and .concurrent_agents == 4
-  and .prompt_tokens == 6685
+  and .fixture_id == "full-context-agentic-v2"
+  and (.prompt_contract_sha256 | test("^[0-9a-f]{64}$"))
+  and .prompt_tokens == 6695
   and .maximum_cold_semantic_response_ms == 54
   and (.agents | length) == 4
   and all(.agents[];
@@ -62,7 +64,7 @@ shasum -a 256 -c "$positive/summary.json.sha256" >/dev/null
 
 negative="$tmp/negative"
 if FAKE_EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
-  FAKE_PROMPT_TOKENS=6684 EXPECTED_PROMPT_TOKENS=6685 \
+  FAKE_PROMPT_TOKENS=6685 EXPECTED_PROMPT_TOKENS=6695 \
   CURL_BIN="$fake_curl" AGENTS=2 \
   OUT_DIR="$negative" WAVE_ID=contract-negative \
     "$ROOT_DIR/scripts/test_deepseek4_peer_cold_wave.sh" \
@@ -70,6 +72,6 @@ if FAKE_EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
   echo "peer contract accepted a drifted prompt-token count" >&2
   exit 1
 fi
-grep -q 'rendered 6684 prompt tokens; expected 6685' "$tmp/negative.stderr"
+grep -q 'rendered 6685 prompt tokens; expected 6695' "$tmp/negative.stderr"
 
 echo "DeepSeek matched-peer cold-wave contract passed"

@@ -2,12 +2,13 @@
 
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
+use mlx_native::ops::copy::dispatch_copy_f32;
 use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::forward_support::{
-    alloc_persistent, begin_decode_pool_token, begin_prefill_pool_layer,
+    alloc, alloc_persistent, begin_decode_pool_token, begin_prefill_pool_layer,
     begin_prefill_submission_inputs, end_decode_pool_token, end_prefill_pool_layer,
     end_prefill_submission_inputs,
 };
@@ -22,6 +23,14 @@ const DEFAULT_MATRIX_PREFILL_WINDOWS: usize = 32;
 const LARGE_MODEL_MATRIX_PREFILL_WINDOWS: usize = 16;
 const LARGE_MODEL_RESIDENT_BYTES: u64 = 100_000_000_000;
 pub(crate) const MIN_MATRIX_APPEND_TOKENS: usize = 33;
+pub(crate) const MAX_COOPERATIVE_PREFILL_ROWS: usize = 2_048;
+
+struct CooperativePrefillLayout {
+    rows_per_sequence: Vec<usize>,
+    total_rows: usize,
+    row_elements: usize,
+    combined_elements: usize,
+}
 
 static STAGE_PROFILE_CAPTURED: AtomicBool = AtomicBool::new(false);
 
@@ -62,6 +71,89 @@ fn publish_prefill_cache_after_gate(
         "DeepSeek-V4 prompt prefill rejected before cache publication",
         "publish complete DeepSeek-V4 prompt prefill",
     )
+}
+
+pub(super) fn publish_prefill_cohort_after_gate(
+    caches: &mut [&mut Deepseek4Cache],
+    spans: &[CacheSpan],
+    commit_gate: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(
+        caches.len() == spans.len(),
+        "DeepSeek-V4 cooperative prefill received {} cache spans for {} caches",
+        spans.len(),
+        caches.len()
+    );
+    let tickets = spans
+        .iter()
+        .zip(caches.iter())
+        .map(|(span, cache)| {
+            cache
+                .validate_prefill_commit(span.start_position, span.token_count)
+                .context("prevalidate DeepSeek-V4 cooperative prefill publication")
+        })
+        .collect::<Result<Vec<_>>>();
+    let tickets = match tickets {
+        Ok(tickets) => tickets,
+        Err(error) => {
+            for cache in caches.iter_mut() {
+                cache.poison();
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = commit_gate() {
+        for cache in caches.iter_mut() {
+            cache.poison();
+        }
+        return Err(error)
+            .context("DeepSeek-V4 cooperative prefill rejected before cache publication");
+    }
+    for (cache, ticket) in caches.iter_mut().zip(tickets) {
+        cache.publish_prefill_end(ticket);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn plan_cooperative_prefill_layout(
+    token_batches: &[&[u32]],
+    hyper_connection_count: usize,
+    hidden_size: usize,
+) -> Result<()> {
+    cooperative_prefill_layout(token_batches, hyper_connection_count, hidden_size).map(|_| ())
+}
+
+fn cooperative_prefill_layout(
+    token_batches: &[&[u32]],
+    hyper_connection_count: usize,
+    hidden_size: usize,
+) -> Result<CooperativePrefillLayout> {
+    let rows_per_sequence = token_batches
+        .iter()
+        .map(|tokens| tokens.len())
+        .collect::<Vec<_>>();
+    let total_rows = rows_per_sequence.iter().try_fold(0_usize, |total, rows| {
+        total
+            .checked_add(*rows)
+            .context("DeepSeek-V4 cooperative prefill row count overflow")
+    })?;
+    anyhow::ensure!(
+        total_rows <= MAX_COOPERATIVE_PREFILL_ROWS,
+        "DeepSeek-V4 cooperative prefill has {total_rows} aggregate rows; maximum is {MAX_COOPERATIVE_PREFILL_ROWS}"
+    );
+    let row_elements = hyper_connection_count
+        .checked_mul(hidden_size)
+        .context("DeepSeek-V4 cooperative prefill row width overflow")?;
+    let combined_elements = total_rows
+        .checked_mul(row_elements)
+        .context("DeepSeek-V4 cooperative prefill state size overflow")?;
+    Ok(CooperativePrefillLayout {
+        rows_per_sequence,
+        total_rows,
+        row_elements,
+        combined_elements,
+    })
 }
 
 fn publish_verifier_cache_after_gate(
@@ -184,6 +276,78 @@ impl Deepseek4Model {
         self.forward_verifier_prefill_with_commit_gate(token_ids, cache, || Ok(()))
     }
 
+    /// Execute independent prompt transactions as one layer-major cohort.
+    ///
+    /// Attention and cache writes remain sequence-local. After each sequence's
+    /// attention finishes, its rows are packed into one contiguous tensor and
+    /// the row-local FFN/MoE executes once across the complete cohort. Logical
+    /// cache cursors publish only after every GPU transaction and the shared
+    /// commit gate complete successfully.
+    pub(crate) fn forward_verifier_prefill_cohort_with_commit_gate(
+        &mut self,
+        token_batches: &[&[u32]],
+        caches: &mut [&mut Deepseek4Cache],
+        commit_gate: impl FnOnce() -> Result<()>,
+    ) -> Result<Vec<MlxBuffer>> {
+        anyhow::ensure!(
+            token_batches.len() >= 2,
+            "DeepSeek-V4 cooperative prefill requires at least two sequences"
+        );
+        anyhow::ensure!(
+            token_batches.len() == caches.len(),
+            "DeepSeek-V4 cooperative prefill received {} token batches for {} caches",
+            token_batches.len(),
+            caches.len()
+        );
+        anyhow::ensure!(
+            token_batches.iter().all(|tokens| !tokens.is_empty()),
+            "DeepSeek-V4 cooperative prefill received an empty token batch"
+        );
+        let layout = cooperative_prefill_layout(
+            token_batches,
+            self.cfg.hyper_connection_count as usize,
+            self.cfg.hidden_size as usize,
+        )?;
+        let spans = token_batches
+            .iter()
+            .zip(caches.iter())
+            .map(|(tokens, cache)| {
+                cache
+                    .plan_prefill(tokens.len())
+                    .context("plan DeepSeek-V4 cooperative prefill transaction")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (states, submitted_any) =
+            self.forward_verifier_prefill_cohort_uncommitted(token_batches, caches, &spans, layout);
+        let states = match states {
+            Ok(states) => states,
+            Err(error) => {
+                if submitted_any {
+                    for cache in caches.iter_mut() {
+                        cache.poison();
+                    }
+                    return Err(error).context(
+                        "DeepSeek-V4 cooperative prefill partially executed; caches poisoned",
+                    );
+                }
+                return Err(error)
+                    .context("DeepSeek-V4 cooperative prefill failed before GPU submission");
+            }
+        };
+        publish_prefill_cohort_after_gate(caches, &spans, commit_gate)?;
+        Ok(states)
+    }
+
+    /// Immediate-commit wrapper for diagnostics and parity tests.
+    #[cfg(test)]
+    pub(super) fn forward_verifier_prefill_cohort(
+        &mut self,
+        token_batches: &[&[u32]],
+        caches: &mut [&mut Deepseek4Cache],
+    ) -> Result<Vec<MlxBuffer>> {
+        self.forward_verifier_prefill_cohort_with_commit_gate(token_batches, caches, || Ok(()))
+    }
+
     /// Execute a bounded prompt transaction, but publish its logical cache
     /// cursor only after the caller accepts the completed GPU transaction.
     /// Serving uses this gate for the worker deadline lease; CLI and existing
@@ -277,6 +441,236 @@ impl Deepseek4Model {
             state = Some(self.forward_verifier_one(token, cache)?);
         }
         state.context("DeepSeek-V4 prompt encoded zero chunks")
+    }
+
+    fn forward_verifier_prefill_cohort_uncommitted(
+        &mut self,
+        token_batches: &[&[u32]],
+        caches: &mut [&mut Deepseek4Cache],
+        spans: &[CacheSpan],
+        layout: CooperativePrefillLayout,
+    ) -> (Result<Vec<MlxBuffer>>, bool) {
+        let mut submitted_any = false;
+        let result = (|| -> Result<Vec<MlxBuffer>> {
+            let layers = self.cfg.num_hidden_layers as usize;
+            let CooperativePrefillLayout {
+                rows_per_sequence,
+                total_rows,
+                row_elements,
+                combined_elements,
+            } = layout;
+            let hc = self.cfg.hyper_connection_count as usize;
+            let hidden = self.cfg.hidden_size as usize;
+            let combined_tokens = token_batches
+                .iter()
+                .flat_map(|tokens| tokens.iter().copied())
+                .collect::<Vec<_>>();
+            let device = self.ctx.device().clone();
+            let executor = GraphExecutor::new(device.clone());
+            let reusable_states = [
+                alloc_persistent(
+                    &device,
+                    DType::F32,
+                    vec![total_rows, hc, hidden],
+                    "cooperative prefill state ping",
+                )?,
+                alloc_persistent(
+                    &device,
+                    DType::F32,
+                    vec![total_rows, hc, hidden],
+                    "cooperative prefill state pong",
+                )?,
+            ];
+            let combined_attention = alloc_persistent(
+                &device,
+                DType::F32,
+                vec![total_rows, hc, hidden],
+                "cooperative prefill attention",
+            )?;
+            let mut id_mm_scratch = if total_rows > MM_ID_ROUTING_THRESHOLD as usize {
+                let rows = u32::try_from(total_rows)
+                    .context("DeepSeek-V4 cooperative prefill rows exceed u32")?;
+                Some([
+                    IdMmScratch::alloc(self.ctx.device(), self.cfg.num_experts, rows)
+                        .context("allocate cooperative gate/down mm_id scratch")?,
+                    IdMmScratch::alloc(self.ctx.device(), self.cfg.num_experts, rows)
+                        .context("allocate cooperative up mm_id scratch")?,
+                ])
+            } else {
+                None
+            };
+            let mut state = None;
+            for layer in 0..layers {
+                let mut row_offset = 0_usize;
+                for sequence in 0..token_batches.len() {
+                    let rows = rows_per_sequence[sequence];
+                    let element_offset = row_offset
+                        .checked_mul(row_elements)
+                        .context("DeepSeek-V4 cooperative state offset overflow")?;
+                    let element_count = rows
+                        .checked_mul(row_elements)
+                        .context("DeepSeek-V4 cooperative state slice overflow")?;
+                    begin_prefill_pool_layer();
+                    let attention_result: Result<()> = (|| {
+                        let mut session = executor.begin().with_context(|| {
+                            format!(
+                                "begin DeepSeek-V4 cooperative prefill layer {layer} sequence {sequence} attention"
+                            )
+                        })?;
+                        // Several DeepSeek attention kernels require a zero-offset
+                        // source allocation. Materialize the logical lane inside
+                        // the same ordered command buffer rather than exposing a
+                        // nonzero-offset view.
+                        let sequence_state = if let Some(state) = state.as_ref() {
+                            let sequence_state = alloc(
+                                &device,
+                                DType::F32,
+                                vec![rows, hc, hidden],
+                                "cooperative prefill sequence state",
+                            )?;
+                            dispatch_copy_f32(
+                                session.encoder_mut(),
+                                &mut self.ctx.registry,
+                                device.metal_device(),
+                                state,
+                                &sequence_state,
+                                element_offset,
+                                0,
+                                element_count,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "unpack DeepSeek-V4 cooperative prefill layer-{layer} sequence-{sequence} state"
+                                )
+                            })?;
+                            session.barrier();
+                            Some(sequence_state)
+                        } else {
+                            None
+                        };
+                        let attention = if layer == 0 {
+                            anyhow::ensure!(
+                                sequence_state.is_none(),
+                                "DeepSeek-V4 cooperative layer 0 must embed each prompt"
+                            );
+                            self.forward_uncompressed_attention_prefill(
+                                None,
+                                token_batches[sequence],
+                                layer,
+                                caches[sequence],
+                                &spans[sequence],
+                                None,
+                                Some(&mut session),
+                            )
+                        } else if self.cfg.compress_ratios[layer] == 0 {
+                            self.forward_uncompressed_attention_prefill(
+                                sequence_state.as_ref(),
+                                token_batches[sequence],
+                                layer,
+                                caches[sequence],
+                                &spans[sequence],
+                                None,
+                                Some(&mut session),
+                            )
+                        } else {
+                            self.forward_compressed_attention_prefill(
+                                sequence_state.as_ref().context(
+                                    "DeepSeek-V4 cooperative compressed attention is missing state",
+                                )?,
+                                layer,
+                                caches[sequence],
+                                &spans[sequence],
+                                None,
+                                Some(&mut session),
+                            )
+                        }
+                        .with_context(|| {
+                            format!(
+                                "encode DeepSeek-V4 cooperative prefill layer-{layer} sequence-{sequence} attention"
+                            )
+                        })?;
+                        session.barrier();
+                        dispatch_copy_f32(
+                            session.encoder_mut(),
+                            &mut self.ctx.registry,
+                            device.metal_device(),
+                            &attention,
+                            &combined_attention,
+                            0,
+                            element_offset,
+                            element_count,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "pack DeepSeek-V4 cooperative prefill layer-{layer} sequence-{sequence} attention"
+                            )
+                        })?;
+                        // Encoding errors above drop an uncommitted command
+                        // buffer. Once finish begins, cache writes may have
+                        // reached Metal even if completion reports an error.
+                        submitted_any = true;
+                        session.finish().with_context(|| {
+                            format!(
+                                "execute DeepSeek-V4 cooperative prefill layer-{layer} sequence-{sequence} attention"
+                            )
+                        })?;
+                        Ok(())
+                    })();
+                    end_prefill_pool_layer();
+                    attention_result?;
+                    row_offset += rows;
+                }
+
+                begin_prefill_pool_layer();
+                let ffn_result: Result<MlxBuffer> = (|| {
+                    let mut session = executor.begin_recorded().with_context(|| {
+                        format!("begin DeepSeek-V4 cooperative prefill layer {layer} FFN")
+                    })?;
+                    let next_state = self.forward_ffn_rows(
+                        &combined_attention,
+                        &combined_tokens,
+                        layer,
+                        None,
+                        Some(&mut session),
+                        Some(reusable_states[layer % reusable_states.len()].clone()),
+                        id_mm_scratch.as_mut(),
+                    )?;
+                    session.finish().with_context(|| {
+                        format!("execute DeepSeek-V4 cooperative prefill layer-{layer} FFN")
+                    })?;
+                    Ok(next_state)
+                })();
+                end_prefill_pool_layer();
+                state = Some(ffn_result?);
+            }
+            let state = state.context("DeepSeek-V4 cooperative prefill encoded zero layers")?;
+            let mut outputs = Vec::with_capacity(rows_per_sequence.len());
+            let mut row_offset = 0_usize;
+            for rows in rows_per_sequence {
+                let element_offset = row_offset
+                    .checked_mul(row_elements)
+                    .context("DeepSeek-V4 cooperative output offset overflow")?;
+                let element_count = rows
+                    .checked_mul(row_elements)
+                    .context("DeepSeek-V4 cooperative output size overflow")?;
+                outputs.push(
+                    state
+                        .slice_view(
+                            (element_offset * DType::F32.size_of()) as u64,
+                            element_count,
+                        )
+                        .with_shape(vec![rows, hc, hidden])
+                        .context("shape DeepSeek-V4 cooperative output view")?,
+                );
+                row_offset += rows;
+            }
+            anyhow::ensure!(
+                row_offset == total_rows && combined_elements == state.element_count(),
+                "DeepSeek-V4 cooperative prefill output partition drift"
+            );
+            Ok(outputs)
+        })();
+        (result, submitted_any)
     }
 
     fn forward_verifier_prefill_uncommitted(
