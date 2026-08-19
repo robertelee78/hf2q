@@ -101,6 +101,84 @@ impl LockedMetadataState {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn with_extracted_executable<R, E>(
+        &self,
+        tree: &super::super::ExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        operation: impl FnOnce(
+            &std::path::Path,
+            &std::fs::File,
+            super::super::ExecutableReleaseBinding,
+        ) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<super::super::ExtractionError>,
+    {
+        super::super::extraction::with_extracted_executable(
+            &self.journal.locked,
+            tree,
+            exact_manifest,
+            manifest,
+            operation,
+        )
+    }
+
+    pub(in crate::distribution) fn normalize_extracted_release(
+        &self,
+        developer_id: crate::distribution::prepared_release::DeveloperIdVerification,
+        tree: super::super::ExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+    ) -> Result<super::super::NormalizedExtractedReleaseTree, super::super::ExtractionError> {
+        super::super::extraction::normalize_developer_id_verified_release(
+            &self.journal.locked,
+            developer_id,
+            tree,
+            exact_manifest,
+            manifest,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn with_normalized_executable<R, E>(
+        &self,
+        tree: &super::super::NormalizedExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        operation: impl FnOnce(
+            &std::path::Path,
+            &std::fs::File,
+            super::super::ExecutableReleaseBinding,
+        ) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<super::super::ExtractionError>,
+    {
+        super::super::extraction::with_normalized_executable(
+            &self.journal.locked,
+            tree,
+            exact_manifest,
+            manifest,
+            operation,
+        )
+    }
+
+    pub(in crate::distribution) fn verify_normalized_release_tree(
+        &self,
+        tree: &super::super::NormalizedExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+    ) -> Result<(), super::super::ExtractionError> {
+        super::super::extraction::verify_normalized_release_tree(
+            &self.journal.locked,
+            tree,
+            exact_manifest,
+            manifest,
+        )
+    }
+
     /// Read structurally complete selected bytes while allowing only the
     /// bounded transaction residue that this held lock is authorized to
     /// recover. The signed-update verifier must authenticate the result.

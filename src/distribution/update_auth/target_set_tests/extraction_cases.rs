@@ -7,6 +7,10 @@ use zip::{CompressionMethod, ZipWriter};
 
 use super::*;
 use crate::distribution::install_state::metadata::MetadataJournalError;
+#[cfg(target_os = "macos")]
+use crate::distribution::prepared_release::verify_and_normalize_release_for_test;
+#[cfg(target_os = "macos")]
+use crate::distribution::prepared_release::verify_and_normalize_release_with_hook_for_test;
 use crate::distribution::prepared_release::{bind_archive, extract_release, PreparedReleaseError};
 use crate::distribution::schema::ReleaseManifestV1;
 use crate::distribution::update_auth::test_repository::{
@@ -326,6 +330,397 @@ fn stored_and_deflated_bundles_cross_the_complete_extraction_boundary() {
                 .expect("dropping extracted proof releases the shared lock"),
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn signed_mode_normalization_is_sealed_and_keeps_the_tree_inert() {
+    let (manifest, manifest_bytes) = manifest();
+    let directories = manifest.derived_directories().to_vec();
+    let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+    let fixture = stable_release_repository_for_artifacts(&manifest_bytes, &archive_bytes);
+    let (temp, authorization) = make_authorization();
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical parent")
+        .join("state");
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let release = bundle(
+        &authorization,
+        &anchor,
+        &fixture.pointer,
+        manifest,
+        manifest_bytes,
+        &archive_bytes,
+    );
+    let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+        .expect("profile-bound extraction succeeds");
+    let normalized = verify_and_normalize_release_for_test(extracted, None, None)
+        .expect("scripted native proof brackets signed-mode normalization");
+    assert_eq!(
+        format!("{normalized:?}"),
+        "SignedModeNormalizedRelease { .. }"
+    );
+
+    let stage = root.join("update/extractions").join(format!(
+        ".extract-v0.2.0-{}",
+        hex::encode(Sha256::digest(&archive_bytes))
+    ));
+    assert_eq!(
+        std::fs::metadata(stage.join("release-manifest.json"))
+            .expect("manifest metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    for (path, _, mode) in PAYLOADS {
+        assert_eq!(
+            std::fs::metadata(stage.join(path))
+                .expect("payload metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            u32::from_str_radix(mode, 8).expect("octal fixture mode")
+        );
+    }
+    for directory in directories {
+        assert_eq!(
+            std::fs::metadata(stage.join(directory))
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(&stage)
+            .expect("stage metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
+    assert!(matches!(
+        crate::distribution::install_state::metadata::lock_metadata_state(&authorization),
+        Err(MetadataJournalError::InstallState(
+            crate::distribution::install_state::InstallStateError::Busy
+        ))
+    ));
+    drop(normalized);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_native_brackets_return_no_capability_and_exact_retry_recovers() {
+    for failed_call in [1_usize, 2_usize] {
+        let (manifest, manifest_bytes) = manifest();
+        let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+        let fixture = stable_release_repository_for_artifacts(&manifest_bytes, &archive_bytes);
+        let (temp, authorization) = make_authorization();
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical parent")
+            .join("state");
+        let anchor = leaked_anchor(&fixture.repository.anchor);
+        commit_fixture(&authorization, &anchor, &fixture.repository);
+
+        let release = bundle(
+            &authorization,
+            &anchor,
+            &fixture.pointer,
+            manifest.clone(),
+            manifest_bytes.clone(),
+            &archive_bytes,
+        );
+        let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+            .expect("profile-bound extraction succeeds");
+        assert!(matches!(
+            verify_and_normalize_release_for_test(extracted, None, Some(failed_call)),
+            Err(PreparedReleaseError::CodeSigning)
+        ));
+
+        let stage = root.join("update/extractions").join(format!(
+            ".extract-v0.2.0-{}",
+            hex::encode(Sha256::digest(&archive_bytes))
+        ));
+        let expected_mode = if failed_call == 1 { 0o600 } else { 0o755 };
+        assert_eq!(
+            std::fs::metadata(stage.join("bin/hf2q"))
+                .expect("retained binary metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode
+        );
+        assert!(!root.join("versions").exists());
+        assert!(!root.join("activations").exists());
+        assert!(!root.join("current").exists());
+
+        let retry = bundle(
+            &authorization,
+            &anchor,
+            &fixture.pointer,
+            manifest.clone(),
+            manifest_bytes.clone(),
+            &archive_bytes,
+        );
+        let extracted = extract_release(bind_archive(retry).expect("retry archive profile binds"))
+            .expect("retry extraction recognizes the retained exact state");
+        drop(
+            verify_and_normalize_release_for_test(extracted, None, None)
+                .expect("exact retry repeats both verifier brackets"),
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn post_normalization_clock_failure_returns_no_capability() {
+    let (manifest, manifest_bytes) = manifest();
+    let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+    let fixture = stable_release_repository_for_artifacts_with_expiry(
+        &manifest_bytes,
+        &archive_bytes,
+        "2099-01-01T00:00:00Z",
+    );
+    let (temp, authorization) = make_authorization();
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical parent")
+        .join("state");
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let release = bundle(
+        &authorization,
+        &anchor,
+        &fixture.pointer,
+        manifest,
+        manifest_bytes,
+        &archive_bytes,
+    );
+    let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+        .expect("profile-bound extraction succeeds");
+    let error = verify_and_normalize_release_for_test(
+        extracted,
+        Some(vec![
+            instant("2099-01-01T00:00:00Z"),
+            instant("2099-01-01T00:00:01Z"),
+        ]),
+        None,
+    )
+    .expect_err("expiry at the post-normalization replay consumes the capability");
+    assert!(matches!(
+        error,
+        PreparedReleaseError::Authentication(ArtifactFetchAuthorizationError::Authentication(
+            TufVerifierError::ExpiredMetadata
+        ))
+    ));
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn post_normalization_clock_rollback_returns_no_capability() {
+    let (manifest, manifest_bytes) = manifest();
+    let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+    let fixture = stable_release_repository_for_artifacts(&manifest_bytes, &archive_bytes);
+    let (temp, authorization) = make_authorization();
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical parent")
+        .join("state");
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let release = bundle(
+        &authorization,
+        &anchor,
+        &fixture.pointer,
+        manifest,
+        manifest_bytes,
+        &archive_bytes,
+    );
+    let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+        .expect("profile-bound extraction succeeds");
+    let error = verify_and_normalize_release_for_test(
+        extracted,
+        Some(vec![
+            instant("2026-08-18T09:00:00Z"),
+            instant("2026-08-18T09:00:01Z"),
+        ]),
+        None,
+    )
+    .expect_err("clock rollback at the post-normalization replay consumes the capability");
+    assert!(matches!(
+        error,
+        PreparedReleaseError::Authentication(ArtifactFetchAuthorizationError::Authentication(
+            TufVerifierError::ClockRollback
+        ))
+    ));
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn selected_generation_drift_after_normalization_returns_no_capability() {
+    let (manifest, manifest_bytes) = manifest();
+    let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+    let fixture = stable_release_repository_for_artifacts(&manifest_bytes, &archive_bytes);
+    let (temp, authorization) = make_authorization();
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical parent")
+        .join("state");
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let release = bundle(
+        &authorization,
+        &anchor,
+        &fixture.pointer,
+        manifest,
+        manifest_bytes,
+        &archive_bytes,
+    );
+    let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+        .expect("profile-bound extraction succeeds");
+    let selector = root.join("update/metadata/current.json");
+    let error = verify_and_normalize_release_with_hook_for_test(extracted, || {
+        let mut bytes = std::fs::read(&selector).expect("selected metadata selector");
+        let sequence = bytes
+            .windows(b"\"sequence\":1".len())
+            .position(|window| window == b"\"sequence\":1")
+            .expect("sequence-one selector");
+        *bytes
+            .get_mut(sequence + b"\"sequence\":".len())
+            .expect("selector sequence byte") = b'2';
+        std::fs::write(&selector, bytes).expect("same-user selector mutation");
+    })
+    .expect_err("selected generation drift consumes the normalized capability");
+    assert!(matches!(error, PreparedReleaseError::Authentication(_)));
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn extraction_namespace_swap_between_native_brackets_returns_no_capability() {
+    let (manifest, manifest_bytes) = manifest();
+    let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+    let fixture = stable_release_repository_for_artifacts(&manifest_bytes, &archive_bytes);
+    let (temp, authorization) = make_authorization();
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical parent")
+        .join("state");
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let release = bundle(
+        &authorization,
+        &anchor,
+        &fixture.pointer,
+        manifest,
+        manifest_bytes,
+        &archive_bytes,
+    );
+    let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+        .expect("profile-bound extraction succeeds");
+    let update = root.join("update");
+    let error = verify_and_normalize_release_with_hook_for_test(extracted, || {
+        std::fs::rename(
+            update.join("extractions"),
+            update.join("extractions-detached"),
+        )
+        .expect("detach normalized namespace");
+        std::fs::create_dir(update.join("extractions")).expect("replacement extraction namespace");
+        std::fs::set_permissions(
+            update.join("extractions"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("replacement namespace mode");
+    })
+    .expect_err("the final native bracket must reject the replacement namespace");
+    assert!(matches!(error, PreparedReleaseError::Extraction(_)));
+    assert!(
+        update
+            .join("extractions-detached")
+            .join(format!(
+                ".extract-v0.2.0-{}",
+                hex::encode(Sha256::digest(&archive_bytes))
+            ))
+            .exists(),
+        "detached normalized evidence is preserved"
+    );
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn normalized_nonbinary_mutation_after_the_first_native_check_is_rejected() {
+    let (manifest, manifest_bytes) = manifest();
+    let archive_bytes = archive(&manifest_bytes, CompressionMethod::Stored);
+    let fixture = stable_release_repository_for_artifacts(&manifest_bytes, &archive_bytes);
+    let (temp, authorization) = make_authorization();
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical parent")
+        .join("state");
+    let anchor = leaked_anchor(&fixture.repository.anchor);
+    commit_fixture(&authorization, &anchor, &fixture.repository);
+
+    let release = bundle(
+        &authorization,
+        &anchor,
+        &fixture.pointer,
+        manifest,
+        manifest_bytes,
+        &archive_bytes,
+    );
+    let extracted = extract_release(bind_archive(release).expect("archive profile binds"))
+        .expect("profile-bound extraction succeeds");
+    let document = root
+        .join("update/extractions")
+        .join(format!(
+            ".extract-v0.2.0-{}",
+            hex::encode(Sha256::digest(&archive_bytes))
+        ))
+        .join("share/doc/hf2q/README.md");
+    let corrupt = vec![b'x'; PAYLOADS[1].1.len()];
+    let error = verify_and_normalize_release_with_hook_for_test(extracted, || {
+        std::fs::write(&document, &corrupt).expect("same-user nonbinary mutation");
+    })
+    .expect_err("the final whole-tree replay must reject nonbinary mutation");
+    assert!(matches!(error, PreparedReleaseError::Extraction(_)));
+    assert_eq!(
+        std::fs::read(document).expect("corrupt evidence retained"),
+        corrupt
+    );
+    assert!(!root.join("versions").exists());
+    assert!(!root.join("activations").exists());
+    assert!(!root.join("current").exists());
 }
 
 #[test]

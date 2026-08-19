@@ -134,14 +134,15 @@ fn signing_information_is_a_closed_fail_closed_profile() {
 fn manifest_policy_failure_happens_before_path_lookup() {
     let manifest = manifest();
     let policy = SigningPolicy::for_test("Z9Y8X7W6V5", IDENTIFIER).expect("test policy");
-    assert_eq!(
+    assert!(matches!(
         verify_path(
             std::path::Path::new("/path/that/must/not/be-opened"),
             &manifest,
             &policy,
+            crate::distribution::install_state::ExecutableReleaseBinding::for_test(),
         ),
         Err(CodeSigningError::Policy)
-    );
+    ));
 }
 
 #[test]
@@ -149,10 +150,15 @@ fn current_test_binary_is_not_accepted_as_a_developer_id_release() {
     let path = std::env::current_exe().expect("current test executable path");
     let manifest = manifest();
     let policy = SigningPolicy::for_test(TEAM_ID, IDENTIFIER).expect("test policy");
-    assert_eq!(
-        verify_path(&path, &manifest, &policy),
+    assert!(matches!(
+        verify_path(
+            &path,
+            &manifest,
+            &policy,
+            crate::distribution::install_state::ExecutableReleaseBinding::for_test(),
+        ),
         Err(CodeSigningError::InvalidSignature)
-    );
+    ));
 }
 
 #[test]
@@ -190,6 +196,11 @@ fn protected_developer_id_release_fixture_is_accepted() {
     )
     .expect("test manifest");
     let policy = SigningPolicy::for_test(&team_id, IDENTIFIER).expect("test signing policy");
-    verify_path(std::path::Path::new(&path), &manifest, &policy)
-        .expect("protected Developer ID fixture");
+    verify_path(
+        std::path::Path::new(&path),
+        &manifest,
+        &policy,
+        crate::distribution::install_state::ExecutableReleaseBinding::for_test(),
+    )
+    .expect("protected Developer ID fixture");
 }

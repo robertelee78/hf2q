@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::macho::{verify_bytes, MachOError};
+use super::macho::{verify_bytes, verify_file, verify_file_with_length_for_test, MachOError};
 use crate::distribution::schema::ReleaseManifestV1;
 
 mod fixture;
@@ -84,6 +84,25 @@ fn exact_thin_arm64_system_only_profile_is_accepted() {
     let manifest = manifest(bytes.len() as u64, "14.0", false);
     let verified = verify_bytes(&bytes, &manifest).expect("valid thin arm64 Mach-O");
     assert_eq!(verified.code_signature_range().end, bytes.len() as u64);
+}
+
+#[test]
+fn retained_file_adapter_matches_bytes_and_rejects_mid_read_truncation() {
+    use std::io::Write;
+
+    let bytes = fixture(FixtureOptions::default());
+    let manifest = manifest(bytes.len() as u64, "14.0", false);
+    let mut file = tempfile::tempfile().expect("temporary Mach-O file");
+    file.write_all(&bytes).expect("write Mach-O fixture");
+    let from_bytes = verify_bytes(&bytes, &manifest).expect("byte source");
+    let from_file = verify_file(&file, &manifest).expect("retained file source");
+    assert_eq!(from_file, from_bytes);
+
+    file.set_len(16).expect("truncate retained file");
+    assert_eq!(
+        verify_file_with_length_for_test(&file, bytes.len() as u64, &manifest),
+        Err(MachOError::Read)
+    );
 }
 #[test]
 fn architecture_header_and_executable_memory_policy_fail_closed() {

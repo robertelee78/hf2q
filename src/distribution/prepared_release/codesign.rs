@@ -34,6 +34,29 @@ pub(super) struct SigningPolicy {
     identifier: String,
 }
 
+/// Ephemeral proof that Security.framework accepted the exact staged inode.
+pub(in crate::distribution) struct DeveloperIdVerification {
+    binding: crate::distribution::install_state::ExecutableReleaseBinding,
+}
+
+#[cfg(test)]
+impl DeveloperIdVerification {
+    pub(in crate::distribution) fn for_test(
+        binding: crate::distribution::install_state::ExecutableReleaseBinding,
+    ) -> Self {
+        Self { binding }
+    }
+}
+
+impl DeveloperIdVerification {
+    pub(in crate::distribution) fn matches(
+        self,
+        current: crate::distribution::install_state::ExecutableReleaseBinding,
+    ) -> bool {
+        self.binding == current
+    }
+}
+
 impl SigningPolicy {
     #[cfg(test)]
     pub(super) fn for_test(team_id: &str, identifier: &str) -> Result<Self, CodeSigningError> {
@@ -136,7 +159,8 @@ pub(super) fn verify_path(
     path: &Path,
     manifest: &ReleaseManifestV1,
     policy: &SigningPolicy,
-) -> Result<(), CodeSigningError> {
+    binding: crate::distribution::install_state::ExecutableReleaseBinding,
+) -> Result<DeveloperIdVerification, CodeSigningError> {
     policy.require_manifest(manifest)?;
     let url = CFURL::from_path(path, false).ok_or(CodeSigningError::InvalidSignature)?;
     let requirement = SecRequirement::from_str(&policy.requirement())
@@ -155,7 +179,8 @@ pub(super) fn verify_path(
         &policy.team_id,
         manifest.code_signing().certificate_common_name(),
     )?;
-    validate_signing_info(&view)
+    validate_signing_info(&view)?;
+    Ok(DeveloperIdVerification { binding })
 }
 
 #[cfg(test)]

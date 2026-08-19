@@ -1,5 +1,8 @@
 use std::io::{Read, Seek, SeekFrom};
 
+#[cfg(target_os = "macos")]
+use std::fs::File;
+
 use zip::{CompressionMethod, ZipArchive};
 
 use super::archive::VerifiedArchiveProfile;
@@ -7,6 +10,11 @@ use super::{ArchiveBoundRelease, PreparedReleaseError};
 use crate::distribution::install_state::{ExtractedReleaseTree, ReleaseExtractionStage};
 use crate::distribution::schema::ReleaseManifestV1;
 use crate::distribution::update_auth::PostLocalIoReleaseAuthorization;
+
+#[cfg(target_os = "macos")]
+use super::codesign::{DeveloperIdVerification, SigningPolicy};
+#[cfg(target_os = "macos")]
+use crate::distribution::install_state::NormalizedExtractedReleaseTree;
 
 /// Inert exact extracted tree with the successful post-I/O TUF replay.
 ///
@@ -20,10 +28,33 @@ pub(in crate::distribution) struct ExtractedRelease<'a> {
     _profile: VerifiedArchiveProfile,
 }
 
+/// Inert, signed-mode tree with a repeated lock-held Developer ID proof.
+///
+/// This value remains private staging and grants no publication, marker,
+/// receipt, prepared-version, activation, path, or descriptor authority.
+#[cfg(target_os = "macos")]
+pub(in crate::distribution) struct SignedModeNormalizedRelease<'a> {
+    _authentication: PostLocalIoReleaseAuthorization<'a>,
+    _tree: NormalizedExtractedReleaseTree,
+    _manifest_bytes: Box<[u8]>,
+    _manifest: ReleaseManifestV1,
+    _profile: VerifiedArchiveProfile,
+    _developer_id: DeveloperIdVerification,
+}
+
 impl std::fmt::Debug for ExtractedRelease<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ExtractedRelease")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for SignedModeNormalizedRelease<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedModeNormalizedRelease")
             .finish_non_exhaustive()
     }
 }
@@ -53,6 +84,134 @@ pub(in crate::distribution) fn extract_release(
         _manifest: parts.manifest,
         _profile: profile,
     })
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn verify_and_normalize_release<'a>(
+    release: ExtractedRelease<'a>,
+    policy: &SigningPolicy,
+) -> Result<SignedModeNormalizedRelease<'a>, PreparedReleaseError> {
+    verify_and_normalize_release_with(
+        release,
+        |path, file, manifest, binding| {
+            super::macho::verify_file(file, manifest)?;
+            Ok(super::codesign::verify_path(
+                path, manifest, policy, binding,
+            )?)
+        },
+        || {},
+        PostLocalIoReleaseAuthorization::reauthenticate_after_mode_normalization,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn verify_and_normalize_release_with<'a>(
+    release: ExtractedRelease<'a>,
+    mut verify: impl FnMut(
+        &std::path::Path,
+        &File,
+        &ReleaseManifestV1,
+        crate::distribution::install_state::ExecutableReleaseBinding,
+    ) -> Result<DeveloperIdVerification, PreparedReleaseError>,
+    after_normalization: impl FnOnce(),
+    reauthenticate: impl FnOnce(
+        PostLocalIoReleaseAuthorization<'a>,
+    ) -> Result<
+        PostLocalIoReleaseAuthorization<'a>,
+        crate::distribution::update_auth::ArtifactFetchAuthorizationError,
+    >,
+) -> Result<SignedModeNormalizedRelease<'a>, PreparedReleaseError> {
+    let ExtractedRelease {
+        _authentication: authentication,
+        _tree: tree,
+        _manifest_bytes: manifest_bytes,
+        _manifest: manifest,
+        _profile: profile,
+    } = release;
+
+    let first_verification: DeveloperIdVerification = authentication.with_extracted_executable(
+        &tree,
+        &manifest_bytes,
+        &manifest,
+        |path, file, binding| verify(path, file, &manifest, binding),
+    )?;
+    let tree = authentication.normalize_extracted_release(
+        first_verification,
+        tree,
+        &manifest_bytes,
+        &manifest,
+    )?;
+    after_normalization();
+    let authentication = reauthenticate(authentication)?;
+    let developer_id = authentication.with_normalized_executable(
+        &tree,
+        &manifest_bytes,
+        &manifest,
+        |path, file, binding| verify(path, file, &manifest, binding),
+    )?;
+    authentication.verify_normalized_release_tree(&tree, &manifest_bytes, &manifest)?;
+    Ok(SignedModeNormalizedRelease {
+        _authentication: authentication,
+        _tree: tree,
+        _manifest_bytes: manifest_bytes,
+        _manifest: manifest,
+        _profile: profile,
+        _developer_id: developer_id,
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::distribution) fn verify_and_normalize_release_for_test<'a>(
+    release: ExtractedRelease<'a>,
+    post_normalization_samples: Option<Vec<jiff::Timestamp>>,
+    fail_verification_call: Option<usize>,
+) -> Result<SignedModeNormalizedRelease<'a>, PreparedReleaseError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut verification_call = 0_usize;
+    let mut first_identity = None;
+    verify_and_normalize_release_with(
+        release,
+        |path, file, _manifest, binding| {
+            verification_call += 1;
+            let metadata = file
+                .metadata()
+                .map_err(|_| PreparedReleaseError::CodeSigning)?;
+            let identity = (path.to_path_buf(), metadata.dev(), metadata.ino());
+            if let Some(first) = &first_identity {
+                assert_eq!(
+                    first, &identity,
+                    "both native verifier brackets must bind the same path and inode"
+                );
+            } else {
+                first_identity = Some(identity);
+            }
+            if fail_verification_call == Some(verification_call) {
+                return Err(PreparedReleaseError::CodeSigning);
+            }
+            Ok(DeveloperIdVerification::for_test(binding))
+        },
+        || {},
+        |authorization| match post_normalization_samples {
+            Some(samples) => {
+                authorization.reauthenticate_after_mode_normalization_for_test(samples)
+            }
+            None => authorization.reauthenticate_after_mode_normalization(),
+        },
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::distribution) fn verify_and_normalize_release_with_hook_for_test<'a>(
+    release: ExtractedRelease<'a>,
+    after_normalization: impl FnOnce(),
+) -> Result<SignedModeNormalizedRelease<'a>, PreparedReleaseError> {
+    verify_and_normalize_release_with(
+        release,
+        |_path, _file, _manifest, binding| Ok(DeveloperIdVerification::for_test(binding)),
+        after_normalization,
+        PostLocalIoReleaseAuthorization::reauthenticate_after_mode_normalization,
+    )
 }
 
 pub(super) trait ExtractionSink {
