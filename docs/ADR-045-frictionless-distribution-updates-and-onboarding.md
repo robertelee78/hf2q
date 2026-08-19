@@ -20,7 +20,8 @@
   resolution, bounded index-selected source transfer, Git/LFS byte
   verification, conversion receipt v3, and the closed checked-in Qwen3.8
   source/artifact/hardware/disk recipe, bounded canonical preparation-pair
-  receipt, and sealed host/conversion/pair proofs are also reconciled;
+  receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
+  are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1632,17 +1633,29 @@ pair.
 
 **Landed preparation-pair boundary (2026-08-19).** Before either conversion
 can enter a pair, `VerifiedRecipeHost` binds the exact target, chip, observed
-unified memory, selected recipe profile, and observed free-space floor. Each
-value is policy input, not proof of how the host was measured; the future
-no-options coordinator remains responsible for supplying it from its OS-bound
-preflight before authentication or large work. Each
-conversion receipt is independently capped at 64 KiB, parsed with a closed
-schema, required to equal its deterministic pretty-JSON encoding plus LF, and
-cross-bound to the complete recipe source inventory, accepted artifact path,
-size, digest, quantization, role-specific conversion strategy, zero excluded
-tensors, and canonical hf2q converter identity. The artifact proof is consumed
-when that conversion proof is minted, so a text receipt cannot be paired with
-a projector artifact or with another recipe.
+unified memory, selected recipe profile, and observed free-space floor.
+Production construction accepts no caller-supplied host facts: the target is
+compile-time fixed, `machdep.cpu.brand_string` and `hw.memsize` are read from
+fixed sysctl keys in-process, and free space is read from the mounted
+filesystem containing the chosen preparation root's nearest existing
+directory. That ancestor is canonicalized before mount selection, so an
+operator-chosen model-root symlink measures its actual destination filesystem;
+this proof grants no filesystem mutation authority. The probe rejects a file
+ancestor and fails closed when the target, sysctl values, mount, or nonzero
+free-space value is unavailable. No PATH-resolved subprocess participates. The
+future no-options coordinator must choose the preparation root and consume this
+sealed proof before authentication or large work. The protected Apple Silicon
+proof gate is `HF2Q_TEST_QWEN38_HOST_PREFLIGHT=1 cargo +1.88.0 test --locked
+--bin hf2q --all-features input::model_recipe_preparation_tests:: --
+--test-threads=1`; ordinary hosted CI still proves the fail-closed and
+filesystem-selection branches without pretending its hardware matches the M5
+Max profile. Each conversion receipt is independently capped at 64 KiB, parsed
+with a closed schema, required to equal its deterministic pretty-JSON encoding
+plus LF, and cross-bound to the complete recipe source inventory, accepted
+artifact path, size, digest, quantization, role-specific conversion strategy,
+zero excluded tensors, and canonical hf2q converter identity. The artifact
+proof is consumed when that conversion proof is minted, so a text receipt
+cannot be paired with a projector artifact or with another recipe.
 
 Only the sealed source proof, the sealed host proof, and one text plus one
 projector conversion from the same converter identity can mint
@@ -1982,7 +1995,9 @@ before public self-update ships.
    proven M5 Max 128 GiB selection profile, derived disk floor, and retention
    decision boundary. The bounded canonical pair receipt now additionally
    consumes the exact source, host/disk, artifact, and conversion-receipt
-   proofs and remains explicitly calibration-pending and inert. Next, embed
+   proofs; its production host proof is minted only from fixed in-process
+   macOS sysctl reads plus the selected target filesystem's observed free
+   space, and remains explicitly calibration-pending and inert. Next, embed
    the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention

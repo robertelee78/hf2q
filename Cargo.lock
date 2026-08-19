@@ -1548,6 +1548,7 @@ dependencies = [
  "sha2",
  "sigstore-tuf",
  "syn",
+ "sysctl",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

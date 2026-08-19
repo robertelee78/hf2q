@@ -655,7 +655,9 @@ harness leans on three patterns:
    and final roots, while root and targets floors remain monotonic.
    The external-model input boundary embeds the one accepted Qwen3.8 recipe,
    verifies exact immutable Hub source and accepted artifact bytes, seals the
-   proven host/memory/free-space selection, and consumes two bounded canonical
+   proven host/memory/free-space selection from fixed in-process macOS sysctl
+   reads plus the selected target filesystem (never caller facts or a
+   subprocess), and consumes two bounded canonical
    conversion receipts into one inert text/projector preparation proof. Its
    compact v1 receipt binds the recipe, source, hardware profile, converter,
    both artifacts, and both receipt digests while remaining explicitly
