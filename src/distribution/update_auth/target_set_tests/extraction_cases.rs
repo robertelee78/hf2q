@@ -119,7 +119,17 @@ fn bundle<'a>(
         ],
     )
     .expect("artifact fetch authority");
-    let mut bound = fetch.bind_pointer(pointer).expect("bound pointer");
+    let mut bound = fetch
+        .bind_pointer_for_test(
+            pointer,
+            [
+                instant("2026-08-18T09:01:01Z"),
+                instant("2026-08-18T09:01:01Z"),
+            ],
+        )
+        .expect("bound pointer")
+        .into_fetch()
+        .expect("fresh fixture requires an artifact fetch");
     let archive_sha256 = bound.archive().sha256().clone();
     let mut stage = bound
         .create_archive_stage_for_test([

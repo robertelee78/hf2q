@@ -69,6 +69,17 @@ pub(in crate::distribution) fn lock_metadata_state(
 }
 
 impl LockedMetadataState {
+    /// Verify the descriptor-bound active release under this shared lock.
+    ///
+    /// Parsed receipts and marker bytes are deliberately insufficient: the
+    /// install-state reader follows and rechecks the complete named activation
+    /// and version tree before returning this semantic downgrade floor.
+    pub(in crate::distribution) fn read_live_installed_release_floor(
+        &self,
+    ) -> Result<super::super::LiveInstalledReleaseFloor, MetadataJournalError> {
+        Ok(super::super::release_floor::read_live_installed_release_floor(&self.journal.locked)?)
+    }
+
     /// Read selected bytes under the shared installation lock with ordinary
     /// authority semantics. Any unselected transaction residue fails closed.
     pub(in crate::distribution) fn read_selected_for_authority(

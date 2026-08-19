@@ -6,7 +6,10 @@ use super::*;
 use crate::distribution::install_state::metadata::{
     MetadataCommitOutcome, MetadataStateAuthorization,
 };
-use crate::distribution::update_auth::artifact_authorization::begin_artifact_fetch_for_test;
+use crate::distribution::install_state::{ActiveInstalledReleaseFloor, LiveInstalledReleaseFloor};
+use crate::distribution::update_auth::artifact_authorization::{
+    begin_artifact_fetch_for_test, classify_release_identity, AutomaticReleaseDisposition,
+};
 use crate::distribution::update_auth::commit::commit_and_reopen_for_test;
 use crate::distribution::update_auth::model::{
     MetadataResponse, PendingMetadataRequest, VerificationStep,
@@ -54,7 +57,17 @@ fn finalized_artifact_authorization<'a>(
         ],
     )
     .expect("artifact fetch authority");
-    let mut bound = fetch.bind_pointer(pointer).expect("bound pointer");
+    let mut bound = fetch
+        .bind_pointer_for_test(
+            pointer,
+            [
+                instant("2026-08-18T09:01:01Z"),
+                instant("2026-08-18T09:01:01Z"),
+            ],
+        )
+        .expect("bound pointer")
+        .into_fetch()
+        .expect("fresh fixture requires an artifact fetch");
     drop(
         bound
             .create_archive_stage_for_test([
@@ -73,6 +86,66 @@ fn finalized_artifact_authorization<'a>(
 
 fn leaked_anchor(bytes: &[u8]) -> EmbeddedTrustRoot {
     EmbeddedTrustRoot::from_compiled(Box::leak(bytes.to_vec().into_boxed_slice()))
+}
+
+#[test]
+fn automatic_release_floor_uses_numeric_semver_and_rejects_equivocation() {
+    let manifest = Sha256Digest::parse("manifest", "11".repeat(32)).expect("manifest digest");
+    let archive = Sha256Digest::parse("archive", "22".repeat(32)).expect("archive digest");
+    let changed = Sha256Digest::parse("changed", "33".repeat(32)).expect("changed digest");
+    let floor = LiveInstalledReleaseFloor::Active(ActiveInstalledReleaseFloor::for_test(
+        "0.10.0",
+        manifest.as_str(),
+        archive.as_str(),
+    ));
+    let version = |value: &str| {
+        ReleaseVersion::parse_stable("version", value.to_owned()).expect("stable version")
+    };
+
+    assert!(matches!(
+        classify_release_identity(
+            &floor,
+            &version("0.9.0"),
+            TargetTriple::Aarch64AppleDarwin,
+            &manifest,
+            &archive,
+        ),
+        Err(TufVerifierError::InstalledReleaseRollback)
+    ));
+    assert_eq!(
+        classify_release_identity(
+            &floor,
+            &version("0.10.0"),
+            TargetTriple::Aarch64AppleDarwin,
+            &manifest,
+            &archive,
+        )
+        .expect("exact active identity"),
+        AutomaticReleaseDisposition::AlreadyCurrent
+    );
+    for (candidate_manifest, candidate_archive) in [(&changed, &archive), (&manifest, &changed)] {
+        assert!(matches!(
+            classify_release_identity(
+                &floor,
+                &version("0.10.0"),
+                TargetTriple::Aarch64AppleDarwin,
+                candidate_manifest,
+                candidate_archive,
+            ),
+            Err(TufVerifierError::InstalledReleaseEquivocation)
+        ));
+    }
+    assert_eq!(
+        classify_release_identity(
+            &floor,
+            &version("0.11.0"),
+            TargetTriple::Aarch64AppleDarwin,
+            &changed,
+            &changed,
+        )
+        .expect("higher release"),
+        AutomaticReleaseDisposition::Upgrade
+    );
 }
 
 fn request(step: VerificationStep, expected: &str) -> PendingMetadataRequest {
@@ -242,8 +315,16 @@ fn artifact_fetch_reauthenticates_under_lock_before_and_after_archive_io() {
     )
     .expect("initial fetch authority");
     let mut bound = fetch
-        .bind_pointer(&fixture.pointer)
-        .expect("pointer-bound authority");
+        .bind_pointer_for_test(
+            &fixture.pointer,
+            [
+                instant("2026-08-18T09:01:01Z"),
+                instant("2026-08-18T09:01:01Z"),
+            ],
+        )
+        .expect("pointer-bound authority")
+        .into_fetch()
+        .expect("fresh fixture requires an artifact fetch");
     let stage = bound
         .create_archive_stage_for_test([
             instant("2026-08-18T09:01:02Z"),
@@ -297,8 +378,16 @@ fn artifact_fetch_reauthenticates_under_lock_before_and_after_archive_io() {
     )
     .expect("second fetch authority");
     let bound = fetch
-        .bind_pointer(&fixture.pointer)
-        .expect("second pointer-bound authority");
+        .bind_pointer_for_test(
+            &fixture.pointer,
+            [
+                instant("2026-08-18T09:02:01Z"),
+                instant("2026-08-18T09:02:01Z"),
+            ],
+        )
+        .expect("second pointer-bound authority")
+        .into_fetch()
+        .expect("fresh fixture requires an artifact fetch");
     assert!(matches!(
         bound.finalize_for_test([
             instant("2026-08-18T09:02:02Z"),
@@ -325,8 +414,16 @@ fn artifact_fetch_rejects_cross_phase_clock_rollback_and_generation_drift() {
     )
     .expect("fetch authority");
     let mut bound = fetch
-        .bind_pointer(&initial.pointer)
-        .expect("pointer-bound authority");
+        .bind_pointer_for_test(
+            &initial.pointer,
+            [
+                instant("2026-08-18T09:01:01Z"),
+                instant("2026-08-18T09:01:01Z"),
+            ],
+        )
+        .expect("pointer-bound authority")
+        .into_fetch()
+        .expect("fresh fixture requires an artifact fetch");
     assert!(matches!(
         bound.create_archive_stage_for_test([
             instant("2026-08-18T09:00:58Z"),
@@ -349,8 +446,16 @@ fn artifact_fetch_rejects_cross_phase_clock_rollback_and_generation_drift() {
     )
     .expect("fresh authority");
     let mut bound = fetch
-        .bind_pointer(&initial.pointer)
-        .expect("bound authority");
+        .bind_pointer_for_test(
+            &initial.pointer,
+            [
+                instant("2026-08-18T09:02:01Z"),
+                instant("2026-08-18T09:02:01Z"),
+            ],
+        )
+        .expect("bound authority")
+        .into_fetch()
+        .expect("fresh fixture requires an artifact fetch");
     let candidate = successor_candidate(&authorization, &anchor, &successor.repository);
     let completed = candidate.verification_completed_at();
     commit_and_reopen_for_test(&authorization, &anchor, candidate, [completed, completed])

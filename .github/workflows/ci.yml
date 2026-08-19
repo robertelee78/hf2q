@@ -299,6 +299,8 @@ jobs:
             src/distribution/install_state/identity/inventory.rs \
             src/distribution/install_state/identity_tests.rs \
             src/distribution/install_state/identity_tests/process_cases.rs \
+            src/distribution/install_state/release_floor.rs \
+            src/distribution/install_state/release_floor_tests.rs \
             src/distribution/install_state/unix.rs \
             src/distribution/prepared_release/mod.rs \
             src/distribution/prepared_release/archive.rs \

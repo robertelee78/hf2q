@@ -549,7 +549,15 @@ harness leans on three patterns:
    logical/consistent-snapshot target names, and a sealed current-time replay
    that accepts one stable pointer plus complete retained release pairs. Pointer
    binding exposes only the selected pointer/manifest/archive descriptors; it
-   is not generic target lookup or downgrade authority. Lock-held successor
+   is not generic target lookup or explicit downgrade authority. Before an
+   automatic plan can obtain artifact transport authority, the same shared
+   lock descriptor-relatively verifies the canonical active activation,
+   receipt, prepared version, installed marker, manifest, and payload twice.
+   That sealed floor rejects a lower numeric SemVer and same-version digest
+   equivocation, returns exact equality as a no-download `AlreadyCurrent`
+   outcome, and permits only a higher release or an explicitly absent
+   `current`. The exact active floor is rechecked before archive staging,
+   after network I/O, and at preparation-lock acquisition. Lock-held successor
    authentication makes versioned pairs append-only by comparing the exact
    selected predecessor and candidate before selector commit; the pointer may
    move and new complete pairs may be appended, but old descriptors cannot be

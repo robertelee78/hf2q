@@ -111,6 +111,50 @@ fn authenticated_prepared_version_feeds_the_existing_first_activation_boundary()
         std::fs::read_link(root.join("current")).expect("current link"),
         std::path::PathBuf::from("activations/00000000000000000001")
     );
+
+    let fetch = begin_artifact_fetch_for_test(
+        &authorization,
+        &anchor,
+        [
+            instant("2026-08-18T09:10:00Z"),
+            instant("2026-08-18T09:10:01Z"),
+        ],
+    )
+    .expect("fresh target set after activation");
+    let binding = fetch
+        .bind_pointer_for_test(
+            &fixture.pointer,
+            [
+                instant("2026-08-18T09:10:02Z"),
+                instant("2026-08-18T09:10:03Z"),
+            ],
+        )
+        .expect("active release pointer binds");
+    let crate::distribution::update_auth::ArtifactPointerBinding::AlreadyCurrent(current) = binding
+    else {
+        panic!("the exact active release must not authorize another download")
+    };
+    assert_eq!(current.version().as_str(), "0.2.0");
+    assert_ne!(current.receipt_sha256(), [0; 32]);
+
+    let locked = crate::distribution::install_state::metadata::lock_metadata_state(&authorization)
+        .expect("lock exact active floor");
+    let expected_floor = locked
+        .read_live_installed_release_floor()
+        .expect("read exact active floor");
+    drop(locked);
+    std::fs::remove_file(root.join("current")).expect("simulate active release drift");
+    let locked = crate::distribution::install_state::metadata::lock_metadata_state(&authorization)
+        .expect("lock after active release drift");
+    assert!(matches!(
+        crate::distribution::update_auth::artifact_authorization::require_same_release_floor(
+            &locked,
+            &expected_floor,
+        ),
+        Err(ArtifactFetchAuthorizationError::Authentication(
+            TufVerifierError::InstalledReleaseChanged
+        ))
+    ));
 }
 
 #[cfg(target_os = "macos")]
