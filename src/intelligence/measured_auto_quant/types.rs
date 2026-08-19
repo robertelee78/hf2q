@@ -3,12 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const RECEIPT_SCHEMA_VERSION: u32 = 2;
 
 /// Exact source checkpoint identity. The weight hash is intentionally opaque:
 /// vanilla, fine-tuned, merged, and weight-edited checkpoints use the same
 /// contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceIdentity {
     pub model_id: String,
     pub revision: String,
@@ -20,6 +21,7 @@ pub struct SourceIdentity {
 
 /// Exact executable environment for a benchmark receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionIdentity {
     pub hf2q_revision: String,
     pub mlx_native_version: String,
@@ -44,20 +46,41 @@ pub enum CalibrationAlgorithm {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WeightEncoding {
-    Gguf { quant_type: String },
-    MlxAffine { bits: u8, group_size: u16 },
+    Gguf {
+        quant_type: String,
+    },
+    /// Default affine profile for the artifact. Tensor-specific bit-width and
+    /// group-size overrides are authoritative in
+    /// `precision_policy_manifest_sha256`; these fields are not a claim that
+    /// every tensor uses one homogeneous profile.
+    MlxAffine {
+        bits: u8,
+        group_size: u16,
+    },
 }
 
 /// Reproducible conversion and execution recipe for one candidate artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateRecipe {
     pub candidate_id: String,
-    pub algorithm: CalibrationAlgorithm,
+    /// Ordered offline transformation pipeline. Round-to-nearest is a
+    /// standalone control; calibrated cascades can compose stages such as
+    /// dynamic allocation, AWQ, and DWQ in the order they were executed.
+    pub calibration_pipeline: Vec<CalibrationAlgorithm>,
     pub encoding: WeightEncoding,
-    /// Hash of the complete per-tensor precision/calibration manifest.
-    pub policy_sha256: String,
+    /// Hash of the complete per-tensor precision-policy manifest.
+    pub precision_policy_manifest_sha256: String,
     /// Calibration corpus and stored teacher-target hashes, when applicable.
     pub calibration_corpus_sha256: Option<String>,
+    /// Hash of the canonical template-rendered UTF-8 calibration stream.
+    pub calibration_rendered_text_sha256: Option<String>,
+    /// Hash of the canonical encoded token-id stream, including sequence
+    /// boundaries and integer byte order defined by the calibration manifest.
+    pub calibration_token_ids_sha256: Option<String>,
+    /// Hash of the canonical calibration manifest that binds source, examples,
+    /// rendering, token stream, collector, tensor/expert coverage, and imatrix.
+    pub calibration_manifest_sha256: Option<String>,
     pub teacher_targets_sha256: Option<String>,
     /// Hash of the native capability decisions and tensor-to-kernel routes
     /// used by the measured server.
@@ -68,6 +91,7 @@ pub struct CandidateRecipe {
 
 /// Exact pass count for a behavioral or structural suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseResult {
     pub passed: u32,
     pub total: u32,
@@ -81,15 +105,21 @@ impl CaseResult {
 
 /// Quality evidence against the exact unquantized source checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualityEvidence {
     /// Hash of the exact corpora, prompts, sampling, activation taps, metric
     /// settings, and named behavioral suites used to produce this evidence.
     pub quality_suite_sha256: String,
     pub source_integrity_passed: bool,
-    pub teacher_kl_divergence: f64,
+    pub teacher_kl: TeacherKlEvidence,
     pub top1_token_agreement: f64,
     pub activation_cosine_similarity: f64,
     pub perplexity_ratio: f64,
+    /// Fixed-horizon free-running greedy comparison against the exact source.
+    /// Both source and candidate generate exactly `tokens_per_prompt` tokens;
+    /// stopping is disabled for this metric so its denominator is invariant.
+    pub greedy_trajectory: GreedyTrajectoryEvidence,
+    pub dataset_separation: DatasetSeparationEvidence,
     pub tool_call_cases: CaseResult,
     pub context_cases: CaseResult,
     pub cache_cases: CaseResult,
@@ -102,6 +132,7 @@ pub struct QualityEvidence {
 /// Gate-0 proof that the exact emitted artifact is executable by the exact
 /// runtime. Converter success alone is insufficient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServabilityEvidence {
     pub conversion_completed: bool,
     pub artifact_catalog_passed: bool,
@@ -111,17 +142,70 @@ pub struct ServabilityEvidence {
 
 /// Hard quality thresholds. They are eligibility gates, never ranking weights.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualityContract {
     pub quality_suite_sha256: String,
-    pub max_teacher_kl_divergence: f64,
+    pub evaluation_manifest_sha256: String,
+    pub deduplication_policy_sha256: String,
+    pub max_teacher_kl_mean: f64,
+    pub max_teacher_kl_p95: f64,
+    pub max_teacher_kl_max: f64,
+    pub min_teacher_kl_prompts: u32,
+    pub min_teacher_kl_tokens: u64,
     pub min_top1_token_agreement: f64,
     pub min_activation_cosine_similarity: f64,
     pub max_perplexity_ratio: f64,
+    pub min_greedy_trajectory_prompts: u32,
+    pub min_greedy_trajectory_tokens_per_prompt: u32,
+    pub min_greedy_trajectory_exact_match_rate: f64,
+    pub min_greedy_trajectory_mean_common_prefix_ratio: f64,
+    pub require_calibration_evaluation_disjoint: bool,
     pub require_tool_calls: bool,
     pub require_context: bool,
     pub require_cache: bool,
     pub require_multimodal: bool,
     pub required_behavioral_regressions: BTreeSet<String>,
+}
+
+/// Distribution-aware KL evidence against the exact source teacher.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherKlEvidence {
+    pub mean: f64,
+    pub p95: f64,
+    pub max: f64,
+    pub prompt_count: u32,
+    pub token_count: u64,
+    pub receipt_sha256: String,
+}
+
+/// Exact calibration/evaluation split and deduplication evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatasetSeparationEvidence {
+    pub calibration_manifest_sha256: Option<String>,
+    pub evaluation_manifest_sha256: String,
+    pub deduplication_policy_sha256: String,
+    pub overlap_count: u32,
+    /// Hash of the canonical pairwise overlap report from which
+    /// `overlap_count` is derived.
+    pub receipt_sha256: String,
+}
+
+/// Integer evidence for a fixed-horizon greedy trajectory comparison.
+///
+/// Rates are derived by the selector instead of trusted from a producer:
+/// `exact_match_prompts / prompt_count` and
+/// `total_common_prefix_tokens / (prompt_count * tokens_per_prompt)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GreedyTrajectoryEvidence {
+    pub prompt_count: u32,
+    pub tokens_per_prompt: u32,
+    pub exact_match_prompts: u32,
+    pub total_common_prefix_tokens: u64,
+    /// Hash of the canonical per-prompt source/candidate token trajectories.
+    pub receipt_sha256: String,
 }
 
 /// A distinct execution shape. Quantization speed is evaluated separately for
@@ -138,6 +222,7 @@ pub enum InferenceRegime {
 
 /// Measured median for one exact workload regime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerformanceMeasurement {
     pub regime: InferenceRegime,
     pub workload_sha256: String,
@@ -153,6 +238,7 @@ pub struct PerformanceMeasurement {
 
 /// Minimum service level and evidence depth for a required regime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegimeRequirement {
     pub regime: InferenceRegime,
     /// Hash of prompts, templates, sampling, context, batch, and media inputs.
@@ -167,6 +253,7 @@ pub struct RegimeRequirement {
 
 /// Complete evidence receipt for a converted artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateReceipt {
     pub schema_version: u32,
     pub source: SourceIdentity,
@@ -181,6 +268,7 @@ pub struct CandidateReceipt {
 
 /// User/workload-specific selection contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectionContract {
     /// Hash of the canonical selection profile, thresholds, and constraints.
     pub selection_profile_sha256: String,
@@ -202,17 +290,22 @@ pub enum CandidateRejectionCode {
     WeightEncodingInvalid,
     RecipeIdentityInvalid,
     CalibrationCorpusIdentityInvalid,
+    CalibrationRenderingIdentityInvalid,
+    CalibrationManifestIdentityInvalid,
     TeacherTargetIdentityInvalid,
     ConversionGateFailed,
     ArtifactCatalogGateFailed,
     RuntimeLoadGateFailed,
     KernelContractGateFailed,
     QualitySuiteIdentityMismatch,
+    CalibrationEvaluationIdentityMismatch,
     SourceIntegrityGateFailed,
     TeacherKlGateFailed,
     Top1AgreementGateFailed,
     ActivationCosineGateFailed,
     PerplexityGateFailed,
+    GreedyTrajectoryGateFailed,
+    CalibrationEvaluationLeakageGateFailed,
     RequiredCaseGateFailed,
     MultimodalGateFailed,
     BehavioralRegressionGateFailed,

@@ -111,6 +111,65 @@ Primary references:
 - [AWQ paper](https://arxiv.org/abs/2306.00978)
 - [GPTQ paper](https://arxiv.org/abs/2210.17323)
 
+### Dynamic 3.0 evidence reviewed on 2026-08-19
+
+Unsloth's [Dynamic 3.0 GGUF documentation](https://unsloth.ai/docs/basics/dynamic-3.0-ggufs)
+provides useful independent evidence for the shape of this decision. Its public
+description reports a model-specific mixed-precision PTQ process, a larger
+multi-domain imatrix corpus refined for agentic coding, chat, and multilingual
+inputs, and held-out evaluation (including long documents) with both KL
+divergence and 32 tokens of free-running greedy generation over 300 prompts. It
+also explicitly warns that instruct calibration must use the model's chat
+template and that a Wikipedia-like calibration set can make evaluation on
+Wikipedia misleading.
+
+The transferable conclusions are:
+
+- raw corpus bytes are not a complete calibration identity; the exact native
+  template rendering and token stream are inputs to the quantizer;
+- calibration and evaluation inputs must be independently hashed and checked
+  for leakage;
+- one-step top-1 agreement can miss trajectory drift, while perplexity can hide
+  offsetting token flips, so fixed-horizon greedy trajectory and KL gates are
+  required in addition to perplexity;
+- the useful allocation unit is per tensor or tensor group, and policies are
+  model-specific rather than universal bit-width recipes;
+- formats chosen partly for Apple/ARM execution must still be benchmarked on
+  hf2q's exact Metal kernels and workloads.
+
+The page does not disclose a complete selection/search algorithm, the exact
+per-tensor policy, or enough build material to reproduce every published
+candidate from source. Although the page says its imatrix is available, the
+exact [Qwen3.8-27B-GGUF repository revision
+`27af057e`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/27af057ecb382ddfea5d12837360a8980560e3ed)
+reviewed here did not list an imatrix or importance-matrix file. Its
+`Divergence-300 @32` prose describes the workload but does not publish a
+precise scalar formula. hf2q therefore does not claim to implement or
+reproduce Dynamic 3.0. It adopts the evidence lessons and defines its own
+deterministic receipt metric: for a suite-bound set of prompts, the source and
+candidate each generate exactly N greedy tokens with early stopping disabled;
+the receipt stores the exact-match prompt count and total common-prefix token
+count, and the selector derives both rates from integers.
+
+The pinned
+[`Qwen3.8-27B-UD-Q4_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/27af057ecb382ddfea5d12837360a8980560e3ed/Qwen3.8-27B-UD-Q4_K_XL.gguf)
+at repository revision
+`27af057ecb382ddfea5d12837360a8980560e3ed` is nevertheless a useful output
+oracle. The 17,559,178,144-byte artifact has LFS SHA-256
+`3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e` and its
+866 tensors use nine storage types: 360 F32, 110 Q8_0, 56 Q6_K, 191 Q5_K, 69
+Q4_K, 3 Q3_K, 70 IQ4_XS, 6 IQ4_NL, and 1 IQ3_S. Assignments are
+tensor-specific and non-monotonic: embeddings, output, attention-value, and
+FFN tensors do not simply follow one global bit tier. The histogram was derived
+by opening the exact remote GGUF header with a local GGUF metadata reader
+and counting tensor type codes; it is a manual research observation, not a
+checked-in hf2q validation receipt. It proves that the published policy is
+substantially more expressive than hf2q's current two-level heuristics. Public
+material does not independently prove that those exact assignments are useful
+or optimal on mlx-native; for example, a policy containing 70 IQ4_XS tensors
+is ineligible until the pinned runtime proves the required QMV, QMM, width-N,
+and family routes for those exact shapes without hidden fallback.
+
 ## Decision
 
 ### 1. Optimize a serving candidate, not a bit width
@@ -160,7 +219,8 @@ A candidate is ineligible unless all applicable evidence passes:
 1. source identity, converter completion, tensor catalog, artifact integrity,
    exact-runtime loading, and required kernel-contract execution;
 2. tokenizer/template identity, teacher-logit KL, top-1 agreement, activation
-   cosine similarity, and perplexity-ratio thresholds;
+   cosine similarity, fixed-horizon greedy trajectory agreement, and
+   perplexity-ratio thresholds;
 3. exact agentic tool name, schema, arguments, tool-result continuation, and
    unary/SSE semantics;
 4. context retrieval, cache-prefix reuse, and cold/cached continuation parity;
@@ -170,6 +230,34 @@ A candidate is ineligible unless all applicable evidence passes:
 Thresholds and corpora are versioned inputs to the evidence contract. Passing
 a phrase-based refusal screen, producing valid JSON with wrong arguments, or
 matching only a few sampled completions is not sufficient evidence.
+
+For every calibrated candidate, receipt schema v2 requires and cross-checks
+identifiers for the raw corpus, the exact template-rendered UTF-8 stream, the
+canonical token-id stream, and a calibration manifest. The planned canonical
+calibration manifest binds source identity, structured examples and
+licenses/splits, seed/order/context/chunking, collector version and accumulation
+order/dtype, tensor and expert coverage/counts, and the final imatrix payload.
+The planned per-tensor precision-policy manifest binds tensor name, shape,
+role/layer, candidate and selected codec/group size, bytes/effective BPW,
+sensitivity/error evidence, required runtime route, and the reason for any
+promotion or protection. For MLX affine storage the encoding's bit width and
+group size are defaults; all heterogeneous overrides are authoritative in that
+manifest. The recipe records an ordered calibration pipeline so cascades such
+as dynamic allocation, AWQ, and DWQ are not collapsed into one algorithm label.
+
+Quality evidence independently requires and cross-checks identifiers for an
+evaluation manifest, deduplication policy, overlap receipt, KL receipt, and
+per-prompt greedy-trajectory receipt. When required by the selection profile,
+nonzero calibration/evaluation overlap is ineligible. KL is reported as mean,
+p95, and maximum with prompt and token counts; a single average cannot hide a
+catastrophic tail.
+
+Schema v2 currently validates the shape, exact identifier agreement, metric
+arithmetic, thresholds, and evidence depth. Canonical manifest types, content
+rehashing, overlap recomputation, and propagation into the conversion receipt
+remain Phase A.1/Phase D work. Until those producers and verifiers land, a
+syntactically valid digest is an asserted identity, not independent proof of
+the referenced content.
 
 ### 4. Performance evidence is execution-regime specific
 
@@ -340,6 +428,11 @@ evidence or part of a landed result.
 - Select only among eligible candidates using measured profile performance.
 - Unit-test that a faster but behavior-drifting candidate loses and that
   vanilla or modified source weights follow the same exact-hash rule.
+- Receipt schema v2 requires separate rendered-text and token-stream
+  identifiers, integer fixed-horizon greedy trajectory evidence,
+  distribution-aware KL evidence, exact manifest identifiers, and rejects
+  asserted dataset overlap when the profile requires that gate. Content
+  rehashing and overlap recomputation remain explicit follow-up work.
 
 This phase changes no conversion format and makes no new speed claim.
 
@@ -385,12 +478,31 @@ capability and must independently beat eligible candidates.
 
 ### Phase D — calibration producers
 
-- Port dynamic sensitivity measurement and allocation with exact corpus hashes.
+- Port dynamic sensitivity measurement and allocation with exact raw-corpus and
+  rendered-token-stream hashes. The default instruct corpus must be
+  multi-domain, template-rendered, versioned, and large enough to cover the
+  declared agentic/chat/multilingual/long-context profile; the current generic
+  `cdv3` corpus remains a control, not an assumed optimal default.
+- Search per-tensor or tensor-group precision policies against a held-out suite
+  using marginal quality gain and the measured Apple kernel cost of the exact
+  tensor shape/regime. Validate the final policy on a second untouched suite;
+  do not tune and report on the same prompts.
+- Preserve per-expert MoE activation statistics and counts through policy
+  allocation; averaging experts into one vector is not eligible evidence.
+  Calibration-required policies fail closed on missing tensors or insufficient
+  expert coverage rather than warning and continuing.
+- Remove the current Q8_0 proxy from source calibration where the family loader
+  cannot consume F16/BF16 expert weights, or bind that proxy transformation as
+  a distinct candidate and prove it against the exact source. An unrecorded
+  proxy is not teacher evidence.
 - Add AWQ and GPTQ only behind the common candidate/evidence contract.
 - Add native DWQ with teacher-target sharding, trainable affine scale/bias
   parameters, optimizer state bounds, checkpoints, and source-teacher gates.
 - Compare algorithms at identical encoding, group size, artifact/runtime,
   corpus, and workload wherever the question is algorithmic quality.
+- Report KL, one-step top-1, the schema-v2 fixed-horizon greedy trajectory
+  metrics, and required behavioral suites. Perplexity remains supplementary and
+  cannot by itself make a candidate eligible.
 
 ### Phase E — production `--quant auto`
 
