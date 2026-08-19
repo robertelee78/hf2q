@@ -9,6 +9,7 @@
 mod archive;
 mod deflate;
 mod extract;
+mod macho;
 
 use std::io::{Read, Seek};
 
@@ -94,5 +95,7 @@ fn validate_archive_reader<A: Read + Seek + ArchiveIntegrity>(
     Ok(profile)
 }
 
+#[cfg(test)]
+mod macho_tests;
 #[cfg(test)]
 mod tests;
