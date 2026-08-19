@@ -76,8 +76,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       commit guard, and durable metadata-baseline proof;
 │                       all internal until the real root and public update
 │                       authority exist
-│   ├── update_transport/ closed Pages-pointer/GitHub-asset routes and manual
-│                       one-hop release redirect, exact bounded bodies, and anonymous
+│   ├── update_transport/ closed Pages-metadata/pointer and GitHub-asset routes,
+│                       fresh verifier-request sessions, manual one-hop release
+│                       redirect, exact bounded bodies, and anonymous
 │                       same-FD streamed archive staging; no extraction,
 │                       prepared-version, installer, or CLI authority
 │   └── prepared_release/ bounded classic-ZIP structural/profile validation,
@@ -631,7 +632,12 @@ harness leans on three patterns:
    fixture bytes are rejected fail-closed. This
    builder remains structural output and cannot authenticate or publish a
    prepared version without the sealed retained-lock coordinator above.
-   Verifier-request metadata HTTP remains a pending production-root slice.
+   The sibling transport now consumes one verifier-issued metadata request at
+   a time from the exact Pages metadata route, maps only a next-root 404 to an
+   absence proof, independently enforces role caps, and durably commits only a
+   completed transcript after restart cleanup and lock-held reauthentication.
+   It remains dormant because no production root factory or public coordinator
+   exists.
    Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected
    write prefix, and requires a wholly fresh transcript. An authenticated root

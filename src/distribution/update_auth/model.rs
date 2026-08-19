@@ -326,7 +326,7 @@ pub(super) enum VerificationStep {
 /// crate-private and accepts only a static byte slice; runtime input never
 /// becomes a trust anchor.
 #[derive(Debug)]
-pub(super) struct EmbeddedTrustRoot {
+pub(in crate::distribution) struct EmbeddedTrustRoot {
     bytes: &'static [u8],
 }
 
@@ -337,5 +337,10 @@ impl EmbeddedTrustRoot {
 
     pub(super) const fn bytes(&self) -> &'static [u8] {
         self.bytes
+    }
+
+    #[cfg(test)]
+    pub(in crate::distribution) const fn for_test(bytes: &'static [u8]) -> Self {
+        Self { bytes }
     }
 }

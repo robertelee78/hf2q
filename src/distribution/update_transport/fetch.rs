@@ -5,10 +5,14 @@ use sha2::{Digest, Sha256};
 use super::http::{HttpExecutor, HttpResponse, ReqwestExecutor};
 use super::origin::{pages_pointer_url, release_asset_url, release_redirect, TargetFetchSpec};
 use super::{UpdateTransportError, VerifiedReleaseBundle};
+use crate::distribution::install_state::metadata::{
+    MetadataCommitOutcome, MetadataStateAuthorization,
+};
 use crate::distribution::install_state::EphemeralArtifactStage;
 use crate::distribution::schema::{ReleaseManifestV1, UpdateChannel};
 use crate::distribution::update_auth::{
     ArtifactFetchAuthorization, ArtifactPointerBinding, BoundArtifactFetchAuthorization,
+    EmbeddedTrustRoot,
 };
 
 pub(in crate::distribution) struct StableUpdateTransport {
@@ -27,6 +31,14 @@ impl StableUpdateTransport {
         authorization: ArtifactFetchAuthorization<'a>,
     ) -> Result<ArtifactPointerBinding<'a>, UpdateTransportError> {
         fetch_and_bind_pointer(&self.executor, authorization)
+    }
+
+    pub(in crate::distribution) fn refresh_metadata(
+        &self,
+        authorization: &MetadataStateAuthorization,
+        anchor: &EmbeddedTrustRoot,
+    ) -> Result<MetadataCommitOutcome, UpdateTransportError> {
+        super::metadata::refresh_metadata(&self.executor, authorization, anchor)
     }
 
     pub(in crate::distribution) fn fetch_release_bundle<'a>(

@@ -1,9 +1,9 @@
 //! Crash-durable authenticated update-metadata state.
 //!
-//! The module is deliberately dormant: the transport-free TUF verifier can
-//! construct a metadata-only candidate, but no network transport, target
-//! lookup, installer, or CLI path can use it yet. This module owns only the
-//! exact local wire contract and crash-durable journal capability split.
+//! The module is deliberately dormant: the origin-locked metadata session can
+//! durably commit a transport-free TUF candidate, but no production root,
+//! target lookup, installer, or CLI path can use it yet. This module owns only
+//! the exact local wire contract and crash-durable journal capability split.
 
 mod journal;
 pub(in crate::distribution) mod schema;

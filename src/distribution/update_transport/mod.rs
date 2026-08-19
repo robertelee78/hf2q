@@ -1,11 +1,14 @@
-//! Origin-locked, exact-byte update artifact transport.
+//! Origin-locked, exact-byte update transport.
 //!
-//! This sibling keeps HTTP out of `update_auth`. It accepts only sealed,
-//! authenticated target capabilities and returns inert exact-byte proofs; it
-//! owns no CLI, extraction, prepared-version, or activation authority.
+//! This sibling keeps HTTP out of `update_auth`. It accepts only one-use
+//! verifier requests or sealed authenticated target capabilities. Metadata is
+//! committed only after the transport-free verifier yields a sealed candidate;
+//! artifact results remain inert exact-byte proofs. It owns no CLI,
+//! extraction, prepared-version, or activation authority.
 
 mod fetch;
 mod http;
+mod metadata;
 mod origin;
 
 #[cfg(test)]

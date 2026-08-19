@@ -485,3 +485,5 @@ fn archive_stream_is_bounded_and_finishes_the_same_fd() {
         Err(UpdateTransportError::BodyRead)
     ));
 }
+
+mod metadata;
