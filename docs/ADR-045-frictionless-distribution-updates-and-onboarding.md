@@ -277,7 +277,123 @@ replacement, or archive mutation returns no extracted-release capability. The
 successful sealed result retains the shared lock and the unforgeable classic-
 ZIP profile, but is still inert and cannot authorize publication.
 
+Developer ID validation, signed-mode normalization, installed-marker creation,
+and prepared-version publication are one first-install-only transaction under
+that retained installation lock. An internal code-signed-tree proof may divide
+the implementation, but it is neither durable nor reusable authority. The
+transaction moves the already authenticated tree without copying its payload:
+
+```text
+update/extractions/.extract-v{VERSION}-{ARCHIVE_SHA256}
+  -> update/prepared/.pending-v{VERSION}-{ARCHIVE_SHA256}
+  -> versions/{VERSION}
+```
+
+`update/prepared/` and each hidden pending root are private `0700`. Before the
+final rename, `versions/` is absent or empty and no `current` or activation may
+exist. This slice introduces no update-retention, pruning, or generic cleanup
+authority. Its bounded inventory admits only one exact transaction shape; an
+unrelated name, multiple intents, pending plus final, or other ambiguous state
+is retained and fails closed.
+
+The marker's one nondeterministic input is persisted in a bounded canonical
+intent name before any tree move:
+
+```text
+.marker-v{VERSION}-{ARCHIVE_SHA256}-t{UNIX_SECONDS:020}.partial
+.marker-v{VERSION}-{ARCHIVE_SHA256}-t{UNIX_SECONDS:020}.ready
+```
+
+The exact marker and fully derived receipt are rebuilt from the authenticated
+installation identity, release descriptors, four selected role versions, and
+that timestamp. The partial file uses exact-prefix recovery, is full-synced,
+and becomes `ready` by a no-replace rename. The ready inode is then moved—not
+copied—into the pending tree as `version-installation.json`, so the published
+tree can contain no torn marker. Exact marker digest and full canonical receipt
+equality are required on every recovery.
+
+Mode normalization accepts only a prefix of the canonical order: manifest,
+payload files in manifest order, then derived directories deepest-first. Files
+move from inert `0600` to their exact signed `0644`/`0755` modes; derived
+directories move from `0700` to `0755`; the version root stays `0700` and the
+marker stays `0600`. Each transition operates on the retained descriptor,
+rechecks device/inode/owner/link count/size/hash, full-syncs, rehashes, and
+revalidates its name. Any non-prefix mixture fails closed.
+
+After all files and directories are full-synced bottom-up, the transaction
+replays the same selected TUF generation at current time, reopens and rebinds
+root/update/prepared/versions/pending/marker/lock/binary identities, and repeats
+the complete tree, marker, receipt, Mach-O, and Developer ID checks. The sole
+prepared-version commit is descriptor-relative no-replace rename from the
+hidden pending name to `versions/{VERSION}`. Before it, every error means no
+version was published. After it, every error is a typed
+`PreparedVersionDurabilityUnknown { version }`; exact recovery reopens the final
+inode, repeats all content and media barriers, and adopts only that same
+marker/receipt before constructing `AuthenticatedPreparedVersion`.
+
+While a prepared intent exists—or while an unactivated first version exists—
+metadata selection may not advance. The shared lock prevents concurrency, and
+this additional inventory guard preserves the exact role versions needed to
+reconstruct a crash-interrupted marker. Recovery completes or fails closed
+before a new metadata transcript can stage.
+
 The binary is Developer ID signed with Hardened Runtime and a secure timestamp.
+The stable v1 signing identifier is the compiled literal `us.hf2q.cli`; the
+final ten-character Apple Team ID is likewise compiled policy and may not be
+selected by the manifest, environment, command line, or network. The
+authenticated manifest must repeat both exact literals before any code-signing
+operation. Its certificate common name is cross-checked against the actual leaf
+certificate for evidence, but it is not a trust root and is never interpolated
+into a code requirement. No production verification constructor exists until
+the real Team ID is checked in and a real Developer ID Application fixture has
+passed the protected release gate.
+
+V1 accepts exactly one little-endian thin arm64-ALL `MH_EXECUTE`, not a
+fat/universal or arm64e binary. The filesystem-free bounded read-at parser
+requires `MH_NOUNDEFS`, `MH_DYLDLINK`, `MH_TWOLEVEL`, and `MH_PIE`, permits only
+the explicitly frozen safe header bits, and rejects all other header flags. Its
+positive load-command profile consists only of structurally exact segment,
+dyld-info, symbol/dynamic-symbol table, UUID, function-starts, data-in-code,
+build-version, dylinker, public system-dylib, modern-entry-point, and terminal
+code-signature commands. Unknown commands and legacy, weak, re-export, lazy,
+upward, encryption, rpath, environment, and thread-entry variants fail closed.
+
+Segments, sections, and link-edit payloads have checked sizes and offsets,
+nonoverlapping file and VM ranges, valid protection subsets, no writable-
+executable mapping, and exact parent/mapping/alignment relationships. There is
+one nonempty regular instruction-only `__TEXT,__text`; its relocation and
+reserved fields are zero and the four-byte-aligned `LC_MAIN` entry lies inside
+it. There is one read-only `__LINKEDIT`; required link-edit payloads precede and
+do not overlap the nonempty `LC_CODE_SIGNATURE`, which ends exactly at EOF.
+`LC_DATA_IN_CODE` may be empty, otherwise its length is a whole number of
+eight-byte entries. One macOS `LC_BUILD_VERSION` has an SDK no older than its
+minimum deployment target, and that minimum equals the manifest. The canonical
+dylinker is `/usr/lib/dyld`; `LC_LOAD_DYLIB` dependencies are absolute public
+paths below `/usr/lib/` or `/System/Library/Frameworks/`. The v1 manifest
+therefore requires an empty `non_system_dynamic_dependencies`; bundled
+libraries require a later schema revision.
+
+Runtime verification uses native Security.framework, never parsed `codesign`
+output. A requirement built only from the two compiled literals requires the
+Apple generic and trusted anchors, the Developer ID Application leaf and issuer
+OIDs, and the exact Team/identifier. `SecStaticCodeCheckValidity` runs with all
+architectures, strict validation, trusted-anchor checking, and no network.
+After that succeeds, a small private FFI bridge type-checks signing information
+and requires the exact Team and identifier, a real TSA `CFDate` timestamp,
+Hardened Runtime, no ad-hoc or linker-signed flags, no raw or dictionary
+entitlements, and the manifest-bound leaf common name. Ordinary certificate
+expiry remains compatible with a valid secure timestamp; install-time
+verification does not force current-expiration or online revocation checks.
+
+Security.framework is path-oriented. The updater keeps the descriptor-relative
+binary open, obtains its macOS path, requires a no-follow reopen of that path to
+match the retained device/inode, and brackets the native validation with repeat
+signature checks plus descriptor hash, named identity, stage identity, and
+manifest-byte validation. This detects ordinary replacement and persistent
+swaps but, like Apple's API, cannot defeat an actively malicious same-EUID ABA
+swap inside the path-only call. That actor remains part of the already excluded
+fully compromised local-account threat.
+
 The final ZIP is submitted with `notarytool`; release promotion requires an
 `Accepted` result and retained submission log for those exact bytes. [Apple
 documents](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)

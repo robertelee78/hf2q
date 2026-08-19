@@ -239,6 +239,12 @@ jobs:
             src/distribution/prepared_release/archive.rs \
             src/distribution/prepared_release/deflate.rs \
             src/distribution/prepared_release/extract.rs \
+            src/distribution/prepared_release/macho.rs \
+            src/distribution/prepared_release/macho/linkedit.rs \
+            src/distribution/prepared_release/macho/segment.rs \
+            src/distribution/prepared_release/macho_tests.rs \
+            src/distribution/prepared_release/macho_tests/fixture.rs \
+            src/distribution/prepared_release/macho_tests/hostile_cases.rs \
             src/distribution/prepared_release/tests.rs \
             src/distribution/update_auth/artifact_authorization.rs \
             src/distribution/update_auth/artifact_authorization/extraction.rs \
