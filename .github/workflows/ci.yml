@@ -344,6 +344,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked --lib --all-features
+          cargo test --locked --test build_script_contract --all-features
           cargo test --locked --test convert_integration --all-features
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
