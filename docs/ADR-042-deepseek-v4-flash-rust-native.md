@@ -1925,6 +1925,57 @@ cooperative median and recorded process peak RSS. Protected agentic waves must
 still pass every unchanged semantic, cache, cancellation, thermal, and latency
 bound before this candidate is accepted.
 
+### Four-lane decode-body cohort falsifier (2026-08-19 rejected)
+
+A test-only four-sequence decode spike asked whether retaining four independent
+DeepSeek cache attentions in one Metal submission chain and executing their
+FFN/head work as rows could remove the post-prefill four-agent wall. The first
+literal multi-row version was not bit-exact. At layer zero, all four attention
+rows matched their independent one-token references, but the multi-row FFN
+first differed for logical lane two at state element 13:
+`-0.02688961` versus `-0.026889611` (one ULP). The full step amplified that
+difference. Source routing explains the boundary: the relevant raw F32
+projection uses the dedicated dense matvec at `M=1` and the dense matrix kernel
+at `M=4`, with a different reduction order. The quantized dense and routed-MoE
+paths remained below their matvec routing thresholds; lane ordering and cache
+attention were not the cause.
+
+The exact reformulation therefore kept four lane-local `M=1` attentions and
+FFNs while encoding them into the same `GraphSession`, and packed only the four
+final states for the shared output head. It made no scheduler or production-API
+change. On `mlx-native =0.10.12`, the exact 107,431,343,168-byte artifact passed
+132 supplied-token steps from position 148 through 280 with distinct lane
+tokens and physical-to-logical permutation `[2, 0, 3, 1]`. State, logits,
+valid window/compressed/indexer cache bytes, and recurrent compressor state
+were bit-identical to four serial cache clones across the ratio-128 boundary,
+ratio-four updates, and 128-token window wrap. At that short diagnostic
+position, ten alternating pairs measured 117.523 ms serial versus 113.494 ms
+cohort median, or 1.0355x. The topology changed from 92 command buffers and
+four synchronizations to 23 and one; dispatches/barriers changed only from
+8,328/5,948 to 8,314/5,892. This short-context scratch-attention result is not
+a production throughput claim.
+
+The production-shaped discriminator independently grew all eight matched
+caches to position 6,676 with logical capacity 131,072 and rechecked their
+valid bytes before timing. The exact parity phase remained green. Ten
+alternating serial samples were
+`[273.243, 264.232, 298.286, 390.419, 550.667, 341.404, 307.514, 344.477, 315.960, 337.340]`
+ms; cohort samples were
+`[282.585, 314.940, 295.589, 489.795, 469.869, 326.392, 314.368, 386.988, 280.750, 300.870]`
+ms. Their diagnostic medians were 326.650 and 314.654 ms, only 1.0381x, with
+substantial variance. Counters again showed the intended 92/4 versus 23/1
+command-buffer/synchronization collapse, while dispatches/barriers moved from
+8,580/6,200 to 8,566/6,144.
+
+That long-context timing is deliberately not calibrated performance authority:
+all loaded-idle samples remained `fair`, the 30-second continuous-Nominal gate
+timed out, and the external wrapper rejected the receipt with exit 42. Even its
+favorable diagnostic median is far below the 1.15x promotion floor. Collapsing
+submission and synchronization without reducing the approximately 8.5k
+lane-local kernel dispatches does not materially change this decode critical
+path. The spike and its RCA remain isolated test evidence; production decode
+cohorting, cache/serving wiring, and scheduler changes are rejected.
+
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
 This section records the rejected 89.65 GiB Q2_K_S artifact and the defects that

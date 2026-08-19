@@ -58,6 +58,8 @@ mod model_tests;
 #[cfg(test)]
 mod real_artifact_cohort_tests;
 #[cfg(test)]
+mod real_artifact_decode_cohort_diagnostic_tests;
+#[cfg(test)]
 mod real_artifact_decode_cohort_tests;
 #[cfg(test)]
 mod real_artifact_tests;

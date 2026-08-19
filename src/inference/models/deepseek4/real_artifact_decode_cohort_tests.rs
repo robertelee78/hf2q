@@ -12,7 +12,12 @@ use super::real_artifact_tests::official_artifact;
 const LANES: usize = 4;
 const PREFIX_ROWS: usize = 148;
 const DECODE_STEPS: usize = 132;
-const CAPACITY: usize = PREFIX_ROWS + DECODE_STEPS;
+const PARITY_CAPACITY: usize = PREFIX_ROWS + DECODE_STEPS;
+const BENCHMARK_POSITION: usize = 6_676;
+const BENCHMARK_LOGICAL_CAPACITY: usize = 131_072;
+// Gives the hardware runner enough room to require 30 continuously nominal
+// seconds after the model and production-capacity caches are resident.
+const LOADED_IDLE_SECONDS: u64 = 45;
 const BENCHMARK_PAIRS: usize = 10;
 const PHYSICAL_TO_LOGICAL: [usize; LANES] = [2, 0, 3, 1];
 const BENCHMARK_OVERRIDE_ENV: &[&str] = &[
@@ -45,6 +50,38 @@ fn prefix_tokens(logical_lane: usize) -> Vec<u32> {
 
 fn supplied_tokens(step: usize) -> [u32; LANES] {
     std::array::from_fn(|logical_lane| ((step * 389 + logical_lane * 7_919 + 17) % 120_000) as u32)
+}
+
+fn benchmark_extension(logical_lane: usize) -> Vec<u32> {
+    (PARITY_CAPACITY..BENCHMARK_POSITION)
+        .map(|position| ((position * 521 + logical_lane * 7_919 + 29) % 120_000) as u32)
+        .collect()
+}
+
+fn grow_and_extend_caches(
+    model: &mut Deepseek4Model,
+    caches: Vec<Deepseek4Cache>,
+    physical_to_logical: [usize; LANES],
+) -> Vec<Deepseek4Cache> {
+    caches
+        .into_iter()
+        .enumerate()
+        .map(|(physical_lane, source)| {
+            let logical_lane = physical_to_logical[physical_lane];
+            let mut grown = model
+                .allocate_logical_cache(BENCHMARK_LOGICAL_CAPACITY)
+                .expect("allocate production-capacity benchmark cache");
+            grown
+                .migrate_from(&source, None)
+                .expect("grow parity cache into production logical capacity");
+            model
+                .forward_verifier_prompt(&benchmark_extension(logical_lane), &mut grown)
+                .expect("extend benchmark cache to production anchor");
+            assert_eq!(grown.position(), BENCHMARK_POSITION);
+            assert_eq!(grown.capacity(), BENCHMARK_LOGICAL_CAPACITY);
+            grown
+        })
+        .collect()
 }
 
 fn read_f32(buffer: &MlxBuffer, label: &str) -> Vec<f32> {
@@ -297,7 +334,7 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     let mut serial_caches = (0..LANES)
         .map(|logical_lane| {
             let mut cache = model
-                .allocate_cache(CAPACITY)
+                .allocate_cache(PARITY_CAPACITY)
                 .expect("allocate serial cache");
             model
                 .forward_verifier_prefill(&prefixes[logical_lane], &mut cache)
@@ -309,7 +346,7 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         .iter()
         .map(|&logical_lane| {
             let mut cache = model
-                .allocate_cache(CAPACITY)
+                .allocate_cache(PARITY_CAPACITY)
                 .expect("allocate cohort cache");
             model
                 .forward_verifier_prefill(&prefixes[logical_lane], &mut cache)
@@ -317,15 +354,6 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
             cache
         })
         .collect::<Vec<_>>();
-    let serial_snapshots = serial_caches
-        .iter()
-        .map(|cache| cache.snapshot().expect("snapshot serial prefix"))
-        .collect::<Vec<_>>();
-    let cohort_snapshots = cohort_caches
-        .iter()
-        .map(|cache| cache.snapshot().expect("snapshot cohort prefix"))
-        .collect::<Vec<_>>();
-
     for step in 0..DECODE_STEPS {
         let logical_tokens = supplied_tokens(step);
         let mut distinct = logical_tokens;
@@ -391,10 +419,40 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
             );
         }
     }
-    assert_eq!(serial_caches[0].position(), CAPACITY);
-    assert_eq!(cohort_caches[0].position(), CAPACITY);
-    assert_eq!(CAPACITY % 128, 24, "proof must cross a ratio-128 boundary");
-    assert_eq!(CAPACITY % 4, 0, "proof must finish on a ratio-4 boundary");
+    assert_eq!(serial_caches[0].position(), PARITY_CAPACITY);
+    assert_eq!(cohort_caches[0].position(), PARITY_CAPACITY);
+    assert_eq!(
+        PARITY_CAPACITY % 128,
+        24,
+        "proof must cross a ratio-128 boundary"
+    );
+    assert_eq!(
+        PARITY_CAPACITY % 4,
+        0,
+        "proof must finish on a ratio-4 boundary"
+    );
+
+    serial_caches = grow_and_extend_caches(&mut model, serial_caches, [0, 1, 2, 3]);
+    cohort_caches = grow_and_extend_caches(&mut model, cohort_caches, PHYSICAL_TO_LOGICAL);
+    for (physical_lane, &logical_lane) in PHYSICAL_TO_LOGICAL.iter().enumerate() {
+        assert_cache_exact(
+            &format!("benchmark anchor logical lane {logical_lane} cache"),
+            &serial_caches[logical_lane],
+            &cohort_caches[physical_lane],
+        );
+    }
+    let serial_snapshots = serial_caches
+        .iter()
+        .map(|cache| cache.snapshot().expect("snapshot serial benchmark anchor"))
+        .collect::<Vec<_>>();
+    let cohort_snapshots = cohort_caches
+        .iter()
+        .map(|cache| cache.snapshot().expect("snapshot cohort benchmark anchor"))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "DeepSeek-V4 B=4 benchmark loaded-idle settle: position={BENCHMARK_POSITION} logical_capacity={BENCHMARK_LOGICAL_CAPACITY} seconds={LOADED_IDLE_SECONDS}"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(LOADED_IDLE_SECONDS));
 
     for (cache, snapshot) in serial_caches.iter_mut().zip(&serial_snapshots) {
         cache
@@ -479,10 +537,13 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     let serial_median = median(serial_ms.clone());
     let cohort_median = median(cohort_ms.clone());
     eprintln!(
-        "DeepSeek-V4 B=4 decode spike: artifact={} prefix={} steps={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x serial_counters={:?} cohort_counters={:?}",
+        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x serial_counters={:?} cohort_counters={:?}",
         path.display(),
         PREFIX_ROWS,
         DECODE_STEPS,
+        BENCHMARK_POSITION,
+        BENCHMARK_LOGICAL_CAPACITY,
+        LOADED_IDLE_SECONDS,
         PHYSICAL_TO_LOGICAL,
         BENCHMARK_PAIRS,
         serial_ms,
