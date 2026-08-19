@@ -35,8 +35,8 @@ pub enum ImatrixError {
     NotAnImatrix { path: String, actual: String },
 
     /// The file is missing one of the canonical KV pairs required by
-    /// the llama-imatrix v3 schema (`imatrix.datasets`, `imatrix.chunk_count`,
-    /// `imatrix.chunk_size`).
+    /// the llama-imatrix v3 schema (`imatrix.chunk_count` or
+    /// `imatrix.chunk_size`). `imatrix.datasets` is optional upstream.
     #[error("imatrix file `{path}` missing required key `{key}`")]
     MissingKv { path: String, key: &'static str },
 

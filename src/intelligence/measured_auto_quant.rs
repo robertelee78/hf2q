@@ -126,10 +126,26 @@ fn validate_contract(contract: &SelectionContract) -> Result<(), MeasuredAutoQua
     }
 
     if !valid_sha256(&contract.quality.quality_suite_sha256)
-        || !valid_nonnegative(contract.quality.max_teacher_kl_divergence)
+        || !valid_sha256(&contract.quality.evaluation_manifest_sha256)
+        || !valid_sha256(&contract.quality.deduplication_policy_sha256)
+        || !valid_nonnegative(contract.quality.max_teacher_kl_mean)
+        || !valid_nonnegative(contract.quality.max_teacher_kl_p95)
+        || !valid_nonnegative(contract.quality.max_teacher_kl_max)
+        || contract.quality.max_teacher_kl_mean > contract.quality.max_teacher_kl_max
+        || contract.quality.max_teacher_kl_p95 > contract.quality.max_teacher_kl_max
+        || contract.quality.min_teacher_kl_prompts == 0
+        || contract.quality.min_teacher_kl_tokens == 0
         || !valid_unit_interval(contract.quality.min_top1_token_agreement)
         || !valid_unit_interval(contract.quality.min_activation_cosine_similarity)
         || !valid_positive(contract.quality.max_perplexity_ratio)
+        || contract.quality.min_greedy_trajectory_prompts == 0
+        || contract.quality.min_greedy_trajectory_tokens_per_prompt == 0
+        || !valid_unit_interval(contract.quality.min_greedy_trajectory_exact_match_rate)
+        || !valid_unit_interval(
+            contract
+                .quality
+                .min_greedy_trajectory_mean_common_prefix_ratio,
+        )
         || contract.max_peak_mlx_bytes == 0
     {
         return Err(MeasuredAutoQuantError::InvalidContract(
@@ -207,7 +223,7 @@ fn rejection_reasons(
         }
         _ => {}
     }
-    if !valid_sha256(&candidate.recipe.policy_sha256)
+    if !valid_sha256(&candidate.recipe.precision_policy_manifest_sha256)
         || !valid_sha256(&candidate.recipe.kernel_profile_sha256)
         || !valid_sha256(&candidate.recipe.server_config_sha256)
     {
@@ -217,10 +233,36 @@ fn rejection_reasons(
             "candidate recipe identity is incomplete or malformed",
         );
     }
-    let calibrated = !matches!(
-        candidate.recipe.algorithm,
-        CalibrationAlgorithm::RoundToNearest
-    );
+    let pipeline = &candidate.recipe.calibration_pipeline;
+    let pipeline_has_duplicate = pipeline
+        .iter()
+        .enumerate()
+        .any(|(index, stage)| pipeline[..index].contains(stage));
+    let round_to_nearest_control = pipeline.as_slice() == [CalibrationAlgorithm::RoundToNearest];
+    let pipeline_valid = !pipeline.is_empty()
+        && !pipeline_has_duplicate
+        && (round_to_nearest_control || !pipeline.contains(&CalibrationAlgorithm::RoundToNearest));
+    if !pipeline_valid {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::RecipeIdentityInvalid,
+            "calibration pipeline is empty, duplicated, or mixes round-to-nearest with calibrated stages",
+        );
+    }
+    let calibrated = pipeline_valid && !round_to_nearest_control;
+    if !calibrated
+        && (candidate.recipe.calibration_corpus_sha256.is_some()
+            || candidate.recipe.calibration_rendered_text_sha256.is_some()
+            || candidate.recipe.calibration_token_ids_sha256.is_some()
+            || candidate.recipe.calibration_manifest_sha256.is_some()
+            || candidate.recipe.teacher_targets_sha256.is_some())
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::RecipeIdentityInvalid,
+            "round-to-nearest control carries unexpected calibration identity",
+        );
+    }
     if calibrated
         && candidate
             .recipe
@@ -232,6 +274,45 @@ fn rejection_reasons(
             &mut reasons,
             CandidateRejectionCode::CalibrationCorpusIdentityInvalid,
             "calibrated candidate is missing its corpus identity",
+        );
+    }
+    if calibrated
+        && candidate
+            .recipe
+            .calibration_rendered_text_sha256
+            .as_deref()
+            .is_none_or(|hash| !valid_sha256(hash))
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::CalibrationRenderingIdentityInvalid,
+            "calibrated candidate is missing its rendered calibration identity",
+        );
+    }
+    if calibrated
+        && candidate
+            .recipe
+            .calibration_token_ids_sha256
+            .as_deref()
+            .is_none_or(|hash| !valid_sha256(hash))
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::CalibrationRenderingIdentityInvalid,
+            "calibrated candidate is missing its tokenized calibration identity",
+        );
+    }
+    if calibrated
+        && candidate
+            .recipe
+            .calibration_manifest_sha256
+            .as_deref()
+            .is_none_or(|hash| !valid_sha256(hash))
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::CalibrationManifestIdentityInvalid,
+            "calibrated candidate is missing its calibration-manifest identity",
         );
     }
     if candidate
@@ -246,7 +327,43 @@ fn rejection_reasons(
             "candidate calibration-corpus identity is malformed",
         );
     }
-    if candidate.recipe.algorithm == CalibrationAlgorithm::Dwq
+    if candidate
+        .recipe
+        .calibration_rendered_text_sha256
+        .as_deref()
+        .is_some_and(|hash| !valid_sha256(hash))
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::CalibrationRenderingIdentityInvalid,
+            "candidate rendered calibration identity is malformed",
+        );
+    }
+    if candidate
+        .recipe
+        .calibration_token_ids_sha256
+        .as_deref()
+        .is_some_and(|hash| !valid_sha256(hash))
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::CalibrationRenderingIdentityInvalid,
+            "candidate tokenized calibration identity is malformed",
+        );
+    }
+    if candidate
+        .recipe
+        .calibration_manifest_sha256
+        .as_deref()
+        .is_some_and(|hash| !valid_sha256(hash))
+    {
+        reject(
+            &mut reasons,
+            CandidateRejectionCode::CalibrationManifestIdentityInvalid,
+            "candidate calibration-manifest identity is malformed",
+        );
+    }
+    if pipeline.contains(&CalibrationAlgorithm::Dwq)
         && candidate
             .recipe
             .teacher_targets_sha256
@@ -327,6 +444,31 @@ fn check_quality(
             "quality-suite identity mismatch or malformed digest",
         );
     }
+    let calibrated =
+        candidate.recipe.calibration_pipeline.as_slice() != [CalibrationAlgorithm::RoundToNearest];
+    let separation = &evidence.dataset_separation;
+    let calibration_identity_matches = if calibrated {
+        separation.calibration_manifest_sha256 == candidate.recipe.calibration_manifest_sha256
+            && separation
+                .calibration_manifest_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+    } else {
+        separation.calibration_manifest_sha256.is_none()
+    };
+    if !calibration_identity_matches
+        || separation.evaluation_manifest_sha256 != quality.evaluation_manifest_sha256
+        || separation.deduplication_policy_sha256 != quality.deduplication_policy_sha256
+        || !valid_sha256(&separation.evaluation_manifest_sha256)
+        || !valid_sha256(&separation.deduplication_policy_sha256)
+        || !valid_sha256(&separation.receipt_sha256)
+    {
+        reject(
+            reasons,
+            CandidateRejectionCode::CalibrationEvaluationIdentityMismatch,
+            "calibration/evaluation split identity mismatch or malformed digest",
+        );
+    }
     if !evidence.source_integrity_passed {
         reject(
             reasons,
@@ -334,8 +476,18 @@ fn check_quality(
             "source integrity gate failed",
         );
     }
-    if !valid_nonnegative(evidence.teacher_kl_divergence)
-        || evidence.teacher_kl_divergence > quality.max_teacher_kl_divergence
+    let teacher_kl = &evidence.teacher_kl;
+    if !valid_nonnegative(teacher_kl.mean)
+        || !valid_nonnegative(teacher_kl.p95)
+        || !valid_nonnegative(teacher_kl.max)
+        || teacher_kl.mean > teacher_kl.max
+        || teacher_kl.p95 > teacher_kl.max
+        || teacher_kl.mean > quality.max_teacher_kl_mean
+        || teacher_kl.p95 > quality.max_teacher_kl_p95
+        || teacher_kl.max > quality.max_teacher_kl_max
+        || teacher_kl.prompt_count < quality.min_teacher_kl_prompts
+        || teacher_kl.token_count < quality.min_teacher_kl_tokens
+        || !valid_sha256(&teacher_kl.receipt_sha256)
     {
         reject(
             reasons,
@@ -368,6 +520,49 @@ fn check_quality(
             reasons,
             CandidateRejectionCode::PerplexityGateFailed,
             "perplexity ratio gate failed",
+        );
+    }
+
+    let trajectory = &evidence.greedy_trajectory;
+    let max_prefix_tokens =
+        u64::from(trajectory.prompt_count).checked_mul(u64::from(trajectory.tokens_per_prompt));
+    let minimum_prefix_tokens_from_exact_matches = u64::from(trajectory.exact_match_prompts)
+        .checked_mul(u64::from(trajectory.tokens_per_prompt));
+    let trajectory_shape_valid = trajectory.prompt_count > 0
+        && trajectory.tokens_per_prompt > 0
+        && trajectory.exact_match_prompts <= trajectory.prompt_count
+        && max_prefix_tokens.is_some_and(|max| trajectory.total_common_prefix_tokens <= max)
+        && minimum_prefix_tokens_from_exact_matches
+            .is_some_and(|min| trajectory.total_common_prefix_tokens >= min);
+    let exact_match_rate = if trajectory.prompt_count == 0 {
+        f64::NAN
+    } else {
+        f64::from(trajectory.exact_match_prompts) / f64::from(trajectory.prompt_count)
+    };
+    let mean_common_prefix_ratio = match max_prefix_tokens {
+        Some(0) | None => f64::NAN,
+        Some(max) => trajectory.total_common_prefix_tokens as f64 / max as f64,
+    };
+    if !trajectory_shape_valid
+        || trajectory.prompt_count < quality.min_greedy_trajectory_prompts
+        || trajectory.tokens_per_prompt < quality.min_greedy_trajectory_tokens_per_prompt
+        || !valid_unit_interval(exact_match_rate)
+        || exact_match_rate < quality.min_greedy_trajectory_exact_match_rate
+        || !valid_unit_interval(mean_common_prefix_ratio)
+        || mean_common_prefix_ratio < quality.min_greedy_trajectory_mean_common_prefix_ratio
+        || !valid_sha256(&trajectory.receipt_sha256)
+    {
+        reject(
+            reasons,
+            CandidateRejectionCode::GreedyTrajectoryGateFailed,
+            "fixed-horizon greedy trajectory gate failed or is malformed",
+        );
+    }
+    if quality.require_calibration_evaluation_disjoint && separation.overlap_count != 0 {
+        reject(
+            reasons,
+            CandidateRejectionCode::CalibrationEvaluationLeakageGateFailed,
+            "calibration/evaluation disjointness gate failed",
         );
     }
 

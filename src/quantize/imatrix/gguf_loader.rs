@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use mlx_native::gguf::GgufFile;
+use mlx_native::gguf::{GgufFile, MetadataValue};
 
 use super::accumulator::{Accumulator, AccumulatorRegistry};
 use super::error::ImatrixError;
@@ -53,7 +53,16 @@ impl LoadedImatrix {
     /// `general.type` == "imatrix", `imatrix.chunk_count` + `imatrix.chunk_size`
     /// present, and every `<name>.in_sum2` has a matching `<name>.counts`.
     pub fn load_from_path(path: &Path) -> Result<Self, ImatrixError> {
-        let source_path = path.display().to_string();
+        Self::load_from_path_with_source(path, path.display().to_string())
+    }
+
+    /// Load bytes from `path` while retaining a different operator-facing
+    /// source label. Imported imatrices use this to parse a private immutable
+    /// snapshot without leaking its temporary path into diagnostics.
+    pub(super) fn load_from_path_with_source(
+        path: &Path,
+        source_path: String,
+    ) -> Result<Self, ImatrixError> {
         let gguf = GgufFile::open(path).map_err(|e| ImatrixError::Parse {
             detail: format!("{source_path}: {e}"),
         })?;
@@ -82,11 +91,15 @@ impl LoadedImatrix {
                 })?;
 
         // --- 3. Datasets array (optional per imatrix.cpp:744) ----------
-        // `mlx_native::gguf` doesn't expose a typed array-of-strings
-        // accessor at the moment; we attempt the lookup as a fallible
-        // call and tolerate absence.
+        // The generic metadata value is public, so preserve a valid string
+        // array exactly. Absence remains legal; a present malformed value is
+        // rejected because silently dropping provenance is unsafe.
         let datasets: Vec<String> = match gguf.metadata("imatrix.datasets") {
-            Some(_) => extract_string_array(&gguf, "imatrix.datasets").unwrap_or_default(),
+            Some(value) => extract_string_array(value).ok_or_else(|| ImatrixError::Parse {
+                detail: format!(
+                    "{source_path}: imatrix.datasets must be an array containing only strings"
+                ),
+            })?,
             None => Vec::new(),
         };
 
@@ -242,25 +255,17 @@ fn shape_to_n_per_row_and_n_mat(shape: &[usize]) -> (usize, usize) {
     }
 }
 
-/// Extract a string-array from a metadata KV by parsing the file's raw
-/// GGUF bytes (mlx-native's `metadata` accessor doesn't expose array
-/// strings directly).
-///
-/// We re-open the file as bytes, scan to the KV section, and parse the
-/// target key's array payload. This is more work than ideal but Phase A
-/// avoids modifying mlx-native to add a new accessor.
-///
-/// Returns `None` if the key isn't present or the parse fails — the
-/// `imatrix.datasets` array is documented as optional (imatrix.cpp:744
-/// `if (datasets_key != -1)`).
-fn extract_string_array(_gguf: &GgufFile, _key: &str) -> Option<Vec<String>> {
-    // Phase A: we don't currently expose a string-array reader on
-    // mlx_native::gguf::GgufFile. The `datasets` field is only used for
-    // diagnostic / `imatrix.datasets` round-trip in tests; production
-    // imatrix consumption doesn't require this field. Return None to
-    // mean "absent or unparseable" — the validator on the writer side
-    // round-trips deterministically against itself.
-    None
+/// Extract a string array from the public mlx-native metadata value.
+/// Absence remains legal, but a present non-string element is malformed
+/// provenance and is rejected by the caller rather than silently discarded.
+fn extract_string_array(value: &MetadataValue) -> Option<Vec<String>> {
+    let MetadataValue::Array(values) = value else {
+        return None;
+    };
+    values
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Read a tensor's raw F32 payload by absolute file offset.
@@ -298,6 +303,54 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write};
 
+    #[test]
+    fn dataset_metadata_accepts_only_string_arrays() {
+        let valid = MetadataValue::Array(vec![
+            MetadataValue::String("agentic".to_string()),
+            MetadataValue::String("multilingual".to_string()),
+        ]);
+        assert_eq!(
+            extract_string_array(&valid),
+            Some(vec!["agentic".to_string(), "multilingual".to_string()])
+        );
+
+        let invalid = MetadataValue::Array(vec![MetadataValue::Uint32(7)]);
+        assert_eq!(extract_string_array(&invalid), None);
+        assert_eq!(extract_string_array(&MetadataValue::Uint32(7)), None);
+    }
+
+    #[test]
+    fn loader_rejects_present_non_string_dataset_metadata() {
+        use crate::backends::gguf::types::MetaValue;
+        use crate::backends::gguf::writer::GgufWriter;
+
+        let mut writer = GgufWriter::new(Cursor::new(Vec::new()));
+        writer.write_header(0, 4).unwrap();
+        writer
+            .write_metadata_kv(KV_KEY_TYPE, &MetaValue::String(KV_VALUE_TYPE.to_string()))
+            .unwrap();
+        writer
+            .write_metadata_kv("imatrix.datasets", &MetaValue::ArrayU32(vec![7]))
+            .unwrap();
+        writer
+            .write_metadata_kv(KV_KEY_CHUNK_COUNT, &MetaValue::U32(1))
+            .unwrap();
+        writer
+            .write_metadata_kv(KV_KEY_CHUNK_SIZE, &MetaValue::U32(512))
+            .unwrap();
+        writer.pad_to_alignment().unwrap();
+        writer.finalize().unwrap();
+        let bytes = writer.into_inner().into_inner();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+
+        let error = LoadedImatrix::load_from_path(file.path()).unwrap_err();
+        let ImatrixError::Parse { detail } = error else {
+            panic!("expected Parse, got {error:?}");
+        };
+        assert!(detail.contains("imatrix.datasets must be an array containing only strings"));
+    }
+
     /// End-to-end: write an imatrix → load it back → assert the
     /// accumulator values + counts round-trip exactly.
     #[test]
@@ -323,6 +376,7 @@ mod tests {
         let loaded = LoadedImatrix::load_from_path(tmp.path()).unwrap();
         assert_eq!(loaded.chunk_count, 1);
         assert_eq!(loaded.chunk_size, 512);
+        assert_eq!(loaded.datasets, ["cdv3"]);
         assert_eq!(loaded.tensor_pair_count(), 1);
         let acc = loaded.accumulator("blk.0.attn_q.weight").unwrap();
         assert_eq!(acc.n_per_row, 4);
