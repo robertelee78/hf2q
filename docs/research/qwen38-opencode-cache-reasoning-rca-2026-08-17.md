@@ -345,9 +345,11 @@ three-workgroup occupancy boundary. Three isolated 104,966-token processes
 then measured 1.603x, 1.610x, and 1.615x; the 1,000-step thermal ratio was
 0.999. A local path-patched hf2q spike improved 16.5732 to 20.6089 tok/s
 (24.3506%) with identical semantic hashes. That is hypothesis proof, not
-release authority. The same register-resident implementation is now published
-and checksum-pinned as `mlx-native 0.10.10`; the protected packed-hf2q
-short/long receipt remains mandatory. Q3 was slower because
+release authority. The register-resident implementation was introduced in
+`mlx-native 0.10.10`; the final candidate resolves the additive,
+checksum-pinned `mlx-native 0.10.12`, whose D512 partial-tail correction does
+not change the Qwen kernel. The protected packed-hf2q short/long receipt
+remains mandatory. Q3 was slower because
 larger per-workgroup state reduced occupancy and was removed from the landing
 code. The protected gate now runs a 512-token short request on every fresh
 OFF/AUTO server before the 105K request, requires byte-identical output and no

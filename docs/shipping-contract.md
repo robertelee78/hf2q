@@ -59,8 +59,9 @@ family's graph, cache, or scheduler contract by approximation.
   physical slot. Cancellation restores only a valid, position-consistent
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The Unreleased 0.1.7 candidate also pairs large automatic MoE gate/up
-  projections through the published `mlx-native 0.10.10` routing-schedule
-  primitive. Decode-sized and forced diagnostic routes remain independent;
+  projections through the routing-schedule primitive introduced in
+  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.10.12`.
+  Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
   independently observed transaction deadline that never returns, fails the

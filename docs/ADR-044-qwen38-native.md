@@ -333,10 +333,13 @@ isolated 104,966-token processes measured 1.603x, 1.610x, and 1.615x; a
 path-patched hf2q spike then measured 16.5732 versus 20.6089 tok/s, a 24.3506%
 gain, with identical semantic hashes. That spike proves the reformulated
 hypothesis but is not release authority. The same register-resident
-implementation is now published and checksum-pinned as `mlx-native 0.10.10`
-without a Cargo patch; the packed hf2q short/long receipt remains the required
-downstream authority. Q3 was not retained because its threadgroup-memory and
-occupancy tradeoff did not justify a second production variant.
+implementation was introduced in `mlx-native 0.10.10`; the release candidate
+now resolves the additive, checksum-pinned `mlx-native 0.10.12` without a
+Cargo patch. Version 0.10.12 bounds D512 prefill reads at a partial logical KV
+tail and does not change the Qwen Q2 kernel. The packed hf2q short/long receipt
+remains the required downstream authority. Q3 was not retained because its
+threadgroup-memory and occupancy tradeoff did not justify a second production
+variant.
 
 Upstream release workflow `32148168017` tested the exact source, packed
 archive, and archive downloaded back from crates.io; it then verified the
