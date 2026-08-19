@@ -68,7 +68,11 @@ pub use gguf_writer::{write_imatrix, write_imatrix_to_path};
 pub enum ImatrixProvenance {
     /// Loaded from disk via `--imatrix <path>` (typically a
     /// `llama-imatrix` reference output).
-    LoadedFromFile(std::path::PathBuf),
+    LoadedFromFile {
+        path: std::path::PathBuf,
+        bytes: u64,
+        sha256: String,
+    },
     /// Computed in-tree by Phase B's forward-pass driver. Phase A does
     /// not produce this variant.
     Computed { corpus_label: String, n_ctx: u32 },
@@ -78,7 +82,11 @@ impl ImatrixProvenance {
     /// Human-readable label used in diagnostic messages.
     pub fn label(&self) -> String {
         match self {
-            ImatrixProvenance::LoadedFromFile(path) => format!("file:{}", path.display()),
+            ImatrixProvenance::LoadedFromFile {
+                path,
+                bytes,
+                sha256,
+            } => format!("file:{}[bytes={},sha256={}]", path.display(), bytes, sha256),
             ImatrixProvenance::Computed {
                 corpus_label,
                 n_ctx,
@@ -102,12 +110,30 @@ pub struct ImatrixData {
 }
 
 impl ImatrixData {
-    /// Load an imatrix from disk + record the `--imatrix <path>` provenance.
+    /// Load an imatrix from an immutable private snapshot and record the
+    /// `--imatrix <path>` provenance. The operator path is copied exactly once;
+    /// parsing never reopens it, so replacement during conversion cannot make
+    /// the materialized registry disagree with the recorded digest.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self, ImatrixError> {
-        let loaded = LoadedImatrix::load_from_path(path)?;
+        let snapshot = snapshot_file(path)?;
+        Self::load_from_snapshot(path, &snapshot)
+    }
+
+    fn load_from_snapshot(
+        operator_path: &std::path::Path,
+        snapshot: &ImatrixSnapshot,
+    ) -> Result<Self, ImatrixError> {
+        let loaded = LoadedImatrix::load_from_path_with_source(
+            snapshot.file.path(),
+            operator_path.display().to_string(),
+        )?;
         Ok(ImatrixData {
             loaded,
-            provenance: ImatrixProvenance::LoadedFromFile(path.to_path_buf()),
+            provenance: ImatrixProvenance::LoadedFromFile {
+                path: operator_path.to_path_buf(),
+                bytes: snapshot.bytes,
+                sha256: snapshot.sha256.clone(),
+            },
         })
     }
 
@@ -135,6 +161,46 @@ impl ImatrixData {
     }
 }
 
+struct ImatrixSnapshot {
+    file: tempfile::NamedTempFile,
+    bytes: u64,
+    sha256: String,
+}
+
+fn snapshot_file(path: &std::path::Path) -> Result<ImatrixSnapshot, ImatrixError> {
+    use std::io::{Read, Write};
+
+    use sha2::{Digest, Sha256};
+
+    let mut source = std::fs::File::open(path)?;
+    let mut snapshot = tempfile::Builder::new()
+        .prefix("hf2q-imatrix-snapshot-")
+        .tempfile()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        snapshot.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| ImatrixError::Parse {
+                detail: format!("{} is too large to snapshot", path.display()),
+            })?;
+    }
+    snapshot.flush()?;
+    snapshot.as_file().sync_all()?;
+    Ok(ImatrixSnapshot {
+        file: snapshot,
+        bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +222,14 @@ mod tests {
 
         let data = ImatrixData::load_from_path(tmp.path()).unwrap();
         assert_eq!(data.tensor_pair_count(), 1);
+        let expected = snapshot_file(tmp.path()).unwrap();
+        match &data.provenance {
+            ImatrixProvenance::LoadedFromFile { bytes, sha256, .. } => {
+                assert_eq!(*bytes, expected.bytes);
+                assert_eq!(*sha256, expected.sha256);
+            }
+            other => panic!("expected loaded-file provenance, got {other:?}"),
+        }
 
         let tmp2 = tempfile::NamedTempFile::new().unwrap();
         data.write_gguf(tmp2.path(), &["cdv3".to_string()]).unwrap();
@@ -176,12 +250,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn immutable_snapshot_binds_the_materialized_registry() {
+        let mut original_registry = AccumulatorRegistry::new();
+        original_registry
+            .register("blk.0.attn_q.weight", 2, 1)
+            .unwrap()
+            .absorb_dense(&[1.0, 2.0])
+            .unwrap();
+        let original = tempfile::NamedTempFile::new().unwrap();
+        write_imatrix_to_path(
+            original.path(),
+            &original_registry,
+            &["original".to_string()],
+            1,
+            128,
+        )
+        .unwrap();
+
+        let snapshot = snapshot_file(original.path()).unwrap();
+
+        let mut replacement_registry = AccumulatorRegistry::new();
+        replacement_registry
+            .register("blk.0.attn_q.weight", 2, 1)
+            .unwrap()
+            .absorb_dense(&[9.0, 10.0])
+            .unwrap();
+        write_imatrix_to_path(
+            original.path(),
+            &replacement_registry,
+            &["replacement".to_string()],
+            2,
+            256,
+        )
+        .unwrap();
+
+        let data = ImatrixData::load_from_snapshot(original.path(), &snapshot).unwrap();
+        assert_eq!(data.loaded.datasets, ["original"]);
+        assert_eq!(data.loaded.chunk_count, 1);
+        assert_eq!(data.loaded.chunk_size, 128);
+        assert_eq!(
+            data.loaded
+                .accumulator("blk.0.attn_q.weight")
+                .unwrap()
+                .values,
+            [1.0, 4.0]
+        );
+        match data.provenance {
+            ImatrixProvenance::LoadedFromFile {
+                path,
+                bytes,
+                sha256,
+            } => {
+                assert_eq!(path, original.path());
+                assert_eq!(bytes, snapshot.bytes);
+                assert_eq!(sha256, snapshot.sha256);
+            }
+            other => panic!("expected loaded-file provenance, got {other:?}"),
+        }
+    }
+
     /// Provenance labels are stable + diagnostic-friendly.
     #[test]
     fn provenance_labels() {
-        let from_file =
-            ImatrixProvenance::LoadedFromFile(std::path::PathBuf::from("/tmp/foo.imatrix.gguf"));
+        let from_file = ImatrixProvenance::LoadedFromFile {
+            path: std::path::PathBuf::from("/tmp/foo.imatrix.gguf"),
+            bytes: 42,
+            sha256: "ab".repeat(32),
+        };
         assert!(from_file.label().starts_with("file:"));
+        assert!(from_file.label().contains("bytes=42"));
+        assert!(from_file.label().contains(&"ab".repeat(32)));
         let computed = ImatrixProvenance::Computed {
             corpus_label: "cdv3".to_string(),
             n_ctx: 512,
