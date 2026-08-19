@@ -347,7 +347,7 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn executable_binding(
+pub(super) fn executable_binding(
     locked: &LockedInstallationIdentity,
     retained_extractions: &Directory,
     retained_stage: &Directory,

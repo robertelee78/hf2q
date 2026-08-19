@@ -2,8 +2,8 @@ use jiff::Timestamp;
 
 use super::model::EmbeddedTrustRoot;
 use super::target_set::{
-    authenticate_selected_targets, authenticate_stored_targets, AuthenticatedReleaseTargets,
-    AuthenticatedTargetDescriptor, AuthenticatedTargetSet,
+    authenticate_selected_targets, AuthenticatedReleaseTargets, AuthenticatedTargetDescriptor,
+    AuthenticatedTargetSet,
 };
 use super::verifier::ClockSource;
 use super::TufVerifierError;
@@ -16,7 +16,9 @@ use crate::distribution::schema::{ReleaseVersion, TargetTriple};
 mod extraction;
 
 pub(in crate::distribution) use extraction::{
-    ExtractionStageAuthorization, PostLocalIoReleaseAuthorization,
+    ExtractionStageAuthorization, LockedReleasePreparation, PostLocalIoReleaseAuthorization,
+    PreparedActivationAuthorization, PreparedPublicationAuthorization,
+    PreparedVersionAuthorization, PreparedVersionCommitError, PreparedVersionCommitGuard,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -232,7 +234,13 @@ pub(super) fn reauthenticate_release(
     let stored = locked
         .read_selected_for_authority()?
         .ok_or(TufVerifierError::NoSelectedMetadata)?;
-    let set = authenticate_stored_targets(authorization, anchor, stored, &mut clock)?;
+    let set = super::target_set::authenticate_stored_targets_after(
+        authorization,
+        anchor,
+        stored,
+        &mut clock,
+        Some(last_sample),
+    )?;
     let current = set.bind_channel_pointer(expected.exact_pointer_bytes())?;
     if current.authenticated_at() < last_sample {
         return Err(TufVerifierError::ClockRollback.into());

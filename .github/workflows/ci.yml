@@ -289,6 +289,10 @@ jobs:
             src/distribution/install_state/extraction.rs \
             src/distribution/install_state/extraction/io.rs \
             src/distribution/install_state/extraction/modes.rs \
+            src/distribution/install_state/extraction/prepared.rs \
+            src/distribution/install_state/extraction/prepared/fault.rs \
+            src/distribution/install_state/extraction/prepared/support.rs \
+            src/distribution/install_state/extraction/prepared/types.rs \
             src/distribution/install_state/extraction_tests.rs \
             src/distribution/install_state/identity.rs \
             src/distribution/install_state/identity/fault.rs \
@@ -302,6 +306,7 @@ jobs:
             src/distribution/prepared_release/codesign_tests.rs \
             src/distribution/prepared_release/deflate.rs \
             src/distribution/prepared_release/extract.rs \
+            src/distribution/prepared_release/publish.rs \
             src/distribution/prepared_release/macho.rs \
             src/distribution/prepared_release/macho/linkedit.rs \
             src/distribution/prepared_release/macho/segment.rs \
@@ -316,6 +321,9 @@ jobs:
             src/distribution/update_auth/target_set.rs \
             src/distribution/update_auth/target_set_tests.rs \
             src/distribution/update_auth/target_set_tests/extraction_cases.rs \
+            src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases.rs \
+            src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases/fault_cases.rs \
+            src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases/hostile_cases.rs \
             src/distribution/update_auth/test_repository.rs \
             src/distribution/update_auth/test_repository/hostile_keys.rs \
             src/distribution/update_auth/tests/hostile_profile.rs \

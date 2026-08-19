@@ -67,7 +67,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │       │                stored bytes are not cryptographic authority
 │       ├── extraction/ private exact-replay extraction tree, bounded retained
 │       │                stages, descriptor-relative crash recovery, and
-│       │                signed-mode prefix normalization under a private root
+│       │                signed-mode prefix normalization plus exact-marker,
+│       │                no-replace prepared-version publication and recovery
 │       └── …           sequence-one activation and bounded restart cleanup
 │   ├── update_auth/    transport-free strict TUF profile, one-use request
 │                       tokens, historical replay floors, root-authorized
@@ -83,8 +84,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       canonical embedded-manifest and exact payload binding,
 │                       shared-lock inert extraction, strict thin-arm64 Mach-O
 │                       and native Developer ID verification, plus double-
-│                       checked signed-mode normalization; no prepared-version,
-│                       publication, or CLI authority
+│                       checked signed-mode normalization and dormant first-
+│                       install publication; no activation, update, or CLI
+│                       authority
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -596,11 +598,23 @@ harness leans on three patterns:
    followed by a final complete normalized-tree identity/mode/size/hash replay.
    Final-mode files/directories form canonical restart prefixes, and every
    normalization/full-sync boundary has returned-error and real-process-abort
-   recovery proof. The stage root and retained lock remain private, and the
-   sealed output grants no marker, receipt, publication, activation, or deletion
-   authority. The only policy constructor is test-only; the real Team ID and
-   protected positive fixture are not yet present, so no production entry point
-   can mint this capability.
+   recovery proof. The retained-lock coordinator then writes a canonical marker
+   intent, moves the exact tree through `update/prepared/.pending-*`, repeats
+   current-time TUF plus Mach-O/Developer ID checks at the commit boundary, and
+   publishes `versions/VERSION` by no-replace rename. Every precommit error
+   leaves inert resumable state; every postcommit error is typed durability-
+   unknown and exact recovery repeats content, namespace, media, marker, and
+   native checks. Install-state can commit only through a one-use update-auth
+   guard sampled after its final namespace rebind; a receipt-bound final token
+   samples again after every postcommit durability check before minting
+   `AuthenticatedPreparedVersion`. Metadata cannot advance while an intent or
+   unactivated version exists. The 28 returned-error
+   and 28 real-process-abort barriers, hostile residue, namespace replacement,
+   clock equality/rollback, and first-activation bridge are covered. The only
+   signing-policy constructor is test-only; the real Team ID and protected
+   positive fixture are not yet present, so no production entry point can mint
+   this capability. No public activation, updater, installer, CLI, or deletion
+   authority is introduced.
    The schema boundary now defines installed-version marker v2 and a narrow
    first-standalone record builder. Marker v2 carries the exact metadata-role
    versions needed to regenerate the same install-receipt-v1 transition after
@@ -608,7 +622,7 @@ harness leans on three patterns:
    receipt rather than trusting only its marker digest. Dormant marker-v1
    fixture bytes are rejected fail-closed. This
    builder remains structural output and cannot authenticate or publish a
-   prepared version.
+   prepared version without the sealed retained-lock coordinator above.
    Verifier-request metadata HTTP remains a pending production-root slice.
    Fresh-process recovery repairs the selected
    rollback floor, crash-durably discards only the derived exact unselected
