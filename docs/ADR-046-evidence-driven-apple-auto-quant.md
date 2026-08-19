@@ -28,7 +28,7 @@ Two prerequisite seams are also open:
   smoke route in `src/arch/smoke.rs` returns `Skipped`. Source-text tests pin
   thresholds but do not execute a real statistical quality gate.
 - The converter accepts or can internally select GGUF tensor encodings that
-  `mlx-native 0.10.10` does not read. Confirmed examples are explicit Q4_1 and
+  `mlx-native 0.10.11` does not read. Confirmed examples are explicit Q4_1 and
   Q5_0, plus the Q4_K shape fallback to Q5_0. A production auto system must
   prove converter-output-to-runtime servability before considering quality or
   speed.
@@ -54,7 +54,7 @@ complete production format:
   linear slots;
 - there is no current Rust DWQ trainer or full-model MLX-affine converter.
 
-The exact `mlx-native = 0.10.10` dependency has affine packed-weight kernels
+The exact `mlx-native = 0.10.11` dependency has affine packed-weight kernels
 and QDQ affine primitives, but the existence of a primitive does not prove
 that hf2q's loader, graph routing, prompt QMM, token QMV, width-N, or model
 family is complete or fast.
@@ -285,21 +285,26 @@ mlx-native owns reusable, model-agnostic execution machinery:
 - a machine-readable capability surface describing supported bit widths, group
   sizes, dtypes, shapes, and execution regimes.
 
-The current `mlx-native 0.10.10` source already contains a generic
-`QuantizedWeight` and sharded safetensors loader, packed affine 4/6/8-bit
-execution, optimized 4/8-bit QMV routes, affine QMM variants, and QDQ affine
-scale/bias gradient primitives. hf2q must consume and complete those generic
-facilities instead of growing a second private affine runtime around the legacy
-overlay.
+The `mlx-native 0.10.11` release contains a generic `QuantizedWeight` and
+sharded safetensors loader, packed affine 4/6/8-bit execution, optimized
+4/8-bit QMV routes, affine QMM variants, packed 4/6-bit embedding gather, and
+QDQ affine scale/bias gradient primitives. It also publishes the serde-backed
+`packed_affine_capability` contract for dense, expert-offset, expert-ID, and
+embedding operations, including exact bit, group, shape, bias, dtype, regime,
+kernel-route, fallback, and rejection data. hf2q must consume and extend those
+generic facilities instead of growing a second private affine runtime around
+the legacy overlay.
 
 Those facilities are not yet one complete fast ABI. The generic packed-weight
 route has row-wise SIMD for supported 4/8-bit decode layouts, a scalar 6-bit
-fallback, and no specialized packed prompt-QMM/width-N or affine embedding
-route. The older `qmm_affine` family has a separate unpacked-U8/F32 contract
-plus a narrow packed 4-bit variant. Upstream MLX supporting a bit width or group
-size does not make that tuple fast—or even executable—in the pinned Rust
-runtime. Phase C must converge these paths around one packed artifact contract
-and report fallbacks rather than hiding them.
+fallback, and packed 4/6-bit embedding gather, but no specialized packed
+prompt-QMM/width-N route. The older `qmm_affine` family has a separate
+unpacked-U8/F32 contract plus a narrow packed 4-bit variant. The published
+capability response proves executability and exposes fallback routing; it does
+not turn a fallback into a performance claim. Upstream MLX supporting a bit
+width or group size likewise does not make that tuple fast—or even executable—
+in the pinned Rust runtime. Phase C must converge these paths around one packed
+artifact contract and report fallbacks rather than hiding them.
 
 Model-family decisions do not move into mlx-native, and Metal kernels do not
 move into hf2q. hf2q asks the pinned runtime capability surface whether every
@@ -340,8 +345,9 @@ This phase changes no conversion format and makes no new speed claim.
 
 ### Phase A.1 — close current Gate-0/Gate-1 seams
 
-- Add the model-agnostic capability surface to mlx-native and consume it from
-  hf2q as a machine-readable converter/runtime tensor-type contract.
+- Pin and consume `mlx-native 0.10.11`'s published capability surface from
+  hf2q as a machine-readable converter/runtime tensor-type contract. Keep a
+  candidate ineligible unless every required tensor and regime is executable.
 - Reject or implement Q4_1, Q5_0, BF16, MXFP4, and every internal shape
   fallback consistently; test every accepted selector through exact-runtime
   GGUF reopen and the regimes it advertises.
@@ -365,8 +371,9 @@ This phase changes no conversion format and makes no new speed claim.
 
 - In hf2q, replace the legacy overlay with a manifest-driven full-model graph
   route and produce indexed, sharded artifacts without whole-model residency.
-- In mlx-native, complete the generic packed-weight loader/capability API and
-  eliminate packed-code expansion/repacking in every required execution route.
+- Extend the generic mlx-native packed-weight loader/capability API where a
+  required regime is absent, and eliminate packed-code expansion/repacking in
+  every required execution route.
 - Support and benchmark the exact 4/6/8-bit group-size matrix exposed by
   mlx-native; implement and publish native kernel work where a required shape
   or regime is absent, then pin that release in hf2q.
