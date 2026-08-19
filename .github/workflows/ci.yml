@@ -122,6 +122,23 @@ jobs:
               and .features == []
           ' <<<"$direct_metadata"
           jq -e '
+            [.packages[]
+              | select(.name == "hf2q")
+              | .dependencies[]
+              | select(
+                  .name == "percent-encoding"
+                  or .name == "sha1"
+                  or .name == "url"
+                )
+              | {name, req, uses_default_features, features}]
+            | sort_by(.name)
+            == [
+              {"name":"percent-encoding","req":"=2.3.2","uses_default_features":true,"features":[]},
+              {"name":"sha1","req":"=0.10.7","uses_default_features":true,"features":[]},
+              {"name":"url","req":"=2.5.8","uses_default_features":true,"features":[]}
+            ]
+          ' <<<"$direct_metadata"
+          jq -e '
             .packages[]
             | select(.name == "hf2q")
             | .dependencies[]
@@ -188,6 +205,25 @@ jobs:
             | .resolve.nodes[]
             | select(.id == $id)
             | .features == []
+          ' <<<"$resolved_metadata"
+          jq -e '
+            ["percent-encoding@2.3.2", "sha1@0.10.7", "url@2.5.8"] as $expected
+            | [.packages[]
+                | select(
+                    (.name == "percent-encoding" and .version == "2.3.2")
+                    or (.name == "sha1" and .version == "0.10.7")
+                    or (.name == "url" and .version == "2.5.8")
+                  )
+                | .id] as $ids
+            | [.resolve.nodes[]
+                | select(.id as $id | $ids | index($id))
+                | ((.id | split("#")[-1]) + ":" + ((.features | sort) | join(",")))]
+              | sort
+              == [
+                "percent-encoding@2.3.2:alloc,default,std",
+                "sha1@0.10.7:default,std",
+                "url@2.5.8:default,std"
+              ]
           ' <<<"$resolved_metadata"
           jq -e '
             (.packages[]
@@ -269,6 +305,20 @@ jobs:
               src/distribution/update_transport || true
           )"
           test -z "$unexpected_transport_extraction"
+          unexpected_hf_external_authority="$(
+            grep -InE \
+              'std::process|Command::new|(^|[^[:alnum:]_])reqwest(::|[[:space:]])|(^|[^[:alnum:]_])hyper(::|[[:space:]])' \
+              src/input/hf_reference.rs \
+              src/input/hf_download.rs \
+              src/input/integrity.rs \
+              src/convert/receipt.rs \
+              src/main.rs || true
+          )"
+          unexpected_hf_external_authority="$(
+            grep -vE '^src/main.rs:[0-9]+:use std::process::ExitCode;$' \
+              <<<"$unexpected_hf_external_authority" || true
+          )"
+          test -z "$unexpected_hf_external_authority"
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -355,8 +405,23 @@ jobs:
             src/distribution/update_auth/testdata/python-tuf-v1/SHA256SUMS \
             src/distribution/update_auth/testdata/python-tuf-v1/generate.py \
             src/distribution/update_auth/testdata/python-tuf-v1/requirements.lock \
+            src/input/hf_reference.rs \
+            src/input/hf_reference_tests.rs \
+            src/input/hf_download.rs \
+            src/input/hf_download_plan_tests.rs \
+            src/input/integrity.rs \
+            src/main.rs \
+            src/cli.rs \
+            src/core/integrity.rs \
+            src/core/provenance/source_shard.rs \
+            src/convert/cli_driver.rs \
+            src/convert/receipt.rs \
+            README.md \
+            CHANGELOG.md \
             docs/ADR-045-frictionless-distribution-updates-and-onboarding.md \
-            docs/ARCHITECTURE.md
+            docs/ADR-033-unified-quant-convert-pipeline.md \
+            docs/ARCHITECTURE.md \
+            docs/converting-a-model.md
           do
             grep -Fqx -- "$required" <<<"$package_list"
           done
@@ -379,6 +444,22 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::update_auth:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::update_transport:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
+          hf_source_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
+          for required_test in \
+            input::hf_reference_tests::equivalent_model_references_share_one_canonical_identity \
+            input::hf_download_plan_tests::immutable_file_metadata_is_checked_before_transfer \
+            input::hf_download_plan_tests::metadata_transfer_caps_are_explicit_and_exact \
+            input::integrity::tests::safetensors_index_entry_cap_is_exact \
+            convert::receipt::tests::prepared_success_receipt_binds_output_and_replaces_stale_atomically \
+            tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity
+          do
+            grep -Fq -- "$required_test: test" <<<"$hf_source_tests"
+          done
+          cargo test --locked --bin hf2q --all-features input::hf_reference_tests::
+          cargo test --locked --bin hf2q --all-features input::hf_download_plan_tests::
+          cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features convert::receipt::tests::
+          cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
           distribution_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \
             distribution::install_state::identity::tests::process_cases::process_abort_at_every_identity_barrier_is_exactly_recoverable \

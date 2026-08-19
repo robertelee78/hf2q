@@ -18,7 +18,8 @@
 //!   `hf-hub::Metadata` etag (kept here so cache-side callers don't
 //!   need to pull in `hf-hub` types).
 //! - [`verify_shard`] — pure file-system + crypto check (file exists,
-//!   size matches, sha256 matches for LFS files).
+//!   size matches, SHA-256 matches for LFS files, canonical Git blob SHA-1
+//!   matches for Git-managed metadata).
 //! - [`shard_path`] — `local_dir.join(filename)` helper.
 //!
 //! What stays in `src/input/integrity.rs`:
@@ -40,9 +41,11 @@
 //! mismatches and continues, because corruption is a refuse-to-proceed
 //! event, not a quality-of-life issue.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha1::{Digest as Sha1Digest, Sha1};
 use thiserror::Error;
 use tracing::debug;
 
@@ -73,6 +76,11 @@ pub enum IntegrityError {
     DuplicateManifestEntry { filename: String },
 
     #[error(
+        "HuggingFace returned no supported immutable identity for '{filename}' (etag: {etag})"
+    )]
+    UnsupportedFileIdentity { filename: String, etag: String },
+
+    #[error(
         "Local file missing during integrity check: shard '{filename}' \
          expected at {path}"
     )]
@@ -98,6 +106,19 @@ pub enum IntegrityError {
         expected: String,
         actual: String,
         local_path: String,
+    },
+
+    #[error(
+        "Integrity check failed for Git-managed file '{filename}' \
+         (repo {repo}@{revision}): expected Git blob SHA-1 {expected}, computed {actual}. \
+         The downloaded metadata does not match HuggingFace's recorded object identity."
+    )]
+    GitBlobMismatch {
+        repo: String,
+        revision: String,
+        filename: String,
+        expected: String,
+        actual: String,
     },
 
     #[error(
@@ -132,7 +153,7 @@ pub struct ShardIntegrity {
     pub sha256: Option<String>,
     /// Raw etag as returned by HF (LFS sha256 hex when LFS, Git-style
     /// SHA-1 of `blob <size>\0<contents>` otherwise).  Stored verbatim
-    /// for traceability; equality checks use [`Self::sha256`].
+    /// for traceability and direct Git-blob verification.
     pub hf_etag: String,
     /// `true` iff the etag came from `x-linked-etag` (i.e. the file is
     /// LFS-managed and the etag IS the file SHA-256).
@@ -171,11 +192,9 @@ impl ShardIntegrity {
 ///
 /// 1. File exists.
 /// 2. File size matches `expected.bytes`.
-/// 3. *(LFS only)* SHA-256 of the file's bytes matches `expected.sha256`.
-///
-/// Step 3 is skipped when `expected.is_lfs == false` — HF's plain etag is
-/// a Git blob SHA-1 (`SHA1("blob <size>\0<contents>")`) that is not
-/// directly comparable to a file SHA-256.
+/// 3. LFS files match the advertised SHA-256; Git-managed files match the
+///    advertised canonical Git blob SHA-1
+///    (`SHA1("blob <size>\0<contents>")`).
 pub fn verify_shard(
     repo: &str,
     revision: &str,
@@ -202,31 +221,57 @@ pub fn verify_shard(
         });
     }
 
-    // Non-LFS files (config.json, tokenizer.json) carry a Git-blob SHA-1
-    // etag that doesn't match a file SHA-256 — record the size-only PASS
-    // and move on.
-    let Some(expected_sha) = expected.sha256.as_ref() else {
-        debug!(
-            filename = %expected.filename,
-            "size match (non-LFS file; no sha256 verification possible)"
-        );
-        return Ok(());
-    };
-
-    let actual_sha = compute_file_sha256(local_path)?;
-    if actual_sha.eq_ignore_ascii_case(expected_sha) {
-        debug!(filename = %expected.filename, "sha256 match");
-        Ok(())
-    } else {
-        Err(IntegrityError::ShardMismatch {
+    if let Some(expected_sha) = expected.sha256.as_ref() {
+        let actual_sha = compute_file_sha256(local_path)?;
+        if actual_sha.eq_ignore_ascii_case(expected_sha) {
+            debug!(filename = %expected.filename, "sha256 match");
+            return Ok(());
+        }
+        return Err(IntegrityError::ShardMismatch {
             repo: repo.to_string(),
             revision: revision.to_string(),
             filename: expected.filename.clone(),
             expected: expected_sha.clone(),
             actual: actual_sha,
             local_path: local_path.display().to_string(),
+        });
+    }
+
+    let expected_git = expected.hf_etag.trim().trim_matches('"');
+    if expected_git.len() != 40 || !expected_git.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(IntegrityError::UnsupportedFileIdentity {
+            filename: expected.filename.clone(),
+            etag: expected.hf_etag.clone(),
+        });
+    }
+    let actual_git = compute_git_blob_sha1(local_path, actual_bytes)?;
+    if actual_git.eq_ignore_ascii_case(expected_git) {
+        debug!(filename = %expected.filename, "Git blob SHA-1 match");
+        Ok(())
+    } else {
+        Err(IntegrityError::GitBlobMismatch {
+            repo: repo.to_string(),
+            revision: revision.to_string(),
+            filename: expected.filename.clone(),
+            expected: expected_git.to_ascii_lowercase(),
+            actual: actual_git,
         })
     }
+}
+
+pub(crate) fn compute_git_blob_sha1(path: &Path, size: u64) -> Result<String, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {size}\0").as_bytes());
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Build a [`PathBuf`] for a single shard within a snapshot dir.  Public
@@ -373,18 +418,36 @@ mod tests {
     }
 
     #[test]
-    fn verify_shard_non_lfs_skips_hash_after_size_match() {
+    fn verify_shard_non_lfs_requires_exact_git_blob_identity() {
         let tmp = TempDir::new().unwrap();
         let contents = br#"{"hidden_size": 4096}"#;
         let path = make_shard_file(tmp.path(), "config.json", contents);
+        let git_sha = compute_git_blob_sha1(&path, contents.len() as u64).unwrap();
         let expected = ShardIntegrity {
             filename: "config.json".into(),
             bytes: contents.len() as u64,
             sha256: None,
-            hf_etag: "0123456789abcdef0123456789abcdef01234567".into(),
+            hf_etag: git_sha,
             is_lfs: false,
         };
-        verify_shard("org/repo", "main", &path, &expected)
-            .expect("non-LFS files only need size to match");
+        verify_shard("org/repo", "main", &path, &expected).expect("Git identity matches");
+
+        let wrong = ShardIntegrity {
+            hf_etag: "0123456789abcdef0123456789abcdef01234567".into(),
+            ..expected.clone()
+        };
+        assert!(matches!(
+            verify_shard("org/repo", "main", &path, &wrong),
+            Err(IntegrityError::GitBlobMismatch { .. })
+        ));
+
+        let unsupported = ShardIntegrity {
+            hf_etag: "opaque-etag".into(),
+            ..expected
+        };
+        assert!(matches!(
+            verify_shard("org/repo", "main", &path, &unsupported),
+            Err(IntegrityError::UnsupportedFileIdentity { .. })
+        ));
     }
 }

@@ -99,8 +99,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/input/           external model I/O — nothing else touches raw model files
 │   ├── config_parser.rs HF config.json → ModelMetadata
 │   ├── safetensors.rs   streaming mmap shard reader → TensorMap
-│   ├── hf_download.rs   HF Hub download (with x-linked-etag integrity)
-│   └── integrity.rs     per-shard SHA-256 verification
+│   ├── hf_reference.rs  bounded canonical Hub ID/URL + immutable identity
+│   ├── hf_download.rs   exact-revision native Hub source-plan/download
+│   └── integrity.rs     bounded index + LFS/Git byte verification
 │
 ├── src/ir/              internal representation crossing modules
 │   ├── mod.rs           ModelMetadata, TensorMap, DType, QuantizedTensor, …
@@ -210,13 +211,13 @@ CLI surface (via `assert_cmd`) or to that narrow lib facade.
 ## 3. The convert pipeline
 
 ```
-                          HF input directory or HF Hub repo
+                    explicit local directory or canonical Hub reference
                                        │
                   ┌────────────────────┴────────────────────┐
-                  │       src/input/ (mmap, config parse,    │
-                  │       integrity, optional HF download)   │
+                  │ src/input/ parse identity, resolve exact │
+                  │ commit, select/authenticate bytes, mmap  │
                   └────────────────────┬────────────────────┘
-                                       │ ModelMetadata + TensorMap
+                                       │ verified source + exact receipt identity
                                        v
                   ┌─────────────────────────────────────────┐
                   │  src/arch/   look up arch entry         │
@@ -488,8 +489,12 @@ every new arch paid pre-`src/arch/`. The canonical reference is
   request latency, token throughput, KV-cache hit rate, MTL dispatch
   count and the regression-gate counters.
 - **Verified remote-conversion receipt** (`src/convert/receipt.rs`): a
-  successful remote-source conversion atomically binds exact source files,
-  converter revision, selected quant, output identity, and peak chunk bounds.
+  successful remote-source conversion binds the original/canonical Hub
+  identity, exact revision, sorted selected source sizes/local SHA-256 values,
+  converter revision, selected quant, output identity, and peak chunk bounds
+  in schema v3. Hub lookup and transfer are native: metadata must match the
+  resolved commit before transfer, LFS weights use SHA-256, and Git-managed
+  assets use canonical Git blob SHA-1 before their local SHA-256 is recorded.
   It is not yet the quality/performance candidate receipt defined by ADR-046.
 - **Environment flags.** Investigation-only env vars are listed in
   `docs/operator-env-vars.md`. Defaults are the safe-production

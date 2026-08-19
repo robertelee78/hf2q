@@ -90,6 +90,13 @@ half = "2.4"
 
 # HuggingFace integration
 hf-hub = "0.5"
+# ADR-045 canonical model-reference boundary. Keep these direct because the
+# parser consumes both APIs instead of relying on incidental transitive pins.
+percent-encoding = "=2.3.2"
+url = "=2.5.8"
+# Hugging Face non-LFS metadata carries the canonical Git blob SHA-1 in
+# its ETag. Verify that identity instead of accepting a same-size rewrite.
+sha1 = "=0.10.7"
 
 # Self-learning intelligence — optional
 ruvector-core = { version = "2.3", optional = true }

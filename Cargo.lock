@@ -1530,6 +1530,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mlx-native",
+ "percent-encoding",
  "predicates",
  "rand 0.8.6",
  "rayon",
@@ -1543,6 +1544,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "sigstore-tuf",
  "syn",
@@ -1555,6 +1557,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zip",
 ]
