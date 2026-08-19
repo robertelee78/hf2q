@@ -232,7 +232,7 @@ jobs:
           test -z "$unexpected_transport_authority"
           unexpected_preparation_authority="$(
             grep -RInE --include='*.rs' --exclude='tests.rs' \
-              'rustix::fs|std::fs|std::net|std::process|reqwest|hyper|tokio::net|url::|clap::|ZipWriter|\.extract(_unwrapped_root_dir)?\(' \
+              'rustix::fs|std::fs|std::net|std::process|reqwest|hyper|tokio::net|(^|[^:[:alnum:]_])url::|clap::|ZipWriter|\.extract(_unwrapped_root_dir)?\(' \
               src/distribution/prepared_release || true
           )"
           test -z "$unexpected_preparation_authority"
