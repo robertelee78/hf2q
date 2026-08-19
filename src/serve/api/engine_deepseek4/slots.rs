@@ -155,6 +155,12 @@ impl Deepseek4PrefillState {
         self.plan.is_cold_wave()
     }
 
+    pub(crate) fn uncached_tokens(&self) -> usize {
+        self.prompt_tokens
+            .len()
+            .saturating_sub(self.plan.initial_cached_tokens())
+    }
+
     /// Plan a cooperative FFN chunk without changing request, cache, or
     /// scheduler state. Only a warm matrix slice strictly before the recovery
     /// checkpoint is eligible; anchor capture, incremental replay, and final
@@ -415,15 +421,23 @@ impl Deepseek4SlotState {
         })
     }
 
-    pub(crate) fn tick(
+    /// Sample and route one token without advancing the model cache.
+    ///
+    /// `Some(token)` means the caller must commit that token to the lane's
+    /// cache and then call [`Self::install_next_logits`]. `None` means this
+    /// request reached a terminal condition and no cache transaction is
+    /// required. Keeping sampling outside cache advancement lets the strict
+    /// four-lane scheduler path submit one shared GPU transaction without
+    /// changing the established serial token semantics.
+    pub(crate) fn prepare_tick(
         &mut self,
         loaded: &mut Deepseek4LoadedModel,
         registration: Option<&ModelRegistration>,
         events: Option<&mpsc::Sender<GenerationEvent>>,
         supervisor: &EngineSupervisor,
-    ) -> Result<()> {
+    ) -> Result<Option<u32>> {
         if self.finished {
-            return Ok(());
+            return Ok(None);
         }
         let (token, logprob) = sample(
             loaded,
@@ -439,7 +453,7 @@ impl Deepseek4SlotState {
         {
             self.finish_reason = "stop";
             self.finished = true;
-            return Ok(());
+            return Ok(None);
         }
 
         self.generated.push(token);
@@ -484,10 +498,31 @@ impl Deepseek4SlotState {
             self.finished = true;
         }
 
-        if !self.finished {
-            self.logits = loaded.commit_generated_token(token, supervisor)?;
+        if self.finished {
+            self.progress.advance_decode(self.generated.len());
+            Ok(None)
+        } else {
+            Ok(Some(token))
         }
+    }
+
+    pub(crate) fn install_next_logits(&mut self, logits: MlxBuffer) {
+        debug_assert!(!self.finished);
+        self.logits = logits;
         self.progress.advance_decode(self.generated.len());
+    }
+
+    pub(crate) fn tick(
+        &mut self,
+        loaded: &mut Deepseek4LoadedModel,
+        registration: Option<&ModelRegistration>,
+        events: Option<&mpsc::Sender<GenerationEvent>>,
+        supervisor: &EngineSupervisor,
+    ) -> Result<()> {
+        if let Some(token) = self.prepare_tick(loaded, registration, events, supervisor)? {
+            let logits = loaded.commit_generated_token(token, supervisor)?;
+            self.install_next_logits(logits);
+        }
         Ok(())
     }
 
@@ -596,6 +631,13 @@ mod tests {
             assert!(plan.end() < 8_000);
             assert_eq!(state.cooperative_tokens(plan).unwrap().len(), expected_rows);
         }
+    }
+
+    #[test]
+    fn uncached_tokens_reports_the_exact_recovery_suffix() {
+        let mut state = cached_prefill_state(6_676, 6_676);
+        state.prompt_tokens.truncate(6_684);
+        assert_eq!(state.uncached_tokens(), 8);
     }
 
     #[test]

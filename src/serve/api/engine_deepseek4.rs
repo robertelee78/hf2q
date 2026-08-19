@@ -349,6 +349,14 @@ impl Deepseek4Session {
         self.cache.position()
     }
 
+    pub(super) fn decode_cohort_compatible_with(&self, other: &Self) -> bool {
+        self.cache.position() == self.committed_tokens.len()
+            && other.cache.position() == other.committed_tokens.len()
+            && self.live_logits.is_some()
+            && other.live_logits.is_some()
+            && self.cache.decode_cohort_compatible_with(&other.cache)
+    }
+
     pub(super) fn prepare_cooperative_prefill(
         &mut self,
         start: usize,
@@ -536,6 +544,89 @@ impl Deepseek4Session {
 }
 
 impl Deepseek4LoadedModel {
+    pub(super) fn commit_generated_tokens_cohort(
+        &mut self,
+        token_ids: [u32; 4],
+        sessions: &mut [Deepseek4Session],
+        sorted_slot_indices: [usize; 4],
+        supervisor: &EngineSupervisor,
+    ) -> Result<[MlxBuffer; 4]> {
+        anyhow::ensure!(
+            sorted_slot_indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "DeepSeek-V4 decode cohort slot indices must be unique and sorted"
+        );
+        let mut wanted = sorted_slot_indices.into_iter().peekable();
+        let mut selected = Vec::with_capacity(4);
+        for (index, session) in sessions.iter_mut().enumerate() {
+            if wanted.peek().copied() == Some(index) {
+                anyhow::ensure!(
+                    session.cache.position() == session.committed_tokens.len(),
+                    "DeepSeek-V4 decode cohort slot {index} cache position {} disagrees with token ledger {}",
+                    session.cache.position(),
+                    session.committed_tokens.len()
+                );
+                session
+                    .committed_tokens
+                    .try_reserve(1)
+                    .context("reserve DeepSeek-V4 decode cohort token ledger")?;
+                selected.push(session);
+                wanted.next();
+            }
+        }
+        anyhow::ensure!(
+            wanted.next().is_none() && selected.len() == 4,
+            "DeepSeek-V4 decode cohort slot index is out of range"
+        );
+        let [lane0, lane1, lane2, lane3] = selected.as_mut_slice() else {
+            unreachable!("validated four DeepSeek-V4 decode cohort sessions")
+        };
+        let mut caches = [
+            &mut lane0.cache,
+            &mut lane1.cache,
+            &mut lane2.cache,
+            &mut lane3.cache,
+        ];
+        let lease = supervisor.arm("deepseek4_decode_cohort", GPU_TRANSACTION_TIMEOUT)?;
+        let state = self
+            .model
+            .forward_verifier_decode_cohort_with_commit_gate(token_ids, &mut caches, || {
+                lease.finish()
+            })
+            .context("execute DeepSeek-V4 decode cohort verifier")?;
+        for (session, token) in selected.iter_mut().zip(token_ids) {
+            session.committed_tokens.push(token);
+        }
+        let logits = supervisor.run(
+            "deepseek4_decode_cohort_head",
+            GPU_TRANSACTION_TIMEOUT,
+            || {
+                self.model
+                    .forward_logits(&state)
+                    .context("execute DeepSeek-V4 decode cohort output head")
+            },
+        )?;
+        let vocab = self.model.cfg.vocab_size as usize;
+        anyhow::ensure!(
+            logits.dtype() == mlx_native::DType::F32 && logits.shape() == [4, vocab],
+            "DeepSeek-V4 decode cohort logits must be F32 [4, {vocab}], got {} {:?}",
+            logits.dtype(),
+            logits.shape()
+        );
+        let row_bytes = vocab
+            .checked_mul(mlx_native::DType::F32.size_of())
+            .context("DeepSeek-V4 decode cohort logits row overflow")?;
+        let rows = std::array::from_fn(|lane| {
+            logits
+                .slice_view((lane * row_bytes) as u64, vocab)
+                .with_shape(vec![1, vocab])
+                .expect("validated DeepSeek-V4 decode cohort logits row")
+        });
+        for (session, row) in selected.iter_mut().zip(&rows) {
+            session.live_logits = Some(row.clone());
+        }
+        Ok(rows)
+    }
+
     pub(super) fn supervised_verifier_prefill_cohort(
         &mut self,
         token_batches: &[&[u32]],
@@ -1388,7 +1479,7 @@ impl Deepseek4LoadedModel {
         Ok((logits, cached_tokens))
     }
 
-    fn commit_generated_token(
+    pub(super) fn commit_generated_token(
         &mut self,
         token: u32,
         supervisor: &EngineSupervisor,

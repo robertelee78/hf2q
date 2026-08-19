@@ -118,6 +118,7 @@ jobs:
           check_receipt deepseek/interactive/summary.json '.receipt_sha256.deepseek.interactive'
           check_receipt deepseek/cached-suffix/summary.json '.receipt_sha256.deepseek.cached_suffix'
           check_receipt deepseek/cooperative-prefill/summary.json '.receipt_sha256.deepseek.cooperative_prefill'
+          check_receipt deepseek/decode-cohort/summary.json '.receipt_sha256.deepseek.decode_cohort'
           check_receipt deepseek/full-context-1/envelope.json '.receipt_sha256.deepseek.wave1'
           check_receipt deepseek/full-context-2/envelope.json '.receipt_sha256.deepseek.wave2'
           check_receipt deepseek/full-context-1/thermal/summary.json '.receipt_sha256.deepseek.wave1_thermal'
@@ -155,6 +156,12 @@ jobs:
             "$cooperative_dir/test.log" "$cooperative_dir/thermal.log" \
             "$cooperative_dir/settle.log" "$EXPECTED_SHA" \
             "$EXPECTED_DEEPSEEK_MODEL_SHA256"
+          decode_cohort_dir="$gate_dir/deepseek/decode-cohort"
+          bash scripts/verify_deepseek4_decode_cohort_receipt.sh \
+            "$decode_cohort_dir/summary.json" "$decode_cohort_dir/raw.json" \
+            "$decode_cohort_dir/test.log" "$decode_cohort_dir/thermal.log" \
+            "$decode_cohort_dir/settle.log" "$EXPECTED_SHA" \
+            "$EXPECTED_DEEPSEEK_MODEL_SHA256"
           for wave in 1 2; do
             wave_dir="$gate_dir/deepseek/full-context-$wave"
             summary_sha=$(shasum -a 256 "$wave_dir/summary.json" | awk '{print $1}')
@@ -179,6 +186,11 @@ jobs:
             test "$cooperative_transactions" = \
               "$(jq -er .cooperative_prefill_transactions "$wave_dir/envelope.json")"
             test "$cooperative_transactions" -gt 0
+            decode_cohort_transactions=$(rg -c \
+              'DeepSeek-V4 exact decode cohort selected' "$server_log" || true)
+            test "$decode_cohort_transactions" = \
+              "$(jq -er .decode_cohort_transactions "$wave_dir/envelope.json")"
+            test "$decode_cohort_transactions" -gt 0
           done
           check_receipt gemma/lifecycle/summary.json '.receipt_sha256.gemma.lifecycle'
           check_receipt gemma/overlap/summary.json '.receipt_sha256.gemma.overlap'
@@ -309,6 +321,11 @@ jobs:
                and $d.cached_suffix.cancellation_during_decode.post_cancel_cached_tokens == $d.cached_suffix.cancellation_during_decode.expected_anchor_tokens
                and $d.cached_suffix.ready_before == true and $d.cached_suffix.ready_after == true
                and $d.cached_suffix.fatal_log_signatures == 0
+               and $d.decode_cohort.status == "pass"
+               and $d.decode_cohort.source_sha == $root.source_sha
+               and $d.decode_cohort.model_sha256 == $deepseek_sha
+               and $d.decode_cohort.parity.exact_state_logits_cache_recurrent == true
+               and $d.decode_cohort.benchmark.speedup > 1
                and ($d.full_context_waves | length) == 2
                and ([$d.full_context_waves[].wave] | sort) == [1, 2]
                and all($d.full_context_waves[];
@@ -317,6 +334,8 @@ jobs:
                  and .fatal_log_signatures == 0 and .receipt.status == "pass"
                  and (.cooperative_prefill_transactions | type) == "number"
                  and .cooperative_prefill_transactions > 0
+                 and (.decode_cohort_transactions | type) == "number"
+                 and .decode_cohort_transactions > 0
                  and .receipt.fixture_id == $pc.fixture_id
                  and .receipt.prompt_contract_sha256 == $prompt_contract_sha256
                  and .receipt.prompt_provenance_sha256 == $prompt_provenance_sha256
@@ -1044,11 +1063,14 @@ jobs:
               scripts/test_deepseek4_agentic.sh \
               scripts/test_deepseek4_structured_tools.sh \
               scripts/test_deepseek4_agentic_fixture_contract.sh \
+              scripts/test_deepseek4_decode_cohort_receipt_contract.sh \
               scripts/test_deepseek4_peer_cold_wave.sh \
               scripts/test_deepseek4_peer_cold_wave_contract.sh \
               scripts/run_deepseek4_matched_peer.sh \
               scripts/macos_thermal_guard.sh \
               scripts/verify_macos_thermal_receipt.sh \
+              scripts/verify_deepseek4_decode_cohort_receipt.sh \
+              scripts/run_deepseek4_decode_cohort_gate.sh \
               scripts/verify_gemma4_wave_thermal_receipt.sh \
               scripts/verify_gemma4_parity_receipt.sh \
               scripts/qwen38_long_decode_ab.sh \
@@ -1073,6 +1095,7 @@ jobs:
             bash scripts/test_qwen36_watchdog_harness_contract.sh
             bash scripts/test_deepseek4_cached_suffix_contract.sh
             bash scripts/test_deepseek4_agentic_fixture_contract.sh
+            bash scripts/test_deepseek4_decode_cohort_receipt_contract.sh
             bash scripts/test_deepseek4_peer_cold_wave_contract.sh
             bash scripts/test_macos_thermal_guard_contract.sh
             bash scripts/test_gemma4_wave_thermal_contract.sh

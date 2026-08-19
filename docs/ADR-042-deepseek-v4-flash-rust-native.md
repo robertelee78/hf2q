@@ -4,11 +4,13 @@
   cache growth revalidated 2026-08-08
 - **Updated:** 2026-08-19 — the four-agent workload is bound to an immutable
   insertion-ordered prompt contract and historical tool-result payload;
-  `mlx-native =0.10.12` fixes non-aligned D512 tail loads; and warm compatible
-  DeepSeek suffixes have a candidate cooperative FFN/MoE path. Earlier
-  real-model structured-tool, prefix-reuse, scheduling, and thermal evidence
-  remains as recorded below. The 2026-08-19 hf2q candidates require exact-SHA
-  CI and protected packed-artifact hardware receipts before publication.
+  `mlx-native =0.10.12` fixes non-aligned D512 tail loads; warm compatible
+  suffixes cooperate through FFN/MoE; and an exact four-lane decode transaction
+  plus synchronized cold handoff restores every unchanged product latency
+  bound. Earlier real-model structured-tool, prefix-reuse, scheduling, and
+  thermal evidence remains as recorded below. The 2026-08-19 hf2q candidate
+  requires exact-SHA CI and protected packed-artifact hardware receipts before
+  publication.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -1907,6 +1909,96 @@ logit equality, identical subsequent-token behavior for B=2/3/4 including the
 cooperative median and recorded process peak RSS. Protected agentic waves must
 still pass every unchanged semantic, cache, cancellation, thermal, and latency
 bound before this candidate is accepted.
+
+### Four-agent cold handoff and exact warm B=4 decode (2026-08-19 candidate)
+
+The product failure was scheduler latency, not a corrupt cache, stalled GPU, or
+weak model artifact. In protected run `32299105258`, the unchanged 6,684-token
+four-agent workload produced the correct `read_file` calls, but the first cold
+pair spent about 26 seconds in prefill and completed around 63–64 seconds. The
+second pair completed around 39–40 seconds. Two active cold prefills therefore
+serialized the cohort enough for one correct response to miss the literal
+60-second product ceiling. Expanding cold admission without controlling the
+handoff then exposed a second failure: early lanes published immediately and
+their cached continuations waited behind the remaining cold wave.
+
+The accepted candidate keeps four distinct caches and independent arithmetic;
+it does not concatenate requests into one semantic sequence. Its contract is:
+
+- admit all four cold prefills and retain the measured 16-window adaptive
+  matrix schedule for this 6,684-token prompt;
+- keep cold unary decode on the 64-token bulk quantum, but keep warm and
+  streaming fallback decode at no more than eight tokens;
+- when a cold unary lane becomes terminal while another cold lane is runnable,
+  retain its final scheduler tick and publish the cold cohort together;
+- replay only a warm 1–8-token recovery suffix before admitting decode, which
+  aligns four compatible cursors without blocking a large tool-result suffix;
+- use the four-lane transaction only for exactly four warm unary lanes with
+  identical cache plans and positions, installed live logits, and aligned token
+  ledgers; every other shape uses the established serial path;
+- pre-reserve all four token ledgers, prevalidate all four cache commits, drain
+  one retained Metal command-buffer chain, pass one supervisor gate, and only
+  then publish every cache cursor and next-logit row. Any submitted failure
+  poisons the affected cohort rather than partially publishing it.
+
+The smallest arithmetic spike used the exact 107,431,343,168-byte official
+artifact, four deliberately permuted lanes, distinct supplied tokens, a
+148-token prefix, and 132 subsequent steps. It crossed both ratio-four and
+ratio-128 recurrent/cache boundaries and compared every F32 state bit, logit
+bit, cache byte, cursor, and recurrent state against four serial executions.
+All comparisons were exact. The transaction reduced the decode body from 92
+command buffers and four synchronizations to 23 command buffers and one
+synchronization. The isolated alternating benchmark measured a serial median
+of 273.361 ms and B=4 median of 230.208 ms, or 1.1875x. A later noisier run was
+still positive at 1.0732x; the protected exact-artifact gate therefore requires
+a positive median rather than claiming the best sample as a universal gain.
+
+Several plausible alternatives were measured and rejected, and none remains
+in the landing diff:
+
+- a two-lane decode transaction was bit-exact over 132 steps but regressed from
+  72.072 to 76.233 ms (0.9454x);
+- 4,096-row and paired cold cooperative-prefill attempts either exceeded the
+  M5 Max memory envelope or regressed the exact workload;
+- prefill windows 14, 12, and 8, and a four-active window-14 schedule, still
+  missed the cold bound (61.370, 60.979, 67.304, and 61.789 seconds);
+- four-active/window-16 without synchronized handoff passed cold but missed
+  cached latency at 19.856 and 17.199 seconds; terminal parking fixed cold at
+  59.808 seconds but cached work still took 17.202 and 17.422 seconds;
+- a global eight-token decode quantum, split warm/cold quantum without cursor
+  alignment, and widened B=4 eligibility either missed cold or never formed an
+  eligible cohort;
+- cursor alignment without synchronized cold publication made server decode
+  fast but left the first clients waiting 6.77 seconds at the cohort barrier,
+  producing 19.268- and 18.454-second cached responses.
+
+The reformulated hypothesis—four cold lanes, synchronized cold publication,
+short-suffix cursor alignment, then exact warm B=4 decode—passed the complete
+unchanged product contract on AC power with Nominal thermal state. Evidence is
+under local artifact
+`hf2q-b4-cohort-handoff-full.XXXXXX.kwNCHNYoIe`; its source-bound server log is
+`/var/tmp/hf2q-b4-cohort-handoff-server.log`. The four cold responses were at
+most 59.097 seconds, cohort wall was 59.489 seconds, and maximum cold TTFT was
+52.413 seconds. Cached unary responses were 12.486–12.577 seconds, automatic
+tool calls 12.520–12.525 seconds, SSE 12.619–12.923 seconds, and tool-result
+continuations 22.178–30.575 seconds. Every required/automatic tool, exact
+argument, SSE terminal, continuation, source-syntax, and retained-prefix check
+passed; cached requests retained 6,676 of 6,684 prompt tokens. The log records
+all four cold terminal lanes parking and releasing together, followed by
+positive exact B=4 selection for cached and automatic-tool work.
+
+The proof reuses the already-recorded immutable model identity
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`;
+it does not reread the 107 GB artifact merely to repeat that digest. Prompt
+contract SHA-256 is
+`c06dc12dd7b20cdbc7a17de87b09fbbe523ce898ce7c7fb7b31b2f502dfb1a9f`,
+prompt-provenance SHA-256 is
+`22c5c482515435db1521b9fe49c5d1c0a12007d1dbf4f0ff217a03e9e9e3d2aa`,
+and repository-context SHA-256 is
+`2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef`.
+Publication still requires the packed exact-SHA binary to reproduce the B=4
+parity/positive-median gate and both continuously monitored four-agent waves.
+No 60/15/35-second ceiling is widened by this decision.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 

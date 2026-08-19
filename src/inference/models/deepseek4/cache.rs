@@ -63,6 +63,13 @@ pub struct CacheStep {
     pub layers: Vec<LayerCacheStep>,
 }
 
+/// Proof ticket for atomic multi-cache decode publication.
+///
+/// All four cursors are validated before the shared supervisor gate and then
+/// advanced without a fallible operation between lanes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::inference::models::deepseek4) struct StepCommitTicket(usize);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKind {
     AttentionKv,
@@ -490,6 +497,17 @@ impl Deepseek4Cache {
         self.next_position
     }
 
+    /// Whether two live lanes can share one exact lockstep decode
+    /// transaction. This is deliberately narrower than shape compatibility:
+    /// the cache plans and logical cursors must be identical, and neither
+    /// lane may carry a poisoned transaction.
+    pub(crate) fn decode_cohort_compatible_with(&self, other: &Self) -> bool {
+        !self.poisoned
+            && !other.poisoned
+            && self.next_position == other.next_position
+            && self.plan == other.plan
+    }
+
     pub fn capacity(&self) -> usize {
         self.plan.context_length
     }
@@ -793,6 +811,30 @@ impl Deepseek4Cache {
         }
         self.next_position += 1;
         Ok(())
+    }
+
+    pub(in crate::inference::models::deepseek4) fn validate_step_commit(
+        &self,
+        position: usize,
+    ) -> Result<StepCommitTicket, CacheError> {
+        let step = self.plan_next_step()?;
+        if step.position != position {
+            return Err(CacheError::StepOutOfOrder {
+                expected: step.position,
+                actual: position,
+            });
+        }
+        Ok(StepCommitTicket(position + 1))
+    }
+
+    pub(in crate::inference::models::deepseek4) fn publish_step_end(
+        &mut self,
+        ticket: StepCommitTicket,
+    ) {
+        debug_assert!(!self.poisoned);
+        debug_assert_eq!(ticket.0, self.next_position + 1);
+        debug_assert!(ticket.0 <= self.plan.context_length);
+        self.next_position = ticket.0;
     }
 
     /// Reset logical visibility and all recurrent compressor state. KV rows

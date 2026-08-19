@@ -17,6 +17,7 @@ mod compressed_attention_main;
 mod compressed_attention_weights;
 pub mod compressor;
 pub mod config;
+mod decode_cohort;
 mod ffn_forward;
 pub mod forward;
 mod forward_support;
@@ -55,6 +56,8 @@ mod forward_tests;
 mod model_tests;
 #[cfg(test)]
 mod real_artifact_cohort_tests;
+#[cfg(test)]
+mod real_artifact_decode_cohort_tests;
 #[cfg(test)]
 mod real_artifact_tests;
 #[cfg(test)]

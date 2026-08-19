@@ -573,6 +573,16 @@ sha256_file "$cooperative_dir/summary.json" \
   >"$cooperative_dir/summary.json.sha256"
 ensure_guard_health
 
+# The warm-prefill proof above and the exact decode proof exercise distinct
+# transaction shapes. Reuse the already-built packed test binary and the
+# already-verified model identity; do not rescan the 107 GB artifact.
+require_no_model_runtime
+bash scripts/run_deepseek4_decode_cohort_gate.sh \
+  "$cooperative_test_binary" "$DEEPSEEK_MODEL" \
+  "$OUT_ROOT/deepseek/decode-cohort" "$EXPECTED_SHA" \
+  "$DEEPSEEK_MODEL_SHA256"
+ensure_guard_health
+
 HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
 HF2Q_QWEN36_WATCHDOG_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-347.json" \
 HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-short.json" \
@@ -615,6 +625,7 @@ run_deepseek_wave() {
   local thermal_summary="$thermal_dir/summary.json"
   local cold_receipts_json
   local cooperative_prefill_transactions
+  local decode_cohort_transactions
   local measurement_samples
   local measurement_duration_seconds
   local non_nominal_measurement_samples
@@ -746,6 +757,13 @@ run_deepseek_wave() {
     echo "DeepSeek wave $wave observed no cooperative warm-prefill transaction" >&2
     return 1
   }
+  decode_cohort_transactions=$(rg -c \
+    'DeepSeek-V4 exact decode cohort selected' "$current_log" || true)
+  [[ "$decode_cohort_transactions" =~ ^[0-9]+$ ]]
+  ((decode_cohort_transactions > 0)) || {
+    echo "DeepSeek wave $wave observed no exact warm B=4 decode transaction" >&2
+    return 1
+  }
   cold_prefill_rates_json=$(
     for request_id in 1 2 3 4; do
       rate=$(rg "DeepSeek-V4 prefill complete request_id=${request_id}( |$)" "$current_log" \
@@ -764,10 +782,11 @@ run_deepseek_wave() {
     --arg summary_sha256 "$(cat "$out/summary.json.sha256")" \
     --arg server_log_sha256 "$(cat "$current_dir/server.log.sha256")" \
     --argjson cooperative_prefill_transactions "$cooperative_prefill_transactions" \
+    --argjson decode_cohort_transactions "$decode_cohort_transactions" \
     --argjson cold_prefill_tokens_per_second "$cold_prefill_rates_json" \
     --slurpfile thermal "$thermal_summary" \
     --slurpfile receipt "$out/summary.json" \
-    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,decode_cohort_transactions:$decode_cohort_transactions,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
   scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \
@@ -1355,6 +1374,7 @@ jq -n \
   --arg deepseek_interactive_sha "$(sha256_file "$OUT_ROOT/deepseek/interactive/summary.json")" \
   --arg deepseek_cached_sha "$(sha256_file "$OUT_ROOT/deepseek/cached-suffix/summary.json")" \
   --arg deepseek_cooperative_sha "$(sha256_file "$OUT_ROOT/deepseek/cooperative-prefill/summary.json")" \
+  --arg deepseek_decode_cohort_sha "$(sha256_file "$OUT_ROOT/deepseek/decode-cohort/summary.json")" \
   --arg deepseek_wave1_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/envelope.json")" \
   --arg deepseek_wave2_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-2/envelope.json")" \
   --arg deepseek_wave1_thermal_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/thermal/summary.json")" \
@@ -1388,6 +1408,7 @@ jq -n \
   --slurpfile deepseek_interactive "$OUT_ROOT/deepseek/interactive/summary.json" \
   --slurpfile deepseek_cached "$OUT_ROOT/deepseek/cached-suffix/summary.json" \
   --slurpfile deepseek_cooperative "$OUT_ROOT/deepseek/cooperative-prefill/summary.json" \
+  --slurpfile deepseek_decode_cohort "$OUT_ROOT/deepseek/decode-cohort/summary.json" \
   --slurpfile deepseek_wave1 "$OUT_ROOT/deepseek/full-context-1/envelope.json" \
   --slurpfile deepseek_wave2 "$OUT_ROOT/deepseek/full-context-2/envelope.json" \
   --slurpfile deepseek_prompt_provenance "$agentic_prompt_provenance" \
@@ -1428,13 +1449,13 @@ jq -n \
       }
     },
     receipt_sha256: {
-      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,cooperative_prefill:$deepseek_cooperative_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha,prompt_provenance:$deepseek_prompt_provenance_sha},
+      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,cooperative_prefill:$deepseek_cooperative_sha,decode_cohort:$deepseek_decode_cohort_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha,prompt_provenance:$deepseek_prompt_provenance_sha},
       gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,eight_slots_thermal:$gemma_wave8_thermal_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha},
       qwen38:{long_decode:$qwen38_long_decode_sha}
     },
     families: {
-      deepseek: {status:"pass",prompt_provenance:$deepseek_prompt_provenance[0],cooperative_prefill:$deepseek_cooperative[0],lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
+      deepseek: {status:"pass",prompt_provenance:$deepseek_prompt_provenance[0],cooperative_prefill:$deepseek_cooperative[0],decode_cohort:$deepseek_decode_cohort[0],lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
       gemma: {status:"pass",lifecycle:$gemma_lifecycle[0],overlap_and_cancellation:$gemma_overlap[0],agent_waves:[$gemma_wave1[0],$gemma_wave2[0],$gemma_wave8[0]],transactions:[$gemma_transactions4[0],$gemma_transactions8[0]],parity:$gemma_parity[0],heap:$gemma_heap[0]},
       qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]},
       qwen38: {status:"pass",long_decode:$qwen38_long_decode[0]}
