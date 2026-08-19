@@ -359,6 +359,17 @@ log snapshot must prove `auto` retained the scalar route before the long AUTO
 request proves Q2 selection. Isolated mlx-native numbers are dependency
 evidence, not hf2q release authority.
 
+Test-ownership RCA (2026-08-18): commit `57d33b92` added three CPU-only GQA-Q2
+policy tests directly to the Metal-owning `kv_cache.rs`. The cross-module GPU
+discipline guard intentionally requires every test in such a file to acquire
+the shared GPU lock first, so the full suite correctly reported 103 tests but
+only 100 acquisitions. Adding locks to pure policy tests would have hidden the
+ownership error and unnecessarily serialized them. The policy, parameter type,
+and tests now live in CPU-only `gqa_q2_policy.rs`; `kv_cache` re-exports the
+parameter type to preserve its caller contract. Hosted CI runs both the policy
+tests and `iter230_a2_lock_discipline`, closing the coverage gap that let the
+inconsistent module placement merge.
+
 The next exact-output optimization sequence is a two-dimensional H2xP2
 query-head/query-position verifier, then native Qwen3.8 MTP and a dynamic
 suffix-automaton proposer behind measured acceptance/cost routing. Split-K
