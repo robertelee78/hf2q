@@ -681,8 +681,12 @@ jobs:
             test -z "$unexpected_imports"
             unexpected_preparation_authority="$(
               grep -RInE --include='*.rs' --exclude='tests.rs' \
-                'rustix::fs|std::fs|std::net|std::process|reqwest|hyper|tokio::net|(^|[^:[:alnum:]_])url::|clap::|ZipWriter|\.extract(_unwrapped_root_dir)?\(' \
+                'rustix::fs|std::fs|File::(create|open|options)|OpenOptions::|std::net|std::process|reqwest|hyper|tokio::net|(^|[^:[:alnum:]_])url::|clap::|ZipWriter|\.extract(_unwrapped_root_dir)?\(' \
                 src/distribution/prepared_release || true
+            )"
+            unexpected_preparation_authority="$(
+              grep -vE '^[^:]+:[0-9]+:use std::fs::File;$' \
+                <<<"$unexpected_preparation_authority" || true
             )"
             test -z "$unexpected_preparation_authority"
             unexpected_extraction_authority="$(
@@ -690,6 +694,7 @@ jobs:
                 'remove_named|remove_dir|remove_file|unlink|rename|fchmod|AuthenticatedPreparedVersion|version-installation|install-receipt|std::process::Command|reqwest|hyper|tokio::net|clap::' \
                 src/distribution/install_state/extraction.rs \
                 src/distribution/install_state/extraction/io.rs \
+                src/distribution/install_state/extraction/modes.rs \
                 src/distribution/prepared_release/extract.rs || true
             )"
             test -z "$unexpected_extraction_authority"
@@ -729,6 +734,7 @@ jobs:
               src/distribution/install_state/artifact/tests.rs \
               src/distribution/install_state/extraction.rs \
               src/distribution/install_state/extraction/io.rs \
+              src/distribution/install_state/extraction/modes.rs \
               src/distribution/install_state/extraction_tests.rs \
               src/distribution/install_state/identity.rs \
               src/distribution/install_state/identity/fault.rs \
@@ -783,7 +789,11 @@ jobs:
               distribution::install_state::identity::tests::process_cases::process_abort_at_every_identity_barrier_is_exactly_recoverable \
               distribution::install_state::identity::tests::process_cases::shared_identity_lock_excludes_a_fresh_process_bootstrap \
               distribution::install_state::extraction::tests::process_abort_mid_file_leaves_only_resumable_inert_state \
+              distribution::install_state::extraction::tests::every_normalization_barrier_is_exactly_restartable_after_sigabrt \
+              distribution::install_state::extraction::tests::every_normalization_barrier_is_exactly_retryable_after_returned_error \
               distribution::update_auth::target_set::tests::extraction_cases::stored_and_deflated_bundles_cross_the_complete_extraction_boundary \
+              distribution::update_auth::target_set::tests::extraction_cases::signed_mode_normalization_is_sealed_and_keeps_the_tree_inert \
+              distribution::update_auth::target_set::tests::extraction_cases::failed_native_brackets_return_no_capability_and_exact_retry_recovers \
               distribution::update_auth::target_set::tests::extraction_cases::post_extraction_archive_revalidation_failure_returns_no_capability_and_is_retryable
             do
               grep -Fq -- "$required_test: test" <<<"$distribution_tests"

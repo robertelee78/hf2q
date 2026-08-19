@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 
 use crate::distribution::schema::ReleaseManifestV1;
 
@@ -97,6 +99,48 @@ pub(super) fn verify_bytes(
     manifest: &ReleaseManifestV1,
 ) -> Result<VerifiedMachO, MachOError> {
     verify_source(&ByteSource(bytes), manifest)
+}
+
+pub(super) fn verify_file(
+    file: &File,
+    manifest: &ReleaseManifestV1,
+) -> Result<VerifiedMachO, MachOError> {
+    let length = file.metadata().map_err(|_| MachOError::Read)?.len();
+    verify_source(&FileSource { file, length }, manifest)
+}
+
+#[cfg(test)]
+pub(super) fn verify_file_with_length_for_test(
+    file: &File,
+    length: u64,
+    manifest: &ReleaseManifestV1,
+) -> Result<VerifiedMachO, MachOError> {
+    verify_source(&FileSource { file, length }, manifest)
+}
+
+struct FileSource<'a> {
+    file: &'a File,
+    length: u64,
+}
+
+impl Source for FileSource<'_> {
+    fn len(&self) -> u64 {
+        self.length
+    }
+
+    fn read_exact_at(&self, mut offset: u64, mut buffer: &mut [u8]) -> io::Result<()> {
+        while !buffer.is_empty() {
+            let count = self.file.read_at(buffer, offset)?;
+            if count == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            offset = offset
+                .checked_add(count as u64)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            buffer = &mut buffer[count..];
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

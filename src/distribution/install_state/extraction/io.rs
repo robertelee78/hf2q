@@ -66,7 +66,11 @@ pub(super) fn verify_file(
     expected_identity: EntryIdentity,
     expected: &ExpectedFile,
 ) -> Result<(), ExtractionError> {
-    let actual = unix::regular_file_identity(file, expected_identity.device)?;
+    let actual = unix::regular_file_identity_with_mode(
+        file,
+        expected_identity.device,
+        expected_identity.mode,
+    )?;
     if actual != expected_identity || actual.size != expected.size {
         return Err(ExtractionError::Integrity);
     }
@@ -88,7 +92,11 @@ pub(super) fn verify_file(
         }
         hasher.update(&buffer[..count]);
     }
-    let after = unix::regular_file_identity(file, expected_identity.device)?;
+    let after = unix::regular_file_identity_with_mode(
+        file,
+        expected_identity.device,
+        expected_identity.mode,
+    )?;
     if after != actual
         || total != expected.size
         || hex::encode(hasher.finalize()) != expected.sha256
@@ -96,6 +104,49 @@ pub(super) fn verify_file(
         return Err(ExtractionError::Integrity);
     }
     Ok(())
+}
+
+/// Reconsume the exact authenticated source for an already normalized file.
+///
+/// Final-mode files are never repaired or rewritten. Any byte mismatch leaves
+/// the inert stage untouched and fails closed.
+pub(super) fn verify_exact_source(
+    file: &File,
+    identity: EntryIdentity,
+    source: &mut dyn Read,
+    expected: &ExpectedFile,
+) -> Result<(), ExtractionError> {
+    if identity.size != expected.size {
+        return Err(ExtractionError::Integrity);
+    }
+    let mut total = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut source_buffer = [0_u8; 64 * 1024];
+    let mut retained_buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = source
+            .read(&mut source_buffer)
+            .map_err(ExtractionError::read_io)?;
+        if count == 0 {
+            break;
+        }
+        let next = total
+            .checked_add(count as u64)
+            .ok_or(ExtractionError::Integrity)?;
+        if next > expected.size {
+            return Err(ExtractionError::Integrity);
+        }
+        read_exact_at(file, &mut retained_buffer[..count], total)?;
+        if retained_buffer[..count] != source_buffer[..count] {
+            return Err(ExtractionError::Integrity);
+        }
+        hasher.update(&source_buffer[..count]);
+        total = next;
+    }
+    if total != expected.size || hex::encode(hasher.finalize()) != expected.sha256 {
+        return Err(ExtractionError::Integrity);
+    }
+    verify_file(file, identity, expected)
 }
 
 fn read_exact_at(

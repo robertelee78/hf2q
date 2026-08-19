@@ -1,9 +1,10 @@
 //! Descriptor-relative standalone installation state.
 //!
-//! This bounded context implements private descriptor-relative extraction and
-//! the first activation of an already authenticated, fully prepared standalone
-//! release. Extraction remains inert and cannot publish an executable version;
-//! neither path establishes update authority or deletion authority.
+//! This bounded context implements private descriptor-relative extraction,
+//! crash-resumable normalization to signed file/directory modes under a private
+//! stage root, and the first activation of an already authenticated, fully
+//! prepared standalone release. Staging remains inert and cannot publish a
+//! version; neither path establishes update authority or deletion authority.
 
 mod artifact;
 mod extraction;
@@ -38,7 +39,8 @@ pub(in crate::distribution) use artifact::{
     ArtifactStageError, EphemeralArtifactStage, VerifiedArchiveFile,
 };
 pub(in crate::distribution) use extraction::{
-    ExtractedReleaseTree, ExtractionError, ReleaseExtractionStage,
+    ExecutableReleaseBinding, ExtractedReleaseTree, ExtractionError,
+    NormalizedExtractedReleaseTree, ReleaseExtractionStage,
 };
 #[allow(unused_imports)]
 pub(in crate::distribution) use identity::{

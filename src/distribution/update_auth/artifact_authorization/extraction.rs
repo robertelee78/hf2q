@@ -54,6 +54,98 @@ impl std::fmt::Debug for LockedReleasePreparation<'_> {
     }
 }
 
+impl<'a> PostLocalIoReleaseAuthorization<'a> {
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn with_extracted_executable<R, E>(
+        &self,
+        tree: &crate::distribution::install_state::ExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &ReleaseManifestV1,
+        operation: impl FnOnce(
+            &std::path::Path,
+            &std::fs::File,
+            crate::distribution::install_state::ExecutableReleaseBinding,
+        ) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<crate::distribution::install_state::ExtractionError>,
+    {
+        self._locked
+            .with_extracted_executable(tree, exact_manifest, manifest, operation)
+    }
+
+    pub(in crate::distribution) fn normalize_extracted_release(
+        &self,
+        developer_id: crate::distribution::prepared_release::DeveloperIdVerification,
+        tree: crate::distribution::install_state::ExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &ReleaseManifestV1,
+    ) -> Result<
+        crate::distribution::install_state::NormalizedExtractedReleaseTree,
+        crate::distribution::install_state::ExtractionError,
+    > {
+        self._locked
+            .normalize_extracted_release(developer_id, tree, exact_manifest, manifest)
+    }
+
+    pub(in crate::distribution) fn reauthenticate_after_mode_normalization(
+        self,
+    ) -> Result<Self, ArtifactFetchAuthorizationError> {
+        self.reauthenticate_after_mode_normalization_with_clock(ClockSource::System)
+    }
+
+    fn reauthenticate_after_mode_normalization_with_clock(
+        self,
+        clock: ClockSource,
+    ) -> Result<Self, ArtifactFetchAuthorizationError> {
+        let current = reauthenticate_release(
+            self._authorization,
+            self._anchor,
+            &self._locked,
+            &self.targets,
+            self.authenticated_at,
+            clock,
+        )?;
+        let authenticated_at = current.authenticated_at();
+        Ok(Self {
+            _authorization: self._authorization,
+            _anchor: self._anchor,
+            _locked: self._locked,
+            targets: current,
+            authenticated_at,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn with_normalized_executable<R, E>(
+        &self,
+        tree: &crate::distribution::install_state::NormalizedExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &ReleaseManifestV1,
+        operation: impl FnOnce(
+            &std::path::Path,
+            &std::fs::File,
+            crate::distribution::install_state::ExecutableReleaseBinding,
+        ) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<crate::distribution::install_state::ExtractionError>,
+    {
+        self._locked
+            .with_normalized_executable(tree, exact_manifest, manifest, operation)
+    }
+
+    pub(in crate::distribution) fn verify_normalized_release_tree(
+        &self,
+        tree: &crate::distribution::install_state::NormalizedExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &ReleaseManifestV1,
+    ) -> Result<(), crate::distribution::install_state::ExtractionError> {
+        self._locked
+            .verify_normalized_release_tree(tree, exact_manifest, manifest)
+    }
+}
+
 impl ExtractionStageAuthorization {
     pub(in crate::distribution) fn version(&self) -> &ReleaseVersion {
         &self.version
@@ -248,5 +340,12 @@ impl<'a> LockedReleasePreparation<'a> {
 impl PostLocalIoReleaseAuthorization<'_> {
     pub(in crate::distribution::update_auth) fn authenticated_at_for_test(&self) -> Timestamp {
         self.authenticated_at
+    }
+
+    pub(in crate::distribution) fn reauthenticate_after_mode_normalization_for_test(
+        self,
+        samples: impl IntoIterator<Item = Timestamp>,
+    ) -> Result<Self, ArtifactFetchAuthorizationError> {
+        self.reauthenticate_after_mode_normalization_with_clock(ClockSource::scripted(samples))
     }
 }

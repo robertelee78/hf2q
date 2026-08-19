@@ -10,10 +10,11 @@
   lock-reauthenticated fetch capability, and same-descriptor streamed archive
   staging, dormant exact embedded-manifest/classic-ZIP validation, and
   lock-held descriptor-relative inert extraction, and dormant native Developer
-  ID requirement/signing-information verification are reconciled; the real
+  ID requirement/signing-information verification, descriptor-bound native
+  verification, and crash-resumable signed-mode normalization are reconciled;
+  the real
   release trust root, verifier-request metadata transport, real compiled Team
-  ID plus protected positive fixture, descriptor-bound codesign integration,
-  signed-mode normalization, crash-durable
+  ID plus protected positive fixture, crash-durable
   prepared-version publication, public update/install/onboarding
   implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
@@ -246,13 +247,19 @@ payload budget is about 32 GiB plus manifest and filesystem overhead.
 
 The manifest and every payload are decoded in canonical archive order into an
 exact descriptor-relative tree. The tree admits at most 4,096 unique derived
-directories. All stage and derived directories remain private `0700`, and all
-files—including payloads whose signed final mode is `0755`—remain inert `0600`.
-The later code-signing/publication transition must consume this capability,
-apply the signed final `0644`/`0755` modes, sync, and reverify before any name
-under `versions/` can exist. Extraction never calls a generic ZIP extractor and
-returns no path, file descriptor, marker, receipt, prepared-version, or
-activation capability.
+directories. Raw extraction leaves every stage/derived directory private
+`0700` and every file—including payloads whose signed final mode is `0755`—
+inert `0600`. Extraction never calls a generic ZIP extractor and returns no
+path, file descriptor, marker, receipt, prepared-version, or activation
+capability. The sealed next transition verifies the same descriptor-bound
+`bin/hf2q`. That ephemeral proof is bound to the live extraction namespace and
+stage identities, executable path/device/inode/size/mode, and exact manifest
+digest; normalization rederives the complete binding before consuming it, so a
+proof from another root or stage cannot be substituted. It then applies the signed
+`0644`/`0755` modes within the same private stage root, replays current TUF
+state, verifies the same path/inode again, and finally reopens and rehashes the
+complete normalized tree. The stage root remains `0700`, and no name under
+`versions/` can exist in this boundary.
 
 Restart recovery treats a correctly named, current-user, single-link,
 same-device `0600` expected file as reconstructible scratch. A newly
@@ -322,6 +329,19 @@ directories move from `0700` to `0755`; the version root stays `0700` and the
 marker stays `0600`. Each transition operates on the retained descriptor,
 rechecks device/inode/owner/link count/size/hash, full-syncs, rehashes, and
 revalidates its name. Any non-prefix mixture fails closed.
+
+The deterministic extraction stage is also the normalization crash journal.
+A final-mode file is accepted only as part of the exact canonical file prefix,
+at its complete authenticated length and SHA-256; it is never rewritten or
+repaired. A final-mode derived directory is accepted only as part of the exact
+deepest-first/path-sorted directory prefix after every file is final. Returned
+errors and real process aborts after every file-mode, file-full-sync,
+directory-mode, directory-sync, namespace-sync, live-rebind, and endpoint
+full-sync barrier must be recoverable by a fresh exact archive replay. The
+successful normalized capability retains the same installation lock and grants
+no path, descriptor, marker, receipt, publication, activation, or deletion
+authority. A mutation of any non-binary payload between the native brackets is
+also rejected by the final whole-tree identity/mode/size/hash replay.
 
 After all files and directories are full-synced bottom-up, the transaction
 replays the same selected TUF generation at current time, reopens and rebinds
@@ -1137,9 +1157,11 @@ downgrade or rollback requires a separate one-use intent capability.
 Large archives are streamed and checked against the sealed descriptor by hf2q
 rather than buffered through either client's convenience target API. The
 origin-locked external-byte layer, exact classic-ZIP/embedded-manifest
-validator, and private descriptor-relative extraction are implemented but
-remain deliberately dormant. Codesign verification, signed-mode normalization,
-and prepared-version publication authority remain pending. Notarization is
+validator, private descriptor-relative extraction, descriptor-bound native
+verification, and crash-resumable signed-mode normalization are implemented
+but remain deliberately dormant. The real compiled Team-ID policy, protected
+positive signing fixture, and prepared-version publication authority remain
+pending. Notarization is
 publisher promotion evidence for the exact archive, not runtime preparation
 authority. The implemented metadata layer
 already preserves the distinction between ordinary read authority and
@@ -1307,11 +1329,13 @@ I/O. The private preparation boundary additionally proves the exact classic-ZIP
 layout, canonical embedded manifest, complete payload inventory, modes, sizes,
 CRCs, and SHA-256 values on the same archive descriptor, then materializes the
 exact bytes into a private inert tree under the retained shared lock. These
-boundaries still do not produce update authority. The next slice must embed the
-real stable trust root, compile the real public Team ID, pass the protected
-positive Developer ID fixture, bind the native verifier to the staged
-descriptor/inode under the retained lock, normalize and sync signed modes, and
-durably publish and reopen the
+boundaries still do not produce update authority. The preparation boundary now
+brackets the same descriptor-bound binary with Mach-O and native Developer ID
+verification, consumes the first ephemeral proof to normalize exact signed
+modes, repeats current-time TUF replay, and requires the same path/inode to pass
+the native verifier again. The next slice must embed the real stable trust root,
+compile the real public Team ID, pass the protected positive Developer ID
+fixture, and durably publish and reopen the
 version before it can construct an authenticated prepared version.
 Neither a receipt, parsed role, provisional candidate, durable baseline, nor
 selected target plan can download bytes or mutate an installation by itself.
@@ -1749,6 +1773,7 @@ support.
 | Published asset replacement | Immutable draft-to-publish flow forbids overwrite; clients bind exact hashes rather than trusting a mutable tag alone. |
 | Malicious archive path/link | A bounded custom classic-ZIP pass preserves every raw record and rejects duplicates, noncanonical order, flags, links/types, ZIP64, comments/extras, local/central disagreement, gaps, overlaps, prefixes, and trailing bytes before the decoder or any extraction runs. The exact embedded manifest and every streamed payload digest must then match the signed inventory. |
 | Crash or torn private extraction | The shared-lock stage has a deterministic authenticated name, exact bounded inventory, private `0600`/`0700` modes, in-place exact reconstruction, per-file `F_FULLFSYNC`, bottom-up directory barriers, namespace rebinding, and a final metadata replay. Safe scratch is resumable; hostile shape is retained and fails closed; no version is published. |
+| Crash or drift during signed-mode normalization | The first descriptor-bound Developer ID proof is one-use; final-mode files and directories must form exact canonical prefixes, and final files are never repaired. Returned-error and `SIGABRT` matrices cover every mode/full-sync/namespace/endpoint barrier. Current-time TUF replay plus a second same-path/inode native check is mandatory before the inert normalized capability exists; expiry, rollback, selected-generation drift, or namespace replacement returns no capability and publishes nothing. |
 | Interrupted install/update | Before activation, old `current` selects the complete old activation. After the sole commit, new `current` selects one complete immutable receipt, relative version link, version, and marker. Partial staging is never executable. |
 | Concurrent updater | Installation lock admits one transition and leaves no ambiguous active version. |
 | Package-manager collision | Receipt plus manager-database ownership evidence prevents self-overwrite; Cargo route history is never guessed, and `hf2q update` delegates through the recorded/selected route and verifies the result. |
@@ -1785,11 +1810,11 @@ before public self-update ships.
    inert extraction with current-time lock-held replay, marker-v2 exact
    preparation evidence, and the first-standalone marker/receipt builder have
    landed as dormant bounded contexts. The native Developer ID requirement and
-   typed signing-information verifier have also landed without a production
-   Team-ID constructor. Next, embed the real stable root, compile the real
-   public Team ID, pass the protected positive signing fixture, bind that proof
-   to the retained extraction inode/lock, and implement signed-mode
-   normalization, crash-durable
+   typed signing-information verifier, descriptor-bound double native check,
+   crash-resumable signed-mode normalization, and post-normalization TUF replay
+   have also landed without a production Team-ID constructor. Next, embed the
+   real stable root, compile the real public Team ID, pass the protected
+   positive signing fixture, and implement crash-durable
    prepared-version publication, live installed-release downgrade
    floor, canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration

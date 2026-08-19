@@ -3,10 +3,11 @@
 //! This bounded context validates a listing-first exact-inventory ZIP and then
 //! materializes it only into private descriptor-relative inert staging while
 //! retaining the shared installation lock. It also contains the dormant native
-//! Developer ID policy and typed signing-information verifier, but deliberately
-//! has no real compiled Team ID or production constructor yet. It owns no
-//! signed-mode normalization, publication, marker, receipt, prepared-version,
-//! activation, installer, or CLI authority.
+//! Developer ID policy and typed signing-information verifier, and brackets
+//! crash-resumable signed-mode normalization with two native checks plus a
+//! current-time TUF replay. It deliberately has no real compiled Team ID or
+//! production constructor yet and owns no publication, marker, receipt,
+//! prepared-version, activation, installer, or CLI authority.
 
 mod archive;
 #[cfg(target_os = "macos")]
@@ -33,7 +34,34 @@ pub(super) enum PreparedReleaseError {
     Authentication(#[from] crate::distribution::update_auth::ArtifactFetchAuthorizationError),
     #[error(transparent)]
     Extraction(#[from] crate::distribution::install_state::ExtractionError),
+    #[cfg(target_os = "macos")]
+    #[error("the staged executable is outside the supported Mach-O profile")]
+    MachO,
+    #[cfg(target_os = "macos")]
+    #[error("the staged executable does not satisfy the native code-signing policy")]
+    CodeSigning,
 }
+
+#[cfg(target_os = "macos")]
+impl From<macho::MachOError> for PreparedReleaseError {
+    fn from(_: macho::MachOError) -> Self {
+        Self::MachO
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<codesign::CodeSigningError> for PreparedReleaseError {
+    fn from(_: codesign::CodeSigningError) -> Self {
+        Self::CodeSigning
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::distribution) use codesign::DeveloperIdVerification;
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::distribution) use extract::{
+    verify_and_normalize_release_for_test, verify_and_normalize_release_with_hook_for_test,
+};
 
 /// Exact archive/manifest agreement before lock-held inert extraction.
 ///

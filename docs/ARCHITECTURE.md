@@ -66,7 +66,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │       ├── metadata/   canonical crash-durable update-metadata journal;
 │       │                stored bytes are not cryptographic authority
 │       ├── extraction/ private exact-replay extraction tree, bounded retained
-│       │                stages, and descriptor-relative crash recovery
+│       │                stages, descriptor-relative crash recovery, and
+│       │                signed-mode prefix normalization under a private root
 │       └── …           sequence-one activation and bounded restart cleanup
 │   ├── update_auth/    transport-free strict TUF profile, one-use request
 │                       tokens, historical replay floors, root-authorized
@@ -80,9 +81,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       prepared-version, installer, or CLI authority
 │   └── prepared_release/ bounded classic-ZIP structural/profile validation,
 │                       canonical embedded-manifest and exact payload binding,
-│                       shared-lock inert extraction, and a filesystem-free
-│                       strict thin-arm64 Mach-O profile parser; no native
-│                       codesign, prepared-version, publication, or CLI authority
+│                       shared-lock inert extraction, strict thin-arm64 Mach-O
+│                       and native Developer ID verification, plus double-
+│                       checked signed-mode normalization; no prepared-version,
+│                       publication, or CLI authority
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes
@@ -568,14 +570,14 @@ harness leans on three patterns:
    a byte-identical deterministic embedded manifest, and every streamed payload
    digest. It then extracts only through directory descriptors into the
    deterministic private `update/extractions/.extract-vVERSION-SHA256` stage.
-   At most eight retained stages are accepted; files remain `0600` and all
-   directories remain `0700`. Exact authenticated replay can reconstruct torn
-   scratch in the same inode, while unexpected names/types/modes/links fail
+   At most eight retained stages are accepted. Raw extraction leaves files
+   `0600` and all directories `0700`; exact authenticated replay can reconstruct
+   torn scratch in the same inode, while unexpected names/types/modes/links fail
    closed without deletion. The same shared installation lock brackets a
    current-time selected-metadata replay before and after local I/O, and the
    anonymous archive descriptor is revalidated on both sides. The sealed result
-   remains inert and grants no path/FD, mode normalization,
-   prepared-version publication, activation, installer, or CLI authority.
+   remains inert and grants no path/FD, prepared-version publication,
+   activation, installer, or CLI authority.
    The same private boundary contains a dormant filesystem-free bounded read-at
    validator for the exact thin arm64-ALL `MH_EXECUTE`/modern-dyld profile. It
    proves segment, section, link-edit, entry-point, deployment, and terminal
@@ -584,11 +586,21 @@ harness leans on three patterns:
    validates all architectures with strict/trusted-anchor/no-network flags,
    and type-checks the bounded signing-information dictionary, certificate
    chain, timestamp, Hardened Runtime flags, entitlement absence, identifier,
-   Team ID, and leaf common name. Its only policy constructor is test-only;
-   the real Team ID and protected positive fixture are not yet present, so it
-   grants no native-signature or prepared-version authority. Descriptor-relative
-   acquisition and retained-lock integration remain in the publication
-   transaction.
+   Team ID, and leaf common name. Descriptor-relative acquisition now checks
+   the exact `bin/hf2q` path/inode/hash before and after each native call. The
+   first ephemeral Developer ID proof seals the live extraction namespace,
+   stage, executable path/inode, and exact manifest digest. Crash-resumable
+   signed-mode normalization rederives that binding before consuming the proof;
+   current TUF state is replayed again, and the same
+   path/inode must pass Mach-O and Developer ID verification a second time,
+   followed by a final complete normalized-tree identity/mode/size/hash replay.
+   Final-mode files/directories form canonical restart prefixes, and every
+   normalization/full-sync boundary has returned-error and real-process-abort
+   recovery proof. The stage root and retained lock remain private, and the
+   sealed output grants no marker, receipt, publication, activation, or deletion
+   authority. The only policy constructor is test-only; the real Team ID and
+   protected positive fixture are not yet present, so no production entry point
+   can mint this capability.
    The schema boundary now defines installed-version marker v2 and a narrow
    first-standalone record builder. Marker v2 carries the exact metadata-role
    versions needed to regenerate the same install-receipt-v1 transition after

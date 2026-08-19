@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::os::fd::OwnedFd;
-use std::path::{Component, Path};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self, AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat};
 use rustix::io::fcntl_dupfd_cloexec;
@@ -31,6 +32,10 @@ impl Directory {
 
     pub(super) fn inode(&self) -> u64 {
         self.stat.st_ino as u64
+    }
+
+    pub(super) fn mode(&self) -> u32 {
+        permission_bits(&self.stat)
     }
 
     pub(super) fn same_object(&self, other: &Self) -> bool {
@@ -216,6 +221,92 @@ pub(super) fn full_sync_file(file: &File) -> Result<(), InstallStateError> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn file_descriptor_path(file: &File) -> Result<PathBuf, InstallStateError> {
+    descriptor_path(file.as_raw_fd())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn directory_descriptor_path(
+    directory: &Directory,
+) -> Result<PathBuf, InstallStateError> {
+    descriptor_path(directory.fd().as_raw_fd())
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_path(raw_fd: std::os::fd::RawFd) -> Result<PathBuf, InstallStateError> {
+    let mut bytes = [0_u8; libc::PATH_MAX as usize];
+    // SAFETY: `raw_fd` belongs to a live retained descriptor and `bytes` is a
+    // writable PATH_MAX-sized buffer as required by macOS F_GETPATH.
+    let result = unsafe { libc::fcntl(raw_fd, libc::F_GETPATH, bytes.as_mut_ptr()) };
+    if result == -1 {
+        return Err(InstallStateError::std_io(
+            "resolve retained descriptor path",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let length =
+        bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(InstallStateError::InvalidLayout(
+                "retained descriptor path is not NUL terminated",
+            ))?;
+    let path = PathBuf::from(OsStr::from_bytes(&bytes[..length]));
+    if !path.is_absolute() {
+        return Err(InstallStateError::InvalidLayout(
+            "retained descriptor path is not absolute",
+        ));
+    }
+    Ok(path)
+}
+
+pub(super) fn set_regular_file_mode(
+    file: &File,
+    expected_device: u64,
+    from_mode: u32,
+    to_mode: u32,
+) -> Result<EntryIdentity, InstallStateError> {
+    let before = fs::fstat(file)
+        .map_err(|error| InstallStateError::io("inspect file before mode transition", error))?;
+    require_regular_policy(&before, from_mode, expected_device)?;
+    let to_mode = u16::try_from(to_mode).map_err(|_| {
+        InstallStateError::InvalidLayout("authenticated file mode is outside the platform range")
+    })?;
+    fs::fchmod(file, Mode::from_raw_mode(to_mode))
+        .map_err(|error| InstallStateError::io("apply authenticated file mode", error))?;
+    let after = fs::fstat(file)
+        .map_err(|error| InstallStateError::io("inspect file after mode transition", error))?;
+    require_same_identity(&before, &after, "file changed during mode transition")?;
+    require_regular_policy(&after, u32::from(to_mode), expected_device)?;
+    Ok(identity(&after))
+}
+
+pub(super) fn set_directory_mode(
+    mut directory: Directory,
+    from_mode: u32,
+    to_mode: u32,
+) -> Result<Directory, InstallStateError> {
+    require_directory_policy(&directory.stat, Some(from_mode), true, None, "directory")?;
+    let to_mode = u16::try_from(to_mode).map_err(|_| {
+        InstallStateError::InvalidLayout(
+            "authenticated directory mode is outside the platform range",
+        )
+    })?;
+    fs::fchmod(directory.fd(), Mode::from_raw_mode(to_mode))
+        .map_err(|error| InstallStateError::io("apply authenticated directory mode", error))?;
+    let after = fs::fstat(directory.fd())
+        .map_err(|error| InstallStateError::io("inspect directory after mode transition", error))?;
+    require_same_identity(
+        &directory.stat,
+        &after,
+        "directory changed during mode transition",
+    )?;
+    require_directory_policy(&after, Some(u32::from(to_mode)), true, None, "directory")?;
+    directory.stat = after;
+    Ok(directory)
+}
+
 pub(super) fn create_symlink(
     parent: &Directory,
     name: &str,
@@ -293,9 +384,17 @@ pub(super) fn regular_file_identity(
     file: &File,
     expected_device: u64,
 ) -> Result<EntryIdentity, InstallStateError> {
+    regular_file_identity_with_mode(file, expected_device, 0o600)
+}
+
+pub(super) fn regular_file_identity_with_mode(
+    file: &File,
+    expected_device: u64,
+    expected_mode: u32,
+) -> Result<EntryIdentity, InstallStateError> {
     let stat = fs::fstat(file)
         .map_err(|error| InstallStateError::io("inspect opened regular file", error))?;
-    require_regular_policy(&stat, 0o600, expected_device)?;
+    require_regular_policy(&stat, expected_mode, expected_device)?;
     Ok(identity(&stat))
 }
 
@@ -303,10 +402,18 @@ pub(super) fn open_private_regular_file(
     parent: &Directory,
     name: &str,
 ) -> Result<(File, EntryIdentity), InstallStateError> {
+    open_regular_file_with_mode(parent, name, 0o600)
+}
+
+pub(super) fn open_regular_file_with_mode(
+    parent: &Directory,
+    name: &str,
+    expected_mode: u32,
+) -> Result<(File, EntryIdentity), InstallStateError> {
     validate_component(name)?;
     let named = fs::statat(parent.fd(), name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| InstallStateError::io("inspect private regular file", error))?;
-    require_regular_policy(&named, 0o600, parent.device())?;
+    require_regular_policy(&named, expected_mode, parent.device())?;
     let fd = fs::openat(
         parent.fd(),
         name,
@@ -322,7 +429,7 @@ pub(super) fn open_private_regular_file(
         &opened,
         "private regular file changed while opening",
     )?;
-    require_regular_policy(&opened, 0o600, parent.device())?;
+    require_regular_policy(&opened, expected_mode, parent.device())?;
     Ok((file, identity(&opened)))
 }
 
