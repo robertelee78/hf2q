@@ -48,6 +48,8 @@ mod attention_forward_tests;
 #[cfg(test)]
 mod cache_tests;
 #[cfg(test)]
+mod decode_cohort_spike;
+#[cfg(test)]
 mod ffn_forward_tests;
 #[cfg(test)]
 mod forward_tests;
@@ -55,6 +57,8 @@ mod forward_tests;
 mod model_tests;
 #[cfg(test)]
 mod real_artifact_cohort_tests;
+#[cfg(test)]
+mod real_artifact_decode_cohort_tests;
 #[cfg(test)]
 mod real_artifact_tests;
 #[cfg(test)]

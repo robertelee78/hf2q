@@ -1,6 +1,7 @@
 use mlx_native::{DType, MlxDevice};
 
 use super::cache::{CacheError, CacheKind, Deepseek4Cache, Deepseek4CachePlan};
+use super::decode_cohort_spike::publish_verifier_cohort_after_gate;
 use super::verifier_forward::{
     plan_cooperative_prefill_layout, publish_prefill_cohort_after_gate, publish_state_after_gate,
 };
@@ -410,6 +411,60 @@ fn cooperative_prefill_publication_is_atomic_across_caches() {
     caches[2].commit_prefill(0, 1).unwrap();
     let mut refs = caches.iter_mut().collect::<Vec<_>>();
     let error = publish_prefill_cohort_after_gate(&mut refs, &spans, || Ok(())).unwrap_err();
+    assert!(error.to_string().contains("prevalidate"));
+    assert_eq!(caches[0].position(), 0);
+    assert_eq!(caches[1].position(), 0);
+    assert_eq!(caches[2].position(), 1);
+    assert_eq!(caches[3].position(), 0);
+    assert!(caches.iter().all(Deepseek4Cache::is_poisoned));
+}
+
+#[test]
+fn cooperative_decode_publication_is_atomic_across_four_caches() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let mut caches = (0..4)
+        .map(|_| Deepseek4Cache::allocate(&plan, device.clone()).unwrap())
+        .collect::<Vec<_>>();
+
+    let [lane0, lane1, lane2, lane3] = caches.as_mut_slice() else {
+        unreachable!()
+    };
+    let mut refs = [lane0, lane1, lane2, lane3];
+    publish_verifier_cohort_after_gate(&mut refs, [0; 4], || Ok(())).unwrap();
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 1 && !cache.is_poisoned()));
+
+    for cache in &mut caches {
+        cache.reset().unwrap();
+    }
+    let [lane0, lane1, lane2, lane3] = caches.as_mut_slice() else {
+        unreachable!()
+    };
+    let mut refs = [lane0, lane1, lane2, lane3];
+    let error = publish_verifier_cohort_after_gate(&mut refs, [0; 4], || {
+        anyhow::bail!("synthetic B=4 supervisor rejection")
+    })
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("rejected before cache publication"));
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 0 && cache.is_poisoned()));
+
+    for cache in &mut caches {
+        cache.reset().unwrap();
+    }
+    caches[2].commit_step(0).unwrap();
+    let [lane0, lane1, lane2, lane3] = caches.as_mut_slice() else {
+        unreachable!()
+    };
+    let mut refs = [lane0, lane1, lane2, lane3];
+    let error = publish_verifier_cohort_after_gate(&mut refs, [0; 4], || Ok(())).unwrap_err();
     assert!(error.to_string().contains("prevalidate"));
     assert_eq!(caches[0].position(), 0);
     assert_eq!(caches[1].position(), 0);

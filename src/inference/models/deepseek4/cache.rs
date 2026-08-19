@@ -63,6 +63,15 @@ pub struct CacheStep {
     pub layers: Vec<LayerCacheStep>,
 }
 
+/// Test-only proof ticket for atomic multi-cache decode publication.
+///
+/// Production one-token serving publishes one cache at a time. The B=4
+/// decode spike must first prove that all four cursors are still publishable,
+/// then advance them without a fallible operation between lanes.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::inference::models::deepseek4) struct StepCommitTicket(usize);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKind {
     AttentionKv,
@@ -793,6 +802,32 @@ impl Deepseek4Cache {
         }
         self.next_position += 1;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::inference::models::deepseek4) fn validate_step_commit(
+        &self,
+        position: usize,
+    ) -> Result<StepCommitTicket, CacheError> {
+        let step = self.plan_next_step()?;
+        if step.position != position {
+            return Err(CacheError::StepOutOfOrder {
+                expected: step.position,
+                actual: position,
+            });
+        }
+        Ok(StepCommitTicket(position + 1))
+    }
+
+    #[cfg(test)]
+    pub(in crate::inference::models::deepseek4) fn publish_step_end(
+        &mut self,
+        ticket: StepCommitTicket,
+    ) {
+        debug_assert!(!self.poisoned);
+        debug_assert_eq!(ticket.0, self.next_position + 1);
+        debug_assert!(ticket.0 <= self.plan.context_length);
+        self.next_position = ticket.0;
     }
 
     /// Reset logical visibility and all recurrent compressor state. KV rows
