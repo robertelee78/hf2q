@@ -42,10 +42,9 @@ jobs:
   build-and-test:
     name: build + test (macos-latest)
     runs-on: macos-latest
-    # A cold Cargo.lock cache rebuild plus the serialized hosted-safe contract
-    # matrix measured just over 30 minutes on macos-latest (run 32116927041).
-    # Keep the gate fail-closed, but give it enough time to finish and report
-    # an actual test result after dependency/security updates.
+    # This covers a cold locked build, audit, serialized hosted-safe contracts,
+    # and post-job cache cleanup. It is a fail-closed ceiling, not the expected
+    # duration; build-script invalidation must leave enough margin for cleanup.
     timeout-minutes: 60
 
     steps:

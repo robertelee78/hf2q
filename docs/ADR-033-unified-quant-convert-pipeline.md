@@ -896,6 +896,17 @@ Before opening any safetensors payload, the driver resolves the index-required s
 
 After successful temporary-GGUF finalization and durable sync, hf2q hashes those exact bytes and prepares a schema-v2 `<output>.receipt.json`. The receipt binds repo + exact revision, sorted source file hashes/sizes, converter package/version and a required exact compile-time git SHA, quant selector, output hash/size, DSpark exclusion status/count, and observed peak chunk-buffer bounds. Registry builds obtain the SHA from Cargo's packaged `.cargo_vcs_info.json`; source builds must provide an exact release/CI SHA and otherwise fail closed before writing. The complete GGUF and receipt are then promoted by separate same-directory atomic renames. If receipt promotion fails after GGUF promotion, hf2q removes any stale sidecar and returns an error; the complete GGUF is not provenance-complete until conversion is rerun successfully. The pair is not claimed as a single filesystem transaction.
 
+Build-provenance CI RCA (2026-08-19): `.cargo_vcs_info.json` is generated
+inside a packaged crate and is absent from a normal Git checkout. Cargo treats
+a missing `rerun-if-changed` input as perpetually stale, so the build script
+must register that file dependency only when the file exists. Runs
+`32116927041` and `32212256016` were previously described as cold-build
+pressure, but both repeatedly relinked the same hf2q test harness; the latter
+passed every blocking body gate and then hit the 60-minute job ceiling during
+post-cache cleanup. After conditional registration, successive different
+filters over the same bin-test target reused the compiled harness, with the
+second Cargo invocation finishing in 0.15 seconds and no hf2q recompilation.
+
 **Memory bound tightened in §P0** from `2 × model_safetensors_size + 512 MiB` to `4 × largest_single_tensor_F32_size + 512 MiB`. For Gemma 4 26B the largest tensor is `ffn_down` at `[2112, 2560]` BF16 → ~20 MB F32 + ~13 MB Q5_K_M payload, giving a bound around `~600 MB` instead of `~96 GB`. The original `2 × model_safetensors_size` envelope was always going to be infeasible on commodity hardware for 26B+ models even before the buffered-Vec antipattern compounded it; tensor-by-tensor is the correct shape of the bound.
 
 **Validation:** the regression test `tests/convert_integration.rs::convert_streaming_rss_under_bound_2026_05_18` (originally `tests/convert_v2_integration.rs::convert_v2_streaming_rss_under_bound_2026_05_18`; renamed by B4) spawns convert under `/usr/bin/time -l` (macOS) / `time -f "%M"` (Linux), parses the OS-reported peak RSS, and asserts `peak < 4 × largest_F32_size + 512 MiB`. Pre-fix this test would have overshot by ~64 MB on its small fixture and by ~104 GB on Gemma 4 26B.
