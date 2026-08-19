@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -14,6 +16,8 @@ pub(super) use releases::{
     stable_release_repository_with_mismatched_pointer, stable_release_successor_for_artifacts,
     stable_release_successor_pair, RetainedReleaseMutation,
 };
+mod hostile_keys;
+pub(super) use hostile_keys::hostile_root_profile_cases;
 
 const EXPIRES: &str = "2999-01-01T00:00:00Z";
 pub(super) const STATIC_KEY_ID: &str =
@@ -34,6 +38,7 @@ pub(super) struct OnlineBindingChangeCase {
     pub(super) old: Vec<u8>,
     pub(super) new: Vec<u8>,
     pub(super) changed: bool,
+    pub(super) within_profile: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -45,24 +50,29 @@ pub(super) enum RotationSignatures {
 
 struct TestKey {
     id: String,
+    key: sigstore_tuf::Key,
     pair: Ed25519KeyPair,
 }
 
 impl TestKey {
-    fn seeded(id: impl Into<String>, seed: u8) -> Self {
-        Self {
-            id: id.into(),
-            pair: Ed25519KeyPair::from_seed_unchecked(&[seed; 32])
-                .expect("fixed Ed25519 test seed"),
-        }
+    fn seeded(_label: impl Into<String>, seed: u8) -> Self {
+        let pair =
+            Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).expect("fixed Ed25519 test seed");
+        let key = sigstore_tuf::Key {
+            keytype: "ed25519".to_owned(),
+            scheme: "ed25519".to_owned(),
+            keyval: sigstore_tuf::KeyVal {
+                public: hex::encode(pair.public_key().as_ref()),
+                extra: BTreeMap::new(),
+            },
+            extra: BTreeMap::new(),
+        };
+        let id = key.key_id().expect("canonical test key ID");
+        Self { id, key, pair }
     }
 
     fn key_value(&self) -> Value {
-        json!({
-            "keytype": "ed25519",
-            "scheme": "ed25519",
-            "keyval": {"public": hex::encode(self.pair.public_key().as_ref())}
-        })
+        serde_json::to_value(&self.key).expect("serialize canonical test key")
     }
 }
 
@@ -225,6 +235,7 @@ pub(super) fn static_lower_roles(version: u64, expires: &str) -> (Vec<u8>, Vec<u
         hex::encode(key.pair.public_key().as_ref()),
         "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56"
     );
+    assert_eq!(key.id, STATIC_KEY_ID);
     lower_roles(version, expires, &[&key])
 }
 
@@ -303,25 +314,43 @@ pub(super) fn online_binding_change_cases() -> Vec<OnlineBindingChangeCase> {
     consistent_snapshot_only["consistent_snapshot"] = json!(true);
 
     [
-        ("root-version-only", version_only, false),
-        ("key-order-only", reordered, false),
-        ("surviving-threshold-change", threshold_only, false),
-        ("surviving-same-key-id-rekey", rekeyed, false),
-        ("same-key-id-rekey-invalidates-quorum", rekeyed_quorum, true),
-        ("timestamp-key-addition", additive, false),
-        ("timestamp-key-replacement", replacement, true),
-        ("timestamp-threshold-revocation", threshold_revocation, true),
-        ("snapshot-key-addition", snapshot_only, false),
-        ("snapshot-key-replacement", snapshot_replacement, true),
-        ("consistent-snapshot-only", consistent_snapshot_only, false),
+        ("root-version-only", version_only, false, true),
+        ("key-order-only", reordered, false, true),
+        ("surviving-threshold-change", threshold_only, false, true),
+        ("surviving-same-key-id-rekey", rekeyed, false, false),
+        (
+            "same-key-id-rekey-invalidates-quorum",
+            rekeyed_quorum,
+            true,
+            false,
+        ),
+        ("timestamp-key-addition", additive, false, true),
+        ("timestamp-key-replacement", replacement, true, true),
+        (
+            "timestamp-threshold-revocation",
+            threshold_revocation,
+            true,
+            true,
+        ),
+        ("snapshot-key-addition", snapshot_only, false, true),
+        ("snapshot-key-replacement", snapshot_replacement, true, true),
+        (
+            "consistent-snapshot-only",
+            consistent_snapshot_only,
+            false,
+            true,
+        ),
     ]
     .into_iter()
-    .map(|(label, new, changed)| OnlineBindingChangeCase {
-        label,
-        old: old.clone(),
-        new: envelope(new, &[&root]),
-        changed,
-    })
+    .map(
+        |(label, new, changed, within_profile)| OnlineBindingChangeCase {
+            label,
+            old: old.clone(),
+            new: envelope(new, &[&root]),
+            changed,
+            within_profile,
+        },
+    )
     .collect()
 }
 

@@ -249,9 +249,14 @@ jobs:
             src/distribution/update_auth/artifact_authorization.rs \
             src/distribution/update_auth/artifact_authorization/extraction.rs \
             src/distribution/update_auth/commit.rs \
+            src/distribution/update_auth/profile.rs \
             src/distribution/update_auth/target_set.rs \
             src/distribution/update_auth/target_set_tests.rs \
             src/distribution/update_auth/target_set_tests/extraction_cases.rs \
+            src/distribution/update_auth/test_repository.rs \
+            src/distribution/update_auth/test_repository/hostile_keys.rs \
+            src/distribution/update_auth/tests/hostile_profile.rs \
+            src/distribution/update_auth/tests/rotation.rs \
             src/distribution/update_transport/mod.rs \
             src/distribution/update_transport/fetch.rs \
             src/distribution/update_transport/http.rs \

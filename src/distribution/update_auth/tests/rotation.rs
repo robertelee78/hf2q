@@ -402,7 +402,16 @@ fn unrelated_root_or_targets_rotation_does_not_reset_online_role_floors() {
 fn online_role_recovery_requires_prior_quorum_invalidation() {
     for case in online_binding_change_cases() {
         let old = profile::root(&case.old).expect("old root parses");
-        let new = profile::root(&case.new).expect("new root parses");
+        let new = if case.within_profile {
+            profile::root(&case.new).expect("new root parses")
+        } else {
+            assert!(matches!(
+                profile::root(&case.new),
+                Err(TufVerifierError::MalformedMetadata)
+            ));
+            sigstore_tuf::metadata::Metadata::<sigstore_tuf::metadata::Root>::from_slice(&case.new)
+                .expect("out-of-profile root remains structural defense-in-depth evidence")
+        };
         assert_eq!(
             crate::distribution::update_auth::verifier::online_role_binding_invalidated(
                 &old.signed,

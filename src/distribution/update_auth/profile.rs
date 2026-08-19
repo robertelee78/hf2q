@@ -12,9 +12,7 @@ use super::TufVerifierError;
 const MAX_SIGNATURES: usize = 64;
 const MAX_ROOT_KEYS: usize = 64;
 const MAX_KEY_IDS_PER_ROLE: usize = 64;
-const MAX_KEY_ID_BYTES: usize = 256;
 const MAX_SIGNATURE_HEX_BYTES: usize = 16 * 1024;
-const MAX_PUBLIC_KEY_BYTES: usize = 16 * 1024;
 const MAX_TARGETS: usize = 4096;
 const MAX_TARGET_NAME_BYTES: usize = 512;
 const MAX_HASHES_PER_DESCRIPTOR: usize = 4;
@@ -41,9 +39,14 @@ pub(super) fn root(bytes: &[u8]) -> Result<Metadata<Root>, TufVerifierError> {
         return Err(TufVerifierError::MalformedMetadata);
     }
     for (key_id, key) in &role.keys {
-        if !bounded_nonempty(key_id, MAX_KEY_ID_BYTES)
-            || key.keyval.public.is_empty()
-            || key.keyval.public.len() > MAX_PUBLIC_KEY_BYTES
+        let computed_key_id = key
+            .key_id()
+            .map_err(|_| TufVerifierError::MalformedMetadata)?;
+        if !is_lower_hex_64(key_id)
+            || computed_key_id != *key_id
+            || key.keytype != "ed25519"
+            || key.scheme != "ed25519"
+            || !is_lower_hex_64(&key.keyval.public)
             || !key.extra.is_empty()
             || !key.keyval.extra.is_empty()
         {
@@ -58,9 +61,10 @@ pub(super) fn root(bytes: &[u8]) -> Result<Metadata<Root>, TufVerifierError> {
             || unique.len() != binding.keyids.len()
             || binding.threshold > unique.len()
             || !binding.extra.is_empty()
-            || binding.keyids.iter().any(|key_id| {
-                !bounded_nonempty(key_id, MAX_KEY_ID_BYTES) || !role.keys.contains_key(key_id)
-            })
+            || binding
+                .keyids
+                .iter()
+                .any(|key_id| !is_lower_hex_64(key_id) || !role.keys.contains_key(key_id))
         {
             return Err(TufVerifierError::MalformedMetadata);
         }
@@ -211,7 +215,7 @@ fn require_signatures<T: Role>(metadata: &Metadata<T>) -> Result<(), TufVerifier
     }
     let mut key_ids = HashSet::new();
     for signature in &metadata.signatures {
-        if !bounded_nonempty(&signature.keyid, MAX_KEY_ID_BYTES)
+        if !is_lower_hex_64(&signature.keyid)
             || signature.sig.len() > MAX_SIGNATURE_HEX_BYTES
             || (!signature.sig.is_empty()
                 && (signature.sig.len() % 2 != 0
@@ -222,6 +226,13 @@ fn require_signatures<T: Role>(metadata: &Metadata<T>) -> Result<(), TufVerifier
         }
     }
     Ok(())
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn require_pin(pin: &MetaFile, maximum: usize) -> Result<(), TufVerifierError> {
