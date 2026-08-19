@@ -12,7 +12,9 @@
   lock-held descriptor-relative inert extraction, and dormant native Developer
   ID requirement/signing-information verification, descriptor-bound native
   verification, crash-resumable signed-mode normalization, and dormant
-  crash-durable prepared-version publication are reconciled;
+  crash-durable prepared-version publication, plus the dormant live-installed-
+  release semantic floor and explicit already-current planning outcome are
+  reconciled;
   the real
   release trust root, verifier-request metadata transport, real compiled Team
   ID plus protected positive fixture, public update/install/onboarding
@@ -1081,6 +1083,29 @@ download, filesystem write, archive extraction, prepared version, activation,
 or downgrade. A later mutation must reacquire the shared installation lock,
 prove the same selected journal identity, and recheck freshness after I/O.
 
+Automatic planning also reads a sealed live installed-release floor while that
+same lock is held. The reader follows only the canonical `current` activation,
+requires the exact bounded activation inventory, and descriptor-relatively
+verifies the canonical receipt, prepared version directory, installed marker,
+manifest, and complete payload before it retains the active version, target,
+manifest/archive SHA-256 values, installation and activation sequences, and
+receipt digest. Two independently reopened snapshots must agree in both bytes
+and inode identities. `current` being absent produces an explicit no-active-
+release state; prepared, extracted, or otherwise unselected residue never
+becomes a downgrade floor or adoption capability.
+
+The authenticated pointer is compared numerically against that live floor
+before artifact transport authority exists. A lower SemVer is rollback, an
+equal version with either release digest changed is equivocation, an exact
+equal version/digest tuple returns a sealed `AlreadyCurrent` outcome with no
+download authority, and only a higher version (or the explicit no-active-
+release state) can produce the one-use fetch capability. The exact floor is
+read again before archive staging, after external I/O, and when the retained-
+lock preparation session begins. Any change in active release, receipt, or
+activation identity invalidates the plan. An intentional pinned downgrade or
+rollback remains a separate future one-use user-intent capability; it cannot
+reuse this automatic path.
+
 The v1 network routes are closed policy, not runtime configuration. Production
 accepts no caller-supplied base URL, mirror, path, redirect host, proxy, or
 HTTP client as update authority. Typed verifier requests and authenticated
@@ -1146,17 +1171,21 @@ Fetching occurs outside the installation lock. Before the large archive and
 again after all I/O, the coordinator reacquires the shared installation lock,
 replays the current selected journal from the compiled anchor at current time,
 and requires the same installation/state identity, selected sequence and
-receipt digest, pointer/manifest/archive descriptors, and fresh role expiries.
+receipt digest, pointer/manifest/archive descriptors, live installed-release
+floor, and fresh role expiries. The same floor is checked once more when the
+lock-retaining preparation session starts.
 Any change discards the inert staged bytes and restarts planning. The fetched
 result alone still grants no extraction, codesign verification,
-prepared-version, installed-release-floor, activation, or update authority.
+prepared-version, activation, or update authority.
 
 TUF metadata versions do not prevent newly signed metadata from moving the
 stable pointer to an older hf2q SemVer. `ReleaseVersion` therefore uses numeric
-SemVer ordering (`0.10.0 > 0.9.0`), but this dormant binding deliberately does
-not compare against an unauthenticated receipt. Public update mutation remains
-blocked on a sealed live-installed-release floor; any user-requested pinned
-downgrade or rollback requires a separate one-use intent capability.
+SemVer ordering (`0.10.0 > 0.9.0`) and the dormant binding compares only with
+the fully verified live floor described above, never a parsed or caller-
+supplied receipt. Public update mutation remains blocked on the production
+root, Team-ID policy, protected positive fixture, metadata transport/session,
+and public coordinator. Any user-requested pinned downgrade or rollback still
+requires a separate one-use intent capability.
 
 Large archives are streamed and checked against the sealed descriptor by hf2q
 rather than buffered through either client's convenience target API. The
@@ -1775,7 +1804,7 @@ support.
 | Threat or failure | Required behavior |
 |---|---|
 | Compromised mirror/CDN asset | A uniquely staged binary must pass exact Developer ID/team validation before it authenticates threshold-signed bootstrap metadata; only that metadata supplies the archive/manifest digests. Any mismatch fails closed, and the high-assurance flow additionally verifies GitHub attestation. |
-| Replayed old metadata or release | Version/expiry/role checks reject rollback and freeze; no downgrade occurs without explicit selection of a previously verified retained version. |
+| Replayed old metadata or release | Version/expiry/role checks reject metadata rollback and freeze. The descriptor-verified live installed-release floor rejects a lower stable SemVer and same-version digest equivocation before transport, returns exact equality as no-download `AlreadyCurrent`, and is rechecked at every later lock boundary. No downgrade occurs without a future explicit one-use intent. |
 | Published asset replacement | Immutable draft-to-publish flow forbids overwrite; clients bind exact hashes rather than trusting a mutable tag alone. |
 | Malicious archive path/link | A bounded custom classic-ZIP pass preserves every raw record and rejects duplicates, noncanonical order, flags, links/types, ZIP64, comments/extras, local/central disagreement, gaps, overlaps, prefixes, and trailing bytes before the decoder or any extraction runs. The exact embedded manifest and every streamed payload digest must then match the signed inventory. |
 | Crash or torn private extraction | The shared-lock stage has a deterministic authenticated name, exact bounded inventory, private `0600`/`0700` modes, in-place exact reconstruction, per-file `F_FULLFSYNC`, bottom-up directory barriers, namespace rebinding, and a final metadata replay. Safe scratch is resumable; hostile shape is retained and fails closed; no version is published. |
@@ -1821,10 +1850,13 @@ before public self-update ships.
    have also landed without a production Team-ID constructor. Exact marker-
    intent recovery, no-replace prepared-version publication, typed postcommit
    durability-unknown recovery, current-time commit gating, and the activation
-   capability bridge have now landed as another dormant bounded context. Next,
+   capability bridge have now landed as another dormant bounded context. The
+   descriptor-verified active-release reader, numeric rollback/equivocation
+   policy, no-download already-current outcome, and repeated floor checks at
+   pointer, archive, post-I/O, and preparation boundaries have also landed.
+   Next,
    embed the real stable root, compile the real public Team ID, pass the
-   protected positive signing fixture, and implement the live installed-release
-   downgrade floor, canonical Hugging
+   protected positive signing fixture, and implement canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration
    receipt, and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated

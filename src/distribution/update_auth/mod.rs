@@ -22,10 +22,10 @@ mod tests;
 
 pub(in crate::distribution) use artifact_authorization::{
     ArchiveStageAuthorization, ArtifactFetchAuthorization, ArtifactFetchAuthorizationError,
-    BoundArtifactFetchAuthorization, ExtractionStageAuthorization, FinalArtifactAuthorization,
-    LockedReleasePreparation, PostLocalIoReleaseAuthorization, PreparedActivationAuthorization,
-    PreparedPublicationAuthorization, PreparedVersionAuthorization, PreparedVersionCommitError,
-    PreparedVersionCommitGuard,
+    ArtifactPointerBinding, BoundArtifactFetchAuthorization, ExtractionStageAuthorization,
+    FinalArtifactAuthorization, LockedReleasePreparation, PostLocalIoReleaseAuthorization,
+    PreparedActivationAuthorization, PreparedPublicationAuthorization,
+    PreparedVersionAuthorization, PreparedVersionCommitError, PreparedVersionCommitGuard,
 };
 pub(in crate::distribution) use commit::AdvancingCommitGuard;
 pub(in crate::distribution) use model::{ExactMetadataRole, VerifiedMetadataCandidate};
@@ -71,6 +71,12 @@ pub(in crate::distribution) enum TufVerifierError {
     RetainedReleaseMutation,
     #[error("the channel pointer does not match the authenticated release targets")]
     TargetBinding,
+    #[error("the authenticated stable pointer selects a release below the active version")]
+    InstalledReleaseRollback,
+    #[error("the authenticated stable pointer equivocates with the active release")]
+    InstalledReleaseEquivocation,
+    #[error("the live installed-release floor changed during update planning")]
+    InstalledReleaseChanged,
     #[error(transparent)]
     ChannelPointer(#[from] crate::distribution::schema::ChannelPointerError),
     #[error(transparent)]

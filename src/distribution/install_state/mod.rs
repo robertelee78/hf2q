@@ -14,9 +14,12 @@ mod host;
 mod identity;
 mod locked;
 pub(in crate::distribution) mod metadata;
+mod release_floor;
 mod unix;
 mod verify;
 
+#[cfg(test)]
+mod release_floor_tests;
 #[cfg(test)]
 mod test_fixture;
 #[cfg(test)]
@@ -53,6 +56,9 @@ pub(in crate::distribution) use extraction::{
 pub(in crate::distribution) use identity::{
     bootstrap_installation_identity, open_existing_installation_identity,
     DurableInstallationIdentity, InstallationIdentityBootstrap, LockedInstallationIdentity,
+};
+pub(in crate::distribution) use release_floor::{
+    ActiveInstalledReleaseFloor, LiveInstalledReleaseFloor,
 };
 
 #[cfg(test)]

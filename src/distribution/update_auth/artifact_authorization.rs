@@ -10,7 +10,10 @@ use super::TufVerifierError;
 use crate::distribution::install_state::metadata::{
     lock_metadata_state, MetadataJournalError, MetadataStateAuthorization,
 };
-use crate::distribution::install_state::{ArtifactStageError, EphemeralArtifactStage};
+use crate::distribution::install_state::{
+    ActiveInstalledReleaseFloor, ArtifactStageError, EphemeralArtifactStage,
+    LiveInstalledReleaseFloor,
+};
 use crate::distribution::schema::{ReleaseVersion, TargetTriple};
 
 mod extraction;
@@ -64,7 +67,27 @@ pub(in crate::distribution) struct BoundArtifactFetchAuthorization<'a> {
     anchor: &'a EmbeddedTrustRoot,
     targets: AuthenticatedReleaseTargets,
     last_sample: Timestamp,
+    release_floor: LiveInstalledReleaseFloor,
     archive_stage_created: bool,
+}
+
+/// Result of binding the exact authenticated stable pointer.
+///
+/// Already-current is a successful no-download outcome. Only `Fetch` carries
+/// artifact transport authority, and that authority retains the exact live
+/// installed-release floor observed under the shared lock.
+pub(in crate::distribution) enum ArtifactPointerBinding<'a> {
+    Fetch(BoundArtifactFetchAuthorization<'a>),
+    AlreadyCurrent(AuthenticatedAlreadyCurrentRelease),
+}
+
+/// Fresh TUF plus live-install proof that the selected release is active.
+///
+/// This is diagnostic state only. It grants no download, activation,
+/// downgrade, rollback, or filesystem mutation authority.
+pub(in crate::distribution) struct AuthenticatedAlreadyCurrentRelease {
+    targets: AuthenticatedReleaseTargets,
+    floor: ActiveInstalledReleaseFloor,
 }
 
 /// Final current-time proof retained by the inert downloaded bundle.
@@ -73,6 +96,26 @@ pub(in crate::distribution) struct FinalArtifactAuthorization<'a> {
     anchor: &'a EmbeddedTrustRoot,
     targets: AuthenticatedReleaseTargets,
     authenticated_at: Timestamp,
+    release_floor: LiveInstalledReleaseFloor,
+}
+
+impl std::fmt::Debug for ArtifactPointerBinding<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fetch(_) => formatter.write_str("ArtifactPointerBinding::Fetch(..)"),
+            Self::AlreadyCurrent(_) => {
+                formatter.write_str("ArtifactPointerBinding::AlreadyCurrent(..)")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedAlreadyCurrentRelease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedAlreadyCurrentRelease")
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for FinalArtifactAuthorization<'_> {
@@ -104,16 +147,65 @@ impl<'a> ArtifactFetchAuthorization<'a> {
     pub(in crate::distribution) fn bind_pointer(
         self,
         exact_pointer_bytes: &[u8],
-    ) -> Result<BoundArtifactFetchAuthorization<'a>, ArtifactFetchAuthorizationError> {
+    ) -> Result<ArtifactPointerBinding<'a>, ArtifactFetchAuthorizationError> {
+        self.bind_pointer_with_clock(exact_pointer_bytes, ClockSource::System)
+    }
+
+    fn bind_pointer_with_clock(
+        self,
+        exact_pointer_bytes: &[u8],
+        clock: ClockSource,
+    ) -> Result<ArtifactPointerBinding<'a>, ArtifactFetchAuthorizationError> {
         let last_sample = self.targets.authenticated_at();
-        let targets = self.targets.bind_channel_pointer(exact_pointer_bytes)?;
-        Ok(BoundArtifactFetchAuthorization {
-            authorization: self.authorization,
-            anchor: self.anchor,
-            targets,
+        let expected = self.targets.bind_channel_pointer(exact_pointer_bytes)?;
+        let locked = lock_metadata_state(self.authorization)?;
+        let targets = reauthenticate_release(
+            self.authorization,
+            self.anchor,
+            &locked,
+            &expected,
             last_sample,
-            archive_stage_created: false,
-        })
+            clock,
+        )?;
+        let release_floor = locked.read_live_installed_release_floor()?;
+        let disposition = classify_release(&release_floor, &targets)?;
+        if disposition == AutomaticReleaseDisposition::AlreadyCurrent {
+            let LiveInstalledReleaseFloor::Active(floor) = release_floor else {
+                return Err(TufVerifierError::InstalledReleaseChanged.into());
+            };
+            return Ok(ArtifactPointerBinding::AlreadyCurrent(
+                AuthenticatedAlreadyCurrentRelease { targets, floor },
+            ));
+        }
+        Ok(ArtifactPointerBinding::Fetch(
+            BoundArtifactFetchAuthorization {
+                authorization: self.authorization,
+                anchor: self.anchor,
+                last_sample: targets.authenticated_at(),
+                targets,
+                release_floor,
+                archive_stage_created: false,
+            },
+        ))
+    }
+}
+
+impl<'a> ArtifactPointerBinding<'a> {
+    pub(in crate::distribution) fn into_fetch(self) -> Option<BoundArtifactFetchAuthorization<'a>> {
+        match self {
+            Self::Fetch(fetch) => Some(fetch),
+            Self::AlreadyCurrent(_) => None,
+        }
+    }
+}
+
+impl AuthenticatedAlreadyCurrentRelease {
+    pub(in crate::distribution) fn version(&self) -> &ReleaseVersion {
+        self.targets.version()
+    }
+
+    pub(in crate::distribution) fn receipt_sha256(&self) -> [u8; 32] {
+        self.floor.receipt_sha256()
     }
 }
 
@@ -155,6 +247,7 @@ impl<'a> BoundArtifactFetchAuthorization<'a> {
         }
         let locked = lock_metadata_state(self.authorization)?;
         let current = self.reauthenticate_locked(&locked, clock)?;
+        require_same_release_floor(&locked, &self.release_floor)?;
         let stage = locked.create_ephemeral_artifact_stage(ArchiveStageAuthorization {
             expected_length: current.archive().length(),
         })?;
@@ -182,12 +275,14 @@ impl<'a> BoundArtifactFetchAuthorization<'a> {
         }
         let locked = lock_metadata_state(self.authorization)?;
         let current = self.reauthenticate_locked(&locked, clock)?;
+        require_same_release_floor(&locked, &self.release_floor)?;
         self.last_sample = current.authenticated_at();
         Ok(FinalArtifactAuthorization {
             authorization: self.authorization,
             anchor: self.anchor,
             authenticated_at: self.last_sample,
             targets: current,
+            release_floor: self.release_floor,
         })
     }
 
@@ -221,6 +316,62 @@ impl<'a> FinalArtifactAuthorization<'a> {
     pub(in crate::distribution) fn authenticated_at(&self) -> Timestamp {
         self.authenticated_at
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutomaticReleaseDisposition {
+    InitialInstall,
+    Upgrade,
+    AlreadyCurrent,
+}
+
+pub(super) fn classify_release(
+    floor: &LiveInstalledReleaseFloor,
+    targets: &AuthenticatedReleaseTargets,
+) -> Result<AutomaticReleaseDisposition, TufVerifierError> {
+    classify_release_identity(
+        floor,
+        targets.version(),
+        targets.target(),
+        targets.manifest().sha256(),
+        targets.archive().sha256(),
+    )
+}
+
+pub(super) fn classify_release_identity(
+    floor: &LiveInstalledReleaseFloor,
+    version: &ReleaseVersion,
+    target: TargetTriple,
+    manifest_sha256: &crate::distribution::schema::Sha256Digest,
+    archive_sha256: &crate::distribution::schema::Sha256Digest,
+) -> Result<AutomaticReleaseDisposition, TufVerifierError> {
+    let LiveInstalledReleaseFloor::Active(active) = floor else {
+        return Ok(AutomaticReleaseDisposition::InitialInstall);
+    };
+    if active.target() != target {
+        return Err(TufVerifierError::InstalledReleaseEquivocation);
+    }
+    match version.cmp(active.version()) {
+        std::cmp::Ordering::Less => Err(TufVerifierError::InstalledReleaseRollback),
+        std::cmp::Ordering::Greater => Ok(AutomaticReleaseDisposition::Upgrade),
+        std::cmp::Ordering::Equal
+            if manifest_sha256 == active.manifest_sha256()
+                && archive_sha256 == active.archive_sha256() =>
+        {
+            Ok(AutomaticReleaseDisposition::AlreadyCurrent)
+        }
+        std::cmp::Ordering::Equal => Err(TufVerifierError::InstalledReleaseEquivocation),
+    }
+}
+
+pub(super) fn require_same_release_floor(
+    locked: &crate::distribution::install_state::metadata::LockedMetadataState,
+    expected: &LiveInstalledReleaseFloor,
+) -> Result<(), ArtifactFetchAuthorizationError> {
+    if &locked.read_live_installed_release_floor()? != expected {
+        return Err(TufVerifierError::InstalledReleaseChanged.into());
+    }
+    Ok(())
 }
 
 pub(super) fn reauthenticate_release(
@@ -264,6 +415,17 @@ pub(super) fn begin_artifact_fetch_for_test<'a>(
         anchor,
         targets,
     })
+}
+
+#[cfg(test)]
+impl<'a> ArtifactFetchAuthorization<'a> {
+    pub(super) fn bind_pointer_for_test(
+        self,
+        exact_pointer_bytes: &[u8],
+        samples: impl IntoIterator<Item = Timestamp>,
+    ) -> Result<ArtifactPointerBinding<'a>, ArtifactFetchAuthorizationError> {
+        self.bind_pointer_with_clock(exact_pointer_bytes, ClockSource::scripted(samples))
+    }
 }
 
 #[cfg(test)]

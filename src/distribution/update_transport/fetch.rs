@@ -8,7 +8,7 @@ use super::{UpdateTransportError, VerifiedReleaseBundle};
 use crate::distribution::install_state::EphemeralArtifactStage;
 use crate::distribution::schema::{ReleaseManifestV1, UpdateChannel};
 use crate::distribution::update_auth::{
-    ArtifactFetchAuthorization, BoundArtifactFetchAuthorization,
+    ArtifactFetchAuthorization, ArtifactPointerBinding, BoundArtifactFetchAuthorization,
 };
 
 pub(in crate::distribution) struct StableUpdateTransport {
@@ -25,7 +25,7 @@ impl StableUpdateTransport {
     pub(in crate::distribution) fn fetch_and_bind_pointer<'a>(
         &self,
         authorization: ArtifactFetchAuthorization<'a>,
-    ) -> Result<BoundArtifactFetchAuthorization<'a>, UpdateTransportError> {
+    ) -> Result<ArtifactPointerBinding<'a>, UpdateTransportError> {
         fetch_and_bind_pointer(&self.executor, authorization)
     }
 
@@ -40,7 +40,7 @@ impl StableUpdateTransport {
 fn fetch_and_bind_pointer<'a>(
     executor: &impl HttpExecutor,
     authorization: ArtifactFetchAuthorization<'a>,
-) -> Result<BoundArtifactFetchAuthorization<'a>, UpdateTransportError> {
+) -> Result<ArtifactPointerBinding<'a>, UpdateTransportError> {
     let spec = TargetFetchSpec::from_descriptor(authorization.pointer())?;
     let request = pages_pointer_url(&spec)?;
     let bytes = fetch_direct(executor, &request, &spec, false)?;

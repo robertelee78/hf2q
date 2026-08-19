@@ -1,6 +1,9 @@
 use jiff::Timestamp;
 
-use super::{reauthenticate_release, ArtifactFetchAuthorizationError, FinalArtifactAuthorization};
+use super::{
+    reauthenticate_release, require_same_release_floor, ArtifactFetchAuthorizationError,
+    FinalArtifactAuthorization,
+};
 use crate::distribution::install_state::metadata::{
     lock_metadata_state, LockedMetadataState, MetadataStateAuthorization,
 };
@@ -671,6 +674,7 @@ impl<'a> FinalArtifactAuthorization<'a> {
             self.authenticated_at,
             clock,
         )?;
+        require_same_release_floor(&locked, &self.release_floor)?;
         let last_sample = targets.authenticated_at();
         Ok(LockedReleasePreparation {
             authorization: self.authorization,
