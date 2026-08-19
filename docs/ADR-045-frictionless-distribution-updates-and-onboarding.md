@@ -19,7 +19,8 @@
   canonical Hugging Face model-reference parsing, immutable native Hub
   resolution, bounded index-selected source transfer, Git/LFS byte
   verification, conversion receipt v3, and the closed checked-in Qwen3.8
-  source/artifact/hardware/disk recipe are also reconciled;
+  source/artifact/hardware/disk recipe, bounded canonical preparation-pair
+  receipt, and sealed host/conversion/pair proofs are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1627,9 +1628,35 @@ sealed artifact proof requires exact size and SHA-256. Neither proof can be
 cloned or used as serving/install authority, and the two roles cannot be
 cross-bound. Live metadata proof covers all 29 official files at the exact
 revision; the opt-in local gate rehashes the already accepted 17.7 GB output
-pair. The no-options coordinator, conversion invocation, source-retention
-mutation, prepared-model registry, and calibration receipt remain pending and
-must consume these proofs rather than reconstructing policy from strings.
+pair.
+
+**Landed preparation-pair boundary (2026-08-19).** Before either conversion
+can enter a pair, `VerifiedRecipeHost` binds the exact target, chip, observed
+unified memory, selected recipe profile, and observed free-space floor. Each
+value is policy input, not proof of how the host was measured; the future
+no-options coordinator remains responsible for supplying it from its OS-bound
+preflight before authentication or large work. Each
+conversion receipt is independently capped at 64 KiB, parsed with a closed
+schema, required to equal its deterministic pretty-JSON encoding plus LF, and
+cross-bound to the complete recipe source inventory, accepted artifact path,
+size, digest, quantization, role-specific conversion strategy, zero excluded
+tensors, and canonical hf2q converter identity. The artifact proof is consumed
+when that conversion proof is minted, so a text receipt cannot be paired with
+a projector artifact or with another recipe.
+
+Only the sealed source proof, the sealed host proof, and one text plus one
+projector conversion from the same converter identity can mint
+`VerifiedModelPreparation`. Its canonical 1,334-byte v1 receipt has SHA-256
+`5b20ca00d6757b285927e6f464271143e8820b1126ae85bc5786a532374ed69b` and
+binds the recipe/source/profile/converter identities, both accepted artifacts,
+and both exact conversion-receipt SHA-256 values. Its only state is
+`awaiting_runtime_calibration`. Parsing those bytes is structural and cannot
+recreate the non-cloneable sealed value; neither form grants serving,
+registration, retention deletion, or filesystem-mutation authority.
+
+The no-options coordinator, conversion invocation, source-retention mutation,
+prepared-model registry, and calibration receipt remain pending and must
+consume these proofs rather than reconstructing policy from strings.
 
 It executes an hf2q-only resumable plan:
 
@@ -1953,7 +1980,10 @@ before public self-update ships.
    receipt v3 have now landed. The closed checked-in Qwen3.8 recipe now binds
    its immutable 29-file source, exact accepted text/projector pair, sole
    proven M5 Max 128 GiB selection profile, derived disk floor, and retention
-   decision boundary. Next, embed the real stable root, compile the real
+   decision boundary. The bounded canonical pair receipt now additionally
+   consumes the exact source, host/disk, artifact, and conversion-receipt
+   proofs and remains explicitly calibration-pending and inert. Next, embed
+   the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention
    transaction, prepared/external artifact provenance, calibration receipt,

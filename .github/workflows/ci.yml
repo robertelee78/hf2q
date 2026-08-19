@@ -328,6 +328,9 @@ jobs:
           recipe=data/model-recipes/qwen38-27b-official-v1.json
           test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
             47a4cec7eb3b19ad68727f557ff47e83f1ef88c791734a76b5bd052d921c9d9d
+          preparation_golden=data/model-recipes/qwen38-27b-preparation-receipt-v1.json
+          test "$(shasum -a 256 "$preparation_golden" | awk '{print $1}')" = \
+            5b20ca00d6757b285927e6f464271143e8820b1126ae85bc5786a532374ed69b
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -422,8 +425,12 @@ jobs:
             src/input/model_recipe.rs \
             src/input/model_recipe/validation.rs \
             src/input/model_recipe/verification.rs \
+            src/input/model_recipe/preparation.rs \
+            src/input/model_recipe/preparation/validation.rs \
             src/input/model_recipe_tests.rs \
+            src/input/model_recipe_preparation_tests.rs \
             data/model-recipes/qwen38-27b-official-v1.json \
+            data/model-recipes/qwen38-27b-preparation-receipt-v1.json \
             src/main.rs \
             src/cli.rs \
             src/core/integrity.rs \
@@ -465,6 +472,8 @@ jobs:
             input::hf_download_plan_tests::metadata_transfer_caps_are_explicit_and_exact \
             input::model_recipe_tests::embedded_recipe_is_exact_canonical_and_binds_accepted_outputs \
             input::model_recipe_tests::semantic_cross_bindings_fail_closed \
+            input::model_recipe_preparation_tests::exact_pair_receipt_is_canonical_and_structurally_reparseable \
+            input::model_recipe_preparation_tests::every_conversion_cross_binding_fails_closed \
             input::integrity::tests::safetensors_index_entry_cap_is_exact \
             convert::receipt::tests::prepared_success_receipt_binds_output_and_replaces_stale_atomically \
             tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity
@@ -474,6 +483,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features input::hf_reference_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download_plan_tests::
           cargo test --locked --bin hf2q --all-features input::model_recipe_tests::
+          cargo test --locked --bin hf2q --all-features input::model_recipe_preparation_tests::
           cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features convert::receipt::tests::
           cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
