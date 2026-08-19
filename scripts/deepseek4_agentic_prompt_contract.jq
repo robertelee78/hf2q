@@ -2,14 +2,38 @@ def sha256: type == "string" and test("^[0-9a-f]{64}$");
 
 .schema_version == 2
 and .fixture_id == "full-context-agentic-v2"
-and .serialization.policy == "client-json-insertion-order"
-and .serialization.legacy_rejected_policy == "recursive-lexicographic-key-order"
+and .serialization.policy == "deepseek-v4-encoding-dsv4-input-order-v1"
+and .serialization.alternate_recursive_lexicographic_policy == "recursive-lexicographic-key-order"
+and .serialization.schema_objects == "preserve-input-order"
+and .serialization.arrays == "preserve-input-order"
 and .serialization.tool_function_keys == ["name", "description", "parameters"]
 and .serialization.parameters_keys == ["type", "properties", "required", "additionalProperties"]
 and .serialization.path_schema_keys == ["type", "description"]
 and .serialization.token_id_digest_encoding == "hf2q-u32le-v1"
 and .serialization.expected_prompt_tokens == 6684
-and .serialization.legacy_rejected_prompt_tokens == 6685
+and .serialization.alternate_recursive_lexicographic_prompt_tokens == 6685
+and .upstream_encoder.revision == "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
+and .upstream_encoder.path == "encoding/encoding_dsv4.py"
+and .upstream_encoder.bytes == 29001
+and .upstream_encoder.sha256 == "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6"
+and .upstream_encoder.golden_vectors == [
+  {
+    input_path: "encoding/tests/test_input_1.json",
+    input_bytes: 2748,
+    input_sha256: "10e0c074c977c3a80daab758af28219c6b1c2bd7f3f5cf2890c84b361cc32897",
+    output_path: "encoding/tests/test_output_1.txt",
+    output_bytes: 2390,
+    output_sha256: "9b366d9d2eac842a6e890594aac0b58648e5623717202b33497afadf03e26540"
+  },
+  {
+    input_path: "encoding/tests/test_input_3.json",
+    input_bytes: 4546,
+    input_sha256: "37bf8ef95e0411ea5f411be0b02fbafec7363438b6ccefddca0c52ec9aeaf69a",
+    output_path: "encoding/tests/test_output_3.txt",
+    output_bytes: 3313,
+    output_sha256: "b3b1cd8748b7b90d3c6be6da3f786f12e4d70be073bd445ea162dfad4dc01a64"
+  }
+]
 and .model.artifact_sha256 == "936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d"
 and .model.bytes == 107431343168
 and .model.source_revision == "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
@@ -45,7 +69,7 @@ and .tool_result.combined_payload_sha256 == "34826d9e2ced0f41f4d57bf873ac6c1d8c2
 and .prompt.tokens == .serialization.expected_prompt_tokens
 and .prompt.cached_anchor_tokens == 6676
 and .prompt.tool_result_uncached_suffix_tokens == 2798
-and .prompt.rejected_legacy_key_sorted_tokens == .serialization.legacy_rejected_prompt_tokens
+and .prompt.alternate_recursive_lexicographic_tokens == .serialization.alternate_recursive_lexicographic_prompt_tokens
 and (.agents | type == "array" and length == 4)
 and ([.agents[].agent] == [1, 2, 3, 4])
 and ([.agents[].run_id] == [
@@ -65,8 +89,8 @@ and all(.agents[];
   and (.request_sha256 | sha256)
   and (.rendered_prompt_sha256 | sha256)
   and (.prompt_token_ids_sha256 | sha256)
-  and (.legacy_key_sorted_rendered_prompt_sha256 | sha256)
-  and (.legacy_key_sorted_prompt_token_ids_sha256 | sha256))
+  and (.alternate_recursive_lexicographic_rendered_prompt_sha256 | sha256)
+  and (.alternate_recursive_lexicographic_prompt_token_ids_sha256 | sha256))
 and ([.agents[].request_sha256] | unique | length == 4)
 and ([.agents[].rendered_prompt_sha256] | unique | length == 4)
 and ([.agents[].prompt_token_ids_sha256] | unique | length == 4)
@@ -88,13 +112,13 @@ and ([.agents[].prompt_token_ids_sha256] == [
   "367da8c22c59e326fac37d1851dbfd728c8ba06daf8312559d42fe7579ea5411",
   "3356019bef7e6cd323db78ec64264feba1e7daa50fc9a5a1bf398172164d8f88"
 ])
-and ([.agents[].legacy_key_sorted_rendered_prompt_sha256] == [
+and ([.agents[].alternate_recursive_lexicographic_rendered_prompt_sha256] == [
   "0efcce39e823feafb2ce5e75dbef2b81577ca3c163b5a8aab858cd5a98035a93",
   "10d1a42d9b12162d08646403f84e01172e972c119ba276df7fe3ac497d2508a5",
   "2ad6d19729e0411a02c6b938c80d9f66940fc9fb27109ce069a885525395071f",
   "6425cc442f9d6dc13d5e77d8bbc3ec233ad60d3ff9b1675bf4cc54543b6d6981"
 ])
-and ([.agents[].legacy_key_sorted_prompt_token_ids_sha256] == [
+and ([.agents[].alternate_recursive_lexicographic_prompt_token_ids_sha256] == [
   "5fea2d2d7172912a2a6c2e1ad3f58478be7896b7c9b12cc3402e6b3d5e1a706e",
   "7b845c25826502f3cecdd529e06a3f2dccb92608faabccb7b44f90a31b94b26b",
   "fa4b56a307d7bd9843d2e5d99894dcbea704e8e08db0d63134f3bf2470c00516",

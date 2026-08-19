@@ -431,8 +431,8 @@ jq -s --arg contract_sha256 "$agentic_prompt_contract_sha" \
       or any(.[]; .status != "pass"
         or .prompt_contract_sha256 != $contract_sha256
         or .prompt_tokens != 6684
-        or .legacy_key_sorted_prompt_tokens != 6685
-        or .preserve_order_delta_proven != true)
+        or .alternate_recursive_lexicographic_prompt_tokens != 6685
+        or .serialization_delta_proven != true)
     then error("invalid DeepSeek prompt provenance")
     else {
       schema_version:2,

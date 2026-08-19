@@ -1752,8 +1752,8 @@ immutable source, exact-SHA CI, or packed-artifact publication authority.
 
 Exact-main cache-lifecycle run `32282861299` exposed a stale test contract, not
 an inference or thermal failure. Commit `d4874792` had correctly enabled
-`serde_json` insertion-order preservation so the DeepSeek chat template sees
-the client's tool schema in its original wire order. The immutable 21,204-byte
+`serde_json` insertion-order preservation so the DeepSeek encoder sees each
+tool schema in source order. The immutable 21,204-byte
 repository fixture, prompt-visible path, model artifact, and request semantics
 were unchanged, but the corrected serialization renders to 6,684 tokens rather
 than the historical key-sorted 6,685.
@@ -1763,9 +1763,10 @@ tokens with zero cold reuse. Three completed the required `read_file` tool call
 before the first agent rejected the stale 6,685 assertion and the harness
 cleaned up the fourth. Prefill completed for all four under entirely Nominal
 thermal telemetry. The release fixture, receipt parser, publication verifier,
-and current operator documentation therefore bind 6,684 tokens; older 6,685
-measurements remain below as historical evidence for the superseded
-serialization. No latency SLO or semantic acceptance predicate changed.
+and current operator documentation therefore bind 6,684 tokens. The 6,685
+recursive-lexicographic rendering remains a measured alternate, not a legacy
+format or an accepted family-wide policy. No latency SLO or semantic acceptance
+predicate changed.
 
 The protected gate now also generates the exact first-wave request and renders
 and tokenizes it directly from the release GGUF before loading the 100 GiB
@@ -1783,16 +1784,32 @@ requests; its first two cold completions also crossed the unchanged 60-second
 acceptance ceiling, so it is diagnostic RCA evidence rather than a performance
 receipt.
 Their thermal samples remained entirely Nominal; the outer thermal failure was
-only fail-closed fallout from missing accepted cold receipts. The isolated
-semantic change and byte-identical context, builder, and template inputs bind
-the one-token delta to JSON key order, not to model execution or thermals.
+only fail-closed fallout from missing accepted cold receipts. The byte-identical
+context, builder, and template inputs bind the one-token prompt delta to JSON
+key order, not to model execution or thermals. They do not prove that the
+shorter historical completion trajectory was caused by serialization: the
+compared commits also changed attention, sampling, serving, and `mlx-native`.
 
-`full-context-agentic-v2` makes that ordering part of the checked-in workload.
-The accepted policy is client JSON insertion order: tool function keys are
-`name, description, parameters`, with parameter keys `type, properties,
-required, additionalProperties`. Its exact prompt is 6,684 tokens. A complete
-recursive lexicographic-key replay is separately rendered and must remain the
-explicitly rejected 6,685-token legacy case. The contract binds all four
+`full-context-agentic-v2` makes the official encoder's ordering part of the
+checked-in workload. Exact upstream revision
+`7872f01b1d1fe23eabc4c98b48bffcef5a386062` serializes tool functions with
+Python `json.dumps` and no key sorting. Its byte-exact case-1 and case-3 golden
+vectors preserve `name, description, parameters`, preserve nested schema
+object order even when sibling schemas use different orders, and preserve all
+arrays. The contract binds `encoding/encoding_dsv4.py` (29,001 bytes, SHA-256
+`abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6`) and
+both input/output vector digests; hosted Rust tests replay those same checked-in
+bytes.
+
+The accepted policy is therefore
+`deepseek-v4-encoding-dsv4-input-order-v1`. Its exact prompt is 6,684 tokens.
+A complete recursive lexicographic-key replay is separately rendered as a
+non-authoritative 6,685-token alternate. A matched exact-artifact 6,673-token
+required-tool experiment is the safety reason not to promote that alternate:
+source order produced the correct `read_file` call in 96 tokens, while recursive
+sorting needed 136 and missed the 128-token ceiling. Reconsidering the policy
+requires one same-commit/binary/artifact alternating A/B that passes both that
+regression and the protected four-agent workload. The contract binds all four
 22,955-byte request bodies, rendered-prompt hashes, and little-endian token-ID
 hashes:
 

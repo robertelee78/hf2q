@@ -34,7 +34,7 @@ def valid_agent:
   and .tool_result_payload_sha256 == $c.tool_result.combined_payload_sha256
   and .expected_prompt_tokens == $c.serialization.expected_prompt_tokens
   and .prompt_tokens == $c.serialization.expected_prompt_tokens
-  and .prompt_tokens != $c.serialization.legacy_rejected_prompt_tokens
+  and .prompt_tokens != $c.serialization.alternate_recursive_lexicographic_prompt_tokens
   and .cold_cached_tokens == 0
   and .cached_tokens == $c.prompt.cached_anchor_tokens
   and .auto_cached_tokens == $c.prompt.cached_anchor_tokens
@@ -75,7 +75,7 @@ and .tool_result_fixture_bytes == $c.tool_result.bytes
 and .tool_result_payload_sha256 == $c.tool_result.combined_payload_sha256
 and .expected_prompt_tokens == $c.serialization.expected_prompt_tokens
 and .prompt_tokens == $c.serialization.expected_prompt_tokens
-and .prompt_tokens != $c.serialization.legacy_rejected_prompt_tokens
+and .prompt_tokens != $c.serialization.alternate_recursive_lexicographic_prompt_tokens
 and (.maximum_cold_ttft_ms | number_between(0; 60000))
 and (.maximum_cold_semantic_response_ms | number_between(0; 60000))
 and (.cohort_cold_wall_ms | number_between(0; 60000))

@@ -368,7 +368,7 @@ jobs:
                  and .receipt.agentic_context_fixture_bytes == $pc.repository_context.bytes
                  and .receipt.repository_context_chars == $pc.repository_context.chars
                  and .receipt.prompt_tokens == $pc.serialization.expected_prompt_tokens
-                 and .receipt.prompt_tokens != $pc.serialization.legacy_rejected_prompt_tokens
+                 and .receipt.prompt_tokens != $pc.serialization.alternate_recursive_lexicographic_prompt_tokens
                  and all(.receipt.agents[];
                    .status == "pass" and .cold_cached_tokens == 0
                    and .agentic_context_fixture_sha256 == $pc.repository_context.sha256
@@ -376,7 +376,7 @@ jobs:
                    and .repository_context_chars == $pc.repository_context.chars
                    and .expected_path == $pc.request.expected_path
                    and .prompt_tokens == $pc.serialization.expected_prompt_tokens
-                   and .prompt_tokens != $pc.serialization.legacy_rejected_prompt_tokens
+                   and .prompt_tokens != $pc.serialization.alternate_recursive_lexicographic_prompt_tokens
                    and .cold_ttft_ms <= 60000
                    and .cold_semantic_response_ms <= 60000
                    and .cached_tokens == $pc.prompt.cached_anchor_tokens

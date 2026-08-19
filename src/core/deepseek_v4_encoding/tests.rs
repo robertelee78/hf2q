@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 const INPUT_1: &str = include_str!("../../../tests/fixtures/deepseek_v4_encoding/input_1.json");
 const OUTPUT_1: &str = include_str!("../../../tests/fixtures/deepseek_v4_encoding/output_1.txt");
@@ -21,6 +22,10 @@ fn official_bytes(fixture: &'static str) -> &'static str {
     // The upstream .txt files omit a final newline. Repository text files
     // retain one; that transport-only byte is not part of the vector.
     fixture.strip_suffix('\n').unwrap_or(fixture)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Deserialize)]
@@ -78,6 +83,34 @@ fn official_case_3_developer_tools_and_latest_reminder() {
         encode_json(INPUT_3, options(ThinkingMode::Thinking)).unwrap(),
         official_bytes(OUTPUT_3)
     );
+}
+
+#[test]
+fn official_input_order_vectors_are_source_bound() {
+    assert_eq!(
+        sha256_hex(INPUT_1.as_bytes()),
+        "10e0c074c977c3a80daab758af28219c6b1c2bd7f3f5cf2890c84b361cc32897"
+    );
+    assert_eq!(
+        sha256_hex(official_bytes(OUTPUT_1).as_bytes()),
+        "9b366d9d2eac842a6e890594aac0b58648e5623717202b33497afadf03e26540"
+    );
+    assert_eq!(
+        sha256_hex(official_bytes(INPUT_3).as_bytes()),
+        "37bf8ef95e0411ea5f411be0b02fbafec7363438b6ccefddca0c52ec9aeaf69a"
+    );
+    assert_eq!(
+        sha256_hex(official_bytes(OUTPUT_3).as_bytes()),
+        "b3b1cd8748b7b90d3c6be6da3f786f12e4d70be073bd445ea162dfad4dc01a64"
+    );
+
+    let rendered = encode_json(INPUT_3, options(ThinkingMode::Thinking)).unwrap();
+    assert!(rendered.contains(
+        r#"{"name": "open", "description": "Batch open IDs (format 【{id}†...】) or URLs.", "parameters": {"#
+    ));
+    assert!(rendered.contains(
+        r#""id": {"description": "ID or URL", "anyOf": [{"type": "integer"}, {"type": "string"}], "default": -1}, "cursor": {"type": "integer", "description": "", "default": -1}"#
+    ));
 }
 
 #[test]

@@ -28,10 +28,10 @@ else
         and .rendered_prompt_bytes > 0
         and .prompt_token_ids_sha256 == $expected.prompt_token_ids_sha256
         and .prompt_tokens == $c.serialization.expected_prompt_tokens
-        and .legacy_key_sorted_rendered_prompt_sha256 == $expected.legacy_key_sorted_rendered_prompt_sha256
-        and ((.legacy_key_sorted_rendered_prompt_bytes | type) == "number")
-        and .legacy_key_sorted_rendered_prompt_bytes > 0
-        and .legacy_key_sorted_prompt_token_ids_sha256 == $expected.legacy_key_sorted_prompt_token_ids_sha256
-        and .legacy_key_sorted_prompt_tokens == $c.serialization.legacy_rejected_prompt_tokens
-        and .preserve_order_delta_proven == true)
+        and .alternate_recursive_lexicographic_rendered_prompt_sha256 == $expected.alternate_recursive_lexicographic_rendered_prompt_sha256
+        and ((.alternate_recursive_lexicographic_rendered_prompt_bytes | type) == "number")
+        and .alternate_recursive_lexicographic_rendered_prompt_bytes > 0
+        and .alternate_recursive_lexicographic_prompt_token_ids_sha256 == $expected.alternate_recursive_lexicographic_prompt_token_ids_sha256
+        and .alternate_recursive_lexicographic_prompt_tokens == $c.serialization.alternate_recursive_lexicographic_prompt_tokens
+        and .serialization_delta_proven == true)
 end

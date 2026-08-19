@@ -227,7 +227,7 @@ expect_contract_rejected() {
 }
 
 expect_contract_rejected stale_count '.serialization.expected_prompt_tokens = 6685'
-expect_contract_rejected missing_legacy_delta '.serialization.legacy_rejected_prompt_tokens = 6684'
+expect_contract_rejected missing_alternate_delta '.serialization.alternate_recursive_lexicographic_prompt_tokens = 6684'
 expect_contract_rejected wrong_policy '.serialization.policy = "recursive-lexicographic-key-order"'
 expect_contract_rejected builder_digest '.request_builder.sha256 = ("a" * 64)'
 expect_contract_rejected template_digest '.chat_template.sha256 = ("a" * 64)'
@@ -252,11 +252,11 @@ jq -n --slurpfile contract "$CONTRACT" \
        rendered_prompt_sha256:.rendered_prompt_sha256,rendered_prompt_bytes:1,
        prompt_token_ids_sha256:.prompt_token_ids_sha256,
        prompt_tokens:$c.serialization.expected_prompt_tokens,
-       legacy_key_sorted_rendered_prompt_sha256:.legacy_key_sorted_rendered_prompt_sha256,
-       legacy_key_sorted_rendered_prompt_bytes:1,
-       legacy_key_sorted_prompt_token_ids_sha256:.legacy_key_sorted_prompt_token_ids_sha256,
-       legacy_key_sorted_prompt_tokens:$c.serialization.legacy_rejected_prompt_tokens,
-       preserve_order_delta_proven:true
+       alternate_recursive_lexicographic_rendered_prompt_sha256:.alternate_recursive_lexicographic_rendered_prompt_sha256,
+       alternate_recursive_lexicographic_rendered_prompt_bytes:1,
+       alternate_recursive_lexicographic_prompt_token_ids_sha256:.alternate_recursive_lexicographic_prompt_token_ids_sha256,
+       alternate_recursive_lexicographic_prompt_tokens:$c.serialization.alternate_recursive_lexicographic_prompt_tokens,
+       serialization_delta_proven:true
      }]}
 ' >"$provenance_receipt"
 jq -e --slurpfile contract "$CONTRACT" \
@@ -283,13 +283,13 @@ expect_provenance_failure request_bytes '.agents[0].request_bytes += 1'
 expect_provenance_failure request_digest '.agents[0].request_sha256 = ("a" * 64)'
 expect_provenance_failure render_digest '.agents[0].rendered_prompt_sha256 = ("a" * 64)'
 expect_provenance_failure token_digest '.agents[0].prompt_token_ids_sha256 = ("a" * 64)'
-expect_provenance_failure legacy_render_digest '.agents[0].legacy_key_sorted_rendered_prompt_sha256 = ("a" * 64)'
-expect_provenance_failure legacy_token_digest '.agents[0].legacy_key_sorted_prompt_token_ids_sha256 = ("a" * 64)'
+expect_provenance_failure alternate_render_digest '.agents[0].alternate_recursive_lexicographic_rendered_prompt_sha256 = ("a" * 64)'
+expect_provenance_failure alternate_token_digest '.agents[0].alternate_recursive_lexicographic_prompt_token_ids_sha256 = ("a" * 64)'
 expect_provenance_failure serialization_policy '.agents[0].serialization_policy = "sorted"'
 expect_provenance_failure token_encoding '.agents[0].token_id_digest_encoding = "native"'
 expect_provenance_failure prompt_tokens '.agents[0].prompt_tokens = 6685'
-expect_provenance_failure legacy_tokens '.agents[0].legacy_key_sorted_prompt_tokens = 6684'
-expect_provenance_failure delta '.agents[0].preserve_order_delta_proven = false'
+expect_provenance_failure alternate_tokens '.agents[0].alternate_recursive_lexicographic_prompt_tokens = 6684'
+expect_provenance_failure delta '.agents[0].serialization_delta_proven = false'
 expect_provenance_failure duplicate '.agents[3] = .agents[2]'
 expect_provenance_failure swapped '.agents = [.agents[1],.agents[0],.agents[2],.agents[3]]'
 

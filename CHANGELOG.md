@@ -65,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt, while conversion, quantization, and model weights remain unchanged.
 - Rebind the frozen DeepSeek four-agent release fixture to its deterministic
   6,684-token insertion-ordered render. The prior 6,685-token assertion was the
-  legacy key-sorted count and stopped an otherwise coherent hardware wave.
+  alternate recursive-lexicographic count and stopped an otherwise coherent hardware wave.
   Release validation now renders and tokenizes the exact first request before
   loading the 100 GiB verifier, so future prompt drift fails early.
 - Hash each immutable release model once per stable file identity instead of

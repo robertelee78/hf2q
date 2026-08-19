@@ -327,28 +327,28 @@ mod tests {
             .encode(rendered.as_str(), false)
             .expect("tokenize insertion-ordered release prompt");
 
-        let mut legacy_tools = request
+        let mut alternate_tools = request
             .tools
             .as_ref()
             .map(serde_json::to_value)
             .transpose()
-            .expect("serialize legacy DeepSeek-V4 tools");
-        if let Some(tools) = legacy_tools.as_mut() {
+            .expect("serialize alternate DeepSeek-V4 tools");
+        if let Some(tools) = alternate_tools.as_mut() {
             sort_json_object_keys_recursively(tools);
         }
-        let legacy_rendered = render_agentic_request_with_tools_json(&request, legacy_tools);
-        let legacy_encoded = tokenizer
-            .encode(legacy_rendered.as_str(), false)
-            .expect("tokenize legacy key-sorted release prompt");
+        let alternate_rendered = render_agentic_request_with_tools_json(&request, alternate_tools);
+        let alternate_encoded = tokenizer
+            .encode(alternate_rendered.as_str(), false)
+            .expect("tokenize alternate recursive-lexicographic release prompt");
 
         let rendered_sha256 = sha256_hex(rendered.as_bytes());
         let prompt_token_ids_sha256 = token_ids_sha256(encoded.get_ids());
-        let legacy_rendered_sha256 = sha256_hex(legacy_rendered.as_bytes());
-        let legacy_prompt_token_ids_sha256 = token_ids_sha256(legacy_encoded.get_ids());
+        let alternate_rendered_sha256 = sha256_hex(alternate_rendered.as_bytes());
+        let alternate_prompt_token_ids_sha256 = token_ids_sha256(alternate_encoded.get_ids());
         eprintln!(
-            "release agentic fixture: request={request_sha256} rendered={rendered_sha256} tokens={} token_ids={prompt_token_ids_sha256} legacy_rendered={legacy_rendered_sha256} legacy_tokens={} legacy_token_ids={legacy_prompt_token_ids_sha256}",
+            "release agentic fixture: request={request_sha256} rendered={rendered_sha256} tokens={} token_ids={prompt_token_ids_sha256} alternate_rendered={alternate_rendered_sha256} alternate_tokens={} alternate_token_ids={alternate_prompt_token_ids_sha256}",
             encoded.len(),
-            legacy_encoded.len(),
+            alternate_encoded.len(),
         );
 
         assert_eq!(
@@ -376,24 +376,24 @@ mod tests {
                 .expect("expected prompt tokens")
         );
         assert_eq!(
-            legacy_rendered_sha256,
-            expected_agent["legacy_key_sorted_rendered_prompt_sha256"]
+            alternate_rendered_sha256,
+            expected_agent["alternate_recursive_lexicographic_rendered_prompt_sha256"]
                 .as_str()
-                .expect("agent legacy rendered prompt hash")
+                .expect("agent alternate rendered prompt hash")
         );
         assert_eq!(
-            legacy_prompt_token_ids_sha256,
-            expected_agent["legacy_key_sorted_prompt_token_ids_sha256"]
+            alternate_prompt_token_ids_sha256,
+            expected_agent["alternate_recursive_lexicographic_prompt_token_ids_sha256"]
                 .as_str()
-                .expect("agent legacy prompt token hash")
+                .expect("agent alternate prompt token hash")
         );
         assert_eq!(
-            legacy_encoded.len() as u64,
-            contract["serialization"]["legacy_rejected_prompt_tokens"]
+            alternate_encoded.len() as u64,
+            contract["serialization"]["alternate_recursive_lexicographic_prompt_tokens"]
                 .as_u64()
-                .expect("legacy rejected prompt tokens")
+                .expect("alternate recursive-lexicographic prompt tokens")
         );
-        assert_ne!(rendered, legacy_rendered);
+        assert_ne!(rendered, alternate_rendered);
 
         if let Ok(receipt_path) = std::env::var("HF2Q_DEEPSEEK4_AGENTIC_CONTRACT_RECEIPT") {
             let receipt = serde_json::json!({
@@ -409,11 +409,11 @@ mod tests {
                 "rendered_prompt_bytes": rendered.len(),
                 "prompt_token_ids_sha256": prompt_token_ids_sha256,
                 "prompt_tokens": encoded.len(),
-                "legacy_key_sorted_rendered_prompt_sha256": legacy_rendered_sha256,
-                "legacy_key_sorted_rendered_prompt_bytes": legacy_rendered.len(),
-                "legacy_key_sorted_prompt_token_ids_sha256": legacy_prompt_token_ids_sha256,
-                "legacy_key_sorted_prompt_tokens": legacy_encoded.len(),
-                "preserve_order_delta_proven": rendered != legacy_rendered,
+                "alternate_recursive_lexicographic_rendered_prompt_sha256": alternate_rendered_sha256,
+                "alternate_recursive_lexicographic_rendered_prompt_bytes": alternate_rendered.len(),
+                "alternate_recursive_lexicographic_prompt_token_ids_sha256": alternate_prompt_token_ids_sha256,
+                "alternate_recursive_lexicographic_prompt_tokens": alternate_encoded.len(),
+                "serialization_delta_proven": rendered != alternate_rendered,
             });
             let receipt_bytes = serde_json::to_vec_pretty(&receipt)
                 .expect("serialize agentic prompt contract receipt");
