@@ -5,8 +5,9 @@
 //!
 //! Token resolution order (Story 3.2):
 //! 1. HF_TOKEN environment variable
-//! 2. ~/.cache/huggingface/token file (hf-hub default)
-//! 3. ~/.huggingface/token file (legacy path)
+//! 2. HUGGING_FACE_HUB_TOKEN environment variable (legacy)
+//! 3. ~/.cache/huggingface/token file (hf-hub default)
+//! 4. ~/.huggingface/token file (legacy path)
 //!
 //! Cache: Uses standard hf-hub cache directory. Subsequent runs with
 //! the same repo skip re-download (hf-hub's built-in LFS resumption).
@@ -603,7 +604,7 @@ fn download_with_cli_command(cmd: &str, repo_id: &str) -> Result<PathBuf, Downlo
 /// 2. HUGGING_FACE_HUB_TOKEN environment variable (legacy)
 /// 3. Standard hf-hub token path (~/.cache/huggingface/token)
 /// 4. Legacy token path (~/.huggingface/token)
-fn resolve_auth_token() -> Option<String> {
+pub(crate) fn resolve_auth_token() -> Option<String> {
     let hf_token = std::env::var("HF_TOKEN").ok();
     let legacy_env_token = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
     let home = home_dir();
@@ -759,6 +760,11 @@ mod tests {
         assert_eq!(
             token,
             Some(("test_token_12345".to_string(), AuthTokenSource::HfTokenEnv,))
+        );
+
+        assert_eq!(
+            resolve_auth_token_from_inputs(Some(""), Some("legacy_token"), None, None),
+            Some(("legacy_token".to_owned(), AuthTokenSource::LegacyEnv))
         );
     }
 
