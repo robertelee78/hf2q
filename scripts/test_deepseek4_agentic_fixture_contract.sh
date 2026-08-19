@@ -189,14 +189,14 @@ jq -n '
     agentic_context_fixture_bytes: 21204,
     repository_context_chars: 20584,
     expected_path: "/opt/hf2q-worktrees/full-context-slots/Cargo.toml",
-    expected_prompt_tokens: 6685,
-    prompt_tokens: 6685,
+    expected_prompt_tokens: 6684,
+    prompt_tokens: 6684,
     cold_cached_tokens: 0,
     cold_ttft_ms: 60000,
     cold_semantic_response_ms: 60000,
-    cached_tokens: 6677,
-    auto_cached_tokens: 6677,
-    continuation_cached_tokens: 6677,
+    cached_tokens: 6676,
+    auto_cached_tokens: 6676,
+    continuation_cached_tokens: 6676,
     cached_ttft_ms: 5000,
     cached_semantic_response_ms: 15000,
     auto_semantic_response_ms: 15000,
@@ -218,8 +218,8 @@ jq -n '
     agentic_context_fixture_sha256: "2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
     agentic_context_fixture_bytes: 21204,
     repository_context_chars: 20584,
-    expected_prompt_tokens: 6685,
-    prompt_tokens: 6685,
+    expected_prompt_tokens: 6684,
+    prompt_tokens: 6684,
     maximum_cold_ttft_ms: 60000,
     maximum_cold_semantic_response_ms: 60000,
     cohort_cold_wall_ms: 60000,
@@ -242,10 +242,10 @@ expect_receipt_failure() {
 
 expect_receipt_failure missing_prompt 'del(.agents[0].prompt_tokens)'
 expect_receipt_failure null_prompt '.agents[0].prompt_tokens = null'
-expect_receipt_failure string_prompt '.agents[0].prompt_tokens = "6685"'
+expect_receipt_failure string_prompt '.agents[0].prompt_tokens = "6684"'
 expect_receipt_failure zero_prompt '.agents[0].prompt_tokens = 0'
-expect_receipt_failure short_prompt '.agents[0].prompt_tokens = 6684'
-expect_receipt_failure long_prompt '.agents[0].prompt_tokens = 6686'
+expect_receipt_failure short_prompt '.agents[0].prompt_tokens = 6683'
+expect_receipt_failure long_prompt '.agents[0].prompt_tokens = 6685'
 expect_receipt_failure fixture_id '.agents[0].fixture_id = "mutable"'
 expect_receipt_failure fixture_digest '.agents[0].agentic_context_fixture_sha256 = ("a" * 64)'
 expect_receipt_failure fixture_bytes '.agents[0].agentic_context_fixture_bytes = 21205'
@@ -265,7 +265,7 @@ cp "$ROOT_DIR/scripts/test_full_context_agent_slots.sh" "$aggregate_root/scripts
 cat >"$aggregate_root/scripts/test_deepseek4_agentic.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-jq -n '{status:"pass", prompt_tokens:6685, cold_cached_tokens:0}' \
+jq -n '{status:"pass", prompt_tokens:6684, cold_cached_tokens:0}' \
   >"$COLD_RESULT_PATH"
 sleep 2
 jq -n --arg run_id "$RUN_ID" '{
@@ -274,11 +274,11 @@ jq -n --arg run_id "$RUN_ID" '{
   agentic_context_fixture_sha256:"2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef",
   agentic_context_fixture_bytes:21204,
   repository_context_chars:20584,
-  expected_prompt_tokens:6685,
-  prompt_tokens:6685,
+  expected_prompt_tokens:6684,
+  prompt_tokens:6684,
   cold_ttft_ms:1,
   cold_semantic_response_ms:1,
-  cached_tokens:6677,
+  cached_tokens:6676,
   tool_result_response_ms:1,
   run_id:$run_id
 }'

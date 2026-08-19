@@ -15,7 +15,8 @@ EXPECTED_PATH=${EXPECTED_PATH:-/opt/hf2q-worktrees/full-context-slots/Cargo.toml
 TOOL_RESULT_PATH=${TOOL_RESULT_PATH:-$ROOT_DIR/Cargo.toml}
 AGENTIC_CONTEXT_FIXTURE=${AGENTIC_CONTEXT_FIXTURE:-$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt}
 AGENTIC_CONTEXT_FIXTURE_SHA256=${AGENTIC_CONTEXT_FIXTURE_SHA256:-2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef}
-# The request JSON is byte-bound to hf2q's 6,685-token fixture. Pinned
+# The request JSON is byte-bound to hf2q's 6,684-token insertion-ordered
+# fixture. Pinned
 # llama.cpp build 10326 renders those same bytes as 6,695 prompt tokens; bind
 # that runtime-specific count so a template/tokenizer drift cannot hide.
 EXPECTED_PROMPT_TOKENS=${EXPECTED_PROMPT_TOKENS:-6695}

@@ -457,7 +457,7 @@ fresh pinned peer for each wave, disables prompt caching, binds binary/model/
 fixture/request identity, requires exact `read_file` semantics and zero-cache
 usage, and records monotonic response/cohort timing under continuous AC and
 thermal telemetry. The peer renders the byte-identical request as 6,695 prompt
-tokens versus hf2q's 6,685, so both runtime-specific counts remain explicit.
+tokens versus hf2q's 6,684, so both runtime-specific counts remain explicit.
 The script is reference evidence only; it never participates in production
 serving and cannot replace hf2q's exact packed-artifact cache gate.
 
