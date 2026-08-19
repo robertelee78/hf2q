@@ -9,6 +9,14 @@ use sha2::{Digest, Sha256};
 use super::test_fixture::{chmod, copy_directory, Fixture};
 use super::*;
 
+fn identity(root: &Path) -> DurableInstallationIdentity {
+    open_existing_installation_identity(
+        ExplicitRootAuthorization::new(root).expect("root authorization"),
+    )
+    .expect("open installation identity")
+    .expect("installation identity exists")
+}
+
 fn canonical_marker(value: serde_json::Value) -> Vec<u8> {
     schema::InstalledVersionMarkerV2::parse_and_validate(
         &serde_json::to_vec(&value).expect("marker JSON"),
@@ -94,7 +102,7 @@ fn simultaneous_fresh_bootstrap_yields_one_ready_and_one_busy() {
         workers.push(std::thread::spawn(move || {
             start.wait();
             let result = prepare_first_activation(
-                ExplicitRootAuthorization::new(&root).expect("root authorization"),
+                identity(&root),
                 AuthenticatedPreparedVersion::for_test_only(receipt),
             );
             match result {
@@ -133,7 +141,7 @@ fn exact_root_authority_does_not_create_missing_ancestors() {
 
     assert!(matches!(
         fixture.prepare(),
-        Err(InstallStateError::Missing("explicit root ancestor"))
+        Err(InstallStateError::Missing("installation identity"))
     ));
     assert!(!parent.exists());
 }
@@ -168,7 +176,7 @@ fn confirmed_migration_requires_a_separate_future_authorization() {
 
     assert!(matches!(
         prepare_first_activation(
-            ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+            identity(&fixture.root),
             AuthenticatedPreparedVersion::for_test_only(migration),
         ),
         Err(InstallStateError::InvalidLayout(
@@ -199,7 +207,7 @@ fn receipt_evidence_and_completion_time_must_be_derived_from_marker() {
         assert!(
             matches!(
                 prepare_first_activation(
-                    ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+                    identity(&fixture.root),
                     AuthenticatedPreparedVersion::for_test_only(receipt_bytes),
                 ),
                 Err(InstallStateError::InvalidLayout(
@@ -221,7 +229,7 @@ fn noncanonical_receipt_bytes_cannot_activate() {
 
     assert!(matches!(
         prepare_first_activation(
-            ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+            identity(&fixture.root),
             AuthenticatedPreparedVersion::for_test_only(noncanonical),
         ),
         Err(InstallStateError::InvalidLayout(
@@ -254,7 +262,7 @@ fn changed_marker_cannot_reuse_stale_receipt_evidence() {
 
     assert!(matches!(
         prepare_first_activation(
-            ExplicitRootAuthorization::new(&fixture.root).expect("root authorization"),
+            identity(&fixture.root),
             AuthenticatedPreparedVersion::for_test_only(receipt_bytes),
         ),
         Err(InstallStateError::InvalidLayout(
@@ -505,6 +513,26 @@ fn replaced_lock_name_blocks_commit_before_current() {
 }
 
 #[test]
+fn replaced_identity_inode_blocks_commit_before_current() {
+    let fixture = Fixture::new();
+    let FirstActivationPreparation::Ready(prepared) = fixture.prepare().expect("prepare") else {
+        panic!("new fixture cannot already be committed");
+    };
+    let identity = fixture.root.join("update/installation-identity.json");
+    let bytes = fs::read(&identity).expect("identity bytes");
+    fs::rename(
+        &identity,
+        fixture.root.join("detached-installation-identity.json"),
+    )
+    .expect("detach identity inode");
+    fs::write(&identity, bytes).expect("same-byte identity replacement");
+    chmod(&identity, 0o600);
+
+    assert!(prepared.commit().is_err());
+    assert!(!fixture.root.join("current").exists());
+}
+
+#[test]
 fn replaced_update_directory_blocks_commit_before_current() {
     let fixture = Fixture::new();
     let FirstActivationPreparation::Ready(prepared) = fixture.prepare().expect("prepare") else {
@@ -531,8 +559,7 @@ fn replaced_update_directory_blocks_commit_before_current() {
 fn symlinked_lock_file_is_never_followed() {
     let fixture = Fixture::new();
     let update = fixture.root.join("update");
-    fs::create_dir_all(&update).expect("create update directory");
-    chmod(&update, 0o700);
+    fs::remove_file(update.join("install.lock")).expect("remove retained lock name");
     symlink("../versions", update.join("install.lock")).expect("create hostile lock symlink");
     assert!(fixture.prepare().is_err());
     assert!(!fixture.root.join("current").exists());

@@ -1,4 +1,7 @@
 use super::*;
+use crate::distribution::install_state::{
+    bootstrap_installation_identity_for_test, IdentityFaultPlan,
+};
 
 #[test]
 fn initial_and_successor_commits_are_bounded_and_idempotent() {
@@ -414,10 +417,11 @@ fn ordinary_reader_rejects_unselected_published_successor() {
 fn metadata_commit_shares_the_nonblocking_installation_lock() {
     let parent = tempfile::tempdir().expect("tempdir");
     let root = test_root(&parent);
+    let state = authorization(&root);
     let _held = LockedInstallation::acquire(&root).expect("hold lock");
     assert!(matches!(
         commit_candidate_for_test(
-            authorization(&root),
+            state,
             candidate_at(&root, "2026-08-17T20:00:00Z", "2026-08-17T20:00:01Z", 2, 3,),
             FaultPlan::default(),
         ),
@@ -428,7 +432,7 @@ fn metadata_commit_shares_the_nonblocking_installation_lock() {
 }
 
 #[test]
-fn selected_journal_is_bound_to_the_authorized_installation_identity() {
+fn selected_journal_cannot_be_reauthorized_with_a_different_installation_identity() {
     let parent = tempfile::tempdir().expect("tempdir");
     let root = test_root(&parent);
     commit_candidate_for_test(
@@ -437,14 +441,15 @@ fn selected_journal_is_bound_to_the_authorized_installation_identity() {
         FaultPlan::default(),
     )
     .expect("commit");
-    let wrong_identity = MetadataStateAuthorization::for_test(
+    let wrong_identity = bootstrap_installation_identity_for_test(
         ExplicitRootAuthorization::new(&root).expect("root authorization"),
         "a70ee078-5f20-45f6-bf42-bfcd1a992382",
+        IdentityFaultPlan::default(),
     );
     assert!(matches!(
-        read_selected(&wrong_identity),
-        Err(MetadataJournalError::Invalid(
-            "metadata generation belongs to a different installation state root"
+        wrong_identity,
+        Err(super::super::InstallStateError::InvalidLayout(
+            "installation identity differs from the requested test identity"
         ))
     ));
 }
@@ -623,6 +628,7 @@ fn precommit_rejects_namespace_inode_and_file_attribute_swaps() {
 
     #[derive(Clone, Copy, Debug)]
     enum Mutation {
+        IdentityFile,
         MetadataDirectory,
         GenerationsDirectory,
         PublishedGeneration,
@@ -633,6 +639,7 @@ fn precommit_rejects_namespace_inode_and_file_attribute_swaps() {
     }
 
     for mutation in [
+        Mutation::IdentityFile,
         Mutation::MetadataDirectory,
         Mutation::GenerationsDirectory,
         Mutation::PublishedGeneration,
@@ -657,6 +664,15 @@ fn precommit_rejects_namespace_inode_and_file_attribute_swaps() {
             authorization(&root),
             candidate_at(&root, "2026-08-17T20:00:01Z", "2026-08-17T20:00:02Z", 3, 4),
             || match mutation {
+                Mutation::IdentityFile => {
+                    let identity = root.join("update/installation-identity.json");
+                    let bytes = std::fs::read(&identity).expect("identity bytes");
+                    std::fs::rename(&identity, root.join("detached-installation-identity.json"))
+                        .expect("detach identity inode");
+                    std::fs::write(&identity, bytes).expect("same-byte identity replacement");
+                    std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600))
+                        .expect("private identity replacement");
+                }
                 Mutation::MetadataDirectory => {
                     std::fs::rename(&metadata, root.join("detached-metadata"))
                         .expect("detach metadata directory");

@@ -12,39 +12,58 @@ use super::cleanup::{verify_cleanup_residue, verify_pending_shape};
 use super::{HistoryMode, CURRENT, GENERATIONS, METADATA};
 use crate::distribution::install_state::file;
 use crate::distribution::install_state::unix::{self, Directory};
-use crate::distribution::install_state::InstallStateError;
 
 pub(in crate::distribution) fn read_selected(
     authorization: &MetadataStateAuthorization,
 ) -> Result<Option<StoredMetadataGeneration>, MetadataJournalError> {
-    let root = match unix::open_existing_root(&authorization.root.path) {
-        Ok(root) => root,
-        Err(InstallStateError::Missing(_)) => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let first_identity = authorization.identity.reopen()?;
+    let first_metadata_identity = unix::entry_identity(&first_identity.update, METADATA)?;
+    let metadata = first_metadata_identity
+        .map(|_| unix::open_directory_at(&first_identity.update, METADATA, Some(0o700), true))
+        .transpose()?;
+    let generations = metadata
+        .as_ref()
+        .map(|metadata| unix::open_directory_at(metadata, GENERATIONS, Some(0o700), true))
+        .transpose()?;
+    let stored = match (&metadata, &generations) {
+        (Some(metadata), Some(generations)) => {
+            read_selected_with_mode(metadata, generations, HistoryMode::Authority)?
+        }
+        (None, None) => None,
+        _ => {
+            return Err(MetadataJournalError::Invalid(
+                "metadata journal namespace is incomplete",
+            ))
+        }
     };
-    let update = match unix::entry_identity(&root, "update")? {
-        None => return Ok(None),
-        Some(_) => unix::open_directory_at(&root, "update", Some(0o700), true)?,
-    };
-    let metadata = match unix::entry_identity(&update, METADATA)? {
-        None => return Ok(None),
-        Some(_) => unix::open_directory_at(&update, METADATA, Some(0o700), true)?,
-    };
-    let generations = unix::open_directory_at(&metadata, GENERATIONS, Some(0o700), true)?;
-    let stored = read_selected_with_mode(&metadata, &generations, HistoryMode::Authority)?;
     bind_selection(&stored, authorization)?;
 
-    // Reopen and re-read every named boundary before returning bytes. A
-    // detached descriptor must never silently become selected authority.
-    let fresh_root = unix::open_existing_root(&authorization.root.path)?;
-    require_same_directory(&fresh_root, &root)?;
-    let fresh_update = unix::open_directory_at(&fresh_root, "update", Some(0o700), true)?;
-    require_same_directory(&fresh_update, &update)?;
-    let fresh_metadata = unix::open_directory_at(&fresh_update, METADATA, Some(0o700), true)?;
-    require_same_directory(&fresh_metadata, &metadata)?;
+    // Identity and metadata are one composite double-read snapshot. A
+    // same-byte replacement of either named inode must fail closed.
+    let second_identity = authorization.identity.reopen()?;
+    require_same_directory(&second_identity.root, &first_identity.root)?;
+    require_same_directory(&second_identity.update, &first_identity.update)?;
+    let second_metadata_identity = unix::entry_identity(&second_identity.update, METADATA)?;
+    if first_metadata_identity.is_some() != second_metadata_identity.is_some() {
+        return Err(MetadataJournalError::Invalid(
+            "metadata journal appeared or disappeared while it was being read",
+        ));
+    }
+    if first_metadata_identity.is_none() {
+        return Ok(None);
+    }
+    let fresh_metadata =
+        unix::open_directory_at(&second_identity.update, METADATA, Some(0o700), true)?;
+    let metadata = metadata.as_ref().ok_or(MetadataJournalError::Invalid(
+        "metadata journal namespace is incomplete",
+    ))?;
+    require_same_directory(&fresh_metadata, metadata)?;
+    let prior_generations = generations.as_ref().ok_or(MetadataJournalError::Invalid(
+        "metadata journal namespace is incomplete",
+    ))?;
     let fresh_generations =
         unix::open_directory_at(&fresh_metadata, GENERATIONS, Some(0o700), true)?;
-    require_same_directory(&fresh_generations, &generations)?;
+    require_same_directory(&fresh_generations, prior_generations)?;
     let repeated =
         read_selected_with_mode(&fresh_metadata, &fresh_generations, HistoryMode::Authority)?;
     bind_selection(&repeated, authorization)?;
@@ -390,10 +409,8 @@ fn bind_selection(
     authorization: &MetadataStateAuthorization,
 ) -> Result<(), MetadataJournalError> {
     if let Some(selected) = selected {
-        MetadataGenerationReceiptV2::parse(&selected.generation_receipt)?.validate_state_identity(
-            &authorization.installation_id,
-            authorization.root.canonical.as_str(),
-        )?;
+        MetadataGenerationReceiptV2::parse(&selected.generation_receipt)?
+            .validate_state_identity(authorization.installation_id(), authorization.state_root())?;
     }
     Ok(())
 }

@@ -18,7 +18,11 @@ pub(in crate::distribution) use journal::{commit_candidate_for_test, Barrier, Fa
 #[cfg(test)]
 mod tests;
 
-use super::{ExplicitRootAuthorization, InstallStateError};
+#[cfg(test)]
+use super::{
+    bootstrap_installation_identity_for_test, ExplicitRootAuthorization, IdentityFaultPlan,
+};
+use super::{DurableInstallationIdentity, InstallStateError};
 pub(super) use crate::distribution::update_auth::{ExactMetadataRole, VerifiedMetadataCandidate};
 
 #[derive(Debug, thiserror::Error)]
@@ -46,24 +50,27 @@ impl MetadataJournalError {
     }
 }
 
-/// Explicit association between one state root and one installation identity.
+/// Live association between one state root and its durable identity inode.
 ///
-/// The production constructor will be added only when setup/ownership state
-/// can supply a live validated installation ID. A path alone cannot make a
-/// copied metadata journal authoritative for another installation.
+/// A path or copied UUID cannot construct this capability, and disk bytes do
+/// not self-authorize a copied metadata journal for another installation.
 #[derive(Debug)]
 pub(in crate::distribution) struct MetadataStateAuthorization {
-    pub(super) root: ExplicitRootAuthorization,
-    installation_id: String,
+    pub(super) identity: DurableInstallationIdentity,
 }
 
 #[cfg(test)]
 impl MetadataStateAuthorization {
     pub(crate) fn for_test(root: ExplicitRootAuthorization, installation_id: &str) -> Self {
-        Self {
-            root,
-            installation_id: installation_id.to_owned(),
-        }
+        Self::from_identity(
+            bootstrap_installation_identity_for_test(
+                root,
+                installation_id,
+                IdentityFaultPlan::default(),
+            )
+            .expect("bootstrap test installation identity")
+            .into_identity(),
+        )
     }
 
     pub(crate) fn for_test_path(root: &std::path::Path, installation_id: &str) -> Self {
@@ -75,12 +82,16 @@ impl MetadataStateAuthorization {
 }
 
 impl MetadataStateAuthorization {
+    pub(in crate::distribution) fn from_identity(identity: DurableInstallationIdentity) -> Self {
+        Self { identity }
+    }
+
     pub(in crate::distribution) fn installation_id(&self) -> &str {
-        &self.installation_id
+        self.identity.installation_id().as_str()
     }
 
     pub(in crate::distribution) fn state_root(&self) -> &str {
-        self.root.canonical.as_str()
+        self.identity.state_root().as_str()
     }
 }
 

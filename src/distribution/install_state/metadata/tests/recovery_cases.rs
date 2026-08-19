@@ -160,6 +160,7 @@ fn every_successor_discard_barrier_preserves_the_selected_floor() {
 fn truncated_final_role_write_prefix_is_discarded_without_authentication() {
     let parent = tempfile::tempdir().expect("tempdir");
     let root = test_root(&parent);
+    let state = authorization(&root);
     let pending = root.join("update/metadata/generations/.pending-00000000000000000001");
     let root_chain = pending.join("root-chain");
     std::fs::create_dir_all(&root_chain).expect("pending write prefix");
@@ -188,7 +189,7 @@ fn truncated_final_role_write_prefix_is_discarded_without_authentication() {
     }
 
     assert_eq!(
-        discard_unselected_for_test(authorization(&root), FaultPlan::default())
+        discard_unselected_for_test(state, FaultPlan::default())
             .expect("derived partial write prefix can be discarded"),
         super::super::MetadataRestartCleanup::DiscardedUnselected { sequence: 1 }
     );
@@ -202,6 +203,7 @@ fn truncated_final_role_write_prefix_is_discarded_without_authentication() {
 fn non_prefix_pending_inventory_fails_closed_without_deletion() {
     let parent = tempfile::tempdir().expect("tempdir");
     let root = test_root(&parent);
+    let state = authorization(&root);
     let pending = root.join("update/metadata/generations/.pending-00000000000000000001");
     std::fs::create_dir_all(&pending).expect("hostile pending directory");
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("root mode");
@@ -221,7 +223,7 @@ fn non_prefix_pending_inventory_fails_closed_without_deletion() {
     )
     .expect("private file mode");
 
-    assert!(discard_unselected_for_test(authorization(&root), FaultPlan::default()).is_err());
+    assert!(discard_unselected_for_test(state, FaultPlan::default()).is_err());
     assert_eq!(
         std::fs::read(pending.join("targets.json")).expect("evidence remains"),
         b"hostile suffix"

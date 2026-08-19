@@ -3,7 +3,7 @@ use std::io::Read;
 
 use sha2::{Digest, Sha256};
 
-use super::locked::LockedInstallation;
+use super::identity::LockedInstallationIdentity;
 use super::unix::{self, Directory, EntryIdentity};
 use super::InstallStateError;
 use crate::distribution::schema::{
@@ -86,7 +86,7 @@ enum FileState {
 
 /// Lock-borrowing, exact-replay release extraction transaction.
 pub(in crate::distribution) struct ReleaseExtractionStage<'lock> {
-    locked: &'lock LockedInstallation,
+    locked: &'lock LockedInstallationIdentity,
     extractions: Directory,
     stage: Directory,
     stage_name: String,
@@ -121,7 +121,7 @@ impl std::fmt::Debug for ExtractedReleaseTree {
 }
 
 pub(super) fn open_release_extraction<'lock>(
-    locked: &'lock LockedInstallation,
+    locked: &'lock LockedInstallationIdentity,
     authorization: ExtractionStageAuthorization,
     exact_manifest: &[u8],
     manifest: &ReleaseManifestV1,

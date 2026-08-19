@@ -22,7 +22,10 @@ impl LockedMetadataJournal {
         )?;
         if let Some(selector) = &selected {
             let receipt = read_receipt(&live.generations, selector)?;
-            receipt.validate_state_identity(&self.installation_id, &self.state_root)?;
+            receipt.validate_state_identity(
+                self.locked.installation_id().as_str(),
+                self.locked.state_root().as_str(),
+            )?;
             self.repeat_postcommit_barriers(selector, FaultPlan::default())?;
             self.finish_predecessor_cleanup(selector, FaultPlan::default())
                 .map_err(|error| error.after_commit(selector.sequence()))?;

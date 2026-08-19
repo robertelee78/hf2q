@@ -79,6 +79,15 @@ pub(super) fn write_or_resume_private_file(
     name: &str,
     expected: &[u8],
 ) -> Result<File, InstallStateError> {
+    write_or_resume_private_file_with_create_hook(parent, name, expected, || Ok(()))
+}
+
+pub(super) fn write_or_resume_private_file_with_create_hook(
+    parent: &Directory,
+    name: &str,
+    expected: &[u8],
+    after_create: impl FnOnce() -> Result<(), InstallStateError>,
+) -> Result<File, InstallStateError> {
     validate_component(name)?;
     let create_flags = OFlags::RDWR
         | OFlags::CREATE
@@ -103,6 +112,7 @@ pub(super) fn write_or_resume_private_file(
         };
     if newly_created {
         unix::sync_directory(parent)?;
+        after_create()?;
     }
 
     let opened = fs::fstat(&file)

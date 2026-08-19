@@ -6,6 +6,7 @@ mod common;
 #[allow(dead_code)]
 mod first_standalone_record;
 mod install_receipt;
+mod installation_identity;
 mod installed_version_marker;
 mod release_manifest;
 mod target_name;
@@ -27,6 +28,9 @@ pub use install_receipt::{
     TransitionEndpointV1, TransitionKind, UpdateRoute, INSTALLATION_LAYOUT_SCHEMA_V1,
     INSTALL_RECEIPT_KIND, INSTALL_RECEIPT_SCHEMA_VERSION, MAX_INSTALL_RECEIPT_BYTES,
     STATE_LAYOUT_SCHEMA_V1,
+};
+pub(in crate::distribution) use installation_identity::{
+    InstallationIdentityError, InstallationIdentityV1, MAX_INSTALLATION_IDENTITY_BYTES,
 };
 pub use installed_version_marker::{
     InstalledVersionMarkerV2, MarkerReleaseV1, RecordedPreparationEvidenceV2,

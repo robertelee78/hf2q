@@ -105,7 +105,10 @@ impl LockedMetadataJournal {
                 true,
             )?;
             let receipt = read_receipt(&live.generations, expected)?;
-            receipt.validate_state_identity(&self.installation_id, &self.state_root)?;
+            receipt.validate_state_identity(
+                self.locked.installation_id().as_str(),
+                self.locked.state_root().as_str(),
+            )?;
             verify_generation(&generation, &receipt, None)?;
             unix::sync_directory(&generation)?;
             trip(faults, TestBarrier::GenerationPostcommitSync)?;
