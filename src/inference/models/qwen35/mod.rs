@@ -43,6 +43,7 @@ pub mod full_attn;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
+pub(super) mod gqa_q2_policy;
 pub mod in_memory_loader;
 pub use chunk_allocs_arena::ChunkAllocsArena;
 pub use dense_ffn_arena::{

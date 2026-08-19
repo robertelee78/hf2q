@@ -5,8 +5,9 @@
 //!
 //! Token resolution order (Story 3.2):
 //! 1. HF_TOKEN environment variable
-//! 2. ~/.cache/huggingface/token file (hf-hub default)
-//! 3. ~/.huggingface/token file (legacy path)
+//! 2. HUGGING_FACE_HUB_TOKEN environment variable (legacy)
+//! 3. ~/.cache/huggingface/token file (hf-hub default)
+//! 4. ~/.huggingface/token file (legacy path)
 //!
 //! Cache: Uses standard hf-hub cache directory. Subsequent runs with
 //! the same repo skip re-download (hf-hub's built-in LFS resumption).
@@ -603,41 +604,83 @@ fn download_with_cli_command(cmd: &str, repo_id: &str) -> Result<PathBuf, Downlo
 /// 2. HUGGING_FACE_HUB_TOKEN environment variable (legacy)
 /// 3. Standard hf-hub token path (~/.cache/huggingface/token)
 /// 4. Legacy token path (~/.huggingface/token)
-fn resolve_auth_token() -> Option<String> {
-    // 1. Environment variable
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        if !token.is_empty() {
+pub(crate) fn resolve_auth_token() -> Option<String> {
+    let hf_token = std::env::var("HF_TOKEN").ok();
+    let legacy_env_token = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
+    let home = home_dir();
+    let cache_token = home
+        .as_ref()
+        .map(|home| home.join(".cache").join("huggingface").join("token"));
+    let legacy_token = home
+        .as_ref()
+        .map(|home| home.join(".huggingface").join("token"));
+
+    let resolved = resolve_auth_token_from_inputs(
+        hf_token.as_deref(),
+        legacy_env_token.as_deref(),
+        cache_token.as_deref(),
+        legacy_token.as_deref(),
+    );
+    match resolved {
+        Some((token, AuthTokenSource::HfTokenEnv)) => {
             debug!("Using HF_TOKEN from environment");
-            return Some(token);
+            Some(token)
         }
-    }
-
-    // 2. Legacy env var
-    if let Ok(token) = std::env::var("HUGGING_FACE_HUB_TOKEN") {
-        if !token.is_empty() {
+        Some((token, AuthTokenSource::LegacyEnv)) => {
             debug!("Using HUGGING_FACE_HUB_TOKEN from environment");
-            return Some(token);
+            Some(token)
+        }
+        Some((token, AuthTokenSource::CacheFile)) => {
+            if let Some(path) = cache_token.as_ref() {
+                debug!(path = %path.display(), "Using token from cache directory");
+            }
+            Some(token)
+        }
+        Some((token, AuthTokenSource::LegacyFile)) => {
+            if let Some(path) = legacy_token.as_ref() {
+                debug!(path = %path.display(), "Using token from legacy path");
+            }
+            Some(token)
+        }
+        None => {
+            debug!("No HuggingFace auth token found");
+            None
         }
     }
+}
 
-    // 3. Standard hf-hub cache token path
-    if let Some(home) = home_dir() {
-        let cache_token = home.join(".cache").join("huggingface").join("token");
-        if let Some(token) = read_token_file(&cache_token) {
-            debug!(path = %cache_token.display(), "Using token from cache directory");
-            return Some(token);
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthTokenSource {
+    HfTokenEnv,
+    LegacyEnv,
+    CacheFile,
+    LegacyFile,
+}
 
-        // 4. Legacy token path
-        let legacy_token = home.join(".huggingface").join("token");
-        if let Some(token) = read_token_file(&legacy_token) {
-            debug!(path = %legacy_token.display(), "Using token from legacy path");
-            return Some(token);
-        }
+/// Pure auth resolver used by the production environment wrapper and tests.
+///
+/// Process environment variables are global mutable state. Passing their
+/// captured values and the candidate token paths into this helper keeps the
+/// precedence contract deterministic without making parallel tests mutate
+/// `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`.
+fn resolve_auth_token_from_inputs(
+    hf_token: Option<&str>,
+    legacy_env_token: Option<&str>,
+    cache_token_path: Option<&std::path::Path>,
+    legacy_token_path: Option<&std::path::Path>,
+) -> Option<(String, AuthTokenSource)> {
+    if let Some(token) = hf_token.filter(|token| !token.is_empty()) {
+        return Some((token.to_owned(), AuthTokenSource::HfTokenEnv));
     }
-
-    debug!("No HuggingFace auth token found");
-    None
+    if let Some(token) = legacy_env_token.filter(|token| !token.is_empty()) {
+        return Some((token.to_owned(), AuthTokenSource::LegacyEnv));
+    }
+    if let Some(token) = cache_token_path.and_then(read_token_file) {
+        return Some((token, AuthTokenSource::CacheFile));
+    }
+    legacy_token_path
+        .and_then(read_token_file)
+        .map(|token| (token, AuthTokenSource::LegacyFile))
 }
 
 /// Read a token from a file, returning None if the file doesn't exist or is empty.
@@ -708,41 +751,53 @@ mod tests {
 
     #[test]
     fn test_resolve_auth_token_from_env() {
-        // Save and restore original env
-        let original = std::env::var("HF_TOKEN").ok();
-        std::env::set_var("HF_TOKEN", "test_token_12345");
+        let token = resolve_auth_token_from_inputs(
+            Some("test_token_12345"),
+            Some("legacy_token"),
+            None,
+            None,
+        );
+        assert_eq!(
+            token,
+            Some(("test_token_12345".to_string(), AuthTokenSource::HfTokenEnv,))
+        );
 
-        let token = resolve_auth_token();
-        assert_eq!(token, Some("test_token_12345".to_string()));
-
-        // Restore
-        match original {
-            Some(val) => std::env::set_var("HF_TOKEN", val),
-            None => std::env::remove_var("HF_TOKEN"),
-        }
+        assert_eq!(
+            resolve_auth_token_from_inputs(Some(""), Some("legacy_token"), None, None),
+            Some(("legacy_token".to_owned(), AuthTokenSource::LegacyEnv))
+        );
     }
 
     #[test]
     fn test_resolve_auth_token_empty_env() {
-        let original = std::env::var("HF_TOKEN").ok();
-        let original2 = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
-        std::env::set_var("HF_TOKEN", "");
-        std::env::set_var("HUGGING_FACE_HUB_TOKEN", "");
+        assert_eq!(
+            resolve_auth_token_from_inputs(Some(""), Some(""), None, None),
+            None
+        );
+    }
 
-        // Should not return empty string
-        let token = resolve_auth_token();
-        if let Some(ref t) = token {
-            assert!(!t.is_empty());
-        }
+    #[test]
+    fn test_resolve_auth_token_file_fallback_precedence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache_token = tmp.path().join("cache-token");
+        let legacy_token = tmp.path().join("legacy-token");
+        std::fs::write(&cache_token, "hf_cache\n").expect("cache token");
+        std::fs::write(&legacy_token, "hf_legacy\n").expect("legacy token");
 
-        match original {
-            Some(val) => std::env::set_var("HF_TOKEN", val),
-            None => std::env::remove_var("HF_TOKEN"),
-        }
-        match original2 {
-            Some(val) => std::env::set_var("HUGGING_FACE_HUB_TOKEN", val),
-            None => std::env::remove_var("HUGGING_FACE_HUB_TOKEN"),
-        }
+        assert_eq!(
+            resolve_auth_token_from_inputs(
+                Some(""),
+                Some(""),
+                Some(&cache_token),
+                Some(&legacy_token),
+            ),
+            Some(("hf_cache".to_owned(), AuthTokenSource::CacheFile))
+        );
+        std::fs::write(&cache_token, "  \n").expect("empty cache token");
+        assert_eq!(
+            resolve_auth_token_from_inputs(None, None, Some(&cache_token), Some(&legacy_token)),
+            Some(("hf_legacy".to_owned(), AuthTokenSource::LegacyFile))
+        );
     }
 
     #[test]

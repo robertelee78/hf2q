@@ -1,7 +1,10 @@
-//! Auto-quant algorithm for `--quant auto` mode.
+//! Legacy capacity estimator for auto-quant planning.
 //!
-//! Selects the best quantization configuration based on model architecture,
-//! hardware capabilities, and user-specified performance constraints.
+//! This module predicts a configuration from architecture, nominal hardware
+//! bandwidth, and user constraints. It must not be treated as evidence that a
+//! candidate is fastest or behavior-preserving. ADR-046 production selection
+//! lives in `measured_auto_quant` and requires exact quality and benchmark
+//! receipts.
 //!
 //! # Algorithm Overview
 //!

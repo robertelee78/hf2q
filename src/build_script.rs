@@ -7,7 +7,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn exact_git_sha(value: &str) -> Option<String> {
     let value = value.trim();
@@ -15,8 +15,13 @@ fn exact_git_sha(value: &str) -> Option<String> {
         .then(|| value.to_ascii_lowercase())
 }
 
-fn packaged_vcs_sha(manifest_dir: &Path) -> Option<String> {
-    let contents = fs::read_to_string(manifest_dir.join(".cargo_vcs_info.json")).ok()?;
+fn packaged_vcs_info_path(manifest_dir: &Path) -> Option<PathBuf> {
+    let path = manifest_dir.join(".cargo_vcs_info.json");
+    path.is_file().then_some(path)
+}
+
+fn packaged_vcs_sha(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
     let after_key = contents.split_once("\"sha1\"")?.1;
     let after_colon = after_key.split_once(':')?.1;
     let quoted = after_colon.split_once('"')?.1;
@@ -28,14 +33,22 @@ fn main() {
     for name in ["GIT_COMMIT_SHA", "VERGEN_GIT_SHA", "GITHUB_SHA"] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
 
     let explicit = ["GIT_COMMIT_SHA", "VERGEN_GIT_SHA", "GITHUB_SHA"]
         .into_iter()
         .filter_map(|name| env::var(name).ok())
         .find_map(|value| exact_git_sha(&value));
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from);
-    let commit = explicit.or_else(|| manifest_dir.as_deref().and_then(packaged_vcs_sha));
+    let packaged_vcs_info = manifest_dir.as_deref().and_then(packaged_vcs_info_path);
+
+    // Cargo treats a missing `rerun-if-changed` input as perpetually stale.
+    // `.cargo_vcs_info.json` exists in a packaged crate but not in a normal Git
+    // checkout, so only register the file dependency when Cargo supplied it.
+    if let Some(path) = packaged_vcs_info.as_deref() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let commit = explicit.or_else(|| packaged_vcs_info.as_deref().and_then(packaged_vcs_sha));
 
     if let Some(commit) = commit {
         println!("cargo:rustc-env=HF2Q_BUILD_GIT_SHA={commit}");
@@ -56,11 +69,19 @@ mod tests {
     #[test]
     fn packaged_vcs_info_supplies_registry_commit() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cargo_vcs_info.json");
         fs::write(
-            dir.path().join(".cargo_vcs_info.json"),
+            &path,
             format!("{{\"git\":{{\"sha1\":\"{}\"}}}}", "D".repeat(40)),
         )
         .unwrap();
-        assert_eq!(packaged_vcs_sha(dir.path()), Some("d".repeat(40)));
+        assert_eq!(packaged_vcs_info_path(dir.path()), Some(path.clone()));
+        assert_eq!(packaged_vcs_sha(&path), Some("d".repeat(40)));
+    }
+
+    #[test]
+    fn missing_packaged_vcs_info_is_not_a_cargo_file_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(packaged_vcs_info_path(dir.path()), None);
     }
 }

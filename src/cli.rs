@@ -227,8 +227,8 @@ pub struct ConvertCliArgs {
     /// Reserved / out-of-scope names (per ADR §P7 AC#1 + Decision §6).
     /// Each surfaces a typed `QuantSelectorError` variant with an
     /// operator-actionable hint pointing at the supported alternative:
-    ///   - `dwq` → `DwqReserved` (reserved for the future Apple MLX
-    ///     `dwq.py` port — separate ADR).
+    ///   - `dwq` → `DwqReserved` (reserved until ADR-046's native
+    ///     affine artifact, trainer, quality, and runtime gates land).
     ///   - `tq1_0`, `tq2_0` → `TqOutOfV1Scope` (recognized ftypes
     ///     without a Quantizer impl in v1).
     ///   - bare `apex` → `ApexUnqualified` (must pick an explicit
@@ -790,15 +790,17 @@ pub struct ServeArgs {
     #[arg(long)]
     pub mmproj: Option<PathBuf>,
 
-    /// ADR-020 AC#5 Iter D — overlay a DWQ-trained mlx-affine
-    /// safetensors file on top of the GGUF-loaded weights.  For each
+    /// Legacy ADR-020 experimental overlay for a compatible mlx-affine
+    /// safetensors file on top of the GGUF-loaded weights. For each
     /// trained Linear stem (`blk.{i}.attn_q`, `attn_k`, `attn_v`,
     /// `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down`), the matching
     /// slot is replaced with an affine-mode `MlxQWeight` that
     /// dispatches through `qmm_affine_t_packed_simd4_b4` (mlx-native
     /// d0de92a).  Currently only dense families (Gemma 4) honor the
     /// overlay; qwen35moe MoE-expert tensors are skipped with a warning
-    /// pending Iter C2.  Source: `hf2q dwq-train --output ...`.
+    /// pending a production full-model affine path. hf2q currently has no
+    /// DWQ producer; this narrow consumer is not `--quant dwq` support.
+    /// See ADR-046.
     #[arg(long)]
     pub dwq_overlay: Option<PathBuf>,
 

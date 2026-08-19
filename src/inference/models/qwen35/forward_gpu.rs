@@ -2504,8 +2504,8 @@ impl Qwen35Model {
                     );
 
                     let gqa_q2_warmed = if !crate::debug::INVESTIGATION_ENV.use_dense
-                        && super::kv_cache::gqa_q2_mode()
-                            != super::kv_cache::GqaQ2Mode::Off
+                        && super::gqa_q2_policy::gqa_q2_mode()
+                            != super::gqa_q2_policy::GqaQ2Mode::Off
                         && self.cfg.head_dim == 256
                         && self.cfg.num_key_value_heads > 0
                         && self.cfg.num_attention_heads % self.cfg.num_key_value_heads == 0
