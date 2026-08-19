@@ -2,8 +2,11 @@ use reqwest::Url;
 
 use super::UpdateTransportError;
 use crate::distribution::schema::{LogicalTargetKind, LogicalTargetName, ReleaseVersion};
-use crate::distribution::update_auth::AuthenticatedTargetDescriptor;
+use crate::distribution::update_auth::{
+    AuthenticatedTargetDescriptor, MetadataRequestKind, MetadataRequestView,
+};
 
+const PAGES_METADATA_BASE: &str = "https://robertelee78.github.io/hf2q/updates/stable/metadata/";
 const PAGES_TARGETS_BASE: &str = "https://robertelee78.github.io/hf2q/updates/stable/targets/";
 const RELEASES_BASE: &str = "https://github.com/robertelee78/hf2q/releases/download/";
 const RELEASE_CDN_HOST: &str = "release-assets.githubusercontent.com";
@@ -14,6 +17,20 @@ pub(super) enum RequestClass {
     Pages,
     Release,
     ReleaseCdn,
+}
+
+pub(super) fn pages_metadata_url(
+    spec: MetadataRequestView<'_>,
+) -> Result<OriginLockedUrl, UpdateTransportError> {
+    require_metadata_name(spec.kind(), spec.relative_name())?;
+    let mut url =
+        Url::parse(PAGES_METADATA_BASE).map_err(|_| UpdateTransportError::OriginPolicy)?;
+    append_canonical_path(&mut url, spec.relative_name())?;
+    require_initial_url(&url, "robertelee78.github.io")?;
+    Ok(OriginLockedUrl {
+        url,
+        class: RequestClass::Pages,
+    })
 }
 
 pub(super) struct OriginLockedUrl {
@@ -180,4 +197,41 @@ fn require_initial_url(url: &Url, host: &str) -> Result<(), UpdateTransportError
         return Err(UpdateTransportError::OriginPolicy);
     }
     Ok(())
+}
+
+fn require_metadata_name(
+    kind: MetadataRequestKind,
+    name: &str,
+) -> Result<(), UpdateTransportError> {
+    let valid = match kind {
+        MetadataRequestKind::Root => versioned_metadata_name(name, "root"),
+        MetadataRequestKind::Timestamp => name == "timestamp.json",
+        MetadataRequestKind::Snapshot => {
+            name == "snapshot.json" || versioned_metadata_name(name, "snapshot")
+        }
+        MetadataRequestKind::Targets => {
+            name == "targets.json" || versioned_metadata_name(name, "targets")
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(UpdateTransportError::OriginPolicy)
+    }
+}
+
+fn versioned_metadata_name(name: &str, role: &str) -> bool {
+    let suffix = format!(".{role}.json");
+    let Some(version) = name.strip_suffix(&suffix) else {
+        return false;
+    };
+    version
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|parsed| parsed > 0 && parsed.to_string() == version)
+}
+
+#[cfg(test)]
+pub(super) fn metadata_name_allowed_for_test(kind: MetadataRequestKind, name: &str) -> bool {
+    require_metadata_name(kind, name).is_ok()
 }

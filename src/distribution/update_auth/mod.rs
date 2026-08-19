@@ -11,6 +11,7 @@ mod commit;
 mod model;
 mod profile;
 mod replay;
+mod session;
 mod strict_json;
 mod target_set;
 mod verifier;
@@ -28,7 +29,13 @@ pub(in crate::distribution) use artifact_authorization::{
     PreparedVersionAuthorization, PreparedVersionCommitError, PreparedVersionCommitGuard,
 };
 pub(in crate::distribution) use commit::AdvancingCommitGuard;
-pub(in crate::distribution) use model::{ExactMetadataRole, VerifiedMetadataCandidate};
+pub(in crate::distribution) use model::{
+    EmbeddedTrustRoot, ExactMetadataRole, VerifiedMetadataCandidate,
+};
+pub(in crate::distribution) use session::{
+    begin_metadata_update, MetadataFetchResponse, MetadataRequestKind, MetadataRequestView,
+    MetadataSessionProgress, MetadataUpdateSession,
+};
 pub(in crate::distribution) use target_set::AuthenticatedTargetDescriptor;
 
 #[derive(Debug, thiserror::Error)]

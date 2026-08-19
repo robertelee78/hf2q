@@ -679,6 +679,20 @@ jobs:
                 | grep -v '^src/distribution/update_auth/' || true
             )"
             test -z "$unexpected_imports"
+            unexpected_transport_authority="$(
+              grep -RInE --include='*.rs' \
+                '^[[:space:]]*use[[:space:]]+(reqwest|hyper|std::net|tokio::net|url::)|std::process::Command|clap::' \
+                src/distribution/update_auth || true
+            )"
+            test -z "$unexpected_transport_authority"
+            unexpected_metadata_session_callers="$(
+              grep -RIlE --include='*.rs' \
+                'begin_metadata_update|MetadataFetchResponse|MetadataSessionProgress|MetadataUpdateSession' \
+                src/distribution \
+                | grep -v '^src/distribution/update_auth/' \
+                | grep -v '^src/distribution/update_transport/' || true
+            )"
+            test -z "$unexpected_metadata_session_callers"
             unexpected_preparation_authority="$(
               grep -RInE --include='*.rs' --exclude='tests.rs' \
                 'rustix::fs|std::fs|File::(create|open|options)|OpenOptions::|std::net|std::process|reqwest|hyper|tokio::net|(^|[^:[:alnum:]_])url::|clap::|ZipWriter|\.extract(_unwrapped_root_dir)?\(' \
@@ -766,6 +780,7 @@ jobs:
               src/distribution/update_auth/artifact_authorization/extraction.rs \
               src/distribution/update_auth/commit.rs \
               src/distribution/update_auth/profile.rs \
+              src/distribution/update_auth/session.rs \
               src/distribution/update_auth/target_set_tests.rs \
               src/distribution/update_auth/target_set_tests/extraction_cases.rs \
               src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases.rs \
@@ -778,8 +793,10 @@ jobs:
               src/distribution/update_transport/mod.rs \
               src/distribution/update_transport/fetch.rs \
               src/distribution/update_transport/http.rs \
+              src/distribution/update_transport/metadata.rs \
               src/distribution/update_transport/origin.rs \
               src/distribution/update_transport/tests.rs \
+              src/distribution/update_transport/tests/metadata.rs \
               src/distribution/update_auth/testdata/python-tuf-v1/1.root.json \
               src/distribution/update_auth/testdata/python-tuf-v1/2.root.json \
               src/distribution/update_auth/testdata/python-tuf-v1/timestamp.json \

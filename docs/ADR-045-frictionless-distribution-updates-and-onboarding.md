@@ -13,11 +13,12 @@
   ID requirement/signing-information verification, descriptor-bound native
   verification, crash-resumable signed-mode normalization, and dormant
   crash-durable prepared-version publication, plus the dormant live-installed-
-  release semantic floor and explicit already-current planning outcome are
-  reconciled;
+  release semantic floor and explicit already-current planning outcome, and
+  the closed verifier-request metadata route plus fresh-session
+  durable commit coordinator are reconciled;
   the real
-  release trust root, verifier-request metadata transport, real compiled Team
-  ID plus protected positive fixture, public update/install/onboarding
+  release trust root, real compiled Team ID plus protected positive fixture,
+  public update/install/onboarding
   implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
 - Updated: 2026-08-19
@@ -1121,10 +1122,20 @@ target descriptors map to exactly these HTTPS locations:
   is the authenticated release version and `B` is the route-validated,
   digest-prefixed physical basename.
 
-The dormant artifact transport implements the pointer and release-asset
-routes. The verifier-issued metadata route is frozen here but remains pending
-alongside the compiled production root and live metadata-session coordinator;
-no current code claims to fetch or commit network metadata.
+The dormant transport implements all three routes. For metadata, a fresh
+session first lock-authenticates the durable selected floor and crash-durably
+discards only an exact never-selected write prefix. It then consumes the
+transport-free verifier's outstanding request token exactly once. The route
+accepts a direct 200 with a nonempty body no larger than the role cap; a
+present `Content-Length` must be nonzero, within the cap, and equal the bytes
+read. Every body is independently read through cap plus one. Only the exact
+next-root request may map a direct 404 to `ConfirmedNotFound`; timestamp,
+snapshot, and targets 404s fail, as do redirects, transformed content, all
+other statuses, malformed headers, and read failures. A completed transcript
+still becomes durable only through the existing lock-held current-time
+reauthentication, selector-boundary freshness check, commit, reopen, and exact
+ordinary-reader replay. The returned commit outcome exposes no target lookup
+or artifact authority. No production root factory or public caller exists yet.
 
 Pages requests never redirect. A release-asset request accepts either an
 immediate 200 response or exactly one 302 from the exact `github.com` route to
@@ -1183,8 +1194,8 @@ stable pointer to an older hf2q SemVer. `ReleaseVersion` therefore uses numeric
 SemVer ordering (`0.10.0 > 0.9.0`) and the dormant binding compares only with
 the fully verified live floor described above, never a parsed or caller-
 supplied receipt. Public update mutation remains blocked on the production
-root, Team-ID policy, protected positive fixture, metadata transport/session,
-and public coordinator. Any user-requested pinned downgrade or rollback still
+root, Team-ID policy, protected positive fixture, and public coordinator. Any
+user-requested pinned downgrade or rollback still
 requires a separate one-use intent capability.
 
 Large archives are streamed and checked against the sealed descriptor by hf2q
@@ -1854,6 +1865,9 @@ before public self-update ships.
    descriptor-verified active-release reader, numeric rollback/equivocation
    policy, no-download already-current outcome, and repeated floor checks at
    pointer, archive, post-I/O, and preparation boundaries have also landed.
+   The verifier-issued Pages metadata route and fresh-session durable commit
+   coordinator have landed with root-only 404 termination, role caps, selected-
+   floor replay, exact restart discard, and no target or artifact authority.
    Next,
    embed the real stable root, compile the real public Team ID, pass the
    protected positive signing fixture, and implement canonical Hugging
