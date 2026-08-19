@@ -347,6 +347,7 @@ impl DurableInstallationIdentity {
                 "named update directory changed after installation identity authorization",
             ));
         }
+        require_final_update_inventory(&root, &update)?;
         unix::verify_named_identity(&update, LOCK_FILE, self.lock_identity)?;
         if unix::regular_file_identity(&self.lock_file, update.device())? != self.lock_identity {
             return Err(InstallStateError::InvalidLayout(
@@ -384,6 +385,7 @@ impl DurableInstallationIdentity {
                 "installation namespace changed before lock acquisition",
             ));
         }
+        require_final_update_inventory(&live.root, &live.update)?;
         if locked.lock_identity() != self.lock_identity
             || unix::regular_file_identity(&self.lock_file, live.update.device())?
                 != self.lock_identity
@@ -414,6 +416,7 @@ impl DurableInstallationIdentity {
         unix::sync_directory(&live.root)?;
         locked.full_sync_endpoint()?;
         let live = locked.reopen()?;
+        require_final_update_inventory(&live.root, &live.update)?;
         let (file, bytes, file_identity) = file::read_regular_file(
             &live.update,
             IDENTITY_FILE,
@@ -455,6 +458,7 @@ impl LockedInstallationIdentity {
 
     pub(super) fn reopen(&self) -> Result<LiveLockedInstallationIdentity, InstallStateError> {
         let live = self.locked.reopen()?;
+        require_final_update_inventory(&live.root, &live.update)?;
         let (identity_file, bytes, file_identity) = file::read_regular_file(
             &live.update,
             IDENTITY_FILE,
@@ -487,6 +491,19 @@ impl LockedInstallationIdentity {
     }
 }
 
+fn require_final_update_inventory(
+    root: &Directory,
+    update: &Directory,
+) -> Result<(), InstallStateError> {
+    let inventory = classify_identity_inventory(root, update)?;
+    if !inventory.final_present || inventory.intent_id.is_some() {
+        return Err(InstallStateError::InvalidLayout(
+            "durable installation identity inventory is not exact",
+        ));
+    }
+    Ok(())
+}
+
 fn open_bound_under_lock(
     locked: &LockedInstallation,
     authorization: ExplicitRootAuthorization,
@@ -502,12 +519,7 @@ fn open_bound(
     update: Directory,
     expected_id: Option<&InstallationId>,
 ) -> Result<DurableInstallationIdentity, InstallStateError> {
-    let inventory = classify_identity_inventory(&root, &update)?;
-    if !inventory.final_present || inventory.intent_id.is_some() {
-        return Err(InstallStateError::InvalidLayout(
-            "durable installation identity inventory is not exact",
-        ));
-    }
+    require_final_update_inventory(&root, &update)?;
     let (file, bytes, file_identity) = file::read_regular_file(
         &update,
         IDENTITY_FILE,

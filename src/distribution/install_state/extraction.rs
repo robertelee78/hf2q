@@ -13,6 +13,14 @@ use crate::distribution::update_auth::ExtractionStageAuthorization;
 
 mod io;
 mod modes;
+mod prepared;
+
+pub(in crate::distribution::install_state) use prepared::require_metadata_advancement_safe;
+#[cfg(test)]
+pub(in crate::distribution) use prepared::{
+    abort_after_prepared_barrier, fail_after_prepared_barrier, observed_prepared_barriers,
+    reset_observed_prepared_barriers, set_prepared_precommit_hook,
+};
 
 #[cfg(test)]
 use io::abort_after_next_extraction_write;
@@ -192,6 +200,17 @@ pub(super) use modes::verify_normalized_release_tree;
 #[cfg(target_os = "macos")]
 pub(super) use modes::{
     normalize_developer_id_verified_release, with_extracted_executable, with_normalized_executable,
+};
+#[cfg(target_os = "macos")]
+pub(in crate::distribution::install_state) use prepared::{
+    authenticate_published_version, finish_published_version, has_recoverable_version,
+    publish_pending_version, recover_prepared_version, stage_normalized_version,
+    verify_prepared_version_tree, with_prepared_executable,
+};
+#[cfg(target_os = "macos")]
+pub(in crate::distribution) use prepared::{
+    PreparedVersionError, PreparedVersionState, PublishedPreparedVersion,
+    VerifiedPublishedPreparedVersion,
 };
 
 pub(super) fn open_release_extraction<'lock>(

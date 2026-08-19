@@ -179,6 +179,157 @@ impl LockedMetadataState {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn has_recoverable_prepared_version(
+        &self,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+    ) -> Result<bool, super::super::PreparedVersionError> {
+        super::super::extraction::has_recoverable_version(&self.journal.locked, authorization)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn stage_normalized_prepared_version(
+        &self,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+        developer_id: crate::distribution::prepared_release::DeveloperIdVerification,
+        tree: super::super::NormalizedExtractedReleaseTree,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        installed_at: u64,
+    ) -> Result<super::super::PreparedVersionState, super::super::PreparedVersionError> {
+        Ok(super::super::PreparedVersionState::Pending(
+            super::super::extraction::stage_normalized_version(
+                &self.journal.locked,
+                authorization,
+                developer_id,
+                tree,
+                exact_manifest,
+                manifest,
+                installed_at,
+            )?,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn recover_prepared_version(
+        &self,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        recovery_reference: u64,
+    ) -> Result<Option<super::super::PreparedVersionState>, super::super::PreparedVersionError>
+    {
+        super::super::extraction::recover_prepared_version(
+            &self.journal.locked,
+            authorization,
+            exact_manifest,
+            manifest,
+            recovery_reference,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn with_prepared_executable<R, E>(
+        &self,
+        state: &super::super::PreparedVersionState,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        operation: impl FnOnce(
+            &std::path::Path,
+            &std::fs::File,
+            super::super::ExecutableReleaseBinding,
+        ) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<super::super::PreparedVersionError>,
+    {
+        super::super::extraction::with_prepared_executable(
+            &self.journal.locked,
+            state,
+            exact_manifest,
+            manifest,
+            operation,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn verify_prepared_version_tree(
+        &self,
+        state: &super::super::PreparedVersionState,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+    ) -> Result<(), super::super::PreparedVersionError> {
+        super::super::extraction::verify_prepared_version_tree(
+            &self.journal.locked,
+            state,
+            authorization,
+            exact_manifest,
+            manifest,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn publish_pending_prepared_version(
+        &self,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+        pending: super::super::PreparedVersionState,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        developer_id: crate::distribution::prepared_release::DeveloperIdVerification,
+        guard: &mut crate::distribution::update_auth::PreparedVersionCommitGuard<'_, '_>,
+    ) -> Result<super::super::PublishedPreparedVersion, super::super::PreparedVersionError> {
+        let super::super::PreparedVersionState::Pending(pending) = pending else {
+            return Err(super::super::PreparedVersionError::Integrity);
+        };
+        super::super::extraction::publish_pending_version(
+            &self.journal.locked,
+            authorization,
+            pending,
+            exact_manifest,
+            manifest,
+            developer_id,
+            || guard.check_at_commit_boundary(authorization),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn finish_published_prepared_version(
+        &self,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+        published: &super::super::PublishedPreparedVersion,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+    ) -> Result<(), super::super::PreparedVersionError> {
+        super::super::extraction::finish_published_version(
+            &self.journal.locked,
+            authorization,
+            published,
+            exact_manifest,
+            manifest,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::distribution) fn authenticate_published_prepared_version(
+        &self,
+        authorization: &crate::distribution::update_auth::PreparedVersionAuthorization,
+        state: super::super::PreparedVersionState,
+        exact_manifest: &[u8],
+        manifest: &crate::distribution::schema::ReleaseManifestV1,
+        developer_id: crate::distribution::prepared_release::DeveloperIdVerification,
+    ) -> Result<super::super::VerifiedPublishedPreparedVersion, super::super::PreparedVersionError>
+    {
+        super::super::extraction::authenticate_published_version(
+            &self.journal.locked,
+            authorization,
+            state,
+            exact_manifest,
+            manifest,
+            developer_id,
+        )
+    }
+
     /// Read structurally complete selected bytes while allowing only the
     /// bounded transaction residue that this held lock is authorized to
     /// recover. The signed-update verifier must authenticate the result.
@@ -215,11 +366,15 @@ impl LockedMetadataState {
                 "candidate identity differs from the locked metadata state",
             ));
         }
+        super::super::extraction::require_metadata_advancement_safe(&self.journal.locked)?;
         self.journal.commit_with_precommit_hooks(
             candidate,
             FaultPlan::default(),
             || Ok(()),
-            || guard.check_at_selector_boundary(),
+            || {
+                super::super::extraction::require_metadata_advancement_safe(&self.journal.locked)?;
+                guard.check_at_selector_boundary()
+            },
         )
     }
 

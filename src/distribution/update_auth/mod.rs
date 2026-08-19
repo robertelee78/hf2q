@@ -23,7 +23,9 @@ mod tests;
 pub(in crate::distribution) use artifact_authorization::{
     ArchiveStageAuthorization, ArtifactFetchAuthorization, ArtifactFetchAuthorizationError,
     BoundArtifactFetchAuthorization, ExtractionStageAuthorization, FinalArtifactAuthorization,
-    PostLocalIoReleaseAuthorization,
+    LockedReleasePreparation, PostLocalIoReleaseAuthorization, PreparedActivationAuthorization,
+    PreparedPublicationAuthorization, PreparedVersionAuthorization, PreparedVersionCommitError,
+    PreparedVersionCommitGuard,
 };
 pub(in crate::distribution) use commit::AdvancingCommitGuard;
 pub(in crate::distribution) use model::{ExactMetadataRole, VerifiedMetadataCandidate};

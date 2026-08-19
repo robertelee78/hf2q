@@ -2,9 +2,10 @@
 //!
 //! This bounded context implements private descriptor-relative extraction,
 //! crash-resumable normalization to signed file/directory modes under a private
-//! stage root, and the first activation of an already authenticated, fully
-//! prepared standalone release. Staging remains inert and cannot publish a
-//! version; neither path establishes update authority or deletion authority.
+//! stage root, crash-durable no-replace prepared-version publication, and the
+//! first activation of an already authenticated standalone release. Only the
+//! sealed current-time TUF/native coordinator can publish; neither publication
+//! nor activation establishes generic update or deletion authority.
 
 mod artifact;
 mod extraction;
@@ -38,9 +39,15 @@ pub(in crate::distribution) use artifact::create_ephemeral_artifact_stage;
 pub(in crate::distribution) use artifact::{
     ArtifactStageError, EphemeralArtifactStage, VerifiedArchiveFile,
 };
+#[cfg(test)]
+pub(in crate::distribution) use extraction::{
+    abort_after_prepared_barrier, fail_after_prepared_barrier, observed_prepared_barriers,
+    reset_observed_prepared_barriers, set_prepared_precommit_hook,
+};
 pub(in crate::distribution) use extraction::{
     ExecutableReleaseBinding, ExtractedReleaseTree, ExtractionError,
-    NormalizedExtractedReleaseTree, ReleaseExtractionStage,
+    NormalizedExtractedReleaseTree, PreparedVersionError, PreparedVersionState,
+    PublishedPreparedVersion, ReleaseExtractionStage, VerifiedPublishedPreparedVersion,
 };
 #[allow(unused_imports)]
 pub(in crate::distribution) use identity::{
@@ -162,11 +169,12 @@ impl ExplicitRootAuthorization {
 
 /// Exact receipt bytes whose release targets were authenticated upstream.
 ///
-/// There is deliberately no production constructor yet. The future signed
-/// update adapter may construct this capability only after authenticating the
-/// exact manifest, archive, and receipt inputs and durably publishing the
-/// prepared version under the authorized root. Parsing JSON is insufficient;
-/// activation preparation independently re-verifies and re-syncs every byte.
+/// There is deliberately no public constructor. The dormant signed-update
+/// adapter constructs this capability only after authenticating the exact
+/// manifest/archive/receipt, durably publishing the prepared version, and
+/// consuming a receipt-bound final freshness token. Parsing JSON is
+/// insufficient; activation preparation independently re-verifies and
+/// re-syncs every byte.
 #[derive(Debug)]
 pub(crate) struct AuthenticatedPreparedVersion {
     receipt_bytes: Vec<u8>,

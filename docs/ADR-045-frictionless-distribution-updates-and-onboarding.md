@@ -11,11 +11,11 @@
   staging, dormant exact embedded-manifest/classic-ZIP validation, and
   lock-held descriptor-relative inert extraction, and dormant native Developer
   ID requirement/signing-information verification, descriptor-bound native
-  verification, and crash-resumable signed-mode normalization are reconciled;
+  verification, crash-resumable signed-mode normalization, and dormant
+  crash-durable prepared-version publication are reconciled;
   the real
   release trust root, verifier-request metadata transport, real compiled Team
-  ID plus protected positive fixture, crash-durable
-  prepared-version publication, public update/install/onboarding
+  ID plus protected positive fixture, public update/install/onboarding
   implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
 - Updated: 2026-08-19
@@ -352,7 +352,11 @@ hidden pending name to `versions/{VERSION}`. Before it, every error means no
 version was published. After it, every error is a typed
 `PreparedVersionDurabilityUnknown { version }`; exact recovery reopens the final
 inode, repeats all content and media barriers, and adopts only that same
-marker/receipt before constructing `AuthenticatedPreparedVersion`.
+marker/receipt. Install-state accepts only a one-use update-auth commit guard,
+not an arbitrary successful callback; that guard samples after the final
+namespace rebind and immediately before the rename. A second one-use receipt-
+bound token samples again after all postcommit tree/media/native verification,
+and only then constructs `AuthenticatedPreparedVersion`.
 
 While a prepared intent exists—or while an unactivated first version exists—
 metadata selection may not advance. The shared lock prevents concurrency, and
@@ -1158,9 +1162,9 @@ Large archives are streamed and checked against the sealed descriptor by hf2q
 rather than buffered through either client's convenience target API. The
 origin-locked external-byte layer, exact classic-ZIP/embedded-manifest
 validator, private descriptor-relative extraction, descriptor-bound native
-verification, and crash-resumable signed-mode normalization are implemented
-but remain deliberately dormant. The real compiled Team-ID policy, protected
-positive signing fixture, and prepared-version publication authority remain
+verification, crash-resumable signed-mode normalization, and crash-durable
+prepared-version publication are implemented but remain deliberately dormant.
+The real compiled Team-ID policy and protected positive signing fixture remain
 pending. Notarization is
 publisher promotion evidence for the exact archive, not runtime preparation
 authority. The implemented metadata layer
@@ -1333,10 +1337,12 @@ boundaries still do not produce update authority. The preparation boundary now
 brackets the same descriptor-bound binary with Mach-O and native Developer ID
 verification, consumes the first ephemeral proof to normalize exact signed
 modes, repeats current-time TUF replay, and requires the same path/inode to pass
-the native verifier again. The next slice must embed the real stable trust root,
-compile the real public Team ID, pass the protected positive Developer ID
-fixture, and durably publish and reopen the
-version before it can construct an authenticated prepared version.
+the native verifier again. It then creates the exact marker/receipt, commits the
+prepared version by no-replace rename, repeats durability and current-time
+authentication, and only then constructs an authenticated prepared version.
+The next production-enablement slice must embed the real stable trust root,
+compile the real public Team ID, and pass the protected positive Developer ID
+fixture.
 Neither a receipt, parsed role, provisional candidate, durable baseline, nor
 selected target plan can download bytes or mutate an installation by itself.
 
@@ -1812,11 +1818,13 @@ before public self-update ships.
    landed as dormant bounded contexts. The native Developer ID requirement and
    typed signing-information verifier, descriptor-bound double native check,
    crash-resumable signed-mode normalization, and post-normalization TUF replay
-   have also landed without a production Team-ID constructor. Next, embed the
-   real stable root, compile the real public Team ID, pass the protected
-   positive signing fixture, and implement crash-durable
-   prepared-version publication, live installed-release downgrade
-   floor, canonical Hugging
+   have also landed without a production Team-ID constructor. Exact marker-
+   intent recovery, no-replace prepared-version publication, typed postcommit
+   durability-unknown recovery, current-time commit gating, and the activation
+   capability bridge have now landed as another dormant bounded context. Next,
+   embed the real stable root, compile the real public Team ID, pass the
+   protected positive signing fixture, and implement the live installed-release
+   downgrade floor, canonical Hugging
    Face reference grammar, prepared/external artifact provenance, calibration
    receipt, and session policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated

@@ -267,12 +267,24 @@ pub(super) fn authenticate_stored_targets(
     stored: StoredMetadataGeneration,
     clock: &mut ClockSource,
 ) -> Result<AuthenticatedTargetSet, TufVerifierError> {
+    authenticate_stored_targets_after(authorization, anchor, stored, clock, None)
+}
+
+pub(super) fn authenticate_stored_targets_after(
+    authorization: &MetadataStateAuthorization,
+    anchor: &EmbeddedTrustRoot,
+    stored: StoredMetadataGeneration,
+    clock: &mut ClockSource,
+    minimum_started_at: Option<Timestamp>,
+) -> Result<AuthenticatedTargetSet, TufVerifierError> {
     let sequence = stored.sequence();
     let generation_sha256: [u8; 32] = Sha256::digest(stored.generation_receipt()).into();
     let receipt = MetadataGenerationReceiptV2::parse(stored.generation_receipt())?;
     let parsed_targets = profile::targets(stored.targets())?;
     let started_at = clock.sample()?;
-    if started_at < receipt.verification_completed_at()? {
+    if started_at < receipt.verification_completed_at()?
+        || minimum_started_at.is_some_and(|minimum| started_at < minimum)
+    {
         return Err(TufVerifierError::ClockRollback);
     }
     let state = replay_selected(anchor, &receipt, stored, started_at)?;

@@ -34,12 +34,12 @@ pub(in crate::distribution) struct ExtractedRelease<'a> {
 /// receipt, prepared-version, activation, path, or descriptor authority.
 #[cfg(target_os = "macos")]
 pub(in crate::distribution) struct SignedModeNormalizedRelease<'a> {
-    _authentication: PostLocalIoReleaseAuthorization<'a>,
-    _tree: NormalizedExtractedReleaseTree,
-    _manifest_bytes: Box<[u8]>,
-    _manifest: ReleaseManifestV1,
-    _profile: VerifiedArchiveProfile,
-    _developer_id: DeveloperIdVerification,
+    pub(super) authentication: PostLocalIoReleaseAuthorization<'a>,
+    pub(super) tree: NormalizedExtractedReleaseTree,
+    pub(super) manifest_bytes: Box<[u8]>,
+    pub(super) manifest: ReleaseManifestV1,
+    pub(super) profile: VerifiedArchiveProfile,
+    pub(super) developer_id: DeveloperIdVerification,
 }
 
 impl std::fmt::Debug for ExtractedRelease<'_> {
@@ -63,25 +63,40 @@ pub(in crate::distribution) fn extract_release(
     release: ArchiveBoundRelease<'_>,
 ) -> Result<ExtractedRelease<'_>, PreparedReleaseError> {
     let ArchiveBoundRelease { bundle, profile } = release;
-    let mut parts = bundle.into_preparation_parts();
-    let preparation = parts.authorization.lock_for_preparation()?;
-    let mut stage = preparation.open_extraction_stage(&parts.manifest_bytes, &parts.manifest)?;
-    parts.archive.revalidate()?;
+    let crate::distribution::update_transport::ReleasePreparationParts {
+        authorization,
+        manifest_bytes,
+        manifest,
+        archive,
+    } = bundle.into_preparation_parts();
+    let preparation = authorization.lock_for_preparation()?;
+    extract_with_preparation(manifest_bytes, manifest, archive, profile, preparation)
+}
+
+pub(super) fn extract_with_preparation<'a>(
+    manifest_bytes: Box<[u8]>,
+    manifest: ReleaseManifestV1,
+    mut archive: crate::distribution::install_state::VerifiedArchiveFile,
+    profile: VerifiedArchiveProfile,
+    preparation: crate::distribution::update_auth::LockedReleasePreparation<'a>,
+) -> Result<ExtractedRelease<'a>, PreparedReleaseError> {
+    let mut stage = preparation.open_extraction_stage(&manifest_bytes, &manifest)?;
+    archive.revalidate()?;
     extract_entries(
-        &mut parts.archive,
-        &parts.manifest_bytes,
-        &parts.manifest,
+        &mut archive,
+        &manifest_bytes,
+        &manifest,
         &profile,
         &mut stage,
     )?;
-    parts.archive.revalidate()?;
+    archive.revalidate()?;
     let tree = stage.finish()?;
     let authentication = preparation.reauthenticate_after_local_io()?;
     Ok(ExtractedRelease {
         _authentication: authentication,
         _tree: tree,
-        _manifest_bytes: parts.manifest_bytes,
-        _manifest: parts.manifest,
+        _manifest_bytes: manifest_bytes,
+        _manifest: manifest,
         _profile: profile,
     })
 }
@@ -105,7 +120,7 @@ pub(super) fn verify_and_normalize_release<'a>(
 }
 
 #[cfg(target_os = "macos")]
-fn verify_and_normalize_release_with<'a>(
+pub(super) fn verify_and_normalize_release_with<'a>(
     release: ExtractedRelease<'a>,
     mut verify: impl FnMut(
         &std::path::Path,
@@ -151,12 +166,12 @@ fn verify_and_normalize_release_with<'a>(
     )?;
     authentication.verify_normalized_release_tree(&tree, &manifest_bytes, &manifest)?;
     Ok(SignedModeNormalizedRelease {
-        _authentication: authentication,
-        _tree: tree,
-        _manifest_bytes: manifest_bytes,
-        _manifest: manifest,
-        _profile: profile,
-        _developer_id: developer_id,
+        authentication,
+        tree,
+        manifest_bytes,
+        manifest,
+        profile,
+        developer_id,
     })
 }
 

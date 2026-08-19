@@ -418,6 +418,9 @@ fn signed_mode_normalization_is_sealed_and_keeps_the_tree_inert() {
 }
 
 #[cfg(target_os = "macos")]
+#[path = "extraction_cases/prepared_publication_cases.rs"]
+mod prepared_publication_cases;
+#[cfg(target_os = "macos")]
 #[test]
 fn failed_native_brackets_return_no_capability_and_exact_retry_recovers() {
     for failed_call in [1_usize, 2_usize] {
@@ -660,7 +663,7 @@ fn extraction_namespace_swap_between_native_brackets_returns_no_capability() {
         .expect("replacement namespace mode");
     })
     .expect_err("the final native bracket must reject the replacement namespace");
-    assert!(matches!(error, PreparedReleaseError::Extraction(_)));
+    assert!(matches!(error, PreparedReleaseError::Authentication(_)));
     assert!(
         update
             .join("extractions-detached")
