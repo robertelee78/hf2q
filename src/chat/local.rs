@@ -80,7 +80,7 @@ async fn resolve_local(
     .await?;
     if !existing.is_empty() {
         let selected = select_server(&existing, args.model.as_deref(), input, output)?;
-        return Ok(EndpointSession::external(selected.endpoint.clone()));
+        return Ok(EndpointSession::discovered_hf2q(selected.endpoint.clone()));
     }
 
     writeln!(output, "no local hf2q server found; starting one")?;

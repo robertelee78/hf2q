@@ -60,12 +60,19 @@ enum Ownership {
     Owned { child: Child, detached: bool },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointKind {
+    Explicit,
+    DiscoveredHf2q,
+}
+
 /// Endpoint plus the only process authority chat is allowed to exercise.
 /// PID metadata is deliberately absent; shutdown authority requires the
 /// concrete Child handle created by this chat invocation.
 #[derive(Debug)]
 pub(crate) struct EndpointSession {
     endpoint: Endpoint,
+    kind: EndpointKind,
     ownership: Ownership,
 }
 
@@ -73,6 +80,15 @@ impl EndpointSession {
     pub(crate) fn external(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
+            kind: EndpointKind::Explicit,
+            ownership: Ownership::External,
+        }
+    }
+
+    pub(crate) fn discovered_hf2q(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            kind: EndpointKind::DiscoveredHf2q,
             ownership: Ownership::External,
         }
     }
@@ -82,6 +98,7 @@ impl EndpointSession {
     pub(crate) fn spawned_loopback(port: u16, child: Child) -> Self {
         Self {
             endpoint: Endpoint::discovered_loopback(port),
+            kind: EndpointKind::DiscoveredHf2q,
             ownership: Ownership::Owned {
                 child,
                 detached: false,
@@ -95,6 +112,10 @@ impl EndpointSession {
 
     pub(crate) fn is_owned(&self) -> bool {
         matches!(self.ownership, Ownership::Owned { .. })
+    }
+
+    pub(crate) fn expects_hf2q_control(&self) -> bool {
+        self.kind == EndpointKind::DiscoveredHf2q
     }
 
     pub(crate) fn is_detached(&self) -> bool {

@@ -13,6 +13,7 @@ pub(crate) struct ChatClient {
     transcript: Transcript,
     options: RequestOptions,
     auth_token: Option<String>,
+    hf2q_non_evicting: bool,
 }
 
 impl ChatClient {
@@ -34,6 +35,7 @@ impl ChatClient {
             transcript: Transcript::new(system),
             options,
             auth_token,
+            hf2q_non_evicting: false,
         })
     }
 
@@ -51,6 +53,10 @@ impl ChatClient {
 
     pub(crate) fn set_thinking(&mut self, mode: ThinkingMode) {
         self.options.thinking = mode;
+    }
+
+    pub(crate) fn set_hf2q_non_evicting(&mut self, enabled: bool) {
+        self.hf2q_non_evicting = enabled;
     }
 
     pub(crate) fn set_model(&mut self, model: String) {
@@ -75,6 +81,9 @@ impl ChatClient {
             .http
             .post(self.endpoint.route("/v1/chat/completions"))
             .json(&request);
+        if self.hf2q_non_evicting {
+            builder = builder.header(super::control::NON_EVICTING_HEADER, "1");
+        }
         if let Some(token) = &self.auth_token {
             builder = builder.bearer_auth(token);
         }
@@ -200,6 +209,9 @@ mod tests {
     #[derive(Clone)]
     struct AuthSeen(Arc<Mutex<Vec<String>>>);
 
+    #[derive(Clone, Default)]
+    struct DiagnosticHeaders(Arc<Mutex<Vec<String>>>);
+
     fn record_auth(headers: &HeaderMap, seen: &AuthSeen) {
         seen.0.lock().unwrap().push(
             headers
@@ -220,6 +232,26 @@ mod tests {
         headers: HeaderMap,
     ) -> Response<Body> {
         record_auth(&headers, &seen);
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )))
+            .unwrap()
+    }
+
+    async fn diagnostic_chat(
+        State(seen): State<DiagnosticHeaders>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        seen.0.lock().unwrap().push(
+            headers
+                .get(super::super::control::NON_EVICTING_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+        );
         Response::builder()
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(concat!(
@@ -335,6 +367,27 @@ mod tests {
             *seen.0.lock().unwrap(),
             vec!["Bearer test-secret", "Bearer test-secret"]
         );
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn hf2q_capability_enables_non_evicting_header_without_changing_body() {
+        let seen = DiagnosticHeaders::default();
+        let router = Router::new()
+            .route("/v1/chat/completions", post(diagnostic_chat))
+            .with_state(seen.clone());
+        let (endpoint, stop) = serve(router).await;
+        let mut client = ChatClient::new(
+            endpoint,
+            "model-a".into(),
+            None,
+            RequestOptions::default(),
+            None,
+        )
+        .unwrap();
+        client.set_hf2q_non_evicting(true);
+        client.send_turn("hello", |_| Ok(())).await.unwrap();
+        assert_eq!(*seen.0.lock().unwrap(), vec!["1"]);
         let _ = stop.send(());
     }
 }

@@ -1,4 +1,5 @@
 mod client;
+mod control;
 pub(crate) mod endpoint;
 mod local;
 mod sse;
@@ -13,6 +14,7 @@ use console::style;
 use crate::cli::ChatArgs;
 
 use client::{fetch_models, ChatClient};
+use control::Hf2qControl;
 use endpoint::{EndpointResolver, EndpointSession};
 use local::AutomaticEndpointResolver;
 use sse::{CompletedResponse, StreamUpdate};
@@ -86,6 +88,21 @@ async fn run_session(
             choose_remote_model(&probe_http, session, auth_token.as_deref(), input, output).await?
         }
     };
+    let control = Hf2qControl::detect(
+        &probe_http,
+        session.endpoint(),
+        auth_token.as_deref(),
+        session.expects_hf2q_control(),
+    )
+    .await?;
+    if let Some(control) = &control {
+        if !control
+            .ensure_active(&model, auth_token.as_deref(), input, output)
+            .await?
+        {
+            bail!("model switch declined");
+        }
+    }
     let options = RequestOptions {
         temperature: args.temperature,
         top_p: args.top_p,
@@ -101,6 +118,7 @@ async fn run_session(
         options,
         auth_token.clone(),
     )?;
+    client.set_hf2q_non_evicting(control.is_some());
 
     writeln!(
         output,
@@ -113,12 +131,21 @@ async fn run_session(
         "commands: /new /model [id] /thinking auto|on|off /status /detach /quit"
     )?;
 
-    interactive_loop(&mut client, session, auth_token.as_deref(), input, output).await
+    interactive_loop(
+        &mut client,
+        session,
+        control.as_ref(),
+        auth_token.as_deref(),
+        input,
+        output,
+    )
+    .await
 }
 
 async fn interactive_loop(
     client: &mut ChatClient,
     session: &mut EndpointSession,
+    control: Option<&Hf2qControl>,
     auth_token: Option<&str>,
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -137,7 +164,7 @@ async fn interactive_loop(
             continue;
         }
         if value.starts_with('/') {
-            if handle_command(client, session, auth_token, value, input, output).await? {
+            if handle_command(client, session, control, auth_token, value, input, output).await? {
                 return Ok(());
             }
             continue;
@@ -148,7 +175,12 @@ async fn interactive_loop(
             .send_turn(value, |update| renderer.render(update))
             .await
         {
-            Ok(response) => renderer.complete(&response)?,
+            Ok(response) => {
+                renderer.complete(&response)?;
+                if let Some(control) = control {
+                    control.write_runtime_status(auth_token, output).await?;
+                }
+            }
             Err(error) => renderer.fail(&error)?,
         }
     }
@@ -158,6 +190,7 @@ async fn interactive_loop(
 async fn handle_command(
     client: &mut ChatClient,
     session: &mut EndpointSession,
+    control: Option<&Hf2qControl>,
     auth_token: Option<&str>,
     command: &str,
     input: &mut impl BufRead,
@@ -198,6 +231,9 @@ async fn handle_command(
                 client.thinking().as_str(),
                 lifecycle
             )?;
+            if let Some(control) = control {
+                control.write_runtime_status(auth_token, output).await?;
+            }
             Ok(false)
         }
         "/thinking" => {
@@ -223,6 +259,15 @@ async fn handle_command(
             } else {
                 choose_remote_model(client.http(), session, auth_token, input, output).await?
             };
+            if let Some(control) = control {
+                if !control
+                    .ensure_active(&model, auth_token, input, output)
+                    .await?
+                {
+                    writeln!(output, "model unchanged")?;
+                    return Ok(false);
+                }
+            }
             client.set_model(model);
             writeln!(output, "model={} (context cleared)", client.model())?;
             Ok(false)
