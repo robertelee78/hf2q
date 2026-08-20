@@ -598,7 +598,9 @@ jobs:
             scripts/install.sh.in \
             scripts/render_standalone_installer.sh \
             scripts/render_standalone_release_record.sh \
+            scripts/sign_notarize_standalone_release.sh \
             scripts/test_standalone_installer.sh \
+            scripts/test_standalone_release_signing_contract.sh \
             Cargo.toml \
             Cargo.lock \
             src/main.rs \
@@ -640,6 +642,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::standalone:: -- --test-threads=1
           scripts/test_standalone_installer.sh
+          scripts/test_standalone_release_signing_contract.sh
           cargo test --locked --bin hf2q --all-features setup:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features tests::convert_config_quant_is_used_and_explicit_quant_wins -- --exact
           cargo test --locked --bin hf2q --all-features tests::invalid_operator_config_fails_before_convert_source_or_serve_bind -- --exact
@@ -653,6 +656,7 @@ jobs:
             distribution::standalone::tests::standalone_lifecycle_installs_updates_rolls_back_and_preserves_operator_state \
             distribution::standalone::tests::standalone_installer_bootstrap_surface_is_hidden_bounded_and_parseable \
             distribution::standalone::update::tests::stable_release_record_is_small_canonical_and_exact \
+            distribution::standalone::update::tests::standalone_candidate_architecture_is_exactly_thin_arm64 \
             setup::defaults_contract_tests::operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults \
             setup::defaults_contract_tests::operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant \
             setup::defaults_contract_tests::absent_operator_config_preserves_existing_command_behavior_without_claiming_root_authority \
@@ -814,6 +818,8 @@ jobs:
             scripts/test_gemma4_eight_slot_receipt_contract.sh \
             scripts/seal_release_binary.sh \
             scripts/test_release_binary_seal_contract.sh \
+            scripts/sign_notarize_standalone_release.sh \
+            scripts/test_standalone_release_signing_contract.sh \
             scripts/verify_release_dependency_provenance.sh \
             scripts/test_release_dependency_provenance_contract.sh \
             scripts/run_release_gate_process_group.sh \
@@ -838,6 +844,7 @@ jobs:
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
           bash scripts/test_qwen38_long_decode_receipt_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
+          bash scripts/test_standalone_release_signing_contract.sh
           bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh

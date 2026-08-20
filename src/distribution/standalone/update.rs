@@ -30,6 +30,7 @@ const RECORD_TIMEOUT: Duration = Duration::from_secs(60);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_SIGNING_INFO_BYTES: usize = 64 * 1024;
 const MAX_VERSION_OUTPUT_BYTES: usize = 256;
+const MAX_ARCHITECTURE_OUTPUT_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,6 +319,7 @@ fn verify_apple_release(
     }
     #[cfg(target_os = "macos")]
     {
+        verify_thin_arm64(candidate)?;
         verify_codesign(current)?;
         verify_codesign(candidate)?;
         let current_identity = signing_identity(current)?;
@@ -351,6 +353,38 @@ fn verify_apple_release(
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_thin_arm64(path: &Path) -> Result<(), StandaloneError> {
+    let output = Command::new("/usr/bin/lipo")
+        .arg("-archs")
+        .arg(path)
+        .output()
+        .map_err(|error| StandaloneError::io("inspect candidate architecture", error))?;
+    if !output.status.success()
+        || output.stdout.len() > MAX_ARCHITECTURE_OUTPUT_BYTES
+        || output.stderr.len() > MAX_ARCHITECTURE_OUTPUT_BYTES
+        || !output.stderr.is_empty()
+        || parse_thin_arm64(&output.stdout).is_err()
+    {
+        return Err(StandaloneError::Trust(
+            "candidate is not an exact thin Apple-Silicon executable",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_thin_arm64(output: &[u8]) -> Result<(), StandaloneError> {
+    let text = std::str::from_utf8(output)
+        .map_err(|_| StandaloneError::Trust("candidate architecture was not UTF-8"))?;
+    let mut architectures = text.split_ascii_whitespace();
+    if architectures.next() != Some("arm64") || architectures.next().is_some() {
+        return Err(StandaloneError::Trust(
+            "candidate is not an exact thin Apple-Silicon executable",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -464,6 +498,16 @@ mod tests {
         let mut noncanonical = record("1.2.3", 42, &sha);
         noncanonical.insert(0, b' ');
         assert!(parse_release_record(&noncanonical).is_err());
+    }
+
+    #[test]
+    fn standalone_candidate_architecture_is_exactly_thin_arm64() {
+        parse_thin_arm64(b"arm64\n").expect("thin arm64");
+        assert!(parse_thin_arm64(b"x86_64\n").is_err());
+        assert!(parse_thin_arm64(b"arm64 x86_64\n").is_err());
+        assert!(parse_thin_arm64(b"arm64e\n").is_err());
+        assert!(parse_thin_arm64(b"").is_err());
+        assert!(parse_thin_arm64(b"arm64\xff").is_err());
     }
 
     #[cfg(target_os = "macos")]

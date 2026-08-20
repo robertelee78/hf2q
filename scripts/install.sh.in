@@ -17,6 +17,13 @@ fail() {
 
 [ "$(uname -s)" = Darwin ] || fail 'only macOS is supported by this release'
 [ "$(uname -m)" = arm64 ] || fail 'this release requires Apple Silicon (arm64)'
+macos_version=$(/usr/bin/sw_vers -productVersion 2>/dev/null) \
+  || fail 'macOS version could not be determined'
+macos_major=${macos_version%%.*}
+case "$macos_major" in
+  ''|*[!0-9]*) fail 'macOS version is not canonical' ;;
+esac
+[ "$macos_major" -ge 14 ] || fail 'this release requires macOS 14 or newer'
 [ -n "${HOME:-}" ] || fail 'HOME is unavailable; set HF2Q_INSTALL_DIR explicitly'
 
 install_dir=${HF2Q_INSTALL_DIR:-"$HOME/.local/bin"}
@@ -52,6 +59,8 @@ if [ "${HF2Q_INSTALL_TEST_MODE:-0}" = 1 ]; then
     *) fail 'test mode is restricted to an exact local file:// fixture' ;;
   esac
 else
+  [ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ] \
+    || fail 'release is not an exact thin Apple-Silicon executable'
   /usr/bin/codesign --verify --strict --verbose=2 "$candidate" >/dev/null 2>&1 \
     || fail 'Apple code-signature verification failed'
   signing_info=$(/usr/bin/codesign --display --verbose=4 "$candidate" 2>&1) \

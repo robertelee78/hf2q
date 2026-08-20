@@ -54,22 +54,22 @@ fi
   fail "failed seal left a destination artifact"
 
 # shellcheck disable=SC2016
-grep -qF 'sealed_binary="$RUNNER_TEMP/cache-lifecycle-sealed-$EXPECTED_SHA/hf2q"' \
+grep -qF 'sealed_binary="$release_evidence/hf2q-aarch64-apple-darwin"' \
   "$CACHE_WORKFLOW" || fail "cache workflow does not place the sealed binary outside Cargo target"
 # shellcheck disable=SC2016
 grep -qF '"$package_root/scripts/seal_release_binary.sh"' "$CACHE_WORKFLOW" || \
   fail "cache workflow does not invoke the packaged binary sealer"
 # shellcheck disable=SC2016
-grep -qF '"$built_binary" "$sealed_binary" "$built_sha"' "$CACHE_WORKFLOW" || \
-  fail "cache workflow does not seal the freshly built binary"
+grep -qF '"$signed_binary" "$sealed_binary" "$binary_sha"' "$CACHE_WORKFLOW" || \
+  fail "cache workflow does not seal the signed candidate"
 grep -qF "printf 'HF2Q_BIN=%s\\n' \"\$sealed_binary\"" "$CACHE_WORKFLOW" || \
   fail "cache workflow does not export the sealed binary"
 # shellcheck disable=SC2016
-grep -qF "printf 'EXPECTED_BINARY_SHA256=%s\\n' \"\$built_sha\"" \
-  "$CACHE_WORKFLOW" || fail "cache workflow does not export the build-time digest"
+grep -qF "printf 'EXPECTED_BINARY_SHA256=%s\\n' \"\$binary_sha\"" \
+  "$CACHE_WORKFLOW" || fail "cache workflow does not export the signed-candidate digest"
 # shellcheck disable=SC2016
 grep -qF 'EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256"' "$CACHE_WORKFLOW" || \
-  fail "cache workflow does not pass the build-time digest to the wrapper"
+  fail "cache workflow does not pass the signed-candidate digest to the wrapper"
 
 awk '
   /^start_server\(\)/ { in_start=1; next }
@@ -82,7 +82,7 @@ grep -qF 'seal_release_binary.sh" --verify "$HF2Q_BIN" "$binary_sha"' \
   "$RELEASE_GATE" || fail "release launch guard does not use the tested identity verifier"
 # shellcheck disable=SC2016
 grep -qF 'binary_sha=$EXPECTED_BINARY_SHA256' "$RELEASE_GATE" || \
-  fail "release wrapper does not keep build-time digest authority"
+  fail "release wrapper does not keep signed-candidate digest authority"
 # shellcheck disable=SC2016
 if grep -qF 'binary_sha=$(sha256_file "$HF2Q_BIN")' "$RELEASE_GATE"; then
   fail "release wrapper adopts the sealed path digest as new authority"
