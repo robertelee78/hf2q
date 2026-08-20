@@ -24,20 +24,20 @@ const MODEL_ID: &str = "Qwen/Qwen3.8-topology-test";
 const REVISION: &str = "1123456789abcdef0123456789abcdef01234567";
 
 #[derive(Clone)]
-struct TensorSpec {
-    name: String,
-    shape: Vec<usize>,
+pub(super) struct TensorSpec {
+    pub(super) name: String,
+    pub(super) shape: Vec<usize>,
 }
 
-struct TopologyFixture {
-    temp: tempfile::TempDir,
+pub(super) struct TopologyFixture {
+    pub(super) temp: tempfile::TempDir,
     verified: crate::input::integrity::VerifiedSourceManifest,
     inventory: VerifiedSourceTensorInventory,
     partition: crate::intelligence::dynamic_allocator::producer::TensorPartitionManifest,
     units: Vec<TensorAllocationUnit>,
 }
 
-fn config() -> serde_json::Value {
+pub(super) fn config() -> serde_json::Value {
     serde_json::json!({
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
@@ -155,7 +155,7 @@ fn lfs_record(filename: &str, bytes: &[u8]) -> ShardIntegrity {
     }
 }
 
-fn fixture(
+pub(super) fn fixture(
     dtype: Dtype,
     mutate: impl FnOnce(&mut serde_json::Value, &mut Vec<TensorSpec>),
 ) -> TopologyFixture {
@@ -285,7 +285,7 @@ fn fixture(
     }
 }
 
-fn open(fixture: &TopologyFixture) -> anyhow::Result<VerifiedQwenSourceSnapshot> {
+pub(super) fn open(fixture: &TopologyFixture) -> anyhow::Result<VerifiedQwenSourceSnapshot> {
     open_verified_qwen_source_snapshot(
         fixture.temp.path(),
         &fixture.verified,
@@ -314,10 +314,15 @@ fn official_config_has_exact_closed_topology_counts() {
         "../../../../../tests/fixtures/qwen38/config.json"
     ))
     .unwrap();
-    let (sources, bf16, f32, transforms) = expected_profile_for_config_for_test(&config).unwrap();
+    let (sources, bf16, f32, bf16_bytes, f32_bytes, max_bytes, transforms) =
+        expected_profile_for_config_for_test(&config).unwrap();
     assert_eq!(sources, 866);
     assert_eq!(bf16, 514);
     assert_eq!(f32, 353);
+    assert_eq!(bf16_bytes, 53_786_705_920);
+    assert_eq!(f32_bytes, 10_582_016);
+    assert_eq!(bf16_bytes + f32_bytes, 53_797_287_936);
+    assert_eq!(max_bytes, 2_542_796_800);
     assert_eq!(
         transforms,
         [290, 161, 240, 48, 48, 48, 32],

@@ -18,7 +18,7 @@ use crate::intelligence::measured_auto_quant::SourceIdentity;
 use super::header::parse_unique_header;
 use super::retained_io::{
     hash_region, hash_retained_file, open_and_read_config, open_retained_directory,
-    open_retained_file, read_exact_at, require_same_file, RetainedSourceFile,
+    open_retained_file, read_exact_at, visit_hashed_tensor_region, RetainedSourceFile,
 };
 use super::scope::{
     parse_unique_qwen_config, source_dispositions, validate_dense_qwen_source_config,
@@ -72,6 +72,12 @@ impl VerifiedQwenSourceSnapshot {
         self.tensors.len()
     }
 
+    pub(super) fn tensor_record(&self, name: &str) -> Option<&SourcePrecisionTensorRecord> {
+        self.tensor_indices
+            .get(name)
+            .and_then(|index| self.tensors.get(*index))
+    }
+
     pub(super) fn tensor_records(&self) -> &[SourcePrecisionTensorRecord] {
         &self.tensors
     }
@@ -104,54 +110,60 @@ impl VerifiedQwenSourceSnapshot {
     /// The source bytes are reread positionally and rehashed during the copy;
     /// no whole-tensor host allocation or pathname reopen occurs.
     pub(crate) fn read_tensor_u16(&self, name: &str, output: &mut [u16]) -> Result<()> {
-        let index = self
-            .tensor_indices
-            .get(name)
-            .copied()
+        let tensor = self
+            .tensor_record(name)
             .ok_or_else(|| anyhow::anyhow!("source tensor {name} is absent"))?;
-        let tensor = &self.tensors[index];
         let expected_elements = usize::try_from(tensor.byte_len / 2)
             .context("source tensor element count is not representable")?;
         ensure!(
             tensor.byte_len % 2 == 0 && output.len() == expected_elements,
             "source tensor {name} destination has the wrong u16 length"
         );
+        let mut scratch = Vec::new();
+        let mut output_offset = 0;
+        self.visit_tensor_le_bytes(name, &mut scratch, |_, bytes| {
+            for pair in bytes.chunks_exact(2) {
+                output[output_offset] = u16::from_le_bytes([pair[0], pair[1]]);
+                output_offset += 1;
+            }
+            Ok(())
+        })?;
+        ensure!(
+            output_offset == output.len(),
+            "source tensor {name} copied the wrong element count"
+        );
+        Ok(())
+    }
+
+    /// Visit one retained BF16/F16 payload as bounded little-endian byte
+    /// chunks while reproducing its authenticated source hash. The caller
+    /// owns and reuses `scratch`; this method never allocates a whole tensor
+    /// and never reopens a source pathname.
+    pub(super) fn visit_tensor_le_bytes<F>(
+        &self,
+        name: &str,
+        scratch: &mut Vec<u8>,
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[u8]) -> Result<()>,
+    {
+        let tensor = self
+            .tensor_record(name)
+            .ok_or_else(|| anyhow::anyhow!("source tensor {name} is absent"))?;
         let shard = self
             .shards
             .iter()
             .find(|shard| shard.source.filename == tensor.shard_filename)
             .ok_or_else(|| anyhow::anyhow!("source tensor {name} lost its retained shard"))?;
-        require_same_file(&shard.source)?;
-
-        let mut buffer = vec![0_u8; SOURCE_READ_CHUNK_BYTES];
-        let mut hasher = Sha256::new();
-        let mut remaining = tensor.byte_len;
-        let mut offset = tensor.payload_offset;
-        let mut output_offset = 0_usize;
-        while remaining != 0 {
-            let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-            ensure!(
-                wanted % 2 == 0,
-                "source tensor {name} has an odd read chunk"
-            );
-            read_exact_at(&shard.source.file, &mut buffer[..wanted], offset)?;
-            hasher.update(&buffer[..wanted]);
-            for pair in buffer[..wanted].chunks_exact(2) {
-                output[output_offset] = u16::from_le_bytes([pair[0], pair[1]]);
-                output_offset += 1;
-            }
-            let consumed = u64::try_from(wanted).unwrap();
-            offset = offset
-                .checked_add(consumed)
-                .context("source tensor read offset overflow")?;
-            remaining -= consumed;
-        }
-        ensure!(
-            output_offset == output.len() && hex::encode(hasher.finalize()) == tensor.byte_sha256,
-            "source tensor {name} changed after snapshot verification"
-        );
-        require_same_file(&shard.source)?;
-        Ok(())
+        visit_hashed_tensor_region(
+            &shard.source,
+            tensor.payload_offset,
+            tensor.byte_len,
+            &tensor.byte_sha256,
+            scratch,
+            visit,
+        )
     }
 
     /// Rehash every retained source file after a future upload pass. This is a

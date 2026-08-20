@@ -87,6 +87,9 @@ ruvector = ["dep:ruvector-core"]
 [dependencies]
 safetensors = "0.7"
 half = "2.4"
+# Hash exact typed Metal-buffer bytes without violating mlx-native's typed
+# slice contract by asking a BF16/F32 allocation for an untyped u8 view.
+bytemuck = "1.25"
 
 # HuggingFace integration
 hf-hub = "0.5"

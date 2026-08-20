@@ -188,3 +188,50 @@ pub(super) fn hash_retained_file(source: &RetainedSourceFile) -> Result<String> 
     require_same_file(source)?;
     Ok(hex::encode(hasher.finalize()))
 }
+
+pub(super) fn visit_hashed_tensor_region<F>(
+    source: &RetainedSourceFile,
+    payload_offset: u64,
+    byte_len: u64,
+    expected_sha256: &str,
+    scratch: &mut Vec<u8>,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &[u8]) -> Result<()>,
+{
+    ensure!(byte_len % 2 == 0, "source tensor has an odd byte length");
+    require_same_file(source)?;
+    if scratch.len() != SOURCE_READ_CHUNK_BYTES {
+        scratch.resize(SOURCE_READ_CHUNK_BYTES, 0);
+    }
+    let mut hasher = Sha256::new();
+    let mut remaining = byte_len;
+    let mut offset = payload_offset;
+    let mut element_offset = 0_usize;
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(scratch.len() as u64)).unwrap();
+        ensure!(wanted % 2 == 0, "source tensor has an odd read chunk");
+        read_exact_at(&source.file, &mut scratch[..wanted], offset)?;
+        hasher.update(&scratch[..wanted]);
+        visit(element_offset, &scratch[..wanted])?;
+        element_offset = element_offset
+            .checked_add(wanted / 2)
+            .context("source tensor element offset overflow")?;
+        let consumed = u64::try_from(wanted).unwrap();
+        offset = offset
+            .checked_add(consumed)
+            .context("source tensor read offset overflow")?;
+        remaining -= consumed;
+    }
+    ensure!(
+        u64::try_from(element_offset)?
+            .checked_mul(2)
+            .context("source tensor visited byte count overflow")?
+            == byte_len
+            && hex::encode(hasher.finalize()) == expected_sha256,
+        "source tensor changed after snapshot verification"
+    );
+    require_same_file(source)?;
+    Ok(())
+}
