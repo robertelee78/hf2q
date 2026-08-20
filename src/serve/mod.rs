@@ -9,6 +9,7 @@ pub mod auto_pipeline;
 pub mod cache;
 pub mod config;
 mod deepseek4_cli;
+pub(crate) mod discovery;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
 pub mod forward_mlx_shared;
@@ -5195,11 +5196,35 @@ pub fn cmd_serve(
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
             .with_context(|| format!("binding to {bind}"))?;
-        let local_addr = listener.local_addr().ok();
+        let local_addr = listener
+            .local_addr()
+            .context("reading bound hf2q HTTP address")?;
         tracing::info!(
-            addr = %local_addr.map(|a| a.to_string()).unwrap_or_else(|| bind.clone()),
+            addr = %local_addr,
             "hf2q HTTP server listening"
         );
+        let local_discovery_registration = if discovery::is_supported() {
+            match discovery::register_bound_listener(&listener).await {
+                Ok(registration) => {
+                    tracing::info!(
+                        service = registration.service_name(),
+                        port = registration.port(),
+                        "hf2q LocalOnly discovery registered"
+                    );
+                    Some(registration)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        port = local_addr.port(),
+                        "hf2q LocalOnly discovery unavailable; HTTP serving continues"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Some(engine) = startup_engine_for_banner.as_ref() {
             let mut stdout = std::io::stdout();
             let mut banner_info = engine.info().clone();
@@ -5227,14 +5252,14 @@ pub fn cmd_serve(
         // which is a `&LoadInfo` borrow — we don't need the engine
         // afterwards.
         drop(startup_engine_for_banner);
-        eprintln!("hf2q serving on http://{}", bind);
+        eprintln!("hf2q serving on http://{}", local_addr);
         let _operator_ui = if let Some((model, family, max_slots)) = operator_identity {
             operator_ui::start(
                 operator_ui_mode,
                 matches!(log_format, cli::LogFormat::Text),
                 model,
                 family,
-                format!("http://{bind}"),
+                format!("http://{local_addr}"),
                 max_slots,
             )?
         } else {
@@ -5289,6 +5314,10 @@ pub fn cmd_serve(
             }
         };
         let mut shutdown_failure = http_result.err();
+        // The HTTP listener has stopped accepting and all in-flight responses
+        // have drained. Remove the discovery record before the potentially
+        // longer KV-cache/worker shutdown so chat never selects a dead endpoint.
+        drop(local_discovery_registration);
 
         // Axum has stopped accepting + drained in-flight HTTP responses.
         // Each in-flight handler that called `engine.generate*` has
@@ -8110,6 +8139,15 @@ mod tests {
             cli_override,
             crate::serve::api::engine::EngineMode::SerialFifo
         );
+    }
+
+    #[test]
+    fn explicit_cli_port_zero_survives_endpoint_resolution() {
+        let config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        let endpoint = resolve_serve_endpoint(None, Some(0), Some(&config.serve));
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 0);
+        assert!(endpoint.host_from_config);
     }
 
     #[test]

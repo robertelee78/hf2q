@@ -233,6 +233,9 @@ flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] 
 zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# ADR-047 machine-local serve discovery. This wraps Apple's native DNS-SD
+# service and exposes the LocalOnly interface plus Tokio browse/resolve streams.
+async-dnssd = "=0.5.1"
 # ADR-045 OS-bound preparation preflight. Read fixed sysctl keys in-process;
 # never trust caller facts or a PATH-resolved `sysctl` subprocess.
 sysctl = { version = "=0.6.0", default-features = false }
