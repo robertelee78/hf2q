@@ -25,6 +25,11 @@ use super::types::{SourcePrecisionDType, SourcePrecisionDisposition, SourcePreci
 const TOPOLOGY_SCHEMA_VERSION: u32 = 1;
 const TOPOLOGY_PROFILE: &str = "dense_qwen35_source_bf16_topology_v1";
 
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(super) use test_support::expected_profile_for_config_for_test;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Qwen35FutureDType {
@@ -162,6 +167,24 @@ impl VerifiedQwen35Bf16TopologyV1 {
 
     pub(crate) fn future_f32_tensor_count(&self) -> usize {
         self.future_f32_tensors
+    }
+
+    pub(super) fn into_upload_parts(
+        self,
+    ) -> (
+        VerifiedQwenSourceSnapshot,
+        Vec<Qwen35SourceTopologyRecord>,
+        String,
+        usize,
+        usize,
+    ) {
+        (
+            self._snapshot,
+            self.records,
+            self.topology_sha256,
+            self.future_bf16_tensors,
+            self.future_f32_tensors,
+        )
     }
 
     #[cfg(test)]
@@ -439,36 +462,4 @@ fn verify_mapper(
             source.name
         ),
     }
-}
-
-#[cfg(test)]
-pub(super) fn expected_profile_for_config_for_test(
-    source_config: &serde_json::Value,
-) -> Result<(usize, usize, usize, [usize; 7])> {
-    let projected = qwen35_config_from_authenticated_source(source_config)?;
-    let mapper = context_from_config(source_config).context("mapper context")?;
-    let config = topology_config(&projected, mapper.multimodal_wrapping)?;
-    let expected = expected_sources(&config)?;
-    let mut bf16 = 0_usize;
-    let mut f32 = 0_usize;
-    let mut transforms = [0_usize; 7];
-    for source in expected.values() {
-        for output in &source.outputs {
-            match output.dtype {
-                Qwen35FutureDType::Bf16 => bf16 += 1,
-                Qwen35FutureDType::F32 => f32 += 1,
-            }
-            let index = match &output.transform {
-                Qwen35SourceTransformV1::Identity => 0,
-                Qwen35SourceTransformV1::AddOneF32 => 1,
-                Qwen35SourceTransformV1::ReorderVHeads { .. } => 2,
-                Qwen35SourceTransformV1::ReorderVHeadsThenNegExpF32 { .. } => 3,
-                Qwen35SourceTransformV1::SqueezeAxis1ThenReorderVSlice { .. } => 4,
-                Qwen35SourceTransformV1::ReorderVHeadsPerRow { .. } => 5,
-                Qwen35SourceTransformV1::SplitInterleavedQGate { .. } => 6,
-            };
-            transforms[index] += 1;
-        }
-    }
-    Ok((expected.len(), bf16, f32, transforms))
 }

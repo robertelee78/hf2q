@@ -1510,6 +1510,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",
+ "bytemuck",
  "clap",
  "clap_complete",
  "console 0.15.11",

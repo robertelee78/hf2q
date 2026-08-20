@@ -915,6 +915,56 @@ or training path. B2b must stream and hash the retained bytes into owned typed
 buffers while discharging these transform obligations; the later family runner
 must separately prove numerical execution and completion.
 
+#### 2026-08-20 — B2b bounded host-populated Metal upload
+
+B2b consumes the opaque B2a topology and returns an opaque, non-cloneable
+`VerifiedQwen35Bf16MetalUploadV1`. Before the first Metal allocation it
+reconciles every B2a source with the retained B1 record, revalidates all seven
+closed transform geometries, computes every output dtype/shape/byte count with
+checked arithmetic, and applies caller and hard bounds to output count, total
+logical bytes, single-buffer bytes, host availability, and the device's
+reported maximum and recommended working set. The capacity comparison accounts
+for exact logical output payload plus one reusable 4 MiB source-read scratch;
+caller reserves are the operator-selected allowance for unmeasured Rust/Metal
+bookkeeping and allocation granularity.
+It is not a measured peak-memory or full teacher-runtime-fit claim.
+
+Each output uses a fresh exact-sized, CPU-writable `StorageModeShared`
+`mlx-native` 0.10.16 allocation from the bound Metal device. The safe allocator
+zero-initializes the allocation and stages residency-set membership when the
+device supports it. B2b then positionally streams the already-retained source
+inode, reproduces its source hash, and initializes the complete logical output.
+BF16 identity, grouped-to-tiled/per-row reorders, and interleaved Q/gate fanout
+preserve raw 16-bit words; future F32 controls widen BF16 exactly and reuse the
+production AddOne and SLEEF-compatible reorder/NegExp semantics. The squeeze
+obligation changes only the authenticated output shape while the required
+partial V-head reorder writes the final layout. Final buffer dtype, shape,
+underlying/logical byte length, zero offset, CPU writability, non-file-backed
+storage, device registry id, distinct allocation identity, and SHA-256 are
+checked before the buffer can enter the opaque catalog. MTP and vision records
+remain explicit zero-output entries.
+
+No partially filled buffer or retained snapshot escapes on allocation, read,
+hash, transform, capacity, or final retained-file rehash failure. The canonical
+process-local receipt binds B1/B2a parents, every source/use/disposition and
+output transform, actual buffer-content hashes, device name/registry id,
+residency mode, limits, and observed capacity. Volatile capacity observations
+are excluded from the stable content-catalog hash and included in the upload
+receipt hash. No `MlxBuffer` reference is exposed because it is cloneable and
+CPU-writable; only the later family-owned teacher constructor may consume the
+catalog.
+
+B2b proves bounded host population and byte verification of owned shared Metal
+storage only. It does not prove a GPU dispatch, command-buffer submission or
+completion, numerical graph correctness, teacher logits, latency, energy,
+measured peak memory, persisted replay, sensitivity, policy quality,
+materialization, allocator admission, or `--quant auto`. The official config's
+preflight oracle is 867 buffers: 514 BF16 buffers totaling 53,786,705,920 bytes
+and 353 F32 buffers totaling 10,582,016 bytes, for 53,797,287,936 logical bytes;
+the largest single buffer is 2,542,796,800 bytes. A full official-artifact load
+time/RSS/Metal benchmark and the later execution-liveness reserve remain B3
+gates. This slice introduces no DWQ, overlay, learned affine, or training path.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
