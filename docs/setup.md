@@ -83,9 +83,14 @@ Every retained regular-file descriptor is read-only, including the optional
 installation-identity and lock inodes; this boundary acquires no lock and
 retains no write authority.
 
-Serving does not consume that proof yet. The existing legacy persistence
-implementations interpret zero as unlimited and enforce only per-store soft
-budgets, so they are intentionally not wired to it. The later managed store
-must use the fixed `<state-root>/cache/sessions` authority, one aggregate hard
-cap, and a pre-write free-space guard before this recorded policy becomes
-active.
+The positive proof has one consuming transition into a setup-private dormant
+managed store; absent and disabled proofs cannot create it. The store uses the
+fixed `<state-root>/cache/sessions` descriptor authority, one aggregate hard
+cap, a pre-admission volume reserve, immutable checksummed object/catalog
+publication, bounded hostile inventories, and exact crash recovery. It remains
+inaccessible to serving, models, CLI dispatch, and the legacy zero-unlimited
+persistors. A family-specific Qwen/SerialFifo compatibility adapter, bounded
+restore, request pinning, access-LRU, and safe replay fallback must land before
+this recorded policy becomes active. Corrupt selected dormant-store evidence
+currently fails closed and is preserved; it is not yet converted to a cache
+miss or quarantine action.

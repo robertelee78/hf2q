@@ -11,6 +11,7 @@ mod unix;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
@@ -46,6 +47,8 @@ pub(super) const MAX_OBJECT_BYTES: u64 = MAX_CHECKPOINT_BYTES + OBJECT_HEADER_BY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ManagedCacheBarrier {
+    DirectoryCreatedBeforeMode,
+    FileCreatedBeforeMode,
     AuthorizationValidated,
     ObjectPartialSynced,
     BeforeObjectPublish,
@@ -55,6 +58,10 @@ pub(super) enum ManagedCacheBarrier {
     BeforeCatalogPublish,
     CatalogPublished,
     CatalogDirectorySynced,
+    BeforeCatalogHistoryPrune,
+    CatalogHistoryPruned,
+    BeforeObjectDelete,
+    ObjectDeleted,
     EndpointSynced,
 }
 
@@ -62,6 +69,8 @@ impl ManagedCacheBarrier {
     #[cfg(test)]
     pub(super) const fn as_str(self) -> &'static str {
         match self {
+            Self::DirectoryCreatedBeforeMode => "directory-created-before-mode",
+            Self::FileCreatedBeforeMode => "file-created-before-mode",
             Self::AuthorizationValidated => "authorization-validated",
             Self::ObjectPartialSynced => "object-partial-synced",
             Self::BeforeObjectPublish => "before-object-publish",
@@ -71,6 +80,10 @@ impl ManagedCacheBarrier {
             Self::BeforeCatalogPublish => "before-catalog-publish",
             Self::CatalogPublished => "catalog-published",
             Self::CatalogDirectorySynced => "catalog-directory-synced",
+            Self::BeforeCatalogHistoryPrune => "before-catalog-history-prune",
+            Self::CatalogHistoryPruned => "catalog-history-pruned",
+            Self::BeforeObjectDelete => "before-object-delete",
+            Self::ObjectDeleted => "object-deleted",
             Self::EndpointSynced => "endpoint-synced",
         }
     }
@@ -144,8 +157,22 @@ struct StoreDirectories {
 
 struct StoreState {
     catalog: CatalogV1,
-    retained_catalog_names: Vec<String>,
+    retained_catalogs: Vec<RetainedCatalog>,
+    retained_objects: BTreeMap<String, RetainedObject>,
     needs_recovery: bool,
+}
+
+struct RetainedCatalog {
+    name: String,
+    identity: unix::EntryIdentity,
+}
+
+#[derive(Clone)]
+struct RetainedObject {
+    shard: String,
+    shard_identity: unix::EntryIdentity,
+    name: String,
+    identity: unix::EntryIdentity,
 }
 
 /// One-owner cache capability. It is intentionally non-Clone and its Debug
@@ -168,8 +195,11 @@ impl ManagedSessionCache {
             .revalidate()
             .map_err(|error| ManagedSessionCacheError::StaleAuthorization(error.to_string()))?;
         let sessions = Directory::duplicate(binding.session_directory_fd())?;
-        transaction::preflight_existing_layout(&sessions)?;
-        transaction::require_structural_capacity(&sessions, limit_bytes)?;
+        transaction::require_minimum_capacity(&sessions, limit_bytes)?;
+        let complete_layout = transaction::preflight_existing_layout(&sessions)?;
+        if !complete_layout {
+            transaction::require_new_layout_free_space(&sessions)?;
+        }
         let pending = unix::ensure_directory(&sessions, PENDING_DIR)?;
         let objects = unix::ensure_directory(&sessions, OBJECTS_DIR)?;
         let catalogs = unix::ensure_directory(&sessions, CATALOGS_DIR)?;
@@ -185,7 +215,7 @@ impl ManagedSessionCache {
             .revalidate()
             .map_err(|error| ManagedSessionCacheError::StaleAuthorization(error.to_string()))?;
         unix::verify_lock(&sessions, LOCK_NAME, &lock)?;
-        let (catalog, retained_catalog_names) =
+        let (catalog, retained_catalogs, retained_objects) =
             transaction::recover(&binding, &directories, &sessions, &lock, limit_bytes)?;
         let store = Self {
             limit_bytes,
@@ -195,7 +225,8 @@ impl ManagedSessionCache {
             lock,
             state: Mutex::new(StoreState {
                 catalog,
-                retained_catalog_names,
+                retained_catalogs,
+                retained_objects,
                 needs_recovery: false,
             }),
         };
