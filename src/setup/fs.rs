@@ -106,6 +106,10 @@ impl RuntimeConfigBinding {
             .map_err(|error| SetupError::Filesystem(error.to_string()))
     }
 
+    pub(in crate::setup) fn session_directory_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.directories.sessions.fd.as_fd()
+    }
+
     #[cfg(test)]
     pub(super) fn retained_regular_files_are_read_only_for_test(&self) -> Result<bool, SetupError> {
         self.state_binding

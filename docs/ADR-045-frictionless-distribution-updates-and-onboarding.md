@@ -26,10 +26,11 @@
   payload transfer plus offline recipe-bound source reauthentication and the
   recipe-owned paired text/projector conversion boundary plus crash-durable
   retained-source pair-receipt and prepared-profile registration are also
-  reconciled; the setup-owned read-only session-policy authorization maps an
-  absent config to no policy, zero only to disabled, and positive bytes only
-  to a retained descriptor-bound `NonZeroU64` proof without constructing a
-  persistor;
+  reconciled; the setup-owned session-policy authorization maps an absent
+  config to no policy, zero only to disabled, and positive bytes only to a
+  retained descriptor-bound `NonZeroU64` proof whose sole consuming transition
+  constructs the landed setup-private dormant managed-session store; that
+  store has no serving or family/codec consumer;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install and remaining onboarding composition, and exact-artifact
@@ -52,9 +53,9 @@ workflow:
 - the README starts with a Rust checkout and release build;
 - the GitHub release workflow publishes the crate and checksum, but no
   end-user Apple Silicon bundle;
-- the CLI now has the bounded first-run setup producer and a dormant read-only
-  typed session-policy authorization, but still has no public self-update
-  command or serving-cache consumer;
+- the CLI now has the bounded first-run setup producer, typed session-policy
+  authorization, and dormant setup-private managed-session store, but still
+  has no public self-update command or serving-cache consumer;
 - remote conversion now has a native immutable-reference/download boundary,
   a checked-in exact Qwen3.8 preparation recipe, the recipe-owned paired
   conversion, and a durable calibration-pending prepared-profile commit, but
@@ -1632,12 +1633,68 @@ Every regular file retained by this dormant authorization, including the
 installation-identity file and its namespace-binding lock inode, is opened
 read-only. It retains no writable file descriptor or lock ownership.
 
-This remains deliberately inert: the server does not call this authorization
-and it cannot construct a persistor or expose a cache path/descriptor. The
-later serving bridge must consume it into one fixed
-`<state-root>/cache/sessions` aggregate budget with pre-admission free-space
-enforcement; the current legacy zero/unset path means unlimited and therefore
-must not be wired directly.
+The positive authorization now has one consuming transition into the dormant,
+setup-private `ManagedSessionCache`; absent and disabled authorizations have no
+such transition. The transition moves the retained root/config/session proof
+and positive limit without exposing a production scalar, path, file descriptor,
+or cloneable token. The store, checkpoint key, commit, and restore surfaces are
+all private to setup, and no serving, CLI, model, scheduler, environment, or
+codec module can call them. The server therefore still does not consume this
+policy, and the legacy zero/unset-unlimited stores remain completely separate.
+
+The dormant store owns one fixed descriptor-relative namespace below
+`<state-root>/cache/sessions`: a lifetime-held nonblocking exclusive
+`.managed-session-cache.lock`; mode-`0700` `pending`, `objects`, `catalogs`, and
+`quarantine` directories; fixed `.object-v1.partial` and
+`.catalog-v1.partial` names under `pending`; immutable
+`objects/<2-lower-hex>/<64-lower-hex>.checkpoint` objects; and immutable
+`catalogs/<20-digit-generation>-<64-lower-hex>.catalog` catalog generations.
+All regular files are current-effective-user, same-device, single-link mode
+`0600`; all lookup and mutation is nofollow and relative to retained directory
+descriptors. The quarantine namespace is bounded and validated but has no
+producer in this dormant slice: corrupt selected evidence fails closed and is
+preserved rather than silently converted to a miss.
+
+Catalog v1 is canonical JSON with a final LF, at most 8 MiB and 4,096 live
+entries. Recovery accepts at most 8,192 objects, a bounded six-generation
+catalog crash window that it prunes to four retained generations, 128
+quarantine entries, and 100 GiB for one encoded checkpoint. The configured
+aggregate cap charges every store-owned child inode by the greater of logical
+bytes and allocated blocks and reserves directory-entry overhead with checked
+arithmetic; the pre-existing authorized `sessions` container is outside that
+store-owned charge.
+A limit below the greater of 1 MiB and 32 filesystem fragments rejects before
+managed-state mutation. Admission evicts the least-recently-committed dormant
+entry before either the aggregate cap or descriptor-volume free-space floor is
+crossed; this is deliberately not yet the product's access-LRU policy because
+restore has no public consumer. The floor is the greater of 20 GiB or 15% of
+the volume, with exact object, catalog, fragment, and metadata headroom checked
+before creation and again before eligibility commit.
+
+Objects stream in bounded 64 KiB writes, hash and bind their complete header,
+receipt-derived key, payload length, and payload digest, then full-sync and
+publish without replacement. Immutable catalogs use the same exact publication
+shape; the no-replace catalog rename is the eligibility/possible-commit point,
+and catalog-directory sync establishes that generation's durability. Precommit
+errors reconcile exact partial/orphan residue on the same live capability.
+Any error after a catalog may have become eligible is
+`CommittedDurabilityUnknown`, poisons that live capability, and requires a
+drop/reopen recovery before another operation. Recovery validates the selected
+catalog and every referenced object before destructive cleanup, so corruption
+preserves unrelated evidence. Restrictive-umask crashes may leave only an
+owner-private mode subset under an exact reserved name; recovery normalizes
+that same inode after owner/type/device/link checks and rejects group/world
+bits, symlinks, hard links, and foreign residue without chmod or deletion.
+
+Hosted fault/SIGABRT matrices cover every publication and destructive barrier,
+including exact same-handle cleanup, catalog-history pruning, and object
+deletion. A protected macOS gate fills a disposable constrained APFS image with
+incompressible bytes, observes a real mid-payload ENOSPC through the production
+64 KiB writer, proves same-handle cleanup and cold reopen miss, then frees space
+and commits/restores the exact checkpoint. This lands a codec-agnostic dormant
+storage substrate only. A typed Qwen/SerialFifo compatibility receipt, bounded
+streaming restore, corruption-to-miss/quarantine policy, access-recency updates,
+request pinning, and serving lifecycle remain mandatory before activation.
 
 Directory creation uses a bounded parent-relative `mkdirat`/`statat`/`chmodat`
 normalization only because macOS cannot descriptor-open a mode-`0000`
@@ -2138,12 +2195,15 @@ public text-first installer shortcut under this ADR.
 
 ### 9. Persist inactive sessions as a bounded acceleration cache
 
-hf2q builds on ADR-017 and ADR-027 rather than creating a second persistence
-system. Active and recently used sessions form the hot unified-memory tier;
-stable request-boundary prefix/KV checkpoints form a cold SSD tier under
-`~/.hf2q/cache/sessions/`. The client transcript remains authoritative: a
-checkpoint is only an acceleration artifact and its loss never loses the
-conversation.
+hf2q reuses the exact replay codec and compatibility lessons from ADR-017 and
+ADR-027, but it does not reuse their path-based or zero-unlimited mutation
+authority. The landed setup-private managed store is the new descriptor-bound,
+aggregate-cap substrate; it remains dormant and codec-agnostic. Once the typed
+family adapter and serving gate land, active and recently used sessions form
+the hot unified-memory tier while stable request-boundary prefix/KV checkpoints
+form a cold SSD tier under `<state-root>/cache/sessions/`. The client transcript
+remains authoritative: a checkpoint is only an acceleration artifact and its
+loss never loses the conversation.
 
 After each successful turn, hf2q atomically commits a sparse latest-useful
 checkpoint. On memory pressure it spills or reuses the durable checkpoint for
@@ -2162,14 +2222,17 @@ permission, or incompatible version becomes a cache miss and normal prefill.
 
 The setup-recorded byte limit is mandatory. A disabled policy is encoded as
 zero; every enabled policy has a positive limit, and zero never means unlimited.
-Writes use private directories/files, checksums, atomic publication, sparse
-checkpoints, and LRU disk eviction before the limit or free-space guard is
-crossed. A disk write failure warns and falls back to safe transcript replay
-rather than blocking unrelated new work. The current tree
-already proves selected SerialFifo Qwen restart hydration; multi-slot Qwen3.8
-vision restoration remains release work and must pass exact-artifact semantic,
-isolation, disk-budget, cancellation, crash, and restart gates before the guide
-claims it.
+The dormant store already proves private descriptor-relative files and
+directories, checksummed immutable objects, catalog-only eligibility, one
+aggregate hard cap, pre-admission free-space enforcement, bounded writes,
+crash recovery, and least-recently-committed eviction. Product activation still
+requires request-access recency and active-request pins so eviction becomes
+true inactive-session LRU, plus the typed family receipt/codec adapter and
+error-to-safe-replay policy. The current legacy tree already proves selected
+SerialFifo Qwen restart hydration, but it is not wired to the managed store.
+Multi-slot Qwen3.8 vision restoration remains release work and must pass
+exact-artifact semantic, isolation, disk-budget, cancellation, crash, and
+restart gates before the guide claims it.
 
 ### 10. Keep every external integration optional
 
@@ -2306,7 +2369,7 @@ support.
 | Wrong text/projector pair | Preparation, startup, `/v1/models`, and image requests fail closed. |
 | Stale or incompatible calibration | Artifact, hardware, ABI, template, scheduler, or settings mismatch invalidates the profile and requires recalibration or a hardware-table profile. |
 | KV checkpoint leakage or corruption | Exact prefix/identity/codec/vision gates reject cross-session reuse; corruption becomes a cache miss and is quarantined. |
-| Session cache fills disk | Setup-recorded byte/free-space guards and LRU eviction stop writes before the boundary; unlimited mode is not accepted. |
+| Session cache fills disk | The dormant store enforces the setup-recorded aggregate cap and descriptor-volume floor with least-recently-committed eviction; activation additionally requires true inactive-session access-LRU and request pins. Unlimited product mode is never accepted. |
 | Existing optional-integration config | Parse/merge validation or no write; never truncate, replace, or silently discard entries. |
 | Port or memory conflict | Calibration/launcher refuses before loading the large model and gives a direct recovery command. |
 
@@ -2377,19 +2440,23 @@ before public self-update ships.
    crash-durably publishes the inert canonical TOML without creating
    installation identity or granting persistence authority. Its read-only
    runtime-policy authorization has also landed: absent and zero remain closed
-   no-persistor states, while a positive limit mints only a retained
-   descriptor-bound `NonZeroU64` proof. It is still dormant and grants no
-   cache-construction authority. Every schema lands with bounded hostile input and
-   golden-byte fixtures; schema parsing alone never creates an authenticated
-   or ownership-verified capability.
+   no-store states, while a positive limit mints a retained descriptor-bound
+   `NonZeroU64` proof whose only consuming transition moves that proof into the
+   landed setup-private dormant managed store. The store now proves the fixed
+   descriptor-relative namespace, immutable object/catalog schemas, one
+   aggregate hard cap, descriptor-volume floor, exact crash recovery, and
+   protected APFS ENOSPC path. It remains unreachable from serving and has no
+   family/codec compatibility adapter. Every schema lands with bounded hostile
+   input and golden-byte fixtures; schema parsing alone never creates an
+   authenticated or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate
    bounded journal schema and recovery state machine; activation receipts stay
    immutable.
 2. Compose the standalone installer with the unified `~/.hf2q` state layout
-   and idempotent Bash/zsh PATH ownership, then consume the already-landed
-   typed setup authorization into session persistence only after the managed
-   store proves one aggregate hard cap, pre-write free-space enforcement,
-   crash-safe descriptor-relative mutation, and exact SerialFifo replay.
+   and idempotent Bash/zsh PATH ownership. Next, add the sealed Qwen text
+   compatibility receipt and bounded streaming adapter, consume the dormant
+   store only for SerialFifo after exact replay/cancellation/request-pin gates,
+   and keep SlotAware and vision persistence disabled until their later gates.
 3. Converge conversion on the exact-revision native downloader, add positional
    canonical model references, the accepted Qwen3.8 quantization/profile
    matrix, source-retention transaction, and receipt-bound text/projector
@@ -2459,6 +2526,11 @@ files.
 - setup passes fresh, cancelled, repeated, malformed-existing-config, and
   non-interactive cases, including no-positive-safe-disk-band and zero-limit
   rejection, without destructive or duplicate changes;
+- the dormant managed-session store passes exact aggregate-cap, free-floor,
+  descriptor/leaf replacement, hostile residue, concurrent lock, corruption-
+  preservation, restrictive-umask, same-handle fault, fresh-process SIGABRT,
+  and immutable-catalog recovery matrices; the protected disposable-APFS gate
+  proves a real mid-payload ENOSPC cleanup/reopen/retry cycle;
 - tampered metadata/archive/manifest, traversal/link archives, interrupted and
   concurrent transitions, unsupported host/macOS, and owner mismatch fail as
   specified;
@@ -2508,9 +2580,10 @@ files.
   missing/mismatched projector, and unsafe URL forms fail before model load;
 - a successfully served cached external artifact triggers no remote update
   check, while explicit `--refresh` is deterministic and receipt-bound;
-- setup's `[Y/n]` policy records the displayed byte limit, enforces sparse LRU
-  disk use and the free-space guard, and never permits an unlimited product
-  cache;
+- setup's `[Y/n]` policy records the displayed byte limit and never permits an
+  unlimited product cache; the dormant store enforces that aggregate cap and
+  free-space guard, while serving activation must additionally prove true
+  inactive-session access-LRU, request pins, and bounded streaming restore;
 - cold-process Qwen3.8 text and image conversations restore the longest exact
   prefix with correct output/tool semantics, while unrelated conversation,
   tenant, image, model, template, codec, scheduler, and settings cases cannot

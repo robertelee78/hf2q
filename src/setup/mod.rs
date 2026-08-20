@@ -1,5 +1,7 @@
 mod fs;
 mod host;
+#[allow(dead_code)]
+pub(crate) mod managed_session_cache;
 mod policy;
 #[allow(dead_code)]
 pub(crate) mod runtime_policy;

@@ -57,10 +57,11 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/doctor.rs        `hf2q doctor` runtime diagnostic
 ├── src/setup/           `hf2q setup` host inventory, canonical bounded TOML,
 │                        disk-aware zero-disabled session policy, and private
-│                        descriptor-relative crash-durable publication, plus a
-│                        dormant read-only absent/disabled/NonZero authorization
-│                        retaining exact root/config/session identities; no
-│                        serving-cache constructor exists yet
+│                        descriptor-relative crash-durable publication, plus
+│                        exact absent/disabled/NonZero authorization and the
+│                        dormant `managed_session_cache/{catalog,transaction,
+│                        unix}` aggregate-cap/free-floor store; no serving or
+│                        family/codec consumer exists yet
 ├── src/preflight.rs     ADR-012 preflight checks (disk, token, …)
 ├── src/progress.rs      indicatif-based progress reporting
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
