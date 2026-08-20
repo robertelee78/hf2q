@@ -331,6 +331,12 @@ jobs:
                and $d.decode_cohort.model_sha256 == $deepseek_sha
                and $d.decode_cohort.parity.exact_state_logits_cache_recurrent == true
                and $d.decode_cohort.benchmark.speedup > 1
+               and $d.decode_cohort.thermal_status == "fair_or_better"
+               and $d.decode_cohort.required_start_state == "nominal"
+               and $d.decode_cohort.maximum_measurement_state == "fair"
+               and $d.decode_cohort.over_limit_measurement_samples == 0
+               and $d.decode_cohort.non_nominal_measurement_samples
+                 == $d.decode_cohort.fair_measurement_samples
                and ($d.full_context_waves | length) == 2
                and ([$d.full_context_waves[].wave] | sort) == [1, 2]
                and all($d.full_context_waves[];
