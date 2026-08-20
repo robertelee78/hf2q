@@ -195,7 +195,7 @@ pub const DEFAULT_MEMORY_BUDGET_FRACTION: f64 = 0.80;
 /// buffers.  The hot-swap orchestrator (iter-208) maintains a
 /// parallel `HashMap<String, Arc<Engine>>` keyed by `repo_id` and
 /// uses this pool's eviction decisions to drop entries from that map.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedHandle {
     /// HuggingFace repo id (`org/repo`), the canonical pool key.
     pub repo_id: String,
@@ -274,7 +274,7 @@ impl std::error::Error for PoolError {}
 ///
 /// See module docs for the eviction algorithm and what this type does
 /// (and explicitly does NOT) do.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LoadedPool {
     /// Maximum number of distinct repos resident.  See module docs.
     capacity_models: usize,
@@ -288,6 +288,35 @@ pub struct LoadedPool {
     /// Cumulative `bytes_resident` across `entries`.  Maintained
     /// incrementally so capacity checks are O(1).
     total_resident_bytes: u64,
+    /// Monotonic mutation revision used to bind diagnostic admission
+    /// confirmations to the exact LRU/budget state they displayed.
+    revision: u64,
+}
+
+/// Operator-visible result of the pool's pure admission calculation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionOutcome {
+    Resident,
+    FitsAlongside {
+        projected_bytes: u64,
+    },
+    WouldEvict {
+        victims: Vec<LoadedHandle>,
+        projected_bytes: u64,
+    },
+    Impossible {
+        reason: PoolError,
+    },
+}
+
+/// Pure admission receipt. The private post-state is consumed by
+/// [`LoadedPool::insert`], keeping planning and execution on one algorithm.
+#[derive(Debug, Clone)]
+pub struct AdmissionPlan {
+    pub revision: u64,
+    pub outcome: AdmissionOutcome,
+    next_pool: Option<LoadedPool>,
+    evicted: Vec<LoadedHandle>,
 }
 
 impl LoadedPool {
@@ -304,6 +333,7 @@ impl LoadedPool {
             entries: HashMap::with_capacity(capacity_models.max(1)),
             lru_order: Vec::with_capacity(capacity_models.max(1)),
             total_resident_bytes: 0,
+            revision: 0,
         }
     }
 
@@ -377,6 +407,12 @@ impl LoadedPool {
         self.total_resident_bytes
     }
 
+    /// Monotonic revision of admission-relevant state (membership, bytes,
+    /// and LRU order). Read-only diagnostics do not change it.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Number of currently-resident handles.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -404,8 +440,11 @@ impl LoadedPool {
         }
         // Move the entry to the back of `lru_order` (MRU end).
         if let Some(pos) = self.lru_order.iter().position(|r| r == repo_id) {
-            let key = self.lru_order.remove(pos);
-            self.lru_order.push(key);
+            if pos + 1 != self.lru_order.len() {
+                let key = self.lru_order.remove(pos);
+                self.lru_order.push(key);
+                self.revision = self.revision.saturating_add(1);
+            }
         }
         true
     }
@@ -430,7 +469,46 @@ impl LoadedPool {
         self.total_resident_bytes = self
             .total_resident_bytes
             .saturating_sub(handle.bytes_resident);
+        self.revision = self.revision.saturating_add(1);
         Some(handle)
+    }
+
+    /// Calculate admission without mutating membership, bytes, LRU order,
+    /// or revision. The returned private post-state is the exact state that
+    /// [`Self::insert`] commits, preventing prediction/execution drift.
+    pub fn admission_plan(&self, handle: &LoadedHandle) -> AdmissionPlan {
+        let was_resident = self.entries.contains_key(&handle.repo_id);
+        let mut next_pool = self.clone();
+        match next_pool.insert_unplanned(handle.clone()) {
+            Ok(evicted) => {
+                next_pool.revision = self.revision.saturating_add(1);
+                let projected_bytes = next_pool.total_resident_bytes;
+                let outcome = if was_resident {
+                    AdmissionOutcome::Resident
+                } else if evicted.is_empty() {
+                    AdmissionOutcome::FitsAlongside { projected_bytes }
+                } else {
+                    AdmissionOutcome::WouldEvict {
+                        victims: evicted.clone(),
+                        projected_bytes,
+                    }
+                };
+                AdmissionPlan {
+                    revision: self.revision,
+                    outcome,
+                    next_pool: Some(next_pool),
+                    evicted,
+                }
+            }
+            Err(reason) => AdmissionPlan {
+                revision: self.revision,
+                outcome: AdmissionOutcome::Impossible {
+                    reason: reason.clone(),
+                },
+                next_pool: None,
+                evicted: Vec::new(),
+            },
+        }
     }
 
     /// Insert a handle into the pool, evicting LRU entries as needed.
@@ -453,6 +531,21 @@ impl LoadedPool {
     ///   to fit it (i.e. impossible to satisfy under any LRU
     ///   eviction sequence).
     pub fn insert(&mut self, handle: LoadedHandle) -> Result<Vec<LoadedHandle>, PoolError> {
+        let plan = self.admission_plan(&handle);
+        match plan.outcome {
+            AdmissionOutcome::Impossible { reason } => Err(reason),
+            _ => {
+                let next_pool = plan
+                    .next_pool
+                    .expect("successful admission plan carries post-state");
+                *self = next_pool;
+                Ok(plan.evicted)
+            }
+        }
+    }
+
+    /// Mutating implementation used only on a cloned pool while planning.
+    fn insert_unplanned(&mut self, handle: LoadedHandle) -> Result<Vec<LoadedHandle>, PoolError> {
         if self.capacity_models == 0 {
             return Err(PoolError::ZeroCapacity);
         }
@@ -618,6 +711,10 @@ pub struct LoadedEngine<E> {
     pub bytes_resident: u64,
     /// Wall-clock when the engine finished loading.
     pub loaded_at: SystemTime,
+    /// Monotonic identity for this concrete admission. A later engine for
+    /// the same pool key receives a different generation so request leases
+    /// from the old engine can never be mistaken for the new one.
+    pub generation: u64,
 }
 
 /// Trait for loading a GGUF into a live engine of type `E`.
@@ -857,6 +954,7 @@ pub struct PoolStats {
     pub capacity_models: usize,
     pub total_resident_bytes: u64,
     pub memory_budget_bytes: u64,
+    pub revision: u64,
 }
 
 /// Per-loaded-handle summary for `/v1/models` extension fields.
@@ -869,7 +967,54 @@ pub struct LoadedSummary {
     pub pool_key: String,
     pub quant: String,
     pub bytes_resident: u64,
+    pub generation: u64,
 }
+
+/// Result of the diagnostic no-evict load path.
+#[derive(Debug)]
+pub enum NonEvictingLoad<E> {
+    Resident(Arc<LoadedEngine<E>>),
+    Loaded(Arc<LoadedEngine<E>>),
+    Conflict(AdmissionPlan),
+}
+
+/// Opaque, non-cloneable receipt proving exactly which engine instances
+/// were spilled by [`HotSwapManager::prepare_evictions`].
+#[derive(Debug)]
+pub struct PreparedEvictions<E> {
+    revision: u64,
+    entries: Vec<(LoadedHandle, Arc<LoadedEngine<E>>)>,
+}
+
+impl<E> PreparedEvictions<E> {
+    pub fn engines(&self) -> impl Iterator<Item = &Arc<LoadedEngine<E>>> {
+        self.entries.iter().map(|(_, engine)| engine)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedEvictionError {
+    StaleRevision { expected: u64, actual: u64 },
+    VictimChanged { pool_key: String },
+}
+
+impl std::fmt::Display for PreparedEvictionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleRevision { expected, actual } => {
+                write!(
+                    f,
+                    "pool revision changed: expected {expected}, actual {actual}"
+                )
+            }
+            Self::VictimChanged { pool_key } => {
+                write!(f, "confirmed eviction victim changed: {pool_key}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedEvictionError {}
 
 /// Errors returned by [`HotSwapManager`] operations.
 #[derive(Debug)]
@@ -1013,6 +1158,7 @@ pub struct HotSwapManager<E> {
     /// pool.get(k).is_some()` for every `k` after every `load_or_get` /
     /// `evict` call returns.
     engines: HashMap<String, Arc<LoadedEngine<E>>>,
+    next_generation: u64,
 }
 
 impl<E> HotSwapManager<E> {
@@ -1051,6 +1197,7 @@ impl<E> HotSwapManager<E> {
             spiller,
             kv_counters: None,
             engines: HashMap::new(),
+            next_generation: 1,
         }
     }
 
@@ -1097,6 +1244,7 @@ impl<E> HotSwapManager<E> {
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
+            generation: self.allocate_generation(),
         });
         let handle = LoadedHandle {
             repo_id: k.clone(),
@@ -1119,6 +1267,7 @@ impl<E> HotSwapManager<E> {
             capacity_models: self.pool.capacity_models(),
             total_resident_bytes: self.pool.total_resident_bytes(),
             memory_budget_bytes: self.pool.memory_budget_bytes(),
+            revision: self.pool.revision(),
         }
     }
 
@@ -1150,7 +1299,50 @@ impl<E> HotSwapManager<E> {
             pool_key: h.repo_id.clone(),
             quant: h.quant.clone(),
             bytes_resident: h.bytes_resident,
+            generation: self
+                .engines
+                .get(&h.repo_id)
+                .map(|engine| engine.generation)
+                .unwrap_or(0),
         })
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        generation
+    }
+
+    /// Pure admission plan for a candidate whose byte estimate is already
+    /// known. This does not touch LRU state and does not invoke the loader.
+    pub fn admission_plan(
+        &self,
+        repo: &str,
+        quant: QuantType,
+        bytes_resident: u64,
+    ) -> AdmissionPlan {
+        self.pool.admission_plan(&LoadedHandle {
+            repo_id: pool_key(repo, quant),
+            quant: quant.as_str().to_string(),
+            loaded_at: SystemTime::UNIX_EPOCH,
+            bytes_resident,
+        })
+    }
+
+    /// Read the GGUF-size estimate and calculate admission without loading.
+    pub fn plan_path(
+        &self,
+        repo: &str,
+        quant: QuantType,
+        gguf_path: &Path,
+    ) -> Result<AdmissionPlan, HotSwapError> {
+        let bytes_resident = std::fs::metadata(gguf_path)
+            .map_err(|source| HotSwapError::FileSize {
+                path: gguf_path.to_path_buf(),
+                source,
+            })?
+            .len();
+        Ok(self.admission_plan(repo, quant, bytes_resident))
     }
 
     /// Force-drop the entry for `(repo, quant)` — symmetric to
@@ -1168,38 +1360,185 @@ impl<E> HotSwapManager<E> {
     /// `hf2q_pool_kv_spills_total{outcome=...}` counter.
     pub fn evict(&mut self, repo: &str, quant: QuantType) -> u64 {
         let k = pool_key(repo, quant);
-        let removed = self.pool.remove(&k);
-        // Eviction-hook trigger.  Fire BEFORE the manager's Arc drops
-        // from `engines` so the spiller observes a live Arc.  Lookup
-        // happens before remove() to capture the handle for the call;
-        // we only fire when both the pool AND the engines map agree
-        // the entry exists (the back-compat defensive `engines.remove`
-        // below covers the desync case without firing the hook).
-        if let (Some(handle), Some(arc)) = (removed.as_ref(), self.engines.get(&k).cloned()) {
-            let outcome = self.spiller.pre_evict(handle, &arc);
-            // ADR-005 Phase 4 reopen iter-213 (AC 5472): record outcome
-            // to `hf2q_pool_kv_spills_total{repo,quant,outcome=...}`.
-            // Skipped does NOT increment (closed-enum guard).
-            if let Some(counters) = self.kv_counters.as_ref() {
-                counters.record_spill(repo, quant, outcome);
+        let Some(summary) = self.iter_loaded().find(|entry| entry.pool_key == k) else {
+            return 0;
+        };
+        let bytes = summary.bytes_resident;
+        let expected_revision = self.pool.revision();
+        match self.prepare_evictions(expected_revision, &[summary]) {
+            Ok(prepared) => {
+                // ADR-005's ordinary request path intentionally commits
+                // immediately; diagnostic switching inserts a lease drain
+                // and worker shutdown between these two phases.
+                if self.commit_prepared(prepared).is_ok() {
+                    bytes
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Run the spill phase for an exact revision-bound victim set without
+    /// changing pool membership. All identities are prevalidated before the
+    /// first spill, and the returned token cannot be cloned, so a successful
+    /// switch cannot accidentally spill the same generation twice.
+    pub fn prepare_evictions(
+        &self,
+        expected_revision: u64,
+        victims: &[LoadedSummary],
+    ) -> Result<PreparedEvictions<E>, PreparedEvictionError> {
+        let actual = self.pool.revision();
+        if actual != expected_revision {
+            return Err(PreparedEvictionError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+
+        let mut entries = Vec::with_capacity(victims.len());
+        for victim in victims {
+            let Some(handle) = self.pool.get(&victim.pool_key).cloned() else {
+                return Err(PreparedEvictionError::VictimChanged {
+                    pool_key: victim.pool_key.clone(),
+                });
+            };
+            let Some(engine) = self.engines.get(&victim.pool_key).cloned() else {
+                return Err(PreparedEvictionError::VictimChanged {
+                    pool_key: victim.pool_key.clone(),
+                });
+            };
+            if handle.quant != victim.quant
+                || handle.bytes_resident != victim.bytes_resident
+                || engine.generation != victim.generation
+            {
+                return Err(PreparedEvictionError::VictimChanged {
+                    pool_key: victim.pool_key.clone(),
+                });
+            }
+            entries.push((handle, engine));
+        }
+
+        for (handle, engine) in &entries {
+            let outcome = self.spiller.pre_evict(handle, engine);
+            if let (Some(counters), Some((repo, quant))) = (
+                self.kv_counters.as_ref(),
+                unpack_pool_key(&handle.repo_id, &handle.quant),
+            ) {
+                counters.record_spill(&repo, quant, outcome);
             }
         }
-        // Drop the engines map entry symmetrically.  If the pool didn't
-        // know about the key (already-evicted from a prior call), the
-        // engines map shouldn't have it either by the invariant — but
-        // we remove unconditionally to be defensive.
-        self.engines.remove(&k);
-        // ADR-017 Closure iter-7 (2026-05-04): drop the spiller's
-        // per-family hook AFTER engines.remove. The hook holds a
-        // cloned `Engine` (iter-3 Phase-E fix) whose inner
-        // `Arc<EngineInner>` keeps the worker thread alive — without
-        // this drop_family call, every model-swap cycle leaks ~16
-        // GB of RSS (verified iter-7 stress smoke: 19.5 GB → 80 GB
-        // after 3 iters). drop_family is a no-op for `NoopKvSpiller`
-        // (no state to release); `BlockPrefixCacheSpiller` overrides
-        // to call `unregister_family` on its registrations map.
-        self.spiller.drop_family(repo, quant);
-        removed.map(|h| h.bytes_resident).unwrap_or(0)
+        Ok(PreparedEvictions {
+            revision: expected_revision,
+            entries,
+        })
+    }
+
+    /// Commit a previously prepared exact victim set. No spill hook runs in
+    /// this phase. Identity and revision are rechecked before any removal.
+    pub fn commit_prepared(
+        &mut self,
+        prepared: PreparedEvictions<E>,
+    ) -> Result<u64, PreparedEvictionError> {
+        let actual = self.pool.revision();
+        if actual != prepared.revision {
+            return Err(PreparedEvictionError::StaleRevision {
+                expected: prepared.revision,
+                actual,
+            });
+        }
+        for (handle, expected_engine) in &prepared.entries {
+            let current = self.engines.get(&handle.repo_id).ok_or_else(|| {
+                PreparedEvictionError::VictimChanged {
+                    pool_key: handle.repo_id.clone(),
+                }
+            })?;
+            if !Arc::ptr_eq(current, expected_engine) {
+                return Err(PreparedEvictionError::VictimChanged {
+                    pool_key: handle.repo_id.clone(),
+                });
+            }
+        }
+
+        let mut removed_bytes = 0u64;
+        for (handle, _) in &prepared.entries {
+            if let Some(removed) = self.pool.remove(&handle.repo_id) {
+                removed_bytes = removed_bytes.saturating_add(removed.bytes_resident);
+            }
+            self.engines.remove(&handle.repo_id);
+            if let Some((repo, quant)) = unpack_pool_key(&handle.repo_id, &handle.quant) {
+                self.spiller.drop_family(&repo, quant);
+            }
+        }
+        Ok(removed_bytes)
+    }
+
+    /// Load and warm only when the canonical plan has no victims. Conflict
+    /// and impossible plans return before the loader is invoked.
+    pub fn load_or_get_non_evicting(
+        &mut self,
+        repo: &str,
+        quant: QuantType,
+        gguf_path: &Path,
+        config: &EngineConfig,
+    ) -> Result<NonEvictingLoad<E>, HotSwapError> {
+        let k = pool_key(repo, quant);
+        if let Some(existing) = self.engines.get(&k).cloned() {
+            self.pool.touch(&k);
+            return Ok(NonEvictingLoad::Resident(existing));
+        }
+
+        let bytes_resident = std::fs::metadata(gguf_path)
+            .map_err(|source| HotSwapError::FileSize {
+                path: gguf_path.to_path_buf(),
+                source,
+            })?
+            .len();
+        let plan = self.admission_plan(repo, quant, bytes_resident);
+        if !matches!(plan.outcome, AdmissionOutcome::FitsAlongside { .. }) {
+            return Ok(NonEvictingLoad::Conflict(plan));
+        }
+
+        let engine = self
+            .loader
+            .load(gguf_path, config)
+            .map_err(HotSwapError::LoaderFailed)?;
+        let loaded_engine = Arc::new(LoadedEngine {
+            engine,
+            repo: repo.to_string(),
+            quant,
+            bytes_resident,
+            loaded_at: SystemTime::now(),
+            generation: self.allocate_generation(),
+        });
+        let handle = LoadedHandle {
+            repo_id: k.clone(),
+            quant: quant.as_str().to_string(),
+            loaded_at: loaded_engine.loaded_at,
+            bytes_resident,
+        };
+        let evicted = self
+            .pool
+            .insert(handle)
+            .map_err(HotSwapError::PoolRefused)?;
+        debug_assert!(
+            evicted.is_empty(),
+            "non-evicting admission published a victim"
+        );
+        if !evicted.is_empty() {
+            return Ok(NonEvictingLoad::Conflict(self.admission_plan(
+                repo,
+                quant,
+                bytes_resident,
+            )));
+        }
+        let outcome = self.spiller.post_admit(repo, quant, &loaded_engine);
+        if let Some(counters) = self.kv_counters.as_ref() {
+            counters.record_restore(repo, quant, outcome);
+        }
+        self.engines.insert(k, Arc::clone(&loaded_engine));
+        Ok(NonEvictingLoad::Loaded(loaded_engine))
     }
 
     /// Return the engine for `(repo, quant)`, loading + admitting if
@@ -1255,6 +1594,7 @@ impl<E> HotSwapManager<E> {
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
+            generation: self.allocate_generation(),
         });
 
         // Admit to the pool.  May evict LRU entries; we drop the
@@ -1349,6 +1689,66 @@ mod tests {
 
     fn h(repo: &str, bytes: u64) -> LoadedHandle {
         LoadedHandle::new(repo, "Q4_K_M", bytes)
+    }
+
+    #[test]
+    fn admission_plan_is_pure_and_execution_matches_exact_victims() {
+        let mut pool = LoadedPool::with_capacity_and_budget(2, 800);
+        pool.insert(h("a/1", 400)).unwrap();
+        pool.insert(h("b/2", 400)).unwrap();
+        let revision = pool.revision();
+        let before_order: Vec<_> = pool.iter().map(|h| h.repo_id.clone()).collect();
+
+        let candidate = h("c/3", 500);
+        let plan = pool.admission_plan(&candidate);
+        let victims = match &plan.outcome {
+            AdmissionOutcome::WouldEvict {
+                victims,
+                projected_bytes,
+            } => {
+                assert_eq!(*projected_bytes, 500);
+                victims
+            }
+            other => panic!("expected eviction plan, got {other:?}"),
+        };
+        assert_eq!(
+            victims
+                .iter()
+                .map(|h| h.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a/1", "b/2"]
+        );
+        assert_eq!(pool.revision(), revision);
+        assert_eq!(
+            pool.iter().map(|h| h.repo_id.clone()).collect::<Vec<_>>(),
+            before_order
+        );
+
+        let executed = pool.insert(candidate).unwrap();
+        assert_eq!(executed, *victims);
+        assert_eq!(pool.revision(), revision + 1);
+    }
+
+    #[test]
+    fn admission_plan_covers_resident_fits_and_impossible() {
+        let mut pool = LoadedPool::with_capacity_and_budget(2, 1_000);
+        pool.insert(h("a/1", 300)).unwrap();
+        assert!(matches!(
+            pool.admission_plan(&h("a/1", 300)).outcome,
+            AdmissionOutcome::Resident
+        ));
+        assert!(matches!(
+            pool.admission_plan(&h("b/2", 400)).outcome,
+            AdmissionOutcome::FitsAlongside {
+                projected_bytes: 700
+            }
+        ));
+        assert!(matches!(
+            pool.admission_plan(&h("huge/1", 1_001)).outcome,
+            AdmissionOutcome::Impossible {
+                reason: PoolError::OversizedHandle { .. }
+            }
+        ));
     }
 
     // --- Construction --------------------------------------------------
@@ -1737,6 +2137,51 @@ mod tests {
 
     fn empty_config() -> EngineConfig {
         EngineConfig::default()
+    }
+
+    #[test]
+    fn non_evicting_conflict_never_calls_loader() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 800);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let first = synthetic_gguf(400);
+        let second = synthetic_gguf(500);
+        mgr.load_or_get("a/1", QuantType::Q4_K_M, first.path(), &empty_config())
+            .unwrap();
+        assert_eq!(loader.call_count(), 1);
+
+        let result = mgr
+            .load_or_get_non_evicting("b/2", QuantType::Q4_K_M, second.path(), &empty_config())
+            .unwrap();
+        assert!(matches!(result, NonEvictingLoad::Conflict(_)));
+        assert_eq!(loader.call_count(), 1, "conflict must precede loader");
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn prepared_eviction_is_revision_and_generation_bound() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(2, 1_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let file = synthetic_gguf(400);
+        let old = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, file.path(), &empty_config())
+            .unwrap();
+        let summary = mgr.iter_loaded().next().unwrap();
+        let revision = mgr.pool_stats().revision;
+
+        mgr.evict("a/1", QuantType::Q4_K_M);
+        let replacement = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, file.path(), &empty_config())
+            .unwrap();
+        assert_ne!(old.generation, replacement.generation);
+        let err = mgr.prepare_evictions(revision, &[summary]).unwrap_err();
+        assert!(matches!(
+            err,
+            PreparedEvictionError::StaleRevision { .. }
+                | PreparedEvictionError::VictimChanged { .. }
+        ));
     }
 
     // --- Load + reuse path ---------------------------------------------

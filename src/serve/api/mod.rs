@@ -22,6 +22,10 @@
 
 #![allow(dead_code)] // some handlers + state helpers land with the engine iter
 
+pub(crate) const DIAGNOSTIC_NO_EVICT_HEADER: &str = "x-hf2q-diagnostic-no-evict";
+pub(crate) const DIAGNOSTIC_NO_EVICT_VALUE: &str = "1";
+
+pub mod control;
 pub mod embedding_pool;
 pub mod engine;
 pub mod engine_deepseek4;
@@ -31,6 +35,7 @@ mod engine_supervisor;
 pub mod grammar;
 pub mod handlers;
 pub mod kv_spill_descriptor;
+pub mod lifecycle;
 pub mod middleware;
 pub mod registry;
 pub mod router;

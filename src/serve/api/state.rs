@@ -17,16 +17,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::engine::Engine;
 use super::schema::OverflowPolicy;
 use crate::core::hardware::HardwareProfile;
+use crate::inference::models::bert::BertConfig;
 use crate::inference::models::bert::config::PoolingType;
 use crate::inference::models::bert::weights::LoadedBertWeights;
-use crate::inference::models::bert::BertConfig;
 use crate::inference::models::nomic_bert::{LoadedNomicBertWeights, NomicBertConfig};
 use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
@@ -307,8 +307,8 @@ pub struct KvSpillCounters {
 // a dependency of the narrow `kv_persist` lib facade. See the
 // `kv_persist::metrics` module docs for the why.
 pub use crate::serve::kv_persist::metrics::{
-    KvCacheMetricsSink, KvQuarantineReason, KV_EVICTION_TRIGGERS, KV_EVICTION_TRIGGER_COUNT,
-    KV_QUARANTINE_REASONS, KV_QUARANTINE_REASON_COUNT,
+    KV_EVICTION_TRIGGER_COUNT, KV_EVICTION_TRIGGERS, KV_QUARANTINE_REASON_COUNT,
+    KV_QUARANTINE_REASONS, KvCacheMetricsSink, KvQuarantineReason,
 };
 const KV_EVICTION_TRIGGER_BUDGET_OVERFLOW: usize = 0;
 
@@ -541,6 +541,10 @@ pub struct AppState {
     /// (every generation request returns 400 `model_not_loaded` — the
     /// auto-pipeline cannot resolve an empty / unspecified `req.model`).
     pub pool: Arc<std::sync::RwLock<HotSwapManager<Engine>>>,
+    /// ADR-047 model-admission gate plus generation-bound request leases.
+    /// Ordinary OpenAI resolution takes a shared guard; explicit diagnostic
+    /// switching takes the exclusive guard and drains exact generations.
+    pub model_lifecycle: Arc<super::lifecycle::ModelLifecycleCoordinator>,
     /// On-disk cache (`~/.cache/hf2q/`).  Held behind `Arc<Mutex<_>>` so
     /// concurrent handlers that resolve a `req.model` through the
     /// auto-pipeline (which may mutate the manifest on download /
@@ -801,6 +805,7 @@ impl AppState {
             ready_for_gen: Arc::new(AtomicBool::new(true)),
             request_counter: Arc::new(AtomicU64::new(0)),
             pool: Arc::new(std::sync::RwLock::new(manager)),
+            model_lifecycle: Arc::new(super::lifecycle::ModelLifecycleCoordinator::default()),
             cache: Arc::new(std::sync::Mutex::new(cache)),
             hardware: Arc::new(hardware),
             no_integrity,
@@ -866,6 +871,7 @@ impl AppState {
             ready_for_gen: Arc::new(AtomicBool::new(true)),
             request_counter: Arc::new(AtomicU64::new(0)),
             pool: Arc::new(std::sync::RwLock::new(manager)),
+            model_lifecycle: Arc::new(super::lifecycle::ModelLifecycleCoordinator::default()),
             cache: Arc::new(std::sync::Mutex::new(cache)),
             hardware: Arc::new(hardware),
             no_integrity: false,
@@ -1053,7 +1059,7 @@ mod tests {
         // tokenizers crate correctly (integration of iter-20 tokenizer
         // builder with iter-21 state struct).
         use crate::inference::models::bert::{
-            build_wordpiece_tokenizer, BertSpecialTokens, BertVocab,
+            BertSpecialTokens, BertVocab, build_wordpiece_tokenizer,
         };
         // Synthetic vocab using llama.cpp's BERT-WPM convention:
         // word-starter tokens are prefixed with ▁ (U+2581). The

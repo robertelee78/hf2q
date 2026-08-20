@@ -1815,6 +1815,7 @@ mod tests {
             quant,
             bytes_resident: 1 << 30,
             loaded_at: SystemTime::now(),
+            generation: 1,
         })
     }
 

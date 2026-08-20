@@ -81,6 +81,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::StreamExt;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
@@ -567,6 +568,43 @@ pub(crate) fn generation_events_to_sse_with_metrics(
     )
 }
 
+/// Metrics-aware SSE whose stream owns an arbitrary lifetime guard. The
+/// guard is dropped only when the stream terminates or the HTTP body is
+/// dropped, which lets ADR-047 bind a model lease to the complete SSE body.
+pub(crate) fn generation_events_to_sse_with_metrics_and_guard<G>(
+    rx: mpsc::Receiver<GenerationEvent>,
+    request_id: String,
+    model_name: String,
+    created: i64,
+    opts: SseStreamOptions,
+    metrics: Arc<ServerMetrics>,
+    guard: G,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+where
+    G: Send + 'static,
+{
+    let inner = generation_events_stream_with_metrics(
+        rx,
+        request_id,
+        model_name,
+        created,
+        opts,
+        Some(metrics),
+    );
+    let guarded = async_stream::stream! {
+        let _guard = guard;
+        futures::pin_mut!(inner);
+        while let Some(item) = inner.next().await {
+            yield item;
+        }
+    };
+    Sse::new(guarded).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(SSE_KEEPALIVE_INTERVAL_SECS))
+            .text(SSE_KEEPALIVE_TEXT),
+    )
+}
+
 /// **ADR-040 §6 Phase C C3** — slot-aware variant of
 /// [`generation_events_to_sse`]. Accepts an optional `slot_id: Option<u32>`
 /// carrying the scheduler-allocated `SlotId.0` for this stream.
@@ -655,6 +693,34 @@ mod tests {
     use axum::body::to_bytes;
     use axum::response::IntoResponse;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn sse_response_body_owns_lifetime_guard_until_drop() {
+        #[derive(Clone)]
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let (_tx, rx) = mpsc::channel(1);
+        let response = generation_events_to_sse_with_metrics_and_guard(
+            rx,
+            "chatcmpl-lease".into(),
+            "model".into(),
+            0,
+            SseStreamOptions::default(),
+            Arc::new(ServerMetrics::default()),
+            probe,
+        )
+        .into_response();
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        drop(response);
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc::Sender;
 
@@ -932,9 +998,11 @@ mod tests {
         assert!(reasoning["choices"][0]["delta"].get("content").is_none());
         let content: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "42");
-        assert!(content["choices"][0]["delta"]
-            .get("reasoning_content")
-            .is_none());
+        assert!(
+            content["choices"][0]["delta"]
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[tokio::test]

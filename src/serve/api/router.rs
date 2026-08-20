@@ -17,15 +17,15 @@
 //! - auth is innermost so it runs AFTER the request-id is stamped, allowing
 //!   401 responses to carry the request-id for correlation.
 
+use axum::Router;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
-use axum::Router;
 
-use super::handlers;
 use super::middleware::{
     bearer_auth, cors_layer, fallback, request_cancellation_layer, request_id_layer,
 };
 use super::state::AppState;
+use super::{control, handlers};
 
 /// Build the complete axum router with all routes and middleware.
 ///
@@ -40,6 +40,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(handlers::health))
         .route("/readyz", get(handlers::readyz))
         .route("/metrics", get(handlers::metrics))
+        .route("/hf2q/v1/runtime", get(control::hf2q_runtime))
+        .route("/hf2q/v1/models/activate", post(control::activate_model))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/:model_id", get(handlers::get_model))
         .route("/v1/chat/completions", post(handlers::chat_completions))
@@ -72,8 +74,8 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header, Request, StatusCode};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
     use super::super::state::ServerConfig;
@@ -193,10 +195,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
         assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("does-not-exist"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does-not-exist")
+        );
     }
 
     // --- fallback 404 ---
@@ -213,10 +217,12 @@ mod tests {
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("/this-route-does-not-exist"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("/this-route-does-not-exist")
+        );
     }
 
     // --- bearer auth ---
@@ -1296,6 +1302,291 @@ mod tests {
                 .contains("still-not-resolvable"),
             "expected default_model name in error: {v}"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ADR-047 diagnostic lifecycle control plane
+    // ────────────────────────────────────────────────────────────────
+
+    fn single_capacity_state() -> (AppState, super::super::engine::Engine) {
+        single_capacity_state_with_config(ServerConfig::default())
+    }
+
+    fn single_capacity_state_with_config(
+        config: ServerConfig,
+    ) -> (AppState, super::super::engine::Engine) {
+        use crate::serve::multi_model::{DefaultModelLoader, HotSwapManager, LoadedPool};
+        use crate::serve::quant_select::QuantType;
+        use std::sync::Arc;
+
+        let mut state = AppState::new(config);
+        let mut manager = HotSwapManager::new(
+            LoadedPool::with_capacity_and_budget(1, 800),
+            Arc::new(DefaultModelLoader),
+        );
+        let engine = super::super::engine::make_synthetic_engine_for_test(
+            super::super::engine::LoadedArch::Qwen35,
+        );
+        manager
+            .admit_for_test("resident/model", QuantType::Q4_K_M, 400, engine.clone())
+            .unwrap();
+        state.pool = Arc::new(std::sync::RwLock::new(manager));
+        (state, engine)
+    }
+
+    fn activation_target(bytes: usize) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![0; bytes]).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn hf2q_runtime_and_activation_routes_use_existing_bearer_auth() {
+        let app = build_router(state_with_auth("diagnostic-secret"));
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hf2q/v1/runtime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hf2q/v1/runtime")
+                    .header(header::AUTHORIZATION, "Bearer diagnostic-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(runtime).await).unwrap();
+        assert_eq!(body["schema_version"], "hf2q.runtime.v1");
+        assert_eq!(body["capabilities"]["non_evicting_load"], true);
+        assert_eq!(
+            body["capabilities"]["diagnostic_no_evict_header"]["name"],
+            "x-hf2q-diagnostic-no-evict"
+        );
+        assert_eq!(
+            body["capabilities"]["diagnostic_no_evict_header"]["value"],
+            "1"
+        );
+
+        let activation = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hf2q/v1/models/activate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(activation.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_no_evict_chat_header_is_authenticated_and_fails_closed_on_conflict() {
+        use crate::serve::quant_select::QuantType;
+
+        let (state, engine) = single_capacity_state_with_config(ServerConfig {
+            auth_token: Some("diagnostic-secret".to_string()),
+            ..Default::default()
+        });
+        let target = activation_target(500);
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "model": target.path().to_string_lossy(),
+            "messages": [{"role": "user", "content": "diagnose"}],
+        });
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-hf2q-diagnostic-no-evict", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, "Bearer diagnostic-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-hf2q-diagnostic-no-evict", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let receipt: serde_json::Value =
+            serde_json::from_str(&body_string(conflict).await).unwrap();
+        assert_eq!(receipt["error"]["code"], "diagnostic_model_conflict");
+        let manager = state.pool.read().unwrap();
+        assert!(
+            manager
+                .try_get("resident/model", QuantType::Q4_K_M)
+                .is_some()
+        );
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        drop(manager);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_request_preserves_adr005_auto_swap_resolution() {
+        let (state, engine) = single_capacity_state();
+        let target = activation_target(500);
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "model": target.path().to_string_lossy(),
+            "messages": [{"role": "user", "content": "ordinary client"}],
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The invalid test artifact reaches the ordinary loader and fails
+        // there. A missing diagnostic header must not acquire the 409
+        // no-evict policy used by the TUI race guard.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(error["error"]["code"], "generation_error");
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_no_evict_header_rejects_values_other_than_one() {
+        let app = build_router(state_default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-hf2q-diagnostic-no-evict", "true")
+                    .body(Body::from(
+                        r#"{"model":"unused","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(error["error"]["param"], "x-hf2q-diagnostic-no-evict");
+    }
+
+    #[tokio::test]
+    async fn activation_conflict_returns_exact_revision_and_never_loads_candidate() {
+        use crate::serve::quant_select::QuantType;
+        let (state, engine) = single_capacity_state();
+        let target = activation_target(500);
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "model": target.path().to_string_lossy(),
+            "action": "load",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hf2q/v1/models/activate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let receipt: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(receipt["status"], "conflict");
+        assert_eq!(receipt["requires_explicit_switch"], true);
+        assert_eq!(receipt["victims"].as_array().unwrap().len(), 1);
+        assert_eq!(receipt["victims"][0]["pool_key"], "resident/model@Q4_K_M");
+        assert!(receipt["pool_revision"].as_u64().is_some());
+        let manager = state.pool.read().unwrap();
+        assert!(
+            manager
+                .try_get("resident/model", QuantType::Q4_K_M)
+                .is_some()
+        );
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        drop(manager);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_switch_rejects_stale_revision_before_shutdown_or_load() {
+        use crate::serve::quant_select::QuantType;
+        let (state, engine) = single_capacity_state();
+        let target = activation_target(500);
+        let victim = state.pool.read().unwrap().iter_loaded().next().unwrap();
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "model": target.path().to_string_lossy(),
+            "action": "switch",
+            "expected_revision": 0,
+            "victims": [{
+                "pool_key": victim.pool_key,
+                "quant": victim.quant,
+                "bytes_resident": victim.bytes_resident,
+                "generation": victim.generation,
+            }],
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hf2q/v1/models/activate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let receipt: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(receipt["code"], "stale_activation_plan");
+        assert!(engine.is_worker_healthy());
+        let manager = state.pool.read().unwrap();
+        assert!(
+            manager
+                .try_get("resident/model", QuantType::Q4_K_M)
+                .is_some()
+        );
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        drop(manager);
+        engine.shutdown().await.unwrap();
     }
 
     // ────────────────────────────────────────────────────────────────
