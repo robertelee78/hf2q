@@ -72,6 +72,10 @@ impl VerifiedQwenSourceSnapshot {
         self.tensors.len()
     }
 
+    pub(super) fn tensor_records(&self) -> &[SourcePrecisionTensorRecord] {
+        &self.tensors
+    }
+
     pub(crate) fn catalog_sha256(&self) -> &str {
         &self.catalog_sha256
     }

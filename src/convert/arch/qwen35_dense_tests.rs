@@ -4,6 +4,7 @@ use crate::convert::arch::qwen35moe_full::MappedTensor;
 fn ctx() -> Qwen35DenseCtx {
     Qwen35DenseCtx {
         num_hidden_layers: 64,
+        full_attention_interval: 4,
         linear: Qwen35LinearAttentionCtx {
             linear_num_key_heads: 16,
             linear_num_value_heads: 48,

@@ -870,6 +870,51 @@ learned affine state; packed/quantized source dtypes and F32 source fallback
 are rejected. Exact family tensor-topology and semantic-transform admission
 remain B2 work.
 
+#### 2026-08-20 — B2a exact BF16 source-topology admission
+
+The first B2 slice closes the dense-Qwen source topology before allocating a
+Metal buffer. It consumes and owns the opaque B1 retained snapshot and returns
+an opaque, process-local `VerifiedQwen35Bf16TopologyV1`. Conversion and B2a use
+the same family-owned mapper-context constructor, so authenticated explicit
+`layer_types`, wrapper namespace, linear-attention head geometry, and mapper
+outcomes cannot drift between the GGUF and source-teacher paths.
+
+B2a compares the snapshot and a config-derived expected inventory in both
+directions. Every admitted text source has an exact name, outermost-first
+shape, BF16 dtype, D1 disposition, production mapper result, and closed future
+transform descriptor. Before constructing the projected layer schedule, a
+checked `3 + full_layers*11 + linear_layers*14 + mtp_layers*15` source count
+must equal the already bounded non-vision snapshot. The shared authenticated
+config projection rejects malformed-present optional fields, zero or
+nondivisible geometry, and more than 256 layers rather than allocating from an
+untrusted declaration. The official pinned Qwen3.8 config produces 866 text
+source records: 851 base autoregressive tensors and 15 fixed/protected MTP
+tensors. Sixteen full-attention fused Q/gate parents fan out into two
+role-distinct branches, giving 867 future base buffers: 514 BF16 projection or
+table buffers and 353 future F32 control buffers. The exact transform profile
+is 290 value-identity/widening outputs, 161 AddOne controls, 240 grouped-to-
+tiled V-head reorders, 48 reorder-then-NegExp controls, 48 squeeze-plus-partial
+V reorders, 48 per-row V reorders, and 32 interleaved Q/gate branches.
+
+The transform vocabulary is family-owned rather than a caller-supplied bake
+list. It binds the exact Q/gate head-interleaving geometry and every DeltaNet
+slice, row, head, kernel, and squeeze parameter. These descriptors are future
+obligations only: B2a does not read or transform tensor payloads and does not
+claim that a BF16-to-F32 widening, AddOne, NegExp, layout reorder, or split has
+executed. B1 may retain F16 structurally, but this BF16 teacher profile rejects
+every non-vision F16 source before topology authority is created.
+
+Vision remains authenticated and exactly Excluded by the dense-Qwen HF source
+predicate and production mapper. Config-declared shared-embedding MTP remains
+authenticated, fixed/protected, and explicitly non-executed by the base
+autoregressive profile. B2a performs no Metal allocation, payload upload,
+command encoding or completion, graph execution, teacher-logit production,
+sensitivity measurement, candidate materialization, allocator admission, or
+`--quant auto` activation. It introduces no DWQ, overlay, affine, calibration,
+or training path. B2b must stream and hash the retained bytes into owned typed
+buffers while discharging these transform obligations; the later family runner
+must separately prove numerical execution and completion.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps

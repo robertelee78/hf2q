@@ -16,8 +16,75 @@ use crate::convert::arch::qwen35moe_full::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35DenseCtx {
     pub num_hidden_layers: usize,
+    pub full_attention_interval: usize,
     pub linear: Qwen35LinearAttentionCtx,
     pub multimodal_wrapping: bool,
+}
+
+/// Build the exact dense-Qwen mapper context from authenticated HF config.
+///
+/// Conversion and source-precision topology admission share this constructor
+/// so an explicit `layer_types` schedule cannot be interpreted differently by
+/// the two paths.
+pub fn context_from_config(config: &serde_json::Value) -> Option<Qwen35DenseCtx> {
+    let text = config.get("text_config").unwrap_or(config);
+    let num_hidden_layers = usize::try_from(text.get("num_hidden_layers")?.as_u64()?).ok()?;
+    let full_attention_interval = match text.get("full_attention_interval") {
+        Some(value) => usize::try_from(value.as_u64()?).ok()?,
+        None => 4,
+    };
+    let linear_num_key_heads = usize::try_from(text.get("linear_num_key_heads")?.as_u64()?).ok()?;
+    let linear_num_value_heads =
+        usize::try_from(text.get("linear_num_value_heads")?.as_u64()?).ok()?;
+    let linear_key_head_dim = usize::try_from(text.get("linear_key_head_dim")?.as_u64()?).ok()?;
+    let linear_value_head_dim =
+        usize::try_from(text.get("linear_value_head_dim")?.as_u64()?).ok()?;
+    if num_hidden_layers == 0
+        || full_attention_interval == 0
+        || linear_num_key_heads == 0
+        || linear_num_value_heads == 0
+        || linear_key_head_dim == 0
+        || linear_value_head_dim == 0
+        || linear_num_value_heads % linear_num_key_heads != 0
+    {
+        return None;
+    }
+    if let Some(layer_types) = text.get("layer_types") {
+        let layer_types = layer_types.as_array()?;
+        if layer_types.len() != num_hidden_layers
+            || layer_types.iter().enumerate().any(|(layer, value)| {
+                let expected = if (layer + 1) % full_attention_interval == 0 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                };
+                value.as_str() != Some(expected)
+            })
+        {
+            return None;
+        }
+    }
+    let multimodal_wrapping = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .map(|architectures| {
+            architectures
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|name| name.ends_with("ForConditionalGeneration"))
+        })
+        .unwrap_or(false);
+    Some(Qwen35DenseCtx {
+        num_hidden_layers,
+        full_attention_interval,
+        linear: Qwen35LinearAttentionCtx {
+            linear_num_key_heads,
+            linear_num_value_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+        },
+        multimodal_wrapping,
+    })
 }
 
 /// Exact Hugging Face source namespace owned by the multimodal wrapper. This
