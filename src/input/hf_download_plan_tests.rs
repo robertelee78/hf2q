@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use super::hf_download::{
     bind_snapshot_parent, complete_download_files, default_revision_for, initial_download_files,
-    metadata_size_cap, resolve_repository_info, validate_file_metadata, validate_repo_inventory,
-    MAX_HF_REPO_FILES, MAX_HF_SMALL_METADATA_BYTES, MAX_HF_TOKENIZER_BYTES,
+    metadata_size_cap, resolve_model_reference, resolve_repository_info_for_test,
+    validate_file_metadata, validate_repo_inventory, DownloadError, MAX_HF_REPO_FILES,
+    MAX_HF_SMALL_METADATA_BYTES, MAX_HF_TOKENIZER_BYTES,
 };
 use super::hf_reference::HfModelReference;
 
@@ -21,18 +22,21 @@ fn repository_info_seals_a_mutable_request_to_the_returned_exact_commit() {
             },
         ],
     };
-    let (resolved, inventory) = resolve_repository_info(reference, "main", &info).unwrap();
+    let resolved = resolve_repository_info_for_test(reference, "main", &info).unwrap();
     assert_eq!(
-        resolved.revision(),
+        resolved.reference().revision(),
         "abcdef0123456789abcdef0123456789abcdef01"
     );
-    assert_eq!(inventory.len(), 2);
+    assert_eq!(resolved.inventory_len(), 2);
+    let debug = format!("{resolved:?}");
+    assert!(!debug.contains("model.safetensors"));
+    assert!(debug.contains("inventory_len: 2"));
 
     let invalid = hf_hub::api::RepoInfo {
         sha: "main".to_owned(),
         siblings: info.siblings.clone(),
     };
-    assert!(resolve_repository_info(
+    assert!(resolve_repository_info_for_test(
         HfModelReference::parse("org/model", None).unwrap(),
         "main",
         &invalid,
@@ -44,12 +48,25 @@ fn repository_info_seals_a_mutable_request_to_the_returned_exact_commit() {
         Some("1111111111111111111111111111111111111111"),
     )
     .unwrap();
-    assert!(resolve_repository_info(
+    assert!(resolve_repository_info_for_test(
         wrong_exact,
         "1111111111111111111111111111111111111111",
         &info
     )
     .is_err());
+}
+
+#[test]
+fn file_specific_resolution_fails_before_any_hub_lookup() {
+    let reference = HfModelReference::parse(
+        "https://huggingface.co/org/model/resolve/main/config.json",
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        resolve_model_reference(reference),
+        Err(DownloadError::FileReferenceUnsupported)
+    ));
 }
 
 #[test]

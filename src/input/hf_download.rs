@@ -38,6 +38,11 @@
 //! followed by re-invoke will re-download only the in-flight shard;
 //! all completed shards are reused.
 //!
+//! The preparation-resolution seam performs only the repository-info lookup:
+//! it consumes the host-checked plan, binds its exact original reference to an
+//! immutable commit and bounded name inventory, and returns an inert sealed
+//! plan before any payload transfer.
+//!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
 //! `hf2q` → verify only in-flight shard re-downloads, total wall-clock
@@ -51,8 +56,21 @@ use tracing::{debug, info};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
-use crate::input::model_recipe::{QWEN38_ACCEPTED_REVISION, QWEN38_REPOSITORY_ID};
+use crate::input::model_recipe::{
+    ModelPreparationPlan, QWEN38_ACCEPTED_REVISION, QWEN38_REPOSITORY_ID,
+};
 use crate::progress::ProgressReporter;
+
+mod resolution;
+
+use resolution::{bind_model_preparation_resolution, resolve_repository_info};
+#[cfg(test)]
+pub(in crate::input) use resolution::{
+    bind_model_preparation_resolution_for_test, resolve_repository_info_for_test,
+};
+pub use resolution::{
+    ModelPreparationResolutionError, ResolvedModelPreparationPlan, ResolvedModelRepository,
+};
 
 const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";
 const DEFAULT_HF_REVISION: &str = "main";
@@ -336,6 +354,9 @@ pub fn download_model_reference(
     reference: HfModelReference,
     progress: &ProgressReporter,
 ) -> Result<DownloadedModel, DownloadError> {
+    if reference.filename().is_some() {
+        return Err(DownloadError::FileReferenceUnsupported);
+    }
     info!(repo = %reference.repo_id(), "Downloading model from Hugging Face Hub");
 
     // Decision 14: disk preflight before any network activity.
@@ -345,66 +366,38 @@ pub fn download_model_reference(
     download_via_hf_hub(reference, &cache_dir, progress)
 }
 
+/// Resolve one parsed model reference to an exact commit and bounded
+/// repository inventory without transferring model payloads.
+pub fn resolve_model_reference(
+    reference: HfModelReference,
+) -> Result<ResolvedModelRepository, DownloadError> {
+    if reference.filename().is_some() {
+        return Err(DownloadError::FileReferenceUnsupported);
+    }
+    let cache_dir = resolve_hf_cache_dir();
+    let api = build_hub_api(&cache_dir, false)?;
+    resolve_with_api(&api, reference)
+}
+
+/// Consume a host-checked preparation plan only after resolving the exact
+/// original reference through the pinned in-process Hub boundary.
+pub fn resolve_model_preparation_plan(
+    plan: ModelPreparationPlan,
+) -> Result<ResolvedModelPreparationPlan, ModelPreparationResolutionError> {
+    let resolution = resolve_model_reference(plan.reference().clone())?;
+    Ok(bind_model_preparation_resolution(plan, resolution)?)
+}
+
 /// Download model files using the hf-hub crate.
 fn download_via_hf_hub(
     reference: HfModelReference,
     cache_dir: &Path,
     progress: &ProgressReporter,
 ) -> Result<DownloadedModel, DownloadError> {
-    use hf_hub::api::sync::ApiBuilder;
     use hf_hub::{Repo, RepoType};
 
-    if reference.filename().is_some() {
-        return Err(DownloadError::FileReferenceUnsupported);
-    }
-
-    // Resolve auth token (Story 3.2)
-    let token = resolve_auth_token();
-    debug!(has_token = token.is_some(), "Auth token resolution");
-
-    // Pin the official endpoint even when HF_ENDPOINT is set in the process.
-    let mut builder = ApiBuilder::new()
-        .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
-        .with_cache_dir(cache_dir.to_path_buf())
-        .with_progress(true);
-
-    if let Some(t) = token {
-        builder = builder.with_token(Some(t));
-    }
-
-    let api = builder.build().map_err(|e| DownloadError::DownloadFailed {
-        reason: format!("Failed to initialize Hugging Face API client: {e}"),
-    })?;
-
-    let requested_revision = reference
-        .requested_revision()
-        .unwrap_or_else(|| default_revision_for(reference.repo_id()))
-        .to_owned();
-    let lookup_repo = api.repo(Repo::with_revision(
-        reference.repo_id().to_owned(),
-        RepoType::Model,
-        requested_revision.clone(),
-    ));
-
-    // Resolve branch/tag/default identity before downloading any source file.
-    let repo_info = lookup_repo.info().map_err(|e| {
-        let err_str = e.to_string();
-        if err_str.contains("401") || err_str.contains("403") || err_str.contains("auth") {
-            DownloadError::AuthError {
-                repo: reference.repo_id().to_owned(),
-            }
-        } else if err_str.contains("404") || err_str.contains("not found") {
-            DownloadError::RepoNotFound {
-                repo: reference.repo_id().to_owned(),
-            }
-        } else {
-            DownloadError::DownloadFailed {
-                reason: format!("Failed to get repository info: {e}"),
-            }
-        }
-    })?;
-    let (resolved, inventory) =
-        resolve_repository_info(reference, &requested_revision, &repo_info)?;
+    let api = build_hub_api(cache_dir, true)?;
+    let (resolved, inventory) = resolve_with_api(&api, reference)?.into_download_parts();
     let repo = api.repo(Repo::with_revision(
         resolved.repo_id().to_owned(),
         RepoType::Model,
@@ -478,6 +471,67 @@ fn download_via_hf_hub(
         reference: resolved,
         manifest,
     })
+}
+
+fn build_hub_api(
+    cache_dir: &Path,
+    progress: bool,
+) -> Result<hf_hub::api::sync::Api, DownloadError> {
+    use hf_hub::api::sync::ApiBuilder;
+
+    let token = resolve_auth_token();
+    debug!(has_token = token.is_some(), "Auth token resolution");
+
+    // Pin the official endpoint even when HF_ENDPOINT is set in the process.
+    let mut builder = ApiBuilder::new()
+        .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(progress);
+    if let Some(token) = token {
+        builder = builder.with_token(Some(token));
+    }
+    builder
+        .build()
+        .map_err(|error| DownloadError::DownloadFailed {
+            reason: format!("Failed to initialize Hugging Face API client: {error}"),
+        })
+}
+
+fn resolve_with_api(
+    api: &hf_hub::api::sync::Api,
+    reference: HfModelReference,
+) -> Result<ResolvedModelRepository, DownloadError> {
+    use hf_hub::{Repo, RepoType};
+
+    if reference.filename().is_some() {
+        return Err(DownloadError::FileReferenceUnsupported);
+    }
+    let requested_revision = reference
+        .requested_revision()
+        .unwrap_or_else(|| default_revision_for(reference.repo_id()))
+        .to_owned();
+    let lookup_repo = api.repo(Repo::with_revision(
+        reference.repo_id().to_owned(),
+        RepoType::Model,
+        requested_revision.clone(),
+    ));
+    let repo_info = lookup_repo.info().map_err(|error| {
+        let message = error.to_string();
+        if message.contains("401") || message.contains("403") || message.contains("auth") {
+            DownloadError::AuthError {
+                repo: reference.repo_id().to_owned(),
+            }
+        } else if message.contains("404") || message.contains("not found") {
+            DownloadError::RepoNotFound {
+                repo: reference.repo_id().to_owned(),
+            }
+        } else {
+            DownloadError::DownloadFailed {
+                reason: format!("Failed to get repository info: {error}"),
+            }
+        }
+    })?;
+    resolve_repository_info(reference, &requested_revision, &repo_info)
 }
 
 fn fetch_expected_file_metadata(
@@ -568,32 +622,6 @@ pub(super) fn default_revision_for(repo_id: &str) -> &'static str {
     } else {
         DEFAULT_HF_REVISION
     }
-}
-
-pub(super) fn resolve_repository_info(
-    reference: HfModelReference,
-    requested_revision: &str,
-    info: &hf_hub::api::RepoInfo,
-) -> Result<(ResolvedHfModelReference, BTreeSet<String>), DownloadError> {
-    let requested_exact = requested_revision.len() == 40
-        && requested_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit());
-    if requested_exact && !requested_revision.eq_ignore_ascii_case(&info.sha) {
-        return Err(DownloadError::InvalidRepositoryInventory {
-            reason: format!(
-                "repository lookup returned commit `{}` instead of explicitly requested `{requested_revision}`",
-                info.sha
-            ),
-        });
-    }
-    let resolved = reference.resolve(&info.sha)?;
-    let inventory = validate_repo_inventory(
-        info.siblings
-            .iter()
-            .map(|sibling| sibling.rfilename.as_str()),
-    )?;
-    Ok((resolved, inventory))
 }
 
 pub(super) fn validate_repo_inventory<'a>(
@@ -1228,18 +1256,18 @@ mod tests {
             .info()
             .expect("fetch Qwen3.8 repository info");
         let reference = HfModelReference::parse(QWEN38_REPOSITORY_ID, None).unwrap();
-        let (resolved, inventory) =
-            resolve_repository_info(reference, QWEN38_ACCEPTED_REVISION, &info).unwrap();
-        assert_eq!(resolved.revision(), QWEN38_ACCEPTED_REVISION);
-        assert!(inventory.contains("config.json"));
-        assert!(inventory.contains("model.safetensors.index.json"));
+        let resolved = resolve_repository_info(reference, QWEN38_ACCEPTED_REVISION, &info).unwrap();
+        assert_eq!(resolved.reference().revision(), QWEN38_ACCEPTED_REVISION);
+        assert!(resolved.contains("config.json"));
+        assert!(resolved.contains("model.safetensors.index.json"));
         let exact_repo = api.repo(Repo::with_revision(
             QWEN38_REPOSITORY_ID.to_owned(),
             RepoType::Model,
             QWEN38_ACCEPTED_REVISION.to_owned(),
         ));
-        let config = fetch_expected_file_metadata(&api, &exact_repo, &resolved, "config.json")
-            .expect("authenticate bounded Qwen3.8 config metadata");
+        let config =
+            fetch_expected_file_metadata(&api, &exact_repo, resolved.reference(), "config.json")
+                .expect("authenticate bounded Qwen3.8 config metadata");
         assert_eq!(config.filename, "config.json");
         assert!(config.bytes > 0 && config.bytes <= MAX_HF_SMALL_METADATA_BYTES);
     }

@@ -6,7 +6,7 @@ use super::{
     recipe_for_reference, ModelPreparationError, ModelRecipe, RecipeArtifactRole,
     SourceRetentionChoice, VerifiedRecipeHost,
 };
-use crate::input::hf_reference::HfModelReference;
+use crate::input::hf_reference::{HfModelReference, ResolvedHfModelReference};
 
 pub const MAX_MODEL_PREPARATION_PATH_BYTES: usize = 4096;
 const MAX_MODEL_PREPARATION_PATH_COMPONENTS: usize = 64;
@@ -167,6 +167,39 @@ impl ModelPreparationPlan {
 
     pub fn minimum_free_bytes(&self) -> u64 {
         self.recipe.minimum_free_bytes()
+    }
+
+    pub(in crate::input) fn validate_resolution<F>(
+        &self,
+        resolved: &ResolvedHfModelReference,
+        contains: F,
+    ) -> Result<(), ModelPreparationError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let same_identity = resolved.original() == self.reference.original()
+            && resolved.repo_id() == self.reference.repo_id()
+            && resolved.canonical_url() == self.reference.canonical_url()
+            && resolved.filename().is_none()
+            && resolved.revision() == self.accepted_revision;
+        if !same_identity {
+            return Err(plan_error(
+                "Hub resolution does not match the planned reference and accepted revision",
+            ));
+        }
+        if let Some(missing) = self
+            .recipe
+            .source()
+            .files()
+            .iter()
+            .find(|file| !contains(file.path()))
+        {
+            return Err(plan_error(format!(
+                "resolved repository is missing recipe source `{}`",
+                missing.path()
+            )));
+        }
+        Ok(())
     }
 
     #[cfg(test)]

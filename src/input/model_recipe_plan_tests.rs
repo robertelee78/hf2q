@@ -1,9 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use super::hf_download::{
+    bind_model_preparation_resolution_for_test, resolve_model_preparation_plan,
+    ResolvedModelRepository,
+};
 use super::hf_reference::HfModelReference;
 use super::model_recipe::{
-    plan_current_model_preparation, ModelPreparationError, ModelPreparationPlan,
-    RecipeArtifactRole, SourceRetentionChoice, QWEN38_ACCEPTED_REVISION,
+    embedded_qwen38_recipe, plan_current_model_preparation, ModelPreparationError,
+    ModelPreparationPlan, RecipeArtifactRole, SourceRetentionChoice, QWEN38_ACCEPTED_REVISION,
 };
 
 fn plan(reference: HfModelReference, root: &Path) -> ModelPreparationPlan {
@@ -16,6 +20,22 @@ fn plan(reference: HfModelReference, root: &Path) -> ModelPreparationPlan {
         100 * 1024 * 1024 * 1024,
     )
     .unwrap()
+}
+
+fn resolution(
+    reference: HfModelReference,
+    revision: &str,
+    omitted_file: Option<&str>,
+) -> ResolvedModelRepository {
+    let recipe = embedded_qwen38_recipe().unwrap();
+    let inventory = recipe
+        .source()
+        .files()
+        .iter()
+        .map(|file| file.path().to_owned())
+        .filter(|file| Some(file.as_str()) != omitted_file)
+        .chain(["unrelated-repository-entry.txt".to_owned()]);
+    ResolvedModelRepository::for_test(reference.resolve(revision).unwrap(), inventory)
 }
 
 #[test]
@@ -89,6 +109,64 @@ fn equivalent_reference_spellings_select_one_plan_identity() {
 }
 
 #[test]
+fn exact_hub_resolution_consumes_the_plan_and_preserves_its_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let reference = HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap();
+    let planned = plan(reference.clone(), temp.path());
+    let expected_root = planned.model_root().to_path_buf();
+    let resolved = bind_model_preparation_resolution_for_test(
+        planned,
+        resolution(reference, QWEN38_ACCEPTED_REVISION, None),
+    )
+    .unwrap();
+    assert_eq!(resolved.recipe_id(), "qwen38-27b-official-v1");
+    assert_eq!(
+        resolved.resolved_reference().revision(),
+        QWEN38_ACCEPTED_REVISION
+    );
+    assert_eq!(resolved.repository_inventory_len(), 30);
+    assert_eq!(resolved.model_root(), expected_root);
+    assert_eq!(resolved.source_root(), expected_root.join("source"));
+    assert_eq!(
+        resolved.artifact_path(RecipeArtifactRole::Text),
+        expected_root.join("artifacts/Qwen3.8-27B-Q4_K_M.gguf")
+    );
+    assert!(format!("{resolved:?}").contains("paths: \"[redacted]\""));
+}
+
+#[test]
+fn resolution_must_match_the_original_plan_revision_and_complete_recipe_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let bare = || HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap();
+
+    let missing = plan(bare(), temp.path());
+    assert!(bind_model_preparation_resolution_for_test(
+        missing,
+        resolution(bare(), QWEN38_ACCEPTED_REVISION, Some("config.json"),),
+    )
+    .is_err());
+
+    let wrong_revision = plan(bare(), temp.path());
+    assert!(bind_model_preparation_resolution_for_test(
+        wrong_revision,
+        resolution(bare(), &"b".repeat(40), None),
+    )
+    .is_err());
+
+    let different_original = plan(bare(), temp.path());
+    let exact_url = HfModelReference::parse(
+        &format!("https://huggingface.co/Qwen/Qwen3.8-27B/tree/{QWEN38_ACCEPTED_REVISION}"),
+        None,
+    )
+    .unwrap();
+    assert!(bind_model_preparation_resolution_for_test(
+        different_original,
+        resolution(exact_url, QWEN38_ACCEPTED_REVISION, None,),
+    )
+    .is_err());
+}
+
+#[test]
 fn current_no_options_plan_passes_on_the_explicit_proof_machine() {
     if std::env::var_os("HF2Q_TEST_QWEN38_HOST_PREFLIGHT").is_none() {
         return;
@@ -101,6 +179,26 @@ fn current_no_options_plan_passes_on_the_explicit_proof_machine() {
     .unwrap();
     assert_eq!(planned.accepted_revision(), QWEN38_ACCEPTED_REVISION);
     assert!(!planned.model_root().exists());
+}
+
+#[test]
+fn current_plan_resolves_through_the_exact_production_hub_boundary() {
+    if std::env::var_os("HF2Q_TEST_QWEN38_RESOLVED_PLAN").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let planned = plan_current_model_preparation(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        &temp.path().join("models"),
+    )
+    .unwrap();
+    let resolved = resolve_model_preparation_plan(planned).unwrap();
+    assert_eq!(
+        resolved.resolved_reference().revision(),
+        QWEN38_ACCEPTED_REVISION
+    );
+    assert!(resolved.repository_inventory_len() >= 29);
+    assert!(!resolved.model_root().exists());
 }
 
 #[test]
