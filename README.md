@@ -83,10 +83,14 @@ target — the inference path is Metal-only.
 ```bash
 git clone git@github.com:robertelee78/hf2q.git
 cd hf2q
-cargo build --release
+GIT_COMMIT_SHA="$(git rev-parse HEAD)" cargo build --release --locked
 ./target/release/hf2q --help
 ./target/release/hf2q setup
 ```
+
+The explicit commit identity is required for immutable remote-conversion
+receipts when building from a checkout. Published packages and future native
+release artifacts embed their own source identity.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records one
 bounded inactive-session policy in `~/.hf2q/config.toml`. It downloads,
@@ -119,6 +123,13 @@ to a sibling checkout.
 - Per-arch disk floor for convert (`src/arch/entries/`): **100 GB** for
   Qwen 3.5 dense, **150 GB** for Qwen 3.5 MoE. Smoke preflight refuses
   to start below `disk_floor_gb + 10`.
+
+For the complete first-run path, use
+**[Get started with hf2q and Qwen3.8](docs/getting-started.md)**. It pins
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT` to an exact source revision and
+walks through native Q4_K_M conversion, text serving, direct API use, and an
+optional OpenCode connection. It does not introduce a second onboarding or
+model-preparation workflow around the existing commands.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -289,15 +300,21 @@ DeepSeek chat-completion request and retains the older
 integer `seed` now drives a decode-step-indexed deterministic sampler; identical
 rendered prompts and sampling settings reproduce across worker threads.
 
-Create the Qwen3.8 artifact natively from its immutable source revision before
-using that launcher:
+The canonical getting-started guide uses the selected text checkpoint
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Create it natively from its
+immutable source revision before using that launcher:
 
 ```bash
-hf2q convert Qwen/Qwen3.8-27B \
-  --revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
+mkdir -p "$HOME/.local/share/hf2q/models/qwen3.8"
+hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
+  --revision 08c2f075b43bc06456382db6b918a3dcabdcf4dd \
   --quant q4_k_m \
-  --output /opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf
+  --output "$HOME/.local/share/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf"
 ```
+
+See the [getting-started guide](docs/getting-started.md) for the complete
+convert, serve, API, and OpenCode sequence. This first path is text-only;
+Qwen3.8 vision remains a separate candidate surface.
 
 Native text conversion and serving are accepted. Vision is a separate
 candidate surface: hf2q converts the 333-tensor tower into a paired projector,
@@ -766,6 +783,8 @@ catalog + smoke prompt before any forward-pass code lands.
 
 ## Documentation index
 
+- `docs/getting-started.md` — canonical Qwen3.8 convert, serve, API, and
+  optional OpenCode journey.
 - `docs/ARCHITECTURE.md` — source-grounded architecture map.
 - `docs/converting-a-model.md` — generic convert reference.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.

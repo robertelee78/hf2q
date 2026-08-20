@@ -219,8 +219,8 @@ layer. One canonical getting-started guide will cover:
 1. verifying the installation with `hf2q --version` and `hf2q doctor`;
 2. reading the supported model/family matrix;
 3. choosing a model appropriate for the operator's task and measured Mac;
-4. acquiring official Hugging Face source weights through the supported
-   existing hf2q path;
+4. acquiring the selected Hugging Face source weights through the supported
+   existing hf2q path, with an exact revision and clear upstream lineage;
 5. converting and quantizing with the current `hf2q convert` syntax;
 6. serving the produced GGUF with the current `hf2q serve` syntax;
 7. checking the OpenAI-compatible endpoint directly; and
@@ -232,7 +232,7 @@ a hidden runtime recommender.
 
 The guide must distinguish:
 
-- hf2q-converted output from an official source repository;
+- hf2q-converted output from the exact source repository named by the guide;
 - explicitly supported external GGUF input; and
 - unsupported or approximate family compatibility, which must not be
   presented as supported.
@@ -245,6 +245,12 @@ other integration.
 Every published command in the guide is an acceptance surface. CI or a
 reproducible release gate must prove its syntax, and hardware/model claims must
 name the exact artifact, settings, and host evidence.
+
+The first guide model is
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT` at exact revision
+`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The guide covers its accepted
+Qwen3.8 text path only. It does not broaden the still-separate Qwen3.8 vision
+candidate or treat a community checkpoint as an official upstream release.
 
 ### 5. Make `hf2q update` honor the installation channel
 
@@ -399,6 +405,40 @@ the next slice begins.
 4. Feed any actual usability gaps into the setup schema rather than inventing
    a parallel workflow.
 
+Slice B is complete for today's source-install product at hf2q commit
+`efa3da2c67daed823ad35c0135e474bb99ac61df`. The protected Apple-Silicon proof
+used an Apple M5 Max with 128 GiB unified memory and the exact guide source
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT` revision
+`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The selected 21-file source set
+was 55,583,125,949 bytes. Its schema-v3 conversion receipt recorded the
+canonical 14-LFS-entry source-bundle SHA-256
+`8531e68e43a4a28ed6c0b9b41ac33dc9484e0fbb5eae96198a8c45ba9caf18d0`.
+Its config, index, and chat-template SHA-256 values were respectively
+`7c45051a516d27c45714ce6ca3285f88194b389f6d8ef71b840478903808271c`,
+`e0c5e013a335880aba95c437b37d34fce7868c58b9f57f06ae91f91b3c359981`,
+and `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`.
+
+Native remote conversion completed in 2,959.05 seconds and produced an
+866-tensor, 16,810,714,848-byte Q4_K_M GGUF with SHA-256
+`d2ea096cf688ebb02a233ee19b66ade4dc48fdff543793c35631bc5e6291aaaf`.
+The schema-v3 receipt independently rebound the same source, converter,
+selector, size, and digest. The server loaded the text-only artifact with its
+embedded tokenizer and template, advertised 262,144 tokens through
+`/v1/models`, and passed readiness, coherent unary output, reconstructable SSE
+ending in `[DONE]`, required and automatic tool calls, tool-result
+continuation, and warm-versus-cold semantic replay. The warm direct
+continuation reused 297 of 374 prompt tokens and exactly matched the cold
+result.
+
+The first OpenCode spike also found and corrected one real documentation gap:
+OpenCode 1.18.18 rendered a 7,105-token agent prompt, which the default
+SerialFifo path correctly rejected above its 2,048-token bounded transaction.
+The existing `--scheduler inflight-batched --max-slots 1` path then performed
+the real file-read tool call, continued with the exact file content, and
+reported 7,100 cached input tokens. The guide now documents that measured
+server invocation. No model-selection, preparation, client-configuration, or
+cache subsystem was added.
+
 ### Slice C: realign setup and make its config effective
 
 1. Inventory stable host facts with in-process platform APIs.
@@ -500,6 +540,8 @@ What exists:
 
 - hf2q's core conversion, quantization, and serving commands;
 - a source/Cargo-oriented install path;
+- the canonical tested text-only Qwen3.8 guide for conversion, serving,
+  direct API use, and optional OpenCode;
 - partial dormant distribution/update security infrastructure;
 - a `setup` command whose current schema primarily records an inert future
   session-cache policy; and
@@ -516,7 +558,6 @@ What is not yet the corrected product:
 - verified Homebrew/npm/direct user channels;
 - a setup schema for conversion, quantization, and serving defaults that the
   production commands consume;
-- the canonical tested operator guide;
 - public channel-aware `hf2q update` and `hf2q uninstall`; and
 - the clean-account installed-artifact acceptance proof.
 
