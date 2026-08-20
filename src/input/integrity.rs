@@ -33,7 +33,9 @@ use std::path::{Component, Path};
 
 use hf_hub::api::sync::ApiBuilder;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use tracing::{debug, info, warn};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
@@ -46,8 +48,11 @@ const MAX_HF_TENSOR_NAME_BYTES: usize = 1024;
 
 /// Type-state proof that every local source file was checked and every
 /// index-required weight shard matched a strong HuggingFace LFS identity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VerifiedSourceManifest {
+    repo: String,
+    revision: String,
+    required_weight_shards: Vec<String>,
     records: Vec<ShardIntegrity>,
 }
 
@@ -56,9 +61,52 @@ impl VerifiedSourceManifest {
         &self.records
     }
 
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub fn required_weight_shards(&self) -> &[String] {
+        &self.required_weight_shards
+    }
+
     #[cfg(test)]
-    pub(crate) fn for_test(records: Vec<ShardIntegrity>) -> Self {
-        Self { records }
+    pub(crate) fn for_test(mut records: Vec<ShardIntegrity>) -> Self {
+        records.sort_by(|left, right| left.filename.cmp(&right.filename));
+        let required_weight_shards = records
+            .iter()
+            .filter(|record| record.filename.ends_with(".safetensors"))
+            .map(|record| record.filename.clone())
+            .collect();
+        Self {
+            repo: "test/repo".into(),
+            revision: "test-revision".into(),
+            required_weight_shards,
+            records,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_bound(
+        repo: impl Into<String>,
+        revision: impl Into<String>,
+        mut records: Vec<ShardIntegrity>,
+    ) -> Self {
+        records.sort_by(|left, right| left.filename.cmp(&right.filename));
+        let required_weight_shards = records
+            .iter()
+            .filter(|record| record.filename.ends_with(".safetensors"))
+            .map(|record| record.filename.clone())
+            .collect();
+        Self {
+            repo: repo.into(),
+            revision: revision.into(),
+            required_weight_shards,
+            records,
+        }
     }
 }
 
@@ -102,19 +150,71 @@ pub fn required_weight_shards(local_dir: &Path) -> Result<Vec<String>, Integrity
                 reason: format!("{} changed while it was read", index_path.display()),
             });
         }
-        let parsed: BoundedSafetensorsIndex = serde_json::from_slice(&raw).map_err(|error| {
-            IntegrityError::InvalidSourceManifest {
-                reason: format!("parse {}: {error}", index_path.display()),
-            }
-        })?;
-        if parsed.required.is_empty() {
-            return Err(IntegrityError::InvalidSourceManifest {
-                reason: "weight_map does not reference any safetensors shards".into(),
-            });
-        }
-        return Ok(parsed.required.into_iter().collect());
+        return required_weight_shards_from_bytes(&raw, &index_path);
     }
     Ok(vec!["model.safetensors".to_owned()])
+}
+
+fn required_weight_shards_from_bytes(
+    raw: &[u8],
+    index_path: &Path,
+) -> Result<Vec<String>, IntegrityError> {
+    let parsed: BoundedSafetensorsIndex =
+        serde_json::from_slice(raw).map_err(|error| IntegrityError::InvalidSourceManifest {
+            reason: format!("parse {}: {error}", index_path.display()),
+        })?;
+    if parsed.required.is_empty() {
+        return Err(IntegrityError::InvalidSourceManifest {
+            reason: "weight_map does not reference any safetensors shards".into(),
+        });
+    }
+    Ok(parsed.required.into_iter().collect())
+}
+
+fn verify_record_bytes(
+    repo: &str,
+    revision: &str,
+    bytes: &[u8],
+    expected: &ShardIntegrity,
+) -> Result<(), IntegrityError> {
+    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_bytes != expected.bytes {
+        return Err(IntegrityError::SizeMismatch {
+            filename: expected.filename.clone(),
+            expected_bytes: expected.bytes,
+            actual_bytes,
+        });
+    }
+    if let Some(expected_sha) = &expected.sha256 {
+        let actual = hex::encode(Sha256::digest(bytes));
+        if actual.eq_ignore_ascii_case(expected_sha) {
+            return Ok(());
+        }
+        return Err(IntegrityError::ShardMismatch {
+            repo: repo.into(),
+            revision: revision.into(),
+            filename: expected.filename.clone(),
+            expected: expected_sha.clone(),
+            actual,
+            local_path: "<owned verified bytes>".into(),
+        });
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+    hasher.update(bytes);
+    let actual = hex::encode(hasher.finalize());
+    let expected_git = expected.hf_etag.trim().trim_matches('"');
+    if actual.eq_ignore_ascii_case(expected_git) {
+        Ok(())
+    } else {
+        Err(IntegrityError::GitBlobMismatch {
+            repo: repo.into(),
+            revision: revision.into(),
+            filename: expected.filename.clone(),
+            expected: expected_git.to_ascii_lowercase(),
+            actual,
+        })
+    }
 }
 
 struct BoundedSafetensorsIndex {
@@ -267,7 +367,14 @@ pub fn verify_conversion_manifest(
     for record in &manifest {
         verify_shard(repo, revision, &local_dir.join(&record.filename), record)?;
     }
-    let required = required_weight_shards(local_dir)?;
+    let index_path = local_dir.join("model.safetensors.index.json");
+    let required = if let Some(record) = by_name.get("model.safetensors.index.json") {
+        let raw = std::fs::read(&index_path)?;
+        verify_record_bytes(repo, revision, &raw, record)?;
+        required_weight_shards_from_bytes(&raw, &index_path)?
+    } else {
+        vec!["model.safetensors".to_owned()]
+    };
     for required in ["config.json", "model.safetensors.index.json"] {
         if (required == "config.json" || local_dir.join(required).is_file())
             && !by_name.contains_key(required)
@@ -298,7 +405,12 @@ pub fn verify_conversion_manifest(
     }
     let mut records = manifest;
     records.sort_by(|a, b| a.filename.cmp(&b.filename));
-    Ok(VerifiedSourceManifest { records })
+    Ok(VerifiedSourceManifest {
+        repo: repo.to_owned(),
+        revision: revision.to_owned(),
+        required_weight_shards: required,
+        records,
+    })
 }
 
 /// Fetch the live manifest at an immutable revision and verify it before

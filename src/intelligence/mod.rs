@@ -9,6 +9,7 @@
 //! - RuVector: self-learning conversion result storage
 
 pub mod auto_quant;
+pub mod calibration;
 pub mod dynamic_allocator;
 pub mod fingerprint;
 // B1.4 — hardware migrated to `crate::core::hardware`; all callers

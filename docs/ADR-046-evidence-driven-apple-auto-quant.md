@@ -535,9 +535,10 @@ and evidence boundary needed before either can be truthful:
   and sensitivity evidence in the policy hash. A verifier independently
   regenerates the frontier from the allocation problem and rejects mutation.
 
-This closes only the **proposal substrate**. It does not yet produce structured
-calibration corpora, imatrices, KL gradients, quantized artifacts, repair a
-policy against full-model validation, or authorize a serving candidate.
+This closes only the **proposal substrate**. By itself it does not produce
+structured calibration evidence, imatrices, KL gradients, quantized artifacts,
+repair a policy against full-model validation, or authorize a serving
+candidate.
 Unsloth Dynamic 3 motivates model-specific heterogeneous allocation and
 disjoint calibration/evaluation; its public material does not disclose a
 reproducible selector that hf2q can import. hf2q therefore keeps the exact
@@ -545,6 +546,63 @@ owner-supplied checkpoint—including an abliterated or otherwise modified
 checkpoint—as teacher, generates its own source-bound evidence, and leaves
 final eligibility to held-out quality/behavior gates plus matched whole-model
 Apple measurements.
+
+#### 2026-08-19 — structured calibration and coverage producer substrate
+
+The next Phase-D slice freezes the inputs that later sensitivity, repair, and
+acceptance producers are allowed to consume. It still does not claim to
+measure Dynamic sensitivity:
+
+- structured examples preserve message roles, native tool definitions and
+  results, thinking mode, template arguments, provenance, license, domain, and
+  exact example order. Conversion and calibration share one fail-closed chat
+  template resolver with the authoritative priority sidecar ->
+  `tokenizer_config.json` -> family fallback. The v1 GGUF/runtime metadata
+  surface represents one template string, so Hugging Face named template maps
+  are rejected identically in both paths instead of selecting an implicit
+  `default` or `tool_use` template;
+- every split is rendered through the same production chat renderer used by
+  serving and tokenized from the same bytes used to compute the exact source
+  tokenizer/template bundle. Receipts retain enough ephemeral material to
+  independently rerender and recompute every raw, rendered, token, and stream
+  digest. Nested JSON insertion order is deliberately evidence-significant:
+  production templates expose that order to the model, so this contract does
+  not relabel recursively sorted JSON as semantically equivalent;
+- calibration, policy-repair validation, and final acceptance holdout are
+  hash-bound split identities checked at runtime. Partition verification
+  rejects overlap by upstream source-record identity, content-only message/tool
+  payload, rendered text, or fixed-width token window and rejects any source,
+  template, tokenizer, renderer, token-bound, or window-bound mismatch;
+- the source tensor inventory is constructed only by reading every tensor from
+  an opaque `VerifiedSourceManifest` snapshot and hashing its actual bytes,
+  name, source-order shape, dtype, and size. Partitioning then binds complete
+  atomic unit membership and packed-expert topology alongside explicit fixed,
+  protected, or excluded source dispositions. Execution codec is intentionally
+  absent here; the later source -> stored -> loaded -> executed manifest owns
+  that claim;
+- coverage contracts consume a validated partition plus an explicit structural
+  collector topology. Caller-supplied observation records must match every
+  declared operation id, graph path, tensor mapping, dense row floor, and
+  per-expert row floor exactly. This prevents substitutions within the declared
+  topology, but D1 does not authenticate activation arrays or prove that the
+  declared topology is the family graph. A family-owned Qwen collector plus an
+  opaque materialization verifier remains mandatory before these records are
+  accepted as measured attention or DeltaNet coverage;
+- allocation schema v3 records both the three-way dataset partition and the
+  full tensor partition. The solver still treats these as opaque identities;
+  admission therefore requires `validate_dynamic_allocation_bindings`, which
+  regenerates the dataset partition and coverage receipt, validates the source
+  tensor partition, and cross-checks every child hash before invoking the
+  solver. SHA-shaped substitutions are rejected.
+
+This is a **model-free producer substrate**, not a completed calibration run.
+It does not yet contain the real Qwen3.8 variable-unit/tap catalog. The exact
+Qwen3.8 source-precision teacher, full differentiable QDQ graph, sensitivity
+receipts, materialized mixed policies, repair loop, untouched acceptance
+results, typed execution manifest, and matched Apple measurements remain
+mandatory later gates. In particular, the current Qwen inference loader's
+hidden stored-to-Q4_0 conversions must be made explicit before Apple cost can
+guide allocation.
 
 ### Phase E — production `--quant auto`
 

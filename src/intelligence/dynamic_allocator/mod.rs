@@ -9,10 +9,13 @@
 mod solver;
 mod types;
 
+pub mod producer;
+
+use solver::allocate_dynamic_frontier;
 pub use solver::{
-    allocate_dynamic_frontier, allocation_problem_sha256, canonical_frontier_bytes,
-    canonical_policy_bytes, final_executed_tensor_bundle_sha256, precision_policy_sha256,
-    tensor_catalog_sha256, validate_policy_frontier, DynamicAllocationError,
+    allocation_problem_sha256, canonical_frontier_bytes, canonical_policy_bytes,
+    final_executed_tensor_bundle_sha256, precision_policy_sha256, tensor_catalog_sha256,
+    validate_policy_frontier, DynamicAllocationError,
 };
 pub use types::*;
 

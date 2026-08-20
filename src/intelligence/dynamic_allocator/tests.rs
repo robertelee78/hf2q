@@ -92,6 +92,7 @@ fn option(
     };
     let operation = OperationExecutionEvidence {
         operation_id: plan.operation_id.clone(),
+        graph_path: format!("qwen35.{unit}", unit = member.name),
         tensor_names: vec![member.name.clone()],
         capability_decision_sha256: digest(&format!("cap-decision-{}-{id}", member.name)),
         regime_costs: BTreeMap::from([
@@ -132,9 +133,16 @@ fn option(
 
 fn unit(id: &str, specs: &[(&str, u64, u64, u64, u64)]) -> TensorAllocationUnit {
     let member = member(id);
+    let operation_id = format!("op-{}", member.name);
+    let graph_path = format!("qwen35.{}", member.name);
     TensorAllocationUnit {
         unit_id: id.into(),
         expected_expert_ids: Vec::new(),
+        operations: vec![TensorOperation {
+            operation_id,
+            graph_path,
+            tensor_names: vec![member.name.clone()],
+        }],
         options: specs
             .iter()
             .map(|(name, bytes, loss, decode, prefill)| {
@@ -163,6 +171,8 @@ fn make_problem(
         },
         tensor_catalog_sha256: catalog,
         expected_tensor_count: count,
+        dataset_partition_manifest_sha256: digest("dataset-partition"),
+        tensor_partition_manifest_sha256: digest("tensor-partition"),
         calibration_manifest_sha256: digest("calibration"),
         sensitivity_model: SensitivityModelIdentity {
             method: "dynamic-kl-gradient-plus-imatrix".into(),
@@ -170,6 +180,7 @@ fn make_problem(
             fixed_point_scale: 1_000_000,
             component_weights_sha256: digest("component-weights"),
             coverage_contract_sha256: digest("coverage"),
+            coverage_receipt_sha256: digest("coverage-receipt"),
         },
         capability_profile_sha256: digest("capability-profile"),
         proposal_workload_profile_sha256: digest("workload-profile"),
@@ -547,6 +558,9 @@ fn fused_operation_cost_is_counted_once_for_two_members() {
         ..problem.units[0].members[0].clone()
     };
     problem.units[0].members.push(second.clone());
+    problem.units[0].operations[0]
+        .tensor_names
+        .push(second.name.clone());
     let option = &mut problem.units[0].options[0];
     let mut plan = option.execution_plans[0].clone();
     plan.tensor_name = second.name.clone();
@@ -557,7 +571,7 @@ fn fused_operation_cost_is_counted_once_for_two_members() {
     plan.transformations[0].input_logical_tensor_sha256 = digest("logical-up");
     plan.transformations[0].output_logical_tensor_sha256 = digest("logical-up");
     option.execution_plans.push(plan);
-    option.operations[0].tensor_names.push(second.name);
+    option.operations[0].tensor_names.push(second.name.clone());
     option.payload_bytes = 20;
     option.sensitivity.final_executed_tensor_bundle_sha256 =
         final_executed_tensor_bundle_sha256(&option.execution_plans).unwrap();
