@@ -6,6 +6,7 @@
 //! another agent can run between decode tokens without changing tokenization,
 //! sampling, reasoning splitting, or DSML tool routing.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,14 +22,14 @@ use crate::serve::sampler_pure;
 
 use super::progress::RequestProgress;
 use super::sampling::{
-    accepted_single_tool_call_is_terminal, decode_token_limit, grammar_runtime, sample,
-    sampler_config, split_reasoning,
+    accept_forced_token, accepted_single_tool_call_is_terminal, decode_token_limit,
+    grammar_runtime, sample, sampler_config, split_reasoning,
 };
 use super::stream::StreamRouter;
 use super::{
     plan_resumable_prefill_chunk, release_completed_prefill_scratch, Deepseek4LoadedModel,
-    Deepseek4PrefillOrigin, Deepseek4ResumablePrefill, Deepseek4ResumablePrefillAdvance,
-    RequestScratchGuard, ResumablePrefillChunk,
+    Deepseek4ResumablePrefill, Deepseek4ResumablePrefillAdvance, RequestScratchGuard,
+    ResumablePrefillChunk,
 };
 
 pub(crate) struct Deepseek4SlotCompletion {
@@ -63,6 +64,7 @@ pub(crate) struct Deepseek4PrefillState {
 pub(crate) struct Deepseek4CooperativePrefillPlan {
     start: usize,
     token_count: usize,
+    capture_anchor_after: bool,
 }
 
 impl Deepseek4CooperativePrefillPlan {
@@ -76,6 +78,10 @@ impl Deepseek4CooperativePrefillPlan {
 
     pub(crate) fn end(self) -> usize {
         self.start + self.token_count
+    }
+
+    pub(crate) fn captures_anchor(self) -> bool {
+        self.capture_anchor_after
     }
 }
 
@@ -162,10 +168,59 @@ impl Deepseek4PrefillState {
             .saturating_sub(self.plan.initial_cached_tokens())
     }
 
+    /// True only while this request owns the bounded incremental suffix after
+    /// its rollback anchor. The tail is at most `RECOVERY_TAIL_TOKENS`; a
+    /// completed prefill is no longer active tail work.
+    pub(crate) fn is_recovery_tail(&self) -> bool {
+        self.plan.cursor >= self.plan.recovery_position
+            && self.plan.cursor < self.prompt_tokens.len()
+    }
+
+    /// Cursor metadata for timer-free alignment of staggered warm matrix
+    /// prefills. Cold waves retain their four-lane admission barrier, and a
+    /// recovery tail is incremental work rather than an alignable segment.
+    pub(crate) fn warm_matrix_alignment_state(&self) -> Option<(usize, usize, usize)> {
+        (!self.plan.is_cold_wave() && self.plan.cursor < self.plan.recovery_position).then_some((
+            self.plan.cursor,
+            self.plan.recovery_position,
+            self.plan.window_multiplier,
+        ))
+    }
+
+    /// Validate that the existing serial prefill planner will land exactly on
+    /// `target_cursor`. Near a recovery boundary it may intentionally shorten
+    /// a nominal window-aligned chunk to preserve a legal incremental tail;
+    /// such a chunk is not an alignment catch-up.
+    pub(crate) fn exact_warm_matrix_alignment_window_cap(
+        &self,
+        target_cursor: usize,
+        sliding_window: usize,
+    ) -> Option<usize> {
+        let (cursor, recovery_position, window_multiplier) = self.warm_matrix_alignment_state()?;
+        let delta = target_cursor.checked_sub(cursor)?;
+        if delta == 0 || sliding_window == 0 || delta % sliding_window != 0 {
+            return None;
+        }
+        let window_cap = (delta / sliding_window).min(window_multiplier);
+        if window_cap == 0 {
+            return None;
+        }
+        let slice = plan_resumable_prefill_chunk(
+            cursor,
+            recovery_position.checked_sub(cursor)?,
+            sliding_window,
+            window_cap,
+            recovery_position,
+        )
+        .ok()?;
+        matches!(slice.chunk, ResumablePrefillChunk::Matrix(tokens) if tokens == delta)
+            .then_some(window_cap)
+    }
+
     /// Plan a cooperative FFN chunk without changing request, cache, or
-    /// scheduler state. Only a warm matrix slice strictly before the recovery
-    /// checkpoint is eligible; anchor capture, incremental replay, and final
-    /// head publication stay on the established serial path.
+    /// scheduler state. Aligned matrix work through the recovery anchor is
+    /// eligible; incremental replay and final head publication stay on the
+    /// established serial path.
     pub(crate) fn plan_cooperative_prefill(
         &self,
         cache_position: usize,
@@ -180,10 +235,7 @@ impl Deepseek4PrefillState {
             cache_position,
             committed_tokens
         );
-        if self.plan.origin != Deepseek4PrefillOrigin::Cached
-            || self.plan.cursor >= self.plan.recovery_position
-            || max_rows < sliding_window
-        {
+        if self.plan.cursor >= self.plan.recovery_position || max_rows < sliding_window {
             return Ok(None);
         }
         let remaining = self.plan.recovery_position - self.plan.cursor;
@@ -201,11 +253,9 @@ impl Deepseek4PrefillState {
         let plan = Deepseek4CooperativePrefillPlan {
             start: self.plan.cursor,
             token_count,
+            capture_anchor_after: slice.capture_anchor_after,
         };
-        if slice.capture_anchor_after
-            || token_count > max_rows
-            || plan.end() >= self.plan.recovery_position
-        {
+        if token_count > max_rows || plan.end() > self.plan.recovery_position {
             return Ok(None);
         }
         Ok(Some(plan))
@@ -227,17 +277,37 @@ impl Deepseek4PrefillState {
         plan: Deepseek4CooperativePrefillPlan,
     ) -> Result<()> {
         anyhow::ensure!(
-            plan.start == self.plan.cursor && plan.end() < self.plan.recovery_position,
+            plan.start == self.plan.cursor
+                && plan.end() <= self.plan.recovery_position
+                && plan.captures_anchor() == (plan.end() == self.plan.recovery_position),
             "DeepSeek-V4 cooperative publication crossed a recovery checkpoint"
         );
         Ok(())
     }
 
+    pub(crate) fn cooperative_anchor_tokens(
+        &self,
+        plan: Deepseek4CooperativePrefillPlan,
+    ) -> Result<Option<&[u32]>> {
+        if !plan.captures_anchor() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            plan.start == self.plan.cursor && plan.end() == self.plan.recovery_position,
+            "DeepSeek-V4 cooperative anchor plan no longer matches the recovery checkpoint"
+        );
+        Ok(Some(&self.prompt_tokens[..self.plan.recovery_position]))
+    }
+
     pub(crate) fn publish_cooperative_prefill(&mut self, plan: Deepseek4CooperativePrefillPlan) {
         debug_assert_eq!(plan.start, self.plan.cursor);
-        debug_assert!(plan.end() < self.plan.recovery_position);
+        debug_assert!(plan.end() <= self.plan.recovery_position);
         self.plan.cursor = plan.end();
         self.progress.advance_prefill(plan.token_count);
+        if plan.captures_anchor() {
+            self.progress
+                .recovery_anchor_captured(self.plan.recovery_position);
+        }
     }
 
     pub(crate) fn advance(
@@ -310,6 +380,7 @@ pub(crate) struct Deepseek4SlotState {
     logits: MlxBuffer,
     sampler: sampler_pure::SamplingParams,
     runtime: Option<GrammarRuntime>,
+    thinking_budget: Option<Deepseek4ThinkingBudgetState>,
     max_tokens: usize,
     generated: Vec<u32>,
     logprobs: Option<Vec<f32>>,
@@ -326,6 +397,61 @@ pub(crate) struct Deepseek4SlotState {
     stream_router: Option<StreamRouter>,
     progress: RequestProgress,
     scratch_guard: Option<RequestScratchGuard>,
+}
+
+#[derive(Debug, Clone)]
+struct Deepseek4ThinkingBudgetState {
+    limit: usize,
+    reasoning_tokens: usize,
+    forced_tokens: Arc<Vec<u32>>,
+    close_tokens: Arc<Vec<u32>>,
+    forced_cursor: Option<usize>,
+    closed: bool,
+}
+
+impl Deepseek4ThinkingBudgetState {
+    fn from_params(params: &SamplingParams) -> Option<Self> {
+        let limit = params.thinking_token_budget?;
+        let forced_tokens = params.reasoning_end_tokens.clone()?;
+        let close_tokens = params.reasoning_close_tokens.clone()?;
+        (params.reasoning_forced_open
+            && limit > 0
+            && !forced_tokens.is_empty()
+            && !close_tokens.is_empty())
+        .then_some(Self {
+            limit,
+            reasoning_tokens: 0,
+            forced_tokens,
+            close_tokens,
+            forced_cursor: None,
+            closed: false,
+        })
+    }
+
+    fn next_forced_token(&mut self) -> Option<(u32, bool)> {
+        if self.closed {
+            return None;
+        }
+        let started = self.forced_cursor.is_none() && self.reasoning_tokens >= self.limit;
+        if started {
+            self.forced_cursor = Some(0);
+        }
+        let cursor = self.forced_cursor?;
+        let token = self.forced_tokens.get(cursor).copied()?;
+        self.forced_cursor = Some(cursor + 1);
+        Some((token, started))
+    }
+
+    fn observe_generated(&mut self, generated_tokens: &[u32]) {
+        if self.closed {
+            return;
+        }
+        if generated_tokens.ends_with(self.close_tokens.as_slice()) {
+            self.closed = true;
+            return;
+        }
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(1);
+    }
 }
 
 impl Deepseek4SlotState {
@@ -393,6 +519,7 @@ impl Deepseek4SlotState {
         );
         let sampler = sampler_config(&params);
         let runtime = grammar_runtime(&params, registration)?;
+        let thinking_budget = Deepseek4ThinkingBudgetState::from_params(&params);
         let logprobs = params.logprobs.then(|| Vec::with_capacity(max_tokens));
         let stream_router = stream.then(|| {
             StreamRouter::new(registration, params.reasoning_forced_open, request_started)
@@ -403,6 +530,7 @@ impl Deepseek4SlotState {
             logits,
             sampler,
             runtime,
+            thinking_budget,
             max_tokens,
             generated: Vec::with_capacity(max_tokens),
             logprobs,
@@ -440,15 +568,32 @@ impl Deepseek4SlotState {
         if self.finished {
             return Ok(None);
         }
-        let (token, logprob) = sample(
-            loaded,
-            &self.logits,
-            &self.params,
-            &self.sampler,
-            &self.generated,
-            &mut self.runtime,
-            supervisor,
-        )?;
+        let forced_token = self
+            .thinking_budget
+            .as_mut()
+            .and_then(Deepseek4ThinkingBudgetState::next_forced_token);
+        if forced_token.is_some_and(|(_, started)| started) {
+            tracing::warn!(
+                request_id = self.progress.id(),
+                budget = self.params.thinking_token_budget,
+                generated_tokens = self.generated.len(),
+                "DeepSeek-V4 required-tool thinking budget reached; forcing reasoning close"
+            );
+        }
+        let (token, logprob) = if let Some((token, _)) = forced_token {
+            accept_forced_token(&mut self.runtime, &self.params, token)?;
+            (token, self.params.logprobs.then_some(0.0))
+        } else {
+            sample(
+                loaded,
+                &self.logits,
+                &self.params,
+                &self.sampler,
+                &self.generated,
+                &mut self.runtime,
+                supervisor,
+            )?
+        };
         if loaded.eos_token_ids.contains(&token)
             || self.runtime.as_ref().is_some_and(GrammarRuntime::is_dead)
         {
@@ -458,6 +603,9 @@ impl Deepseek4SlotState {
         }
 
         self.generated.push(token);
+        if let Some(budget) = self.thinking_budget.as_mut() {
+            budget.observe_generated(&self.generated);
+        }
         if let (Some(values), Some(value)) = (self.logprobs.as_mut(), logprob) {
             values.push(value);
         }
@@ -601,6 +749,7 @@ impl Deepseek4SlotState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Deepseek4PrefillOrigin;
     use super::*;
 
     fn cached_prefill_state(cursor: usize, recovery_position: usize) -> Deepseek4PrefillState {
@@ -624,6 +773,39 @@ mod tests {
         }
     }
 
+    fn thinking_budget_params(limit: usize) -> SamplingParams {
+        SamplingParams {
+            reasoning_forced_open: true,
+            thinking_token_budget: Some(limit),
+            reasoning_end_tokens: Some(Arc::new(vec![90, 91])),
+            reasoning_close_tokens: Some(Arc::new(vec![90, 91])),
+            ..SamplingParams::default()
+        }
+    }
+
+    #[test]
+    fn required_tool_thinking_budget_forces_close_then_releases_decode() {
+        let mut budget =
+            Deepseek4ThinkingBudgetState::from_params(&thinking_budget_params(2)).unwrap();
+        assert_eq!(budget.next_forced_token(), None);
+        budget.observe_generated(&[11]);
+        assert_eq!(budget.next_forced_token(), None);
+        budget.observe_generated(&[11, 12]);
+        assert_eq!(budget.next_forced_token(), Some((90, true)));
+        budget.observe_generated(&[11, 12, 90]);
+        assert_eq!(budget.next_forced_token(), Some((91, false)));
+        budget.observe_generated(&[11, 12, 90, 91]);
+        assert_eq!(budget.next_forced_token(), None);
+    }
+
+    #[test]
+    fn natural_reasoning_close_disarms_required_tool_budget() {
+        let mut budget =
+            Deepseek4ThinkingBudgetState::from_params(&thinking_budget_params(8)).unwrap();
+        budget.observe_generated(&[1, 90, 91]);
+        assert_eq!(budget.next_forced_token(), None);
+    }
+
     #[test]
     fn cooperative_prefill_plan_matches_two_three_and_four_lane_serving_widths() {
         let state = cached_prefill_state(6_676, 8_000);
@@ -643,26 +825,83 @@ mod tests {
     }
 
     #[test]
+    fn warm_matrix_alignment_cap_lands_exactly_or_falls_back() {
+        let state = cached_prefill_state(6_676, 9_466);
+        assert_eq!(
+            state.warm_matrix_alignment_state(),
+            Some((6_676, 9_466, 16))
+        );
+        assert_eq!(
+            state.exact_warm_matrix_alignment_window_cap(7_316, 128),
+            Some(5)
+        );
+
+        let shrink_band = cached_prefill_state(852, 1_000);
+        assert_eq!(
+            shrink_band.exact_warm_matrix_alignment_window_cap(980, 128),
+            None,
+            "the prefill planner shortens this nominal 128-token catch-up to preserve a legal tail"
+        );
+    }
+
+    #[test]
     fn uncached_tokens_reports_the_exact_recovery_suffix() {
         let mut state = cached_prefill_state(6_676, 6_676);
         state.prompt_tokens.truncate(6_684);
         assert_eq!(state.uncached_tokens(), 8);
+        assert!(state.is_recovery_tail());
+
+        let mut cold = cached_prefill_state(0, 6_676);
+        cold.plan.origin = super::super::Deepseek4PrefillOrigin::Cold;
+        cold.prompt_tokens.truncate(6_684);
+        assert!(!cold.is_recovery_tail());
+        assert_eq!(cold.warm_matrix_alignment_state(), None);
+        cold.plan.cursor = cold.plan.recovery_position;
+        assert!(cold.is_recovery_tail());
+        assert_eq!(cold.warm_matrix_alignment_state(), None);
+        cold.plan.cursor = cold.prompt_tokens.len();
+        assert!(!cold.is_recovery_tail());
     }
 
     #[test]
-    fn cooperative_prefill_excludes_cold_anchor_and_incremental_work() {
-        let mut cold = cached_prefill_state(0, 8_000);
-        cold.plan.origin = Deepseek4PrefillOrigin::Cold;
-        assert!(cold
-            .plan_cooperative_prefill(0, 0, 128, 512)
+    fn cooperative_prefill_accepts_aligned_cold_matrix_and_anchor_but_excludes_tail() {
+        let mut cold = cached_prefill_state(0, 6_676);
+        cold.plan.origin = super::super::Deepseek4PrefillOrigin::Cold;
+        cold.prompt_tokens.truncate(6_684);
+        let mut transactions = 0;
+        let mut cooperative_rows = 0;
+        let mut anchors = 0;
+        while let Some(plan) = cold
+            .plan_cooperative_prefill(cold.plan.cursor, cold.plan.cursor, 128, 512)
             .unwrap()
-            .is_none());
+        {
+            assert!((1..=512).contains(&plan.token_count()));
+            assert!(plan.end() <= cold.plan.recovery_position);
+            anchors += plan.captures_anchor() as usize;
+            if plan.captures_anchor() {
+                assert_eq!(
+                    cold.cooperative_anchor_tokens(plan).unwrap().unwrap().len(),
+                    cold.plan.recovery_position
+                );
+            }
+            cold.validate_cooperative_prefill_commit(plan).unwrap();
+            cold.publish_cooperative_prefill(plan);
+            transactions += 1;
+            cooperative_rows += plan.token_count();
+        }
+        assert_eq!(transactions, 14);
+        assert_eq!(anchors, 1);
+        assert_eq!(cooperative_rows, cold.plan.cursor);
+        assert_eq!(cold.plan.cursor, cold.plan.recovery_position);
+        assert_eq!(cold.prompt_tokens.len() - cold.plan.recovery_position, 8);
 
         let anchor = cached_prefill_state(7_488, 8_000);
-        assert!(anchor
+        let anchor_plan = anchor
             .plan_cooperative_prefill(7_488, 7_488, 128, 512)
             .unwrap()
-            .is_none());
+            .expect("aligned final matrix slice should capture the recovery anchor");
+        assert!(anchor_plan.captures_anchor());
+        assert_eq!(anchor_plan.end(), 8_000);
 
         let incremental = cached_prefill_state(7_968, 8_000);
         assert!(incremental

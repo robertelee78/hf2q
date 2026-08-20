@@ -405,6 +405,25 @@ impl Deepseek4Session {
         self.committed_tokens.extend_from_slice(tokens);
     }
 
+    pub(super) fn capture_cooperative_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        let snapshot = self
+            .cache
+            .snapshot()
+            .context("snapshot DeepSeek-V4 cooperative prompt-boundary cache")?;
+        anyhow::ensure!(
+            snapshot.position() == prompt_prefix.len(),
+            "DeepSeek-V4 cooperative prompt anchor position {} does not match {} rendered tokens",
+            snapshot.position(),
+            prompt_prefix.len()
+        );
+        self.pending_turn_anchor = Some(snapshot);
+        self.pending_turn_anchor_tokens
+            .extend_from_slice(prompt_prefix);
+        Ok(())
+    }
+
     /// Return the longest prefix this retained slot can safely resume for the
     /// rendered prompt. DeepSeek's native encoder may rewrite the generated
     /// reasoning/tool tail on the next turn, so scheduler affinity must

@@ -133,6 +133,37 @@ pub(super) fn sample(
     Ok((token, logprob))
 }
 
+/// Advance the suspended required-tool grammar with a server-forced
+/// reasoning boundary token. Normal sampling performs this update inside
+/// [`sample`]; a forced token must preserve the same runtime transition or
+/// the DSML body would remain unconstrained after `</think>`.
+pub(super) fn accept_forced_token(
+    runtime: &mut Option<GrammarRuntime>,
+    params: &SamplingParams,
+    token: u32,
+) -> Result<()> {
+    let runtime = runtime
+        .as_mut()
+        .context("DeepSeek-V4 forced reasoning close requires a tool grammar runtime")?;
+    let token_bytes = params
+        .token_bytes
+        .as_deref()
+        .context("DeepSeek-V4 forced reasoning close requires the token byte table")?;
+    let bytes = token_bytes
+        .get(token as usize)
+        .with_context(|| format!("DeepSeek-V4 forced token {token} is outside the vocabulary"))?;
+    anyhow::ensure!(
+        !bytes.is_empty(),
+        "DeepSeek-V4 forced reasoning token {token} has no wire bytes"
+    );
+    runtime.accept_bytes(bytes);
+    anyhow::ensure!(
+        !runtime.is_dead(),
+        "DeepSeek-V4 forced reasoning close made the tool grammar dead"
+    );
+    Ok(())
+}
+
 pub(super) fn split_reasoning(
     raw: &str,
     registration: Option<&ModelRegistration>,
@@ -265,10 +296,35 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        accepted_single_tool_call_is_terminal, decode_token_limit, grammar_runtime,
-        sample_cpu_logits, sampler_config,
+        accept_forced_token, accepted_single_tool_call_is_terminal, decode_token_limit,
+        grammar_runtime, sample_cpu_logits, sampler_config,
     };
     use crate::serve::api::engine::{GrammarKind, SamplingParams, ToolCallPolicy};
+
+    #[test]
+    fn forced_reasoning_close_arms_required_tool_grammar() {
+        let grammar =
+            crate::serve::api::grammar::parse("root ::= \"b\"\n").expect("parse literal grammar");
+        let mut token_bytes = vec![Vec::new(); 2];
+        token_bytes[0] = b"</think>".to_vec();
+        token_bytes[1] = b"b".to_vec();
+        let params = SamplingParams {
+            grammar: Some(grammar),
+            grammar_kind: GrammarKind::ToolCallBodyRequired,
+            token_bytes: Some(Arc::new(token_bytes)),
+            reasoning_forced_open: true,
+            ..SamplingParams::default()
+        };
+        let registration = crate::serve::api::registry::find_for("deepseek-v4-flash")
+            .expect("DeepSeek registration");
+        let mut runtime =
+            grammar_runtime(&params, Some(&registration)).expect("build grammar runtime");
+        assert!(runtime.as_ref().unwrap().is_awaiting_trigger());
+        accept_forced_token(&mut runtime, &params, 0).expect("force reasoning close");
+        assert!(!runtime.as_ref().unwrap().is_awaiting_trigger());
+        runtime.as_mut().unwrap().accept_bytes(b"b");
+        assert!(runtime.as_ref().unwrap().is_accepted());
+    }
 
     #[test]
     fn agentic_grammar_contract_deepseek_requires_exactly_one_authoritative_table() {

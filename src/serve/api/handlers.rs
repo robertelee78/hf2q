@@ -1032,6 +1032,24 @@ struct PreparedChatContext {
 const QWEN_TOOL_CONTINUATION_THINKING_CEILING: usize = 512;
 const QWEN_REPEATED_CAP_THINKING_FLOOR: usize = 256;
 
+fn deepseek_required_tool_thinking_eligible(
+    registration: Option<&registry::ModelRegistration>,
+    reasoning_forced_open: bool,
+    constrained_tool_choice: bool,
+    tool_count: usize,
+    parallel_tool_calls: bool,
+    logprobs: bool,
+    explicit_thinking_budget: Option<usize>,
+) -> bool {
+    registration.is_some_and(|registration| registration.family == "deepseek4")
+        && reasoning_forced_open
+        && constrained_tool_choice
+        && tool_count == 1
+        && !parallel_tool_calls
+        && !logprobs
+        && explicit_thinking_budget.is_none()
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct QwenToolChainState {
     is_tool_continuation: bool,
@@ -1199,6 +1217,88 @@ mod qwen_thinking_budget_tests {
         }))
         .unwrap();
         assert_eq!(request.thinking_token_budget, Some(1536));
+    }
+
+    #[test]
+    fn deepseek_required_tool_budget_is_narrowly_scoped() {
+        let deepseek = registry::find_for("deepseek-v4-flash").expect("DeepSeek registration");
+        assert!(deepseek_required_tool_thinking_eligible(
+            Some(&deepseek),
+            true,
+            true,
+            1,
+            false,
+            false,
+            None,
+        ));
+        for ineligible in [
+            deepseek_required_tool_thinking_eligible(
+                Some(&deepseek),
+                false,
+                true,
+                1,
+                false,
+                false,
+                None,
+            ),
+            deepseek_required_tool_thinking_eligible(
+                Some(&deepseek),
+                true,
+                false,
+                1,
+                false,
+                false,
+                None,
+            ),
+            deepseek_required_tool_thinking_eligible(
+                Some(&deepseek),
+                true,
+                true,
+                2,
+                false,
+                false,
+                None,
+            ),
+            deepseek_required_tool_thinking_eligible(
+                Some(&deepseek),
+                true,
+                true,
+                1,
+                true,
+                false,
+                None,
+            ),
+            deepseek_required_tool_thinking_eligible(
+                Some(&deepseek),
+                true,
+                true,
+                1,
+                false,
+                true,
+                None,
+            ),
+            deepseek_required_tool_thinking_eligible(
+                Some(&deepseek),
+                true,
+                true,
+                1,
+                false,
+                false,
+                Some(16),
+            ),
+        ] {
+            assert!(!ineligible);
+        }
+        let qwen = registry::find_for("qwen3.8").expect("Qwen registration");
+        assert!(!deepseek_required_tool_thinking_eligible(
+            Some(&qwen),
+            true,
+            true,
+            1,
+            false,
+            false,
+            None,
+        ));
     }
 
     fn message(role: &str, reasoning: Option<&str>) -> ChatMessage {
@@ -1782,6 +1882,15 @@ where
         && engine
             .registration()
             .is_some_and(|registration| registration.family == "qwen35");
+    let deepseek_required_tool_thinking_mode = deepseek_required_tool_thinking_eligible(
+        engine.registration(),
+        reasoning_forced_open,
+        constrained_tool_choice,
+        req_tools.map_or(0, |tools| tools.len()),
+        effective_parallel_tool_calls(req.parallel_tool_calls),
+        req.logprobs.unwrap_or(false),
+        explicit_thinking_budget,
+    );
     let chain_state = qwen_tool_chain_state(&messages_for_render);
     if qwen_thinking_mode {
         if let Some((tool, repeats)) = repeated_tool_result_signature(&messages_for_render, 3) {
@@ -1792,7 +1901,7 @@ where
             );
         }
     }
-    let default_thinking_budget =
+    let qwen_default_thinking_budget =
         if explicit_thinking_budget.is_none() && qwen_thinking_mode && !constrained_tool_choice {
             let base = match std::env::var("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET") {
                 Ok(value) => match value.parse::<usize>() {
@@ -1827,6 +1936,24 @@ where
         } else {
             None
         };
+    let deepseek_default_thinking_budget = if deepseek_required_tool_thinking_mode {
+        match std::env::var("HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET") {
+            Ok(value) => match value.parse::<usize>() {
+                Ok(0) => None,
+                Ok(value) => Some(value),
+                Err(_) => {
+                    return Err(ApiError::invalid_request(
+                        "HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET must be a non-negative integer",
+                        Some("thinking_token_budget".into()),
+                    )
+                    .into_response());
+                }
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     if explicit_thinking_budget == Some(0) {
         return Err(ApiError::invalid_request(
             "thinking_token_budget must be greater than zero",
@@ -1834,14 +1961,22 @@ where
         )
         .into_response());
     }
-    let configured_thinking_budget = explicit_thinking_budget.or(default_thinking_budget);
+    let configured_thinking_budget = explicit_thinking_budget
+        .or(qwen_default_thinking_budget)
+        .or(deepseek_default_thinking_budget);
     if qwen_thinking_mode {
         tracing::info!(
             tool_continuation = chain_state.is_tool_continuation,
             tool_cycles_since_user = chain_state.tool_cycles_since_user,
             explicit_thinking_budget,
-            effective_default_thinking_budget = default_thinking_budget,
+            effective_default_thinking_budget = qwen_default_thinking_budget,
             "Qwen thinking budget policy resolved"
+        );
+    }
+    if deepseek_required_tool_thinking_mode {
+        tracing::info!(
+            effective_default_thinking_budget = deepseek_default_thinking_budget,
+            "DeepSeek-V4 required-tool thinking budget policy resolved"
         );
     }
     let (thinking_token_budget, reasoning_end_tokens, reasoning_close_tokens) =
@@ -1853,7 +1988,11 @@ where
                 )
                 .into_response());
             };
-            if registration.family != "qwen35" || !reasoning_forced_open {
+            let qwen_budget = registration.family == "qwen35" && reasoning_forced_open;
+            let deepseek_budget = registration.family == "deepseek4"
+                && deepseek_required_tool_thinking_mode
+                && explicit_thinking_budget.is_none();
+            if !qwen_budget && !deepseek_budget {
                 return Err(ApiError::invalid_request(
                     "thinking_token_budget currently requires Qwen thinking mode",
                     Some("thinking_token_budget".into()),
@@ -1862,7 +2001,7 @@ where
             }
             if !matches!(engine.mode(), engine::EngineMode::SlotAware { .. }) {
                 return Err(ApiError::invalid_request(
-                    "thinking_token_budget requires the Qwen inflight-batched scheduler",
+                    "thinking_token_budget requires an inflight-batched scheduler",
                     Some("thinking_token_budget".into()),
                 )
                 .into_response());
@@ -1874,7 +2013,11 @@ where
                 )
                 .into_response()
             })?;
-            let transition = format!("\nI need to answer now.{close}");
+            let transition = if qwen_budget {
+                format!("\nI need to answer now.{close}")
+            } else {
+                close.to_string()
+            };
             let encode = |text: &str| {
                 engine
                     .tokenizer()
@@ -1882,7 +2025,7 @@ where
                     .map(|encoding| std::sync::Arc::new(encoding.get_ids().to_vec()))
                     .map_err(|error| {
                         ApiError::invalid_request(
-                            format!("failed to tokenize Qwen reasoning boundary: {error}"),
+                            format!("failed to tokenize reasoning boundary: {error}"),
                             Some("thinking_token_budget".into()),
                         )
                         .into_response()
@@ -1892,7 +2035,7 @@ where
             let close_tokens = encode(close)?;
             if end_tokens.is_empty() || close_tokens.is_empty() {
                 return Err(ApiError::invalid_request(
-                    "Qwen reasoning boundary tokenized to an empty sequence",
+                    "reasoning boundary tokenized to an empty sequence",
                     Some("thinking_token_budget".into()),
                 )
                 .into_response());
@@ -1984,7 +2127,10 @@ where
         }
         _ => engine::ToolCallPolicy::Auto,
     };
-    if thinking_token_budget.is_some() && tc_policy == engine::ToolCallPolicy::Constrained {
+    if thinking_token_budget.is_some()
+        && tc_policy == engine::ToolCallPolicy::Constrained
+        && !deepseek_required_tool_thinking_mode
+    {
         return Err(ApiError::invalid_request(
             "thinking_token_budget cannot be combined with required or named tool_choice",
             Some("thinking_token_budget".into()),

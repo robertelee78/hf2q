@@ -63,7 +63,7 @@ family's graph, cache, or scheduler contract by approximation.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The Unreleased 0.1.7 candidate also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.10.12`.
+  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.10.16`.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -102,6 +102,17 @@ from a clean packed artifact that resolves the published, checksum-pinned
 | Native lifetime/fatal recovery | Exact-artifact hardware waves keep command-buffer and CFString populations bounded and reject every timeout or ignored-submission signature. Packed model-free fail-stop and supervisor tests inject the fatal return/dead-worker state, prove no post-fatal submission, preserve `/health` as process liveness, and require `/readyz` plus new generation to fail closed. The hardware gate does not intentionally poison Metal. |
 
 The shared cross-family changes additionally require:
+
+The hardware binary is compiled only from the `.crate` unpacked into a fresh
+temporary directory outside the source checkout. That build uses a fresh,
+checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
+compiler, documentation, flags, wrapper, target, and profile override
+variables, and rejects Cargo config anywhere in the packed root's ancestry.
+Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
+bytes, including the exact `mlx-native 0.10.16` crates.io source and checksum.
+The protected release workflow rehashes and revalidates those downloaded raw
+files, then requires its newly packed `Cargo.lock` to be byte-identical before
+publishing.
 
 The protected cross-family gate content-hashes a model artifact once for each
 stable file identity. It records the exact path, digest, device/inode, size,

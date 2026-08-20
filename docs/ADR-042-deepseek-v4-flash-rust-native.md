@@ -2169,6 +2169,72 @@ reuses the previously recorded immutable model digest; it does not reread the
 107 GB model merely to repeat that identity. Packed exact-SHA release gates
 remain required before publication.
 
+### Bounded required-tool reasoning and timer-free warm alignment (2026-08-20 candidate)
+
+The accepted-terminal-forward correction above removed one provably unused
+model evaluation, but it did not bound the model's reasoning before a required
+tool body. On the exact single-tool release workload, DeepSeek can remain in
+the forced-open reasoning phase until the 128-token completion ceiling even
+though the required DSML grammar already determines the only legal next
+action. At current decode rates, that uncontrolled phase consumes the narrow
+margin below the unchanged 60-second cold-response ceiling. This is generated
+work, not a cache miss or a stalled GPU.
+
+The candidate gives the canonical DeepSeek launcher an eight-token operator
+default only for the narrow path where a safe transition is mechanically
+provable: DeepSeek reasoning is forced open, tool choice is required or names
+the tool, exactly one tool is declared, parallel calls and logprobs are off,
+and the caller did not supply the Qwen-only public thinking-budget extension.
+Zero disables the operator default. Auto tool choice, multi-tool catalogs,
+parallel calls, response formats, and other model families keep their existing
+behavior. At the limit the slot emits the tokenizer-derived bare `</think>`
+sequence, advances the suspended required-tool grammar with those exact bytes,
+and then resumes normal constrained sampling. It never truncates a tool JSON
+body or treats a partially accepted call as complete.
+
+The same product trace exposed a separate warm-suffix scheduling defect.
+Tool-result requests are submitted close together but not atomically. Three
+warm matrix lanes can therefore commit one transaction before the fourth is
+admitted, leaving the fourth exactly five native 128-token windows behind.
+The ordinary cooperative selector then sees unequal cursors and falls back to
+serial work for the rest of the suffix. The timer-free correction selects the
+lowest compatible warm lane, uses the existing serial planner to prove that a
+bounded catch-up lands exactly on the leading cursor, advances only that
+lane, and then lets the normal widest-cohort selector resume. Cold work,
+recovery tails, unequal recovery anchors, non-window-aligned deltas, and the
+planner's recovery shrink band remain ineligible. No timer, sleep, request
+concatenation, or cross-sequence cache sharing is introduced.
+
+A continuously Nominal diagnostic run under
+`/var/tmp/hf2q-deepseek-alignment-budget8-quiet.X2zx3h` passed all four
+cold/cached/automatic/SSE/tool-result/source-tool conversations. All four cold
+semantic responses completed in 59.690 seconds; cached unary was 9.297
+seconds, automatic tool calls were 12.999--13.103 seconds, SSE tool calls were
+9.288--9.669 seconds, tool-result continuations were 27.062--30.173 seconds,
+and source-tool calls were 11.601--11.861 seconds. Every warm replay retained
+6,676 of 6,684 prompt tokens. The server recorded all 16 eight-token budget
+resolutions and forced closes, one exact `6,676 -> 7,316` catch-up with
+`window_cap=5`, and a following four-lane cooperative transaction at cursor
+7,316. The protected wave now rejects a run unless it observes those budget
+and scheduler transitions rather than inferring them from a final HTTP pass.
+
+A later canonical-launcher diagnostic proved that the launcher selected the
+eight-token default, but is deliberately rejected as performance evidence.
+An unrelated conversion had left roughly 10 GiB of swap in use and another
+foreign `hf2q` process appeared at the measurement tail; cold response was
+65.742 seconds. The failure does not authorize a wider latency limit. Release
+measurement must begin only after the existing 60-second thermal settle and a
+new process-group-scoped contention check prove that no foreign compiler or
+model runtime is active. The model identity continues to use the cached,
+unchanged-file verification receipt; these reruns do not reread the 107 GB
+artifact merely to restate its SHA-256.
+
+Model-free validation after the exact planner hardening passed 134 DeepSeek
+tests with zero failures and eight hardware-only tests ignored. Publication
+still requires a clean packed exact-main binary to pass both guarded product
+waves plus the independent cooperative-prefill and decode-cohort gates. No
+60/15/35-second product ceiling is widened by this candidate.
+
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
 This section records the rejected 89.65 GiB Q2_K_S artifact and the defects that
