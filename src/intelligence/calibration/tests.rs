@@ -161,10 +161,20 @@ fn model_dir() -> (TempDir, RenderDatasetRequest) {
         ],
     );
     let template_sha256 = sha256(TEMPLATE.as_bytes());
+    let tensor_bundle_sha256 = crate::core::provenance::compute_source_bundle_sha256(
+        &verified_source
+            .records()
+            .iter()
+            .map(crate::core::provenance::SourceShard::from_integrity)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut source = source(template_sha256, resolved.tokenizer_bundle_sha256);
+    source.tensor_bundle_sha256 = tensor_bundle_sha256;
     let request = RenderDatasetRequest {
         model_dir: temp.path().into(),
         arch: "qwen35".into(),
-        source: source(template_sha256, resolved.tokenizer_bundle_sha256),
+        source,
         verified_source,
         renderer_revision: "production-renderer-v1".into(),
         max_tokens_per_example: 64,
@@ -334,6 +344,11 @@ fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment()
     .unwrap();
 
     validate_teacher_prediction_plan(plan.manifest()).unwrap();
+    assert_eq!(plan.manifest().source, calibration.manifest().source);
+    assert_eq!(
+        plan.manifest().verified_source_manifest_sha256,
+        calibration.manifest().verified_source_manifest_sha256
+    );
     assert_eq!(plan.manifest().greedy_prompts.len(), 1);
     assert_eq!(plan.manifest().greedy_prompts[0].stable_id, "gen");
     assert!(plan.prediction_point_count() >= 2);
@@ -437,6 +452,16 @@ fn prediction_plan_validator_rejects_rehashed_noncanonical_example_and_greedy_or
     reordered_greedy.greedy_prompts.push(original);
     super::prediction_plan::resign_prediction_plan_for_test(&mut reordered_greedy);
     assert!(validate_teacher_prediction_plan(&reordered_greedy).is_err());
+
+    let mut invalid_source = plan.manifest().clone();
+    invalid_source.source.config_sha256 = "not-a-sha256".into();
+    super::prediction_plan::resign_prediction_plan_for_test(&mut invalid_source);
+    assert!(validate_teacher_prediction_plan(&invalid_source).is_err());
+
+    let mut invalid_source_manifest = plan.manifest().clone();
+    invalid_source_manifest.verified_source_manifest_sha256 = "A".repeat(64);
+    super::prediction_plan::resign_prediction_plan_for_test(&mut invalid_source_manifest);
+    assert!(validate_teacher_prediction_plan(&invalid_source_manifest).is_err());
 }
 
 #[test]
@@ -616,6 +641,19 @@ fn source_record_identity_cannot_be_renamed_across_splits() {
 
 #[test]
 fn render_inputs_must_match_the_opaque_verified_source_snapshot() {
+    let (_temp, mut request) = model_dir();
+    request.source.tensor_bundle_sha256 = "0".repeat(64);
+    assert!(matches!(
+        render_and_tokenize_split(
+            &dataset(
+                DatasetSplit::Calibration,
+                example("cal", "calibration", false),
+            ),
+            &request,
+        ),
+        Err(CalibrationInputError::InvalidDataset(_))
+    ));
+
     let (temp, request) = model_dir();
     let tokenizer_path = temp.path().join("tokenizer.json");
     let mut bytes = std::fs::read(&tokenizer_path).unwrap();

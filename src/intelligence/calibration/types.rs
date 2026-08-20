@@ -8,7 +8,7 @@ use crate::intelligence::measured_auto_quant::SourceIdentity;
 use crate::serve::api::schema::{ChatMessage, Tool};
 
 pub const CALIBRATION_INPUT_SCHEMA_VERSION: u32 = 1;
-pub const TEACHER_PREDICTION_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const TEACHER_PREDICTION_PLAN_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -261,6 +261,8 @@ pub struct TeacherPredictionExampleReceipt {
 #[serde(deny_unknown_fields)]
 pub struct TeacherPredictionPlanManifest {
     pub schema_version: u32,
+    pub source: SourceIdentity,
+    pub verified_source_manifest_sha256: String,
     pub dataset_partition_manifest_sha256: String,
     pub calibration_corpus_artifact_sha256: String,
     pub calibration_manifest_sha256: String,

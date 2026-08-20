@@ -10,6 +10,7 @@ mod header;
 mod retained_io;
 mod scope;
 mod snapshot;
+mod teacher_execution_plan;
 mod topology;
 mod topology_expected;
 mod topology_expected_mtp;
@@ -19,6 +20,11 @@ mod upload_plan;
 mod upload_transform;
 
 pub(crate) use snapshot::{open_verified_qwen_source_snapshot, VerifiedQwenSourceSnapshot};
+#[allow(unused_imports)] // consumed by the subsequent completed runner slice
+pub(crate) use teacher_execution_plan::{
+    preflight_qwen35_source_teacher_execution, Qwen35SourceTeacherRunLimitsV1,
+    StructurallyBoundQwen35SourceTeacherWorkV1,
+};
 #[allow(unused_imports)] // opaque B2a seam consumed by the subsequent Metal-upload slice
 pub(crate) use topology::{admit_qwen35_bf16_topology, VerifiedQwen35Bf16TopologyV1};
 pub(crate) use types::QwenSourceSnapshotLimits;
@@ -40,3 +46,6 @@ mod topology_tests;
 
 #[cfg(test)]
 mod upload_tests;
+
+#[cfg(test)]
+mod teacher_execution_plan_tests;

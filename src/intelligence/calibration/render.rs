@@ -107,7 +107,9 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn source_valid(source: &crate::intelligence::measured_auto_quant::SourceIdentity) -> bool {
+pub(super) fn source_valid(
+    source: &crate::intelligence::measured_auto_quant::SourceIdentity,
+) -> bool {
     !source.model_id.is_empty()
         && !source.revision.is_empty()
         && is_sha256(&source.config_sha256)
@@ -354,6 +356,19 @@ fn render_unverified(
     {
         return Err(CalibrationInputError::InvalidDataset(
             "verified render source is bound to a different repository or revision".into(),
+        ));
+    }
+    let source_shards = request
+        .verified_source
+        .records()
+        .iter()
+        .map(crate::core::provenance::SourceShard::from_integrity)
+        .collect::<Vec<_>>();
+    if crate::core::provenance::compute_source_bundle_sha256(&source_shards).as_deref()
+        != Some(request.source.tensor_bundle_sha256.as_str())
+    {
+        return Err(CalibrationInputError::InvalidDataset(
+            "verified render source has a different tensor bundle".into(),
         ));
     }
     if request.max_tokens_per_example == 0 || request.token_window_size == 0 {
