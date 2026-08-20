@@ -1046,6 +1046,31 @@ consume this exact work capability into B2b/B3a, execute with fresh base-only
 state, terminally complete every required row, and publish only after the final
 family receipt is built. No DWQ state or path is introduced.
 
+The second B3b prerequisite makes target publication the final consuming
+transition. Target begin refuses an existing destination before model-weight
+or Metal allocation, canonicalizes that destination parent for stable reporting,
+retains its exact directory descriptor as the publication location, and creates
+its private temporary through that descriptor. Later changes to a lexical
+symlink alias cannot redirect the retained destination. `finish_unpublished`
+flushes, syncs, bounded-hashes, and
+independently rereads that exact inode while leaving the destination absent. It
+returns an opaque owner whose structural receipt can be joined to the future
+family completion receipt. Under cooperative same-user directory writers,
+dropping it best-effort removes its private name after an identity check.
+`publish_noclobber` reverifies the inode and parent, syncs the retained file and
+private directory entry, and then uses one descriptor-relative atomic
+no-replace rename as its last fallible operation. That namespace transition
+removes the private name and creates the final name for the same retained inode
+without any rollback-by-path race. The returned open file, rather than a later
+pathname lookup, remains the structural authority. Directory-entry durability
+across a process or host crash is not claimed; a crash-visible target without
+the future in-memory family receipt is uncommitted and cannot mint authority.
+Pre-publication temporary cleanup is best-effort and assumes cooperative
+same-user writers in the destination directory. The existing callback writer
+uses the same two transitions and still returns structural-only authority. This
+is process-local publication continuity, not a persisted sidecar/replay, graph,
+completion, numerical, sensitivity, Dynamic, selector, or DWQ authority.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
