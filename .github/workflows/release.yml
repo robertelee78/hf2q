@@ -881,9 +881,15 @@ jobs:
                 <<<"$unexpected_hf_external_authority" || true
             )"
             test -z "$unexpected_hf_external_authority"
+            unexpected_pretransfer_authority="$(
+              grep -nE \
+                'repo\.(get|download|download_with_progress)\(|download_file|std::fs|File::|OpenOptions|std::process|Command::new|reqwest|hyper|tokio::net|clap::|Serialize|Deserialize' \
+                src/input/hf_download/resolution.rs || true
+            )"
+            test -z "$unexpected_pretransfer_authority"
             unexpected_recipe_external_authority="$(
               grep -RInE --include='*.rs' \
-                'hf_hub|resolve_model_reference|resolve_model_preparation_plan|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
+                'hf_hub|resolve_model_reference|resolve_model_preparation_plan|authorize_model_preparation_transfer|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
                 src/input/model_recipe.rs src/input/model_recipe || true
             )"
             test -z "$unexpected_recipe_external_authority"
@@ -1029,8 +1035,11 @@ jobs:
               input::model_recipe_preparation_tests::current_recipe_host_preflight_passes_on_the_explicit_proof_machine \
               input::model_recipe_plan_tests::canonical_no_options_layout_is_exact_and_inert \
               input::model_recipe_plan_tests::exact_hub_resolution_consumes_the_plan_and_preserves_its_layout \
+              input::model_recipe_plan_tests::exact_recipe_metadata_mints_only_an_inert_transfer_authorization \
               input::model_recipe_plan_tests::resolution_must_match_the_original_plan_revision_and_complete_recipe_inventory \
+              input::model_recipe_plan_tests::transfer_authorization_rejects_every_metadata_cross_binding \
               input::model_recipe_plan_tests::current_plan_resolves_through_the_exact_production_hub_boundary \
+              input::model_recipe_plan_tests::current_plan_authorizes_all_recipe_metadata_before_payload_transfer \
               input::model_recipe_plan_tests::current_no_options_plan_passes_on_the_explicit_proof_machine \
               input::model_recipe_plan_tests::preparation_root_is_absolute_canonical_bounded_and_directory_backed \
               input::integrity::tests::safetensors_index_entry_cap_is_exact \

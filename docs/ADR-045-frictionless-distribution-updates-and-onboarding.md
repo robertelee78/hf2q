@@ -21,8 +21,8 @@
   verification, conversion receipt v3, and the closed checked-in Qwen3.8
   source/artifact/hardware/disk recipe, bounded canonical preparation-pair
   receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
-  plus the canonical inert no-options preparation layout and exact Hub
-  resolution transition are also reconciled;
+  plus the canonical inert no-options preparation layout, exact Hub resolution,
+  and complete recipe-metadata transfer authorization are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1705,7 +1705,23 @@ Unrelated repository entries remain inert and private. The returned
 layout but still grants no payload transfer, conversion, deletion,
 registration, calibration, serving, or filesystem-mutation authority.
 
-The resolved-plan payload transfer, no-options conversion invocation,
+**Landed pre-transfer metadata authorization (2026-08-19).** Before a recipe
+payload can be requested, the download module queries the pinned Hub metadata
+endpoint for each of the 29 recipe names at the already resolved immutable
+commit. Request order is the recipe's canonical order. Every response must
+name that commit and exactly match the checked-in relative name, byte length,
+Git or LFS classification, ETag, and LFS SHA-256 when present. Missing, extra,
+reordered, renamed, resized, reclassified, or rehashed records fail before any
+payload transfer. The non-cloneable `AuthorizedModelPreparationTransfer`
+consumes the resolved plan, canonicalizes the accepted records back to the
+checked-in values, keeps the record inventory private, and exposes no generic
+file selection. It still grants no payload transfer, conversion,
+filesystem-mutation, deletion, registration, calibration, or serving
+authority. The opt-in live proof is
+`HF2Q_TEST_QWEN38_TRANSFER_AUTH=1 cargo +1.88.0 test --locked --bin hf2q
+--all-features input::model_recipe_plan_tests::current_plan_authorizes_all_recipe_metadata_before_payload_transfer -- --exact --test-threads=1`.
+
+The authorized payload transfer, no-options conversion invocation,
 source-retention mutation, prepared-model registry, and calibration receipt
 remain pending and must consume these proofs rather than reconstructing policy
 from strings.
@@ -2039,9 +2055,10 @@ before public self-update ships.
    space. The canonical no-options preparation plan now owns that proof and
    derives the bounded source/artifact/receipt/profile layout without creating
    it; its exact original reference is now consumed by the pinned Hub resolver
-   and bound to the accepted commit plus complete recipe-owned name inventory
-   before any payload transfer. All remain explicitly calibration-pending and
-   inert. Next, embed
+   and bound to the accepted commit plus complete recipe-owned name inventory.
+   A second metadata-only transition authenticates the size and Git/LFS
+   identity of every recipe file before any payload transfer. All remain
+   explicitly calibration-pending and inert. Next, embed
    the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention
