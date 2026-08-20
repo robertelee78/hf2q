@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::cli::SetupArgs;
 
 use self::host::{HostObservation, HostProbe, LiveHostProbe};
-use self::policy::{format_bytes, recommended_limit, resolve_policy, PolicyResolution};
-use self::schema::ConfigV1;
+use self::policy::{resolve_preferences, PreferenceResolution};
+pub(crate) use self::schema::{OperatorConfigV2, ServeDefaultsV2};
 
 #[derive(Debug, Error)]
 pub(crate) enum SetupError {
@@ -43,23 +43,38 @@ impl SetupError {
     }
 }
 
-pub(super) fn run(args: SetupArgs) -> Result<(), SetupError> {
+pub(super) fn run(args: SetupArgs, explicit_root: Option<&Path>) -> Result<(), SetupError> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let mut input = stdin.lock();
     let mut output = stdout.lock();
-    execute(args, &LiveHostProbe, interactive, &mut input, &mut output)
+    execute(
+        args,
+        explicit_root,
+        &LiveHostProbe,
+        interactive,
+        &mut input,
+        &mut output,
+    )
+}
+
+pub(crate) fn load_operator_config(
+    explicit_root: Option<&Path>,
+) -> Result<Option<OperatorConfigV2>, SetupError> {
+    let root = resolve_root(explicit_root)?;
+    fs::load_config_if_present(&root)
 }
 
 fn execute<P: HostProbe, R: BufRead, W: Write>(
     args: SetupArgs,
+    explicit_root: Option<&Path>,
     probe: &P,
     interactive: bool,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), SetupError> {
-    let root = resolve_root(args.state_root.as_deref())?;
+    let root = resolve_root(explicit_root)?;
     let state_binding = crate::distribution::verify_setup_state_root(&root)
         .map_err(|error| SetupError::Filesystem(error.to_string()))?;
     let observed = fs::observe_existing_config(&root)?;
@@ -77,11 +92,10 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
         volume_available_bytes,
     } = probe.observe(&root)?;
     hardware.validate()?;
-    let recommendation = recommended_limit(volume_total_bytes, volume_available_bytes)?;
 
     writeln!(
         output,
-        "Detected {} on {}: {} / {} with {} bytes unified memory and a {}-byte Metal recommended working set (macOS {}, {} {} + {} {} logical cores, shell {}, RLIMIT_NOFILE {}).",
+        "Detected {} on {}: {} / {} with {} bytes unified memory and a {}-byte Metal recommended working set (macOS {}, {} {} + {} {} logical cores, configured shell {}, RLIMIT_NOFILE {}).",
         hardware.target,
         root.display(),
         hardware.chip_model,
@@ -98,28 +112,21 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
     )?;
     writeln!(
         output,
-        "Containing volume: {} bytes total, {} bytes available; recommended session-cache limit {} bytes ({}).",
-        volume_total_bytes,
-        volume_available_bytes,
-        recommendation,
-        format_bytes(recommendation),
+        "Containing volume: {} bytes total, {} bytes available.",
+        volume_total_bytes, volume_available_bytes,
+    )?;
+    writeln!(
+        output,
+        "Recommended defaults follow the tested Qwen3.8 coding-client journey; every value remains overrideable per command."
     )?;
 
-    let session_cache = match resolve_policy(
-        &args,
-        current.map(|config| &config.session_cache),
-        interactive,
-        recommendation,
-        input,
-        output,
-    )? {
-        PolicyResolution::Cancelled => {
+    let config = match resolve_preferences(&args, current, interactive, input, output)? {
+        PreferenceResolution::Cancelled => {
             writeln!(output, "Setup cancelled; no configuration was changed.")?;
             return Ok(());
         }
-        PolicyResolution::Selected(policy) => policy,
+        PreferenceResolution::Selected(config) => config,
     };
-    let config = ConfigV1::new(hardware, session_cache)?;
     let bytes = config.to_canonical_bytes()?;
     let changed = fs::persist(&root, &config, &bytes, &observed, &state_binding)?;
     writeln!(
@@ -128,16 +135,24 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
         if changed { "Configured" } else { "Verified" },
         root.join("config.toml").display()
     )?;
+    writeln!(output, "Default convert quant: {}", config.convert.quant)?;
     writeln!(
         output,
-        "Recorded session-cache policy: {} ({} bytes).",
-        if config.session_cache.limit_bytes == 0 {
-            "disabled"
-        } else {
-            "enabled"
-        },
-        config.session_cache.limit_bytes
+        "Default serve endpoint: {}:{}",
+        config.serve.host, config.serve.port
     )?;
+    writeln!(
+        output,
+        "Default serve scheduler: {} (max slots {}).",
+        config.serve.scheduler.as_str(),
+        config.serve.max_slots
+    )?;
+    if config.serve.host == "0.0.0.0" {
+        writeln!(
+            output,
+            "LAN serving requires --auth-token or HF2Q_AUTH_TOKEN before hf2q will bind."
+        )?;
+    }
     writeln!(
         output,
         "No model was downloaded, converted, loaded, or served."
@@ -161,10 +176,15 @@ fn resolve_root(explicit: Option<&Path>) -> Result<PathBuf, SetupError> {
         }
     };
     if !root.is_absolute() {
-        return Err(SetupError::Input("setup root must be absolute".to_owned()));
+        return Err(SetupError::Input(
+            "hf2q state root must be absolute".to_owned(),
+        ));
     }
     Ok(root)
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod defaults_contract_tests;

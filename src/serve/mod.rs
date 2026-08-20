@@ -4025,13 +4025,33 @@ pub(crate) fn parse_scheduler_config(
     max_slots_cli: Option<u32>,
     max_slots_env: Option<&str>,
 ) -> std::result::Result<api::engine::EngineMode, String> {
+    parse_scheduler_config_with_defaults(
+        scheduler_cli,
+        scheduler_env,
+        max_slots_cli,
+        max_slots_env,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn parse_scheduler_config_with_defaults(
+    scheduler_cli: Option<cli::SchedulerArg>,
+    scheduler_env: Option<&str>,
+    max_slots_cli: Option<u32>,
+    max_slots_env: Option<&str>,
+    scheduler_config: Option<cli::SchedulerArg>,
+    max_slots_config: Option<u32>,
+) -> std::result::Result<api::engine::EngineMode, String> {
     use api::engine::EngineMode;
 
     // ---- 1. Resolve scheduler choice ----
     //
     // CLI flag wins; env is the fallback. Whitespace-only env values
     // are treated as unset (trim semantics match `should_enable_kv_persist`).
-    let scheduler_from_env: Option<cli::SchedulerArg> =
+    let scheduler_from_env: Option<cli::SchedulerArg> = if scheduler_cli.is_some() {
+        None
+    } else {
         match scheduler_env.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             None => None,
             Some(raw) => {
@@ -4051,15 +4071,22 @@ pub(crate) fn parse_scheduler_config(
                     }
                 }
             }
-        };
-    let scheduler = scheduler_cli.or(scheduler_from_env);
+        }
+    };
+    let scheduler = scheduler_cli.or(scheduler_from_env).or(scheduler_config);
 
     // ---- 2. Resolve max_slots ----
     //
     // CLI flag wins; env is the fallback. `HF2Q_MAX_SLOTS=0` is
     // refused loudly (per ADR-040 iter-2.5 F3a). Whitespace-only env
     // values are treated as unset.
-    let max_slots_from_env: Option<u32> =
+    if matches!(scheduler, None | Some(cli::SchedulerArg::FifoSerial)) {
+        return Ok(EngineMode::SerialFifo);
+    }
+
+    let max_slots_from_env: Option<u32> = if max_slots_cli.is_some() {
+        None
+    } else {
         match max_slots_env.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             None => None,
             Some(raw) => match raw.parse::<u32>() {
@@ -4073,8 +4100,9 @@ pub(crate) fn parse_scheduler_config(
                     ));
                 }
             },
-        };
-    let max_slots_requested = max_slots_cli.or(max_slots_from_env);
+        }
+    };
+    let max_slots_requested = max_slots_cli.or(max_slots_from_env).or(max_slots_config);
     if let Some(0) = max_slots_requested {
         return Err(format!(
             "ADR-040 C4: --max-slots=0 / HF2Q_MAX_SLOTS=0 is rejected per \
@@ -4087,28 +4115,57 @@ pub(crate) fn parse_scheduler_config(
     }
 
     // ---- 3. Build the EngineMode ----
-    match scheduler {
-        // ADR-040 §3.6 backward-compat — env-absence is byte-equivalent
-        // to pre-ADR-040. `max_slots` (if any) is IGNORED on the
-        // SerialFifo path; the legacy 3-arg `Engine::spawn` is
-        // single-slot by definition.
-        None | Some(cli::SchedulerArg::FifoSerial) => Ok(EngineMode::SerialFifo),
-        Some(cli::SchedulerArg::InflightBatched) => {
-            let max_slots = max_slots_requested.unwrap_or(DEFAULT_MAX_SLOTS_UNDER_INFLIGHT);
-            // Defensive: parsed-zero already rejected above. The
-            // `.max(1)` here is a defense-in-depth pin for any future
-            // refactor that loses the zero-check above.
-            Ok(EngineMode::SlotAware {
-                max_slots: max_slots.max(1),
-            })
-        }
-    }
+    let max_slots = max_slots_requested.unwrap_or(DEFAULT_MAX_SLOTS_UNDER_INFLIGHT);
+    // Defensive: parsed-zero already rejected above. The `.max(1)` here is a
+    // defense-in-depth pin for any future refactor that loses the zero-check.
+    Ok(EngineMode::SlotAware {
+        max_slots: max_slots.max(1),
+    })
 }
 
 /// ADR-040 §3.4 — default `max_slots` under `EngineMode::SlotAware`.
 /// Half the reopen-trigger threshold of `8`, so the first ramp deploys
 /// with headroom.
 pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedServeEndpoint {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) host_from_config: bool,
+}
+
+pub(crate) fn resolve_serve_endpoint(
+    host_cli: Option<&str>,
+    port_cli: Option<u16>,
+    operator_defaults: Option<&crate::setup::ServeDefaultsV2>,
+) -> ResolvedServeEndpoint {
+    let host_from_config = host_cli.is_none() && operator_defaults.is_some();
+    ResolvedServeEndpoint {
+        host: host_cli
+            .map(str::to_owned)
+            .or_else(|| operator_defaults.map(|defaults| defaults.host.clone()))
+            .unwrap_or_else(|| "127.0.0.1".to_owned()),
+        port: port_cli
+            .or_else(|| operator_defaults.map(|defaults| defaults.port))
+            .unwrap_or(8080),
+        host_from_config,
+    }
+}
+
+pub(crate) fn validate_configured_endpoint_auth(
+    endpoint: &ResolvedServeEndpoint,
+    auth_token: Option<&str>,
+) -> std::result::Result<(), String> {
+    let has_auth_token = auth_token.is_some_and(|token| !token.trim().is_empty());
+    if endpoint.host_from_config && endpoint.host == "0.0.0.0" && !has_auth_token {
+        return Err(
+            "setup configured LAN serving on 0.0.0.0, but no authentication token is set; pass --auth-token, set HF2Q_AUTH_TOKEN, or override --host 127.0.0.1"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
 
 /// Bind a loaded projector to the text architecture before allocating its
 /// GPU weights. Standard architecture, tokenizer, projector profile, output
@@ -4197,7 +4254,11 @@ pub(crate) fn parse_kv_cache_budget(
     }
 }
 
-pub fn cmd_serve(args: cli::ServeArgs, log_format: cli::LogFormat) -> Result<()> {
+pub fn cmd_serve(
+    args: cli::ServeArgs,
+    log_format: cli::LogFormat,
+    operator_defaults: Option<&crate::setup::ServeDefaultsV2>,
+) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
@@ -4209,6 +4270,9 @@ pub fn cmd_serve(args: cli::ServeArgs, log_format: cli::LogFormat) -> Result<()>
             .ok()
             .filter(|s| !s.is_empty())
     });
+    let endpoint = resolve_serve_endpoint(args.host.as_deref(), args.port, operator_defaults);
+    validate_configured_endpoint_auth(&endpoint, auth_token.as_deref())
+        .map_err(|message| anyhow::anyhow!(message))?;
 
     let overflow_policy = match args.overflow_policy {
         cli::OverflowPolicyArg::Reject => OverflowPolicy::Reject,
@@ -4227,19 +4291,21 @@ pub fn cmd_serve(args: cli::ServeArgs, log_format: cli::LogFormat) -> Result<()>
     // `parse_scheduler_config` is unit-tested without env mutation; this
     // call site is the only `std::env::var` lookup for these two knobs.
     //
-    // Per ADR-040 §3.6 backward-compat: with the flag absent AND the
-    // env unset/empty, this returns `EngineMode::SerialFifo` —
+    // Per ADR-040 §3.6 backward-compat: with the flag, env, and setup
+    // config all absent, this returns `EngineMode::SerialFifo` —
     // byte-equivalent to pre-ADR-040. On a parse failure (bogus
     // scheduler name, `max_slots=0`, non-u32 env), we propagate the
     // operator-facing message via `anyhow!` so `cmd_serve` exits
     // non-zero before binding the listener (fail-loud per §7 mantra).
     let scheduler_env = std::env::var("HF2Q_SCHEDULER").ok();
     let max_slots_env = std::env::var("HF2Q_MAX_SLOTS").ok();
-    let engine_mode = parse_scheduler_config(
+    let engine_mode = parse_scheduler_config_with_defaults(
         args.scheduler,
         scheduler_env.as_deref(),
         args.max_slots,
         max_slots_env.as_deref(),
+        operator_defaults.map(|defaults| defaults.scheduler.as_cli()),
+        operator_defaults.map(|defaults| defaults.max_slots),
     )
     .map_err(|msg| anyhow::anyhow!("{msg}"))?;
     let kv_cache_budget_env = std::env::var("HF2Q_KV_CACHE_BUDGET_BYTES").ok();
@@ -4257,8 +4323,8 @@ pub fn cmd_serve(args: cli::ServeArgs, log_format: cli::LogFormat) -> Result<()>
     );
 
     let config = ServerConfig {
-        host: args.host.clone(),
-        port: args.port,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
         auth_token,
         cors_allowed_origins: args.cors_origins.clone(),
         queue_capacity: args.queue_capacity,
@@ -4271,7 +4337,7 @@ pub fn cmd_serve(args: cli::ServeArgs, log_format: cli::LogFormat) -> Result<()>
 
     // Warn when exposing beyond localhost. Decision #7 + #13 — public-internet
     // is NOT a supported deployment target.
-    if args.host == "0.0.0.0" {
+    if endpoint.host == "0.0.0.0" {
         tracing::warn!(
             "Server bound to 0.0.0.0 — exposes API on all interfaces. \
              Public-internet exposure is NOT a supported deployment target \
@@ -6236,10 +6302,12 @@ mod tests {
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, find_special_token_stop,
         llama_cpp_special_token_id_for_model, maybe_print_serve_banner, parse_kv_cache_budget,
-        parse_scheduler_config, render_jinja_template, resolve_enable_thinking, run_decode_loop,
-        should_enable_kv_persist, validate_mmproj_diagnostic_mode, validate_mmproj_text_binding,
-        DecodeStopReason, RaisePolicy, DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
-        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        parse_scheduler_config, parse_scheduler_config_with_defaults, render_jinja_template,
+        resolve_enable_thinking, resolve_serve_endpoint, run_decode_loop, should_enable_kv_persist,
+        validate_configured_endpoint_auth, validate_mmproj_diagnostic_mode,
+        validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
+        DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::cli;
     use crate::core::chat_templates::QWEN3_CHATML;
@@ -7987,6 +8055,78 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn serve_config_defaults_are_used_and_cli_env_override_them() {
+        let config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        let endpoint = resolve_serve_endpoint(None, None, Some(&config.serve));
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 8081);
+        assert!(endpoint.host_from_config);
+
+        let endpoint = resolve_serve_endpoint(Some("0.0.0.0"), Some(9090), Some(&config.serve));
+        assert_eq!(endpoint.host, "0.0.0.0");
+        assert_eq!(endpoint.port, 9090);
+        assert!(!endpoint.host_from_config);
+
+        let configured = parse_scheduler_config_with_defaults(
+            None,
+            None,
+            None,
+            None,
+            Some(config.serve.scheduler.as_cli()),
+            Some(config.serve.max_slots),
+        )
+        .unwrap();
+        assert_eq!(
+            configured,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 1 }
+        );
+
+        let env_override = parse_scheduler_config_with_defaults(
+            None,
+            Some("inflight_batched"),
+            None,
+            Some("3"),
+            Some(config.serve.scheduler.as_cli()),
+            Some(config.serve.max_slots),
+        )
+        .unwrap();
+        assert_eq!(
+            env_override,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 3 }
+        );
+
+        let cli_override = parse_scheduler_config_with_defaults(
+            Some(cli::SchedulerArg::FifoSerial),
+            Some("inflight_batched"),
+            Some(7),
+            Some("3"),
+            Some(config.serve.scheduler.as_cli()),
+            Some(config.serve.max_slots),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_override,
+            crate::serve::api::engine::EngineMode::SerialFifo
+        );
+    }
+
+    #[test]
+    fn configured_lan_requires_runtime_auth() {
+        let mut config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        config.serve.host = "0.0.0.0".to_owned();
+        let endpoint = resolve_serve_endpoint(None, None, Some(&config.serve));
+        assert!(validate_configured_endpoint_auth(&endpoint, None).is_err());
+        assert!(validate_configured_endpoint_auth(&endpoint, Some("  ")).is_err());
+        validate_configured_endpoint_auth(&endpoint, Some("secret")).unwrap();
+
+        let explicit = resolve_serve_endpoint(Some("0.0.0.0"), None, Some(&config.serve));
+        assert!(!explicit.host_from_config);
+        validate_configured_endpoint_auth(&explicit, None).unwrap();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // ADR-040 Phase C iter-4 (C4) — CLI/env wiring for `HF2Q_SCHEDULER` +
     // `--scheduler` / `HF2Q_MAX_SLOTS` + `--max-slots` (2026-05-23).
     //
@@ -8162,8 +8302,13 @@ mod tests {
         assert!(err.contains("max-slots"), "msg: {err}");
 
         // Bonus: non-parseable env value also errors with named diag.
-        let err = parse_scheduler_config(None, None, None, Some("not-a-number"))
-            .expect_err("non-u32 HF2Q_MAX_SLOTS must error");
+        let err = parse_scheduler_config(
+            Some(cli::SchedulerArg::InflightBatched),
+            None,
+            None,
+            Some("not-a-number"),
+        )
+        .expect_err("non-u32 HF2Q_MAX_SLOTS must error");
         assert!(err.contains("HF2Q_MAX_SLOTS"), "msg: {err}");
         assert!(err.contains("u32"), "msg must name u32: {err}");
     }
@@ -8202,6 +8347,15 @@ mod tests {
             mode,
             crate::serve::api::engine::EngineMode::SlotAware { max_slots: 7 }
         );
+
+        let mode = parse_scheduler_config(
+            Some(cli::SchedulerArg::FifoSerial),
+            Some("not-a-scheduler"),
+            None,
+            Some("not-a-number"),
+        )
+        .expect("irrelevant malformed env must not defeat explicit FIFO");
+        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
     }
 
     /// CLI `--max-slots` wins over `HF2Q_MAX_SLOTS`.
@@ -8214,6 +8368,18 @@ mod tests {
             Some("16"),
         )
         .expect("cli max_slots wins over env");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 2 }
+        );
+
+        let mode = parse_scheduler_config(
+            Some(cli::SchedulerArg::InflightBatched),
+            Some("not-a-scheduler"),
+            Some(2),
+            Some("not-a-number"),
+        )
+        .expect("explicit CLI values must bypass malformed lower-precedence env");
         assert_eq!(
             mode,
             crate::serve::api::engine::EngineMode::SlotAware { max_slots: 2 }

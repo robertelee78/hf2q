@@ -2,12 +2,51 @@ use std::path::{Path, PathBuf};
 
 use sysinfo::Disks;
 
-use super::schema::{ConfiguredShell, HardwareProfileV1};
+use super::schema::ConfiguredShell;
 use super::SetupError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HardwareProfile {
+    pub(super) target: String,
+    pub(super) chip_model: String,
+    pub(super) unified_memory_bytes: u64,
+    pub(super) metal_device_name: String,
+    pub(super) metal_recommended_working_set_bytes: u64,
+}
+
+impl HardwareProfile {
+    pub(super) fn validate(&self) -> Result<(), SetupError> {
+        if self.target != "aarch64-apple-darwin" {
+            return Err(SetupError::Host(
+                "hardware target must be aarch64-apple-darwin".to_owned(),
+            ));
+        }
+        for (field, value) in [
+            ("chip model", self.chip_model.as_str()),
+            ("Metal device name", self.metal_device_name.as_str()),
+        ] {
+            if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+                return Err(SetupError::Host(format!(
+                    "{field} must be 1..=128 non-control UTF-8 bytes"
+                )));
+            }
+        }
+        if self.unified_memory_bytes == 0
+            || self.metal_recommended_working_set_bytes == 0
+            || self.unified_memory_bytes > i64::MAX as u64
+            || self.metal_recommended_working_set_bytes > i64::MAX as u64
+        {
+            return Err(SetupError::Host(
+                "hardware inventory contains an invalid byte value".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HostObservation {
-    pub(super) hardware: HardwareProfileV1,
+    pub(super) hardware: HardwareProfile,
     pub(super) macos_version: String,
     pub(super) configured_shell: ConfiguredShell,
     pub(super) performance_level0_name: String,
@@ -67,7 +106,7 @@ fn read_host_profile() -> Result<HostObservation, SetupError> {
         ));
     }
     Ok(HostObservation {
-        hardware: HardwareProfileV1 {
+        hardware: HardwareProfile {
             target: "aarch64-apple-darwin".to_owned(),
             chip_model,
             unified_memory_bytes,

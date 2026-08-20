@@ -92,22 +92,22 @@ The explicit commit identity is required for immutable remote-conversion
 receipts when building from a checkout. Published packages and future native
 release artifacts embed their own source identity.
 
-`hf2q setup` inventories the selected Apple-Silicon host and records one
-bounded inactive-session policy in `~/.hf2q/config.toml`. It downloads,
+`hf2q setup` inventories the selected Apple-Silicon host and records defaults
+that the existing `convert` and `serve` commands consume. It downloads,
 converts, loads, and serves nothing. Complete automation is non-interactive:
 
 ```bash
-hf2q setup --session-cache off
-hf2q setup --session-cache on --session-cache-limit 32GiB
+hf2q setup --accept-defaults
 ```
 
-Use `--state-root /absolute/path` for a custom standalone state root. The
-recorded session policy is currently inert and is not wired into serving.
-Zero is reserved to mean disabled rather than the legacy unlimited setting.
-ADR-045 will replace this provisional schema with conversion and serving
-defaults that have real production consumers. See
-[`docs/setup.md`](docs/setup.md) for the exact prompt, schema, filesystem, and
-failure contract.
+The canonical Qwen3.8 guide profile records Q4_K_M conversion, localhost port
+8081, and inflight-batched serving with one active slot. Interactive setup can
+change those choices for another workload or model family. Explicit command
+flags still win, and existing scheduler
+environment overrides retain their precedence. Use the global
+`--state-root /absolute/path` option for a custom config root and pass the same
+option to later convert or serve commands. See [`docs/setup.md`](docs/setup.md)
+for the exact prompts, schema, precedence, filesystem, and failure contract.
 
 The exact `mlx-native` declaration in `Cargo.toml` resolves from `crates.io`.
 For local mlx-native development place a path
@@ -149,7 +149,7 @@ manual setup.
 
 | Command | What it does |
 |---|---|
-| `hf2q setup` | Inventory Apple Silicon and record a bounded, currently inert session-cache policy. |
+| `hf2q setup` | Learn the Apple-Silicon host and record defaults consumed by `convert` and `serve`. |
 | `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Inspect a GGUF model without loading weights. |

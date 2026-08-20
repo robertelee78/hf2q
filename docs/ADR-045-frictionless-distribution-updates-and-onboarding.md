@@ -27,7 +27,7 @@ The corrected product boundary is:
 2. `hf2q setup`, which learns the host and operator preferences and writes
    defaults consumed by later hf2q commands;
 3. one tested guide for choosing a supported model and using the existing
-   convert, quantize, serve, and API surfaces;
+   convert-with-quantization, serve, and API surfaces;
 4. `hf2q update`, which updates hf2q through the channel that installed it;
 5. safe, channel-aware uninstall behavior; and
 6. a clean-Mac proof that the whole journey works.
@@ -58,7 +58,7 @@ The implementation disposition is therefore:
 | Existing block and Qwen persistence implementations | **Keep outside ADR-045** under ADR-017 and ADR-027 | Setup and onboarding do not create a second cache implementation. |
 | Stable Mac/Metal/memory/storage probes and reusable private atomic config-file mechanics | **Keep and simplify** for the corrected setup schema | These directly support system learning and safe config publication. |
 | Exact release revision/tag/checksum lineage and the existing Cargo source-package channel | **Keep** | They are useful release evidence and an advanced install channel, but are not proof of the standalone native channel. |
-| Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | The runtime authorization and second store are removed in this slice. The temporary inert setup field remains only until the consumed convert/serve setup schema replaces it. |
+| Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | The runtime authorization and second store are removed. Schema 2 replaces the temporary cache field with defaults consumed by convert and serve. |
 | No-options model recipes, prepared-model profiles/registry/publication, source-retention orchestration, and post-conversion calibration state | **Remove** | They have no production caller and replace guide steps with an unrequested orchestration system. Any useful exact model evidence moves to the relevant model/conversion ADR or guide proof. |
 | Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, and their structural CI sentinels | **Remove** | The current code cannot install, update, or uninstall hf2q and does not shorten the path to the first real channel. |
 | Release manifest/receipt and installation-identity concepts, archive/signature validation, and atomic publication mechanics | **Keep, then simplify behind the reachable standalone channel** | The first channel needs a signed/notarized native artifact, a small manifest and channel receipt, atomic replacement with one known-good fallback, and observable behavior tests. The artifact spike decides which existing validators remain necessary. |
@@ -178,23 +178,31 @@ the smallest design that proves the observable contract.
 4. write a versioned hf2q configuration under the selected state root; and
 5. be safe and idempotent to run again.
 
-The configuration must cover the stable defaults needed by the existing
-workflow, including at minimum:
+The version-2 config freezes only five stable defaults with immediate
+production consumers:
 
-- model source, output, cache, and state locations;
-- whether downloaded source weights are retained after a successful
-  conversion;
-- conversion/quantization preferences that map to supported hf2q options;
-- resource-conscious defaults derived from the Mac, rather than fabricated
-  hardware capabilities; and
-- serving defaults such as bind policy, port, authentication/exposure policy,
-  and the stable runtime options the existing server actually supports.
+- `convert.quant`, validated by the existing `QuantSelector`;
+- `serve.host` and `serve.port`;
+- `serve.scheduler`; and
+- `serve.max_slots`.
 
-The exact schema will be derived from the current CLI and operator guide
-before implementation. A setup field is allowed only when a later production
-command consumes it or the guide clearly uses it. Explicit command-line
-arguments override configured defaults. Malformed or unsupported config fails
-with an actionable error; it never silently becomes an unsafe or unlimited
+The guide-proven recommendation is `q4_k_m`, `127.0.0.1:8081`, and
+`inflight_batched` with one active slot. Interactive setup explains and may
+change each value. Setup observes hardware and storage to inform the operator,
+but does not persist a hardware snapshot or claim that a model-free probe can
+derive a safe model size.
+
+Model source/revision, output path, cache roots, source-retention policy,
+authentication secrets, model-specific conversion inputs, and experimental
+runtime knobs are deliberately absent. The current commands do not expose one
+honest shared cache or source-retention setting, and model-specific paths must
+remain explicit. A setup field is allowed only when a later production command
+consumes it or the guide clearly uses it.
+
+Explicit command-line arguments override configured defaults. Existing serve
+environment overrides remain between CLI and config. Malformed, provisional,
+or unsupported config fails with an actionable error before download, model
+load, or listener bind; it never silently becomes an unsafe or unlimited
 default.
 
 `hf2q setup` does not:
@@ -342,15 +350,18 @@ implementation detail.
 
 ## Configuration precedence
 
-The final setup schema is intentionally not frozen by this scope correction.
-It will be specified from the actual supported CLI in the setup implementation
-slice. The governing precedence is:
+The schema-2 setup slice freezes the governing precedence as:
 
 1. an explicit command-line argument;
 2. an explicit environment override already supported by that command;
-3. the selected profile in hf2q's versioned config;
-4. a setup-derived host default; and
-5. the command's safe built-in default.
+3. hf2q's versioned config; and
+4. the command's safe built-in default.
+
+Convert has no quantization built-in: `--quant` wins over config, and absence
+of both is an actionable input error. Serve retains its pre-setup built-ins
+when config is absent. The global `--state-root` selects the config root for
+setup, convert, and serve; a custom root is never inferred from the executable
+or a model path.
 
 Security-sensitive choices, such as non-loopback serving or disabling
 authentication, require explicit operator intent and must not be inferred from
@@ -450,6 +461,12 @@ cache subsystem was added.
 5. Prove that explicit flags override config and setup itself performs no
    model or integration work.
 
+The slice implements schema 2 with the five fields above. The old schema 1 was
+provisional and is not auto-migrated: its exact bytes remain untouched and the
+operator is told to move it aside and rerun setup. Publication retains the
+private descriptor-relative lock, exact-prefix recovery, atomic rename, and
+durability barriers already proven by setup's filesystem tests.
+
 ### Slice D: publish the standalone Apple-Silicon channel
 
 1. Produce the exact signed, notarized, immutable release artifact.
@@ -505,8 +522,9 @@ published bytes.
 ### Guide
 
 - Every command parses against the shipped CLI.
-- A clean-account operator can follow the guide from official source weights
-  to an hf2q-converted GGUF and a valid OpenAI-compatible response.
+- A clean-account operator can follow the guide from its exact pinned Hugging
+  Face source weights to an hf2q-converted GGUF and a valid OpenAI-compatible
+  response.
 - The exact protected Apple-Silicon proof records source revision, model
   artifact, quantization, settings, hardware, output correctness, and cleanup.
 - The optional OpenCode section proves connection and a realistic tool-call
@@ -543,21 +561,19 @@ What exists:
 - the canonical tested text-only Qwen3.8 guide for conversion, serving,
   direct API use, and optional OpenCode;
 - partial dormant distribution/update security infrastructure;
-- a `setup` command whose current schema primarily records an inert future
-  session-cache policy; and
+- a `setup` command that records conversion and serving defaults consumed by
+  the existing commands through a selected state root; and
 - dormant model-preparation components created under the prior over-broad ADR
   wording.
 
-The unreachable second managed-session store and its runtime authorization
-have been removed. `hf2q setup` no longer creates or authorizes a separate
-`cache/sessions` hierarchy.
+The unreachable second managed-session store, its runtime authorization, and
+the provisional session-cache setup field have been removed. `hf2q setup` does
+not create or authorize a separate `cache/sessions` hierarchy.
 
 What is not yet the corrected product:
 
 - the live standalone installer at hf2q.us;
 - verified Homebrew/npm/direct user channels;
-- a setup schema for conversion, quantization, and serving defaults that the
-  production commands consume;
 - public channel-aware `hf2q update` and `hf2q uninstall`; and
 - the clean-account installed-artifact acceptance proof.
 
@@ -580,8 +596,8 @@ under their actual governing decisions before more onboarding code is added.
 
 ### Trade-offs
 
-- Correcting scope does not itself ship an installer or fix the current setup
-  schema.
+- Correcting setup does not itself ship an installer or package-manager
+  channel.
 - Previously landed ADR-045-labeled code requires an explicit follow-up audit.
 - Channel-aware update/uninstall behavior must be implemented and tested for
   each advertised method rather than hidden behind one generic mechanism.

@@ -30,6 +30,11 @@ pub struct Cli {
     #[arg(long, value_enum, global = true)]
     pub log_level: Option<LogLevel>,
 
+    /// Absolute hf2q state root containing config.toml. Defaults to
+    /// `$HOME/.hf2q`. Setup writes this file; convert and serve read it.
+    #[arg(long, value_name = "ABSOLUTE_PATH", global = true)]
+    pub state_root: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -65,7 +70,7 @@ impl LogLevel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Record host facts and an inert bounded future session-cache policy.
+    /// Learn this Mac and record defaults used by convert and serve.
     Setup(SetupArgs),
 
     /// Patch an existing GGUF file's metadata without changing tensor bytes
@@ -125,25 +130,31 @@ pub enum Command {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct SetupArgs {
-    /// Record whether future inactive-session persistence may be enabled.
-    /// Omit only for an interactive terminal prompt.
-    #[arg(long, value_enum)]
-    pub session_cache: Option<SessionCacheChoice>,
+    /// Default quant selector used by `hf2q convert` when `--quant` is omitted.
+    #[arg(long, value_name = "QUANT")]
+    pub default_quant: Option<String>,
 
-    /// Recorded future persistence byte limit. Accepts an integer with an optional
-    /// B, KiB, MiB, GiB, or TiB suffix. Required with non-interactive `on`.
-    #[arg(long, value_name = "SIZE")]
-    pub session_cache_limit: Option<String>,
+    /// Default serve bind host. Setup accepts only 127.0.0.1 or 0.0.0.0.
+    #[arg(long, value_name = "HOST")]
+    pub serve_host: Option<String>,
 
-    /// Absolute hf2q state root. Defaults to `$HOME/.hf2q`.
-    #[arg(long, value_name = "ABSOLUTE_PATH")]
-    pub state_root: Option<PathBuf>,
-}
+    /// Default serve port.
+    #[arg(long, value_name = "PORT")]
+    pub serve_port: Option<u16>,
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SessionCacheChoice {
-    On,
-    Off,
+    /// Default serve scheduler.
+    #[arg(long, value_enum, value_name = "POLICY")]
+    pub serve_scheduler: Option<SchedulerArg>,
+
+    /// Default active-request slots for inflight-batched serving.
+    #[arg(long, value_name = "N")]
+    pub serve_max_slots: Option<u32>,
+
+    /// Accept the displayed values without prompting. A fresh config uses the
+    /// canonical Qwen3.8 guide defaults; a rerun retains current values.
+    /// Explicit setup flags override individual values.
+    #[arg(long, default_value_t = false)]
+    pub accept_defaults: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -254,10 +265,12 @@ pub struct ConvertCliArgs {
     ///     supported tier set in the message).
     ///
     /// Parsed via `QuantSelector::from_name`; unrecognized values
-    /// surface as input errors. Per
+    /// surface as input errors. When omitted, the value recorded by
+    /// `hf2q setup` is used; without either source, conversion fails and
+    /// asks the operator to choose. Per
     /// [[feedback-no-backwards-compat-2026-05-18]]: no legacy aliases.
     #[arg(long)]
-    pub quant: String,
+    pub quant: Option<String>,
 
     /// Destination GGUF file. Existing files are overwritten.
     #[arg(short, long)]
@@ -740,16 +753,18 @@ pub struct ServeArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Host to bind to. Defaults to 127.0.0.1 (localhost only) per ADR-005
-    /// Decision #7. Use `--host 0.0.0.0` to expose on the LAN; public-internet
-    /// is NOT a supported deployment target (reverse-proxy assumption,
-    /// Decision #13).
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
+    /// Host to bind to. Explicit CLI wins over the setup config; without
+    /// either, defaults to 127.0.0.1 (localhost only) per ADR-005 Decision
+    /// #7. Use `--host 0.0.0.0` to expose on the LAN; public-internet is NOT
+    /// a supported deployment target (reverse-proxy assumption, Decision
+    /// #13).
+    #[arg(long)]
+    pub host: Option<String>,
 
-    /// Port to listen on.
-    #[arg(long, default_value = "8080")]
-    pub port: u16,
+    /// Port to listen on. Explicit CLI wins over the setup config; without
+    /// either, the built-in default remains 8080.
+    #[arg(long)]
+    pub port: Option<u16>,
 
     /// Maximum sequence length (reserved for future iterations — context
     /// length is read from GGUF metadata).
@@ -1143,14 +1158,18 @@ mod tests {
     fn getting_started_qwen38_commands_parse_exactly() {
         let revision = "08c2f075b43bc06456382db6b918a3dcabdcf4dd";
         let model = "/tmp/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf";
+        let cli = Cli::parse_from(["hf2q", "setup", "--accept-defaults"]);
+        let Command::Setup(args) = cli.command else {
+            panic!("expected Setup");
+        };
+        assert!(args.accept_defaults);
+
         let cli = Cli::parse_from([
             "hf2q",
             "convert",
             "jenerallee78/Qwen3.8-27B-Abliterated-SFT",
             "--revision",
             revision,
-            "--quant",
-            "q4_k_m",
             "--output",
             model,
         ]);
@@ -1162,31 +1181,18 @@ mod tests {
             Some(PathBuf::from("jenerallee78/Qwen3.8-27B-Abliterated-SFT"))
         );
         assert_eq!(args.revision.as_deref(), Some(revision));
-        assert_eq!(args.quant, "q4_k_m");
+        assert!(args.quant.is_none());
         assert_eq!(args.output, PathBuf::from(model));
 
-        let cli = Cli::parse_from([
-            "hf2q",
-            "serve",
-            "--model",
-            model,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8081",
-            "--scheduler",
-            "inflight-batched",
-            "--max-slots",
-            "1",
-        ]);
+        let cli = Cli::parse_from(["hf2q", "serve", "--model", model]);
         let Command::Serve(args) = cli.command else {
             panic!("expected Serve");
         };
         assert_eq!(args.model, Some(PathBuf::from(model)));
-        assert_eq!(args.host, "127.0.0.1");
-        assert_eq!(args.port, 8081);
-        assert_eq!(args.scheduler, Some(SchedulerArg::InflightBatched));
-        assert_eq!(args.max_slots, Some(1));
+        assert!(args.host.is_none());
+        assert!(args.port.is_none());
+        assert!(args.scheduler.is_none());
+        assert!(args.max_slots.is_none());
         assert!(args.mmproj.is_none());
     }
 }

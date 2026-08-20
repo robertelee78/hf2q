@@ -1,215 +1,202 @@
 use std::io::{BufRead, Write};
 
-use crate::cli::{SessionCacheChoice, SetupArgs};
+use crate::cli::{SchedulerArg, SetupArgs};
 
-use super::schema::SessionCachePolicyV1;
+use super::schema::{ConfiguredScheduler, OperatorConfigV2};
 use super::SetupError;
 
-const KIB: u64 = 1024;
-const MIB: u64 = 1024 * KIB;
-const GIB: u64 = 1024 * MIB;
-const TIB: u64 = 1024 * GIB;
-const MAX_SESSION_CACHE_BYTES: u64 = 100 * GIB;
-const RESERVED_BYTES: u64 = 20 * GIB;
 const MAX_PROMPT_BYTES: usize = 256;
 
-pub(super) enum PolicyResolution {
+pub(super) enum PreferenceResolution {
     Cancelled,
-    Selected(SessionCachePolicyV1),
+    Selected(OperatorConfigV2),
 }
 
-pub(super) fn recommended_limit(total: u64, available: u64) -> Result<u64, SetupError> {
-    if total == 0 || available > total {
-        return Err(SetupError::Host(
-            "filesystem reported invalid capacity facts".to_owned(),
-        ));
-    }
-    let volume_tenth = total / 10;
-    let free_quarter = available / 4;
-    let fifteen_percent = (total / 100)
-        .checked_mul(15)
-        .and_then(|whole| whole.checked_add((total % 100) * 15 / 100))
-        .ok_or_else(|| SetupError::Host("filesystem capacity arithmetic overflowed".to_owned()))?;
-    let reserve = RESERVED_BYTES.max(fifteen_percent);
-    Ok(MAX_SESSION_CACHE_BYTES
-        .min(volume_tenth)
-        .min(free_quarter)
-        .min(available.saturating_sub(reserve)))
-}
-
-pub(super) fn resolve_policy<R: BufRead, W: Write>(
+pub(super) fn resolve_preferences<R: BufRead, W: Write>(
     args: &SetupArgs,
-    current: Option<&SessionCachePolicyV1>,
+    current: Option<&OperatorConfigV2>,
     interactive: bool,
-    recommendation: u64,
     input: &mut R,
     output: &mut W,
-) -> Result<PolicyResolution, SetupError> {
-    match (args.session_cache, args.session_cache_limit.as_deref()) {
-        (Some(SessionCacheChoice::Off), None) => Ok(PolicyResolution::Selected(disabled())),
-        (Some(SessionCacheChoice::Off), Some(_)) => Err(SetupError::Input(
-            "--session-cache-limit is invalid when --session-cache off".to_owned(),
-        )),
-        (Some(SessionCacheChoice::On), Some(value)) => Ok(PolicyResolution::Selected(enabled(
-            value,
-            recommendation,
-            output,
-        )?)),
-        (Some(SessionCacheChoice::On), None) if interactive => {
-            prompt_limit(current, recommendation, input, output)
-        }
-        (Some(SessionCacheChoice::On), None) => Err(SetupError::Input(
-            "non-interactive setup requires --session-cache on --session-cache-limit SIZE"
-                .to_owned(),
-        )),
-        (None, Some(_)) => Err(SetupError::Input(
-            "--session-cache-limit requires --session-cache on".to_owned(),
-        )),
-        (None, None) if interactive => {
-            let current_enabled = current.map_or(true, |policy| policy.limit_bytes > 0);
-            write!(
-                output,
-                "Keep inactive sessions on disk for fast resume? {} ",
-                if current_enabled { "[Y/n]" } else { "[y/N]" }
-            )?;
-            output.flush()?;
-            let Some(answer) = read_prompt_line(input)? else {
-                return Ok(PolicyResolution::Cancelled);
-            };
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "" if !current_enabled => Ok(PolicyResolution::Selected(disabled())),
-                "" | "y" | "yes" => prompt_limit(current, recommendation, input, output),
-                "n" | "no" => Ok(PolicyResolution::Selected(disabled())),
-                _ => Err(SetupError::Input(
-                    "expected y, yes, n, no, or Enter".to_owned(),
-                )),
-            }
-        }
-        (None, None) => Err(SetupError::Input(
-            "non-interactive setup requires --session-cache off or --session-cache on --session-cache-limit SIZE"
-                .to_owned(),
-        )),
-    }
-}
-
-fn prompt_limit<R: BufRead, W: Write>(
-    current: Option<&SessionCachePolicyV1>,
-    recommendation: u64,
-    input: &mut R,
-    output: &mut W,
-) -> Result<PolicyResolution, SetupError> {
-    if recommendation == 0 {
-        return Err(SetupError::Input(
-            "session persistence cannot be enabled: no positive safe disk band remains".to_owned(),
-        ));
-    }
-    let default = current
-        .map(|policy| policy.limit_bytes)
-        .filter(|limit| *limit > 0)
-        .unwrap_or(recommendation);
-    write!(output, "Session cache limit [{}]: ", format_bytes(default))?;
-    output.flush()?;
-    let Some(answer) = read_prompt_line(input)? else {
-        return Ok(PolicyResolution::Cancelled);
-    };
-    let limit = if answer.is_empty() {
-        default
-    } else {
-        parse_byte_size(&answer)?
-    };
-    validate_enabled_limit(limit, recommendation, output)?;
-    Ok(PolicyResolution::Selected(SessionCachePolicyV1 {
-        limit_bytes: limit,
-    }))
-}
-
-fn enabled<W: Write>(
-    value: &str,
-    recommendation: u64,
-    output: &mut W,
-) -> Result<SessionCachePolicyV1, SetupError> {
-    let limit = parse_byte_size(value)?;
-    validate_enabled_limit(limit, recommendation, output)?;
-    Ok(SessionCachePolicyV1 { limit_bytes: limit })
-}
-
-fn validate_enabled_limit<W: Write>(
-    limit: u64,
-    recommendation: u64,
-    output: &mut W,
-) -> Result<(), SetupError> {
-    if limit == 0 {
-        return Err(SetupError::Input(
-            "--session-cache on requires a positive limit; zero means disabled".to_owned(),
-        ));
-    }
-    if recommendation == 0 {
-        return Err(SetupError::Input(
-            "session persistence cannot be enabled: no positive safe disk band remains".to_owned(),
-        ));
-    }
-    if limit > i64::MAX as u64 {
-        return Err(SetupError::Input(
-            "session cache limit exceeds TOML's signed integer range".to_owned(),
-        ));
-    }
-    if limit > recommendation {
-        writeln!(
-            output,
-            "Warning: requested {} exceeds the disk-aware recommendation {}.",
-            format_bytes(limit),
-            format_bytes(recommendation)
-        )?;
-    }
-    Ok(())
-}
-
-fn disabled() -> SessionCachePolicyV1 {
-    SessionCachePolicyV1 { limit_bytes: 0 }
-}
-
-pub(super) fn parse_byte_size(value: &str) -> Result<u64, SetupError> {
-    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return Err(SetupError::Input(
-            "SIZE must be an integer with optional B, KiB, MiB, GiB, or TiB suffix".to_owned(),
-        ));
-    }
-    let (digits, multiplier) = [
-        ("KiB", KIB),
-        ("MiB", MIB),
-        ("GiB", GIB),
-        ("TiB", TIB),
-        ("B", 1),
-    ]
-    .into_iter()
-    .find_map(|(suffix, multiplier)| {
-        value
-            .strip_suffix(suffix)
-            .map(|digits| (digits, multiplier))
-    })
-    .unwrap_or((value, 1));
-    if digits.is_empty()
-        || (digits.len() > 1 && digits.starts_with('0'))
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+) -> Result<PreferenceResolution, SetupError> {
+    if !interactive
+        && current.is_none()
+        && !args.accept_defaults
+        && !fresh_noninteractive_is_complete(args)
     {
         return Err(SetupError::Input(
-            "SIZE must use canonical unsigned decimal digits".to_owned(),
+            "fresh non-interactive setup requires --accept-defaults or explicit values for --default-quant, --serve-host, --serve-port, --serve-scheduler, and (for inflight) --serve-max-slots"
+                .to_owned(),
         ));
     }
-    digits
-        .parse::<u64>()
-        .ok()
-        .and_then(|number| number.checked_mul(multiplier))
-        .ok_or_else(|| SetupError::Input("SIZE exceeds u64".to_owned()))
-}
 
-pub(super) fn format_bytes(bytes: u64) -> String {
-    for (suffix, unit) in [("TiB", TIB), ("GiB", GIB), ("MiB", MIB), ("KiB", KIB)] {
-        if bytes >= unit && bytes % unit == 0 {
-            return format!("{} {suffix}", bytes / unit);
+    let mut selected = current
+        .cloned()
+        .unwrap_or(OperatorConfigV2::guide_defaults()?);
+    apply_explicit(args, &mut selected);
+
+    if !interactive || args.accept_defaults {
+        return Ok(PreferenceResolution::Selected(OperatorConfigV2::new(
+            selected.convert,
+            selected.serve,
+        )?));
+    }
+
+    if args.default_quant.is_none() {
+        write!(
+            output,
+            "Default conversion quantization [{}]: ",
+            selected.convert.quant
+        )?;
+        output.flush()?;
+        let Some(answer) = read_prompt_line(input)? else {
+            return Ok(PreferenceResolution::Cancelled);
+        };
+        if !answer.is_empty() {
+            selected.convert.quant = answer;
         }
     }
-    format!("{bytes} bytes")
+
+    if args.serve_scheduler.is_none() {
+        write!(
+            output,
+            "Optimize serving for long agent and tool-use prompts? {} ",
+            if selected.serve.scheduler == ConfiguredScheduler::InflightBatched {
+                "[Y/n]"
+            } else {
+                "[y/N]"
+            }
+        )?;
+        output.flush()?;
+        let Some(answer) = read_prompt_line(input)? else {
+            return Ok(PreferenceResolution::Cancelled);
+        };
+        selected.serve.scheduler = match yes_no(
+            &answer,
+            selected.serve.scheduler == ConfiguredScheduler::InflightBatched,
+        )? {
+            true => ConfiguredScheduler::InflightBatched,
+            false => ConfiguredScheduler::FifoSerial,
+        };
+        if selected.serve.scheduler == ConfiguredScheduler::FifoSerial {
+            selected.serve.max_slots = 1;
+        }
+    }
+
+    if selected.serve.scheduler == ConfiguredScheduler::InflightBatched
+        && args.serve_max_slots.is_none()
+    {
+        write!(
+            output,
+            "Maximum simultaneous active requests [{}]: ",
+            selected.serve.max_slots
+        )?;
+        output.flush()?;
+        let Some(answer) = read_prompt_line(input)? else {
+            return Ok(PreferenceResolution::Cancelled);
+        };
+        if !answer.is_empty() {
+            selected.serve.max_slots = parse_positive_u32("active request count", &answer)?;
+        }
+    }
+
+    if args.serve_host.is_none() {
+        write!(
+            output,
+            "Allow other devices on the LAN to connect? {} ",
+            if selected.serve.host == "0.0.0.0" {
+                "[Y/n]"
+            } else {
+                "[y/N]"
+            }
+        )?;
+        output.flush()?;
+        let Some(answer) = read_prompt_line(input)? else {
+            return Ok(PreferenceResolution::Cancelled);
+        };
+        selected.serve.host = if yes_no(&answer, selected.serve.host == "0.0.0.0")? {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        }
+        .to_owned();
+    }
+
+    if args.serve_port.is_none() {
+        write!(output, "Default API port [{}]: ", selected.serve.port)?;
+        output.flush()?;
+        let Some(answer) = read_prompt_line(input)? else {
+            return Ok(PreferenceResolution::Cancelled);
+        };
+        if !answer.is_empty() {
+            selected.serve.port = parse_port(&answer)?;
+        }
+    }
+
+    Ok(PreferenceResolution::Selected(OperatorConfigV2::new(
+        selected.convert,
+        selected.serve,
+    )?))
+}
+
+fn fresh_noninteractive_is_complete(args: &SetupArgs) -> bool {
+    args.default_quant.is_some()
+        && args.serve_host.is_some()
+        && args.serve_port.is_some()
+        && args.serve_scheduler.is_some()
+        && (args.serve_scheduler == Some(SchedulerArg::FifoSerial)
+            || args.serve_max_slots.is_some())
+}
+
+fn apply_explicit(args: &SetupArgs, selected: &mut OperatorConfigV2) {
+    if let Some(quant) = &args.default_quant {
+        selected.convert.quant.clone_from(quant);
+    }
+    if let Some(host) = &args.serve_host {
+        selected.serve.host.clone_from(host);
+    }
+    if let Some(port) = args.serve_port {
+        selected.serve.port = port;
+    }
+    if let Some(scheduler) = args.serve_scheduler {
+        selected.serve.scheduler = match scheduler {
+            SchedulerArg::FifoSerial => ConfiguredScheduler::FifoSerial,
+            SchedulerArg::InflightBatched => ConfiguredScheduler::InflightBatched,
+        };
+        if scheduler == SchedulerArg::FifoSerial && args.serve_max_slots.is_none() {
+            selected.serve.max_slots = 1;
+        }
+    }
+    if let Some(max_slots) = args.serve_max_slots {
+        selected.serve.max_slots = max_slots;
+    }
+}
+
+fn yes_no(answer: &str, default: bool) -> Result<bool, SetupError> {
+    match answer.to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(SetupError::Input(
+            "expected y, yes, n, no, or Enter".to_owned(),
+        )),
+    }
+}
+
+fn parse_positive_u32(field: &str, value: &str) -> Result<u32, SetupError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| SetupError::Input(format!("{field} must be a positive integer")))
+}
+
+fn parse_port(value: &str) -> Result<u16, SetupError> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| SetupError::Input("API port must be in 1..=65535".to_owned()))
 }
 
 fn read_prompt_line<R: BufRead>(input: &mut R) -> Result<Option<String>, SetupError> {
@@ -249,6 +236,6 @@ fn read_prompt_line<R: BufRead>(input: &mut R) -> Result<Option<String>, SetupEr
         }
     }
     String::from_utf8(bytes)
-        .map(Some)
+        .map(|answer| Some(answer.trim().to_owned()))
         .map_err(|_| SetupError::Input("setup prompt input must be valid UTF-8".to_owned()))
 }
