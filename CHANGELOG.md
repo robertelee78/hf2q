@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bound DeepSeek-V4's forced-open reasoning before a narrowly constrained
+  single required tool, and align staggered compatible warm-prefill cursors
+  before resuming four-lane cooperative execution. The protected gate proves
+  both transitions without widening the 60/15/35-second product limits.
 - Keep the OpenAI `parallel_tool_calls` omission consistent with hf2q's
   established single-call default, and stop DeepSeek generation as soon as a
   constrained non-parallel tool body is accepted. This removes an unused final
